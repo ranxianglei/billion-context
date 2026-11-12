@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>."
-    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>。"
+    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · upstreamFirstByteMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>."
+    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · upstreamFirstByteMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -19,6 +19,13 @@ entries:
     group: process
     desc_en: "Hard ceiling on a single upstream call (12 min covers slow deep-thinking models)."
     desc_zh: "单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。"
+  - key: network.upstreamFirstByteMs
+    type: number
+    default: "= upstreamTimeoutMs (resolved; 720000 when unset)"
+    env: BILI_UPSTREAM_FIRST_BYTE_MS
+    group: process
+    desc_en: "Phase-1 budget: request sent → first response byte (undici resolves the fetch around the first body data). Unset follows the RESOLVED upstreamTimeoutMs — including deployments that raise BILI_UPSTREAM_TIMEOUT_MS above 12 min (#5917 review: a constant 720000 fallback would silently re-cap them) — so behavior is unchanged; tighter deployments opt in (#5904: a wedged upstream that accepts requests but never answered previously hung silently until the client aborted). After the first byte, chunk-gap silence stays governed by the full upstreamTimeoutMs (#1706/#1714 guarantee). When this value is set BELOW upstreamTimeoutMs, a first-byte timeout becomes its own failure class `upstream-headers-timeout` — zero response bytes were received, so bili replays it in-proxy under the existing retry budget (BILI_REPLAY_RETRY_MAX, default 3) instead of failing the whole request once; the mid-stream (body) idle timeout stays `upstream-timeout` and non-retried. Unset, behavior is byte-identical to before (#5807/#5831). The release gate sets 120000."
+    desc_zh: "阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。未设时跟随解析后的 upstreamTimeoutMs——包括把 BILI_UPSTREAM_TIMEOUT_MS 提到 12 分钟以上的部署（#5917 评审：常量 720000 回落会悄悄把它们压回 12 分钟）——行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。当该值被收紧到低于 upstreamTimeoutMs 时，首字节超时成为独立失败类 `upstream-headers-timeout`——因为一个响应字节都未收到，bili 会在代理内按既有重试预算（BILI_REPLAY_RETRY_MAX，默认 3 次）重放，而不是让整步只失败一次；流中途（body）空闲超时仍是 `upstream-timeout` 且不重试。未设时行为与之前逐字节一致（#5807/#5831）。发布 gate 设 120000。"
   - key: network.requestWatchdogMs
     type: number
     default: "2× upstreamTimeoutMs"
@@ -87,15 +94,15 @@ entries:
     default: "true"
     env: BILI_THROTTLE_429
     group: process
-    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior."
-    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。"
+    desc_en: "Egress-side 429 governor (#4204): repeated upstream 429s are answered locally instead of forwarded. Account limits and unrecognized/malformed responses hold origin+credential; only KeyRing's exact `keyring_model_temporarily_unavailable` code with a matching request model holds origin+credential+model, leaving other models eligible. A mismatch or missing model remains account-wide; false restores the legacy always-forward behavior."
+    desc_zh: "出站 429 治理器（#4204）：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理；设为 false 恢复旧的总是转发行为。"
   - key: network.throttle429MaxConsecutive
     type: number
     default: "5"
     env: BILI_THROTTLE_429_MAX_CONSECUTIVE
     group: process
-    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it."
-    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。"
+    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears an account hold, or the matching model's non-429 response clears its model hold."
+    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到账号级 hold 收到任意非 429 响应，或模型级 hold 收到同一模型的非 429 响应后清除。"
   - key: network.throttle429BaseDelayMs
     type: number
     default: "2000"
@@ -110,6 +117,13 @@ entries:
     group: process
     desc_en: "Ceiling for the 429 hold backoff and for the terminal-phase probe interval."
     desc_zh: "429 hold 退避的上限，也是终局阶段探测间隔的上限。"
+  - key: network.throttle429Scope
+    type: string
+    default: "credential"
+    env: BILI_THROTTLE_429_SCOPE
+    group: process
+    desc_en: "Hold granularity for marker-less upstream 429s (#5199). The value match is EXACT (`credential` or `model`, case-sensitive) — a typo falls back to `credential` with one warn log. `credential` (default) keeps #5696's conservative semantics — any 429 without a recognized model marker (`keyring_model_temporarily_unavailable`, or a bili relay's `bili_throttle_hold` scope=model) holds the whole origin+credential, so every model behind that credential waits out the backoff. `model` keys the hold by the send's request model instead, for gateways that front many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style relays where one model's RPM exhaustion must not freeze its siblings); requests whose model cannot be identified remain credential-wide, and recognized markers keep their own semantics in both modes. NOTE: under `model`, the hold key is the request model string EXACTLY as the wire carries it (`glm-5.2` ≠ `GLM-5.2` ≠ `glm-5.2-128k`) — a gateway that rewrites model names or serves one model under several aliases keeps separate holds per spelling, matching how its own per-model quotas are billed."
+    desc_zh: "无标记上游 429 的 hold 粒度（#5199）。取值匹配是**精确匹配**（`credential` 或 `model`，区分大小写）——拼错会回落到 `credential` 并打一条 warn。`credential`（默认）保持 #5696 的保守语义——凡未携带可识别模型标记（`keyring_model_temporarily_unavailable`，或 bili 中继的 `bili_throttle_hold` scope=model）的 429 均按整个 origin+凭据持有，该凭据下所有模型一起退避等待。`model` 改按发送请求的模型分桶持有，适用于单凭据背后多模型独立限流的网关（LiteLLM/one-api/opencode.ai 类中继，一个模型的 RPM 耗尽不应冻结兄弟模型）；无法识别模型的请求仍按凭据级持有，两种模式下已识别标记的语义均不变。注意：`model` 模式下 hold 键就是请求报文里的模型字符串，逐字精确（`glm-5.2` ≠ `GLM-5.2` ≠ `glm-5.2-128k`）——网关若改写模型名或同一模型挂多个别名，会按每个拼写各持一份 hold，与其自身按模型计的配额口径一致。"
   - key: network.maxShrinkPerCompress
     type: number
     default: "unset"
@@ -164,15 +178,29 @@ entries:
     default: "10485760"
     env: BILI_WS_OUTBOUND_BYTES
     group: process
-    desc_en: "Soft byte budget for the WebSocket lane only (#3701): when the final serialized Responses WS frame exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress), then whatever remains is boundedly downscaled through the jimp maxDim ladder. If the frame still does not fit and the upstream closes with 1009 before any event, one strictly smaller resend is attempted within the same request. Set 0 to disable shedding (previous send-as-is behavior). HTTP lanes are unaffected — the hard refusal cap stays network.outboundBodyBytes."
-    desc_zh: "仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。"
+    desc_en: "Soft byte budget for the WebSocket lane only (#3701): when the final serialized Responses WS frame exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress on tool-armed lanes — codex-style lanes that reject injected tools keep the size-only annotation), then whatever remains is boundedly downscaled through the jimp maxDim ladder. If the frame still does not fit and the upstream closes with 1009 before any event, one strictly smaller resend is attempted within the same request. Set 0 to disable shedding (previous send-as-is behavior). HTTP lanes are unaffected — the hard refusal cap stays network.outboundBodyBytes."
+    desc_zh: "仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。"
   - key: network.httpOutboundBytes
     type: number
     default: "10485760"
     env: BILI_HTTP_OUTBOUND_BYTES
     group: process
-    desc_en: "Soft byte budget for the plain/proxy/pi-native HTTP relay lane (#3909): when the final serialized request exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress), then whatever remains is boundedly downscaled through the jimp maxDim ladder. Closes the gap image-dense sessions leave open: token-space folding decides in tokens while the upstream rejects in bytes / pixel-decode CPU (Cloudflare Worker 503), so a ~48 MiB request 503s forever with every retry resending the same pixels. Applies only when no managed transport is installed (the spawned relay); the WS lane uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never shed here (#3701 Finding 1). Set 0 to disable (previous send-as-is); the hard refusal cap stays network.outboundBodyBytes."
-    desc_zh: "面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。"
+    desc_en: "Soft byte budget for the plain/proxy/pi-native HTTP relay lane (#3909): when the final serialized request exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress on tool-armed lanes — codex-style lanes that reject injected tools keep the size-only annotation), then whatever remains is boundedly downscaled through the jimp maxDim ladder. Closes the gap image-dense sessions leave open: token-space folding decides in tokens while the upstream rejects in bytes / pixel-decode CPU (Cloudflare Worker 503), so a ~48 MiB request 503s forever with every retry resending the same pixels. Applies only when no managed transport is installed (the spawned relay); the WS lane uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never shed here (#3701 Finding 1). Set 0 to disable (previous send-as-is); the hard refusal cap stays network.outboundBodyBytes."
+    desc_zh: "面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。"
+  - key: network.ingestBodyBytes
+    type: number
+    default: "33554432"
+    env: BILI_INGEST_BODY_BYTES
+    group: process
+    desc_en: "Cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER decode (#5794 item 2). A TEXT-DOMINATED body above it is refused with an actionable 413 (stage ingest) before the sweep, because any parseable text body over 32 MiB is already ~8M tokens — beyond every real model window — and burning seconds of event-loop time to parse it (the 51.2 MiB / 29,619-message incident: 5.5–7.2 s per round, 54.6% of local CPU, 747 s FATAL) cannot end in success. Image-bearing bodies are exempt on every lane: base64 pixels are excluded from the token meter by design (images billed separately, never doomed on raw bytes — #496/#1800/#857), so over-band image mass stays governed by the admission slots, the receive cap and each lane's own shed / pre-send byte budget (#3909 ~48 MiB image-dense sessions, #3701 WS screenshots; the Responses lane is exempt outright regardless). Distinct from the admission SLOTS (network.receiveBodyBytes threshold): the slots cap CONCURRENCY of large decodes, this cap bounds a single body. Set 0 to disable (legacy parse-everything)."
+    desc_zh: "解码之后进入 JSON.parse+归一化清扫的成本带（解码后字节，#5794 第 2 项）。超限的**文本为主**的体在清扫之前以可操作的 413（stage ingest）拒收：任何可解析的 32 MiB+ 文本体都 ≥ ~8M token、超过一切真实模型窗口，为它烧掉数秒事件循环时间没有意义（51.2 MiB / 29,619 条消息现场：每轮 5.5–7.2s、占本机 CPU 54.6%、747s FATAL）。带图片的体在所有车道豁免：base64 像素按设计不进 token 计量（图片单独计费、绝不在原始字节上判死——#496/#1800/#857），超带的图片体量仍由准入槽位、收件上限与各车道自身的裁减/预发送字节预算治理（#3909 ~48 MiB 图片密集会话、#3701 WS 截图；Responses 车道无论如何整体豁免）。与大解码准入槽位（network.receiveBodyBytes 阈值）不同：槽位限的是大解码的并发数，本上限限的是单个体的成本。设为 0 可禁用（恢复此前的全解析）。"
+  - key: network.maxMessages
+    type: number
+    default: "0"
+    env: BILI_MAX_MESSAGES
+    group: process
+    desc_en: "Per-upstream hard cap on the messages[] array length (#5000 item 2) — the COUNT dimension: a wire constraint no byte/token estimate expresses (the 26,903-message / 55.2 MiB #5000 session cleared every size gate and died at the upstream with the count error). Per-UPSTREAM on purpose: there is no universal value, so the default is 0 = disabled; set it to your upstream's known limit and over-count bodies get an actionable 413 (restart the session or rewind) instead of a guaranteed upstream 400. Count only — it never folds. Enforced in preflight (before the token trigger) and at the egress fuse for the no-model lane."
+    desc_zh: "单上游 messages[] 数组长度硬限（#5000 第 2 项）——COUNT 维度：任何字节/token 估算都表达不了的线路约束（#5000 的 26,903 条消息 / 55.2 MiB 会话清掉所有尺寸闸后仍在上游以条数错误死掉）。刻意按上游设置：没有通用值，默认 0 = 关闭；把它设为你所连上游的已知上限后，超条数的体会得到可操作的 413（重启会话或 rewind）而不是一次必然的上游 400。只判条数、从不折叠。在 preflight（token 触发器之前）与无模型车道的出站熔断处强制执行。"
   - key: network.caFile
     type: string
     default: "unset"
@@ -205,12 +233,41 @@ entries:
     desc_en: "Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output."
     desc_zh: "pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。"
   - key: guardrails.repetition
-    type: boolean
+    type: "boolean | object"
     default: "true"
     env: BILI_GUARDRAIL_REPETITION
     group: process
-    desc_en: "Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). false / env 0 disables it."
-    desc_zh: "pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。false 或 env 0 关闭。"
+    desc_en: "Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). The object form additionally accepts `enabled` (default true, gate), `warn` (default 3, warning threshold), `abort` (default 5, final-refuse threshold), and `recovery` (default false, opt-in graceful-termination mode: calls 6–(abort+4) are refused with a stuck-report while the turn stays alive, and the turn is forcibly terminated only when the identical call reaches abort+5 in a row (#5505)). false / env 0 disables it. Object sub-fields are file-only (not exposed via env var)."
+    desc_zh: "pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。对象形式另接受 `enabled`（默认 true，总开关）、`warn`（默认 3，警告阈值）、`abort`（默认 5，最终拒绝阈值）和 `recovery`（默认 false，选择性的优雅终止模式：调用 6 至 (abort+4) 次被拒绝并附卡死报告（回合保留、不中断宿主回合），直到同一调用连续达到 abort+5 次才强制终止回合（#5505））。false 或 env 0 关闭。对象子字段仅限配置文件（不通过环境变量暴露）。"
+  - key: guardrails.repetition.enabled
+    type: boolean
+    default: "true"
+    env: — (file-only)
+    group: process
+    desc_en: "Gates the identical-call loop-breaker when used with the object form. true (default) enables it; false disables it. Use `repetition: false` (boolean form) for the simpler opt-out."
+    desc_zh: "使用对象形式时控制调用循环破除器的开关。true（默认）启用；false 禁用。简单禁用请用 `repetition: false`（布尔形式）。"
+  - key: guardrails.repetition.warn
+    type: number
+    default: "3"
+    env: — (file-only)
+    group: process
+    desc_en: "First warning threshold. Identical calls from this count onward get a WARNING notice appended to results (#3066). Must be less than `abort`."
+    desc_zh: "首次警告阈值。从第 N 次起，相同调用会在结果中附带 WARNING 通知（#3066）。必须小于 `abort`。"
+  - key: guardrails.repetition.abort
+    type: number
+    default: "5"
+    env: — (file-only)
+    group: process
+    desc_en: "Final-refuse threshold. The next identical call after this count is blocked and refused without execution, followed by a FINAL WARNING (#5225). Must be greater than `warn`."
+    desc_zh: "最终拒绝阈值。此计数之后的下一次相同调用会被阻止并拒绝执行，附带 FINAL WARNING（#5225）。必须大于 `warn`。"
+  - key: guardrails.repetition.recovery
+    type: boolean
+    default: "false"
+    env: — (file-only)
+    group: process
+    desc_en: "Opt-in graceful-termination mode (#5505). When true, calls after the final refusal (abort) are refused with a stuck-report while the turn stays alive (soft-stop). The turn is forcibly terminated only when the identical call reaches abort+5 (hard backstop, default 10). false (default) = original behavior: ctx.abort() at call 6."
+    desc_zh: "选择性的优雅终止模式（#5505）。开启后，最终拒绝（abort）之后的相同调用被拒绝并附卡死报告（软停止，回合保留）。同一调用连续达到 abort+5 次时才强制终止回合（硬保底，默认 10）。false（默认）= 原始行为：第 6 次调用时 ctx.abort()。"
+
   - key: guardrails.textRunThreshold
     type: number
     default: "200"
@@ -226,8 +283,8 @@ entries:
     site_group: proc
     desc_en: "Session persistence to disk under the XDG state dir."
     desc_zh: "会话落盘持久化（XDG state 目录之下）。"
-    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
-    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
+    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
+    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
   - key: persist.enabled
     type: boolean
     default: "true"
@@ -249,6 +306,13 @@ entries:
     group: process
     desc_en: "Write debounce window for session files."
     desc_zh: "会话文件写入的去抖窗口。"
+  - key: persist.maxDelayMs
+    type: number
+    default: "5000"
+    env: BILI_PERSIST_MAX_DELAY_MS
+    group: process
+    desc_en: "Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6058)."
+    desc_zh: "持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6058）。"
   - key: persist.tailTokens
     type: number
     default: "16384 (0 disables message persistence)"
@@ -313,8 +377,8 @@ entries:
     default: "on"
     env: BILI_STORAGE_JSON_WRITER
     group: process
-    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
-    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
+    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session CCR content-store sidecar stops being written as well - in full mode the index's ccr mirror is consulted first on every read, so the mirror is the durable copy. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
+    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
   - key: storage.walJournalSizeLimitBytes
     type: number
     default: "8388608"
@@ -362,11 +426,11 @@ entries:
     desc_zh: "启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。"
   - key: sessions.residentMaxBytes
     type: number
-    default: "536870912"
+    default: "4294967296"
     env: BILI_SESSION_RESIDENT_MAX_BYTES
     group: process
-    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
-    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+    desc_en: "Soft target for estimated resident session bytes (#2803; raised from 512 MiB to 4 GiB in #5779 — single sessions routinely exceed half a GiB and ping-ponged against the smaller budget forever). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. Lower it if your machine has little RAM."
+    desc_zh: "驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。"
   - key: sessions.hardMaxBytes
     type: number
     default: "(same as `sessions.residentMaxBytes`)"
