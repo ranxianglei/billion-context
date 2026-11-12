@@ -27,12 +27,16 @@ import {
     _resetRegisterForTest,
     _settleNativeForTest,
     _stateBeforeSendForTest,
+    _nativeStateForTest,
+    _resetRoutedForTest,
     _stateHeadersForTest,
     _stateTakeoverGateForTest,
     type PluginContext,
     type ForkChildVerdict,
 } from "../src/agent/dsh-native.ts";
 import { __resetConversationRecallForTests } from "../src/agent/conversation-recall.ts";
+import { installNativeWebSocketIntercept, _resetForTest as resetWsIntercept } from "../src/agent/native-ws-intercept.ts";
+import { WebSocket, WebSocketServer } from "ws";
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
@@ -106,7 +110,7 @@ function runWaterfall(
     return composed(options, () => base()) as AsyncIterable<number>;
 }
 
-async function withSetup(fn: (handle: CtxHandle) => Promise<void>): Promise<void> {
+async function withSetup(fn: (handle: CtxHandle, proxy: MockProxy) => Promise<void>): Promise<void> {
     __resetConversationRecallForTests();
     const home = mkdtempSync(join(tmpdir(), "dsh-llm-stream-"));
     const saved: Record<string, string | undefined> = {};
@@ -121,7 +125,7 @@ async function withSetup(fn: (handle: CtxHandle) => Promise<void>): Promise<void
     try {
         await apply(handle.ctx);
         await waitFor(() => handle.registered.length === 1, "attach tool registration");
-        await fn(handle);
+        await fn(handle, proxy);
     } finally {
         await _settleNativeForTest();
         proxy.server.close();
@@ -165,6 +169,61 @@ async function startMockProxy(): Promise<MockProxy> {
     const port = typeof address === "object" && "port" in address ? address.port : 0;
     return { origin: `http://127.0.0.1:${port}`, server };
 }
+
+test("DSH Codex WS receives scoped plugin identity and reuses the attributed socket", { timeout: 15_000 }, async () => {
+    await withSetup(async (handle, proxy) => {
+        const original = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+        const wss = new WebSocketServer({ noServer: true });
+        const upgrades: import("node:http").IncomingMessage[] = [];
+        const frames: string[] = [];
+        proxy.server.on("upgrade", (req, socket, head) => {
+            upgrades.push(req);
+            wss.handleUpgrade(req, socket, head, peer => {
+                peer.on("message", data => { frames.push(String(data)); peer.send("ack"); });
+            });
+        });
+        let socket: WebSocket | undefined;
+        try {
+            Object.defineProperty(globalThis, "WebSocket", { configurable: true, writable: true, value: WebSocket });
+            installNativeWebSocketIntercept(_nativeStateForTest());
+            const Ctor = globalThis.WebSocket as unknown as new (url: string, options: { headers: Record<string, string> }) => WebSocket;
+            handle.setInitiator(undefined);
+            for (let turn = 0; turn < 2; turn++) {
+                const iterator = runWaterfall(handle.events, { sessionId: "ws-scoped-session" }, async function* () {
+                    if (socket === undefined) {
+                        socket = new Ctor("wss://chatgpt.com/backend-api/codex/responses", { headers: { "session-id": "provider-session" } });
+                        await new Promise<void>((resolve, reject) => {
+                            socket!.addEventListener("open", () => resolve(), { once: true });
+                            socket!.addEventListener("error", reject, { once: true });
+                        });
+                    }
+                    const ack = new Promise<void>((resolve, reject) => {
+                        socket!.addEventListener("message", () => resolve(), { once: true });
+                        socket!.addEventListener("error", reject, { once: true });
+                    });
+                    socket.send(JSON.stringify({ type: "response.create", model: "test-model", input: [{ role: "user", content: `test turn ${turn}` }] }));
+                    await ack;
+                    yield turn;
+                });
+                for await (const value of iterator) assert.equal(value, turn);
+            }
+            assert.equal(upgrades.length, 1);
+            assert.equal(upgrades[0].url, "/bili/https://chatgpt.com/backend-api/codex/responses");
+            assert.equal(upgrades[0].headers["x-bili-plugin"], "dsh");
+            assert.equal(upgrades[0].headers["x-bili-plugin-conversation"], "ws-scoped-session");
+            assert.equal(upgrades[0].headers["session-id"], "provider-session");
+            assert.equal(frames.length, 2);
+        } finally {
+            socket?.close();
+            for (const peer of wss.clients) peer.terminate();
+            await new Promise<void>(resolve => wss.close(() => resolve()));
+            resetWsIntercept();
+            _resetRoutedForTest();
+            if (original !== undefined) Object.defineProperty(globalThis, "WebSocket", original);
+            else Reflect.deleteProperty(globalThis, "WebSocket");
+        }
+    });
+});
 
 function headersOf(init: { headers?: unknown }): Record<string, string> {
     const raw = init.headers;

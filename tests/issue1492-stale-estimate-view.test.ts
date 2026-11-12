@@ -215,16 +215,25 @@ test("#1492 A: poisoned estimate baseline must not drive nudge/preflight on a fo
     );
 });
 
-test("#1492 B: a usage-sourced high baseline must STILL fire preflight (real overflow evidence)", async () => {
+test("#1492 B (post-#4288): a usage-sourced baseline above the window on a FITTING payload forwards instead of burning summarization — the overflow, if real, arms on rejection", async () => {
+    // Contract update (#4288 re-land, PR #4725): the old expectation — a
+    // usage-grade baseline above the window must still fire preflight —
+    // collided head-on with #4288 (mid-session window shrink leaves a usage
+    // baseline above the NEW window; burning the ladder on a payload that
+    // fits its own window dead-looped clients until timeout). The #4288
+    // doctrine wins: the floorless exit forwards a fitting payload; a usage
+    // baseline above the limit cannot have been measured under this window
+    // regime, and if the overflow is real the forward is rejected, the
+    // overflow-arm (#1110/#987) arms from THIS request's evidence, and the
+    // rescue folds. Estimate-grade stays silent (case A); usage-grade on a
+    // fitting payload is now silent too — the arm is the overflow evidence
+    // channel, not the stale usage number.
     const { streamed, nonStream, session } = await runCase("issue1492-usage-sess", "usage");
-    assert.ok(nonStream >= 1, `a usage-grade baseline above the window must keep driving compression (nonStream=${nonStream})`);
-    // No nudge-marker assertion here: the forwarded body is the POST-FOLD
-    // rebuild (server.ts re-runs prepare after preflight), whose fresh nudge
-    // decision sees nothing left to fold and suppresses — kernel-owned
-    // behavior, identical pre/post fix. The asymmetry pinned by this case is
-    // the trigger itself: estimate-source stays silent (case A), usage-source
-    // still burns summarization calls.
-    void streamed;
+    assert.equal(nonStream, 0, `a fitting payload forwards without summarization even under a usage-grade stale baseline (nonStream=${nonStream})`);
+    assert.equal(streamed.length, 2, "two streaming forwards (one per turn)");
+    for (let i = 0; i < 6; i++) {
+        assert.ok(streamed[1].includes(`CODE_${i}_`), `heavy ${i} must survive unfolded (no fold ran)`);
+    }
     assert.equal(session.stats.lastInputTokens, 5000, "self-heal via the next real usage report");
 });
 

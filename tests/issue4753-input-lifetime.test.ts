@@ -39,15 +39,21 @@ test.afterEach(() => {
 // B1: parity corpus — new precomputed bookkeeping vs the old inline algorithm.
 // ---------------------------------------------------------------------------
 
-// Verbatim copy of the OLD comparableHistory walker (was private in
-// src/plugin.ts; kept here so the oracle cannot silently drift with the fix).
+// Verbatim copy of the CANONICAL comparableHistory walker (private in
+// src/plugin.ts; kept here so the oracle cannot silently drift from the fix).
+// Tracks #4266's thinking-family handling: thinking/redacted_thinking/reasoning
+// are comparable by view when they carry a string payload (a payload-less
+// thinking block stays non-comparable, fail-closed).
 function oracleComparableHistory(value: unknown): boolean {
     if (value === null || typeof value === "string") return true;
     if (Array.isArray(value)) return value.every(oracleComparableHistory);
     if (!value || typeof value !== "object") return false;
     const part = value as Record<string, unknown>;
-    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
+    if (part.type === "thinking") return typeof part.thinking === "string" || typeof part.signature === "string";
+    if (part.type === "redacted_thinking") return typeof part.data === "string";
+    if (part.type === "reasoning") return true;
     if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return oracleComparableHistory(part.content);
     if (part.output !== undefined) return oracleComparableHistory(part.output);
@@ -90,7 +96,7 @@ const PARITY_FIXTURES: Array<{ name: string; body: string; expected: boolean }> 
     { name: "top-level array", body: "[1,2]", expected: false },
     { name: "empty messages array", body: JSON.stringify({ messages: [] }), expected: true },
     { name: "unicode text", body: JSON.stringify({ messages: [{ role: "user", content: "中文テキスト🎉" }] }), expected: true },
-    { name: "thinking block", body: JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }], thinking_tokens: 3 }] }), expected: false },
+    { name: "thinking block", body: JSON.stringify({ messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "hmm" }], thinking_tokens: 3 }] }), expected: true }, // #4266: string-payload thinking is comparable by view
 ];
 
 for (const fx of PARITY_FIXTURES) {
@@ -316,7 +322,7 @@ test("settlement hook: fires once and before the first streamed byte (200)", asy
     const order: string[] = [];
     let settled = 0;
     trackOrder(f.res, order);
-    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-200", undefined, undefined, undefined, () => { settled += 1; order.push("settled"); });
+    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-200", undefined, undefined, undefined, undefined, undefined, () => { settled += 1; order.push("settled"); });
     assert.equal(calls, 1);
     assert.equal(settled, 1, "hook fires exactly once");
     assert.equal(order[0], "settled", `settlement precedes the first byte: ${JSON.stringify(order)}`);
@@ -342,7 +348,7 @@ test("settlement hook: fires once before a passthrough 400 is written", async (t
     const order: string[] = [];
     let settled = 0;
     trackOrder(f.res, order);
-    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-400", undefined, undefined, undefined, () => { settled += 1; order.push("settled"); });
+    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-400", undefined, undefined, undefined, undefined, undefined, () => { settled += 1; order.push("settled"); });
     assert.equal(settled, 1, "hook fires exactly once on the error path too");
     assert.equal(order[0], "settled", `settlement precedes the error write: ${JSON.stringify(order)}`);
 });
@@ -362,7 +368,7 @@ test("settlement hook: never fires when the response is already closed (fast pat
     f.res.destroy();
     f.res.emit("close");
     let settled = 0;
-    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-fast", undefined, undefined, undefined, () => { settled += 1; });
+    await forward(f.req, f.res, f.opts, Buffer.from("{}"), null, f.core, f.config, () => {}, undefined, "probe-fast", undefined, undefined, undefined, undefined, undefined, () => { settled += 1; });
     assert.equal(settled, 0, "no attempt started, nothing to settle");
     assert.equal(calls, 0, "the main fetch must not start against a closed response");
 });

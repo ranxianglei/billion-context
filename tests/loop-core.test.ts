@@ -264,22 +264,30 @@ test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empt
     }
 });
 
-// #156/#4186: a failed-only mutating round completes immediately. The failed
-// frames are ephemeral (#1548): never persisted, never seen by the client.
-// Re-requesting after them lets the frames reach upstream once and then vanish
-// from the next client request — an unsanctioned mid-history rewrite of the
-// provider's frozen prefix (the seam #4186 measured in 7/17 fuzz seeds).
-// Breaking on the FIRST failed-only round keeps them off the wire entirely;
-// the streamed ❌ receipt carries the reason into the client's next turn.
-test("loop #156/#4186: failed-only compress round → completes after round 1 with ZERO re-requests", async () => {
+// #5220 (history #156/#4186): a failed-only mutating round NO LONGER ends the
+// turn. The failure is fed back to the model as a plain assistant recovery
+// receipt — bytes identical to the ❌ marker already streamed to the client —
+// so the model decides what to do next instead of a fabricated "length"
+// finish silently killing a running task (no client on any wire auto-
+// continues "length"). The retry body must NOT carry this round's ephemeral
+// tool frames (#1548/#4186 seam): receipt only. Bounded by the restored #156
+// narrow breaker: re-submitting the IDENTICAL failing call (same signature)
+// is pure ping-pong and still breaks — that is exactly what this fixture
+// produces on round 2, so it runs ONE re-request then completes.
+test("loop #5220: failed-only compress round → recovery-receipt re-request, identical resubmit breaks", async () => {
     const failingRound = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
         COMPLETED,
     ].join("");
     let fetchCalls = 0;
+    const bodies: string[] = [];
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(failingRound, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        fetchCalls++;
+        if (init?.body !== undefined) bodies.push(String(init.body));
+        return new Response(failingRound, { status: 200 });
+    }) as typeof fetch;
     try {
         const out = await drain(
             new Response(failingRound, { status: 200 }).body!,
@@ -287,9 +295,12 @@ test("loop #156/#4186: failed-only compress round → completes after round 1 wi
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(fetchCalls, 0, "the failed frame NEVER reached upstream — no re-request was sent at all");
+        assert.equal(fetchCalls, 1, "first-time failure re-requests ONCE (recovery receipt); the identical round-2 resubmit hits the #156 signature breaker");
         assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
         assert.ok(out.includes("❌"), "failure receipt surfaced to the client so the reason survives the turn");
+        const body = bodies[0]!;
+        assert.ok(body.includes("❌"), "retry body carries the recovery receipt as assistant text");
+        assert.ok(!body.includes("function_call") && !body.includes("call_c"), "ephemeral failed frames stay off the wire (#1548/#4186) — receipt only");
     } finally {
         globalThis.fetch = orig;
     }
@@ -353,6 +364,51 @@ test("loop usage: protocol='responses' → cached NOT double-counted (input_toke
     assert.equal(ctx.session.stats.cachedTokens, 900);
     assert.equal(ctx.session.stats.cacheSamples, 1);
 });
+
+for (const completion of ["text", "tool"] as const) {
+    for (const placement of ["empty-delta-tail", "empty-choices-tail", "finish"] as const) {
+        test(`#4943: OpenAI ${completion} ${placement} usage settles once and replaces the stale anchor`, async () => {
+            const ctx = makeCtx([], "openai");
+            ctx.session.stats.lastInputTokens = 1000;
+            ctx.session.stats.lastUsageGradeTokens = 1000;
+            const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+            const frame = (value: unknown): string => `data: ${JSON.stringify(value)}\n\n`;
+            let totalInput = 0;
+            for (let turn = 1; turn <= 2; turn++) {
+                const prompt = 50000 * turn;
+                const usage = { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10, prompt_tokens_details: { cached_tokens: 4096 } };
+                const delta = completion === "tool"
+                    ? { tool_calls: [{ index: 0, id: "call_ping", type: "function", function: { name: "ping", arguments: "{}" } }] }
+                    : { content: "hello world" };
+                const finishReason = completion === "tool" ? "tool_calls" : "stop";
+                const finish = frame({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }], ...(placement === "finish" ? { usage } : {}) });
+                const tail = placement === "finish" ? "" : frame({ choices: placement === "empty-choices-tail" ? [] : [{ index: 0, delta: {} }], usage });
+                const raw = frame({ choices: [{ index: 0, delta }] }) + finish + tail + "data: [DONE]\n\n";
+                const chunks: Buffer[] = [];
+                for await (const part of runCompressLoop(
+                    new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+                    createOpenaiAdapter(body), buildCompressSystemPrompt(),
+                )) chunks.push(part);
+                totalInput += prompt;
+                assert.equal(ctx.session.stats.lastInputTokens, prompt);
+                assert.equal(ctx.session.stats.lastUsageGradeTokens, prompt);
+                assert.equal(ctx.session.stats.inputTokens, totalInput);
+                assert.equal(ctx.session.stats.outputTokens, 10 * turn);
+                assert.equal(ctx.session.stats.cachedTokens, 4096 * turn);
+                assert.equal(ctx.session.stats.cacheSamples, turn);
+                const output = Buffer.concat(chunks).toString("utf8");
+                if (completion === "tool") {
+                    const usageFrame = tail || finish;
+                    assert.equal(output.split(usageFrame).length - 1, 1, "client receives the original usage frame exactly once");
+                    assert.ok(output.indexOf(usageFrame) < output.indexOf("data: [DONE]"));
+                    if (tail) assert.ok(output.indexOf(tail) > output.indexOf(finish));
+                } else {
+                    assert.ok(output.includes("hello world"));
+                }
+            }
+        });
+    }
+}
 
 test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
     const ctx = makeCtx();
@@ -506,6 +562,56 @@ test("isTransientUpstreamError: classifier matrix", () => {
     assert.equal(isTransientUpstreamError(503, "service unavailable"), true);
     assert.equal(isTransientUpstreamError(200, "captcha"), false, "2xx never classified");
     assert.equal(REPLAY_MAX_ATTEMPTS, 3);
+});
+
+// Regression guard for #3606: risk-control gateways return 400 whose body
+// machine-declares retryability (code 11101, actions:["RETRY"]) or uses the
+// canonical "Please retry" / 「请重试」 phrasing — none of which hit the
+// original seven markers, so every such rejection failed fast instead of
+// being replayed.
+const RETRY_DECLARED_400_BODY = JSON.stringify({ error: { message: JSON.stringify({
+    code: 11101,
+    msg: "Parse message failed: unsupported content type at index 0: tool_use",
+    requestId: "req-test",
+    displayMsg: { en: "Bad request.", zh: "请求不合法" },
+    actions: ["RETRY", "SUBMIT_FEEDBACK"],
+}) } });
+
+test("isTransientUpstreamError: explicit retry declarations (#3606)", () => {
+    assert.equal(isTransientUpstreamError(400, RETRY_DECLARED_400_BODY), true, 'JSON-string-wrapped actions:["RETRY"] 400 is transient');
+    assert.equal(isTransientUpstreamError(400, '{"code":11101,"actions":["RETRY","SUBMIT_FEEDBACK"]}'), true, "flat actions:[RETRY] 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"error":{"retryable":true,"message":"temporary"}}'), true, "nested retryable:true 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"message":"please retry later"}'), true, '"please retry" wording is transient');
+    assert.equal(isTransientUpstreamError(400, '{"displayMsg":{"en":"Invalid request. Please retry","zh":"请求内容不合法，请重试"},"msg":"x"}'), true, "Please retry / 请重试 wording is transient");
+    // negatives: only unambiguous machine signals or canonical phrasing count
+    assert.equal(isTransientUpstreamError(400, '{"message":"invalid api_key, do not retry"}'), false, '"do not retry" stays non-transient');
+    assert.equal(isTransientUpstreamError(400, '{"retryable":"true"}'), false, 'string "true" is not a boolean declaration');
+    assert.equal(isTransientUpstreamError(400, '{"actions":["SUBMIT_FEEDBACK"]}'), false, "actions without RETRY is not transient");
+    assert.equal(isTransientUpstreamError(400, "not json at all"), false, "non-JSON body without markers is not transient");
+});
+
+test("replay retry: upstream-declared transient 400 then success → retried (#3606)", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response(RETRY_DECLARED_400_BODY, { status: 400 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "declared-transient 400 retried once");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
 });
 
 test("replayBackoffMs: exponential from env-tunable base", () => {
