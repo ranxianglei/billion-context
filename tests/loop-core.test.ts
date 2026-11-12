@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
 import type { WireProtocol } from "../src/util.ts";
 import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
