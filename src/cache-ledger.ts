@@ -652,38 +652,46 @@ export function noteClientAbort(session: Session): void {
 // (server/handle.ts) must read exactly these headers or holds go unmatched.
 export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
 
-/** #2131: stable fingerprint of the outbound credential — the ONLY form the
- *  key is ever persisted in (raw secrets never reach the ledger, logs or the
- *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
- *  returns undefined when the lane sent no recognized credential header. */
+/** #2131: stable fingerprint of the outbound credential SET — the ONLY form
+ *  the key is ever persisted in (raw secrets never reach the ledger, logs or
+ *  the web UI). Checks the standard bearer/api-key headers, case-insensitively;
+ *  returns undefined when the lane sent no recognized credential header.
+ *  #6148: a lane may forward MORE than one distinct credential (e.g. a shared
+ *  gateway `authorization` plus a per-account `x-api-key`) — the identity must
+ *  cover the whole set. Collecting only the first header in insertion order
+ *  made it flip with header order (governor holds missed on reorder) and made
+ *  the second credential invisible (another account behind the same gateway
+ *  inherited the first's hold). Every recognized header is now collected,
+ *  deduped by normalized value ("Bearer X" + bare "X" collapse onto one
+ *  member, preserving the #2131 single-key alias), and the SORTED set is
+ *  hashed — insertion-order independent by construction. A single-distinct-
+ *  value set hashes byte-identically to the pre-#6148 behavior. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const creds = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
-            // Strip the auth-scheme envelope so "Bearer X" (authorization) and
-            // a bare "X" (x-api-key) hash to the SAME credential identity.
-            const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") {
-                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
-                // re-signed EVERY request (Signature is an HMAC over the
-                // per-request date + body hash), so hashing the raw line
-                // yields a per-request-unique identity — downstream that
-                // meant the 429 governor's holds never matched (#4204 never
-                // throttled on the APIG lane it was built for), the #3376
-                // keepalive snapshot deleted itself after every forward, and
-                // #2131 cache-sample attribution fragmented into one bucket
-                // per request. The STABLE credential on that line is the
-                // Access key id — fingerprint only that.
-                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
-            }
-        }
+        if (!(CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) continue;
+        // Strip the auth-scheme envelope so "Bearer X" (authorization) and
+        // a bare "X" (x-api-key) hash to the SAME credential identity.
+        const v = value.trim().replace(/^Bearer\s+/i, "").trim();
+        if (v === "") continue;
+        // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+        // re-signed EVERY request (Signature is an HMAC over the
+        // per-request date + body hash), so hashing the raw line
+        // yields a per-request-unique identity — downstream that
+        // meant the 429 governor's holds never matched (#4204 never
+        // throttled on the APIG lane it was built for), the #3376
+        // keepalive snapshot deleted itself after every forward, and
+        // #2131 cache-sample attribution fragmented into one bucket
+        // per request. The STABLE credential on that line is the
+        // Access key id — fingerprint only that.
+        const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+        creds.add(m !== null ? `sdk-hmac:${m[1]!}` : v);
     }
-    if (cred === undefined) return undefined;
-    return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
+    if (creds.size === 0) return undefined;
+    // \u0000 separator keeps ["ab","c"] distinct from ["a","bc"].
+    return "sha256:" + createHash("sha256").update([...creds].sort().join("\u0000"), "utf8").digest("hex").slice(0, 12);
 }
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
