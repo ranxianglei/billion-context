@@ -707,7 +707,7 @@ export function dshContextTabLabel(): string | undefined {
     return s.length > 0 ? s : undefined;
 }
 
-export type PluginBypassOverride = "auto" | "on" | "off";
+type PluginBypassOverride = "auto" | "on" | "off";
 
 /** BILI_PLUGIN_BYPASS — operator override of the x-bili-plugin-bypass
  *  passthrough decision (#6220). Three-state, read per-request (flips live,
