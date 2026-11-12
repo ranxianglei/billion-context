@@ -287,7 +287,7 @@ function substrateDestructionPauseParagraph(n: number): string {
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 // #5986 review fix: the observed failure mode after a compress rejection is the
@@ -1072,21 +1072,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
-        // compressAtFoldPoint v2 pointer echo (kind=already-folded-echo): the
-        // call's content was the relocation ack text of an earlier fold — the
-        // model copied the most recent compress call's rewritten args as its
-        // template (field report on #5949's v2: four identical
-        // content-not-array receipts in 25 minutes, each receipt feeding the
-        // next retry). Nothing is wrong with the format and nothing is
-        // foldable: ack a no-op instead of lecturing. NOT routed through
-        // recordCompressFailure (no repeat-guard counter for the model to
-        // misread as "the user asked N times"), but loop-tracked so a runaway
-        // echo burst still collapses to the #2146 short refusal.
-        if (diagnostics.kind === "already-folded-echo") {
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, "already-folded-echo") : "";
-            ctx.log("[acp-proxy: compress call echoed a fold-point relocation pointer (compressAtFoldPoint v2) — acked as no-op]");
-            return compressResult(`[bili: nothing was compressed — the text you sent is the relocation pointer of an earlier, already-completed fold (its summary lives at its fold point in the history). Do not re-send it. To fold NEW consumed ranges, issue one compress call whose content holds fresh 'mNNNNN–mNNNNN optional topic' header lines with their summaries.]${loopGuard}`, "refused", 0, "already-folded-echo");
-        }
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
@@ -1511,6 +1496,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             }
             return compressResult(receipt, "refused", 0, gateReason);
         }
+        // #5608-D: this fold is the session's next legitimate cache-breaking
+        // boundary — flag the one-time #4316 citation-space alignment to ride
+        // it (persist.scheduleSave consumes the marker before serializing).
+        // Armed only HERE, past the blocksCreated === 0 returns above: a
+        // refused or no-op compress rewrites no history, so it is not a
+        // boundary — arming on it let the next save run the alignment (and
+        // its time-attribute mark raise) on a call that folded nothing.
+        ctx.session.pendingLedgerAlign = true;
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);
 

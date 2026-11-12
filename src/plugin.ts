@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,8 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { blockOpsEnabled, effectiveBlockOpsConfig } from "./acp-block-ops.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -72,7 +73,7 @@ import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from 
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
-import { incomingCoreMessages } from "./fork-adoption.js";
+import { incomingCoreMessages, seedTimestampsFromParent } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 
@@ -1045,6 +1046,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const absorbOn = absorbEnabled(config);
     const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
     const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
+    // #5765: block-lifecycle tools — one switch (compress.blockOps.enabled),
+    // off by default; same conservative #1192 manifest rule as absorb (base
+    // config, no route/model context here).
+    const blockOpsOn = blockOpsEnabled(config);
+    const blockOps = blockOpsOn ? blockOpsTools() : undefined;
     const rulesOn = rulesEnabled(config);
     // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
     // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
@@ -1087,11 +1093,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         proxy: "billion-context",
         version: VERSION,
         commit: BUILD_COMMIT,
-        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : []), ...(blockOpsOn ? [ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME] : [])],
         tools: {
-            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : [])],
-            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
-            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOps ? blockOps.anthropic : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOps ? blockOps.openai : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOps ? blockOps.responses : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, compression: PLUGIN_COMPRESSION_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -1763,6 +1769,19 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (parent.state.viewLatchConfigDigest) {
                 child.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
             }
+            // #5608/#5609: carry the timestamp ledger (raw-id-keyed cache bytes,
+            // same content-addressed discipline as the ref seeding above) so the
+            // child's first replay re-renders the provider-cached time= attrs
+            // instead of minting "now" for inherited history.
+            seedTimestampsFromParent(child, parent);
+            // #5608-B: uniform arm on recognized continuations — carried
+            // parent stamps win over mints; bounds boundary-turn fresh ids.
+            child.state.suppressMintingOnce = true;
+            // #5608-C: inherit the parent's visibility mark with its number
+            // space (see fork-adoption.ts for the byte-parity rationale).
+            // Guarded: a markless parent must not materialize the key on the child.
+            if (parent.state.timestampsHighWaterRefSeq !== undefined)
+                child.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).
@@ -1861,6 +1880,12 @@ function disabledOptionalToolNote(tool: string, session: Session, config: Config
     if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
     if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
     if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
+    // #5765: block-lifecycle tools — per-session effective config (a manifest
+    // served while enabled may outlive a config change).
+    if (BLOCK_OP_TOOL_NAMES.has(tool) && effectiveBlockOpsConfig(session, config)?.enabled !== true) {
+        const verb = tool === ACP_RETIRE_TOOL_NAME ? "no blocks were retired" : tool === ACP_RESTORE_TOOL_NAME ? "no blocks were restored" : "no summary was rewritten";
+        return `${tool} is not enabled on this bili proxy (compress.blockOps.enabled is not true) — ${verb}.`;
+    }
     return undefined;
 }
 
@@ -2365,6 +2390,7 @@ export async function handlePluginTool(
         const absorb = effectiveAbsorbConfig(session, deps.config);
         if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
         if (effectiveRulesEnabled(session, deps.config)) allowed.push(RULE_TOOL_NAME);
+        if (effectiveBlockOpsConfig(session, deps.config)?.enabled === true) allowed.push(ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));
         return;
@@ -3920,6 +3946,157 @@ export async function pipePluginChatWithStrip(
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, protocol, "read-error");
         emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
+        return;
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+}
+
+// #1295: plugin-mode passthrough for the commandcode CLI wire (bare JSONL).
+// The agent owns compression (its compress tool call rides its own re-sent
+// history), so the proxy only strips model-emitted render tags from the two
+// prose fields and sniffs usage; every other byte passes through untouched.
+export async function pipePluginJsonlWithStrip(
+    stream: ReadableStream<Uint8Array>,
+    res: ServerResponse,
+    session?: Session,
+    log?: (s: string) => void,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    // One filter instance per prose field (the SSE pipe keeps per-field
+    // instances too — a shared state machine cross-contaminates text and
+    // reasoning when the fields interleave). The JSONL wire carries each
+    // delta as a whole line, so the filters' held tails are only resolved at
+    // the terminal frame / EOF / read failure — never per line (a per-line
+    // flush destroys the cross-delta tag/marker state this filter exists for).
+    const onStrip = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
+    const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
+    let sawTerminal = false;
+    let visibleTextChars = 0;
+    let finalFinishReason: string | undefined;
+    const acc: UsageSample = {};
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
+            applyUsageSample(session, acc, "openai");
+            markDirty(session);
+        }
+    };
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        const st = { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 };
+        for (const f of [textFilter, reasonFilter]) {
+            const s = f.stats();
+            st.inputChars += s.inputChars;
+            st.outputChars += s.outputChars;
+            st.dropped = st.dropped || s.dropped;
+            st.dropCount += s.dropCount;
+        }
+        const msg = degenerateTurnWarning({
+            reason: finalFinishReason,
+            terminalReason: "stop",
+            toolCalls: 0,
+            text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped, dropCount: st.dropCount },
+            sawThinking: false,
+            wire: "plugin-passthrough-commandcode",
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
+    };
+    // Write back whatever prose the filters are still holding as synthetic
+    // lines of the ORIGINAL event type, so held tails land before the
+    // terminal frame instead of being silently dropped (mirrors the SSE
+    // pipe's flushTails-at-terminal pattern).
+    const flushFieldTails = async () => {
+        const textTail = textFilter.flush();
+        const reasonTail = reasonFilter.flush();
+        if (textTail.length > 0 && !res.destroyed && !res.writableEnded) {
+            visibleTextChars += textTail.length;
+            if (!res.write(Buffer.from(JSON.stringify({ type: "text-delta", text: textTail }) + "\n", "utf8"))) await awaitDrain(res);
+        }
+        if (reasonTail.length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(JSON.stringify({ type: "reasoning-delta", text: reasonTail }) + "\n", "utf8"))) await awaitDrain(res);
+        }
+    };
+    try {
+        while (true) {
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch (e) {
+                settleUsage();
+                if (res.destroyed || res.writableEnded) return;
+                try { await flushFieldTails(); } catch { /* client half-gone; the signal below is best-effort too */ }
+                loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+                emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
+                return;
+            }
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx: number;
+            while ((idx = buf.indexOf("\n")) >= 0) {
+                const line = buf.slice(0, idx);
+                buf = buf.slice(idx + 1);
+                if (line.trim().length === 0) continue;
+                let ev: Record<string, unknown>;
+                try {
+                    ev = JSON.parse(line) as Record<string, unknown>;
+                } catch {
+                    if (!res.write(Buffer.from(line + "\n", "utf8"))) await awaitDrain(res);
+                    continue;
+                }
+                const type = ev["type"];
+                let outLine = line;
+                if ((type === "text-delta" || type === "reasoning-delta") && typeof ev["text"] === "string") {
+                    const f = type === "text-delta" ? textFilter : reasonFilter;
+                    const clean = f.push(ev["text"] as string);
+                    if (type === "text-delta") visibleTextChars += clean.length;
+                    if (clean !== ev["text"]) outLine = JSON.stringify({ ...ev, text: clean });
+                } else if (type === "finish") {
+                    await flushFieldTails();
+                    sawTerminal = true;
+                    if (typeof ev["finishReason"] === "string") finalFinishReason = ev["finishReason"] as string;
+                    const tu = ev["totalUsage"];
+                    if (tu !== null && typeof tu === "object" && !Array.isArray(tu)) {
+                        const t = tu as Record<string, unknown>;
+                        if (typeof t["inputTokens"] === "number") acc.inputTokens = t["inputTokens"] as number;
+                        if (typeof t["outputTokens"] === "number") acc.outputTokens = t["outputTokens"] as number;
+                        const details = t["inputTokenDetails"];
+                        if (details !== null && typeof details === "object" && typeof (details as Record<string, unknown>)["cacheReadTokens"] === "number") {
+                            acc.cachedTokens = (details as Record<string, unknown>)["cacheReadTokens"] as number;
+                        }
+                    }
+                } else if (type === "error") {
+                    sawTerminal = true;
+                    await flushFieldTails();
+                }
+                if (!res.write(Buffer.from(outLine + "\n", "utf8"))) await awaitDrain(res);
+            }
+        }
+        await flushFieldTails();
+        if (buf.trim().length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(buf + "\n", "utf8"))) await awaitDrain(res);
+        }
+        settleUsage();
+        maybeWarnDegenerate();
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
+        }
+        try { await flushFieldTails(); } catch { /* client half-gone; the signal below is best-effort too */ }
+        loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
         return;
     } finally {
         reader.releaseLock();

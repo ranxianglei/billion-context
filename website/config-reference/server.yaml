@@ -146,6 +146,16 @@ entries:
     group: upstream
     desc_en: "Route table: URL-prefix keys to per-provider entries (models, compress, compat, …). See the Providers section."
     desc_zh: "路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。"
+  - key: modelEndpointPatterns
+    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" }"
+    default: "[]"
+    group: upstream
+    id: tt.modelendpoints
+    site_group: up
+    desc_en: "Declarable custom-wire model endpoints: absolute URL prefixes mapped to a wire family. One config source feeds BOTH the proxy protocol classifier and the client-side fetch claim, so the two gates can no longer drift (#1295)."
+    desc_zh: "可声明的自定义 wire 模型端点：绝对 URL 前缀到 wire 族的映射。同一配置源同时喂给代理协议分类器与客户端 fetch 认领，两个门不再漂移（#1295）。"
+    site_en: "<code>modelEndpointPatterns</code> — declare model endpoints on non-standard paths (URL prefix → wire family); empty = built-in path tables only."
+    site_zh: "<code>modelEndpointPatterns</code> —— 声明非标准路径上的模型端点（URL 前缀 → wire 族）；空 = 仅内置路径表。"
   - key: modelContextLimit
     type: number
     default: "200000"

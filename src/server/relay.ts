@@ -8,7 +8,7 @@ import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorM
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, relocateCompressCarriers, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, buildBlockOpsSystemPrompt, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
@@ -16,6 +16,7 @@ import { noteSuccessfulForward } from "../cache-keepalive.js";
 import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
+import { rewrapCommandcodeBody } from "../commandcode-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
@@ -40,11 +41,12 @@ import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutbou
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
+import { createCommandcodeAdapter } from "../loop/adapter-commandcode.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
-import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
+import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
@@ -71,10 +73,9 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
-import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -679,6 +680,14 @@ async function forwardCaptured(
             }
         }
     }
+    // #1295: restore the CLI envelope at the final forward boundary — AFTER
+    // every flat-body mutation above (compat roles, output steering) so the
+    // client's provider plugin receives its exact native shape.
+    if (prepared?.commandcode && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
+        } catch { /* malformed flat body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -735,13 +744,20 @@ async function forwardCaptured(
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active
+    // #1295: commandcode re-sends must carry the envelope too — a compress-loop
+    // retry that dropped it would present flat OpenAI where the client's wire
+    // expects the CLI envelope.
+    const ccMetaForResend = prepared?.commandcode?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
-            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
-            if (compatDropPaths.length > 0) dropCompatFieldsJson(b, compatDropPaths);
+            let out = b;
+            if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
+            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(out, steerProtocol, steerCfg);
+            if (compatDropPaths.length > 0) dropCompatFieldsJson(out, compatDropPaths);
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
-            return v1Active ? wrapV1Internal(b, v1Meta) : b;
+            out = v1Active ? wrapV1Internal(out, v1Meta) : out;
+            if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            return out;
         }
         : undefined;
     // Show the final proxied URL (where the request actually lands) as the
@@ -2101,7 +2117,7 @@ async function forwardCaptured(
             // longer change, so deliver the upstream failure in-band (protocol error
             // event for streams; verbatim error body under 200 otherwise).
             if (prepared?.stream) {
-                emitStreamError(res, prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
+                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
             } else {
                 try { res.end(errBody ?? undefined); } catch { /* client gone */ }
             }
@@ -2215,7 +2231,9 @@ async function forwardCaptured(
         // signal, or end raw for permitlist hosts that own the handling.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
-            if (prepared.stream && maxFakeCompletionRetries() > 0) {
+            // #1295: the JSONL wire has no fake-completion shape to detect —
+            // its finish event IS the terminal frame.
+            if (prepared.stream && !prepared.commandcode && maxFakeCompletionRetries() > 0) {
                 // #1900: retry from wireBody — the exact bytes this request's main
                 // attempt shipped (post wireTransform and any same-request re-send),
                 // never the raw client body: upstream may have rejected those raw
@@ -2258,7 +2276,16 @@ async function forwardCaptured(
                     log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
                     clientAbort.abort();
                 });
-                if (prepared.protocol === "responses") {
+                if (prepared.commandcode) {
+                    // #1295: bare JSONL events — no SSE framing, no [DONE]; the
+                    // pipe strips render tags from the two prose fields only.
+                    await pipePluginJsonlWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                    );
+                } else if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
                     // when the turn completes with nothing visible.
@@ -2364,7 +2391,9 @@ async function forwardCaptured(
     // skipped the trailing clearUpstreamTimer and leaked a live idle
     // timer plus its socket for the full window.
     try {
-        if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        // #1295: commandcode streams terminate with their own finish event —
+        // no fake-completion shape exists to buffer-and-retry (#371 off).
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -2460,6 +2489,12 @@ async function forwardCaptured(
             } else {
                 log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
             }
+        } else if (prepared && prepared.commandcode && prepared.stream) {
+            // #1295: bare JSONL response on a non-injected turn — same prose-only
+            // strip pipe as plugin mode; no session (usage accounting stays off,
+            // same rationale as the SSE branch below).
+            const p = prepared;
+            await pipePluginJsonlWithStrip(responseBody, res, undefined, (msg) => log("info", `[${p.session.id}] ${msg}`));
         } else if (
             prepared &&
             prepared.stream &&
@@ -2574,13 +2609,11 @@ async function forwardCaptured(
             // the first request (prefix-cache anchor).
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            // #5765 cache-seam parity: the block-ops section rides the round-2
+            // rebuild exactly like the steady prepare* paths (hybrid lane on
+            // text protocol — it is a function tool there).
+            const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-            // Experimental fold-point "thinking clear" (default OFF): install the
-            // kernel drop predicate only when BOTH switches are set; strict-echo
-            // and signed-thinking views yield none at all (#684/#1658).
-            if (loopConfig.compressAtFoldPointClearThinking) {
-                loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(prepared.originalMessages as BiliMessage[], isStrictReasoningEcho(prepared.session, targetOrigin, modelIdOf({ model: prepared.model })));
-            }
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
             // section with a plain "\n\n" (sysParts.join / injectSystem parts
@@ -2590,6 +2623,9 @@ async function forwardCaptured(
             // the absorb boundary char).
             const absorbSection = absorbActive
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const blockOpsSection = blockOpsActive
+                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2610,8 +2646,12 @@ async function forwardCaptured(
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
+            // #1295: commandcode keeps the internal protocol "openai" (request
+            // shape is openai-completions) but speaks bare JSONL on the wire.
+            const adapter = prepared.commandcode
+                ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
+                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             // #564/#2627: separator slots for the CURRENT round's body, refreshed
             // by each fold. The loop reads this through `ctx.separatorSlots` so the
             // continuity judge sees the same producer record prepare sees.
@@ -2657,20 +2697,7 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point summary relocation round-2 mirror (switch A): with
-                    // the switch on, each still-visible compress pair keeps its
-                    // chronological slot but its SUMMARY TEXT is re-emitted at its
-                    // fold point (call args become a pointer — v2 semantics).
-                    // Idempotent when processTurn's node already relocated them
-                    // (view-only + deterministic transform).
-                    const out = loopConfig.compressAtFoldPoint
-                        ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
-                            isCompressTool: loopConfig.isCompressTool,
-                            ...(loopConfig.compressAtFoldPointClearThinking && loopConfig.reasoningDroppable
-                                ? { clearThinking: true, reasoningDroppable: loopConfig.reasoningDroppable }
-                                : {}),
-                        }) as BiliMessage[]
-                        : outBase;
+                    const out = outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
@@ -2730,7 +2757,7 @@ async function forwardCaptured(
             }
             res.end();
         } catch (e) {
-            emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
+            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;

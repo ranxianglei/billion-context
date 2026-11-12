@@ -12,7 +12,7 @@
 
 import type { CoreMessage } from "acp-kernel";
 import { parseDataUrl, type BiliMessage } from "acp-kernel/wire";
-import { decodeImageDims } from "./image-tokens.js";
+import { decodeImageDims, googleMediaParts } from "./image-tokens.js";
 import { responsesToolImageParts } from "./responses-tool-output.js";
 
 /** The codec's own placeholder for an anthropic image block (wire/index.js).
@@ -90,6 +90,24 @@ export function messageImages(m: CoreMessage): ImageRef[] {
         for (const part of responseParts) {
             if (!isObj(part) || part.type !== "input_image") continue;
             refs.push(refFromDataUrl(part.image_url) ?? {});
+        }
+        if (refs.length > 0) return refs;
+    }
+    // Gemini tool responses keep their images in rawGoogleParts rather than
+    // the singular image sidecar; inspect all parts before that fallback.
+    if (Array.isArray(mm.rawGoogleParts)) {
+        const refs: ImageRef[] = [];
+        for (const part of googleMediaParts(mm.rawGoogleParts)) {
+            const inline = part.inlineData;
+            if (isObj(inline) && typeof inline.mimeType === "string" && inline.mimeType.startsWith("image/")
+                && typeof inline.data === "string") {
+                refs.push({ mediaType: inline.mimeType, b64: inline.data });
+                continue;
+            }
+            const file = part.fileData;
+            if (isObj(file) && typeof file.mimeType === "string" && file.mimeType.startsWith("image/")) {
+                refs.push(refFromDataUrl(file.fileUri) ?? { mediaType: file.mimeType });
+            }
         }
         if (refs.length > 0) return refs;
     }

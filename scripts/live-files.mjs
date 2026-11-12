@@ -137,6 +137,11 @@ export const LIVE_FILES = [
     // Routing parity forks an isolated proxy per arm; all sockets use listen(0),
     // state uses the test sandbox, and each child exits before the next arm.
     "tests/dsh-llm-stream-attribution.test.ts",
+    // Real npm pack/install children use mkdtemp package fixtures and the
+    // preload's per-process XDG roots; they bind no listener ports.
+    "tests/pack-install.test.ts",
+    // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
+    "tests/ci-janitor-fork-heads.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

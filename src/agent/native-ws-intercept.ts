@@ -61,6 +61,15 @@ interface EventListenerObject {
 }
 type WsEventTargetOptions = { capture?: boolean; once?: boolean; passive?: boolean; signal?: AbortSignal } | boolean;
 
+interface DeferredListener {
+    el: EventListener | EventListenerObject;
+    capture: boolean;
+    once: boolean;
+    passive?: boolean;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+}
+
 const WS_INTERCEPT_FLAG = Symbol.for("billion-context.native-ws-intercept");
 const OWN_MARKER = Symbol.for("billion-context.native-ws-intercept.own");
 
@@ -221,7 +230,7 @@ class DeferredWebSocket {
     private cancelled = false;
     private closed = false;
     private settled = false;
-    private listeners = new Map<string, Array<{ el: EventListener | EventListenerObject; once: boolean }>>();
+    private listeners = new Map<string, DeferredListener[]>();
     private handlers: Partial<Record<"onopen" | "onerror" | "onclose" | "onmessage", EventListener | null>> = {};
     private binaryTypeOverride: string | undefined;
 
@@ -262,8 +271,14 @@ class DeferredWebSocket {
         if (this.real !== undefined) return;
         this.real = real;
         for (const [type, entries] of this.listeners) {
-            for (const entry of entries) real.addEventListener(type, entry.el, { once: entry.once });
+            for (const entry of entries) {
+                if (entry.onAbort) entry.signal?.removeEventListener("abort", entry.onAbort);
+                real.addEventListener(type, entry.el, {
+                    capture: entry.capture, once: entry.once, passive: entry.passive, signal: entry.signal,
+                });
+            }
         }
+        this.listeners.clear();
         for (const key of ["onopen", "onerror", "onclose", "onmessage"] as const) {
             const handler = this.handlers[key];
             if (handler !== undefined) real[key] = handler;
@@ -277,22 +292,36 @@ class DeferredWebSocket {
             return;
         }
         if (listener === null) return;
-        const once = typeof options === "object" && options !== null ? options.once === true : options === true;
+        const detail = typeof options === "object" && options !== null ? options : undefined;
+        if (detail?.signal?.aborted) return;
+        const capture = typeof options === "boolean" ? options : detail?.capture === true;
         const list = this.listeners.get(type) ?? [];
-        list.push({ el: listener, once });
+        if (list.some(entry => entry.el === listener && entry.capture === capture)) return;
+        const entry: DeferredListener = {
+            el: listener, capture, once: detail?.once === true, passive: detail?.passive, signal: detail?.signal,
+        };
+        if (entry.signal) {
+            entry.onAbort = () => this.removeEventListener(type, listener, { capture });
+            entry.signal.addEventListener("abort", entry.onAbort, { once: true });
+        }
+        list.push(entry);
         this.listeners.set(type, list);
     }
 
-    removeEventListener(type: string, listener: EventListener | EventListenerObject | null, _options?: WsEventTargetOptions): void {
+    removeEventListener(type: string, listener: EventListener | EventListenerObject | null, options?: WsEventTargetOptions): void {
         if (this.real !== undefined) {
-            this.real.removeEventListener(type, listener, _options);
+            this.real.removeEventListener(type, listener, options);
             return;
         }
         if (listener === null) return;
+        const capture = typeof options === "boolean" ? options : options?.capture === true;
         const list = this.listeners.get(type);
         if (list !== undefined) {
-            const at = list.findIndex((entry) => entry.el === listener);
-            if (at >= 0) list.splice(at, 1);
+            const at = list.findIndex((entry) => entry.el === listener && entry.capture === capture);
+            if (at >= 0) {
+                const [entry] = list.splice(at, 1);
+                if (entry.onAbort) entry.signal?.removeEventListener("abort", entry.onAbort);
+            }
             if (list.length === 0) this.listeners.delete(type);
         }
     }
@@ -300,9 +329,10 @@ class DeferredWebSocket {
     dispatchEvent(event: Event): boolean {
         if (this.real !== undefined) return this.real.dispatchEvent(event);
         for (const entry of [...(this.listeners.get(event.type) ?? [])]) {
+            if (!this.listeners.get(event.type)?.includes(entry)) continue;
+            if (entry.once) this.removeEventListener(event.type, entry.el, { capture: entry.capture });
             if (typeof entry.el === "function") entry.el.call(this, event);
             else entry.el.handleEvent(event);
-            if (entry.once) this.removeEventListener(event.type, entry.el);
         }
         // A real EventTarget fires the on* handler property alongside listeners —
         // a client registered via ws.onclose = fn must not miss a window-phase
@@ -328,6 +358,7 @@ class DeferredWebSocket {
         if (this.cancelled || this.closed) return;
         this.cancelled = true;
         queueMicrotask(() => {
+            this.closed = true;
             const event = new Event("close");
             Object.assign(event, { code: 1006, reason: "", wasClean: false });
             this.dispatchEvent(event);
