@@ -1025,10 +1025,10 @@ export class UnifiedStore {
                        next_run_id = excluded.next_run_id,
                        meta_json = excluded.meta_json,
                        stats_json = excluded.stats_json,
-                       metadata_json = excluded.metadata_json,
-                       kstate_json = excluded.kstate_json,
+                       metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
+                       kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
                        tail_json = excluded.tail_json,
-                       ccr_json = excluded.ccr_json,
+                       ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
                        orphans_json = excluded.orphans_json`,
                 )
