@@ -11,7 +11,7 @@ import {
 } from "acp-kernel";
 import { featureEnabled } from "./rollout.js";
 import type { Session } from "./session.js";
-import { ccrEnabled, contentStoreOf, effectiveCcr, retrieveToolName, adoptContentStore } from "./store.js";
+import { ccrEnabled, contentStoreOf, retrieveToolName, adoptContentStore } from "./store.js";
 
 // #6111 POC (from #6025): render proxy-mode fold summaries as CCR placeholders
 // on the OUTBOUND view instead of inline prose. A wall of summary text re-voiced
@@ -40,12 +40,17 @@ const SYNTHETIC_SUMMARY_REF_BASE = 5_000_000;
 const SYNTHETIC_SUMMARY_REF_SPAN = 4_999_999; // [5_000_000, 9_999_998] ⊂ valid mNNNNN
 const SUMMARY_PLACEHOLDER_KIND = "compressed history";
 
-// Bounded-head default for the fold-summary placeholder. The tool-result CCR
-// default is 96 chars, but a fold summary is the ONLY inline trace of a whole
-// folded span — 96 chars is a header fragment with near-zero topical signal
-// (measured on real folds). A larger bounded head gives prose folds (which have
-// no literals for the inverted index to catch) a real topical hint. Still
+// Bounded head for the fold-summary placeholder. The tool-result CCR default
+// is 96 chars, but a fold summary is the ONLY inline trace of a whole folded
+// span — 96 chars is a header fragment with near-zero topical signal (measured
+// on real folds). A larger bounded head gives prose folds (which have no
+// literals for the inverted index to catch) a real topical hint. Still
 // bounded: it is a hint, not the full prose (that stays one acp_retrieve away).
+// Deliberately NOT derived from ccr.maxHeadChars: the resolved CCR config
+// always carries a filled-in maxHeadChars (default 96), so a `?? 256` fallback
+// would never fire in production and the fold head would silently inherit the
+// tool-result bound. This is a POC parameter; if the POC graduates it gets its
+// own knob (config-surface discipline).
 const FOLD_SUMMARY_DEFAULT_HEAD_CHARS = 256;
 
 // Inverted-index cap: guards a pathological never-ending session from growing
@@ -94,16 +99,20 @@ export function readFoldSummaryIndex(session: Session): FoldSummaryIndex {
 
 /** Merge freshly-extracted anchors (anchor → refs) into the session's persisted
  *  index. Idempotent (a ref already listed for an anchor is not re-added) and
- *  bounded (stops adding once the anchor count hits the cap). */
+ *  bounded (stops adding once the anchor count hits the cap). The cap counts
+ *  DISTINCT anchors only: re-merging an existing anchor must not consume cap
+ *  headroom, or a long session's per-turn re-merge of the whole view's anchors
+ *  would inflate the count and stop the index from growing long before the cap. */
 function mergeFoldIndex(session: Session, indexOut: Map<string, Set<string>>): void {
     if (indexOut.size === 0) return;
     const existing = readFoldSummaryIndex(session);
     let anchorCount = Object.keys(existing).length;
     for (const [anchor, refs] of indexOut) {
         if (anchorCount >= FOLD_INDEX_MAX_ANCHORS) break;
+        const isNew = existing[anchor] === undefined;
         const arr = existing[anchor] ?? (existing[anchor] = []);
         for (const r of refs) if (!arr.includes(r)) arr.push(r);
-        anchorCount++;
+        if (isNew) anchorCount++;
     }
     session.metadata.foldSummaryIndex = existing;
 }
@@ -199,7 +208,7 @@ export function applyFoldSummaryCcr(
         return { messages, applied: false };
     }
     const indexOut = new Map<string, Set<string>>();
-    const folded = foldSummariesToCcr(messages, contentStoreOf(session), retrieveToolName(session), effectiveCcr(session)?.maxHeadChars ?? FOLD_SUMMARY_DEFAULT_HEAD_CHARS, indexOut);
+    const folded = foldSummariesToCcr(messages, contentStoreOf(session), retrieveToolName(session), FOLD_SUMMARY_DEFAULT_HEAD_CHARS, indexOut);
     if (folded.replaced > 0) {
         adoptContentStore(session, folded.store);
         mergeFoldIndex(session, indexOut);

@@ -178,9 +178,13 @@ test("extractFoldAnchors pulls the grep-able literals, lowercases, dedupes, drop
     assert.deepEqual(extractFoldAnchors(prose), anchors, "same prose → same anchors");
 });
 
-test("bounded head: fold-summary placeholder head uses the 256-char default (not the 96 tool-result default)", () => {
+test("bounded head: fold-summary placeholder head uses the 256 fold bound (not the 96 tool-result default)", () => {
     const session = getSession(`t-fsc-head-${Math.random().toString(36).slice(2)}`);
-    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    // PRODUCTION config shape: resolveCompress always fills ccr.maxHeadChars
+    // with the tool-result default (96) when the user did not set it — the
+    // stamped effective config therefore always carries a number, never
+    // undefined. The fold head must NOT follow that value.
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50, maxHeadChars: 96 });
     // A prose summary with no literals (the head is its only topical signal).
     // Long enough that 96 chars is a fragment but 256 chars carries the topic.
     const prose = "[Compressed conversation section]\n" +
@@ -195,10 +199,10 @@ test("bounded head: fold-summary placeholder head uses the 256-char default (not
         const parsed = parseStoredPlaceholder(out.messages[0]!.text!);
         assert.ok(parsed, "placeholder must parse");
         // The head (the backtick-quoted group, parsed as `title`) is the first
-        // 256 chars (bounded), NOT 96 — so it extends well past the 96-char
-        // mark and carries real topical signal.
+        // 256 chars (bounded), NOT the 96 the resolved ccr config carries
+        // (96 would yield a 97-char head incl. ellipsis — far below this bar).
         assert.ok(parsed!.title, "placeholder must carry a head (backtick group)");
-        assert.ok(parsed!.title!.length > 96, `head must exceed the 96 tool-result default (got ${parsed!.title!.length})`);
+        assert.ok(parsed!.title!.length > 200, `head must use the 256 fold bound, not the resolved ccr.maxHeadChars (got ${parsed!.title!.length})`);
         // normalizeHead caps at maxHeadChars and appends an ellipsis on truncation,
         // so the bound is maxHeadChars + a small margin.
         assert.ok(parsed!.title!.length <= 260, `head must stay bounded near 256 (got ${parsed!.title!.length})`);
@@ -231,6 +235,31 @@ test("index: idempotent across turns (re-applying the same summary does not dupl
         applyFoldSummaryCcr([summaryMsg("idx-2", prose)], session); // next turn, same summary
         const idx = readFoldSummaryIndex(session);
         assert.equal(idx["k84bd"]!.length, 1, "ref listed once despite two passes");
+    });
+});
+
+test("index: cap counts DISTINCT anchors — re-merging existing anchors does not consume headroom", () => {
+    const session = getSession(`t-fsc-idx-cap-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    // Seed the index at cap-1 (16383 anchors), one of which the new summary
+    // re-merges. Pre-fix, the re-merge incremented the anchor count to the cap
+    // and the NEW anchor was silently dropped — a long session's per-turn
+    // re-merge of the whole view's anchors would stop the index from growing
+    // long before the cap. The cap must count distinct anchors only.
+    const seeded: Record<string, string[]> = {};
+    for (let i = 0; i < 16382; i++) seeded[`a${String(i).padStart(5, "0")}`] = ["m5000001"];
+    seeded["k84bd"] = ["m5000001"];
+    session.metadata.foldSummaryIndex = seeded;
+    // `k84bd` (existing, re-merged) is extracted before `newanchor1` (new) —
+    // that order is what reproduces the pre-fix drop.
+    const prose = "[Compressed conversation section]\nKey `k84bd` and `newanchor1` discussed.";
+    withGateEnv("1", () => {
+        const out = applyFoldSummaryCcr([summaryMsg("idx-cap", prose)], session);
+        assert.equal(out.applied, true);
+        const idx = readFoldSummaryIndex(session);
+        assert.equal(Object.keys(idx).length, 16384, "cap respected: 16383 seeded + 1 new");
+        const ref = syntheticSummaryRef("idx-cap");
+        assert.ok(idx["newanchor1"]?.includes(ref), "the NEW anchor must still land when the index is at the cap");
     });
 });
 
