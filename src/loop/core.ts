@@ -840,6 +840,11 @@ export async function* runCompressLoop(
     };
 
     try {
+        // #6465: whether ANY round of this turn produced assistant text. The
+        // loop-cap / failed-only early-exit paths must surface an interrupted
+        // outcome (not a fake success) when the turn is internal-only — no
+        // assistant final message reached the client.
+        let sawAssistantTextThisTurn = false;
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
             let assistantText = "";
@@ -932,6 +937,7 @@ export async function* runCompressLoop(
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
+                        if (ev.delta.length > 0) sawAssistantTextThisTurn = true;
                         let tp = roundParts[roundParts.length - 1];
                         if (!tp || tp.kind !== "text") {
                             tp = { kind: "text", text: "" };
@@ -1662,9 +1668,21 @@ export async function* runCompressLoop(
                 return;
             }
 
-            // Graceful termination at the loop limit — NEVER a degenerate empty
-            // completion; surface whatever text/markers were produced this round.
+            // Termination at the loop limit. #6465: an internal-only turn (no
+            // assistant text in any round) must surface an interrupted outcome,
+            // not a fake success — a `response.completed` / "length" finish with
+            // no assistant final message reads as a clean turn to clients (Codex
+            // records completed, no error) and silently drops the user's intent.
+            // A turn that DID produce assistant text keeps the graceful
+            // completion: the client has the text and can continue.
             if (round >= MAX_LOOP_ROUNDS) {
+                if (!sawAssistantTextThisTurn) {
+                    const msg = `internal operation loop hit the safety limit (${MAX_LOOP_ROUNDS} rounds) without an assistant final message — the turn was interrupted; resend your last message to continue`;
+                    ctx.log(`[acp-loop] round ${round} hit MAX_LOOP_ROUNDS with no assistant text; surfacing an interrupted outcome (#6465)`);
+                    loggerLog("warn", `[acp-loop] loop limit (${MAX_LOOP_ROUNDS}) reached with no assistant final; emitting error (#6465)`);
+                    yield adapter.emitError(msg);
+                    return;
+                }
                 ctx.log(`[acp-loop] round ${round} hit MAX_LOOP_ROUNDS; completing gracefully`);
                 loggerLog("warn", `[acp-loop] loop limit (${MAX_LOOP_ROUNDS}) reached; completing gracefully`);
                 yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
@@ -1712,6 +1730,16 @@ export async function* runCompressLoop(
                     const why = stuck
                         ? "every failing signature already failed in an earlier round"
                         : "receipt channel unavailable (" + ([threadContinue ? "threads-delta" : null, ctx.visibilityMarkers === false ? "visibility markers off" : null].filter(Boolean).join(", ")) + ")";
+                    // #6465: same interrupted-outcome contract as the loop cap —
+                    // an internal-only turn (no assistant text) must not read as
+                    // a clean "length" completion to the client.
+                    if (!sawAssistantTextThisTurn) {
+                        const msg = `internal operation loop broke early (${why}) without an assistant final message — the turn was interrupted; resend your last message to continue`;
+                        ctx.log(`[acp-loop] round ${round}: failed-only mutating round (${why}); no assistant text — surfacing an interrupted outcome (#6465)`);
+                        loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early with no assistant final; emitting error (${why}) (#156/#4186/#5220/#6465)`);
+                        yield adapter.emitError(msg);
+                        return;
+                    }
                     ctx.log(`[acp-loop] round ${round}: failed-only mutating round (${why}); completing after ${round} round(s) instead of re-requesting (#156/#4186/#5220)`);
                     loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (${why}) (#156/#4186/#5220)`);
                     yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });

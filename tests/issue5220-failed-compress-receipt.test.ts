@@ -189,7 +189,9 @@ test("#5220 T3: identical failing call resubmitted → #156 signature breaker st
             { url: "http://mock", headers: {} },
         );
         assert.equal(n, 1, "round 2 repeats the EXACT failing signature → breaker ends the turn after one re-request");
-        assert.ok(/event: response\.completed/.test(out), "graceful completion (not degenerate empty)");
+        // #6465: no assistant text in any round → the breaker surfaces an
+        // interrupted outcome (response.failed), not a fake success.
+        assert.ok(/event: response\.failed/.test(out), "interrupted outcome (not a fake success, #6465)");
         assert.ok(out.includes("❌"), "receipt surfaced");
     } finally {
         globalThis.fetch = orig;
@@ -212,7 +214,9 @@ test("#5220 T4: DIFFERENT failing args every round → no breaker, runs to MAX_L
             { url: "http://mock", headers: {} },
         );
         assert.equal(n, MAX_LOOP_ROUNDS - 1, "every round carries a first-seen signature; only the round limit bounds the turn");
-        assert.ok(/event: response\.completed/.test(out), "graceful completion at the limit (not degenerate empty)");
+        // #6465: no assistant text in any round → the cap surfaces an
+        // interrupted outcome (response.failed), not a fake success.
+        assert.ok(/event: response\.failed/.test(out), "interrupted outcome at the limit (not a fake success, #6465)");
     } finally {
         globalThis.fetch = orig;
     }
@@ -233,7 +237,9 @@ test("#5220 T5 fallback: visibilityMarkers=false keeps the old contract — brea
         );
         assert.equal(n, 0, "markers off → the receipt would be server-invisible bytes upstream (#4186 seam) → old break contract");
         assert.ok(!out.includes("❌"), "no marker was ever surfaced in this mode");
-        assert.ok(/event: response\.completed/.test(out), "graceful completion present");
+        // #6465: no assistant text in any round → the break surfaces an
+        // interrupted outcome (response.failed), not a fake success.
+        assert.ok(/event: response\.failed/.test(out), "interrupted outcome (not a fake success, #6465)");
     } finally {
         globalThis.fetch = orig;
     }
