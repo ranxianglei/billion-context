@@ -428,9 +428,9 @@ entries:
     default: "{}"
     env: BILI_ALLOW_DSH_COMPACTION
     group: behavior
-    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel — are documented in the following entries."
-    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。"
-    desc_ja: "セクションは認識されるが、従来のエスケープハッチは削除された（#3666、#2028 を代替）：`allowDshCompaction` キーおよび `BILI_ALLOW_DSH_COMPACTION` 環境変数はもはや存在しない — dsh ネイティブコンパクションは、すべてのレーンにおいてワイヤガードによって無条件に拒否される。残存する `dsh.allowDshCompaction` の値は、一度限りの非推奨警告とともに無視される；代わりにホスト側の抑制を適用すること（#3354/#2474）。ライブキー — `dsh.authoredCompaction`、`dsh.contextTab`、`dsh.contextTabLabel` — は以下のエントリに文書化されている。"
+    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel, dsh.settingsTab — are documented in the following entries."
+    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel、dsh.settingsTab——见接下来的条目。"
+    desc_ja: "セクションは認識されるが、従来のエスケープハッチは削除された（#3666、#2028 を代替）：`allowDshCompaction` キーおよび `BILI_ALLOW_DSH_COMPACTION` 環境変数はもはや存在しない — dsh ネイティブコンパクションは、すべてのレーンにおいてワイヤガードによって無条件に拒否される。残存する `dsh.allowDshCompaction` の値は、一度限りの非推奨警告とともに無視される；代わりにホスト側の抑制を適用すること（#3354/#2474）。ライブキー — `dsh.authoredCompaction`、`dsh.contextTab`、`dsh.contextTabLabel`、`dsh.settingsTab` — は以下のエントリに文書化されている。"
   - key: dsh.authoredCompaction
     type: boolean
     default: "true (on, #3901 flip)"
@@ -454,6 +454,13 @@ entries:
     desc_en: "Custom display name for the DSH top-bar Context tab (#4237), e.g. \"压缩账本\" when another plugin (dsh-context) owns the name 「上下文」. Trimmed non-empty string wins over the built-in label; blank or absent falls back to the built-in. File-only tier (display preference, no env knob per #2030). Default unset = built-in label unchanged."
     desc_zh: "DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为\"压缩账本\"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。"
     desc_ja: "DSH トップバーの Context タブのカスタム表示名（#4237）、例：別のプラグイン（dsh-context）が「上下文」の名前を所有している場合の \"压缩账本\"。トリムされた空でない文字列が組み込みラベルに優先される；空白または未設定の場合は組み込みにフォールバック。ファイル専用ティア（表示設定、#2030 に従い環境変数なし）。デフォルト未設定 = 組み込みラベルは変更なし。"
+  - key: dsh.settingsTab
+    type: boolean
+    default: "true"
+    group: behavior
+    desc_en: "Registers the bili section on the DSH settings page (#6436): false removes ONLY that navigation entry — compression, the Context tab, the plugin bundle config face and the Web UI keep working, so the panel stays reachable from the plugin detail page and the bili Web UI. Takes effect on the next page load / dsh restart (slot registration happens at page load). File-only tier (display preference, no env knob per #2030). Default true = today's behavior unchanged."
+    desc_zh: "是否在 DSH 设置页注册 bili 一节（#6436）：false 只移除该导航入口——压缩、上下文标签页、插件 bundle 配置面与 Web UI 均不受影响，设置面板仍可从插件详情页与 bili Web UI 打开。下次页面加载 / dsh 重启生效（槽位注册发生在页面加载时）。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认 true = 现状不变。"
+    desc_ja: "DSH 設定ページの bili セクションを登録する（#6436）：`false` にすると、そのナビゲーションエントリのみが削除される — コンプレッション、Context タブ、プラグインバンドル設定フェイス、Web UI は引き続き動作し、パネルはプラグイン詳細ページと bili Web UI から引き続きアクセス可能。次のページ読み込み / dsh リスタート時に有効になる（スロット登録はページ読み込み時に発生）。ファイル専用ティア（表示設定、#2030 に従い環境変数なし）。デフォルト `true` = 現在の動作は変更なし。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"

@@ -707,6 +707,18 @@ export function dshContextTabLabel(): string | undefined {
     return s.length > 0 ? s : undefined;
 }
 
+/** dsh.settingsTab (#6436): whether the DSH settings page shows the bili
+ *  section (settings.section slot). Default ON = today's behavior; false
+ *  removes only that navigation entry — compression, the Context tab, the
+ *  plugin bundle config face and the Web UI keep working. File-only on
+ *  purpose (#2030 env-var discipline: a display preference, not a secret /
+ *  spawn channel / host posture). Resolved by the host half at page-load
+ *  time and shipped to the browser half via the __BILI__ snapshot /
+ *  /bili/origin route. */
+export function dshSettingsTabEnabled(): boolean {
+    return loadConfigFile().dsh?.settingsTab !== false;
+}
+
 type PluginBypassOverride = "auto" | "on" | "off";
 
 /** BILI_PLUGIN_BYPASS — operator override of the x-bili-plugin-bypass
