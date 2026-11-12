@@ -20,6 +20,7 @@ import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-loo
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -714,6 +715,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
+    // #6xxx durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    getStore().ingestRowsNow(session);
     markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims

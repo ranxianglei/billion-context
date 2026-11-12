@@ -20,6 +20,7 @@ import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-loo
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { carriesCodexLocalCompactionSummary, CODEX_LOCAL_COMPACTION_MIN_MISSING, isCodexHost } from "../codex-compact.js";
@@ -638,6 +639,8 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+    // #6xxx durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    getStore().ingestRowsNow(session);
     markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
     if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
