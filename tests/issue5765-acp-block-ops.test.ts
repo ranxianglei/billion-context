@@ -299,3 +299,22 @@ test("acp_rewrite: numeric blockId is accepted the way acp_retire accepts it (si
         restore(snap);
     }
 });
+
+// The net-shrink exception: a rewrite that shrinks the summary it replaces is
+// always allowed, even when the stored summary was already larger than the
+// folded content (cleaning up a pre-existing bloat is still an improvement).
+test("acp_rewrite: shrinking an already-bloated summary is allowed even above the folded budget", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
+    const snap = isolate(base);
+    try {
+        const s = makeSession("t-rewrite-improve");
+        addBlock(s, "b1", { summary: "bloated ".repeat(400) }); // ~800 tokens, far above the folded budget
+        s.state.blocks[0].compressedTokens = 100; // the block folded only ~100 tokens
+        const smaller = "tighter ".repeat(200); // ~400 tokens: still > 100, but < the bloated summary
+        const r = executeProxyTool("acp_rewrite", { blockId: "b1", summary: smaller }, ctxWithLimits(s));
+        assert.equal(r.outcome, "success", r.text);
+        assert.equal(s.state.blocks[0].summary, smaller.trim()); // kernel stores summary.trim()
+    } finally {
+        restore(snap);
+    }
+});
