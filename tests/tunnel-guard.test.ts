@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
+import { classifyIp, checkTunnelDestination, isLoopbackHostHeader, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #409: the /bili/<absolute-url> tunnel must not reach the proxy's own
@@ -57,6 +57,32 @@ test("classifyIp: range matrix", () => {
     assert.equal(classifyIp("::ffff:a9fe:a9fe"), "linkLocal", "hex-mapped metadata is not public");
     assert.equal(classifyIp("::ffff:a00:1"), "private", "hex-mapped RFC1918 is not public");
     assert.equal(classifyIp("::ffff:808:808"), "public", "hex-mapped public stays public");
+});
+
+test("isLoopbackHostHeader: loopback names yes, rebinding domains no (#6334)", () => {
+    // Loopback names (the legitimate inter-instance probe shape) — with or
+    // without a port, v4 / v6 / localhost.
+    assert.equal(isLoopbackHostHeader("127.0.0.1"), true);
+    assert.equal(isLoopbackHostHeader("127.0.0.1:8787"), true);
+    assert.equal(isLoopbackHostHeader("127.5.5.5:1"), true, "whole 127/8 is loopback");
+    assert.equal(isLoopbackHostHeader("localhost:8787"), true);
+    assert.equal(isLoopbackHostHeader("localhost"), true);
+    assert.equal(isLoopbackHostHeader("[::1]:8787"), true, "bracketed v6 loopback");
+    assert.equal(isLoopbackHostHeader("::1"), true, "bare v6 loopback");
+    assert.equal(isLoopbackHostHeader("127.0.0.1:8787 ".trim()), true, "whitespace tolerated");
+    // The DNS-rebinding signature: a non-loopback name, with or without port.
+    assert.equal(isLoopbackHostHeader("evil.com"), false);
+    assert.equal(isLoopbackHostHeader("evil.com:8787"), false);
+    assert.equal(isLoopbackHostHeader("MYHOST.local:8787"), false, "case-insensitive, non-loopback name");
+    // Non-loopback addresses are not loopback names either.
+    assert.equal(isLoopbackHostHeader("10.0.0.1:8787"), false, "private is not loopback");
+    assert.equal(isLoopbackHostHeader("192.168.1.1"), false);
+    assert.equal(isLoopbackHostHeader("169.254.169.254"), false, "link-local is not loopback");
+    assert.equal(isLoopbackHostHeader("8.8.8.8"), false, "public is not loopback");
+    // Degenerate input never throws.
+    assert.equal(isLoopbackHostHeader(""), false);
+    assert.equal(isLoopbackHostHeader(undefined), false);
+    assert.equal(isLoopbackHostHeader(["127.0.0.1"]), false, "array Host is not a single name");
 });
 
 const localIps = () => new Set(["127.0.0.1", "::1", "192.168.1.5", "127.0.0.2"]);
