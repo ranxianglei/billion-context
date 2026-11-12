@@ -4,6 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
