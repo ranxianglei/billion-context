@@ -199,7 +199,7 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
  *  developer item); no such emitter is evidenced. */
 export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
     return msg.role === "system" && msg.contentType === "text" && typeof msg.text === "string" &&
-        msg.text.trim().length > 0 && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
+        /\S/.test(msg.text) && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
         ? "durable/system-prompt"
         : undefined;
 }
