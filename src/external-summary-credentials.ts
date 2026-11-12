@@ -5,6 +5,8 @@ import { configFile } from "./paths.js";
 import { loadConfigFile, loadNamedProviders, loadRoutes, type NamedProviderRecipe } from "./config.js";
 import { expandExternalSummaryChain, parseExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 
+const MAX_CREDENTIAL_STORE_BYTES = 256 * 1024;
+
 function validKey(value: unknown): value is string {
     return typeof value === "string" && value.length > 0 && value.length <= 8192 && !/[\x00-\x20\x7f]/.test(value);
 }
@@ -34,7 +36,7 @@ export class SummaryCredentialStore {
         try {
             const stat = lstatSync(this.path);
             if (!stat.isFile() || stat.isSymbolicLink() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) throw new Error();
-            if (stat.size > 256 * 1024) throw new Error();
+            if (stat.size > MAX_CREDENTIAL_STORE_BYTES) throw new Error();
             const data: unknown = JSON.parse(readFileSync(this.path, "utf8"));
             if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error();
             const result = Object.create(null) as Record<string, string>;
@@ -88,8 +90,10 @@ export class SummaryCredentialStore {
             if (key === null) delete values[name];
             else values[name] = key;
             if (Object.keys(values).length > 16) throw new Error("External summary credential store is full");
+            const serialized = JSON.stringify(values) + "\n";
+            if (Buffer.byteLength(serialized, "utf8") > MAX_CREDENTIAL_STORE_BYTES) throw new Error("External summary credential store is full");
             descriptor = openSync(temp, "wx", 0o600);
-            writeFileSync(descriptor, JSON.stringify(values) + "\n", "utf8");
+            writeFileSync(descriptor, serialized, "utf8");
             fsyncSync(descriptor);
             closeSync(descriptor);
             descriptor = undefined;
