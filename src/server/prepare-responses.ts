@@ -715,7 +715,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
-    // #6xxx durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is

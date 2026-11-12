@@ -3162,7 +3162,7 @@ export class SessionStore {
         loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
     }
 
-    /** #6150-fix: durability-before-render — make a session's unified-index
+    /** #3397 (PR #6326): durability-before-render — make a session's unified-index
      *  rows durable SYNCHRONOUSLY (the small SQLite ingest) WITHOUT writing the
      *  JSON envelope. The incremental lane calls this the instant a turn's
      *  response has fully left, so the refs the model just saw are on disk before

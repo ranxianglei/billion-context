@@ -639,7 +639,7 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
-    // #6xxx durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;

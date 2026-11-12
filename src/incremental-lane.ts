@@ -1005,7 +1005,7 @@ export async function handleIncrementalTurn(
         inFlight.delete(conversationId);
         const session = peekSession(sessionId);
         settled = true;
-        // #6150-fix: durability-before-render — the turn's ledger rows are made
+        // #3397 (PR #6326): durability-before-render — the turn's ledger rows are made
         // durable NOW (synchronous unified-index ingest) so a crash before the
         // debounced envelope save (#5155) cannot leave the refs the model just
         // saw unbacked (the #3397 orphaned-generation gap: the lane rendered the

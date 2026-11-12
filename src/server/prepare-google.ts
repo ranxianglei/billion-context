@@ -416,7 +416,7 @@ export async function prepareGoogle(
         if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
     snapshotMessages(session, originalMessages);
-    // #6xxx durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;

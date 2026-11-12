@@ -608,7 +608,7 @@ export async function prepareAnthropic(
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
-    // #6xxx durability-before-render: make this turn's ledger rows durable NOW
+    // #3397 durability-before-render: make this turn's ledger rows durable NOW
     // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
     // about to see are on disk BEFORE the response is sent. Without this, a
     // crash before the debounced save (#5155) leaves rendered refs unbacked —
