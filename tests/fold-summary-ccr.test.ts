@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createContentStore, parseStoredPlaceholder, refToIndex, retrieveByRef, RETRIEVE_TOOL_NAME, type CoreMessage } from "acp-kernel";
-import { foldSummariesToCcr, syntheticSummaryRef } from "../src/fold-summary-ccr.js";
+import { applyFoldSummaryCcr, foldSummariesToCcr, syntheticSummaryRef } from "../src/fold-summary-ccr.js";
+import { getSession } from "../src/session.js";
+import { contentStoreOf, storeEffectiveCcr } from "../src/store.js";
 
 // #6111 POC (from #6025): proxy-mode fold summaries rendered as CCR placeholders
 // on the outbound view. The transform lives in src/fold-summary-ccr.ts; these
@@ -93,4 +95,56 @@ test("empty-text summary is left untouched and counts as unreplaced", () => {
     assert.equal(out.replaced, 0);
     assert.equal(out.messages[0], empty, "empty summary passes through by reference");
     assert.deepEqual(out.store.byRef, {}, "nothing stored");
+});
+
+// --- seam gate (applyFoldSummaryCcr): both directions, per gate discipline #3617 ---
+
+const GATE_ENV = "BILI_ROLLOUT_FOLD_SUMMARY_CCR_PLACEHOLDER";
+
+function withGateEnv(value: string | undefined, fn: () => void): void {
+    const prev = process.env[GATE_ENV];
+    if (value === undefined) delete process.env[GATE_ENV];
+    else process.env[GATE_ENV] = value;
+    try {
+        fn();
+    } finally {
+        if (prev === undefined) delete process.env[GATE_ENV];
+        else process.env[GATE_ENV] = prev;
+    }
+}
+
+test("gate: feature OFF + ccr ON → summary stays inline prose (no placeholder)", () => {
+    const session = getSession(`t-fsc-gate-off-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const summary = summaryMsg("g-off", "[Compressed conversation section]\nSome summary prose.");
+    withGateEnv("0", () => {
+        const out = applyFoldSummaryCcr([summary], session);
+        assert.equal(out.applied, false, "must not apply when the feature is off");
+        assert.equal(out.messages[0], summary, "prose untouched (same ref) when feature off");
+    });
+});
+
+test("gate: feature ON + ccr OFF → summary stays inline prose (no placeholder)", () => {
+    const session = getSession(`t-fsc-gate-noccr-${Math.random().toString(36).slice(2)}`);
+    const summary = summaryMsg("g-noccr", "[Compressed conversation section]\nSome summary prose.");
+    withGateEnv("1", () => {
+        const out = applyFoldSummaryCcr([summary], session);
+        assert.equal(out.applied, false, "must not apply when CCR is not armed");
+        assert.equal(out.messages[0], summary, "prose untouched when ccr not armed");
+    });
+});
+
+test("gate: feature ON + ccr ON → summary becomes a retrievable placeholder", () => {
+    const session = getSession(`t-fsc-gate-on-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nUser asked for X; chose A over B because Z.";
+    const summary = summaryMsg("g-on", prose);
+    withGateEnv("1", () => {
+        const out = applyFoldSummaryCcr([summary], session);
+        assert.equal(out.applied, true, "must apply when feature + ccr both on");
+        assert.ok(out.messages[0]!.text!.startsWith("📦 [acp-stored #"), `placeholder shape:\n${out.messages[0]!.text}`);
+        const res = retrieveByRef(contentStoreOf(session), syntheticSummaryRef("g-on"));
+        assert.equal(res.ok, true, "stored ref must be retrievable from the session store");
+        assert.equal(res.text, prose, "retrieved bytes equal the original prose");
+    });
 });
