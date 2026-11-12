@@ -82,8 +82,10 @@ export function extractFoldAnchors(text: string): string[] {
 
 /** Persisted fold-summary inverted index: anchor (lowercased) → the synthetic
  *  refs of the fold summaries containing it. A plain object (not a Map) so it
- *  round-trips through session.metadata JSON unchanged. Absent == empty. */
-export type FoldSummaryIndex = Record<string, string[]>;
+ *  round-trips through session.metadata JSON unchanged. Absent == empty.
+ *  Module-private: readFoldSummaryIndex is the only accessor (the keyword query
+ *  in store.ts reads session.metadata directly to avoid a circular import). */
+type FoldSummaryIndex = Record<string, string[]>;
 
 export function readFoldSummaryIndex(session: Session): FoldSummaryIndex {
     const v = session.metadata.foldSummaryIndex;
