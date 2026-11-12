@@ -287,7 +287,8 @@ async function runForeignBlocks(store: SessionStore, json: boolean, apply: boole
     const result = applyForeignBlockSweep(store, plan);
     if (!result) return fail("foreign-block sweep failed mid-run (see log)", json, data);
     data.result = result;
-    if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
+    const code = result.failed.length > 0 ? 1 : 0;
+    if (json) return { code, text: `${JSON.stringify(data, null, 2)}\n` };
     text += `\nexecuted:\n  archived blocks:      ${result.archived.length}`;
     for (const f of result.archived) text += `\n    ${f.sessionId} / ${f.blockId} (tier ${f.tier}, covered ${f.coveredCount})`;
     if (result.failed.length > 0) {
@@ -295,7 +296,7 @@ async function runForeignBlocks(store: SessionStore, json: boolean, apply: boole
         for (const f of result.failed) text += `\n    ${f.finding.sessionId} / ${f.finding.blockId}: ${f.reason ?? "unknown"}`;
     }
     text += "\nnote: takes effect on next session load/restart — a running host keeps its in-memory copy until reload";
-    return { code: 0, text: `${text}\n` };
+    return { code, text: `${text}\n` };
 }
 
 export async function runSessionsCommand(opts: {
