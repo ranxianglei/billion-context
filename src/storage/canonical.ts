@@ -67,7 +67,12 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
             // DIGEST_SKIPPED_KEYS for why presence, not value, is the problem.
             // hasOwn, not `in` — a "__proto__" key must not read as skipped.
             if (Object.hasOwn(DIGEST_SKIPPED_KEYS, k)) continue;
-            out[k] = canonicalizeWithContext(v, k);
+            const normalized = canonicalizeWithContext(v, k);
+            if (k === "__proto__") {
+                Object.defineProperty(out, k, { value: normalized, enumerable: true, writable: true, configurable: true });
+            } else {
+                out[k] = normalized;
+            }
         }
         return out;
     }
@@ -155,8 +160,7 @@ export function canonicalDigest(value: unknown): string {
             const orderedKeys = keys.filter(isArrayIndexKey).sort((a, b) => Number(a) - Number(b))
                 .concat(keys.filter((k) => !isArrayIndexKey(k)).sort());
             for (const k of orderedKeys) {
-                // Assigning __proto__ to canonicalize's plain output creates no JSON property.
-                if (Object.hasOwn(DIGEST_SKIPPED_KEYS, k) || k === "__proto__") continue;
+                if (Object.hasOwn(DIGEST_SKIPPED_KEYS, k)) continue;
                 const v = (current as Record<string, unknown>)[k];
                 if (v === undefined || typeof v === "function" || typeof v === "symbol") continue;
                 write(separator);
