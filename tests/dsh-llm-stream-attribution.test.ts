@@ -105,6 +105,24 @@ test("DSH dispatch switches native/bili/native with unchanged native wire and a 
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
+// The kernel stamps wall-clock `yyyy-mm-dd hh:mm:ss` timestamps into the
+// payload in two places: the ACP tag's time="…" attribute (local time of
+// occurrence) and the compress tool-result's block time range "[start – end]".
+// The arms below fork separate proxies that run at different wall-clock times,
+// so those values legitimately differ across arms even when the payload is
+// otherwise byte-identical. Mask every wall-clock timestamp before the
+// cross-arm deepEqual so the comparison tests payload fidelity, not the clock
+// (same sanctioned normalization as issue5403-watermark-fastpath.test.ts). All
+// message content here is test-controlled, so no user timestamp can be masked.
+function maskWallClockTime(value: unknown): unknown {
+    if (typeof value === "string") return value.replace(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/g, "T");
+    if (Array.isArray(value)) return value.map(maskWallClockTime);
+    if (value !== null && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, maskWallClockTime(v)]));
+    }
+    return value;
+}
+
 test("bili-only and model-routed bili have identical real proxy folds and forwarded requests", { timeout: 30_000 }, async () => {
     const { createServer } = await import("node:http");
     const { fork } = await import("node:child_process");
@@ -167,7 +185,7 @@ test("bili-only and model-routed bili have identical real proxy folds and forwar
                     assert.equal(after.blocks[0].active, true);
                     assert.ok(JSON.stringify(forwards[1]).includes(args.content[0].summary));
                     assert.ok(JSON.stringify(forwards[1]).length < JSON.stringify(forwards[0]).length);
-                    outcomes.push({ forwards: structuredClone(forwards), blocks: after.blocks.map(({ createdAt, compressCallId, durationMs, ...b }) => b), tools: handle.registered.map(t => t.name) });
+                    outcomes.push({ forwards: structuredClone(forwards).map(maskWallClockTime), blocks: after.blocks.map(({ createdAt, compressCallId, durationMs, ...b }) => b), tools: handle.registered.map(t => t.name) });
                 } finally { resetFetchIntercept({ anchor: savedFetch }); globalThis.fetch = savedFetch; }
             }, async () => {
                 child = fork(new URL("./fixtures/dsh-compaction-parity-proxy.mjs", import.meta.url), [`http://127.0.0.1:${address.port}`], { execArgv: ["--import", "tsx"], stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, BILI_PERSIST: "0" } });
