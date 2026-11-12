@@ -111,6 +111,8 @@ export const LIVE_FILES = [
     // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
     // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
     "tests/log-retention.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
     // #5631 restart survival: real bili proxy children under OS signals
     // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
     // probed-free ports re-probed on every restart — no band reuse.
