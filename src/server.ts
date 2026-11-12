@@ -103,7 +103,7 @@ import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, 
 import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
-import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
+import { armEventLoopWatchdog, otherOwnerCount } from "./event-loop-watchdog.js";
 import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -730,13 +730,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // the off-loop reap degenerates back into the in-loop path. A wedged
         // loop freezes the last known value — sound, because attaching during a
         // wedge needs an HTTP answer.
-        getWatcherCount: () => {
-            const s = liveWatchers;
-            if (!s) return 0;
-            let n = s.size;
-            if (offloopOwnerPid !== null && s.has(offloopOwnerPid)) n -= 1;
-            return n;
-        },
+        getWatcherCount: () => otherOwnerCount(liveWatchers, offloopOwnerPid),
         onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
     });
 

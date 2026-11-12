@@ -86,6 +86,20 @@ export function ownerReapVerdict(deadStreak: number, confirmTicks: number, gapMs
     return deadStreak >= confirmTicks && gapMs >= softWarnMs && watcherCount <= 0;
 }
 
+/** The production count of OTHER attached owners for the off-loop reap guard
+ *  (#5449/#7): the in-loop watcher set minus the probed parentPid, whose
+ *  removal from the set depends on the in-loop reaper this axis backstops —
+ *  without the exclusion the guard freezes at ≥1 and the off-loop reap
+ *  degenerates back into the starved in-loop path (the incident shape).
+ *  undefined = pre-context window, where no socket exists yet so no attach
+ *  could have landed: 0 is truth there, not a fallback. */
+export function otherOwnerCount(watchers: ReadonlySet<number> | undefined, probedPid: number | null): number {
+    if (!watchers) return 0;
+    let n = watchers.size;
+    if (probedPid !== null && watchers.has(probedPid)) n -= 1;
+    return n;
+}
+
 interface EventLoopWatchdogHandle {
     /** Stop heartbeating and terminate the worker. Idempotent. */
     stop(): void;
