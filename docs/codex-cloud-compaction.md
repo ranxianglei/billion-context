@@ -61,9 +61,11 @@ detail.
 The proxy folds history on the wire, while the model client still measures its
 own (unfolded) history. Without coordination right after a successful ACP fold
 the client keeps asking the server to compact a body that is already smaller.
-bili therefore announces the tokens it just folded on the response
-(`x-bili-plugin-compressed`) and dsh-codex-subscription credits exactly that
-much to the next request's compaction threshold — once, never permanently.
+bili therefore announces, on every response, the tokens it *currently* folds
+out of the wire (`x-bili-plugin-compressed`, the sum of the active blocks'
+covered tokens — prepare-time known, stable across retries, absent when nothing
+is folded). A cooperating client credits that amount to its next request's
+compaction threshold instead of permanently lowering it.
 
 ## What happens at the boundary
 

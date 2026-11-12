@@ -274,3 +274,26 @@ test("bili's own forged carrier never counts as a remote checkpoint", async () =
         await h.close();
     }
 });
+
+test("a turn with an active fold announces the folded token count to the client", async () => {
+    const h = await startHarness();
+    try {
+        const conv = "folded-on-wire";
+        const seeded = await seed(h, conv, pluginHeaders(conv));
+        const active = seeded.state.blocks.filter((b) => b.active);
+        assert.ok(active.length > 0, "the seed folded a block");
+        const expected = active.reduce((sum, b) => sum + b.compressedTokens, 0);
+        const res = await fetch(h.url, { method: "POST", headers: pluginHeaders(conv), body: body(conv, messages(7, 5)) });
+        assert.equal(res.status, 200);
+        await res.text();
+        assert.equal(res.headers.get("x-bili-plugin-compressed"), String(expected), "the proxy announces what it folds (#cloud-double)");
+
+        const fresh = "folded-on-wire-fresh";
+        const cold = await fetch(h.url, { method: "POST", headers: pluginHeaders(fresh), body: body(fresh, messages(0, 3)) });
+        assert.equal(cold.status, 200);
+        await cold.text();
+        assert.equal(cold.headers.get("x-bili-plugin-compressed"), null, "nothing folded, nothing announced");
+    } finally {
+        await h.close();
+    }
+});

@@ -47,9 +47,10 @@ bili（`src/codex-checkpoint.ts`）把**新身份**——新 id 或更大的 `se
 ## 不重复压缩同一段 token
 
 代理在线上折叠了历史，但模型客户端仍按自己（未折叠）的历史计算体积。折叠成功后
-不做协调，客户端会继续请求服务端压缩一个已经变小的 body。因此 bili 在响应里通告
-本轮折叠掉的 token 数（`x-bili-plugin-compressed`），`dsh-codex-subscription` 把
-同样的额度**一次性**抵扣进下一次请求的压缩阈值，而不是永久下调。
+不做协调，客户端会继续请求服务端压缩一个已经变小的 body。因此 bili 在**每个响应**
+上通告它此刻从线上折叠掉的 token 数（`x-bili-plugin-compressed`，等于活跃块的
+covered tokens 之和——prepare 时已知、重试稳定、没有折叠时不出现在响应里）。配合的
+客户端把该额度抵扣进下一次请求的压缩阈值，而不是永久下调。
 
 ## 边界上发生什么
 

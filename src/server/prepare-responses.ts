@@ -73,8 +73,13 @@ export async function prepareResponses(
 ): Promise<Prepared> {
     const sessionId = session.id;
     // Announced back to a cooperating client so its own cloud-compaction
-    // threshold can account for what the proxy just folded (#cloud-double).
-    const tokensCompressedBefore = session.stats.tokensSaved;
+    // threshold can account for what the proxy currently folds out of the wire
+    // (#cloud-double). Sum of active blocks' covered tokens: prepare-time
+    // known, stable across retries, and zero once the history is rebased.
+    const foldedOnWire = session.state.blocks.reduce(
+        (sum, block) => (block.active && Number.isFinite(block.compressedTokens) ? sum + block.compressedTokens : sum),
+        0,
+    );
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
     const stream = parsed.stream === true;
     ++session.stats.requests;
@@ -826,9 +831,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
         ...(codexBoundaryRequested ? { codexBoundary: { requested: true, messages: codexBoundaryMessages } } : {}),
-        ...(session.stats.tokensSaved > tokensCompressedBefore
-            ? { responseExtraHeaders: { "x-bili-plugin-compressed": String(session.stats.tokensSaved - tokensCompressedBefore) } }
-            : {}),
+        ...(foldedOnWire > 0 ? { responseExtraHeaders: { "x-bili-plugin-compressed": String(foldedOnWire) } } : {}),
         codexForge,
         dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId),
     };
