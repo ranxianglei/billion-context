@@ -60,7 +60,7 @@ import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { decodeRequestBody } from "../content-encoding.js";
-import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
+import { dshContextTabEnabled, dshContextTabLabel, dshSettingsTabEnabled, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
@@ -1960,11 +1960,14 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // a stale link.
     // #4237: the payload also carries the Context-tab face flags (register
     // gate + optional custom label), read live on every call so a web-settings
-    // edit lands on the next page load without a proxy restart.
-    const withCtxTabFace = (base: Record<string, unknown>): Record<string, unknown> => {
+    // edit lands on the next page load without a proxy restart. #6436 adds the
+    // settings-section gate; it is emitted only when OFF so a default-config
+    // payload stays byte-identical and an older host half keeps failing open.
+    const withDshFace = (base: Record<string, unknown>): Record<string, unknown> => {
         base.contextTab = dshContextTabEnabled();
         const label = dshContextTabLabel();
         if (label !== undefined) base.contextTabLabel = label;
+        if (!dshSettingsTabEnabled()) base.settingsTab = false;
         return base;
     };
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
@@ -1974,11 +1977,12 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // must therefore ride the row even before the origin is bound (spawn mode
         // reads register.base only after bootstrap), or dsh.contextTab=false fails
         // open on desktop forever. A null origin is safe: readOrigin() treats a
-        // non-string origin as unresolved and keeps polling /bili/origin, and
-        // readCtxTabFace() only needs contextTab/contextTabLabel. Mirrors the
+        // non-string origin as unresolved and keeps polling /bili/origin, and the
+        // browser half reads only the face flags it knows (contextTab,
+        // contextTabLabel, settingsTab). Mirrors the
         // /bili/origin route expression below so snapshot ≡ route at any instant.
         const origin = currentOrigin();
-        table.push({ kind: "global", name: "__BILI__", value: withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }) });
+        table.push({ kind: "global", name: "__BILI__", value: withDshFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }) });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
@@ -2013,9 +2017,9 @@ export async function apply(ctx: PluginContext): Promise<void> {
             const origin = currentOrigin();
             // #3373: relay mode ⇒ the client derives its base from the probe
             // response URL itself; the loopback origin is useless (and leaky)
-            // to a remote browser. #4237: same Context-tab face flags as the
+            // to a remote browser. #4237/#6436: same DSH face flags as the
             // snapshot row.
-            const body = JSON.stringify(withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
+            const body = JSON.stringify(withDshFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },

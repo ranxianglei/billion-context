@@ -1142,11 +1142,11 @@ export type ProxyOptions = {
  *  `allowDshCompaction` escape hatch was REMOVED (#3651) — dsh native
  *  compaction is now refused unconditionally by the #1729 wire guard on every
  *  lane, and a landed checkpoint durably shadows the raw history
- *  (irreversible), so no opt-in remains. The one live key is
- *  `authoredCompaction` (#3723/#3901). Leftover removed keys still sit in old
- *  files: the section stays RECOGNIZED so they don't trip the unknown-key
- *  warning, and each is ignored with a once-per-process deprecation note
- *  (warnRemovedDshAllowKey). */
+ *  (irreversible), so no opt-in remains. Live keys are `authoredCompaction`
+ *  (#3723/#3901), `contextTab` / `contextTabLabel` (#4237) and `settingsTab`.
+ *  Leftover removed keys still sit in old files: the section stays RECOGNIZED
+ *  so they don't trip the unknown-key warning, and each is ignored with a
+ *  once-per-process deprecation note (warnRemovedDshAllowKey). */
 interface DshFileSettings {
     /** #3723/#3901: bili-authored compaction answers (ON by default since
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
@@ -1167,6 +1167,13 @@ interface DshFileSettings {
      *  rename exists for machines where another plugin occupies the same name
      *  (dsh-context ships its own "上下文"). */
     contextTabLabel?: string;
+    /** #6436: show the bili section on the DSH settings page (settings.section
+     *  slot). ON by default; `false` removes only that navigation entry — the
+     *  panel stays reachable through the plugin bundle config face and the
+     *  Web UI. Resolved per page load by the host half and shipped to the
+     *  browser half through the __BILI__ snapshot / /bili/origin route.
+     *  File-only (display preference, no env tier per #2030). */
+    settingsTab?: boolean;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -2708,9 +2715,9 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     const d = obj.dsh;
     if (d !== null && typeof d === "object" && !Array.isArray(d)) {
         // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
-        // (#4237) are the LIVE keys in the section — everything else found
-        // here is removed/unknown and gets named.
-        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        // (#4237), settingsTab (#6436) are the LIVE keys in the section —
+        // everything else found here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel", "settingsTab"]);
         for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();

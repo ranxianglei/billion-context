@@ -589,6 +589,18 @@ function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
     return { hidden, label };
 }
 
+/** #6436: settings-section face flag from the __BILI__ snapshot (host half,
+ *  dsh.settingsTab). `hidden` skips the settings.section registration — only
+ *  the DSH settings navigation entry goes away; the panel stays mounted at
+ *  plugins.bundle.config and reachable through the Web UI. Fails open: an
+ *  absent field (legacy host, pre-bootstrap page load) keeps today's
+ *  registration byte-identical. */
+function readSettingsTabFace(): { hidden: boolean } {
+    const g = globalThis as { __BILI__?: { settingsTab?: unknown } };
+    const snap = g.__BILI__;
+    return { hidden: snap !== undefined && snap.settingsTab === false };
+}
+
 function openExternal(url: string): void {
     const w = globalThis as { open?: (url: string, target?: string, features?: string) => unknown };
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
@@ -1141,10 +1153,17 @@ export function apply(ctx: ClientContext): void {
             }),
         );
     };
-    ctx.slots.inject(
-        "settings.section",
-        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
-    );
+    // #6436: dsh.settingsTab=false (config file / web settings) skips the
+    // settings.section registration — only the DSH settings navigation entry
+    // goes away; the ledger stays reachable through the plugin bundle config
+    // face and the Web UI. Fail-open on an absent flag.
+    const settingsGate = readSettingsTabFace();
+    if (!settingsGate.hidden) {
+        ctx.slots.inject(
+            "settings.section",
+            () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
+        );
+    }
     ctx.slots.inject(
         "plugins.bundle.config",
         () => ctx.slots.register({ name: "plugins.bundle.config", key: "billion-context", locale: NS }, panel(false)),
