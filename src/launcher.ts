@@ -4233,8 +4233,9 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
  *  helper was alive stays inert until a shutdown+respawn. The resident's boot
  *  epoch (health.configEpoch) vs our current one says whether the user's latest
  *  edit is being shadowed. Returns an actionable warning, or undefined when there's
- *  nothing to report: resident epoch absent (pre-#4705 build), either side unreadable
- *  ("" — e.g. a different per-lane file), or the two agree. */
+ *  nothing to report: resident epoch absent (pre-#4705 build — unknown, not a
+ *  false positive), either side blank ("" sentinel — defensive; the live
+ *  configFileEpoch() never yields blank), or the two agree. */
 export function attachConfigDriftNote(residentEpoch: string | undefined, currentEpoch: string): string | undefined {
     if (residentEpoch === undefined || residentEpoch === "" || currentEpoch === "") return undefined;
     if (residentEpoch === currentEpoch) return undefined;
