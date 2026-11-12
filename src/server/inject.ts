@@ -10,7 +10,7 @@ import { conversationPromptSections, externalSummaryEnabled, messageTimestampSec
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 
-const CODEX_EXEC_EXEMPT_NOTE = " This proxy-provided tool has no functions.exec SDK binding: call it DIRECTLY as a normal tool call using its declared name and namespace. Do not invoke it through tools.* inside functions.exec; the proxy executes the direct call server-side.";
+export const CODEX_EXEC_EXEMPT_NOTE = " This proxy-provided tool has no functions.exec SDK binding: call it DIRECTLY as a normal tool call using its declared name and namespace. Do not invoke it through tools.* inside functions.exec; the proxy executes the direct call server-side.";
 
 // Hint detection must not widen the shared omnibus reachability gate (#5592).
 function hasCodexExec(tools: readonly unknown[], namespace = ""): boolean {
