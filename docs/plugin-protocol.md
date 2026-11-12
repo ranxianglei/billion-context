@@ -149,6 +149,14 @@ Notify the proxy that the agent performed an **in-session native compaction** (e
 
 Effect: the proxy marks a one-shot compaction boundary on the session. On the next model request, blocks that were active before the compaction but no longer anchor into the shortened history are downgraded to a pre-compaction archive (listed by `acp_status` with a reason; `decompress` on one returns an explicit "unavailable" error instead of failing silently), and stale `byRaw`/`byRef` mappings are pruned to the live ids. Errors: `400` invalid JSON / missing `conversationId`, `404` unknown conversation.
 
+#### `POST /__bili/plugin/compress`
+
+Ask the proxy to fold the conversation **now**, before the host cancels its own auto-compaction (pi's `session_before_compact` with reason `threshold` or `overflow`). Without it the cancelled pass leaves the context full until the next model request triggers preflight. The proxy re-runs preflight over the conversation's last model request, under the session lock, with the same gates and summary rounds that request ran; the body is the same `{ "conversationId": ... }` as `/compact`.
+
+The proxy keeps each plugin session's last model request (its headers included, since the summary rounds need its credential) in memory only: the session's next request replaces it, and it goes when the session leaves memory. It is never logged, persisted or returned by any route.
+
+Answers: `{ok: true, folded: true}` when ranges were folded, `{ok: true, folded: false}` when the request already fitted, `{ok: true, skipped: "no-request"}` when the session has no plugin request yet, `{ok: false, error}` when preflight could not fold. While the summary rounds run the proxy may send `200` and whitespace before the JSON, as preflight holds a non-streaming client. Errors: `400` invalid JSON / missing `conversationId`, `404` unknown conversation, `500` preflight threw. The host cancels its own pass whatever the answer, and should bound the wait by its own abort signal.
+
 ### 6. MITM transparent-proxy mode
 
 The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. Instead the proxy's own launcher (`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY=http://127.0.0.1:<port>` in the child env, next to the `HTTPS_PROXY` + CA vars it already sets. A plugin detects cooperative mode by reading that env var (the proxy origin for all `/__bili/plugin/*` calls); everything else (headers, tool forwarding, status) is identical — the `x-bili-plugin*` headers pass through the MITM tunnel into the same pipeline. This is also where `x-bili-plugin-context-window` matters most: MITM upstreams are often private relays the models.dev registry doesn't know.

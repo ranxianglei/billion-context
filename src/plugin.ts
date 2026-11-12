@@ -974,6 +974,61 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
     res.end(JSON.stringify({ ok: true, conversationId }));
 }
 
+// #6199: the last preflight call of each plugin session, kept in memory so
+// the host can ask for the fold before its own compaction runs. The request
+// it carries (headers included) is replaced by the session's next request and
+// dropped with the session; it is never logged, persisted or served.
+type RetainedPreflight = (res: ServerResponse) => Promise<"folded" | "unchanged" | "failed">;
+const retainedPreflight = new WeakMap<Session, RetainedPreflight>();
+
+export function retainPreflight(session: Session, run: RetainedPreflight): void {
+    retainedPreflight.set(session, run);
+}
+
+/** The host's compaction is about to run (pi session_before_compact): walk
+ *  the session's last request through preflight now. Answers 200 with
+ *  {folded} or {skipped}; the walk may hold the socket with whitespace before
+ *  the JSON, as preflight holds a non-streaming client. */
+export async function handlePluginCompress(payload: string, res: ServerResponse): Promise<void> {
+    const answer = (status: number, body: Record<string, unknown>): void => {
+        if (res.writableEnded || res.destroyed) return;
+        if (!res.headersSent) res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+    };
+    let parsed: { conversationId?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown };
+    } catch {
+        answer(400, { ok: false, error: "invalid JSON body" });
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        answer(400, { ok: false, error: "conversationId is required" });
+        return;
+    }
+    const { session } = resolveConversation(conversationId);
+    if (!session) {
+        answer(404, { ok: false, error: `unknown plugin conversation id "${conversationId}"` });
+        return;
+    }
+    const run = retainedPreflight.get(session);
+    if (run === undefined) {
+        answer(200, { ok: true, conversationId, skipped: "no-request" });
+        return;
+    }
+    acquireInFlight(session);
+    try {
+        const outcome = await withSessionLock(session, () => run(res));
+        answer(200, outcome === "failed" ? { ok: false, conversationId, error: "preflight could not fold" } : { ok: true, conversationId, folded: outcome === "folded" });
+    } catch (err) {
+        loggerLog("warn", `[${session.id}] /__bili/plugin/compress: preflight threw ${err instanceof Error ? err.name : typeof err}`);
+        answer(500, { ok: false, conversationId, error: "preflight threw" });
+    } finally {
+        releaseInFlight(session);
+    }
+}
+
 // #2322: the host named the conversation (pi /name) — remember it as the
 // session's display title. B-channel design: a dedicated endpoint (instead
 // of a request header) so set/rename/CLEAR are all expressible (empty name =

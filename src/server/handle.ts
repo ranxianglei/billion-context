@@ -56,7 +56,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, retainPreflight, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -3157,6 +3157,15 @@ async function handleRequest(
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
                 if (!countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane) {
+                    if (pluginAgent) {
+                        // #6199: the host may ask to fold before its own compaction
+                        // (/__bili/plugin/compress); it re-enters this same call.
+                        const call = { prepared: { ...prepared, stream: false }, reqConfig, nativeWindow, requestModel, resolvedNativeWindow, windowShrinkReason, route, affinity, anonymous: anonAffinity !== null };
+                        retainPreflight(session, async (holdRes) => {
+                            const again = await preflightCompressIfNeeded(call.prepared, runPrepare, req, bodyBuffer, holdRes, opts, core, call.reqConfig, call.nativeWindow, call.requestModel, call.resolvedNativeWindow, call.windowShrinkReason, call.route, call.affinity, call.anonymous, log, instanceId);
+                            return isPreflightFailFast(again) ? "failed" : again !== call.prepared ? "folded" : "unchanged";
+                        });
+                    }
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
