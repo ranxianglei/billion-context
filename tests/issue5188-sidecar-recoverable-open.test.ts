@@ -1,28 +1,27 @@
 /**
- * #5188 (open-side half of the #5140 fix): a sidecar whose FIRST synchronous
- * open died on a transient OS error used to degrade the whole process to
- * legacy-only for its lifetime — no retry path existed anywhere. Under CI-shard
- * machine load (many test processes sharing one disk) that one unlucky open at
- * construction time is exactly what stripped the unified layer, and the fork
- * raw-tail rebuild (#5140's HTTP 409 SNAPSHOT_UNAVAILABLE) fails closed on
- * replicasAvailable().
+ * #5188/#5140 open-side — re-pinned to the FINAL owner policy (2026-10-30).
  *
- * Recovery is demand-driven on BOTH consumer classes, each with its own pace:
- * - save path (scheduleSave/flushSync): one maybeOpen per 30 s cooldown window;
- * - read path (replicasAvailable): one maybeOpen per 100 ms interval — a read
- *   asking "are replicas available?" gets a fresh answer instead of waiting for
- *   the next write. #5140's flake was precisely that gap: ctor open dies under
- *   shard load, the resource clears milliseconds later, and the cold-restore
- *   snapshot request arrives before any save could trigger a retry — and the
- *   old constructor-time cooldown stamp gated even the first retry for 30 s.
- *
- * Both directions pinned (#3617): recovery works without a restart once the
- * resource returns (no save required on the read timeline), AND while
- * gated/failed the store keeps serving (JSON durability intact, bounded
- * attempt counts per pace, no retry spam inside either window).
- *
- * The strike-side half of #5188 (transient vs structural ingest-error
- * classification) has its own suite: tests/issue5140-contention-not-disabling.test.ts
+ * Master's original story ("a first synchronous open that dies on a transient
+ * OS error degrades the process to legacy-only, then the demand-driven reopen
+ * heals it without a restart") was superseded twice over: round 3 says ANY
+ * failed open at boot makes bili REFUSE TO START loudly (silent lifetime
+ * degradation of any kind is withdrawn), and round 5 says a proven-corrupt
+ * index alarms and boots WITHOUT the index, with an operator hand-fix — never
+ * moved, copied or rebuilt automatically. So in the sqlite world a live
+ * process no longer ever sits in "sidecar wanted but missing because of a
+ * transient open failure": the two reachable no-sidecar states are the
+ * intentional opt-outs (legacy/persist-off/encryption) and the proven-corrupt
+ * alarm. The reopen machinery survives as the defensive net behind
+ * tryRecoverSidecar()'s new catch (its docstring explains why), plus the
+ * mysql async-attach path — and this suite pins the two policy edges around
+ * it instead of the retired heal story:
+ *   1. an unlucky FIRST open (no engine available) refuses to start:
+ *      construction throws, the pre-death status wire names the cause, no
+ *      index.db debris is left behind;
+ *   2. a proven-corrupt index alarms ONCE per boot and the demand-driven
+ *      reopen hooks respect the integrity flag — no re-scan storm, no second
+ *      alarm, replicas stay honestly unavailable, while envelope service
+ *      continues.
  */
 
 import { test } from "node:test";
@@ -31,11 +30,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionStore, setShadowReopenCooldownMsForTests, setShadowReopenReadCheckMsForTests } from "../src/persist.ts";
+import { UnifiedShadow, hadIntegrityQuickCheckFailure } from "../src/storage/shadow.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { _resetStorageRuntimeStatusForTest, storageStatusWire } from "../src/storage/runtime-status.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { createInitialState } from "acp-kernel";
-import type { Session } from "../src/session.ts";
+import type { Session } from "../src/session.js";
 
 const HERMETIC = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5188-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(HERMETIC, "no-config.json");
@@ -46,170 +46,77 @@ function mkSess(id = "rec-s1"): Session {
     return { id, meta: { protocol: "anthropic" }, metadata: {}, stats: { requests: 1 }, state: createInitialState() } as unknown as Session;
 }
 
-test("sidecar recovers without a restart once the resource returns (#5188)", () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "rec-"));
-    let store: SessionStore | undefined;
+test("an unlucky FIRST open (no engine) refuses to start — loud throw, wire names the cause (#5188 final)", () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "bootrefuse-"));
+    _resetStorageRuntimeStatusForTest();
+    setSqliteEnginesUnavailableForTests(true);
     try {
-        _resetStorageRuntimeStatusForTest();
-        setShadowReopenCooldownMsForTests(0);
-        setSqliteEnginesUnavailableForTests(true);
-        store = new SessionStore({ dir, enabled: true });
-        assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
-        assert.equal(storageStatusWire().degraded, true, "degraded state observable on the status wire");
-        // resource returns mid-process; the very next save retries immediately
-        // (the constructor's failed open does not consume the retry budget)
-        setSqliteEnginesUnavailableForTests(false);
-        store.scheduleSave(mkSess());
-        assert.equal(store.replicasAvailable(), true, "recovered by the save path without a restart");
-        assert.equal(storageStatusWire().degraded, false, "status wire clears with the recovery");
+        assert.throws(
+            () => new SessionStore({ dir, enabled: true }),
+            /no SQLite engine available/i,
+            "round-3 policy: a failed first open is a refusal to start, not a silent lifetime degradation",
+        );
+        const wire = storageStatusWire();
+        assert.equal(wire.degraded, true, "the pre-death diagnostic surface still reports it");
+        assert.match(String(wire.reason), /SQLite engine/i, "the wire names the missing engine as the cause");
+        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "a refused boot leaves no index.db debris");
     } finally {
-        setShadowReopenCooldownMsForTests(null);
         setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
-        store?.closeQuietly();
     }
 });
 
-test("each pace gates its own retries and JSON durability holds while degraded (#5188)", async () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "gate-"));
-    let store: SessionStore | undefined;
-    const warns: string[] = [];
+test("a proven-corrupt index alarms ONCE and the reopen hooks never re-scan it (#5188 guard)", () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "corrupt-"));
+    _resetStorageRuntimeStatusForTest();
+    // Build a valid index, close it, then truncate it past its midpoint —
+    // the canonical quick_check-provable corruption from the #4816 family.
+    let s1: SessionStore | undefined;
     try {
-        _resetStorageRuntimeStatusForTest();
-        setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
-        setSqliteEnginesUnavailableForTests(true);
-        setShadowReopenCooldownMsForTests(300);
-        setShadowReopenReadCheckMsForTests(300);
-        store = new SessionStore({ dir, enabled: true });
-        const failedOpens = () => warns.filter((w) => /failed to open/.test(w)).length;
-        assert.equal(failedOpens(), 1, "exactly one failed-open warn from construction");
-        // the ctor failure does NOT consume either pace: the first save fires
-        // one immediate attempt…
-        store.scheduleSave(mkSess("g1"));
-        assert.equal(failedOpens(), 2, "first save retries immediately (no constructor-time stamp)");
-        // …and its failure arms the save cooldown: further saves stay quiet…
-        store.flushSync(mkSess("g2"));
-        assert.equal(failedOpens(), 2, "the second save is gated by the cooldown the first attempt armed");
-        // …while the read path takes its own single immediate attempt…
-        assert.equal(store.replicasAvailable(), false, "still legacy-only while the resource is gone");
-        assert.equal(failedOpens(), 3, "the first read check fires its own immediate attempt");
-        // …and everything inside both windows stays quiet…
-        store.scheduleSave(mkSess("g3"));
-        store.flushSync(mkSess("g4"));
-        store.replicasAvailable();
-        assert.equal(failedOpens(), 3, "no retry spam inside either window");
-        // …until the windows elapse, then the next attempt recovers.
-        setSqliteEnginesUnavailableForTests(false);
-        await new Promise((r) => setTimeout(r, 400));
-        store.scheduleSave(mkSess("g5"));
-        assert.equal(store.replicasAvailable(), true, "post-cooldown attempt succeeds once the resource returns");
+        s1 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        s1!.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
     } finally {
-        setLogCapture(null);
+        s1?.closeQuietly();
+    }
+    const idx = path.join(dir, "index.db");
+    const sz = fs.statSync(idx).size;
+    const fd = fs.openSync(idx, "r+");
+    fs.ftruncateSync(fd, Math.floor(sz / 2));
+    fs.closeSync(fd);
+
+    const errors: string[] = [];
+    setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
+    const alarms = () => errors.filter((m) => m.includes("FAILED its integrity quick_check")).length;
+    const store: SessionStore | undefined = (() => {
+        // Direct probe: the alarm fires and the integrity latch trips.
+        const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(sh, null, "proven-corrupt index comes back as 'no sidecar'");
+        assert.equal(hadIntegrityQuickCheckFailure(), true, "integrity latch tripped");
+        // Now the actual boot: fresh in-boot scan (every boot decides from
+        // fresh evidence), ONE more alarm, then the process runs anyway.
+        return new SessionStore({ dir, debounceMs: 1, enabled: true });
+    })();
+    try {
+        assert.ok(store !== undefined, "round-5 policy: boot proceeds envelope-served");
+        const atBoot = alarms();
+        assert.ok(atBoot >= 1, "the boot's own scan alarmed");
+        // Demand-driven reopen hooks, unthrottled: every single read asks
+        // "are replicas available?" and every save would ask again. Without
+        // the integrity guard each of them would re-open, re-run quick_check
+        // against the same broken bytes and re-alarm — a permanent log storm
+        // with zero chance of success (only an operator hand-fix helps).
+        setShadowReopenCooldownMsForTests(0);
+        setShadowReopenReadCheckMsForTests(0);
+        for (let i = 0; i < 6; i++) {
+            assert.equal(store!.replicasAvailable(), false, `replicas honestly unavailable on attempt ${i}`);
+        }
+        store!.flushSync(mkSess("r5188-guard"));
+        assert.equal(alarms(), atBoot, "no re-scan storm: the boot-time alarm stands alone");
+        const wire = storageStatusWire();
+        assert.match(String(wire.reason ?? ""), /left UNTOUCHED/i, "the wire keeps naming the manual fix");
+    } finally {
         setShadowReopenCooldownMsForTests(null);
         setShadowReopenReadCheckMsForTests(null);
-        setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
-        store?.closeQuietly();
-    }
-});
-
-// #5188 round 3: the read-check slot only helps if ANOTHER consumer touches
-// availability after the spike clears — #5140's cold-restore GET was the last
-// touch, so it still raced the recovery. The user-visible 409 paths now wait a
-// bounded moment for that self-recovery (persist.waitForReplicas); all three
-// directions pinned below (#3617): recovery inside the window succeeds, a
-// still-gone resource costs exactly the budget and fails closed as before, and
-// latched-disabled never waits at all.
-
-test("waitForReplicas resolves once the resource returns inside the window (#5140 round 3)", async () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-"));
-    let store: SessionStore | undefined;
-    try {
-        _resetStorageRuntimeStatusForTest();
-        setSqliteEnginesUnavailableForTests(true);
-        store = new SessionStore({ dir, enabled: true });
-        assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
-        // production pacing: 750 ms budget; the resource returns 200 ms in and
-        // the next read-check slot (100 ms) drives the successful attempt
-        const release = setTimeout(() => setSqliteEnginesUnavailableForTests(false), 200);
-        const t0 = Date.now();
-        const ok = await store.waitForReplicas();
-        const elapsed = Date.now() - t0;
-        clearTimeout(release);
-        assert.equal(ok, true, "the wait resolves successfully once the resource returns");
-        assert.ok(elapsed >= 150, "it actually waited for the recovery (no pre-existing replica)");
-        assert.ok(elapsed < 700, "bounded well inside the budget");
-        assert.equal(store.replicasAvailable(), true, "replicas stay available after the wait");
-    } finally {
-        setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
-        store?.closeQuietly();
-    }
-});
-
-test("waitForReplicas gives up at the deadline when the resource stays gone", async () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-gone-"));
-    let store: SessionStore | undefined;
-    try {
-        _resetStorageRuntimeStatusForTest();
-        setSqliteEnginesUnavailableForTests(true);
-        store = new SessionStore({ dir, enabled: true });
-        const t0 = Date.now();
-        const ok = await store.waitForReplicas();
-        const elapsed = Date.now() - t0;
-        assert.equal(ok, false, "a still-gone resource fails closed exactly as before");
-        assert.ok(elapsed >= 700 && elapsed < 2000, `waited out the full budget, bounded (elapsed=${elapsed}ms)`);
-        assert.equal(store.replicasAvailable(), false, "still legacy-only afterwards");
-    } finally {
-        setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
-        store?.closeQuietly();
-    }
-});
-
-test("waitForReplicas never waits on a latched-disabled sidecar", async () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-latch-"));
-    let store: SessionStore | undefined;
-    try {
-        _resetStorageRuntimeStatusForTest();
-        store = new SessionStore({ dir, enabled: true });
-        const sh = (store as unknown as { shadow?: { stats: { disabled: boolean } } }).shadow;
-        assert.ok(sh, "sidecar opens normally when the resource is healthy");
-        sh.stats.disabled = true; // simulate a structural-breakage latch
-        const t0 = Date.now();
-        const ok = await store.waitForReplicas();
-        assert.equal(ok, false, "latched-disabled resolves false immediately — waiting cannot help there");
-        assert.ok(Date.now() - t0 < 100, "no wait spent on an unrecoverable state");
-    } finally {
-        setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
-        store?.closeQuietly();
-    }
-});
-
-test("an unlucky first open recovers on the next read check — no save, no 30 s wait (#5140 timeline)", async () => {
-    const dir = fs.mkdtempSync(path.join(HERMETIC, "tl-"));
-    let store: SessionStore | undefined;
-    try {
-        _resetStorageRuntimeStatusForTest();
-        // NO seams: production pacing applies. This is #5140's exact CI
-        // timeline — the ctor open dies under shard load, the resource clears
-        // milliseconds later, and the cold-restore snapshot request (a pure
-        // READ) arrives before any save could trigger a retry. Before the fix
-        // this returned false forever: the constructor stamped a 30 s cooldown
-        // and only the save path ever retried.
-        setSqliteEnginesUnavailableForTests(true);
-        store = new SessionStore({ dir, enabled: true });
-        assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
-        setSqliteEnginesUnavailableForTests(false);
-        // production read-check interval is 100 ms; wait past one slot so the
-        // next availability check is definitely eligible
-        await new Promise((r) => setTimeout(r, 150));
-        assert.equal(store.replicasAvailable(), true, "a plain read recovers the sidecar — no save anywhere in this timeline");
-        assert.equal(storageStatusWire().degraded, false, "status wire clears with the recovery");
-    } finally {
-        setSqliteEnginesUnavailableForTests(false);
-        _resetStorageRuntimeStatusForTest();
+        setLogCapture(null);
         store?.closeQuietly();
     }
 });
