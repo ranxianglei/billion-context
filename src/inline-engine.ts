@@ -269,7 +269,10 @@ function responseFrom(res: InlineRes): Response {
 
 function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
     return async (input, init, rawFetch) => {
+        const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
+        signal?.throwIfAborted();
         const req = await toInlineReq(input, init);
+        signal?.throwIfAborted();
         const res = new InlineRes();
         // Spawn-mode cancel parity (#3278 review): honor the caller's
         // AbortSignal. Destroying res drives the pipeline's own close plumbing
@@ -277,7 +280,6 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
         // socket close does over HTTP, stopping the upstream round trip; the
         // raced promise makes the caller reject with the abort reason like
         // undici would instead of running to completion and burning tokens.
-        const signal = init?.signal;
         let onAbort: (() => void) | undefined;
         let abortPromise: Promise<never> | undefined;
         if (signal != null) {
