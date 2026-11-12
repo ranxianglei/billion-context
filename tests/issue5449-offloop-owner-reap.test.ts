@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import {
     WATCHDOG_OWNER_DEAD_CONFIRM_TICKS,
     armEventLoopWatchdog,
+    otherOwnerCount,
     ownerReapVerdict,
 } from "../src/event-loop-watchdog.ts";
 import { isPidAlive } from "../src/instance.ts";
@@ -48,6 +49,21 @@ test("ownerReapVerdict: all three gates must hold together (#5449)", () => {
     assert.equal(ownerReapVerdict(7, 3, 60_000, 30_000, 0), true);
 });
 
+test("otherOwnerCount: the production counter excludes only the probed pid (#5449/#7)", () => {
+    const spawner = 4242;
+    // pre-context window: no set yet, no socket, no attach possible — 0 is truth
+    assert.equal(otherOwnerCount(undefined, spawner), 0);
+    // incident shape: the dead spawner is still in the set — it must not count
+    assert.equal(otherOwnerCount(new Set<number>([spawner]), spawner), 0);
+    // one other live host attached alongside the spawner
+    assert.equal(otherOwnerCount(new Set<number>([spawner, process.pid]), spawner), 1);
+    // probed pid absent from the set — raw size stands
+    assert.equal(otherOwnerCount(new Set<number>([process.pid]), spawner), 1);
+    // axis disabled (manual bili start): nothing to exclude
+    assert.equal(otherOwnerCount(new Set<number>([process.pid]), null), 1);
+    assert.equal(otherOwnerCount(new Set<number>(), null), 0);
+});
+
 test("dead owner + wedged loop + no other watchers trips off-loop reap (#5449)", async () => {
     const ownerPid = await spawnEphemeralOwner();
     let trippedWith: { gapMs: number, reason?: string } | undefined;
@@ -81,9 +97,9 @@ test("dead owner + wedged loop + no other watchers trips off-loop reap (#5449)",
 test("dead spawner still in the watcher SET trips — the guard counts OTHER owners only (#5449/#7)", async () => {
     // Production wiring shape (src/server.ts): proxyWatchers is seeded with the
     // spawner pid at creation and only the in-loop reaper removes it — under a
-    // wedge the set still holds the dead owner. The count handler therefore
-    // reports set size minus the probed pid, or this axis could never fire for
-    // a single-spawner orphan (the incident shape).
+    // wedge the set still holds the dead owner. The count handler is the
+    // production otherOwnerCount itself, or this axis could never fire for a
+    // single-spawner orphan (the incident shape).
     const ownerPid = await spawnEphemeralOwner();
     const watchers = new Set<number>([ownerPid]);
     let trippedWith: { gapMs: number, reason?: string } | undefined;
@@ -95,7 +111,7 @@ test("dead spawner still in the watcher SET trips — the guard counts OTHER own
         softWarnMs: 60,
         hardTimeoutMs: 30_000,
         parentPid: ownerPid,
-        getWatcherCount: () => Math.max(0, watchers.size - (watchers.has(ownerPid) ? 1 : 0)),
+        getWatcherCount: () => otherOwnerCount(watchers, ownerPid),
         fatalMode: "report",
         onTrip: (gapMs, reason) => { trippedWith = { gapMs, reason }; },
     });
@@ -126,7 +142,7 @@ test("dead owner + wedge but ANOTHER watcher attached never trips (#5449/#7 last
         softWarnMs: 60,
         hardTimeoutMs: 30_000,
         parentPid: ownerPid,
-        getWatcherCount: () => Math.max(0, watchers.size - (watchers.has(ownerPid) ? 1 : 0)),
+        getWatcherCount: () => otherOwnerCount(watchers, ownerPid),
         fatalMode: "report",
         onTrip: () => { trips += 1; },
     });
@@ -226,8 +242,6 @@ test("watcher count rides every beat — init-time count must not freeze the gua
 });
 
 test("no parentPid — axis disabled, zero behavior change for manual bili start (#5449)", async () => {
-    const ownerPid = await spawnEphemeralOwner();
-    void ownerPid;
     let trips = 0;
     const handle = armEventLoopWatchdog({
         logFile: null,
