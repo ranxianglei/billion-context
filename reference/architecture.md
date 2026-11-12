@@ -113,6 +113,7 @@ billion-context/
 │   ├── acp-status.ts             # acp_status payload (ranges/nudge recomputed live)
 │   ├── acp-panel.ts              # Cache report wrapper for transcript display
 │   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over dumps (#1266)
+│   ├── acp-block-ops.ts          # Block retirement + external rewrite host executors (acp_retire/acp_restore/acp_rewrite): arg parse, receipts, dirty mark (#5765)
 │   ├── marker/                   # Inbound marker stripping: one spec table + engine, four wires (#2811)
 │   │   ├── anchors.ts            #   Shared marker anchors: integrity note, silence clause, echo match
 │   │   ├── engine.ts             #   Raw-stage inbound marker strip: one ordered pipeline (#2811)
@@ -182,6 +183,7 @@ billion-context/
 │   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
+│   ├── toml-integer.ts           # Shared strict TOML integer reader for model token limits
 │   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)
 │   ├── plugin-install.ts         # `bili plugin install` driving host channels
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)
@@ -327,7 +329,8 @@ billion-context/
 │       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
 │       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
-│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
+│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420) — thin wrapper over mdrender.ts
+│       ├── mdrender.ts           #   Shared escape-first Markdown + hand-rolled syntax-highlight core (server render + browser IIFE via .toString() inline, zero deps)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)
 │       ├── client.ts             #   Web UI client JS bundle
 │       ├── styles.ts             #   Web UI CSS
