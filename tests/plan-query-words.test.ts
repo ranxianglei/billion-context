@@ -81,9 +81,9 @@ test("all nine natural-language diagnostics recover their declared answer", () =
 });
 
 test("supported literal, identifier and multilingual diagnostics also retain their declared answers", () => {
-    const existingSubstringFailures = new Set(["variable-a", "plain-stopword-query", "all-function-word-literals"]);
+    const existingSubstringFailures = new Set(["variable-a", "all-function-word-literals"]);
     const cases = PLAN_QUERY_WORD_CASES.filter((fixture) => fixture.category !== "natural-language" && !existingSubstringFailures.has(fixture.id));
-    assert.equal(cases.length, 23);
+    assert.equal(cases.length, 24);
     for (const fixture of cases) {
         for (const limit of [1, 3]) {
             const result = executePlanRetrievalSearch(fixture, "status-aware", { limit });
@@ -93,7 +93,7 @@ test("supported literal, identifier and multilingual diagnostics also retain the
 });
 
 test("known substring failures retain old ordering without relabelling them as successes", () => {
-    for (const id of ["variable-a", "plain-stopword-query", "all-function-word-literals"]) {
+    for (const id of ["variable-a", "all-function-word-literals"]) {
         const fixture = PLAN_QUERY_WORD_CASES.find((entry) => entry.id === id)!;
         const frozen = baseline.groups.queryWords.find((entry) => entry.id === id)!;
         assert.ok(!fixture.relevantBlockIds.includes(frozen.outputs[0].blockIds[0]), `${id}: a recorded pre-existing failure`);
