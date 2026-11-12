@@ -15,10 +15,21 @@
 // skeletons were already recorded + persisted under their lane keys. Every
 // raw-key rung and the msgid rescue keep priority over the new rung.
 //
+// The model-switch trigger (second field repro, @almazom on the DSH lane):
+// a quota fleet switching models mid-session rewrites the system text on
+// EVERY switch, and the header-declared model changes in the same window.
+// The model-switch rung (#2601/#2817) then re-anchors the conversation to
+// the RAW key — orphaning the lane's folds. The candidate search is
+// factored into findContinuingLane, consulted by BOTH the new lane-migration
+// rung and a guard on the model-switch rung: when the incoming continues a
+// lane, the raw re-anchor is skipped and the lane is kept. A model switch
+// with NO lane to continue still re-anchors raw (the #2601/#2817 control).
+//
 // Gate discipline (#3617): the bug shape migrates, and EACH guardrail leg
 // keeps its designed fork alive (stranger content, stale-shorter replay,
 // shallow blob, scattered below-threshold agreement, different
-// discriminator, raw-rung priority, msgid-rescue priority).
+// discriminator, raw-rung priority, msgid-rescue priority, model-switch
+// raw-control).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -205,6 +216,46 @@ test("#6114 priority: msgid rescue to the raw key outranks lane migration", () =
     assert.equal(r.key, id, "store-id overlap rescues onto the raw key before lane migration");
     assert.equal(r.action, "reanchor");
     assert.equal(sessionOrderSkeletonOf(lane)?.length, 42, "the lane was not touched");
+});
+
+test("#6114 model switch: a model switch that continues a derived-persona lane keeps the lane (not re-anchored to raw)", () => {
+    const id = "sess-6114-k";
+    const main = turns("main", 40);
+    const disc = main[0].content as string;
+    resetSessionOrderForTest();
+    // Raw claimed under V0 with a declared model; the lane forked under V1
+    // carries the same model (the quota-fleet shape: every request declares
+    // its model via x-bili-plugin-model).
+    assert.equal(resolveSessionOrder(id, turns(`early-${id}`, 6), V0, "model-A").action, "claim");
+    assert.equal(resolveSessionOrder(id, main, V1, "model-A", undefined, disc).action, "derived-persona");
+    resolveSessionOrder(id, [...main, ...turns(`grow-${id}`, 2)], V1, "model-A", undefined, disc);
+    const lane = key3(id, V1, disc);
+    assert.equal(sessionOrderSkeletonOf(lane)?.length, 42);
+    // The @almazom trigger: the operator switches models mid-session — the
+    // host rewrites the system text (V1→V2) AND declares a new model
+    // (model-A→model-B) in the same window, and the history is a strict
+    // continuation of the lane. Before the fix, the model-switch rung
+    // (#2601/#2817) re-anchored the conversation to the RAW key and orphaned
+    // the lane's fold blocks (each switch minted a fresh sibling).
+    const r = resolveSessionOrder(id, [...main, ...turns("more", 4)], V2, "model-B", undefined, disc);
+    assert.equal(r.key, lane, "the model switch must NOT re-anchor the conversation to raw");
+    assert.equal(r.action, "reanchor");
+    assert.equal(sessionOrderSkeletonOf(key3(id, V2, disc)), undefined, "no V2 sibling lane minted");
+    assert.equal(sessionOrderSkeletonOf(lane)?.length, 44, "the lane skeleton grew with the switched request");
+});
+
+test("#6114 model switch control: a model switch on the RAW key (no lane) still re-anchors raw (#2601/#2817)", () => {
+    const id = "sess-6114-l";
+    resetSessionOrderForTest();
+    const chainA = turns("chain", 6);
+    assert.equal(resolveSessionOrder(id, chainA, V0, "model-A").action, "claim");
+    // Discontinuous deep history + model header change, and NO lane exists
+    // (the conversation lives on the raw key) — the model-switch rung keeps
+    // its designed re-anchor; the #6114 guard must not swallow it.
+    const r = resolveSessionOrder(id, turns("fresh", 4), V1, "model-B");
+    assert.equal(r.key, id, "no lane to continue → the #2601/#2817 absorption still re-anchors raw");
+    assert.equal(r.action, "reanchor");
+    assert.match(r.reason ?? "", /#2601\/#2817/);
 });
 
 // ── end to end: the incident wire (Anthropic Messages + x-claude-code-session-id) ──
