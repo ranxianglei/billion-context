@@ -1794,7 +1794,10 @@ export class MysqlBackend implements StorageBackend {
             if (c !== null) content[hash] = c;
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        // sqlite twin: appended as the last step inside the sweep
+        // transaction, so a failed sweep leaves no line for a session that
+        // is still active.
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
             const rel: string[] = [];
@@ -1823,6 +1826,7 @@ export class MysqlBackend implements StorageBackend {
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
             contentRowsDeleted = await this.collectZeroRefIn(c, rel);
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#3931] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1842,11 +1846,12 @@ export class MysqlBackend implements StorageBackend {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
+        // sqlite twin: newest matching line wins.
         let lineNo = -1;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
-            for (let i = 0; i < rawLines.length; i++) {
+            for (let i = rawLines.length - 1; i >= 0; i--) {
                 if (!rawLines[i].trim()) continue;
                 let candidate: unknown;
                 try {
@@ -1951,11 +1956,15 @@ export class MysqlBackend implements StorageBackend {
             );
         });
         const kept: string[] = [];
+        let ownLines = 0;
         for (const l of rawLines) {
             if (!l.trim()) continue;
             try {
                 const head = JSON.parse(l) as { sessionId?: string };
-                if (head.sessionId === sessionId) continue;
+                if (head.sessionId === sessionId) {
+                    if (++ownLines === 2) loggerLog("warn", `[storage] archive log holds more than one line for session ${sessionId}: the newest was restored, older ones are dropped`);
+                    continue;
+                }
             } catch {
                 continue;
             }
