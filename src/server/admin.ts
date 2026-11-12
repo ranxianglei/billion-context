@@ -16,7 +16,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginCompact, handlePluginCompress, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
@@ -873,6 +873,18 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             handlePluginCompact(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/compress") {
+        // #6199: fold before the host's own auto-compaction (pi session_before_compact).
+        try {
+            const body = await readBody(req);
+            await handlePluginCompress(body.toString("utf8"), res);
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
