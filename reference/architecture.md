@@ -46,6 +46,7 @@ billion-context/
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
+│   ├── model-endpoints.ts         # Declarable custom-wire model endpoints: pattern parse + longest-prefix match, one source feeds proxy classifier + client claim (#1295)
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
 │   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
@@ -68,6 +69,7 @@ billion-context/
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
 │   ├── egress-transforms.ts      # User-registerable egress request-body rewrite pipeline (#6003)
 │   ├── wire-drop-warn.ts         # Warn when a wire codec drops non-text parts (#1205)
+│   ├── commandcode-wire.ts       # commandcode CLI envelope codec: nested openai-completions request unwrap + bare JSONL response handling (#1295)
 │   ├── text-safe.ts              # Surrogate-safe string prefix helper
 │   ├── sse-util.ts               # SSE parsing / line-ending normalization
 │   ├── stream.ts                 # SSE stream utilities + tag patching
@@ -111,6 +113,7 @@ billion-context/
 │   ├── acp-status.ts             # acp_status payload (ranges/nudge recomputed live)
 │   ├── acp-panel.ts              # Cache report wrapper for transcript display
 │   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over dumps (#1266)
+│   ├── acp-block-ops.ts          # Block retirement + external rewrite host executors (acp_retire/acp_restore/acp_rewrite): arg parse, receipts, dirty mark (#5765)
 │   ├── marker/                   # Inbound marker stripping: one spec table + engine, four wires (#2811)
 │   │   ├── anchors.ts            #   Shared marker anchors: integrity note, silence clause, echo match
 │   │   ├── engine.ts             #   Raw-stage inbound marker strip: one ordered pipeline (#2811)
@@ -191,6 +194,7 @@ billion-context/
 │   │   ├── index.ts              #   Stream-failure presentation options (#1455)
 │   │   ├── core.ts               #   Protocol-neutral event model + tool adjudication
 │   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter
+│   │   ├── adapter-commandcode.ts #   commandcode wire adapter: envelope unwrap/re-wrap over the OpenAI-family loop (#1295)
 │   │   ├── adapter-openai.ts     #   OpenAI chat adapter
 │   │   ├── adapter-responses.ts  #   Responses API adapter (+ over-long id healing)
 │   │   ├── adapter-google.ts     #   Google wire adapter
@@ -323,7 +327,8 @@ billion-context/
 │       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
 │       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
-│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
+│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420) — thin wrapper over mdrender.ts
+│       ├── mdrender.ts           #   Shared escape-first Markdown + hand-rolled syntax-highlight core (server render + browser IIFE via .toString() inline, zero deps)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)
 │       ├── client.ts             #   Web UI client JS bundle
 │       ├── styles.ts             #   Web UI CSS

@@ -457,6 +457,14 @@ export function persistDebounceMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : 500;
 }
 
+/** BILI_PERSIST_MAX_DELAY_MS > persist.maxDelayMs > 5000 (#6058: under sustained
+ *  traffic the max-delay cap — not the debounce window — sets the session-order /
+ *  prefix-affinity snapshot rewrite rate; both writers had it hardcoded at 5s). */
+export function persistMaxDelayMs(): number {
+    const v = tInt("BILI_PERSIST_MAX_DELAY_MS", filePersist().maxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : 5_000;
+}
+
 /** BILI_PERSIST_TAIL_TOKENS > persist.tailTokens > 16384 (0 disables message persistence). */
 export function persistTailTokens(): number {
     const v = tInt("BILI_PERSIST_TAIL_TOKENS", filePersist().tailTokens);
@@ -1060,38 +1068,3 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     return WAL_JOURNAL_SIZE_LIMIT;
 }
 
-/** EXPERIMENTAL fold-point carrier relocation switch (view transform A): when
- *  on, a still-visible compress call/result pair is moved from its original
- *  tail-adjacent position to its own fold point, so resent history ends in
- *  "[folded region] – [pair] – [protected messages]" instead of a tool exchange
- *  sitting at the very end (which weak-attention models read as a fresh
- *  command). Pure view-side transform — refs/state untouched, recomputed
- *  identically every turn; off = byte-identical to the pre-feature layout.
- *  OPT-IN (default OFF; verified on real models 2026-11-01 #5470, kept opt-in
- *  per owner decision).
- *  Env BILI_COMPRESS_AT_FOLD_POINT (0/false/off vs 1/true/on) wins over the
- *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = OFF.
- *  Garbage spellings fall through tiers. Pure: never throws. */
-export function resolveCompressAtFoldPoint(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}
-
-/** Second opt-in riding on BILI_COMPRESS_AT_FOLD_POINT: drop the contiguous
- *  run of unsigned reasoning cores immediately preceding a relocated pair at
- *  the moment of repositioning (the turn's "think" about the fold itself).
- *  Default OFF; both switches must be set for anything to be dropped, and the
- *  host additionally refuses any core carrying a wire signature or running
- *  under strict reasoning-echo (#1658/#684 doctrine — signed bytes are never
- *  rewritten or deleted).
- *  Env BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over config-file
- *  `compress.compressAtFoldPointClearThinking`; absent = OFF. Pure: never
- *  throws. */
-export function resolveCompressAtFoldPointClearThinking(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}
