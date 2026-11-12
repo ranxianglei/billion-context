@@ -17,6 +17,7 @@ import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-loo
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
@@ -491,7 +492,7 @@ export async function prepareAnthropic(
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
-            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
@@ -525,7 +526,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -538,15 +539,17 @@ export async function prepareAnthropic(
                 // [#5688] the side call shares the main request's upstream —
                 // un-deduped rebuiltMessages would 400 the decision too.
                 // [#4570] and the side array must obey the system-position rule
-                // on the array actually sent, which is exactly this one.
-                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions([...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }]), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                // on the array actually sent, which is exactly this one; #5432
+                // inserts the prompt BEFORE a trailing client system run so the
+                // backstop below stays a no-op for legal shapes.
+                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions(insertBeforeTrailingSystemRun(dedupeAdjacentOutputConfig(rebuiltMessages), [{ role: "user", content: buildDecisionPrompt(ranges) }])), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -562,7 +565,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -582,16 +585,17 @@ export async function prepareAnthropic(
         // carrier as the nudge (never persisted, never in the client's
         // re-sent history, prefix-cache safe).
         if (turn.statusLine) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: turn.statusLine }]);
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
-        // trailing user note (kept last so it never reorders cached messages).
+        // trailing user note (after every stable message; only a client trailing
+        // system run may follow it — #5432).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
         // upstream accepts this request; on failure they ride the next one.
         const retrNotes = snapshotRetrievalNotes(session);
         const retrNote = renderRetrievalNotes(retrNotes);
         if (retrNote) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: retrNote }]);
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
@@ -604,6 +608,14 @@ export async function prepareAnthropic(
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
+    // #3397 durability-before-render: make this turn's ledger rows durable NOW
+    // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
+    // about to see are on disk BEFORE the response is sent. Without this, a
+    // crash before the debounced save (#5155) leaves rendered refs unbacked —
+    // the #3397 orphaned-generation gap that makes a later turn cite refs the
+    // gate rejects as "above the highest allocated ref". markDirty below keeps
+    // the JSON envelope debounced; this only moves the small row ingest ahead.
+    getStore().ingestRowsNow(session);
     markDirty(session);
 
     // [#5604] a preflight fold of the tail (soft protection relaxed to 0, or a
