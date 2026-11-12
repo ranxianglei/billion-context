@@ -287,7 +287,7 @@ function substrateDestructionPauseParagraph(n: number): string {
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 // #5986 review fix: the observed failure mode after a compress rejection is the
