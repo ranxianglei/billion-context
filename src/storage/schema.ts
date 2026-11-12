@@ -122,6 +122,35 @@ export const STORAGE_SCHEMA_VERSION = 12;
  *  shrink on demand with ?vacuum=full. */
 export const WAL_JOURNAL_SIZE_LIMIT = 0;
 
+/** #5788: the oldest schema version this build can still READ. Every
+ *  NON-ADDITIVE migration (one that changes the meaning of existing rows,
+ *  not just adds columns/indexes) MUST raise this constant in the same
+ *  commit — v8 is the only one so far (position-independent identity
+ *  backfill, #4390/#4677: a pre-v8 build writing into a v8 store would
+ *  emit rows with no identity and corrupt the cross-save JOIN key). v9/
+ *  v10/v11 are additive (indexes / nullable columns) and do NOT raise it.
+ *  Persisted per store (kv_store namespace "storage", key
+ *  "schema_reader_floor") so an older build opening a store a newer build
+ *  migrated can REFUSE instead of silently writing rows it cannot read
+ *  back — the rolling upgrade / rollback case (#5082 shared-index
+ *  topology). A test pins floor ≤ STORAGE_SCHEMA_VERSION. */
+export const STORAGE_MIN_READER_VERSION = 8;
+
+/** #5788: the store's persisted reader floor is above this build's schema
+ *  version — a NEWER build applied a non-additive migration this build
+ *  cannot read. The file is NOT corrupt (it is simply newer than this
+ *  build), so this is a startup refusal in the CANTOPEN/readonly bucket
+ *  (handled in shadow.ts), not a StorageIntegrityError: degrading to the
+ *  legacy path or writing into the store would let the newer build's rows
+ *  lose their semantics. Remediation: upgrade bili, or restore a
+ *  pre-upgrade index.db{,-wal,-shm} backup. */
+export class StorageSchemaFloorError extends Error {
+    constructor(public readonly storedFloor: number, public readonly runningVersion: number) {
+        super(`[storage] schema reader floor ${storedFloor} is above this build's schema version ${runningVersion} — the store was migrated by a newer bili with a non-additive change this build cannot read; upgrade bili, or restore a pre-upgrade index.db{,-wal,-shm} backup, before starting`);
+        this.name = "StorageSchemaFloorError";
+    }
+}
+
 /** Connection pragmas for every index.db opener. The journal cap is
  *  per-opener and only issued when positive (0 = unlimited, the SQLite
  *  default); the default list below is what short-lived openers (export
@@ -528,12 +557,50 @@ CREATE TABLE IF NOT EXISTS egress_block_state (
 );
 `;
 
-/** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
-export function migrateSchema(db: {
+/** The structural surface migrateSchema needs from a SQLite handle —
+ *  satisfied by both node:sqlite and better-sqlite3 (and test fakes). */
+type SchemaDb = {
     exec(sql: string): void;
     prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[]; run(...a: unknown[]): unknown };
     transaction<T>(fn: () => T): T;
-}): { from: number; to: number } {
+};
+
+/** #5788: read the persisted reader floor (kv_store namespace "storage",
+ *  key "schema_reader_floor") and refuse when it is above this build's
+ *  schema version. A MISSING row (pre-feature store) is UNKNOWN, not
+ *  "too new" — it passes, so existing stores never false-refuse. A
+ *  MALFORMED value passes too: a false refusal would make an existing
+ *  store unopenable, while a false pass degrades to today's (ungated)
+ *  behavior. Math: floor ≤ the build that wrote it stamped user_version,
+ *  so floor > runningVersion implies the stamp is above runningVersion —
+ *  one check suffices, and it only ever runs in the from >=
+ *  STORAGE_SCHEMA_VERSION branch (where kv_store is guaranteed to exist). */
+function enforceReaderFloor(db: SchemaDb): void {
+    let row: { value_json: string } | undefined;
+    try {
+        row = db.prepare(
+            "SELECT value_json FROM kv_store WHERE namespace = 'storage' AND key = 'schema_reader_floor'",
+        ).get() as { value_json: string } | undefined;
+    } catch {
+        // kv_store unreadable (a corrupt store missing the table) — treat as
+        // unknown and pass: the gate must never introduce a NEW fail-at-open
+        // path, so a store that opened before this feature still opens (it
+        // fails later on its first real kv op, as it did before).
+        return;
+    }
+    if (row === undefined) return;
+    let floor: unknown;
+    try {
+        floor = JSON.parse(row.value_json);
+    } catch {
+        return;
+    }
+    if (typeof floor !== "number" || !Number.isInteger(floor)) return;
+    if (floor > STORAGE_SCHEMA_VERSION) throw new StorageSchemaFloorError(floor, STORAGE_SCHEMA_VERSION);
+}
+
+/** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
+export function migrateSchema(db: SchemaDb): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
     // #6785 review fix (owner): DROP COLUMN needs SQLite ≥ 3.35. The host
@@ -724,7 +791,13 @@ export function migrateSchema(db: {
     if (sessionCols.length > 0 && !sessionCols.includes("fork_egress_watermark")) {
         db.exec("ALTER TABLE sessions ADD COLUMN fork_egress_watermark INTEGER");
     }
-    if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
+    if (from >= STORAGE_SCHEMA_VERSION) {
+        // #5788: the store is at/above this build — before no-op'ing, make
+        // sure a newer build's non-additive migration didn't raise the
+        // reader floor past this build (refuse if so).
+        enforceReaderFloor(db);
+        return { from, to: from };
+    }
     let needV8Backfill = false;
     db.transaction(() => {
         if (from < 1) db.exec(STORAGE_DDL_V1);
@@ -859,7 +932,20 @@ export function migrateSchema(db: {
         // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
-    db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+    // #5788: stamp the schema version AND the reader floor in ONE small
+    // transaction — a crash between the two statements would leave a torn
+    // pair. The gate reads the floor only when the stamp is already at/
+    // above this build, so a torn pair (floor row committed, stamp not yet
+    // bumped) would under-report the floor and let a too-old build in.
+    // PRAGMA user_version is transactional in SQLite (header write
+    // participates in the txn), so both land or neither does.
+    db.transaction(() => {
+        db.prepare(
+            "INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES ('storage', 'schema_reader_floor', ?, ?) " +
+                "ON CONFLICT(namespace, key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+        ).run(JSON.stringify(STORAGE_MIN_READER_VERSION), Date.now());
+        db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+    });
     // #7574: idx_conversations_session ships inside STORAGE_DDL_V1, so only
     // a database BORN on a current build ever had it — a library that
     // climbed to its user_version from an earlier release took the versioned
