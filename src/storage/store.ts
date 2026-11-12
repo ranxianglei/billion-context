@@ -16,8 +16,8 @@
  * field, always guarded by those assertions.
  */
 
-import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync, openSync, fsyncSync, fchmodSync, closeSync, renameSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
@@ -59,6 +59,25 @@ const GC_ZERO_REF_BATCH_SIZE = 2000;
  *  session's distinct released hashes exceed it only pathologically, and
  *  the loop simply continues with the next chunk. */
 const ZERO_REF_SWEEP_CHUNK = 500;
+
+export function rewriteArchiveLog(file: string, text: string): void {
+    const target = realpathSync(file);
+    const tmp = `${target}.${randomUUID()}.tmp`;
+    let fd: number | undefined;
+    try {
+        const mode = statSync(target).mode & 0o777;
+        fd = openSync(tmp, "wx", mode);
+        fchmodSync(fd, mode);
+        writeFileSync(fd, text);
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        renameSync(tmp, target);
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+        try { unlinkSync(tmp); } catch { /* rename already consumed the temporary file */ }
+    }
+}
 /** #4739 test instrumentation: message rows materialized by getMessages /
  *  getMessagesAt (each row = one CAS read + media hydration). Production
  *  code never reads this; tests assert ordinary loads stop decoding the
@@ -340,7 +359,7 @@ export interface IngestSessionInput {
 const EXT_KEY_MAX = 256;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
-function validateExtKey(value: string, what: string): void {
+export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
         throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
     }
@@ -352,12 +371,12 @@ function validateExtKey(value: string, what: string): void {
     }
 }
 
-function serializeExtValue(value: unknown): string {
+export function serializeExtValue(value: unknown): string {
     const json = JSON.stringify(value);
     if (json === undefined) {
         throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
     }
-    if (json.length > EXT_VALUE_MAX_BYTES) {
+    if (Buffer.byteLength(json, "utf8") > EXT_VALUE_MAX_BYTES) {
         throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
     }
     return json;
@@ -2061,7 +2080,7 @@ export class UnifiedStore {
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
@@ -2134,13 +2153,13 @@ export class UnifiedStore {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
             for (let i = 0; i < rawLines.length; i++) {
                 if (!rawLines[i].trim()) continue;
-                let candidate: { sessionId?: string };
+                let candidate: unknown;
                 try {
-                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                    candidate = JSON.parse(rawLines[i]) as unknown;
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) { lineNo = i; break; }
             }
         } catch {
             return { ok: false, reason: "export-corrupt" };
@@ -2154,7 +2173,27 @@ export class UnifiedStore {
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            const references = new Map<string, number>();
+            const addRef = (hash: unknown): void => {
+                if (typeof hash === "string") references.set(hash, (references.get(hash) ?? 0) + 1);
+            };
+            for (const m of dump.messages) addRef(m.content_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) addRef(mm.media_hash);
+            for (const b of dump.blocks) {
+                if (this.db.prepare("SELECT 1 FROM blocks WHERE session_id = ? AND block_id = ?").get(sessionId, b.block_id)) continue;
+                addRef(b.summary_hash);
+                addRef(b.one_hash);
+            }
+            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const cp of dump.checkpoints) {
+                if (!this.getCheckpoint(cp.cp_id as string)) addRef(cp.state_hash);
+            }
+            for (const [hash, count] of references) {
+                const body = dump.content[hash] ?? this.getContent(hash);
+                if (body === null || body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+                if (count > 1) this.db.prepare("UPDATE content SET refcount = refcount + ? WHERE hash = ?").run(count - 1, hash);
+            }
             const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             for (const m of dump.messages) {
                 // #4665: pre-fix dumps lack both fields — recompute identity
@@ -2176,8 +2215,10 @@ export class UnifiedStore {
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
             for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
-            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
-            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+            for (const x of dump.sessionExt) {
+                insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now());
+            }
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
             this.db
@@ -2203,7 +2244,7 @@ export class UnifiedStore {
             } catch { continue; }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
         return { ok: true };
     }
@@ -2271,9 +2312,9 @@ export class UnifiedStore {
         let lineNo = -1;
         for (let i = 0; i < rawLines.length; i++) {
             if (!rawLines[i].trim()) continue;
-            let head: { sessionId?: string; blockId?: string };
-            try { head = JSON.parse(rawLines[i]) as typeof head; } catch { continue; }
-            if (head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
+            let head: unknown;
+            try { head = JSON.parse(rawLines[i]) as unknown; } catch { continue; }
+            if (head && typeof head === "object" && "sessionId" in head && "blockId" in head && head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
         }
         if (lineNo === -1) return { ok: false, reason: "not-found" };
         let dump: { block: Record<string, unknown>; content: Record<string, string> };
@@ -2287,7 +2328,12 @@ export class UnifiedStore {
                 "SELECT 1 AS one FROM blocks WHERE session_id = ? AND block_id = ?",
             ).get(sessionId, blockId);
             if (twin) return;
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            for (const hash of [dump.block.summary_hash, dump.block.one_hash]) {
+                if (typeof hash !== "string") continue;
+                const body = dump.content[hash];
+                if (body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+            }
             this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,
@@ -2307,7 +2353,7 @@ export class UnifiedStore {
             } catch { continue; }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#5312] restored block ${blockId} into ${sessionId} from ${exportPath}`);
         return { ok: true };
     }
@@ -2567,8 +2613,8 @@ export class UnifiedStore {
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
             validateExtKey(keyPrefix, "key prefix");
-            where.push("key LIKE ? ESCAPE '\\'");
-            args.push(likeEscape(keyPrefix) + "%");
+            where.push("key LIKE ? ESCAPE '\\' AND instr(key, ?) = 1");
+            args.push(likeEscape(keyPrefix) + "%", keyPrefix);
         }
         const sql =
             "SELECT namespace, key, value_json, updated_at FROM kv_store" +
@@ -3136,17 +3182,36 @@ export class UnifiedStore {
 
     /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
      *  outside the covered intervals. Inclusive [start, end] pairs; overlaps
-     *  are harmless (each pair contributes an outside-of-pair conjunct).
+     *  are merged before querying the uncovered gaps in bounded batches.
      *  Empty interval list = every live row. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
-        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? AND retired_at IS NULL";
-        const params: unknown[] = [sessionId];
-        for (const [a, b] of intervals) {
-            sql += " AND (seq < ? OR seq > ?)";
-            params.push(a, b);
+        const merged: [number, number][] = [];
+        for (const [start, end] of [...intervals].sort((a, b) => a[0] - b[0])) {
+            if (start > end) continue;
+            const last = merged.at(-1);
+            if (last && start <= last[1] + 1) last[1] = Math.max(last[1], end);
+            else merged.push([start, end]);
         }
-        sql += " ORDER BY seq";
-        const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
+        const gaps: Array<[number | undefined, number | undefined]> = [];
+        let lower: number | undefined;
+        for (const [start, end] of merged) {
+            gaps.push([lower, start]);
+            lower = end;
+        }
+        gaps.push([lower, undefined]);
+        const rows: Record<string, unknown>[] = [];
+        for (let offset = 0; offset < gaps.length; offset += 200) {
+            const params: unknown[] = [sessionId];
+            const clauses = gaps.slice(offset, offset + 200).map(([lo, hi]) => {
+                const bounds: string[] = [];
+                if (lo !== undefined) { bounds.push("seq > ?"); params.push(lo); }
+                if (hi !== undefined) { bounds.push("seq < ?"); params.push(hi); }
+                return bounds.length > 0 ? `(${bounds.join(" AND ")})` : "1";
+            });
+            const sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? AND retired_at IS NULL"
+                + ` AND (${clauses.join(" OR ")}) ORDER BY seq`;
+            for (const row of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) rows.push(row);
+        }
         return rows.map((r) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
