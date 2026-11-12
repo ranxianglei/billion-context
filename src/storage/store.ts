@@ -31,6 +31,8 @@ import {
     readSnapView,
     snapGcCoveredRows,
     snapL1Record,
+    snapR3LatchedRead,
+    snapR3LatchWrite,
     snapplaneStatusWire,
     snapRowsAll,
     SnapPlaneDeadError,
@@ -374,6 +376,12 @@ export interface IngestSessionInput {
      *  from this view; null falls back to the defensive full-transcript diff
      *  (saves that don't carry a turn view). */
     planeMessages?: CoreMessage[] | null;
+    /** #6181 B0: one-shot plane-write skip for THIS save — set by the lane
+     *  for a turn that cannot be addressed against the plane (a non-cohort
+     *  chained delta). snapShadowSync returns before any plane work; the
+     *  flag is consumed at the persist build (the live session flag is
+     *  cleared by the lane after the in-request flush). */
+    skipPlaneFlush?: boolean;
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
@@ -1609,6 +1617,13 @@ export class UnifiedStore {
         const sid = input.session.sessionId;
         if (this.hasLaneExt(sid)) return; // skip:lane — lane transcripts are not the cohort truth
         if (isSnapPlaneDead(sid)) return; // dead (R1) — sticky, silent; status surfaces it
+        // #6181 B0: a turn that CANNOT be addressed against the plane (a
+        // non-cohort chained delta — its kernel view is a delta, not the
+        // world) skips the plane write for THIS save: deriving events from
+        // the collapsed view would DELETE every row the view does not
+        // contain (snapViewEvents is a final-state diff). The flag is
+        // one-shot — consumed by the persist build, not here.
+        if (input.skipPlaneFlush) return;
         const now = Date.now();
         // Stage-0 identity: raw host session id → ledger id (v1 mapping: the
         // conversation binding, session_id when there is none).
@@ -2575,6 +2590,26 @@ export class UnifiedStore {
             this.db.prepare("UPDATE l1_world SET envelope_json = NULL, envelope_checksum = NULL WHERE sess_raw = ?").run(sessRaw);
         });
         clearSnapPlaneDead(sid);
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
+     *  previous process (a restart must not re-arm a misbehaving host and
+     *  re-400 the same broken envelope). */
+    snapR3Latched(sid: string): boolean {
+        try {
+            return snapR3LatchedRead(this.db, this.snapSessRawOf(sid));
+        } catch {
+            return false; // schema/column edge: treat as unlatched, the in-memory breaker still fires
+        }
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort — a failed
+     *  write degrades to the in-memory latch, which still fires this
+     *  process). */
+    snapR3Latch(sid: string): void {
+        try {
+            snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+        } catch { /* best-effort — see above */ }
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).

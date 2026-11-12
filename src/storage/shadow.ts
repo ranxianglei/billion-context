@@ -1013,6 +1013,18 @@ export class UnifiedShadow {
         this.sync.snapStage0Reset(sessionId);
     }
 
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);

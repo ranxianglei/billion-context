@@ -152,6 +152,7 @@ billion-context/
 │   │   ├── delta.ts              #   Outbound delta selection: seed/delta/no-op + full-resend detection (#6181)
 │   │   ├── identity.ts           #   matchWorld verdicts (echo/probe/scatter/issue/diverge/resync) + canon parse (#5874)
 │   │   ├── plane.ts              #   Stage-0 decision glue: R3 identity check, 400 fault breaker, lane decide (#6181)
+│   │   ├── stage0.ts             #   Lane-agnostic stage-0 entry: pin + R3 + stage-0 decision + assembly, shared by the openai and responses lanes (#6181)
 │   │   └── types.ts              #   Shared stage-0 types (type-only, kernel-public-types only) (#6181)
 │   ├── storage/                  # Unified storage layer (schema, SQLite engine ladder, backends) (#2671)
 │   │   ├── backend.ts            #   Storage backend contract: sqlite + mysql operation seam (#3931)

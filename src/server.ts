@@ -165,6 +165,7 @@ import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
+import { FoundationRejectError } from "./snapshot/plane.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -780,6 +781,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // The rethrow rides ONLY the request the WS session stamped
             // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
             if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
+            // #6181 B1/B2: an R3 identity fault (the client declared a
+            // snapshot envelope that fails the identity gates) is a HARD 400
+            // with the identity marker — NOT the generic 503, NOT a silent
+            // raw forward: the host must learn that the envelope is broken.
+            // Both lanes rethrow FoundationRejectError into this funnel; it
+            // throws before processTurn, so the session is untouched.
+            if (err instanceof FoundationRejectError) {
+                if (!res.headersSent) {
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
+                    res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
+                } else {
+                    res.end();
+                }
+                return;
+            }
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
@@ -2001,6 +2017,13 @@ export type Prepared = {
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
+    /** #6181 B4: the delta frontier selected for THIS turn's outbound —
+     *  COMMITTED to the session only AFTER the upstream ACCEPTS the request
+     *  (relay.ts, first forward, status < 400). A failed/4xx forward drops
+     *  it (null) so the next round RE-SEEDS (at-least-once: over-serving is
+     *  safe, under-serving is the context loss). Absent (undefined) = no
+     *  delta was selected this turn. */
+    pendingResponsesDelta?: { frontierPos: number; servedAnchors: string[] } | null;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND
      *  anthropic system (pre-anchor). Preflight summary calls must carry it —

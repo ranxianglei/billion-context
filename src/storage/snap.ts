@@ -732,6 +732,32 @@ export function snapL1EnvelopeUpsert(db: DbLike, sessRaw: string, envelopeJson: 
     if (res.changes === 0) throw new Error(`snapL1EnvelopeUpsert: no l1_world row for sess_raw ${sessRaw.slice(0, 12)}… (record it first)`);
 }
 
+/** #6181 M3: read the persisted R3 breaker latch (true when the sid's
+ *  breaker latched in a PREVIOUS process — a restart must not re-arm a
+ *  misbehaving host). Missing row or NULL → false. */
+export function snapR3LatchedRead(db: DbLike, sessRaw: string): boolean {
+    const r = db
+        .prepare("SELECT r3_latched_at FROM l1_world WHERE sess_raw = ?")
+        .get(sessRaw) as { r3_latched_at: number | null } | undefined;
+    return !!r && !!r.r3_latched_at;
+}
+
+/** #6181 M3: persist the R3 breaker latch (UPDATE only — the l1 row is
+ *  created by snapL1Record before the lane arms; a missing row degrades
+ *  silently, the in-memory latch still fires for this process). */
+export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): void {
+    // Upsert — the first fault of a fresh session happens BEFORE its stage-0
+    // snapL1Record call (the R3 check runs at pin validation), so an
+    // UPDATE-only latch would silently no-op for sessions with no l1 row yet.
+    // ledger_id takes the placeholder sessRaw and witness_probe/issued_at the
+    // sentinel values: the latch row's envelope stays NULL until a later
+    // (repaired) stage-0 snapL1Record upsert carries the real ledger id and
+    // witness. A latched session never re-arms (runStage0 checks the persisted
+    // latch before any store call), so the placeholder can never hit the
+    // "red" ledger-conflict path of snapL1Record.
+    db.prepare("INSERT INTO l1_world (sess_raw, ledger_id, witness_probe, issued_at, r3_latched_at) VALUES (?, ?, '', ?, ?) ON CONFLICT(sess_raw) DO UPDATE SET r3_latched_at = excluded.r3_latched_at, ledger_id = COALESCE(l1_world.ledger_id, excluded.ledger_id), witness_probe = COALESCE(NULLIF(l1_world.witness_probe, ''), excluded.witness_probe)").run(sessRaw, sessRaw, nowMs, nowMs);
+}
+
 // ---------------------------------------------------------------------------
 // 2×2 read side — the FULL row set (active AND inactive), for the stage-0
 // hydrate: S4 drift checks, explainedGone (fold-covered ids may legally
