@@ -177,3 +177,15 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
 
 实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
+
+## 离环 owner 死亡回收 —— 看门狗第二轴(#5449)
+
+#4762 看门狗覆盖 ≥5 分钟的连续卡死,但 #5449 事故(dsh/Windows)暴露了中间地带:DSH 宿主在代理事件循环卡死且让出稀疏(日志密度 1–7 行/分钟)时死亡。环内父进程监视器(2 秒 tick)只有循环让出时才能检测/回收,而把死掉的 spawner 从 `proxyWatchers` 里移除的唯一路径正是这个被饿死的回收器——于是孤儿进程以 ~51% 单核 CPU 占住 `index.db` 写锁与首选端口长达 33 分钟,接替实例漂移到 18790,钉在 18789 上的调用方 826 秒零字节。
+
+设计:#4762 的 worker 线程增加第二条独立轴。worker 在自己的事件循环上每 tick 用 `process.kill(pid, 0)` 探测 spawner 的 owner pid(`BILI_PARENT_PID`,以 `parentPid` 传入)——EPERM 记为存活(#3890 纪律),被复用的 pid 读作存活,所以探测可能漏回收但绝不会误杀。仅当三者同时成立才触发:死亡连续 ≥ `WATCHDOG_OWNER_DEAD_CONFIRM_TICKS`(3 次)、主循环静默 ≥ `WATCHDOG_SOFT_WARN_MS`(30 秒)、无其他 owner 附着(计数随每次心跳采样)。循环静默门保证不越权:仍在让出的循环会先走到环内回收器的优雅路径(~11 秒)。计数为 `otherOwnerCount()`——环内监视集减去被探测 pid(它的移除依赖被饿死的回收器;不排除则守卫冻结在 ≥1,该轴退化回环内路径)。卡死的循环冻结最后已知计数——合理,因为卡死期间附着新 owner 需要 HTTP 应答。
+
+净效果:稀疏让出卡死下的孤儿占用,从数分钟收敛到 owner 死亡后 ~15–45 秒。FATAL 行携带最后一次探测的 errno(Windows 上 errno 是归因假死 episode 的唯一线索,#3890)。
+
+行为变更(已披露):旧 = owner 死亡后卡死的代理只由环内 tick 回收(受让出频率限制——事故中为分钟级)或 #4762 全卡死退出(≥5 分钟)。新 = 额外地,worker 在确认 owner 死亡 ×3 tick + 循环静默 ≥30 秒 + 零其他 watcher 后 ~15–45 秒退出进程。不变:手动 `bili start`(无 `BILI_PARENT_PID` → 轴禁用,逐字节一致);健康/慢让出循环(优雅关闭仍获胜);多 owner 共享代理(最后 owner 守卫);全部 wire/config/持久化面(未触碰)。范围外:#5449 Part 2(漂移端口上的滞留调用方)另行跟踪(#5834)。
+
+测试:`tests/issue5449-offloop-owner-reap.test.ts`(`ownerReapVerdict` 与 `otherOwnerCount` 纯谓词边界表 + 真实 worker 触发/不触发矩阵:死 owner+卡死+空集以 reason `parent-gone` 触发;死 spawner 仍在集合中经生产计数器触发;另有活 owner 附着绝不触发;活 owner 绝不触发;健康心跳循环绝不触发(不越权);计数随心跳更新而非 init 快照;无 `parentPid` 时轴禁用)。

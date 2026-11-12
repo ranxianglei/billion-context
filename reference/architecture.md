@@ -49,7 +49,7 @@ billion-context/
 │   ├── model-endpoints.ts         # Declarable custom-wire model endpoints: pattern parse + longest-prefix match, one source feeds proxy classifier + client claim (#1295)
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
 │   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
-│   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
+│   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762) + off-loop owner-death reap when the loop is wedged (#5449)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
 │   ├── log-retention.ts          # Private-log generations: 48h target under a hard byte budget, 0600, honest coverage
