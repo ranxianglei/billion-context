@@ -23,7 +23,7 @@ process.env.BILI_PERSIST = "0";
 import { defaultConfig } from "acp-kernel";
 import { handlePluginManifest } from "../src/plugin.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { injectGoogleTool, injectOpenaiTool, injectResponsesTool, injectTool, injectSystem } from "../src/server/inject.ts";
+import { CODEX_EXEC_EXEMPT_NOTE, injectGoogleTool, injectOpenaiTool, injectResponsesTool, injectTool, injectSystem } from "../src/server/inject.ts";
 import { PROJECT_URL_NOTE, PTC_BINDING_NOTE, PTC_EXEMPT_NOTE, PROJECT_ATTRIBUTION_LINE, withProjectAttribution } from "../src/compress-tool.ts";
 
 const RUN_CODE = { name: "run_code", description: "Run a program in the sandbox." };
@@ -96,7 +96,6 @@ test("injectResponsesTool: run_code client → exempt note, flat shape", () => {
     assert.equal(out.get("run_code"), RUN_CODE.description, "client entry untouched");
 });
 
-const CODEX_DIRECT_NOTE = "This proxy-provided tool has no functions.exec SDK binding";
 const CODEX_EXEC = { type: "custom", name: "exec", description: "Run JavaScript code to orchestrate tool calls." };
 
 test("injectResponsesTool: qualified Codex exec teaches direct calls without changing host tools (#5592)", () => {
@@ -113,7 +112,7 @@ test("injectResponsesTool: qualified Codex exec teaches direct calls without cha
         assert.equal(out[0], tools[0], "host declarations retain object identity");
         assert.equal(JSON.stringify(tools), before, "host declarations remain byte-exact");
         for (const name of ["compress", "decompress", "search_context", "acp_status", "acp_cache"]) {
-            assert.ok(descriptions.get(name)?.includes(CODEX_DIRECT_NOTE), name);
+            assert.ok(descriptions.get(name)?.includes(CODEX_EXEC_EXEMPT_NOTE), name);
             assert.ok(!descriptions.get(name)?.includes(PTC_BINDING_NOTE), name);
         }
         assert.equal(JSON.stringify(out), JSON.stringify(injectResponsesTool(tools)), "stable prompt bytes");
@@ -136,7 +135,7 @@ test("injectResponsesTool: ordinary exec and unrelated namespaces do not acquire
     ];
     for (const tools of shapes) {
         for (const description of flat(injectResponsesTool(tools)).values()) {
-            assert.ok(!description.includes(CODEX_DIRECT_NOTE));
+            assert.ok(!description.includes(CODEX_EXEC_EXEMPT_NOTE));
         }
     }
 });
@@ -148,10 +147,10 @@ test("injectResponsesTool: Codex notes preserve native MCP tools and pack-owned 
     const out = injectResponsesTool(tools, undefined, pack);
     assert.equal(out[1], native);
     assert.equal(flat(out).get("compress"), pack.compress.description);
-    assert.ok(flat(out).get("acp_status")?.includes(CODEX_DIRECT_NOTE));
+    assert.ok(flat(out).get("acp_status")?.includes(CODEX_EXEC_EXEMPT_NOTE));
     for (const entries of Object.values(readManifestTools())) {
         assert.ok(entries.get("compress")?.includes(PTC_BINDING_NOTE));
-        assert.ok(!entries.get("compress")?.includes(CODEX_DIRECT_NOTE));
+        assert.ok(!entries.get("compress")?.includes(CODEX_EXEC_EXEMPT_NOTE));
     }
 });
 
