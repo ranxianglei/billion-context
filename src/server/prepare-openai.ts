@@ -28,7 +28,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, effectiveCcr, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -46,7 +46,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { foldSummariesToCcr } from "../fold-summary-ccr.js";
+import { applyFoldSummaryCcr } from "../fold-summary-ccr.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -443,16 +443,11 @@ export async function prepareOpenai(
         let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         // #6111 POC (from #6025): render proxy-mode fold summaries as CCR
         // placeholders on the outbound view instead of inline prose — weak models
-        // misread a wall of summary text as the current question. Default off; only
-        // where CCR is armed so acp_retrieve can never point at an absent tool.
+        // misread a wall of summary text as the current question. Gated on the
+        // rollout feature AND CCR being armed (a placeholder must stay retrievable).
         // Outbound copies only — session state / message records are untouched.
-        if (featureEnabled("foldSummaryCcrPlaceholder") && ccrEnabled(session)) {
-            const foldedSummaries = foldSummariesToCcr(egressMessages, contentStoreOf(session), retrieveToolName(session), effectiveCcr(session)?.maxHeadChars ?? 96);
-            if (foldedSummaries.replaced > 0) {
-                egressMessages = foldedSummaries.messages;
-                adoptContentStore(session, foldedSummaries.store);
-            }
-        }
+        const foldCcr = applyFoldSummaryCcr(egressMessages, session);
+        if (foldCcr.applied) egressMessages = foldCcr.messages;
         // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the

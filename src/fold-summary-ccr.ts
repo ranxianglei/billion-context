@@ -9,6 +9,9 @@ import {
     type CoreMessage,
     type MessageContentStore,
 } from "acp-kernel";
+import { featureEnabled } from "./rollout.js";
+import type { Session } from "./session.js";
+import { ccrEnabled, contentStoreOf, effectiveCcr, retrieveToolName, adoptContentStore } from "./store.js";
 
 // #6111 POC (from #6025): render proxy-mode fold summaries as CCR placeholders
 // on the OUTBOUND view instead of inline prose. A wall of summary text re-voiced
@@ -103,4 +106,26 @@ export function foldSummariesToCcr(
         };
     });
     return { messages: out, store, replaced };
+}
+
+/** Seam entry for the #6111 fold-summary→CCR-placeholder swap: applies
+ *  foldSummariesToCcr to an egress view, gated on the rollout feature AND CCR
+ *  being armed (a placeholder must stay retrievable — never point at an absent
+ *  tool). Outbound view only; the session content store is adopted in place.
+ *  Returns { applied: false } (same array) when the gate is off or there is
+ *  nothing to swap. Both egress seams (prepare-openai / prepare-responses) call
+ *  this so the gate lives in exactly one place. */
+export function applyFoldSummaryCcr(
+    messages: CoreMessage[],
+    session: Session,
+): { messages: CoreMessage[]; applied: boolean } {
+    if (!featureEnabled("foldSummaryCcrPlaceholder") || !ccrEnabled(session)) {
+        return { messages, applied: false };
+    }
+    const folded = foldSummariesToCcr(messages, contentStoreOf(session), retrieveToolName(session), effectiveCcr(session)?.maxHeadChars ?? 96);
+    if (folded.replaced > 0) {
+        adoptContentStore(session, folded.store);
+        return { messages: folded.messages, applied: true };
+    }
+    return { messages, applied: false };
 }

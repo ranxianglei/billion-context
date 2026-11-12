@@ -28,6 +28,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_
 import { blockOpsEnabled, storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { applyFoldSummaryCcr } from "../fold-summary-ccr.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
@@ -443,6 +444,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         processedMessages = ordered.messages;
         separatorSlots = ordered.slots;
+        // #6111 POC (responses seam — the H2 gap): fold summaries are kernel-created
+        // insertions (absent from the raw projection), so the codec emits the
+        // processed text verbatim — swapping it here reaches the wire, parallel to
+        // the openai seam. Gated on the rollout feature AND CCR being armed.
+        // Outbound view only; session state untouched.
+        const foldCcr = applyFoldSummaryCcr(processedMessages, session);
+        if (foldCcr.applied) processedMessages = foldCcr.messages;
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
