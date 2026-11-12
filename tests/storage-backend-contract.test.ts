@@ -78,6 +78,31 @@ test("registry: sqlite resolves through the registry; names are advertised", asy
     }
 });
 
+for (const lane of lanes) {
+    test(`${lane.name}: KV prefixes match literal keys without case or accent folding`, async () => {
+        const dir = scratch();
+        const backend = await lane.open(dir);
+        const namespace = `kv-prefix-${lane.name}-${process.pid}-${Date.now()}`;
+        try {
+            for (const key of ["Prefix:one", "prefix:two", "café:one", "cafe:two", "a%_\\[literal]:one", "aXYZliteral:two"]) {
+                await backend.setKv(namespace, key, { key });
+            }
+            const keys = async (prefix: string) => (await backend.listKv(namespace, prefix)).map((r) => r.key);
+            assert.deepEqual(await keys("Prefix:"), ["Prefix:one"]);
+            assert.deepEqual(await keys("prefix:"), ["prefix:two"]);
+            assert.deepEqual(await keys("café:"), ["café:one"]);
+            assert.deepEqual(await keys("cafe:"), ["cafe:two"]);
+            assert.deepEqual(await keys("a%_\\[literal]:"), ["a%_\\[literal]:one"]);
+            assert.deepEqual(await keys("missing:"), []);
+            assert.equal((await keys("")).length, 6);
+        } finally {
+            await backend.deleteKv(namespace);
+            await backend.close();
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+}
+
 test("contract: ingest → reads round-trip through the interface", async () => {
     const dir = scratch();
     try {

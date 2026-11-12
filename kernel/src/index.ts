@@ -126,6 +126,12 @@ export type {
   CollectContentOptions,
   InlineRestoreResult,
 } from "./decompress.js";
+export {
+  retireBlocks,
+  restoreBlocks,
+  rewriteBlockSummary,
+} from "./block-ops.js";
+export type { BlockOpOutcome } from "./block-ops.js";
 export { buildStatusReport, buildRecap } from "./report.js";
 export type { StatusReportOptions, StatusReportMeta } from "./report.js";
 export { segmentGroups } from "./segment.js";

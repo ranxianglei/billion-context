@@ -161,9 +161,12 @@ function writeSnapshotLegacy(): void {
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
  *  union), merge ours in fresher-wins, re-apply bounds, write back. Writes are
  *  chained so back-to-back schedules never lose updates against each other. */
-function persistUnifiedNow(): void {
+function persistUnifiedNow(): Promise<void> {
+    // This batch now owns its queued write; later mutations need a fresh
+    // debounce window even while the store is still settling this one.
+    pendingSince = null;
     const store = kvStore();
-    if (!store) return;
+    if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
         let live: OrderSkeletonEntry[] | null = null;
         try {
@@ -182,6 +185,7 @@ function persistUnifiedNow(): void {
         // matching what the warning promises; a healthy store stays primary.
         kvReady = false;
     });
+    return kvChain;
 }
 
 /** Once per process (wired at cli start): layer the kv snapshot over what the

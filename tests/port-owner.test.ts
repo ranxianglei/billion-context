@@ -4,6 +4,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Agent, fetch as directFetch } from "undici";
 import { findForeignOwner, holderHintFragment, holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, type HealthFetcher } from "../src/port-owner.ts";
 import { atomicWriteInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "../src/instance.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -264,6 +265,39 @@ test("holderProbeOrigin: wildcard binds probe through loopback (#4762)", () => {
     assert.equal(holderProbeOrigin("127.0.0.1", 18789), "http://127.0.0.1:18789");
     assert.equal(holderProbeOrigin("0.0.0.0", 18789), "http://127.0.0.1:18789");
     assert.equal(holderProbeOrigin("::", 18789), "http://127.0.0.1:18789");
+});
+
+test("holderProbeOrigin: IPv6 literals remain valid URL authorities", () => {
+    assert.equal(holderProbeOrigin("::1", 18789), "http://[::1]:18789");
+    assert.equal(holderProbeOrigin("2001:db8::1", 18789), "http://[2001:db8::1]:18789");
+    assert.equal(holderProbeOrigin("[::1]", 18789), "http://[::1]:18789");
+    assert.equal(holderProbeOrigin("localhost", 18789), "http://localhost:18789");
+});
+
+test("probeHolderForHint: a healthy IPv6 listener is not diagnosed as wedged", async () => {
+    const server = http.createServer((req, res) => {
+        assert.equal(req.url, "/__bili/health");
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true, pid: FOREIGN_PID, instanceId: "ipv6-holder" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "::1", resolve);
+    });
+    const port = (server.address() as { port: number }).port;
+    const dispatcher = new Agent();
+    try {
+        const hint = await probeHolderForHint({
+            origin: holderProbeOrigin("::1", port),
+            fetchImpl: (url, init) => directFetch(url, { signal: init?.signal, dispatcher }),
+        });
+        assert.match(hint, /answered \/__bili\/health \(pid 4242424\)/);
+        assert.doesNotMatch(hint, /wedged or dead|kill it/);
+    } finally {
+        await dispatcher.close();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
 });
 
 test("holderHintFragment: serving vs wedged/dead wording, with and without a pid (#4762)", () => {
