@@ -26,6 +26,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
@@ -1651,16 +1652,37 @@ function missingSlot(): DriftSlotFingerprint {
     return { id: "-", role: "-", length: 0, sha8: "-" };
 }
 
+/** #6351: the two legs hold the same message in DIFFERENT media representations.
+ *
+ *  Rows are written media-SPLIT (`planIngest` -> `splitMediaContent`: an
+ *  `imageBase64` payload and every >=2 KiB data URL become `{"$media":hash}`
+ *  CAS references), but `UnifiedStore.getMessages()` returns them media-
+ *  HYDRATED (`hydrateMedia` inlines the payload again) — the verifier reads the
+ *  tail through exactly that accessor, so its leg is hydrated while the
+ *  envelope's `lastMessages` keeps the split form.
+ *
+ *  Hashing the canonical JSON as-is therefore compares a ~2 KB placeholder
+ *  against a ~200 KB inlined payload for the SAME message and marks drift: a
+ *  measured 1,991 vs 201,293 bytes on one tool result, and ten 390-byte user
+ *  rows that hydrate to 112-672 KB. That is a digest-shape mismatch (#4392
+ *  family), so the latch it triggers re-ingests the whole tail forever (#5677).
+ *
+ *  Normalize BOTH legs to the split form before hashing: it is idempotent on
+ *  already-split input, so the envelope leg passes through unchanged, and
+ *  `splitMediaContent(hydrate(x)) === x` was verified byte-identical on every
+ *  media-bearing row sampled, so a real content edit still changes the digest.
+ */
 function messageSignature(value: unknown): { digest: string; slot: DriftSlotFingerprint } {
     const json = JSON.stringify(canonicalize(value)) ?? "null";
-    const digest = sha256(json);
+    const normalized = splitMediaContent(json).content;
+    const digest = sha256(normalized);
     const message = value as { id?: unknown; role?: unknown } | null;
     return {
         digest,
         slot: !message || typeof message !== "object" ? missingSlot() : {
             id: typeof message.id === "string" ? message.id : "-",
             role: typeof message.role === "string" ? message.role : "-",
-            length: json.length,
+            length: normalized.length,
             sha8: digest.slice(0, 8),
         },
     };
