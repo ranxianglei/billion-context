@@ -258,13 +258,14 @@ async function toInlineReq(input: FetchInput, init?: RequestInit): Promise<Inlin
     return new InlineReq(parsed.pathname + parsed.search, method, headerMap, body);
 }
 
-function responseFrom(res: InlineRes): Response {
+function responseFrom(res: InlineRes, method: string): Response {
     const headers = new Headers();
     for (const [k, v] of res.headHeaders) {
         if (HOP_HEADERS.has(k.toLowerCase())) continue;
         headers.append(k, v);
     }
-    return new Response(res.bodyStream, { status: res.statusCode, statusText: res.statusMessage || undefined, headers });
+    const body = method === "HEAD" || res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304 ? null : res.bodyStream;
+    return new Response(body, { status: res.statusCode, statusText: res.statusMessage || undefined, headers });
 }
 
 function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
@@ -374,7 +375,7 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
                 res.once("close", detach);
             }
         }
-        return responseFrom(res);
+        return responseFrom(res, req.method);
     };
 }
 
