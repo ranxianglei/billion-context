@@ -65,7 +65,7 @@ import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir, resolvePluginBypass } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -113,6 +113,17 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
+
+// #6220: warn-once per forced state for BILI_PLUGIN_BYPASS ("on" / "off" /
+// "invalid") — the first request that sees a forced state gets the loud risk
+// line, later requests stay at debug level.
+const pluginBypassForceWarned = new Set<string>();
+
+/** Test seam: clear the #6220 warn-once set so a suite can assert the warns
+ *  from a clean slate (same pattern as _resetNoOutputCeilingWarningsForTest). */
+export function _resetPluginBypassForceWarnForTest(): void {
+    pluginBypassForceWarned.clear();
+}
 
 // #5608 v3: weakest VERIFIED common-prefix ratio (verifiedPrefix / chainDepth)
 // at which a byte-exact MISS may still weakly adopt the closest tracked chain.
@@ -637,7 +648,23 @@ async function handleRequest(
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
     // here would double-manage it. Raw forward, zero state touched.
-    if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
+    // #6220: BILI_PLUGIN_BYPASS force switch (env, tri-state) overrides the
+    // per-request header decision: "on" force-bypasses ALL inbound traffic
+    // (escape valve); "off" ignores the header everywhere; unset/auto = the
+    // header-based behavior below.
+    const bypassMode = resolvePluginBypass();
+    if (bypassMode === "on" && !pluginBypassForceWarned.has("on")) {
+        pluginBypassForceWarned.add("on");
+        log("warn", `BILI_PLUGIN_BYPASS=on — forced: EVERY inbound model request is now raw passthrough (no compression, no session state, any lane). If nothing in-process (e.g. opencode acp) is actually compressing, your traffic reaches the model UNCOMPRESSED. Unset BILI_PLUGIN_BYPASS to restore per-request header behavior (#6220).`);
+    } else if (bypassMode === "off" && !pluginBypassForceWarned.has("off")) {
+        pluginBypassForceWarned.add("off");
+        log("warn", `BILI_PLUGIN_BYPASS=off — forced: the inbound ${BILI_PLUGIN_BYPASS_HEADER} header is ignored on every request; opencode legacy sessions will now be managed by bili, but their pre-existing ref space lives in the in-process acp store, so their history degrades to a read-only archive. Unset BILI_PLUGIN_BYPASS to restore per-request header behavior (#6220).`);
+    } else if (bypassMode === "invalid" && !pluginBypassForceWarned.has("invalid")) {
+        pluginBypassForceWarned.add("invalid");
+        log("warn", `BILI_PLUGIN_BYPASS is set to an unrecognized value — treating it as unset (auto). Use 1 (force bypass all traffic), 0 (never bypass) or auto/unset (#6220).`);
+    }
+    const bypass = bypassMode === "on" || (bypassMode !== "off" && headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1");
+    if (bypass) {
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;

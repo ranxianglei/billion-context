@@ -1068,3 +1068,23 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     return WAL_JOURNAL_SIZE_LIMIT;
 }
 
+/** BILI_PLUGIN_BYPASS — #6220: tri-state force switch for the
+ *  x-bili-plugin-bypass wire lane (decision site: src/server/handle.ts).
+ *  "on"  (1/true/on)  — force bypass: EVERY inbound model request is raw
+ *                       passthrough, all lanes, no compression, no state.
+ *  "off" (0/false/off) — never bypass: ignore any inbound
+ *                       x-bili-plugin-bypass header (incl. opencode legacy).
+ *  "auto" (unset/empty/auto) — honor the header per request (today's behavior).
+ *  "invalid" — set to an unrecognized value: behaves as "auto"; the read site
+ *  warns once so a typo can't silently sit on the surface.
+ *  Env-only by owner ruling in the #6220 thread (explicit escape valve, not a
+ *  per-machine tunable — no config-file twin, per reference/env-vars.md hard
+ *  rule 1). Pure: env in, decision out (never throws). */
+export function resolvePluginBypass(env: NodeJS.ProcessEnv = process.env): "on" | "off" | "auto" | "invalid" {
+    const raw = env.BILI_PLUGIN_BYPASS?.trim().toLowerCase();
+    if (raw === "1" || raw === "true" || raw === "on") return "on";
+    if (raw === "0" || raw === "false" || raw === "off") return "off";
+    if (raw === undefined || raw === "" || raw === "auto") return "auto";
+    return "invalid";
+}
+

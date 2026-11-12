@@ -415,6 +415,7 @@
 | `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
 | `BILI_STRICT_PORT` | number | unset | — | 派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。 |
 | `BILI_UPGRADE_REPLACEMENT` | boolean-ish | unset | — | 派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。 |
+| `BILI_PLUGIN_BYPASS` | string | unset (auto) | — | x-bili-plugin-bypass 透传判决的强制开关（#6220）。缺省/auto = 由每请求头决定（opencode 旧版 acp 会话透传、其余压缩，行为零变化）。1/on = 强制所有流量透传、不压缩不记状态：用于“进程内已有压缩器但 bili 仍在管理这些会话”的逃生阀；若进程内实际没有压缩器（如 opencode acp），流量会以**未压缩**状态直达模型。0/off = 无视一切入站透传头（含 opencode 旧版）：bili 接管这些会话，但其既有引用空间在进程内 acp 存储里，历史降级为只读归档。每种强制态首次命中时打一条醒目警告；无法识别的取值按缺省（auto）处理并警告一次。按 owner 决定（#6220）env-only。 |
 | `BILI_OPENCODE_ACP_SPEC` | string | unset | — | 派生通道：opencode 原生车道的 ACP 规格标记。 |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | 启动器通道：传入被派生客户端的模型窗口覆盖。 |
 | `BILI_LAUNCHER_LANE` | string | unset | — | 启动器通道：派生方 bili 进程的车道身份。 |

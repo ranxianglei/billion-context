@@ -218,6 +218,7 @@
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
 | `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
 | `BILI_DSH_MAX_TESTED_VERSION` | dsh native lane「高于已测最高版」启动提示的上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读运行中的构建，**严格高于**上限才弹一条启动提示，建议先回滚；默认 0.2.0-rc.2（CI e2e 锚点），新版本验证通过后抬高；空串 = 关闭检查；只提示不拦截 |
+| `BILI_PLUGIN_BYPASS` | x-bili-plugin-bypass 判决的强制开关（#6220）：缺省/auto 按每请求头走（零行为变化）；`1` 强制全流量原始透传（逃生阀，无进程内压缩器时流量**未压缩**直达模型）；`0` 无视一切 bypass 头（opencode 旧版会话被 bili 接管，既有历史降级只读归档）；无法识别的取值按缺省处理 + 一次警告；每种强制态首次命中打一条醒目 warn；env-only（owner 在 #6220 明确拍板，无文件键） |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 

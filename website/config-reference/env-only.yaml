@@ -299,6 +299,15 @@ entries:
     desc_en: "Spawn channel: marks a self-restart replacement — it must own exactly the freed port or exit without hopping (#3044)."
     desc_zh: "派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。"
     desc_ja: "生成チャネル：自己再起動による置換をマークする — 解放されたポートを正確に所有するか、ホッピングせずに終了しなければならない（#3044）。"
+  - key: BILI_PLUGIN_BYPASS
+    type: string
+    default: "unset (auto)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Force switch for the x-bili-plugin-bypass wire decision (#6220). Unset/auto = the inbound per-request header decides (legacy opencode acp sessions bypass, everyone else is compressed — zero behavior change). 1/on = FORCE bypass for ALL inbound traffic, raw passthrough with no compression or session state: the escape valve when an in-process compressor is loaded but bili still manages those sessions; if nothing in-process (e.g. opencode acp) is actually compressing, traffic reaches the model UNCOMPRESSED. 0/off = ignore any inbound bypass header, including opencode legacy ones: bili takes over those sessions, but their pre-existing ref space lives in the in-process acp store, so their history degrades to a read-only archive. Each forced state emits one loud startup-of-traffic warn; unrecognized values are treated as unset (auto) with one warning. Env-only by design (owner decision in #6220)."
+    desc_zh: "x-bili-plugin-bypass 透传判决的强制开关（#6220）。缺省/auto = 由每请求头决定（opencode 旧版 acp 会话透传、其余压缩，行为零变化）。1/on = 强制所有流量透传、不压缩不记状态：用于“进程内已有压缩器但 bili 仍在管理这些会话”的逃生阀；若进程内实际没有压缩器（如 opencode acp），流量会以**未压缩**状态直达模型。0/off = 无视一切入站透传头（含 opencode 旧版）：bili 接管这些会话，但其既有引用空间在进程内 acp 存储里，历史降级为只读归档。每种强制态首次命中时打一条醒目警告；无法识别的取值按缺省（auto）处理并警告一次。按 owner 决定（#6220）env-only。"
+    desc_ja: "x-bili-plugin-bypass ワイヤ判定の強制スイッチ（#6220）。未設定/auto = 受信の各リクエストヘッダが決定する（レガシー opencode acp セッションはバイパス、その他は圧縮 — 挙動変更ゼロ）。1/on = 全受信トラフィックを強制バイパス、圧縮もセッション状態もなしで生パススルー：プロセス内圧縮器がロードされているのに bili がまだそれらのセッションを管理している場合の緊急出口；プロセス内で実際に圧縮しているものがない場合（例：opencode acp）、トラフィックは圧縮されずにモデルに到達する。0/off = 入ってくるバイパスヘッダをすべて無視（opencode レガシー含む）：bili がそれらのセッションを引き受けるが、既存の ref 空間はプロセス内の acp ストアにあるため、その履歴は読み取り専用アーカイブに降格される。各強制状態はトラフィック開始時に 1 回の大きな警告を出す；認識できない値は未設定（auto）として扱い、1 回警告する。設計上 env のみ（#6220 のオーナー決定）。"
   - key: BILI_OPENCODE_ACP_SPEC
     type: string
     default: "unset"

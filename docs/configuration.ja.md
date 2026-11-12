@@ -414,6 +414,7 @@
 | `BILI_PARENT_PID` | number | unset | — | 生成チャネル：ライフサイクル監視用の親プロセスID。 |
 | `BILI_STRICT_PORT` | number | unset | — | 生成チャネル：正確なポート要件（スキャッターはホッピングせず、明確に拒否される）。 |
 | `BILI_UPGRADE_REPLACEMENT` | boolean-ish | unset | — | 生成チャネル：自己再起動による置換をマークする — 解放されたポートを正確に所有するか、ホッピングせずに終了しなければならない（#3044）。 |
+| `BILI_PLUGIN_BYPASS` | string | unset (auto) | — | x-bili-plugin-bypass ワイヤ判定の強制スイッチ（#6220）。未設定/auto = 受信の各リクエストヘッダが決定する（レガシー opencode acp セッションはバイパス、その他は圧縮 — 挙動変更ゼロ）。1/on = 全受信トラフィックを強制バイパス、圧縮もセッション状態もなしで生パススルー：プロセス内圧縮器がロードされているのに bili がまだそれらのセッションを管理している場合の緊急出口；プロセス内で実際に圧縮しているものがない場合（例：opencode acp）、トラフィックは圧縮されずにモデルに到達する。0/off = 入ってくるバイパスヘッダをすべて無視（opencode レガシー含む）：bili がそれらのセッションを引き受けるが、既存の ref 空間はプロセス内の acp ストアにあるため、その履歴は読み取り専用アーカイブに降格される。各強制状態はトラフィック開始時に 1 回の大きな警告を出す；認識できない値は未設定（auto）として扱い、1 回警告する。設計上 env のみ（#6220 のオーナー決定）。 |
 | `BILI_OPENCODE_ACP_SPEC` | string | unset | — | 生成チャネル：opencodeネイティブレーン用のACP仕様マーカー。 |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | string | unset | — | ランチャーチャネル：生成されたクライアントに渡されるモデルウィンドウのオーバーライド。 |
 | `BILI_LAUNCHER_LANE` | string | unset | — | ランチャーチャネル：生成元のbiliプロセスのレーンID。 |
