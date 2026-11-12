@@ -776,6 +776,23 @@ function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.Proc
     return dshDesktopCopyPathMatches(installDir, real, anchor, `/node_modules/${DSH_PACKAGE}`, process.platform === "win32");
 }
 
+/** #2082: true when `installDir` is the dsh DESKTOP profile copy that bili
+ *  owns in place (#1575). The self-update lanes use it to arm the boot smoke:
+ *  a proxy running FROM that copy takes the plain self-update path
+ *  (hostManagedInstall exempts the layout), yet it swaps the very copy a
+ *  running dsh respawns its plugin from — the same exposure
+ *  refreshDshDesktopCopy gates. */
+function isDshDesktopInstall(installDir: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+    if (!installDir) return false;
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
+    }
+    return isDshDesktopBiliCopy(installDir, real, env);
+}
+
 /** #1234/#2199: true when `installDir` is the OpenCode v2 plugin-manager CACHE
  *  copy of billion-context — under $XDG_CACHE_HOME/opencode (default
  *  ~/.cache/opencode) at .../node_modules/billion-context. A bare
@@ -1740,7 +1757,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false, checkOn
             return;
         }
         try {
-            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
+            // #2082: when this proxy runs FROM the dsh desktop copy, the
+            // self-update swaps the copy dsh respawns from — same boot smoke
+            // as the refreshDshDesktopCopy lane.
+            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl), process.env, { bootSmoke: isDshDesktopInstall(installDir) });
             if (result.ok) {
                 await clearInstallBackoff(bkey);
                 await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
@@ -2294,7 +2314,8 @@ export async function forceInstallVersion(
         // install between the pre-lock read and lock acquisition.
         const diskUnderLock = await readDiskVersion(installDir);
         if (diskUnderLock === targetVersion) return { ok: true };
-        const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
+        // #2082: same boot smoke as the other lanes when the target is the dsh desktop copy.
+        const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball), process.env, { bootSmoke: isDshDesktopInstall(installDir) });
         if (result.ok) {
             const channel = installSource ?? `advisory:${advisoryId}`;
             await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, channel);
