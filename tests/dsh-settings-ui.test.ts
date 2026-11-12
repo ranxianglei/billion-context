@@ -169,6 +169,33 @@ test("#6436: dsh.settingsTab=false rides the boot snapshot and /bili/origin; def
     }
 });
 
+// #6436: the default-config payload must stay byte-identical to #4237 — no
+// settingsTab key at all (the host half only emits the field when OFF, so an
+// older host half that predates settingsTab keeps failing open on the absent
+// field). Pins the "default omits it" half of the gate (#3617 both directions).
+test("#6436: default config omits settingsTab from the __BILI__ payload (byte-identical to #4237)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({}));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
+            const routes: RouteRow[] = [];
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: true });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
 type RouteRow = { kind: string; path: string; handler: (req: unknown, res: FakeRes) => void | Promise<void> };
 
 class FakeRes {
