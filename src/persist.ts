@@ -3229,6 +3229,56 @@ export class SessionStore {
         loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
     }
 
+    /** #3397 (PR #6326): durability-before-render — make a session's unified-index
+     *  rows durable SYNCHRONOUSLY (the small SQLite ingest) WITHOUT writing the
+     *  JSON envelope. The incremental lane calls this the instant a turn's
+     *  response has fully left, so the refs the model just saw are on disk before
+     *  the debounced envelope save (#5155) settles. A crash in that window no
+     *  longer leaves rendered refs unbacked (the #3397 orphaned-generation gap
+     *  that made long sessions cite refs the gate rejects as "above the highest
+     *  allocated ref"). The large JSON envelope stays debounced — only the small
+     *  row ingest moves ahead of it. Mirrors the debounced path's ingest legs
+     *  (stale-disk guard + rawTail + live CCR + noteOwnCommit), minus the
+     *  envelope write and its landing stamp. */
+    ingestRowsNow(session: Session): void {
+        if (!this.shadow) return; // legacy-only (no unified index) — nothing to back
+        try {
+            const stamp = this.liveStorageStamp;
+            const record = this.buildRecordForSave(session, stamp);
+            const disk = this.staleDiskPayload(record);
+            if (disk !== null) {
+                // #2401/#405: disk is strictly newer — converge + ingest the disk view
+                // (same as the debounced path, minus the envelope rewrite). Log the same
+                // "rejected stale snapshot" line (throttled identically) so the
+                // multi-instance guard stays observable when this durability pass
+                // converges before the debounced save gets to it.
+                const now = Date.now();
+                const last = this.staleWarnAt.get(record.id) ?? 0;
+                if (now - last >= STALE_WARN_THROTTLE_MS) {
+                    this.staleWarnAt.set(record.id, now);
+                    this.log(
+                        "warn",
+                        `[persist] rejected stale snapshot for session ${record.id} (durability-before-render): in-memory copy is older than the on-disk one (another bili instance holds newer state) — keeping disk state and converging in-memory state to it, so subsequent requests serve the fuller fold coverage instead of the stale view (#405/#2401)`,
+                    );
+                }
+                this.convergeToDisk(session, disk);
+                this.shadow.record(disk);
+                this.noteOwnCommit(session.id, disk);
+                return;
+            }
+            const payload = session.decompositionLog;
+            if (payload !== undefined) session.decompositionLog = undefined;
+            const tail = session.lastMessagesFolded !== true ? session.lastMessages : undefined;
+            this.shadow.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
+                tail && tail.length > 0
+                    ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
+                    : undefined, session.contentStore ?? undefined);
+            this.noteOwnCommit(session.id, record);
+        } catch (err) {
+            this.log("warn", `[persist] ingestRowsNow failed for ${session.id}: ${String(err)} — the debounced save retries the full path`);
+        }
+    }
+
     scheduleSave(session: Session): void {
         // #5608-D: a committed fold IS the session's next legitimate
         // cache-breaking boundary — run the deferred #4316 citation-space
