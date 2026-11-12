@@ -279,7 +279,7 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
         } else if (protocol === "commandcode") {
             // The finish event IS this wire's terminator: when delivered there
             // is nothing to synthesize; only a mid-flight cut gets an error line.
-            if (!finished) safeWrite(res, `${JSON.stringify({ type: "error", error: "upstream_stream_truncated", message })}\n\n`);
+            if (!finished) safeWrite(res, `${JSON.stringify({ type: "error", error: "upstream_stream_truncated", message })}\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
