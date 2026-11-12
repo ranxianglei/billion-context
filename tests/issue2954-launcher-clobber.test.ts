@@ -6,7 +6,7 @@
 // (#1232) cannot be clobbered — find our child there by pid and trust the
 // origin IT recorded.
 
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -14,6 +14,26 @@ import os from "node:os";
 import path from "node:path";
 import type { ProxyInstanceFile } from "../src/instance.ts";
 import { ensureProxyRunning, SPAWN_BUDGET_MS, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
+
+// #4953: private XDG roots — the starting marker is ONE global file per state
+// dir (proxy-starting). A co-run launcher suite (or real machine activity)
+// claiming it looks active to these fake clocks (their startedAt vs our tiny
+// ticks*1000 epoch), so we wait behind it and burn a full extra budget.
+// Convention: tests/auto-restart.test.ts.
+const xdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bc-2954-xdg-"));
+process.env.XDG_CACHE_HOME = path.join(xdgRoot, "cache");
+process.env.XDG_CONFIG_HOME = path.join(xdgRoot, "config");
+process.env.XDG_DATA_HOME = path.join(xdgRoot, "data");
+process.env.XDG_STATE_HOME = path.join(xdgRoot, "state");
+
+after(() => {
+    delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    delete process.env.XDG_DATA_HOME;
+    delete process.env.XDG_STATE_HOME;
+    rmrf(xdgRoot);
+});
 
 const FP_SCRIPT = path.join(os.tmpdir(), `bili-fp-2954-${process.pid}.js`);
 fs.writeFileSync(FP_SCRIPT, "// fingerprint fixture\n");

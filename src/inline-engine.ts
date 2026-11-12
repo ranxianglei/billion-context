@@ -328,6 +328,9 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
                 const e = err as { name?: string; message?: string };
                 const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
                 if (clientAbort && !abortSurfaced) ctx.log("info", `client aborted mid-stream: ${msg}`);
+                // #2465/#5663: classified transport deaths are already fully described on
+                // one line (kind/code/errno/syscall/address/hint) — stack frames add no signal.
+                else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) ctx.log("error", msg);
                 // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
                 // throttled [warn] at the throw site is the canonical record.
                 else if (!isExpectedFailFast(err)) {

@@ -35,9 +35,14 @@ type Item = Record<string, unknown>;
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const NUDGE_MARKER = "Compressible ranges (";
 // Indices verified against the kernel's nudge gate with nudgeGrowthTokens=2000
-// and ~9KiB filler turns: the first T1 injection lands on upstream request 7.
-const PROXY_TOOL_AT = 7; // upstream request index whose response = acp_status call (round 1)
-const FOLD_AT = 8;       // upstream request index whose response = compress call (round 2)
+// and ~9KiB filler turns. Pre-#4521 (master) the injections landed on
+// requests {7,8,9}; since #4521 the armed-but-silent status line rides an
+// ephemeral carrier on the gated turns and its shown-marker feeds the nudge
+// gate back, so the schedule shifts to {4,6,8,9} — the fold/proxy-tool-round
+// mechanics under test are unchanged, only this probe's anchor re-calibrates
+// to the next nudge-carrying request pair (6 → tool round, 7 → fold round).
+const PROXY_TOOL_AT = 6; // upstream request index whose response = acp_status call (round 1)
+const FOLD_AT = 7;       // upstream request index whose response = compress call (round 2)
 // FOLD_AT+1 = post-fold refreshed re-request (round 3); FOLD_AT+2 = next steady client turn.
 const TOTAL_TURNS = 13;
 

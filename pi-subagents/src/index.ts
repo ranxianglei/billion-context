@@ -133,22 +133,21 @@ export function createSubagentsExtension(inline?: SubagentsAdapterConfig): Exten
         setDelegatePolicy(state.policy);
         setDelegateDefaults({ thinkingLevel: state.policy.thinkingLevel, agents: state.policy.agents });
         setDelegateNotifyIfRead(state.policy.notifyIfRead);
-        // Third-party subagent overlap guard (#415): a PROJECT-scope pi-subagents
-        // install stands acp_delegate down unless delegate.forceEnable opts back
-        // in; a USER-scope-only install logs a warning and stays active, so a
-        // global install can't silently disable it in every project.
+        // Third-party subagent overlap guard (#415, scope widened in #5637): a
+        // pi-subagents install at EITHER scope stands acp_delegate down unless
+        // delegate.forceEnable opts back in — a user-scope install is loaded in
+        // every project too, so warn-only would duplicate the surface everywhere.
         if (state.policy.enabled && !state.policy.forceEnable) {
           const scopes = findPiSubagentsInstalls(resolveAgentDir(), cwd);
-          if (scopes.project[0] !== undefined) {
+          const install = scopes.project[0] ?? scopes.user[0];
+          if (install !== undefined) {
             state.stoodDown = true;
-            logWarn("delegate", { event: "delegate-auto-disabled", sid, install: scopes.project[0], scope: "project", hint: "run /acp-subagents (billion-context-pi) to give its agents ACP compression tools; delegate.forceEnable=true keeps acp_delegate" });
+            logWarn("delegate", { event: "delegate-auto-disabled", sid, install, scope: scopes.project[0] !== undefined ? "project" : "user", hint: "run /acp-subagents (billion-context-pi) to give its agents ACP compression tools; delegate.forceEnable=true keeps acp_delegate" });
             if (!standDownWarned) {
               standDownWarned = true;
               if (ctx.hasUI) ctx.ui.notify(DELEGATE_STAND_DOWN_MESSAGE, "warning");
               else console.error(DELEGATE_STAND_DOWN_MESSAGE);
             }
-          } else if (scopes.user[0] !== undefined) {
-            logWarn("delegate", { event: "delegate-user-scope-detected", sid, install: scopes.user[0], action: "warn-only" });
           }
         }
       } catch (e) {
