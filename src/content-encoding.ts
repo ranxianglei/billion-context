@@ -1,4 +1,4 @@
-import { createBrotliDecompress, createGunzip, createInflate, createInflateRaw } from "node:zlib";
+import * as zlib from "node:zlib";
 import { DecodedRequestBusyError } from "./request-body-budget.js";
 import type { Duplex } from "node:stream";
 import { Decompress as ZstdDecompress } from "fzstd";
@@ -69,6 +69,9 @@ function streamDecode(factory: () => Duplex, input: Buffer, max: number, options
 }
 
 async function decodeZstd(input: Buffer, max: number, options?: DecodeOptions): Promise<Buffer> {
+    if (typeof zlib.createZstdDecompress === "function") {
+        return streamDecode(zlib.createZstdDecompress, input, max, options);
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     const decoder = new ZstdDecompress((chunk) => {
@@ -83,15 +86,15 @@ async function decodeZstd(input: Buffer, max: number, options?: DecodeOptions): 
 }
 
 async function decodeOne(coding: string, input: Buffer, max: number, options?: DecodeOptions): Promise<Buffer> {
-    if (coding === "gzip" || coding === "x-gzip") return streamDecode(createGunzip, input, max, options);
-    if (coding === "br") return streamDecode(createBrotliDecompress, input, max, options);
+    if (coding === "gzip" || coding === "x-gzip") return streamDecode(zlib.createGunzip, input, max, options);
+    if (coding === "br") return streamDecode(zlib.createBrotliDecompress, input, max, options);
     if (coding === "zstd") return decodeZstd(input, max, options);
     if (coding === "deflate") {
         try {
-            return await streamDecode(createInflate, input, max, options);
+            return await streamDecode(zlib.createInflate, input, max, options);
         } catch (err) {
             if (err instanceof DecompressedTooLargeError || err instanceof DecodedRequestBusyError || options?.signal?.aborted) throw err;
-            return streamDecode(createInflateRaw, input, max, options);
+            return streamDecode(zlib.createInflateRaw, input, max, options);
         }
     }
     throw new Error(`unsupported request content-encoding: ${coding}`);
