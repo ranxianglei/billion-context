@@ -1,5 +1,5 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
-import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-kernel/wire";
+import { googleSystemText, openaiToCore, responsesToCore, type BiliMessage, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
@@ -218,6 +218,43 @@ function responsesSysDevItemText(item: Record<string, unknown>): string {
     return "";
 }
 
+// #6293: the overhead-exclusive system slice of a Responses body is EXACTLY
+// the set the kernel projection hoists OUT of the core view: top-level
+// instructions plus the LEADING run of role=system/developer items. Mid-
+// history sys/dev items land in projection.msgs instead (#4166) and are
+// billed by estimateCoreMessages — counting them here again doubled the
+// cold-start preflight base (core + overhead both carried the same bytes,
+// tripping spurious pre-compression when no usage baseline exists yet).
+// Projecting with the same codec the core view uses keeps both sides on one
+// definition; a body the codec refuses falls back to the legacy all-sys/dev
+// walk (fail-closed overcount — the call sites degrade to an empty core on
+// the same failure, so nothing goes unbilled).
+function responsesOverheadSystemText(parsed: Record<string, unknown>): string {
+    try {
+        return responsesToCore(parsed as ResponsesRequestBody).systemParts.join("\n");
+    } catch {
+        const parts: string[] = [];
+        const instructions = parsed.instructions;
+        if (typeof instructions === "string" && instructions.length > 0) parts.push(instructions);
+        else if (Array.isArray(instructions)) {
+            const joined = instructions
+                .map((part) => (typeof (part as { text?: unknown })?.text === "string" ? (part as { text: string }).text : ""))
+                .join("\n");
+            if (joined.length > 0) parts.push(joined);
+        }
+        if (Array.isArray(parsed.input)) {
+            for (const raw of parsed.input as Array<unknown>) {
+                if (!raw || typeof raw !== "object") continue;
+                const item = raw as Record<string, unknown>;
+                if (item.role !== "system" && item.role !== "developer") continue;
+                const text = responsesSysDevItemText(item);
+                if (text.length > 0) parts.push(text);
+            }
+        }
+        return parts.join("\n");
+    }
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term
@@ -235,10 +272,12 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
             return 0;
         }
     }
-    const sysRaw = protocol === "responses"
-        ? parsed.instructions
-        : protocol === "google"
-          ? googleSystemText(parsed as GoogleRequestBody)
+    // responses: instructions ride the projection's systemParts — counted once
+    // by responsesOverheadSystemText below, never here (#6293).
+    const sysRaw = protocol === "google"
+        ? googleSystemText(parsed as GoogleRequestBody)
+        : protocol === "responses"
+          ? undefined
           : parsed.system;
     let sysText = "";
     if (typeof sysRaw === "string") {
@@ -251,12 +290,21 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     // openai chat: the kernel hoists leading system/developer messages out of
     // the array into the rebuilt body's system field — but raw clients that
     // never went through a rebuild keep them in messages; count both shapes.
+    // #6293: project instead of walking — only the LEADING contiguous prefix
+    // leaves the core view; mid-history system messages are core messages
+    // already billed by estimateCoreMessages, so the old all-messages walk
+    // double-billed them. Projection failure → legacy walk (fail-closed).
     if (protocol === "openai" && Array.isArray(parsed.messages)) {
-        const hoisted = (parsed.messages as Array<Record<string, unknown>>)
-            .filter((m) => m.role === "system" || m.role === "developer")
-            .map((m) => (typeof m.content === "string" ? m.content : ""))
-            .join("\n");
-        sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
+        let hoisted = "";
+        try {
+            hoisted = openaiToCore(parsed as OpenAIRequestBody).systemText;
+        } catch {
+            hoisted = (parsed.messages as Array<Record<string, unknown>>)
+                .filter((m) => m && (m.role === "system" || m.role === "developer"))
+                .map((m) => (typeof m.content === "string" ? m.content : ""))
+                .join("\n");
+        }
+        if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
     }
     // responses: codex sends its whole system prompt as role=developer items
     // inside input[] (top-level instructions stays empty). The kernel hoists
@@ -264,15 +312,10 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     // rebuild moves them back into input[] as a developer message while
     // stripping instructions — so the whole system prompt is invisible to
     // estimateCoreMessages AND to the instructions-only read above (#829).
-    // Count the developer/system items in input[] (mirrors the openai branch);
-    // content may be a plain string or an array of input_text/output_text parts.
-    if (protocol === "responses" && Array.isArray(parsed.input)) {
-        const hoisted = (parsed.input as Array<Record<string, unknown>>)
-            .filter((item) => item.role === "system" || item.role === "developer")
-            .map(responsesSysDevItemText)
-            .filter((t) => t.length > 0)
-            .join("\n");
-        if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
+    // #6293: count exactly that hoisted set via the shared codec — mid-
+    // history sys/dev items are core messages (#4166), not overhead.
+    if (protocol === "responses") {
+        sysText = responsesOverheadSystemText(parsed);
     }
     return defaultCountTokens(sysText)
         + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
