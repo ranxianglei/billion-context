@@ -237,32 +237,33 @@ export class ResponsesWsHistory {
         if (!Array.isArray(request.input)) throw new Error("response.create requires an input array");
         if (previous !== undefined && previous !== null) {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
-            // Walk the checkpoint chain oldest→newest. The base level always
+            // Replay the checkpoint chain oldest→newest. The base level always
             // carries a complete reconstruction in request.input; every later
             // level contributes only its own tail + output (its augmented body
             // would double-count the echoed previous output otherwise).
             const levels: Checkpoint[] = [];
             let cursor: Checkpoint | undefined = this.checkpoint;
             while (cursor) {
-                levels.unshift(cursor);
+                levels.push(cursor);
                 cursor = cursor.base;
             }
-            const base = levels[0];
+            const base = levels[levels.length - 1];
             if (!base || !Array.isArray(base.request.input)) throw new Error("previous_response_not_found");
             // Per-level contribution in conversation order: the base's complete
             // input, then each later level's own tail followed by its output.
-            let input: unknown[] = [];
-            for (let i = 0; i < levels.length; i++) {
+            const input: unknown[] = [];
+            for (let i = levels.length - 1; i >= 0; i--) {
                 const level = levels[i];
-                if (i === 0 && Array.isArray(level.request.input)) input = [...input, ...level.request.input];
-                else if (Array.isArray(level.tail)) input = [...input, ...level.tail];
-                input = [...input, ...level.output];
+                const added = i === levels.length - 1 ? level.request.input : level.tail;
+                if (Array.isArray(added)) for (const item of added) input.push(item);
+                for (const item of level.output) input.push(item);
             }
+            for (const item of request.input) input.push(item);
             // #2966: generate is a per-request action control, not conversation
             // state — a prewarm's generate:false must not leak into a continuation
             // that omits the field (the upstream would then refuse to generate).
-            const { generate: _priorGenerate, ...topRequest } = levels[levels.length - 1].request;
-            return { ...topRequest, ...request, input: [...input, ...request.input] };
+            const { generate: _priorGenerate, ...topRequest } = levels[0].request;
+            return { ...topRequest, ...request, input };
         }
         return request;
     }
