@@ -200,9 +200,13 @@ test("#3905 chat: an announcement RETRY degenerates into the in-band error (#870
     const refetch = () => Promise.resolve(streamOf(announceTurn()));
     await pipePluginChatWithStrip(streamOf(announceTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
     const text = out.join("");
+    // #5958: the double-degenerate #870 terminal now ships as the protocol-native
+    // error frame (the global default) instead of the legacy "[ACP] stream error"
+    // completion shape — assert the native openai frame carrying the #3905 message.
     assert.ok(
-        text.includes("[ACP] stream error"),
-        "the client is told, rather than left with a second silent announcement",
+        text.includes('"code":"stream_error"') &&
+        text.includes("[acp-proxy: the turn degenerated again after the continuation nudge]"),
+        "the client is told (native error frame), rather than left with a second silent announcement",
     );
 });
 
