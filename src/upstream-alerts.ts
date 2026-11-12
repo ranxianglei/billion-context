@@ -30,6 +30,9 @@ export interface UpstreamAlert {
      *  the full English string for JSON consumers). Redacted. */
     skippedProxy?: string;
     skippedSource?: string;
+    /** #5146: errno captured at failure time (e.g. ECONNREFUSED) — surfaces in the
+     *  /__bili/upstreams report so the DSH banner can show WHY. */
+    code?: string;
 }
 
 /** v1 scope (#1682): only "fundamentally cannot connect" transport failures.
@@ -37,8 +40,12 @@ export interface UpstreamAlert {
  *  - upstream-timeout: fired AFTER connect (headers/body idle budget) — the
  *    request may have reached the upstream, so "cannot reach" would be a lie;
  *  - unknown: unclassified — better silent than a misleading red banner. */
-const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
+// Exported so the taxonomy coverage gate (tests) can assert every connect-
+// stage errno lands in an alertable kind — the #2465 failure mode was exactly
+// a code missing from BOTH this set and the fail-fast set at once. (#5663)
+export const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "connect-timeout",
+    "upstream-unreachable",
     "connect-refused",
     "proxy-reset",
     "upstream-reset",
@@ -47,6 +54,18 @@ const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
 ]);
 
 const MAX_ALERTS = 32;
+
+/** #5572: an alert row is a snapshot of NOW (#1682), so it dies when its host stops
+ *  being hit-and-failing. A single stray failure against a provider that then stops
+ *  being requested — a loopback shim that rebound to a fresh ephemeral port after a
+ *  plugin reload, or a user-configured endpoint whose session switched models away —
+ *  otherwise pins the banner forever: the dead port can never succeed again, so
+ *  clearUpstreamAlertsForHost — the only other removal path — can never fire for it.
+ *  Circuit half-open probes are request-driven (consulted per-request, no background
+ *  timer), so an unreferenced host gets neither fresh failures nor probes. Expire rows
+ *  older than this since their LAST failure; a host still actively failing refreshes
+ *  lastSeen on every failing request and stays visible while genuinely down. */
+const ALERT_STALE_MS = 5 * 60_000;
 
 let alerts = new Map<string, UpstreamAlert>();
 
@@ -62,6 +81,24 @@ function keyFor(kind: UpstreamFailureKind, host: string): string {
     return kind + "\u0000" + host;
 }
 
+/** #5572: drop rows whose last failure predates `now - ALERT_STALE_MS`. Called lazily
+ *  from the two read projections; sweeping ≤MAX_ALERTS entries per read is negligible.
+ *  Deleting the current entry mid-iteration is defined behavior for a Map iterator. */
+function pruneStaleAlerts(now: number): void {
+    if (alerts.size === 0) return;
+    const cutoff = now - ALERT_STALE_MS;
+    for (const [key, a] of alerts) {
+        if (a.lastSeen < cutoff) alerts.delete(key);
+    }
+}
+
+/** #5146: pull the errno off a Node error when present (ECONNREFUSED, ENOTFOUND, …) so the
+ *  /__bili/upstreams report can show WHY beyond the classified kind. undefined for non-errors. */
+function errnoCode(error: unknown): string | undefined {
+    const c = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+    return typeof c === "string" && c.length > 0 ? c : undefined;
+}
+
 /** Record one failed model request. Dedup key (kind, host): repeats refresh
  *  lastSeen/count only. Non-alert kinds are ignored entirely. `skipped` (#2809)
  *  rides along so the banner can name the proxy default-direct mode skipped. */
@@ -70,6 +107,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
     if (!ALERT_KINDS.has(kind)) return;
     const host = hostOf(url);
     const now = Date.now();
+    const code = errnoCode(error);
     const key = keyFor(kind, host);
     const skippedFields = skipped ? { skippedProxy: redactedSkippedProxy(skipped), skippedSource: skipped.source } : {};
     const hint = hintWithSkippedProxy(kind, skipped);
@@ -78,6 +116,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         existing.lastSeen = now;
         existing.count += 1;
         existing.hint = hint;
+        if (code !== undefined) existing.code = code;
         Object.assign(existing, skippedFields);
         return;
     }
@@ -92,7 +131,7 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         }
         if (oldestKey !== undefined) alerts.delete(oldestKey);
     }
-    alerts.set(key, { kind, host, hint, firstSeen: now, lastSeen: now, count: 1, ...skippedFields });
+    alerts.set(key, { kind, host, hint, firstSeen: now, lastSeen: now, count: 1, ...(code !== undefined ? { code } : {}), ...skippedFields });
 }
 
 /** Any resolved response to this host proves the path works again — clear ALL
@@ -104,8 +143,10 @@ export function clearUpstreamAlertsForHost(url: string): void {
     }
 }
 
-/** Active alerts, most recently seen first. Always a fresh array. */
-export function getUpstreamAlerts(): UpstreamAlert[] {
+/** Active alerts, most recently seen first. Always a fresh array. Prunes rows that
+ *  stopped refreshing past ALERT_STALE_MS before projecting (#5572). */
+export function getUpstreamAlerts(now: number = Date.now()): UpstreamAlert[] {
+    pruneStaleAlerts(now);
     return [...alerts.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
@@ -133,6 +174,8 @@ interface UpstreamCircuitFailure {
     kind: string;
     detail: string;
     at: number;
+    /** #5146: errno at failure time for the /__bili/upstreams report. */
+    code?: string;
 }
 
 interface UpstreamCircuit {
@@ -151,8 +194,11 @@ const MAX_CIRCUITS = 32;
 interface CircuitEntry {
     state: UpstreamCircuit;
     /** True while the single half-open probe is in flight — concurrent
-     *  requests fail fast instead of stacking parallel probes. */
+     *  requests fail fast instead of stacking parallel probes. The slot is a
+     *  lease that lapses one cooldown after probeAt: a claimant can be answered
+     *  locally (e.g. by the #4204 429 hold) and never settle it. */
     probeInFlight: boolean;
+    probeAt: number;
     /** #4254: timestamp of the last emitted per-request fail-fast [warn], used by
      *  noteCircuitFailFastLog to bound the OPEN-state log storm to one line/window. */
     lastFailFastLogAt: number;
@@ -180,8 +226,10 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
     if (!entry || entry.state.openedAt === null) return undefined;
     const c = entry.state;
     if (now < (c.nextProbeAt ?? 0)) return blockReasonText(c, now);
-    if (entry.probeInFlight) return blockReasonText(c, now);
+    // Lease, not lock (see CircuitEntry.probeInFlight).
+    if (entry.probeInFlight && now - entry.probeAt < circuitProbeCooldownMs) return blockReasonText(c, now);
     entry.probeInFlight = true;
+    entry.probeAt = now;
     return undefined;
 }
 
@@ -248,6 +296,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     const kind = classifyUpstreamFailure(error, { viaProxy });
     const host = hostOf(url);
     const now = Date.now();
+    const code = errnoCode(error);
     let entry = circuits.get(host);
     if (!entry) {
         if (!ALERT_KINDS.has(kind)) return;
@@ -263,7 +312,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
             }
             if (oldestKey !== undefined) circuits.delete(oldestKey);
         }
-        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, lastFailFastLogAt: 0 };
+        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, probeAt: 0, lastFailFastLogAt: 0 };
         circuits.set(host, entry);
     }
     const c = entry.state;
@@ -271,14 +320,14 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
     if (c.openedAt !== null) {
         // Open: the half-open probe just finished without a response — release
         // the slot and re-arm the cooldown regardless of kind (see above).
-        c.lastFailure = { kind, detail: shortDetail, at: now };
+        c.lastFailure = { kind, detail: shortDetail, at: now, ...(code !== undefined ? { code } : {}) };
         entry.probeInFlight = false;
         c.nextProbeAt = now + circuitProbeCooldownMs;
         loggerLog("warn", `[acp-proxy] upstream circuit probe FAILED for ${host} (${kind}) — re-armed until ${new Date(c.nextProbeAt).toISOString()} (#3148)`);
         return;
     }
     if (!ALERT_KINDS.has(kind)) return;
-    c.lastFailure = { kind, detail: shortDetail, at: now };
+    c.lastFailure = { kind, detail: shortDetail, at: now, ...(code !== undefined ? { code } : {}) };
     c.consecutiveFailures += 1;
     if (c.consecutiveFailures >= CIRCUIT_OPEN_AFTER) {
         c.openedAt = now;
@@ -297,13 +346,117 @@ export function recordUpstreamCircuitSuccess(url: string): void {
     circuits.delete(entry.state.host);
 }
 
+/** #6026: an OPEN circuit whose last scheduled probe lies more than
+ *  ALERT_STALE_MS in the past — with no newer failure since — is history, not
+ *  NOW, for REPORTING purposes only. Probes are request-driven (no background
+ *  timer), so once traffic to the host stops, nextProbeAt freezes and the entry
+ *  would otherwise pin every status surface forever — its only removal path is
+ *  a resolved response, which an on-demand local model may never send again.
+ *  The same window as the alert TTL so both tables age out together and the
+ *  banner source drains as one unit. Deliberately report-only: the entry stays
+ *  in the map and upstreamCircuitBlockReason keeps consulting it, so fail-fast
+ *  and the half-open probe slot behave exactly as before. */
+function isOpenCircuitStale(e: CircuitEntry, now: number): boolean {
+    const c = e.state;
+    if (c.openedAt === null) return false;
+    const anchor = c.nextProbeAt ?? c.lastFailure?.at ?? c.openedAt;
+    return now - anchor > ALERT_STALE_MS;
+}
+
 /** Open circuits for status surfaces (acp_status / web UI), newest first.
- *  Closed hosts keep no entry. Fresh copies. */
-export function getOpenUpstreamCircuits(): UpstreamCircuit[] {
+ *  Closed hosts keep no entry; stale idle circuits are excluded (#6026). */
+export function getOpenUpstreamCircuits(now: number = Date.now()): UpstreamCircuit[] {
     return [...circuits.values()]
-        .filter((e) => e.state.openedAt !== null)
+        .filter((e) => e.state.openedAt !== null && !isOpenCircuitStale(e, now))
         .map((e) => ({ ...e.state }))
         .sort((a, b) => (b.openedAt ?? 0) - (a.openedAt ?? 0));
+}
+
+// #5146: the read contract behind GET /__bili/upstreams — the loopback-gated
+// surface DSH's frame-level banner polls (contract settled in #4254; that PR's
+// landing of this half was dropped when it closed unmerged, which is exactly
+// why the shipped banner polled a route that never existed). bili is a
+// transparent pipe, so this reports per HOST (the only identity it knows),
+// never per conversation; DSH filters that down to the hosts its own
+// conversations point at. Merges the two existing tables into one stable
+// shape: the open circuit is the authoritative "currently down" signal
+// (fail-fast stops minting new alerts once open), while the alert rows carry
+// the actionable hint and cover the pre-circuit window. An idle open circuit —
+// last scheduled probe more than ALERT_STALE_MS in the past with no newer
+// failure — is excluded from this projection like any stale alert row (#6026).
+
+export interface UpstreamHealthEntry {
+    /** Host[:port] the failing traffic targeted — raw (endpoint is loopback-gated). */
+    host: string;
+    port: number | null;
+    /** Primary failure kind: the circuit's last failure when open, else the most
+     *  recently seen alert for the host. */
+    kind: string;
+    /** errno captured at failure time (ECONNREFUSED, …) when available. */
+    code?: string;
+    /** Actionable hint (most recent alert of the primary kind, else circuit detail). */
+    hint?: string;
+    /** Observed failure count — circuit strikes when open, else summed alert counts. */
+    count: number;
+    firstSeen: number;
+    lastSeen: number;
+    /** Present only while a circuit is OPEN; null in the alert-only window. */
+    circuit: { state: "open"; nextProbeInMs: number } | null;
+}
+
+export interface UpstreamHealthReport {
+    upstreams: UpstreamHealthEntry[];
+}
+
+export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealthReport {
+    pruneStaleAlerts(now);
+    interface Acc {
+        alerts: UpstreamAlert[];
+        circuit: UpstreamCircuit | null;
+    }
+    const byHost = new Map<string, Acc>();
+    const touch = (host: string): Acc => {
+        let acc = byHost.get(host);
+        if (!acc) {
+            acc = { alerts: [], circuit: null };
+            byHost.set(host, acc);
+        }
+        return acc;
+    };
+    for (const a of alerts.values()) touch(a.host).alerts.push(a);
+    for (const e of circuits.values()) {
+        // #6026: report-only staleness filter — see isOpenCircuitStale.
+        if (e.state.openedAt !== null && !isOpenCircuitStale(e, now)) touch(e.state.host).circuit = e.state;
+    }
+    const upstreams: UpstreamHealthEntry[] = [];
+    for (const [host, { alerts: hostAlerts, circuit }] of byHost.entries()) {
+        const latest = hostAlerts.length > 0 ? hostAlerts.reduce((m, a) => (a.lastSeen > m.lastSeen ? a : m)) : undefined;
+        const kind = circuit?.lastFailure?.kind ?? latest?.kind ?? "unknown";
+        const code = circuit?.lastFailure?.code ?? latest?.code;
+        const hint = latest?.hint ?? circuit?.lastFailure?.detail;
+        const count = circuit ? circuit.consecutiveFailures : hostAlerts.reduce((s, a) => s + a.count, 0);
+        const beginTimes = [...hostAlerts.map((a) => a.firstSeen), ...(circuit ? [circuit.openedAt ?? now] : [])];
+        const endTimes = [...hostAlerts.map((a) => a.lastSeen), ...(circuit ? [circuit.lastFailure?.at ?? now] : [])];
+        let port: number | null = null;
+        const colon = host.lastIndexOf(":");
+        if (colon >= 0) {
+            const p = Number(host.slice(colon + 1));
+            if (Number.isInteger(p) && p > 0 && p <= 65535) port = p;
+        }
+        upstreams.push({
+            host,
+            port,
+            kind,
+            ...(code !== undefined ? { code } : {}),
+            ...(hint !== undefined ? { hint } : {}),
+            count,
+            firstSeen: Math.min(...beginTimes),
+            lastSeen: Math.max(...endTimes),
+            circuit: circuit ? { state: "open", nextProbeInMs: Math.max(0, (circuit.nextProbeAt ?? now) - now) } : null,
+        });
+    }
+    upstreams.sort((a, b) => b.lastSeen - a.lastSeen);
+    return { upstreams };
 }
 
 export function _resetUpstreamCircuitsForTest(): void {

@@ -19,7 +19,7 @@
 // provider adapter interface (Gemini's official cache-refresh API), restart
 // persistence.
 
-import { findRoute, loadConfigFile, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
+import { findRoute, loadConfigFile, resolveModelEntryOnRoute, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
 import { credentialFingerprint } from "./cache-ledger.js";
 import { log as loggerLog } from "./logger.js";
 import { peekSession } from "./session.js";
@@ -92,7 +92,7 @@ export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstre
     const g: CacheKeepaliveSettings = loadConfigFile().cacheKeepalive ?? {};
     const route = routes ? findRoute(routes, upstreamUrl) : undefined;
     const p: CacheKeepaliveSettings = route?.cacheKeepalive ?? {};
-    const m: CacheKeepaliveSettings = typeof model === "string" && model.length > 0 ? route?.models?.[model]?.cacheKeepalive ?? {} : {};
+    const m: CacheKeepaliveSettings = resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive ?? {};
     const lvl = <K extends keyof CacheKeepaliveSettings>(k: K): CacheKeepaliveSettings[K] => (m[k] !== undefined ? m[k] : p[k] !== undefined ? p[k] : g[k]);
 
     let assumeTtl: "5m" | "1h" | undefined;
@@ -132,7 +132,10 @@ export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
                 found = "1h";
                 return;
             }
-            if (ttl === "5m") found = "5m";
+            // A cache_control breakpoint without an explicit ttl uses Anthropic's
+            // default 5-minute TTL, so it is a 5m-tier breakpoint (#5665); only an
+            // explicit "1h" lifts the tier.
+            found = "5m";
         }
         for (const v of Object.values(o)) walk(v);
     };
@@ -172,8 +175,19 @@ interface KeepaliveEntry {
 
 const registry = new Map<string, KeepaliveEntry>();
 
+/** Real-timer scheduler: every handle is unref'd (#5666) so an armed cadence
+ *  timer never holds the event loop open. Interactive hosts stay alive for
+ *  their own reasons and the pings still fire on schedule; a short-lived
+ *  process (pi -p, a sub-agent) whose only remaining handle is the armed
+ *  keepalive now exits cleanly instead of limping along until maxDurationMs. */
+function realSchedule(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
+    const t = setTimeout(fn, ms);
+    t.unref?.();
+    return t;
+}
+
 let clock: () => number = () => Date.now();
-let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = (fn, ms) => setTimeout(fn, ms);
+let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = realSchedule;
 let cancelFn: (id: ReturnType<typeof setTimeout>) => void = (id) => clearTimeout(id);
 
 export interface KeepaliveArmInput {
@@ -454,7 +468,7 @@ export function _setKeepaliveSchedulerForTest(sched: FakeScheduler | undefined):
         scheduleFn = (fn, ms) => sched.schedule(fn, ms) as ReturnType<typeof setTimeout>;
         cancelFn = (id) => sched.cancel(id as unknown);
     } else {
-        scheduleFn = (fn, ms) => setTimeout(fn, ms);
+        scheduleFn = realSchedule;
         cancelFn = (id) => clearTimeout(id);
     }
 }
