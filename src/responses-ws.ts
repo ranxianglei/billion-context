@@ -627,6 +627,16 @@ class ResponsesWsResponse extends http.ServerResponse {
         Object.defineProperty(this, "socket", { get: () => req.socket });
     }
 
+    // Socket-death semantics, as in InlineRes.destroy(): OutgoingMessage.destroy()
+    // emits 'close' only through its own socket slot (not the `socket` getter
+    // above), and the relay aborts the upstream only on 'close' while !writableEnded.
+    override destroy(error?: Error): this {
+        if (this.destroyed) return this;
+        super.destroy(error);
+        if (!this.ended) this.emit("close");
+        return this;
+    }
+
     override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding: BufferEncoding, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
@@ -678,13 +688,26 @@ class ResponsesWsResponse extends http.ServerResponse {
         if (!this.terminal && this.peer.readyState === WebSocket.OPEN) {
             let details: unknown;
             try { details = JSON.parse(this.buffer); } catch { details = undefined; }
-            this.peer.send(object(details)
-                ? JSON.stringify({ ...details, type: "error", status: this.statusCode >= 400 ? this.statusCode : 502 })
-                : errorFrame("incomplete_response", "Responses exchange ended without a terminal event", 502));
+            const status = this.statusCode >= 400 ? this.statusCode : 502;
+            if (!object(details)) {
+                this.peer.send(errorFrame("incomplete_response", "Responses exchange ended without a terminal event", status));
+            } else {
+                // #4601: the WS-lane error contract is { type, status, error: { code?, message?, headers? } }
+                // (codex parse_wrapped_websocket_error_event) — a string `error` fails that deserialization and
+                // codex waits out its idle timeout instead of failing fast. Normalize at this one conversion
+                // point; the HTTP lanes keep their own string-error contract untouched.
+                const rawError = details.error;
+                const detailText = typeof details.detail === "string" ? details.detail : "";
+                const error: Record<string, unknown> = object(rawError) ? rawError
+                    : typeof rawError === "string"
+                        ? { code: "proxy_failure", message: detailText !== "" && detailText !== rawError ? `${rawError}: ${detailText}` : rawError }
+                        : { code: "incomplete_response", message: "Responses exchange ended without a terminal event" };
+                this.peer.send(JSON.stringify({ ...details, error, type: "error", status }));
+            }
         }
         this.ended = true;
         this.emit("finish");
-        this.emit("close");
+        if (!this.destroyed) this.emit("close");
         const cb = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : callback;
         if (typeof cb === "function") cb();
         return this;

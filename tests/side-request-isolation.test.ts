@@ -6,7 +6,7 @@ import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kerne
 import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -554,6 +554,30 @@ test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#
     assert.ok(estimateRawBodyTokens({ content: "汉".repeat(100) }) >= 100, "CJK counted per-char");
 });
 
+test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5000 item 3)", () => {
+    const toolsMass = 120 * defaultCountTokens("d".repeat(40_000));
+    const body = {
+        system: "s".repeat(1_000),
+        tools: Array.from({ length: 120 }, () => ({ type: "function", function: { name: "t", description: "d".repeat(40_000) } })),
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+    };
+    const b = estimateRawBodyBreakdown(body);
+    assert.equal(b.total, estimateRawBodyTokens(body), "total equals the plain meter exactly (same walk, same exclusions)");
+    assert.ok(b.tools >= toolsMass, "tools[] mass lands in the tools bucket");
+    assert.ok(b.messages >= defaultCountTokens("m".repeat(1_000)), "message text lands in the messages bucket");
+    assert.ok(b.system >= defaultCountTokens("s".repeat(1_000)), "system text lands in the system bucket");
+    assert.equal(b.total, b.messages + b.tools + b.system + b.other, "buckets are exhaustive");
+    // the #5000 shape: a body whose mass rides tools[] — the doom message must
+    // be able to name THAT dimension, not "trim the oversized content".
+    assert.ok(b.tools > b.messages + b.system + b.other, "tools-dominant body reports tools-dominant");
+    // image payloads still excluded from every bucket (#5932).
+    const img = estimateRawBodyBreakdown({ image_url: `data:image/png;base64,${"A".repeat(50_000)}` });
+    assert.equal(img.total, 0, "image_url stays excluded in every bucket");
+    // non-object bodies bucket into other (or nothing) without throwing.
+    assert.equal(estimateRawBodyBreakdown(null).total, 0, "null body");
+    assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
+});
+
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {
     const llama = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)" } });
     const hit = inspectContextOverflow(400, llama);
@@ -1039,6 +1063,11 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
         const s = getSession(SESSION);
         assert.ok(s, "session row exists (created before the gate)");
         assert.equal(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state untouched by side requests (blocked or not)");
+        // Named poison-field pin (#5608-B fix for exactly this shape): a resume-miss
+        // under UNPROVEN identity (cross-lane boilerplate prefix match) must not arm
+        // honest-NULL on a side lane — a lane that never runs a kernel pass could
+        // never self-clear the flag, and it would ride into persisted state.
+        assert.equal(s.state.suppressMintingOnce, undefined, "unproven-identity miss must not arm honest-NULL on a side request (#554/#5608-B)");
         assert.equal(s.stats.requests, 0, "side requests do not count as main requests");
     } finally {
         await closeRig(rig);

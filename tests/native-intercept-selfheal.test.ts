@@ -641,3 +641,61 @@ test("#2827: first web-access adoption writes nothing to the host terminal and r
     assert.match(diags[0], /\[info\] \[v=[^\]]+\] \[native-client\] \[bili-native\] adopted pi-web-access proxy fetch as downstream \(supported coexistence, #2435\)/);
     assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
 });
+
+// #5907: the no-guard postures (env escape hatch / non-configurable host
+// property) are exactly where a third-party replacement silently un-routes
+// model traffic — pin that each one names the degraded posture in bili.log
+// instead of staying silent. The env-hatch case is fully reversible; the
+// non-configurable case LOCKS the slot for the rest of this process
+// (configurable:false can never be undone), so it must stay LAST in this file.
+test("#5907: BILI_RECLAIM_FETCH_PATCH=0 keeps classic install and logs the disabled self-heal once", async () => {
+    const saved = globalThis.fetch;
+    const sink: string[] = [];
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40003", ready: Promise.resolve("http://127.0.0.1:40003") };
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    const savedEnv = process.env.BILI_RECLAIM_FETCH_PATCH;
+    process.env.BILI_RECLAIM_FETCH_PATCH = "0";
+    globalThis.fetch = fakeFetch(sink);
+    _resetForTest();
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Classic install still routes on a normal host...
+        await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.deepEqual(sink, ["http://127.0.0.1:40003/bili/http://127.0.0.1:8199/v1/messages"]);
+        // ...and the disabled self-heal posture is named in bili.log.
+        const log = fs.readFileSync(CHAIN_LOG_FILE, "utf8").split("\n");
+        const warns = log.filter(l => l.includes("#5907") && l.includes("BILI_RECLAIM_FETCH_PATCH=0"));
+        assert.equal(warns.length, 1);
+    } finally {
+        globalThis.fetch = saved;
+        if (savedEnv === undefined) delete process.env.BILI_RECLAIM_FETCH_PATCH;
+        else process.env.BILI_RECLAIM_FETCH_PATCH = savedEnv;
+        _resetForTest();
+    }
+});
+
+test("#5907: non-configurable globalThis.fetch degrades to classic install with a loud one-time warning", async () => {
+    // NOTE: this test permanently locks globalThis.fetch (configurable:false is
+    // irreversible within a process). node --test runs each file in its own
+    // process, so nothing after this point can be affected — keep it last.
+    const sink: string[] = [];
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40004", ready: Promise.resolve("http://127.0.0.1:40004") };
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    _resetForTest();
+    Object.defineProperty(globalThis, "fetch", { value: fakeFetch(sink), writable: false, configurable: false });
+    let threw: unknown = null;
+    try {
+        installNativeFetchIntercept(state);
+    } catch (e) {
+        threw = e; // strict-mode write to the non-writable slot — acceptable, the diagnostic below already fired
+    }
+    if (threw !== null) assert.match(String(threw), /fetch/i);
+    // The call goes out UNROUTED (no /bili/ rewrite, proxy never sees it)...
+    await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+    // ...and the degraded posture is named in bili.log exactly once.
+    const log = fs.readFileSync(CHAIN_LOG_FILE, "utf8").split("\n");
+    const warns = log.filter(l => l.includes("#5907") && l.includes("not configurable"));
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /\/bili\//);
+});

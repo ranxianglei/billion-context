@@ -187,6 +187,20 @@ entries:
     group: process
     desc_en: "Soft byte budget for the plain/proxy/pi-native HTTP relay lane (#3909): when the final serialized request exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress on tool-armed lanes — codex-style lanes that reject injected tools keep the size-only annotation), then whatever remains is boundedly downscaled through the jimp maxDim ladder. Closes the gap image-dense sessions leave open: token-space folding decides in tokens while the upstream rejects in bytes / pixel-decode CPU (Cloudflare Worker 503), so a ~48 MiB request 503s forever with every retry resending the same pixels. Applies only when no managed transport is installed (the spawned relay); the WS lane uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never shed here (#3701 Finding 1). Set 0 to disable (previous send-as-is); the hard refusal cap stays network.outboundBodyBytes."
     desc_zh: "面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。"
+  - key: network.ingestBodyBytes
+    type: number
+    default: "33554432"
+    env: BILI_INGEST_BODY_BYTES
+    group: process
+    desc_en: "Cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER decode (#5794 item 2). A TEXT-DOMINATED body above it is refused with an actionable 413 (stage ingest) before the sweep, because any parseable text body over 32 MiB is already ~8M tokens — beyond every real model window — and burning seconds of event-loop time to parse it (the 51.2 MiB / 29,619-message incident: 5.5–7.2 s per round, 54.6% of local CPU, 747 s FATAL) cannot end in success. Image-bearing bodies are exempt on every lane: base64 pixels are excluded from the token meter by design (images billed separately, never doomed on raw bytes — #496/#1800/#857), so over-band image mass stays governed by the admission slots, the receive cap and each lane's own shed / pre-send byte budget (#3909 ~48 MiB image-dense sessions, #3701 WS screenshots; the Responses lane is exempt outright regardless). Distinct from the admission SLOTS (network.receiveBodyBytes threshold): the slots cap CONCURRENCY of large decodes, this cap bounds a single body. Set 0 to disable (legacy parse-everything)."
+    desc_zh: "解码之后进入 JSON.parse+归一化清扫的成本带（解码后字节，#5794 第 2 项）。超限的**文本为主**的体在清扫之前以可操作的 413（stage ingest）拒收：任何可解析的 32 MiB+ 文本体都 ≥ ~8M token、超过一切真实模型窗口，为它烧掉数秒事件循环时间没有意义（51.2 MiB / 29,619 条消息现场：每轮 5.5–7.2s、占本机 CPU 54.6%、747s FATAL）。带图片的体在所有车道豁免：base64 像素按设计不进 token 计量（图片单独计费、绝不在原始字节上判死——#496/#1800/#857），超带的图片体量仍由准入槽位、收件上限与各车道自身的裁减/预发送字节预算治理（#3909 ~48 MiB 图片密集会话、#3701 WS 截图；Responses 车道无论如何整体豁免）。与大解码准入槽位（network.receiveBodyBytes 阈值）不同：槽位限的是大解码的并发数，本上限限的是单个体的成本。设为 0 可禁用（恢复此前的全解析）。"
+  - key: network.maxMessages
+    type: number
+    default: "0"
+    env: BILI_MAX_MESSAGES
+    group: process
+    desc_en: "Per-upstream hard cap on the messages[] array length (#5000 item 2) — the COUNT dimension: a wire constraint no byte/token estimate expresses (the 26,903-message / 55.2 MiB #5000 session cleared every size gate and died at the upstream with the count error). Per-UPSTREAM on purpose: there is no universal value, so the default is 0 = disabled; set it to your upstream's known limit and over-count bodies get an actionable 413 (restart the session or rewind) instead of a guaranteed upstream 400. Count only — it never folds. Enforced in preflight (before the token trigger) and at the egress fuse for the no-model lane."
+    desc_zh: "单上游 messages[] 数组长度硬限（#5000 第 2 项）——COUNT 维度：任何字节/token 估算都表达不了的线路约束（#5000 的 26,903 条消息 / 55.2 MiB 会话清掉所有尺寸闸后仍在上游以条数错误死掉）。刻意按上游设置：没有通用值，默认 0 = 关闭；把它设为你所连上游的已知上限后，超条数的体会得到可操作的 413（重启会话或 rewind）而不是一次必然的上游 400。只判条数、从不折叠。在 preflight（token 触发器之前）与无模型车道的出站熔断处强制执行。"
   - key: network.caFile
     type: string
     default: "unset"
@@ -269,8 +283,8 @@ entries:
     site_group: proc
     desc_en: "Session persistence to disk under the XDG state dir."
     desc_zh: "会话落盘持久化（XDG state 目录之下）。"
-    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
-    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
+    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
+    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
   - key: persist.enabled
     type: boolean
     default: "true"
@@ -292,6 +306,13 @@ entries:
     group: process
     desc_en: "Write debounce window for session files."
     desc_zh: "会话文件写入的去抖窗口。"
+  - key: persist.maxDelayMs
+    type: number
+    default: "5000"
+    env: BILI_PERSIST_MAX_DELAY_MS
+    group: process
+    desc_en: "Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6058)."
+    desc_zh: "持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6058）。"
   - key: persist.tailTokens
     type: number
     default: "16384 (0 disables message persistence)"
@@ -356,8 +377,8 @@ entries:
     default: "on"
     env: BILI_STORAGE_JSON_WRITER
     group: process
-    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session content-store sidecar keeps being written either way. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
-    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
+    desc_en: "Phase 3 envelope switch (#2960): off stops writing the legacy JSON session envelope while storage.unified is full - the SQLite index becomes the only persistent copy (reads are already unified-first; boot enumerates the index union, so index-only sessions load normally). Only honored in effective-full mode: under shadow/legacy (or with encryption active) the request is ignored with a one-time warning because the JSON file remains the sole source of truth. Env tier 0/false/off = off and 1/true/on = on wins over the strict file spellings. Fail-safe: if the sidecar disables itself mid-run, envelope writes resume on the next save. Rollback: unset the knob - writing resumes, index-only sessions keep loading via the boot union, and replicas/restore re-materialize portable JSON envelopes. Downgrading the binary (or losing the SQLite engine) makes index-only sessions invisible to v0.1.196 and older until a >=v0.1.197 binary runs again - the data stays intact in index.db, it is just not read by the older code. The per-session CCR content-store sidecar stops being written as well - in full mode the index's ccr mirror is consulted first on every read, so the mirror is the durable copy. A jsonWriter=off lane must be the SOLE writer of its sessions directory: an off lane reads unified-first and never falls back to the file, so any peer instance running legacy/shadow against the same directory diverges silently (its JSON copy stops receiving updates, and the off lane never sees the peer's writes)."
+    desc_zh: "Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。"
   - key: storage.walJournalSizeLimitBytes
     type: number
     default: "8388608"

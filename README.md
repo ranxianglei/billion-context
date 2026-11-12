@@ -1,6 +1,6 @@
 # billion-context
 
-<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a></p>
+<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a></p>
 
 <p align="center"><strong>Context-compression plugin</strong> — <em>billion-context is all you need.</em></p>
 
@@ -201,13 +201,31 @@ skipping bili commands entirely:
   without `dist/` and the bundle never loads) — same end state either way
   (pnpm into the profile, bundled patch layer mounted by dsh itself); remove
   through the same channel. See the dsh section below.
-- **opencode:** add the bare npm name to your real config's plugin list —
-  `"plugin": ["billion-context"]` (npm form only; a git checkout has no
-  published entry). The package publishes `exports["./server"]` →
-  `dist/agent/opencode-native.js`, so opencode loads it through its own
-  Npm.add machinery and the plugin self-spawns exactly like the
-  bili-installed form. Do the two things the bili installer would have done
-  for you too: set `"compaction": { "auto": false }` in the same config
+- **opencode:** easiest is `bili plugin install opencode` (it picks the
+  right entry form for your host version). Hand-install without bili (npm
+  form only; a git checkout has no published entry):
+  - **OpenCode 1.x** — add the bare npm name to your real config's plugin
+    list: `"plugin": ["billion-context"]`. The package publishes
+    `exports["./server"]` → `dist/agent/opencode-native.js`, so opencode
+    loads it through its own Npm.add machinery and the plugin self-spawns
+    exactly like the bili-installed form.
+  - **OpenCode 2.x** — the bare name does NOT work: 2.x resolves it through
+    the package `main` field (`dist/index.js`, the CLI — no plugin
+    definition), so the module load fails (#3976). Instead, put a one-line
+    re-export in a directory and point the config's `plugins` list at that
+    directory:
+
+    ```js
+    // <shim dir>/index.js
+    export { default } from "<abs path to the global install>/dist/agent/opencode-native.js";
+    ```
+
+    ```json
+    { "plugins": ["<shim dir>"] }
+    ```
+
+  Either generation: do the two things the bili installer would have done
+  for you too — set `"compaction": { "auto": false }` in the same config
   (otherwise OpenCode's native auto-compaction double-compresses) and keep a
   manual backup of the file first.
 - **claude:** this repository doubles as a Claude Code plugin marketplace —

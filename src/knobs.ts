@@ -28,6 +28,7 @@ import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
+import { LOG_RETENTION_BUDGET_BYTES, LOG_RETENTION_TARGET_MS } from "./log-retention.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -283,6 +284,12 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+// #5794: the ingest cost band (decoded bytes) that may run the JSON.parse /
+// normalization sweep. 32 MiB ≈ the observed 51.2 MiB/29,619-msg incident
+// (5.5–7.2 s per round, 54.6% of local CPU, 747 s event-loop FATAL); any
+// parseable body ABOVE it is already ≥ ~8M tokens = 5–10× the largest model
+// window, so it can never succeed. 0 = no ingest cap (legacy).
+const DEFAULT_INGEST_BODY_BYTES = 32 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -334,6 +341,29 @@ export function limitsWsOutboundBytes(): number {
 export function limitsHttpOutboundBytes(): number {
     const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
+}
+
+/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 32 MiB. Cost band for the
+ *  JSON.parse + normalization sweep AFTER decode (the 51.2 MiB #5794 body spent
+ *  seconds there per round). Bodies above it are refused before the sweep with
+ *  an actionable 413; any parseable body over 32 MiB is ≥ ~8M tokens, i.e.
+ *  beyond every real model window, so nothing valid is blocked. 0 disables the
+ *  ingest cap (legacy parse-everything). */
+export function limitsIngestBytes(): number {
+    const v = tInt("BILI_INGEST_BODY_BYTES", loadConfigFile().network?.ingestBodyBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
+}
+
+// #5000 item 2: per-upstream hard cap on the messages[] array length — a wire
+// constraint no byte/token estimate expresses (the 26,903-message #5000 session
+// cleared every size gate and died at the upstream). Per-UPSTREAM on purpose:
+// there is no universal value, so the default is 0 = disabled; operators set
+// BILI_MAX_MESSAGES / network.maxMessages to their upstream's known limit and
+// over-limit bodies get an actionable 413 (restart / rewind) instead of a
+// guaranteed upstream 400. Count only — it never folds.
+export function limitsMaxMessages(): number {
+    const v = tInt("BILI_MAX_MESSAGES", loadConfigFile().network?.maxMessages);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---
@@ -425,6 +455,14 @@ export function persistZstdEnabled(): boolean {
 export function persistDebounceMs(): number {
     const v = tInt("BILI_PERSIST_DEBOUNCE_MS", filePersist().debounceMs);
     return Number.isFinite(v) && v >= 0 ? v : 500;
+}
+
+/** BILI_PERSIST_MAX_DELAY_MS > persist.maxDelayMs > 5000 (#6058: under sustained
+ *  traffic the max-delay cap — not the debounce window — sets the session-order /
+ *  prefix-affinity snapshot rewrite rate; both writers had it hardcoded at 5s). */
+export function persistMaxDelayMs(): number {
+    const v = tInt("BILI_PERSIST_MAX_DELAY_MS", filePersist().maxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : 5_000;
 }
 
 /** BILI_PERSIST_TAIL_TOKENS > persist.tailTokens > 16384 (0 disables message persistence). */
@@ -746,6 +784,40 @@ export function dump4xxMaxBytes(): number {
     return Math.max(1024, n || 2 * 1024 * 1024);
 }
 
+/** BILI_LOG_RETENTION_HOURS > diagnostics.logRetentionHours > 48. How much
+ *  wall-clock history the private log keeps before the byte budget trims it.
+ *  Floor 1 h. A SET env var owns the switch even when its content is illegal
+ *  (process-level convention, #2030): an unparsable value falls back to the
+ *  DEFAULT, never to the file layer, so the file key cannot silently shadow it. */
+function logRetentionTargetMs(): number {
+    const envRaw = process.env.BILI_LOG_RETENTION_HOURS;
+    const f = fileDiag().logRetentionHours;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_TARGET_MS / 3_600_000;
+    const hours = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_TARGET_MS / 3_600_000)
+        : fromFile;
+    return Math.max(1, hours) * 3_600_000;
+}
+
+/** BILI_LOG_BUDGET_BYTES > diagnostics.logBudgetBytes > 256 MiB. HARD cap on
+ *  bytes across the active log + every sealed generation — the budget wins over
+ *  the target window. Floor 1 MiB so a typo cannot degenerate the log to nothing.
+ *  Same set-env-owns-the-switch rule as the target above. */
+function logRetentionBudgetBytes(): number {
+    const envRaw = process.env.BILI_LOG_BUDGET_BYTES;
+    const f = fileDiag().logBudgetBytes;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_BUDGET_BYTES;
+    const bytes = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_BUDGET_BYTES)
+        : fromFile;
+    return Math.max(1 << 20, bytes);
+}
+
+/** The resolved retention policy snapshot the logger installs at startup. */
+export function logRetentionPolicy(): { targetMs: number; budgetBytes: number } {
+    return { targetMs: logRetentionTargetMs(), budgetBytes: logRetentionBudgetBytes() };
+}
+
 /** BILI_DUMP_MAX_TOTAL_BYTES > diagnostics.maxTotalBytes > off (null). Total-size cap
  *  for debug dump dirs (#2412); floor 1 MiB; 0/negative/non-numeric = off. */
 export function dumpGcMaxTotalBytes(): number | null {
@@ -996,38 +1068,3 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     return WAL_JOURNAL_SIZE_LIMIT;
 }
 
-/** EXPERIMENTAL fold-point carrier relocation switch (view transform A): when
- *  on, a still-visible compress call/result pair is moved from its original
- *  tail-adjacent position to its own fold point, so resent history ends in
- *  "[folded region] – [pair] – [protected messages]" instead of a tool exchange
- *  sitting at the very end (which weak-attention models read as a fresh
- *  command). Pure view-side transform — refs/state untouched, recomputed
- *  identically every turn; off = byte-identical to the pre-feature layout.
- *  OPT-IN (default OFF; verified on real models 2026-11-01 #5470, kept opt-in
- *  per owner decision).
- *  Env BILI_COMPRESS_AT_FOLD_POINT (0/false/off vs 1/true/on) wins over the
- *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = OFF.
- *  Garbage spellings fall through tiers. Pure: never throws. */
-export function resolveCompressAtFoldPoint(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}
-
-/** Second opt-in riding on BILI_COMPRESS_AT_FOLD_POINT: drop the contiguous
- *  run of unsigned reasoning cores immediately preceding a relocated pair at
- *  the moment of repositioning (the turn's "think" about the fold itself).
- *  Default OFF; both switches must be set for anything to be dropped, and the
- *  host additionally refuses any core carrying a wire signature or running
- *  under strict reasoning-echo (#1658/#684 doctrine — signed bytes are never
- *  rewritten or deleted).
- *  Env BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over config-file
- *  `compress.compressAtFoldPointClearThinking`; absent = OFF. Pure: never
- *  throws. */
-export function resolveCompressAtFoldPointClearThinking(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
-    const raw = env.BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING?.trim().toLowerCase();
-    if (raw === "1" || raw === "true" || raw === "on") return true;
-    if (raw === "0" || raw === "false" || raw === "off") return false;
-    return typeof fileValue === "boolean" ? fileValue : false;
-}

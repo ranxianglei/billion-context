@@ -63,8 +63,10 @@ import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { bodyOverWindowDetail as sharedBodyOverWindowDetail, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
+import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -2093,6 +2095,11 @@ export async function apply(ctx: PluginContext): Promise<void> {
         ctx.webServer.register(adminRelayRoute);
     }
 
+    // #1295: declared custom-wire endpoints — the SAME config source the proxy
+    // classifier reads. Loaded best-effort into this host process; a config
+    // change takes effect on the next host start.
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
+
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
         state.attach = true;
@@ -2305,17 +2312,27 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // floor sits under it; the bare floor marks the stronger "provably
         // over" tier in the line below. #4111 keeps the media exclusion
         // (base64 mass bills through the upstream's image lane, not as text).
-        // Unknown window or unsized body keeps #1117 semantics.
+        // An unsized body keeps #1117 semantics; an UNKNOWN window falls back
+        // to the 1M floor (#5907).
         // #4079: the declared window can be wrong SMALL (stale host config,
         // model-catalog fallback) — the bar never assumes below max(declared, 1M).
-        const doom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: NO declaration at all (a custom provider whose model info the
+        // host never resolved) must not disarm the arm either — fall back to
+        // the same floor instead of forwarding an oversized body into a
+        // guaranteed upstream rejection.
+        const declared = effectiveContextWindow(ctx);
+        const doom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613); a direct send would 400 upstream`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (${windowNote}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613/#5907); a direct send would 400 upstream`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx), body);
     };
+
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
     // agentless lane is not ours to manage — but a body whose CALIBRATED
     // core-text token estimate reaches the window has no direct future: the
@@ -2325,22 +2342,34 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // gateway send that passed every floor-only check, then bricked the
     // whole session when upstream rejected it). Same dual-tier pricing as
     // the threw arm — calibrated estimate first, the bare floor marking the
-    // "provably over" tier, #4111's media exclusion intact. Unknown window
-    // or unsized/streamed body keeps #1117, now named in the durable line
-    // via refuse()'s size note.
+    // "provably over" tier, #4111's media exclusion intact. An unsized/streamed
+    // body keeps #1117, now named in the durable line via refuse()'s size
+    // note; an unknown window falls back to the 1M floor (#5907).
     const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
         // #4079: same undersized-declaration guard as the threw arm — the
         // bar never assumes below the 1M common window floor. #4111: same
         // media-aware core-text caliber too (see bodyOverWindowDetail).
-        const unattributedDoom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: an unknown window falls back to the same floor instead of
+        // disarming the whole arm.
+        const declared = effectiveContextWindow(ctx);
+        const unattributedDoom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (unattributedDoom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613); a direct send would be a guaranteed upstream rejection`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (${windowNote}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613/#5907); a direct send would be a guaranteed upstream rejection`);
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
         return refuse(url, attr, body);
     };
     state.takeoverGate = (url, body, init) => {
+        // #1295: an operator-declared endpoint is explicitly "this URL IS my
+        // model API" — declaration outranks heuristic attribution (a provider
+        // plugin's LLM call may run outside dsh's ALS initiator scope). The
+        // proxy-side body disambiguation still guards against same-path
+        // non-conversation payloads being misrouted.
+        if (matchModelEndpoint(getDeclaredModelEndpoints(), url) !== undefined) return true;
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
             threwStreak = 0;
@@ -2357,9 +2386,10 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
             // #4829 review: without init there is no body to decode and the
-            // claim can never succeed — settle synchronously so this shape
-            // keeps the OLD verdict class: native-ws-intercept.ts compares
-            // its gate result with === false WITHOUT awaiting.
+            // claim can never succeed — settle synchronously. Both gate
+            // consumers await the verdict today (fetch lane since #4829, WS
+            // lane inside its deferred window since #5838), so this is a fast
+            // path, not a verdict-class contract.
             if (init === undefined) {
                 threwStreak = 0;
                 threwGiveUpNoticed = false;
@@ -2417,7 +2447,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         if (unroutedEndpoints.has(key)) return;
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
-        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …) or endpoints declared via modelEndpointPatterns in the global config.`;
         persistClientEvent(line);
     };
 
@@ -2846,8 +2876,8 @@ export async function apply(ctx: PluginContext): Promise<void> {
     });
 
     // node:test drives apply() directly with a mock ctx — never patch
-    // globalThis.fetch from inside a test run.
-    if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+    // globalThis.fetch/WebSocket from inside a test run.
+    if (process.env.NODE_TEST_CONTEXT === undefined) installDshIntercepts(state);
 
     // #4134: hold activation until the ACP tool registration has landed (or
     // is provably not coming / 2s cap). The host composes each model round
@@ -2861,6 +2891,20 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // under NODE_TEST_CONTEXT (a mock apply() with no spawn armed would
     // otherwise burn the full 2s cap on every call).
     if (process.env.NODE_TEST_CONTEXT === undefined) await registerArmed();
+}
+
+/** Both client-side egress legs of the dsh lane (#5838): model HTTP(S) through
+ *  the fetch intercept, and the Codex Responses WebSocket leg through the WS
+ *  wrapper. DSH embeds pi-ai whose openai-codex-responses provider defaults to
+ *  transport auto, so a successful WebSocket exchange NEVER calls fetch — with
+ *  only the fetch leg installed the whole conversation bypasses the proxy while
+ *  bili's own gate leaves native compaction off, i.e. nothing compresses until
+ *  the context limit. The state carries the per-dispatch hooks (async
+ *  takeoverGate, toolsReady, beforeSend fork adoption, headersFor stamps) that
+ *  the wrapper runs inside its deferred window before the upgrade goes out. */
+export function installDshIntercepts(state: NativeInterceptState): void {
+    installNativeFetchIntercept(state);
+    installNativeWebSocketIntercept(state);
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can

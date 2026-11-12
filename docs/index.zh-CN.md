@@ -1,6 +1,6 @@
 # 文档总目录
 
-> 全部系统文档集中在 `docs/`。仓库根目录只保留四个入口文件：`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`。原根路径保留单行重定向占位（计划 1–2 个版本后删除，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
+> 全部系统文档集中在 `docs/`。仓库根目录只保留四个核心入口文件——`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`——外加受认可的社区 README 译本（`README.<locale>.md`，如 `README.ja.md`，批准于 2026-11-09 / #6000）。原根路径保留单行重定向占位（计划 1–2 个版本后删除，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
 > 惰性加载的施工参考（架构 / 环境变量 / 测试 / 发版 / git-pr）：[reference/](../reference/README.md)。
 
 ## 从这里开始
@@ -25,6 +25,7 @@
 | [msgid-infrastructure](msgid-infrastructure.zh-CN.md) / [English](msgid-infrastructure.md) | sessionid+msgid 的生产、校验（六份副本）、钉住与消费 |
 | [opencode-responses-websocket](opencode-responses-websocket.zh-CN.md) / [English](opencode-responses-websocket.md) | OpenCode V2 Responses-over-WebSocket 集成（#1844） |
 | [plugin-protocol](plugin-protocol.md) | 协作插件协议 v2（实验性，无中文版） |
+| [wire-contracts](wire-contracts.zh-CN.md) / [English](wire-contracts.md) | WC 台账：可声明自定义 wire 端点（#1295）背后的上游 wire 约束永久账本；条目只被取代（SUPERSEDED），不删除 |
 
 ## 工程与运维
 
