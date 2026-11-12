@@ -188,6 +188,9 @@ test("#4323 A: three consecutive sampled drifts escalate once and freeze envelop
             assert.equal(escalated.length, 1, "exactly ONE escalation alarm for the whole streak");
             assert.ok(escalated[0].msg.includes("active block(s) vs index"), `alarm names both sides' fold counts: ${escalated[0].msg}`);
             assert.ok(escalated[0].msg.includes("#394"), "alarm names the multi-writer anti-pattern");
+            // #4614: the alarm must name BOTH known producers — a single host re-writing
+            // slots below the watermark on every save produces the identical signature.
+            assert.ok(escalated[0].msg.includes("#4614"), "alarm also names the single-writer repeating-rewrite producer");
             const resolved = captured.filter((e) => e.level === "info" && e.msg.includes(`drift resolved for ${ids}`));
             assert.equal(resolved.length, 1, "re-admission is logged");
             const driftErrors = captured.filter((e) => e.level === "error" && e.msg.startsWith(`[storage] unified shadow DIGEST DRIFT for ${ids}:`));

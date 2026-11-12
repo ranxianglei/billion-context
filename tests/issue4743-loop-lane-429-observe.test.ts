@@ -25,7 +25,7 @@ import { runReasoningGuard, type SseSink } from "../src/reasoning-guard.ts";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { noteUpstreamThrottle429, upstreamThrottleLocalReject, _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
+import { noteUpstreamThrottle429, upstreamThrottlePeekReject, _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "3";
@@ -68,24 +68,24 @@ test("responses-wire compress loop feeds the 429 governor (#4743)", async () => 
             threw = true;
         }
         assert.ok(threw, "a terminal 429 propagates out of the loop");
-        assert.ok(upstreamThrottleLocalReject(url, headers), "governor armed after the loop's terminal 429");
+        assert.ok(upstreamThrottlePeekReject(url, headers), "governor armed after the loop's terminal 429");
 
         // Clear: a settled ok response lifts the hold.
         globalThis.fetch = (async () => new Response(JSON.stringify({ id: "ok", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }] }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
         await compressLoopResponsesJson(initial, ctx, body, { url, headers });
-        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a resolved verdict lifts the hold");
+        assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a resolved verdict lifts the hold");
 
         // Review fix (#4772): a fail-fast NON-429 verdict also settles the endpoint —
         // the #4204 contract clears on ANY resolved non-429 (relay parity), so the
         // loop's boundary report must cover thrown UpstreamHttpError(≠429) too.
         globalThis.fetch = (async () => new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 })) as typeof fetch;
         try { await compressLoopResponsesJson(initial, ctx, body, { url, headers }); } catch { /* expected */ }
-        assert.ok(upstreamThrottleLocalReject(url, headers), "re-armed by a second terminal 429");
+        assert.ok(upstreamThrottlePeekReject(url, headers), "re-armed by a second terminal 429");
         globalThis.fetch = (async () => new Response(JSON.stringify({ error: "invalid model" }), { status: 400, headers: { "content-type": "application/json" } })) as typeof fetch;
         let threw400 = false;
         try { await compressLoopResponsesJson(initial, ctx, body, { url, headers }); } catch { threw400 = true; }
         assert.ok(threw400, "a fail-fast 400 propagates out of the loop");
-        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a settled non-429 verdict lifts the hold");
+        assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a settled non-429 verdict lifts the hold");
     } finally {
         globalThis.fetch = prevFetch;
     }
@@ -161,7 +161,7 @@ test("reasoning-guard continuation rounds feed the 429 governor (#4743)", async 
             config: { enabled: true },
             log: () => {},
         });
-        assert.ok(upstreamThrottleLocalReject(url, headers), "governor armed after a 429 continuation round");
+        assert.ok(upstreamThrottlePeekReject(url, headers), "governor armed after a 429 continuation round");
     } finally {
         const closed = once(server, "close");
         server.close();
@@ -225,15 +225,15 @@ test("preflight refold clears the 429 hold without self-arming (#4743/#4772)", a
         mode = "429";
         const probed = preflightFixture(url);
         await preflightCompress(probed.deps, probed.messages);
-        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a 429'd summary probe alone does not arm the hold (no self-block)");
+        assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a 429'd summary probe alone does not arm the hold (no self-block)");
 
         // Clear: a settled non-429 summary response lifts an existing hold (same origin key).
         noteUpstreamThrottle429(url, headers, null);
-        assert.ok(upstreamThrottleLocalReject(url, headers), "setup: hold armed");
+        assert.ok(upstreamThrottlePeekReject(url, headers), "setup: hold armed");
         mode = "200";
         const cleared = preflightFixture(url);
         await preflightCompress(cleared.deps, cleared.messages);
-        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a resolved summary lifts the hold");
+        assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a resolved summary lifts the hold");
     } finally {
         const closed = once(server, "close");
         server.close();

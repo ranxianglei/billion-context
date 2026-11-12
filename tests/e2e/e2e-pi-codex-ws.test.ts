@@ -512,7 +512,7 @@ test("A: explicit websocket — intercepted, stamped, compress/decompress round 
     assert.ok(sentinelRef, "sentinel message carries an ACP ref tag");
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     const foldedRow = mock.rows.filter((r) => r.transport === "ws").find((r) => toolResult(r, "compress")?.includes("Compressed"));
     assert.ok(foldedRow, "compress executed and reported the fold");
 
@@ -585,7 +585,7 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
 
     // Delta frames emerge inside multi-call tool-loop processes (pi's
     // websocketSessionCache is per-process): A/E show them on the final call of
@@ -688,7 +688,7 @@ test("D: explicit sse — regression guard, full fold cycle over HTTP", { skip: 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     ok("recall", await piRun(ctx, "final recall", { resume: true }));
 
     // Re-capture AFTER fold/recall: preFoldRows is a pre-fold snapshot.
@@ -722,7 +722,14 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
         assert.ok(r.stdout.includes("WS_E2E_OK"));
     };
 
-    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED"));
+    // #5428 flipped the pi lane's DEFAULT posture to inline (in-process proxy):
+    // left unpinned, X's proxy would die with its pi process and unregister its
+    // instance record — nothing left to discover, nothing for Y to attach to.
+    // This scenario pins the legacy spawn/attach posture it was built on;
+    // scenarios A–D intentionally ride the new inline default.
+    const legacyPosture: NodeJS.ProcessEnv = { BILI_PI_INLINE: "0" };
+
+    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED", { extraEnv: legacyPosture }));
     const origin = proxyOriginOf(ctxX);
     assert.ok(origin, "X's proxy origin discovered from its instance record");
     // Y attaches to X's proxy (real subagent posture: inherited
@@ -733,7 +740,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Same tool args ({}) from both sessions, interleaved.
     const [xStatus, yStatus] = await Promise.all([
-        piRun(ctxX, "WS_STATUS alpha status", { resume: true }),
+        piRun(ctxX, "WS_STATUS alpha status", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "WS_STATUS beta status", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X status", xStatus);
@@ -763,7 +770,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Concurrent plain turns, same proxy, no cross-talk afterwards.
     const [xFin, yFin] = await Promise.all([
-        piRun(ctxX, "concurrent X tail", { resume: true }),
+        piRun(ctxX, "concurrent X tail", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "concurrent Y tail", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X concurrent", xFin);

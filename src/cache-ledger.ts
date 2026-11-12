@@ -18,6 +18,8 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
+import { isForeignMembership } from "./request-membership.js";
+import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -440,6 +442,11 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #564/#2627: exit-core indexes of THIS body that bili proved are its own
+     *  ordering separators, as the invariant judge returned them at send. The
+     *  next loop round's continuity verdict reads them as entry-side ownership.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    ownedSeparatorCores?: ReadonlySet<number>;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -537,6 +544,19 @@ export function lastForwardedBody(session: Session): SeamSlot | undefined {
     return pendingCapture(session).sentBody;
 }
 
+/** #4731: the pending evidence PAIR of the in-flight request — outbound body
+ *  AND inbound view from ONE source: the ALS capture when this code runs
+ *  inside withCacheCapture (relay lane), else session.transient (loop lane).
+ *  Callers that pair the two sides MUST take both from here; mixing one side
+ *  from the capture with the other from the fallback can mate an old body
+ *  with fresh usage and mis-attribute the seam. Settled baselines
+ *  (settledBody/settledInBody) always live on session.transient and stay
+ *  read from there on every lane. */
+export function pendingEvidencePair(session: Session): { sentBody?: SeamSlot; inBody?: InboundSlot } {
+    const pending = pendingCapture(session);
+    return { sentBody: pending.sentBody, inBody: pending.inBody };
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
@@ -627,30 +647,58 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+// #5795: single source of truth for the credential header names — the 429
+// governor's hold key (upstream-throttle.ts) and the pre-ingest fast path
+// (server/handle.ts) must read exactly these headers or holds go unmatched.
+export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
+
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
  *  key is ever persisted in (raw secrets never reach the ledger, logs or the
  *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") { cred = v; break; }
+            if (v !== "") {
+                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+                // re-signed EVERY request (Signature is an HMAC over the
+                // per-request date + body hash), so hashing the raw line
+                // yields a per-request-unique identity — downstream that
+                // meant the 429 governor's holds never matched (#4204 never
+                // throttled on the APIG lane it was built for), the #3376
+                // keepalive snapshot deleted itself after every forward, and
+                // #2131 cache-sample attribution fragmented into one bucket
+                // per request. The STABLE credential on that line is the
+                // Access key id — fingerprint only that.
+                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
+            }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
 // field reordering (a host that emits the same knobs in a different order must
-// NOT flip the cache-partition identity between requests).
-function canonicalJson(v: unknown): string {
+// NOT flip the cache-partition identity between requests). Exported: the
+// persist-side metadata fold gate (#5506) fingerprints with the same
+// canonicalization so live-vs-disk comparisons are like-for-like.
+export function canonicalJson(v: unknown): string {
     if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     const obj = v as Record<string, unknown>;
@@ -722,6 +770,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        ownedSeparatorCores: samePayload ? prior.ownedSeparatorCores : undefined,
     };
     if ("round" in transient && transient.round > 1) {
         delete transient.imageFacts;
@@ -885,10 +934,20 @@ function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | n
 // returned UTF-16 code units, so CJK offsets were short by up to 3× and the
 // 1024-byte head threshold / ±64-byte append tolerance misfired on them.
 function byteLcp(a: Buffer, b: Buffer): number {
-    let lcp = 0;
     const n = Math.min(a.length, b.length);
-    while (lcp < n && a[lcp] === b[lcp]) lcp++;
-    return lcp;
+    if (n === 0 || a[0] !== b[0]) return 0;
+    // Same integer as the naive per-byte walk ("first k bytes equal" is
+    // monotone in k), but binary search over k with native Buffer.compare
+    // views (memcmp, no copies) — consecutive turns share the whole history
+    // as prefix, so the walk was O(body) of interpreter steps every turn.
+    let lo = 1;
+    let hi = n;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(a.subarray(0, mid), b.subarray(0, mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
 
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
@@ -900,9 +959,16 @@ function byteLcp(a: Buffer, b: Buffer): number {
 function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
     if (cur.length <= prev.length || lcp >= prev.length) return false;
     const room = prev.length - lcp;
-    let lcs = 0;
-    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
-    return lcp + lcs === prev.length;
+    // "the last k bytes of prev equal the last k of cur" is monotone in k —
+    // the same native-compare binary search as byteLcp, over the suffix.
+    let lo = 0;
+    let hi = room;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(prev.subarray(prev.length - mid), cur.subarray(cur.length - mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lcp + lo === prev.length;
 }
 
 // #2982: byte offset of the CLOSING bracket terminating the top-level
@@ -923,15 +989,21 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
     const n = body.length;
     let depth = 0; // object/array nesting depth
     let inStr = false;
-    let esc = false;
     let want = -1; // depth at which the tracked array closes (-1 = not tracking)
     let keyAt = -1; // opening-quote offset of a candidate top-level key
-    for (let i = 0; i < n; i++) {
+    let i = 0;
+    while (i < n) {
         const c = body[i];
         if (inStr) {
-            if (esc) esc = false;
-            else if (c === 92) esc = true; // backslash
-            else if (c === 34) {
+            if (c === 92) {
+                // Backslash run: JSON parity — an odd-length run escapes the
+                // single byte after it, an even run is pure content.
+                let j = i;
+                while (j < n && body[j] === 92) j++;
+                i = (j - i) % 2 === 1 ? j + 1 : j;
+                continue;
+            }
+            if (c === 34) {
                 inStr = false;
                 if (keyAt >= 0) {
                     // +1/-1 strip the surrounding quotes from the captured range.
@@ -949,16 +1021,35 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                         }
                     }
                 }
+                i++;
+                continue;
             }
+            // String content: hop to the next quote or backslash (native
+            // scans) instead of branching per byte — the bulk of any body.
+            let m = n;
+            const q = body.indexOf(34, i + 1);
+            if (q !== -1 && q < m) m = q;
+            const b = body.indexOf(92, i + 1);
+            if (b !== -1 && b < m) m = b;
+            i = m;
             continue;
         }
-        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; continue; }
-        if (c === 123 || c === 91) { depth++; continue; }
+        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
+        if (c === 123 || c === 91) { depth++; i++; continue; }
         if (c === 125 || c === 93) {
             if (want !== -1 && c === 93 && depth === want) return i;
             depth--;
+            i++;
             continue;
         }
+        // Inter-token filler (whitespace/commas/colons/literals): hop to the
+        // next structural byte, again natively.
+        let m = n;
+        for (const code of [34, 123, 125, 91, 93]) {
+            const p = body.indexOf(code, i + 1);
+            if (p !== -1 && p < m) m = p;
+        }
+        i = m;
     }
     return null;
 }
@@ -1291,10 +1382,14 @@ export function recordCacheSample(
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
-            const curB = session.transient?.sentBody;
+            // #4731: both pending sides come from ONE source via
+            // pendingEvidencePair — on the relay lane the evidence lives in
+            // the #4430 ALS capture (session.transient.sentBody is never
+            // written there), on the loop lane it falls back to the transient
+            // slot byte-identically.
+            const { sentBody: curB, inBody: curIn } = pendingEvidencePair(session);
             const prevB = session.transient?.settledBody;
             if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
-                const curIn = session.transient?.inBody;
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1766,13 +1861,30 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4899: USD spend ledger — input/cache-read/cache-write billed at the
+        // per-request stamped price, in lockstep with the token counters above
+        // (foreign #4805 payloads bill too: the tokens were really spent, the
+        // gate only protects this conversation's anchor family).
+        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+        // #4805: id-membership gate — a report produced by a request whose
+        // message ids do not join this session's known id family is foreign
+        // billing data under a colliding session key (auxiliary host personas
+        // stamp the host conversation id on their own tiny payloads). It
+        // still counts toward cumulative usage, but it is not this
+        // conversation's truth and must not touch the anchor family. Abstain
+        // paths (no evidence / first turns / #2821 re-mints) settle exactly
+        // as before: the gate only ever refuses the clearly-foreign.
+        if (isForeignMembership(session.transient?.requestMembership)) {
+            const m = session.transient!.requestMembership!;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
+        } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
@@ -1782,6 +1894,7 @@ export function settleUsageReport(
         // never by estimate-grade samples or arming paths; dropped at native-
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
+        session.stats.lastUsagePayloadUpper = session.stats.localInputEstimate ?? 0;
         session.stats.lastInputTokensSource = "usage";
         // #3148: a real usage report supersedes the failed-round arm — drop the
         // visibility marker so acp_status stops advertising a stale emergency state.
@@ -1818,6 +1931,7 @@ export function settleUsageReport(
         // re-arms both in one event).
         delete session.stats.overflowArmTokens;
         delete session.stats.overflowArmCompletionReserve;
+        }
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane
@@ -1923,6 +2037,12 @@ export function settleUsageReport(
     else delete settled.settledBody;
     delete pending.sentBody;
     const seamIn = pending.inBody;
+    // #4731: noteForwardedBody deletes pending.inBody on round>1 of a capture,
+    // so a same-request retry settles without inbound evidence and drops the
+    // settledInBody baseline (the round-2 delete-then-miss). That conservative
+    // behavior stays BY DESIGN: #3023 attribution is diagnostic-only (nothing
+    // bills on settledInBody), and the pair accessor cannot cheaply recover
+    // the evidence here because the delete removes it from the capture itself.
     if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
     else delete settled.settledInBody;
     delete pending.inBody;

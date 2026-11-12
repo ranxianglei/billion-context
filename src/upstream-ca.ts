@@ -37,7 +37,9 @@ export function upstreamCaIdentity(now = Date.now()): string {
         lastIdentity = "none";
         return "none";
     }
-    if (now - lastStatAt < IDENTITY_TTL_MS && lastIdentity !== "none") return lastIdentity;
+    // Throttle file-change probes only for the same configured path. A live
+    // config switch must not reuse the previous file's dispatcher/trust cache.
+    if (now - lastStatAt < IDENTITY_TTL_MS && lastIdentity.startsWith(`${caFile}\u0000`)) return lastIdentity;
     let mtimeMs = 0;
     try { mtimeMs = statSync(caFile).mtimeMs; } catch { /* missing file => mtime 0 */ }
     lastIdentity = `${caFile}\u0000${mtimeMs}`;

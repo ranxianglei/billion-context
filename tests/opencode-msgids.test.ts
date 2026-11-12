@@ -201,3 +201,41 @@ test("opencode msgids: content drift between harvest and wire degrades instead o
     const body2 = await plannedBody(t2.e);
     assert.deepEqual(body2.msgIds, ["msg_c1"], "cache_control markers do not break the 1:1 proof");
 });
+
+test("opencode msgids: a single-flight-blocked turn does not burn its ids (#4491/#3378)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    __resetOpencodeMsgIdsForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    const s = state(lane.base);
+    const hooks = createV1ServerHooks(() => lane.base, {}, {});
+
+    const sid = "ses_guard_burn";
+    await hooks["experimental.chat.messages.transform"]?.({}, { messages: [hostMessage("msg_u1", "user", "hello", sid)] });
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: [wmsg("user", "hello")] }, sid);
+    await maybeIncrementalOpencode(t1.e, s);
+    assert.equal((t1.e.request as Request).headers.get("x-bili-plugin-turn"), "1", "seed converted, left UN-acked");
+
+    // While the seed is still pending, the next turn hits the single-flight
+    // guard: the request must ride the normal pipeline untouched — and the
+    // blocked attempt must NOT claim this turn's ids.
+    await hooks["experimental.chat.messages.transform"]?.({}, { messages: [
+        hostMessage("msg_u1", "user", "hello", sid),
+        hostMessage("msg_a1", "assistant", "hi there", sid),
+        hostMessage("msg_u2", "user", "next", sid),
+    ] });
+    const wire2 = { model: "claude-test", max_tokens: 512, system: "be terse", messages: [wmsg("user", "hello"), wmsg("assistant", "hi there"), wmsg("user", "next")] };
+    const t2b = fakeEvent(wire2, sid);
+    await maybeIncrementalOpencode(t2b.e, s);
+    assert.equal((t2b.e.request as Request).headers.get("x-bili-plugin-turn"), null, "guard: blocked attempt rides the normal pipeline");
+    assert.deepEqual(await plannedBody(t2b.e), JSON.parse(JSON.stringify(wire2)), "body untouched by the blocked attempt");
+
+    // The seed acks; the host retries the same turn — the delta ids must
+    // still ride (a burned claim would silently drop the whole field).
+    opencodeIncrementalOnResponse(t1.url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "1" } }), headersOf(t1.e.request as Request));
+    const t2 = fakeEvent(wire2, sid);
+    await maybeIncrementalOpencode(t2.e, s);
+    const body2 = await plannedBody(t2.e);
+    assert.deepEqual(body2.msgIds, ["msg_a1", "msg_u2"], "blocked attempt did not burn the delta ids");
+});

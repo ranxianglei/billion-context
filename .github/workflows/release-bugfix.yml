@@ -23,8 +23,13 @@ name: Bugfix Release (carve-out)
 #
 # NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
 # agent session abused manual dispatch to publish v0.1.208 outside the intended
-# flow (see #4718). The ONLY ignition shape left is a HUMAN merging the
-# carve-out PR below.
+# flow (see #4718); the human PR merge became the only ignition shape.
+# NOTE 2026-10-28 (owner decision; revives the 5de4103c/#3613 emergency valve
+# whose step gates this file kept all along): workflow_dispatch returns AS THE
+# EMERGENCY VALVE ONLY — and hardened against a repeat of #4718: fast mode
+# engages solely when `fast` is checked AND `confirm_fast` is typed exactly
+# "FAST PUBLISH CONFIRMED" (see FAST_ON below). Any default or programmatic
+# dispatch silently keeps the slow safe path.
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
@@ -41,6 +46,20 @@ on:
   pull_request:
     types: [closed]
     branches: [master]
+  workflow_dispatch:
+    # Emergency valve only — see the 2026-10-28 header note. Slow-safe unless
+    # BOTH signals arrive together.
+    inputs:
+      fast:
+        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk."
+        type: boolean
+        required: false
+        default: false
+      confirm_fast:
+        description: "TYPE EXACTLY: FAST PUBLISH CONFIRMED — anything else (blank included) keeps the normal slow path."
+        type: string
+        required: false
+        default: ""
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
@@ -48,11 +67,25 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Fast mode = BOTH explicit signals (typed-phrase guard vs accidental/
+      # automated dispatches, #4718). Non-dispatch events see FAST_ON=false.
+      FAST_ON: ${{ inputs.fast == true && inputs.confirm_fast == 'FAST PUBLISH CONFIRMED' }}
     permissions:
       contents: write
       id-token: write
       actions: write
     steps:
+      - name: Ensure jq (2026-10 runner images are unreliable about it — always install our own)
+        run: |
+          type -a jq || true
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64" -o "$HOME/.local/bin/jq"
+          chmod +x "$HOME/.local/bin/jq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/jq" --version
+
       - name: Validate trigger + resolve the publish ref
         id: resolve
         run: |
@@ -120,6 +153,24 @@ jobs:
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
 
+      - name: Verify plugin manifests match package.json (#4449)
+        # The four plugin manifests carry their own version fields — the
+        # marketplaces use them for UPDATE DETECTION, so a release whose
+        # manifests disagree with package.json ships a plugin that never
+        # prompts users to upgrade. Drift = red release, nothing shipped.
+        # See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        # #4576 follow-up: lanes cut from a pre-#4449 tag do not carry the
+        # manifest sync script at all -- fail-open with a notice there instead
+        # of MODULE_NOT_FOUND (same existence-guard philosophy as release-manual's
+        # lane guard).
+        run: |
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs --check
+          else
+            echo "::notice::this tree predates #4449 (no scripts/sync-codex-plugin-version.mjs) — manifest sync check skipped for the pre-#4449 lane"
+          fi
+
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
         run: |
@@ -173,7 +224,7 @@ jobs:
         # human-picked ref; with fast=true the human explicitly owns skipping
         # this lane matrix — version guards and the build sanity below still
         # run.
-        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -185,7 +236,7 @@ jobs:
 
       - name: Pre-flight gate (full suite)
         # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
-        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
@@ -198,9 +249,9 @@ jobs:
         # EMERGENCY fast mode: keep the cheap sanity (install/typecheck/build)
         # so a broken tree still fails loudly, but skip the full npm test —
         # the lane matrix above was skipped by explicit human choice.
-        if: steps.resolve.outputs.proceed == 'true' && inputs.fast == true
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON == 'true'
         run: |
-          echo "::warning::FAST MODE — full CI lanes and the full npm test were SKIPPED by an explicit human choice (workflow_dispatch fast=true). Publish sanity = version guards + npm ci + typecheck + build only."
+          echo "::warning::FAST MODE by '${{ github.actor }}' (workflow_dispatch fast=true + typed confirmation) — full CI lanes and the full npm test SKIPPED. Publish sanity = version guards + npm ci + typecheck + build only."
           npm ci
           npm run typecheck
           npm run build
@@ -210,7 +261,7 @@ jobs:
         # own lane runs at the head sha) ran in parallel with the pre-flight;
         # wait them out now. Any red lane or timeout ⇒ release fails, nothing
         # is published.
-        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_GATE_TIMEOUT_MIN: "60"

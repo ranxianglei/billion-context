@@ -107,7 +107,10 @@ test("failure receipt falls back to the last nudge's compressible table when no 
     };
 
     request(ctx, "m00001", "m00002");
-    const rejected = request(ctx, "m00001", "m00002");
+    // #4521 flip: re-requesting an already-covered range is now an idempotent no-op SUCCESS,
+    // so the refusal trigger moves to refs unknown to the session (stale generation) — the
+    // fallback-to-last-nudge-table behavior under test is unchanged.
+    const rejected = request(ctx, "m00099", "m00100");
     assert.equal(rejected.outcome, "refused");
     assert.match(rejected.text, /Current compressible ranges from the last compression check/);
     assert.doesNotMatch(rejected.text, /Call acp_status before retrying/);
