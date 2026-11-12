@@ -162,16 +162,23 @@ for (const scenario of [
     });
 }
 
-test("zero folds: anonymous unknown baseline retains size-arbitration policy", { timeout: 15_000 }, async () => {
+// #5000/#4543 (2e021109, after this PR's base): the measured-body gate now
+// dominates inside the arbitration arm — a measured outbound body over the
+// window is doomed locally for EVERY baseline regime (the original
+// size-arbitration forwarding only remains for measured-fitting bodies, which
+// this fixture's est≈measured regime cannot produce). Pin the current policy.
+test("zero folds: anonymous unknown baseline — measured over-window body is doomed locally", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true });
-    assert.ok(f.result === f.prepared, JSON.stringify(f.logs));
-    assert.ok(f.logs.some(line => line.includes("forwarding once for the upstream to arbitrate")));
+    assert.ok("failFast" in f.result, JSON.stringify(f.logs));
+    assert.equal(f.result.status, 413);
+    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
 });
 
-test("zero folds: a prior scoped refusal still blocks anonymous size arbitration", { timeout: 15_000 }, async () => {
+test("zero folds: a prior scoped refusal keeps the anonymous body locally doomed", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true, localRefusal: true });
     assert.ok("failFast" in f.result, JSON.stringify(f.logs));
-    assert.ok(f.logs.some(line => line.includes("NOT re-forwarding for size arbitration")));
+    assert.equal(f.result.status, 413);
+    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
 });
 
 test("zero folds: image reserve is not deflated by text calibration", { timeout: 15_000 }, async () => {
