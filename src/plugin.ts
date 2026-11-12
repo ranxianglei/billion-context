@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
-import { clientConversationHeader } from "./session-id.js";
+import { clientConversationHeader, stripSessPrefix } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
@@ -2179,7 +2179,10 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
         return;
     }
-    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    // #6433: normalize the zcode `sess_` prefix (sess_<uuid> → <uuid>) so an
+    // older shim or another client sending the prefixed form still resolves the
+    // bare-uuid session the proxy created from the model request header.
+    const conversationId = stripSessPrefix(typeof parsed.conversationId === "string" ? parsed.conversationId : undefined) ?? "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
     if (parsed.toolCallId !== undefined && (typeof parsed.toolCallId !== "string" || !parsed.toolCallId.trim() || parsed.toolCallId.length > 512)) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "toolCallId must be a non-empty string of at most 512 characters" });
     if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });

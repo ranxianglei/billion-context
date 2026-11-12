@@ -10,6 +10,18 @@ export type ConversationIdentity = {
     clientProvided: boolean;
 };
 
+/** #6433: zcode's bootstrap-hook injects CLAUDE_CODE_SESSION_ID with a `sess_`
+ *  prefix (sess_<uuid>), but the proxy's plugin routing keys sessions by the
+ *  bare uuid (the model request header carries the bare form). Strip the prefix
+ *  so the shim's env binding and the proxy's session store agree on the id.
+ *  No other client uses this prefix (grep-verified), so a global strip is safe. */
+export function stripSessPrefix(v: string | undefined): string | undefined {
+    const t = v?.trim();
+    if (!t) return undefined;
+    const stripped = t.startsWith("sess_") ? t.slice("sess_".length) : t;
+    return stripped.length > 0 ? stripped : undefined;
+}
+
 /**
  * Session identity for the proxy's OWN compression state.
  *
@@ -97,7 +109,12 @@ export function conversationHeaderSource(headers: Record<string, string | string
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
-        if (typeof v === "string" && v.trim().length > 0) return { name, value: v.trim() };
+        // #6433: normalize the zcode `sess_` prefix so a header carrying the
+        // prefixed form still keys the same bare-uuid session the shim binds to.
+        if (typeof v === "string") {
+            const normalized = stripSessPrefix(v);
+            if (normalized) return { name, value: normalized };
+        }
     }
     return undefined;
 }

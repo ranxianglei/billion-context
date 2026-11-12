@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
+import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, stripSessPrefix } from "../src/session-id.ts";
 import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
 test("preferPromptCacheKeyIdentity: fingerprint + prompt_cache_key → stable client-provided identity (omp stateless replay)", () => {
@@ -100,6 +100,36 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({ "x-mavis-session-id": "M", "x-opencode-session-id": "N" }), "M");
     // Explicit plugin identity still outranks everything else.
     assert.equal(clientConversationHeader({ "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "P", "x-opencode-session-id": "N" }), "P");
+});
+
+test("stripSessPrefix: zcode sess_ prefix normalization (#6433)", () => {
+    // zcode's bootstrap-hook injects CLAUDE_CODE_SESSION_ID with a sess_ prefix
+    // (sess_<uuid>), but the proxy's plugin routing keys sessions by the bare
+    // uuid. The prefix must be stripped so both forms agree on the id.
+    assert.equal(stripSessPrefix("sess_abc-123"), "abc-123");
+    assert.equal(stripSessPrefix("  sess_abc-123  "), "abc-123");
+    // Bare uuid (no prefix) is unchanged.
+    assert.equal(stripSessPrefix("abc-123"), "abc-123");
+    // "sess" without the trailing underscore is NOT the prefix — kept verbatim.
+    assert.equal(stripSessPrefix("sess-abc"), "sess-abc");
+    // "sess_" alone strips to empty → undefined (no usable id).
+    assert.equal(stripSessPrefix("sess_"), undefined);
+    // Empty / undefined inputs.
+    assert.equal(stripSessPrefix(""), undefined);
+    assert.equal(stripSessPrefix("   "), undefined);
+    assert.equal(stripSessPrefix(undefined), undefined);
+});
+
+test("clientConversationHeader: normalizes zcode sess_ prefix (#6433)", () => {
+    // A header carrying the sess_-prefixed form must resolve to the bare uuid
+    // so the session the proxy created (from the bare-uuid model request) is
+    // found by the shim's env binding.
+    assert.equal(clientConversationHeader({ "x-claude-code-session-id": "sess_abc-123" }), "abc-123");
+    assert.equal(clientConversationHeader({ "x-session-id": "sess_abc-123" }), "abc-123");
+    // A value that is ONLY the prefix strips to empty → falls through to the
+    // next header in the walk (or undefined when none remains).
+    assert.equal(clientConversationHeader({ "x-session-id": "sess_", "x-acp-session": "B" }), "B");
+    assert.equal(clientConversationHeader({ "x-session-id": "sess_" }), undefined);
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
