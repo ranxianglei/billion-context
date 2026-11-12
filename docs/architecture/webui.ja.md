@@ -1,6 +1,6 @@
 # モジュール: Web パネルと管理画面 (`src/web` + `src/server/admin.ts`)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [webui.zh-CN.md](./webui.zh-CN.md) · 2026-11-08 時点、master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [webui.zh-CN.md](./webui.zh-CN.md) · 2026-11-08 時点、master
 
 ![Web パネルモジュール](./assets/webui.en.svg)
 (ビットマップフォールバック: [webui.en.png](./assets/webui.en.png))

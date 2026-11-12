@@ -2,6 +2,7 @@
 
 > システムのアーキテクチャに関するハブページです。このページには**全体図**と**モジュール台帳**を掲載しています。各モジュールは、このディレクトリ内に独自のページ（英語 + `.zh-CN`）を持ち、それぞれに独自の図が用意されています。
 > 中国語版: [architecture.zh-CN.md](./architecture.zh-CN.md)
+> English: [architecture.md](./architecture.md)
 >
 > **ライブドキュメント（オーナー裁定 2026-11-08）。** モジュール境界、図示されたデータフロー、テーブル、レーン、またはワイヤーパスを変更する PR は、同じ PR 内で影響を受けるページ、図、およびこのハブテーブルを更新する必要があります。CI は機械的な部分（`tools/check-architecture-docs.mjs`）を強制します。ルールの本文は [AGENTS.md](../AGENTS.md) の "Documentation Layout" セクションにあります。
 

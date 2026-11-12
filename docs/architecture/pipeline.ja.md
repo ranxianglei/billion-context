@@ -1,6 +1,6 @@
 # モジュール: リクエストパイプライン (`src/server` + `src/loop`)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-10 時点, master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-10 時点, master
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (ビットマップフォールバック: [pipeline.en.png](./assets/pipeline.en.png))

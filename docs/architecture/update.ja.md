@@ -1,6 +1,6 @@
 # モジュール: self-update & install lanes (`src/update.ts` + lane modules)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中文: [update.zh-CN.md](./update.zh-CN.md) · 2026-11-08 時点, master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中文: [update.zh-CN.md](./update.zh-CN.md) · 2026-11-08 時点, master
 
 ![Self-update module](./assets/update.en.svg)
 (ビットマップフォールバック: [update.en.png](./assets/update.en.png))

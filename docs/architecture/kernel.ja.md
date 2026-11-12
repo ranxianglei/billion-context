@@ -1,6 +1,6 @@
 # モジュール: 圧縮カーネル (`kernel/` — acp-kernel, リポジトリ内)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [kernel.zh-CN.md](./kernel.zh-CN.md) · 2026-11-08 時点、master、カーネル v0.0.184
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [kernel.zh-CN.md](./kernel.zh-CN.md) · 2026-11-08 時点、master、カーネル v0.0.184
 
 ![圧縮カーネルモジュール](./assets/kernel.en.svg)
 (ビットマップフォールバック: [kernel.en.png](./assets/kernel.en.png))

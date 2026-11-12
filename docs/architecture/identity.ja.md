@@ -1,6 +1,6 @@
 # モジュール: セッションとメッセージのアイデンティティ
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [identity.zh-CN.md](./identity.zh-CN.md) · 2026-11-08 時点、master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [identity.zh-CN.md](./identity.zh-CN.md) · 2026-11-08 時点、master
 
 ![セッションとメッセージのアイデンティティモジュール](./assets/identity.en.svg)
 (ビットマップフォールバック: [identity.en.png](./assets/identity.en.png))

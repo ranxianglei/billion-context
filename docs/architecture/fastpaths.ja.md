@@ -1,6 +1,6 @@
 # モジュール: fastpaths (増分レーン / v5 ウォーターマーク / Dレーン / レガシー)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [fastpaths.zh-CN.md](./fastpaths.zh-CN.md) · 2026-11-08 時点、master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [fastpaths.zh-CN.md](./fastpaths.zh-CN.md) · 2026-11-08 時点、master
 
 ![Fastpaths module](./assets/fastpaths.en.svg)
 (ビットマップフォールバック: [fastpaths.en.png](./assets/fastpaths.en.png))

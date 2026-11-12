@@ -1,6 +1,6 @@
 # モジュール: ホストレーン (`src/agent` + `src/server/lane-decisions.ts`)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語: [lanes.zh-CN.md](./lanes.zh-CN.md) · 2026-11-08 時点、master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語: [lanes.zh-CN.md](./lanes.zh-CN.md) · 2026-11-08 時点、master
 
 ![Host lanes module](./assets/lanes.en.svg)
 (ビットマップフォールバック: [lanes.en.png](./assets/lanes.en.png))

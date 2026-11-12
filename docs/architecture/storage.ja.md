@@ -1,6 +1,6 @@
 # モジュール: 統合ストレージ (`src/persist.ts` + `src/storage/`)
 
-> [アーキテクチャハブ](../architecture.md) の一部 · 中国語版: [storage.zh-CN.md](./storage.zh-CN.md) · 2026-11-08 時点、master、スキーマ v11
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [storage.zh-CN.md](./storage.zh-CN.md) · 2026-11-08 時点、master、スキーマ v11
 
 ![統合ストレージモジュール](./assets/storage.en.svg)
 (ビットマップフォールバック: [storage.en.png](./assets/storage.en.png))
