@@ -1,13 +1,15 @@
 import { Agent } from "undici";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FIRST_BYTE_TIMEOUT_CODE } from "./upstream-fail.js";
 import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import {
     upstreamTimeoutMs as knobUpstreamTimeoutMs,
+    upstreamFirstByteMs as knobUpstreamFirstByteMs,
     replayMaxAttempts as knobReplayMaxAttempts,
     replayBaseDelayMs as knobReplayBaseDelayMs,
     maxShrinkPerCompress as knobMaxShrinkPerCompress,
 } from "./knobs.js";
+import { log } from "./logger.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -22,6 +24,14 @@ import {
 export { MAX_REQUEST_BYTES } from "./request-body-budget.js";
 import { checkOutboundBody } from "./request-body-budget.js";
 export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
+
+// NOTE (#5917 review): there is deliberately NO UPSTREAM_FIRST_BYTE_MS default
+// constant here — the unset fallback of the first-byte knob is the RESOLVED
+// upstreamTimeoutMs() (src/knobs.ts), so "unset" stays byte-identical to the
+// pre-#5904 single-phase watchdog for EVERY configuration, including
+// deployments that raise BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min
+// local-model prefills. Pinning a 720000 constant here would silently re-cap
+// those deployments' first byte at 12 min.
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
 /** Test hook: how many fetchWithTimeout idle-timers are currently armed.
@@ -62,12 +72,15 @@ export function _resetIdleTimerSeamsForTest(): void {
  *  tune it live. Local-model deployments with very large contexts can need
  *  prefills longer than the 12-minute default before their first token.
  *
- *  This budget is the SOLE silence bound by design: there is deliberately no
- *  finer-grained mid-stream stall detector. A #1452-era opt-in guard
+ *  This budget remains the SOLE default silence bound: there is deliberately
+ *  no finer-grained mid-stream stall detector. A #1452-era opt-in guard
  *  (BILI_STREAM_STALL_MS) was retired in #1706/#1714 — local-model
  *  deployments legitimately go silent for minutes mid-stream (thinking
  *  phases, long prefills), so any finite sub-budget false-positived healthy
- *  turns into truncations. Do not re-add a shorter timer here. */
+ *  turns into truncations. Do not re-add a shorter MID-STREAM timer here.
+ *  (#5904 adds only a phase-1 FIRST-BYTE budget knob — request sent → first
+ *  response byte — and its default equals this full budget, so default
+ *  behavior is unchanged; see upstreamFirstByteMs in src/knobs.ts.) */
 export function upstreamTimeoutMs(): number {
     return knobUpstreamTimeoutMs();
 }
@@ -178,17 +191,46 @@ export async function fetchWithTimeout(
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
     checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
+    // #5904: two-phase watchdog. Phase 1 (request sent → first response byte)
+    // uses its own budget — min(caller's explicit timeout, the first-byte knob)
+    // — so "upstream accepted the request but never answered" fails (and
+    // logs) distinctly. Default knob value = the full idle budget, so unset =
+    // byte-identical to the old single-phase watchdog. Phase 2 (body
+    // streaming) re-arms to the full idle budget, preserving the #1706/#1714
+    // guarantee that long silent prefills/streams are never truncated.
+    const firstByteBudget = Math.min(timeoutMs ?? Number.POSITIVE_INFINITY, knobUpstreamFirstByteMs());
+    // #5807/#5831: a first-byte timeout is only REPLAYABLE when the operator
+    // explicitly tightened the first-byte budget below the idle budget — that
+    // is the only case where "silence before the first byte" is bounded by a
+    // small, deliberate number rather than the 12-min default (whose unset
+    // value must stay byte-identical to the legacy single-phase watchdog, and
+    // whose 3× stacking across retries is exactly what the #5831 decision ruled
+    // out). firstByteBudget < effective ⇔ the first-byte source (the knob when
+    // set, else the resolved idle) is strictly tighter than the effective full
+    // budget — e.g. a tightened knob, or a caller timeout LONGER than it.
+    const firstByteIsSplit = firstByteBudget < effective;
+    let firstByteTripped = false;
     const controller = new AbortController();
     let cleared = false;
-    const armTimer = () => {
+    let phase: "first-byte" | "body" = "first-byte";
+    const safeUrl = () => {
+        try { return new URL(url).origin + new URL(url).pathname; } catch { return url.slice(0, 120); }
+    };
+    const armTimer = (delayMs: number) => {
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
+            // The watchdog historically fired SILENTLY — a wedged upstream meant
+            // the fetch rejected with a bare AbortError and nothing in the log
+            // explained it (#5904 forensics: 300s of total silence). Name the
+            // phase and budget every time it trips.
+            log("warn", `upstream watchdog fired (${phase} phase, ${delayMs}ms budget) — ${String(opts.method ?? "GET")} ${safeUrl()} aborted: ${phase === "first-byte" ? "no response headers" : "no body chunk"} in budget`);
+            if (phase === "first-byte" && firstByteIsSplit) firstByteTripped = true;
             controller.abort();
-        }, idleTimerDelayOverrideMs ?? effective);
+        }, idleTimerDelayOverrideMs ?? delayMs);
         liveUpstreamTimers.add(t);
         return t;
     };
-    let timer = armTimer();
+    let timer = armTimer(firstByteBudget);
     const rearm = () => {
         // A late body chunk can resolve after the consumer already called
         // clearTimer (abandoned response — e.g. a failed retry whose body is
@@ -198,7 +240,8 @@ export async function fetchWithTimeout(
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
         idleRearmCount += 1;
-        timer = armTimer();
+        phase = "body";
+        timer = armTimer(effective);
     };
     let onExternalAbort: (() => void) | null = null;
     if (externalSignal) {
@@ -249,6 +292,15 @@ export async function fetchWithTimeout(
         const raw = transport
             ? await transport(url, finalOpts)
             : await fetch(url, finalOpts as RequestInit) as Response;
+        // #5904: phase 1 ends HERE — undici resolves the fetch around the
+        // FIRST BODY DATA (a headers-only-then-silent upstream stays pending,
+        // as observed live: headers written at t=0, fetch resolved at the first
+        // chunk at t=300ms). So phase 1 covers request-sent → first response
+        // byte, and once we get here the remaining silence (inter-chunk gaps,
+        // thinking phases, long prefills) is phase-2 mid-stream silence guarded
+        // by the full idle budget — never the shorter first-byte budget
+        // (#1706/#1714 guarantee).
+        rearm();
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
@@ -266,6 +318,17 @@ export async function fetchWithTimeout(
         return { response: raw, clearTimer: cleanup, stopIdleTimer };
     } catch (e) {
         cleanup();
+        // #5807/#5831: carry the phase-1 cause so the classifier can give it its
+        // own, replayable kind. Preserve name/message (downstream code keys off
+        // name === "AbortError", e.g. preflight's abort/timeout sniff) and keep
+        // the original as `cause` so chainOf() still sees the real AbortError
+        // beneath the marker.
+        if (firstByteTripped && e instanceof Error) {
+            const marked = new Error(e.message, { cause: e }) as Error & { code: string };
+            marked.name = e.name;
+            marked.code = UPSTREAM_FIRST_BYTE_TIMEOUT_CODE;
+            throw marked;
+        }
         throw e;
     }
 }
@@ -316,7 +379,10 @@ export class UpstreamHttpError extends Error {
  *  rate-limit rejection rather than a genuine client error. GLM Coding Plan
  *  returns 400 {"code":3007,"msg":"captcha verify failed"} ~1s after large
  *  context rewrites (issue #189); every observed case recovered on retry,
- *  so such bodies are retried while plain 4xx (bad model, bad params) fail fast. */
+ *  so such bodies are retried while plain 4xx (bad model, bad params) fail
+ *  fast. "please retry" / "请重试" cover the canonical "just retry" phrasing of
+ *  risk-control gateways (issue #3606). Bare "retry" is deliberately absent —
+ *  "do not retry" / "请勿重试" must stay non-transient. */
 const TRANSIENT_BODY_MARKERS = [
     "captcha",
     "verify failed",
@@ -325,13 +391,74 @@ const TRANSIENT_BODY_MARKERS = [
     "rate limit",
     "too many requests",
     "try again",
+    "please retry",
+    "请重试",
 ];
+
+// #3606: an explicit machine self-declaration outranks prose sniffing — a
+// gateway that says its rejection is retryable means it, and enumerating
+// every vendor's wording will never converge. Bodies past this cap are too
+// large to be JSON error envelopes; skip the parse.
+const DECLARATION_BODY_CAP = 65_536;
+// Node visit budget for the declaration scan: bounds worst-case work on
+// pathological (but still small) bodies.
+const DECLARATION_NODE_BUDGET = 4_096;
 
 export function isTransientUpstreamError(status: number, body: string): boolean {
     if (status === 429 || status >= 500) return true;
     if (status < 400) return false;
     const lower = body.toLowerCase();
-    return TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker));
+    if (TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker))) return true;
+    return bodyDeclaresRetryable(body);
+}
+
+// #3606: honor the upstream's explicit retryability declaration — an "actions"
+// array containing "RETRY" (case-insensitive) or a boolean "retryable": true
+// anywhere in the error JSON. The scan walks nested objects AND string values
+// that themselves parse as JSON, because gateways wrap their envelope in a
+// string field ({"error":{"message":"{...}"}}, the shape behind issue #3606's
+// code 11101 bodies). A string "true" or an actions list without RETRY is NOT
+// a declaration — only unambiguous machine signals count.
+function bodyDeclaresRetryable(body: string): boolean {
+    if (body.length > DECLARATION_BODY_CAP) return false;
+    const root = parseJsonObject(body);
+    if (root === undefined) return false;
+    const queue: unknown[] = [root];
+    let head = 0;
+    let visited = 0;
+    while (head < queue.length && visited < DECLARATION_NODE_BUDGET) {
+        const node = queue[head++];
+        visited += 1;
+        if (typeof node === "string") {
+            const nested = parseJsonObject(node);
+            if (nested !== undefined) queue.push(nested);
+        } else if (Array.isArray(node)) {
+            for (const item of node) queue.push(item);
+        } else if (node !== null && typeof node === "object") {
+            for (const [key, value] of Object.entries(node)) {
+                const loweredKey = key.toLowerCase();
+                if (loweredKey === "actions" && Array.isArray(value)
+                    && value.some((item) => typeof item === "string" && item.toLowerCase() === "retry")) {
+                    return true;
+                }
+                if (loweredKey === "retryable" && value === true) {
+                    return true;
+                }
+                if (value !== null && typeof value === "object") queue.push(value);
+                else if (typeof value === "string" && /^[{\[]/.test(value.trimStart())) queue.push(value);
+            }
+        }
+    }
+    return false;
+}
+
+function parseJsonObject(text: string): object | undefined {
+    try {
+        const value: unknown = JSON.parse(text);
+        return typeof value === "object" && value !== null ? value : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 /** Total requests per replay attempt (initial + retries). */

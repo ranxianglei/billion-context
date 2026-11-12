@@ -1,4 +1,4 @@
-import type { WireProtocol } from "./util.js";
+import { trailingSystemRunStart, type WireProtocol } from "./util.js";
 import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 /** Append `text` as a trailing user turn on the wire's own request body.
@@ -12,7 +12,7 @@ import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
  *
  *  Returns null when the body is unparseable or carries no turn array — the
  *  caller skips the mutation rather than sending a body it has mangled. */
-export function appendTrailingUserText(protocol: WireProtocol, body: string | Buffer, text: string): string | null {
+export function appendTrailingUserText(protocol: WireProtocol, body: string | Buffer, text: string, model?: string): string | null {
     const raw = typeof body === "string" ? body : body.toString("utf8");
     let obj: Record<string, unknown>;
     try {
@@ -47,7 +47,7 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         if (last && typeof last === "object" && last.role === "user" && Array.isArray(last.parts)) {
             // #3159: plain text after a functionResponse part 400s on Vertex —
             // keep the canonical order when merging into a tool-result tail.
-            last.parts = normalizeGoogleUserPartOrder([...(last.parts as unknown[]), { text }] as GooglePart[]);
+            last.parts = normalizeGoogleUserPartOrder([...(last.parts as unknown[]), { text }] as GooglePart[], { model });
         } else {
             arr.push({ role: "user", parts: [{ text }] });
         }
@@ -62,6 +62,13 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         if (typeof c === "string") last.content = `${c}\n\n${text}`;
         else if (Array.isArray(c)) last.content = [...c, { type: "text", text }];
         else last.content = text;
+    } else if (protocol === "anthropic") {
+        // #5432: the assembled body can legally END in a client trailing system
+        // run (the kernel heal keeps it verbatim at array end); a plain push
+        // would put a user after it and 400. Insert before the run instead —
+        // identical to the push when no system trails. OpenAI has no such rule,
+        // so its bytes stay exactly as before.
+        arr.splice(trailingSystemRunStart(arr), 0, { role: "user", content: text });
     } else {
         arr.push({ role: "user", content: text });
     }

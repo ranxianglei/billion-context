@@ -46,6 +46,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { storageStatusWire } from "../src/storage/runtime-status.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
+import { METADATA_EXPECTED_REBASE, METADATA_OFFLOAD_PENDING, METADATA_REBASE_FETCH_TRIED } from "../src/fold-reconcile.ts";
 import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,14 @@ export function stripOneTimeAlignment<T>(view: T): T {
     }
     const out = JSON.parse(json) as (T & { state?: Record<string, unknown>; blockContents?: unknown }) & Record<string, unknown>;
     if (out.state && "refLedgerAligned" in out.state) delete out.state["refLedgerAligned"];
+    // #5608-C/D companion bookkeeping of the SAME one-time alignment:
+    // restampRefsToLedger raises the time-attr visibility mark alongside the
+    // renumbering (kernel/src/refs.ts), and #5608-D moved WHEN that pass runs
+    // (cold load -> first post-fold save), so cross-mode / cross-timing legs
+    // legitimately differ in exactly these fields. Strip them like the flag.
+    // (suppressMintingOnce is deliberately NOT stripped — it is not an
+    // alignment fingerprint; its presence in a compared state is a real bug.)
+    if (out.state && "timestampsHighWaterRefSeq" in out.state) delete out.state["timestampsHighWaterRefSeq"];
     // cacheLedger line `bd` digests hash the RAW outbound bodies — bodies whose
     // only cross-leg delta is this same citation renumbering. The bodies are
     // compared directly (per-turn shaCiteNorm), so masking the derived digests
@@ -147,6 +156,17 @@ export function stripOneTimeAlignment<T>(view: T): T {
     // the ingest pipeline's experience of building this view (errors, watermark
     // drops), which is inherently load-path-dependent, not conversation state.
     if (out.metadata && "snapshotShadow" in (out.metadata as Record<string, unknown>)) delete (out.metadata as Record<string, unknown>)["snapshotShadow"];
+    // #5142 expected-rebase accounting records are unified-store evidence: the
+    // stored-row backfill can only run where index.db exists, so a full-mode leg
+    // legitimately carries these entries while a legacy leg never sees them.
+    // Drift-accounting inputs, not wire or fold state — behavior pinned
+    // separately in tests/issue5142-expected-rebase.test.ts.
+    if (out.metadata) {
+        const md = out.metadata as Record<string, unknown>;
+        delete md[METADATA_EXPECTED_REBASE];
+        delete md[METADATA_REBASE_FETCH_TRIED];
+        delete md[METADATA_OFFLOAD_PENDING];
+    }
     if (bcEntries) out.blockContents = new Map(bcEntries.map(([k, val]) => [remap.get(k) ?? k, val]));
     return sortObjectKeys(out) as T;
 }

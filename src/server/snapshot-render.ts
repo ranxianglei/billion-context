@@ -121,7 +121,7 @@ function legacyFor(session: Session, deps: SnapshotRenderDeps, clientMsgs: BiliM
     return clientMsgs;
 }
 
-function parseRow(content: string, seq: number): BiliMessage | null {
+function parseRow(content: string, seq: number, ts?: number | null): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
         if (typeof parsed.id !== "string" || typeof parsed.role !== "string") return null;
@@ -134,6 +134,9 @@ function parseRow(content: string, seq: number): BiliMessage | null {
         // DISPLAY index. Rows written before this change simply lack the
         // field; the kernel counter path keeps serving them unchanged.
         msg.ledgerSeq = seq + 1;
+        // #4313: the wall-clock stamp rides the column, never the stored
+        // bytes — hydrate it back onto the object (NULL = pre-feature).
+        if (typeof ts === "number") msg.ts = ts;
         return msg;
     } catch {
         return null;
@@ -194,8 +197,11 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     // signature here — #3812: the old sig sweep could not distinguish an upgrade
     // twin from a genuine later duplicate of the same text and silently swallowed
     // real messages).
+    // Retired blocks stay in the coverage set: their rows remain suppressed
+    // (retire removes the SUMMARY from the view, not the fold itself). Only
+    // the anchor synthesis skips them (assembleView).
     const activeBlocks = session.state.blocks.filter((b) => b.active);
-    const blockSeeds: { blockId: string; seqs: Set<number> }[] = [];
+    const blockSeeds: { blockId: string; seqs: Set<number>; retired?: boolean }[] = [];
     const coveredSeqUnion = new Set<number>();
     for (const block of activeBlocks) {
         const blockSeqs = new Set<number>();
@@ -210,7 +216,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         // path, which renders the client view untouched.
         if (blockSeqs.size === 0) return { reason: "block-unanchored" };
         for (const seq of blockSeqs) coveredSeqUnion.add(seq);
-        blockSeeds.push({ blockId: block.blockId, seqs: blockSeqs });
+        blockSeeds.push({ blockId: block.blockId, seqs: blockSeqs, retired: block.retired === true });
     }
 
     // #D5-5: merge the covered seqs into disjoint intervals and load bytes
@@ -230,7 +236,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         if (contentRows !== null) {
             const bySeq = new Map<number, ViewRow>();
             for (const row of contentRows) {
-                const msg = parseRow(row.content, row.seq);
+                const msg = parseRow(row.content, row.seq, row.ts);
                 if (!msg) return { reason: "row-unparsable" }; // uncovered bytes are untrustworthy: degrade, never guess
                 bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
             }
@@ -249,7 +255,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
                 if (full !== null) {
                     const fullBySeq = new Map<number, BiliMessage>();
                     for (const row of full) {
-                        const msg = parseRow(row.content, row.seq);
+                        const msg = parseRow(row.content, row.seq, row.ts);
                         if (msg) fullBySeq.set(row.seq, msg);
                     }
                     for (const r of rows) {
@@ -271,9 +277,10 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
 /** Anchor synthesis + covered-suppression merge shared by both renderers;
  *  d = number of prefix rows rendered, tailMsgs ride verbatim after them.
  *  null = an uncovered row has no bytes (never render a hole). */
-function assembleView(rows: ViewRow[], blockSeeds: { blockId: string; seqs: Set<number> }[], coveredSeqUnion: Set<number>, d: number, tailMsgs: BiliMessage[]): BiliMessage[] | null {
+function assembleView(rows: ViewRow[], blockSeeds: { blockId: string; seqs: Set<number>; retired?: boolean }[], coveredSeqUnion: Set<number>, d: number, tailMsgs: BiliMessage[]): BiliMessage[] | null {
     const anchors: { at: number; msg: BiliMessage }[] = [];
-    for (const { blockId, seqs: blockSeqs } of blockSeeds) {
+    for (const { blockId, seqs: blockSeqs, retired } of blockSeeds) {
+        if (retired) continue; // #5765: no summary anchor — covered rows stay suppressed
         let maxCover = -1;
         for (const seq of blockSeqs) maxCover = Math.max(maxCover, seq);
         let at = d;
