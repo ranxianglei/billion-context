@@ -1,4 +1,4 @@
-import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, refToIndex } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -38,6 +38,11 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  appendMediaRefsSection,
+  collectFoldMediaRefs,
+  parseMediaRefsSection,
+} from "./media-refs.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -104,6 +109,23 @@ export interface ProcessTurnInput {
   state: CompressionState;
   config: Config;
   tokenCount: number;
+  /** Where tokenCount came from:
+   *   - "usage": a billing-grade reading (a fresh upstream input_tokens
+   *     sample or a provenance-stable anchor derived from one).
+   *   - "estimate": a local fallback (char-bound estimate — e.g. right
+   *     after an aborted turn or a cache-TTL expiry that left no usage
+   *     report). Such readings structurally run high relative to what will
+   *     actually be billed.
+   * Feeds the phantom-pressure guard: with nudge.requireUsageSampleForPressure
+   * (default on) an ESTIMATE reading never arms the pressure band outright —
+   * the injection is deferred one round until a usage-grade reading lands,
+   * which costs nothing in practice (the next request carries the report).
+   * The #5865 backstop bounds that deferral to nudge.maxEstimateHoldRounds
+   * (default 2) consecutive estimate rounds so a backend that NEVER reports
+   * usage cannot starve its pressure nudges forever. Omit for legacy behavior
+   * (guard off). Non-pressure tiers are unaffected.
+   */
+  tokenCountSource?: "usage" | "estimate";
   /**
    * Which messages get an <acp> ref tag injected into their text
    * (the render-refs pipeline node). Refs are ALWAYS assigned regardless
@@ -161,6 +183,15 @@ type RangeResolution =
  *  carries a clipped text (≤ keepPrefix+marker+keepSuffix ≈ 4KiB); a fold
  *  clears the latch, so normal sessions hold a handful at most. Oldest drop. */
 const MAX_TRUNCATE_LATCH = 64;
+
+/** #5698: a tier-1 fold answering the fire that offered `pending` tokens must
+ *  reclaim at least this fraction of the offered mass for the T1 channel to
+ *  count as draining. Partial compliance below it (production #5671: nudges
+ *  offering ~450K answered by 3-6K folds) sets the harvest-stall flag so tier
+ *  arbitration can route to mass-qualified distillation instead of starving
+ *  it behind a never-draining T1. Measured against the fire's pendingT1, so
+ *  eager lanes (fold the whole offer) never trip it. */
+export const STALL_HARVEST_RATIO = 0.5;
 
 function rangeError(
   spec: { startRef: string; endRef: string },
@@ -282,20 +313,30 @@ function applyRefolds(input: {
   runId: string;
   config: Config;
   blockIds: string[];
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min here too; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }): void {
-  validateSummaryLength(input.spec, input.config.compress);
+  validateSummaryLength(input.spec, input.config.compress, {
+    skipMin: input.minFloorCovered === true,
+  });
   const targets = new Set(input.blockIds);
-  input.state.blocks = input.state.blocks.map((block) =>
-    targets.has(block.blockId)
-      ? {
-          ...block,
-          summary: input.spec.summary,
-          topic: input.spec.topic ?? block.topic,
-          runId: input.runId,
-          restoredInline: false,
-        }
-      : block,
-  );
+  input.state.blocks = input.state.blocks.map((block) => {
+    if (!targets.has(block.blockId)) return block;
+    // #5620: refold rewrites the stored summary — carry this block's own
+    // MEDIA REFS section forward mechanically.
+    const carriedRefs = parseMediaRefsSection(block.summary).map(
+      scrubLoneSurrogates,
+    );
+    return {
+      ...block,
+      summary: appendMediaRefsSection(input.spec.summary, carriedRefs),
+      topic: input.spec.topic ?? block.topic,
+      runId: input.runId,
+      restoredInline: false,
+    };
+  });
 }
 
 export function createCore(ports: Ports = {}): CompressionCore {
@@ -662,8 +703,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // Scope is EXACTLY the fold-candidate set that mutates state in the loop —
     // never every requested range, else a consumed range whose summary happens to
     // be long would wrongly kill a batch whose real candidates all validate.
+    // #5894: the FLOOR judges the BATCH, not each paragraph. A multi-candidate
+    // batch passes when its COMBINED summaries reach minSummaryLength — one
+    // trivial span may honestly earn a few words without atomically killing its
+    // siblings (#3003's own advice was "drop the offending range(s)", which then
+    // failed ALONE against the same floor and spun). A single folding candidate
+    // keeps guarding its own summary; EMPTY and MAX stay per-range in both shapes.
+    let batchFloorByTotal = false;
     {
-      const lengthFailures: string[] = [];
+      const foldCandidates: ApplyCompressionInput["ranges"][number][] = [];
       for (const spec of input.ranges) {
         if (skipSpecs.has(spec)) continue;
         const resolution = classifications.get(spec);
@@ -673,17 +721,48 @@ export function createCore(ports: Ports = {}): CompressionCore {
           resolution.status === "consumed" &&
           refoldDecisions.get(spec)?.kind === "refold";
         if (!foldsFresh && !foldsRefold) continue;
+        foldCandidates.push(spec);
+      }
+      const lengthFailures: string[] = [];
+      const minLen = input.config.compress.minSummaryLength;
+      if (foldCandidates.length === 1) {
+        const solo = foldCandidates[0]!;
         try {
-          validateSummaryLength(spec, input.config.compress);
+          validateSummaryLength(solo, input.config.compress);
         } catch (error) {
           lengthFailures.push(
             rangeError(
-              spec,
+              solo,
               error instanceof Error ? error.message : String(error),
             ),
           );
         }
+      } else {
+        for (const spec of foldCandidates) {
+          try {
+            validateSummaryLength(spec, input.config.compress, { skipMin: true });
+          } catch (error) {
+            lengthFailures.push(
+              rangeError(
+                spec,
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
+          }
+        }
+        if (minLen > 0 && foldCandidates.length > 1) {
+          const total = foldCandidates.reduce(
+            (sum, spec) => sum + (spec.summary?.trim() ?? "").length,
+            0,
+          );
+          if (total < minLen) {
+            lengthFailures.push(
+              `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
+            );
+          }
+        }
       }
+      batchFloorByTotal = foldCandidates.length > 1;
       if (lengthFailures.length > 0) {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
@@ -735,6 +814,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
               runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
+              minFloorCovered: batchFloorByTotal,
             });
             blocksCreated += decision.blocks.length;
           } catch (error) {
@@ -773,6 +853,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           protectedMessageIds,
           countTokens,
           preExistingCoverage,
+          minFloorCovered: batchFloorByTotal,
         });
         blocksCreated += outcome.noop
           ? 0
@@ -848,6 +929,29 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // (which may have consumed blocks of tier N to produce tier N+1), every
       // tier should be eligible to re-evaluate from the new token count.
       state.nudge.lastShownByTier = {};
+      // #5415: the #5293 abort-absorb debt bank drained with the backlog it
+      // tracked — a fresh cadence starts from a clean slate.
+      state.nudge.absorbedDebt = 0;
+      state.nudge.absorbCount = 0;
+      // #5698: T1 harvest-stall accounting (consume-once). The tier-1 fire
+      // banked its offered pending; this fold answers it. A distill (any new
+      // block above tier 1) proves the distillation channel delivers — clear
+      // the stall. A message-shaped fold harvesting < STALL_HARVEST_RATIO of
+      // the offered pending is partial compliance: the T1 channel is not
+      // draining while the block pile keeps growing (#5671 treadmill) — set
+      // the stall so arbitration can route to mass-qualified distillation.
+      const distilled = state.blocks
+        .filter((b) => !preFoldBlockIds.has(b.blockId))
+        .some((b) => (b.tier ?? 1) > 1);
+      const firePending = state.nudge.lastT1FirePending;
+      if (distilled) {
+        state.nudge.t1HarvestStall = false;
+        state.nudge.lastT1FirePending = undefined;
+      } else if (firePending !== undefined && firePending > 0) {
+        state.nudge.t1HarvestStall =
+          tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        state.nudge.lastT1FirePending = undefined;
+      }
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -896,6 +1000,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const ctx: PipelineContext = {
       config: input.config,
       tokenCount: input.tokenCount,
+      tokenCountSource: input.tokenCountSource,
       countTokens,
       contentStore,
     };
@@ -1097,23 +1202,55 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
     const stamps = { ...(io.state.tsStamps ?? {}) };
     const knownIds = io.state.messageRefs.byRaw;
     let changed = false;
+    // #5608-C: the time-attribute visibility high-water mark is written EXACTLY
+    // once — the moment this session first runs the timestamp pipeline — to the
+    // PRE-PASS highest ref index. Refs minted afterwards exceed it structurally
+    // (assign-refs continues from highest+1); older refs stay excluded until an
+    // edit/fold re-mints them onto a higher seat, whose tag bytes already change
+    // with the new number (the attribute then costs zero extra).
+    // Consequence: flipping #4313 on mid-session (or the default off→on upgrade)
+    // costs ZERO prefix bytes, and a restart never re-opens the window.
+    const hwmFresh = io.state.timestampsHighWaterRefSeq === undefined;
+    const hwm = hwmFresh
+      ? highestUsedIndex(io.state.messageRefs)
+      : (io.state.timestampsHighWaterRefSeq as number);
+    // #5608-B: the host arms this one-shot from a fresh-child-from-parent path.
+    const suppressed = io.state.suppressMintingOnce === true;
     const messages = io.messages.map((m) => {
       if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
       const stamped = stamps[m.id];
       if (stamped !== undefined) {
         if (m.ts === stamped) return m;
+        // Attached earlier (persisted before the #5608-C gate existed): keep the
+        // provider-cached bytes verbatim — stability beats retrospective gating.
+        // Unattached: render the attribute only for ELIGIBLE current refs (minted
+        // after the feature became effective for this session).
+        const cur = knownIds[m.id];
+        const seq = cur === undefined ? null : refToIndex(cur);
+        if (seq === null || seq <= hwm) return m;
         changed = true;
         return { ...m, ts: stamped };
       }
       const carried = typeof m.ts === "number" ? m.ts : undefined;
-      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      // #5608-B: while the host arm is set (a FRESH-state child just inherited
+      // a parent's history — resume adoption / fork clone), NEVER mint
+      // Date.now(): those ids' real times are unknown, and fabricating
+      // "today" for old messages is a lie (spec §5; #5608-A display tier).
+      // Carried values still win; everything else stays honest NULL.
+      const ts =
+        carried ??
+        (!suppressed && knownIds[m.id] === undefined ? Date.now() : undefined);
       if (ts === undefined) return m;
       stamps[m.id] = ts;
       changed = true;
       return { ...m, ts };
     });
-    if (!changed) return io;
-    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+    if (!changed && !hwmFresh && !suppressed) return io;
+    const nextState = { ...io.state, tsStamps: stamps, timestampsHighWaterRefSeq: hwm as number };
+    // Self-clear without a phantom key: omitting the property entirely keeps
+    // key-sensitive state comparisons (and JSON shape) clean.
+    if (suppressed) delete nextState.suppressMintingOnce;
+    return { ...io, messages, state: nextState };
   },
   };
 }
@@ -1152,11 +1289,14 @@ const assignRefsNode: PipelineNode = {
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
+    // Unrecoverable media (no stored bytes AND no re-access handle) rides
     // outside msg.text; folding one destroys it permanently with no restore
     // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
-    // advertised, never folded. Archivable inline images fold like text and
-    // stay citable by their numeric ref for decompress({ imageRef }) (#2607).
+    // advertised, never folded. #5620: ref-based media (remote URL / file id)
+    // is NOT blocked — its handle rides the stored summary (media-refs.ts)
+    // and decompress restores the original. Archivable inline images fold
+    // like text and stay citable by their numeric ref for
+    // decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
@@ -1371,6 +1511,7 @@ const nudgeNode: PipelineNode = {
   run(io, ctx) {
     const nudge = decideNudge({
       tokenCount: ctx.tokenCount,
+      tokenCountSource: ctx.tokenCountSource,
       config: ctx.config,
       state: io.state,
       messages: io.messages,
@@ -1445,6 +1586,12 @@ const nudgeNode: PipelineNode = {
           ...stamped.lastShownByTier,
           [nudge.tier]: ctx.tokenCount,
         };
+      }
+      // #5698: bank the offered tier-1 mass as the compliance denominator —
+      // the first applyCompression after this fire compares its harvest
+      // against this number to detect a non-draining T1 channel.
+      if (nudge.tier === 1 && nudge.breakdown) {
+        stamped.lastT1FirePending = nudge.breakdown.pendingT1;
       }
     }
 
@@ -1612,6 +1759,10 @@ interface SingleRangeInput {
   protectedMessageIds?: Set<string>;
   countTokens: (text: string) => number;
   preExistingCoverage: Set<string>;
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }
 
 interface SingleRangeOutcome {
@@ -1697,6 +1848,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         runId: input.runId,
         config: input.config,
         blockIds: decision.blocks.map((block) => block.blockId),
+        minFloorCovered: input.minFloorCovered,
       });
       return {
         tokens: 0,
@@ -1730,11 +1882,14 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // #4521: everything in the range was dropped by content filters
     // (protected tool pairs, media, …) with no zone hit and no consumed
     // blocks — same idempotent no-op class as the two above, so the batch is
-    // not poisoned by it.
+    // not poisoned by it. #5919: the projection may have carried a specific
+    // reason (e.g. a merge skipped because its turn cannot be closed now) —
+    // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
     return {
       tokens: 0,
       warnings: [
+        ...warnings,
         `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
@@ -1755,6 +1910,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // #5620: ref-recoverable media folded here keeps its re-access handles in
+  // the stored summary — appended mechanically (never model discretion; on
+  // the wire a URL part is often invisible to the summarizer), and carried
+  // forward from consumed blocks so merges/distillations drop none.
+  const foldMediaRefs = collectFoldMediaRefs(
+    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
+    consumedBlockIds.map((id) => blockById(input.state, id)),
+  ).map(scrubLoneSurrogates);
+
   const blockId = allocateBlockId(input.state);
   // #4316 layer 3: resolve the fold's ledger interval before constructing the
   // block. The claim is recorded only when it is EXACT — see
@@ -1768,7 +1932,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: input.spec.summary,
+    summary: appendMediaRefsSection(input.spec.summary, foldMediaRefs),
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],
@@ -1851,7 +2015,9 @@ function resolveCoverageInterval(
 
 function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
-  validateSummaryLength(input.spec, cfg);
+  validateSummaryLength(input.spec, cfg, {
+    skipMin: input.minFloorCovered === true,
+  });
 
   // #4521: the empty-range case (no direct messages, no consumed blocks)
   // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
@@ -1862,6 +2028,7 @@ function validateCompressionRange(input: SingleRangeInput): void {
 function validateSummaryLength(
   spec: { summary: string; summaryMaxChars?: number },
   cfg: Config["compress"],
+  opts: { skipMin?: boolean } = {},
 ): void {
   const summary = spec.summary?.trim() ?? "";
 
@@ -1871,7 +2038,13 @@ function validateSummaryLength(
     );
   }
 
-  if (cfg.minSummaryLength > 0 && summary.length < cfg.minSummaryLength) {
+  // #5894: skipMin — the caller judged the FLOOR at batch level (multi-candidate
+  // total); EMPTY + MAX below stay enforced, only the per-range min is waived.
+  if (
+    !opts.skipMin &&
+    cfg.minSummaryLength > 0 &&
+    summary.length < cfg.minSummaryLength
+  ) {
     throw new Error(
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
@@ -1887,6 +2060,7 @@ function validateSummaryLength(
 
 interface NudgeInput {
   tokenCount: number;
+  tokenCountSource?: "usage" | "estimate";
   config: Config;
   state: CompressionState;
   messages: CoreMessage[];
@@ -1977,6 +2151,44 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // High-pressure band: over maxContextLimitPct (subsumes the emergency
   // threshold). Bypasses growth gate + cadence; gated on effective pending.
   const pressure = overLimit || emergencyOverride;
+  // Phantom-pressure guard: `tokenCount` above can rest on a LOCAL ESTIMATE
+  // instead of a billing sample (char-bound fallback — typically while no
+  // usage report has landed after an aborted turn, or after a cache-TTL
+  // expiry that voided the sample-delivery window). Such readings
+  // structurally overstate what will actually be billed (they measure inbound
+  // bytes the rewrite view is about to drop — observed ~3x billed), and
+  // firing EMERGENCY/OVER-LIMIT rewrites keyed to that meter destroys content
+  // the bill never saw and burns the prefix cache. Deferring the pressure
+  // action costs at most one round on reporting backends: the very next
+  // request carries a fresh billing report (or a provenance-stable anchor).
+  // Billed readings ("usage") and legacy callers (source omitted) keep
+  // byte-identical behavior; opt out via nudge.requireUsageSampleForPressure
+  // = false.
+  // #5865 estimate-hold backstop: "at most one round" only holds while the
+  // upstream reports usage. A backend that NEVER does (anonymous zero-
+  // baseline / silent-backend sessions, #728/#553 — where the local estimate
+  // is the ONLY pressure signal) would otherwise be deferred forever, one
+  // estimate round after another. Track the consecutive-estimate streak in
+  // NudgeState and stop deferring once it exceeds nudge.maxEstimateHoldRounds
+  // (default 2): the double-ghost windows the guard exists for stay covered.
+  // Starvation bound: for a usage-reporting backend the streak rarely exceeds
+  // 1, so the cap is ~maxEstimateHoldRounds missed opportunities; for a
+  // silent backend the streak has been accumulating since the session's
+  // first round, so pressure is injected the moment it first arrives.
+  const estimateHoldStreak =
+    input.tokenCountSource === "estimate"
+      ? (state.nudge.estimateHoldStreak ?? 0) + 1
+      : 0;
+  state.nudge.estimateHoldStreak = estimateHoldStreak > 0 ? estimateHoldStreak : undefined;
+  const maxEstimateHoldRounds = Math.max(
+    0,
+    Math.floor(config.nudge.maxEstimateHoldRounds ?? 2),
+  );
+  const pressureDeferredNoSample =
+    pressure &&
+    input.tokenCountSource === "estimate" &&
+    config.nudge.requireUsageSampleForPressure !== false &&
+    estimateHoldStreak <= maxEstimateHoldRounds;
 
   const baseline = state.nudge.lastPerMessageNudgeTokens;
   const hadPendingNudge = state.nudge.lastNudgeShownTokens > 0;
@@ -2034,6 +2246,19 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const t2Pen = tiers[2]?.pending ?? 0;
   const t3Pen = tiers[3]?.pending ?? 0;
   const maxPending = Math.max(0, t1Eff, t2Pen, t3Pen);
+  // #5698: the T1 channel is PROVEN non-draining — its last fire was answered
+  // by a fold harvesting < STALL_HARVEST_RATIO of the offered pending
+  // (#5671 treadmill: nudges offering ~450K answered by 3-6K folds, forever).
+  // While set, a mass-qualified distillation tier may fire AHEAD of T1
+  // (growth band) and T1 leaves the pressure-band candidate set when a
+  // distill tier can pay the minimum benefit. The stall is an effectiveness
+  // signal on the T1 channel — consistent with #379's "mass is the need
+  // signal": it is consulted only when the distill tier's own mass ALREADY
+  // qualifies. Absent the flag (eager lanes, fresh states, tiers off)
+  // everything decides byte-identically.
+  const t1HarvestStall =
+    config.tiers.enabled && state.nudge.t1HarvestStall === true;
+  let stallEscalated = false;
   // First-sight mass bypass (#194): growthReference seeds to tokenCount when
   // no baseline exists, so a session that ARRIVES with a huge ready mass
   // (stateless full-history ingest / restored state) shows growthSinceReference
@@ -2052,8 +2277,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     baseline === 0 &&
     usage >= config.nudge.minContextLimitPct &&
     Math.max(t1Eff, t2Pen, t3Pen) >= nudgeGrowthTokens;
+  // #5415: the #5293 abort-absorb re-anchors the growth reference to the
+  // current meter, zeroing growth on every user-aborted turn. Abort-heavy
+  // clients (85 absorbs in one 4.5h log) then never cross the floor and a
+  // huge ready mass sits idle for hours ("growth 4450 < floor 33750, ready:
+  // T1 302220"). The host banks the repeatedly-skipped MEASURED growth into
+  // state.nudge.absorbedDebt and counts the absorbs. Debt (and the drain
+  // guard below) pay ONLY once absorbCount >= 2: a SINGLE abort stays
+  // byte-identically quiet as #5293 pinned — its debt may be large (one
+  // abort after a long quiet stretch banks the whole interval) but it must
+  // not re-fire the cadence on the user's redirect. The SECOND absorb is
+  // the proof the session is abort-heavy, not redirect-polite, so the bank
+  // pays into the floor like live growth and the 209-era cadence recovers.
+  const absorbedDebt = state.nudge.absorbedDebt ?? 0;
+  const absorbCount = state.nudge.absorbCount ?? 0;
+  const repeatAbsorbs = absorbCount >= 2;
+  const payableDebt = repeatAbsorbs ? absorbedDebt : 0;
+  // Backlog-drain guard (#5415; same philosophy as the #194 first-sight
+  // bypass — the floor paces WITHIN a backlog, it must not gate draining
+  // one): when absorbs have REPEATEDLY disturbed the cadence (count >= 2),
+  // no nudge is outstanding (lastNudgeShownTokens === 0 — an ignored nudge
+  // keeps it set, so this never re-fires on an unresponsive session), and
+  // the ready mass is at least double the T1 threshold, drain now instead
+  // of idling behind the starved growth leg. Single-absorb and debt-free
+  // sessions decide byte-identically: the bypass cannot touch them.
+  const backlogDrainReady =
+    repeatAbsorbs &&
+    absorbedDebt > 0 &&
+    state.nudge.lastNudgeShownTokens === 0 &&
+    Math.max(t1Eff, t2Pen, t3Pen) >= 2 * tierThresholds[1] &&
+    usage >= config.nudge.minContextLimitPct;
   const growthReady =
-    firstSightMassReady || growthSinceReference >= growthFloor;
+    firstSightMassReady ||
+    backlogDrainReady ||
+    growthSinceReference + payableDebt >= growthFloor;
   const t2Count = tiers[2]?.targetBlocks.length ?? 0;
   const t3Count = tiers[3]?.targetBlocks.length ?? 0;
 
@@ -2073,7 +2330,14 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // the kernel would atomically reject. emergency vs over-limit only
     // changes the reason label/voice; truncate.threshold remains the
     // independent last resort when there is genuinely nothing to compress.
-    const candidates: CompressionTier[] = [1];
+    // #5698: with the T1 channel proven non-draining, max-pending would just
+    // re-select the tier that demonstrated it cannot deliver (T1 447K pending,
+    // 3-6K per nudge) — take T1 out of the running when a distill tier can pay
+    // the minimum benefit, so pressure routes to the channel that works.
+    const candidates: CompressionTier[] = [];
+    if (!(t1HarvestStall && Math.max(t2Pen, t3Pen) >= minPressureBenefit)) {
+      candidates.push(1);
+    }
     if (config.tiers.enabled) {
       candidates.push(2, 3);
     }
@@ -2088,8 +2352,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // Minimum-benefit gate (#198): a sub-threshold pending can never look
     // actionable, no matter how hot the band is — otherwise every "success"
     // resets the baselines and the same EMERGENCY nudge re-injects each turn.
-    if (best !== null && bestPending >= minPressureBenefit) {
+    if (
+      best !== null &&
+      bestPending >= minPressureBenefit &&
+      !pressureDeferredNoSample
+    ) {
       injectedTier = best;
+      stallEscalated = t1HarvestStall && best !== 1;
       const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
       injectedReason =
         best === 1
@@ -2097,10 +2366,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= tierThresholds[1]) {
+    // #5698 stall escalation: while the T1 channel is proven non-draining,
+    // a distill tier whose own mass qualifies may fire ahead of T1 — without
+    // the normal `> t1Eff` dominance requirement (the treadmill state has
+    // T1 effective 447K vs T2 112K, so dominance can never hold even though
+    // ONE distill call reclaims 91.6% of the floor). Cadence still applies.
+    if (t1HarvestStall && t3Pen >= tierThresholds[3] && t3Pen > t2Pen) {
+      const lastShown = state.nudge.lastShownByTier[3] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 3;
+        stallEscalated = true;
+        injectedReason = `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (
+      injectedTier === null &&
+      t1HarvestStall &&
+      t2Pen >= tierThresholds[2]
+    ) {
+      const lastShown = state.nudge.lastShownByTier[2] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 2;
+        stallEscalated = true;
+        injectedReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (injectedTier === null && t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
       injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t2CountReady || (t2Pen >= tierThresholds[2] && t2Pen > t1Eff))
     ) {
@@ -2114,6 +2413,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t3CountReady ||
         (t3Pen >= tierThresholds[3] && t3Pen > t2Pen && t3Pen > t1Eff))
@@ -2134,10 +2434,16 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   if (shouldInject && firstSightMassReady) {
     injectedReason += " [first-sight mass]";
   }
+  if (shouldInject && stallEscalated) {
+    injectedReason += " [T1 harvest stall]";
+  }
 
   let reason: string;
   if (injectedTier !== null) {
     reason = injectedReason;
+  } else if (pressure && pressureDeferredNoSample) {
+    const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+    reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection held (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) until a usage-grade reading decides or the estimate-hold backstop elapses; hard-overflow backstop unaffected`;
   } else if (pressure) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason =
@@ -2191,7 +2497,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (pendingShort)
       parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
-      parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
+      parts.push(
+        absorbedDebt > 0 && !repeatAbsorbs
+          ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} held (single abort, #5293) < floor ${growthFloor}`
+          : payableDebt > 0
+            ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} across ${absorbCount} aborts < floor ${growthFloor}`
+            : `growth ${growthSinceReference} < floor ${growthFloor}`,
+      );
     if (parts.length === 0)
       parts.push(
         `max compressible ${maxPending}, growth ${growthSinceReference}`,
@@ -2205,6 +2517,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     growthSinceReference,
     countTokens,
   );
+
 
   return {
     shouldInject,
@@ -2225,6 +2538,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       hasPendingNudge: hasPendingNudge ? 1 : 0,
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
+      pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
+      estimateHoldStreak,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,
       pendingT2: tiers[2]!.pending,
@@ -2302,6 +2617,17 @@ function cloneState(state: CompressionState): CompressionState {
     // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
     // re-arms the restamp on every applyCompression.
     refLedgerAligned: state.refLedgerAligned,
+    // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
+    // fold clone with the same contract — losing either re-opens its window.
+    // Conditional spread: legacy states carry neither key and must stay
+    // key-free (an explicit undefined would materialize a phantom key that
+    // every state-shape / state-key digest compares).
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
   };
 }
 
