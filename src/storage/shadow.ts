@@ -1609,28 +1609,58 @@ class BatchedViewVerification {
 
     private compareMessages(key: "lastMessages" | "pluginSnapshot", seqs: number[] | null): void {
         const expected = this.legacy[key];
+        const tailLen = seqs?.length ?? 0;
+        // #6353: the envelope leg holds a bounded SUFFIX of the table leg's
+        // tail (boundedFoldedSnapshot drops the oldest messages until the
+        // token budget is met), so positional comparison from index 0
+        // mismatches every slot once the tail grows past the envelope budget.
+        // Align to the overlap: expected[i] corresponds to
+        // seqs[tailLen - expected.length + i].
+        const offset = expected === undefined ? 0 : Math.max(0, tailLen - expected.length);
         let index = 0;
         for (const seq of seqs ?? []) {
             const rec = this.messages.get(seq);
             if (!rec) {
+                // #4390: a tailSeqs pointer with no row means the table leg
+                // is shorter than the tail it claims — a real defect, not an
+                // alignment artifact. Report as drift and advance the index.
                 this.tailGaps++;
+                this.changed(key);
+                index++;
                 continue;
             }
-            const want = expected && index < expected.length ? messageSignature(expected[index]) : undefined;
-            if (!want || want.digest !== rec.sig.digest) {
+            const wantIndex = index - offset;
+            const hasSlot = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length;
+            if (hasSlot) {
+                const want = messageSignature(expected[wantIndex]);
+                if (want.digest !== rec.sig.digest) {
+                    this.changed(key);
+                    if (key === "lastMessages" && !this.tailSlot) {
+                        const fields = diffFieldNames(expected[wantIndex], rec.raw);
+                        this.tailSlot = fields === undefined
+                            ? { index, expect: want.slot, got: rec.sig.slot }
+                            : { index, expect: want.slot, got: rec.sig.slot, fields };
+                    }
+                }
+            } else if (expected === undefined) {
+                // The envelope has no messages at all, but the table has a
+                // row — the envelope claims an empty tail, which is drift.
                 this.changed(key);
-                if (key === "lastMessages" && expected && !this.tailSlot) {
-                    const fields = diffFieldNames(expected[index], rec.raw);
-                    this.tailSlot = fields === undefined
-                        ? { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot }
-                        : { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot, fields };
+                if (key === "lastMessages" && !this.tailSlot) {
+                    this.tailSlot = { index, expect: missingSlot(), got: rec.sig.slot };
                 }
             }
+            // else: the envelope is a proper suffix and this table row is
+            // outside the envelope's window — not comparable, not drift.
             index++;
         }
-        if (seqs && expected && index < expected.length) {
+        // #6353: the envelope cannot hold more rows than the tail it claims —
+        // if it does, the extra rows are drift.
+        if (expected !== undefined && expected.length > tailLen) {
             this.changed(key);
-            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index, expect: messageSignature(expected[index]).slot, got: missingSlot() };
+            if (key === "lastMessages" && !this.tailSlot) {
+                this.tailSlot = { index: tailLen, expect: messageSignature(expected[tailLen]).slot, got: missingSlot() };
+            }
         }
     }
 
