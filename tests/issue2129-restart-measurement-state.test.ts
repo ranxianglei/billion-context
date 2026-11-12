@@ -62,6 +62,7 @@ test("measurement-state stats survive a reload round-trip (#2129)", async () => 
         st.localInputEstimate = 12345;
         st.lastUsageGradeTokens = 9876;
         st.lastInputTokensOrigin = "http://127.0.0.1:8787";
+        st.lastInputTokensModel = "claude-opus-5-5";
         st.calibratedEstimate = 0.4375;
         st.calibratedEstimateOrigin = "http://127.0.0.1:8787";
         st.calibrationRing = { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48] };
@@ -75,6 +76,7 @@ test("measurement-state stats survive a reload round-trip (#2129)", async () => 
         assert.equal(back.stats.localInputEstimate, 12345, "localInputEstimate round-trips");
         assert.equal(back.stats.lastUsageGradeTokens, 9876, "lastUsageGradeTokens round-trips");
         assert.equal(back.stats.lastInputTokensOrigin, "http://127.0.0.1:8787", "lastInputTokensOrigin round-trips");
+        assert.equal(back.stats.lastInputTokensModel, "claude-opus-5-5", "lastInputTokensModel round-trips (#6430)");
         assert.equal(back.stats.calibratedEstimate, 0.4375, "calibratedEstimate round-trips");
         assert.equal(back.stats.calibratedEstimateOrigin, "http://127.0.0.1:8787", "calibratedEstimateOrigin round-trips");
         assert.deepEqual(back.stats.calibrationRing, { origin: "http://127.0.0.1:8787", values: [0.4, 0.45, 0.48] }, "calibrationRing round-trips");
