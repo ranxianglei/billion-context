@@ -163,52 +163,89 @@ export function stage0Decide(input: Stage0Input): Stage0Result {
     // diverges → resync, one-round convergence. Never guess.
     let decision: WorldDecision;
     const seqs = input.seqs ?? null;
-    const m2Candidate =
+    const storedSet = stored !== null ? new Set(stored.envelope.map((e) => e.id)) : null;
+    // The plane's max stamped seq: rows are stamped ledgerSeq = pos+1
+    // (the D-lane contract, snapshot-render.ts:154), so the frontier is
+    // derivable from the row pos alone — no post_json parse.
+    let planeMaxSeq = 0;
+    for (const r of rows) {
+        if (r.active === 1 && r.pos + 1 > planeMaxSeq) planeMaxSeq = r.pos + 1;
+    }
+    // Review-round-2 Residual 1b: the host re-sent a body this proxy already
+    // processed — every id is already in the stored canon and the carrier
+    // seqs (when present) sit at/below the plane frontier (the original
+    // turn's in-request flush stamped them before its response left). Zero
+    // side effects: the canon is kept as-is, the lane re-assembles the SAME
+    // world (an idempotent kernel round), and the egress no-op
+    // classification keeps the chain id and skips the developer message.
+    // Without this guard the M2 retry ([m5] vs head m1) would headMove →
+    // diverge → snapStage0Reset: a harmless retry would WIPE the plane.
+    if (
         stored !== null &&
+        storedSet !== null &&
         !input.resync &&
         input.incoming.length > 0 &&
-        seqs !== null &&
-        seqs.length === input.incoming.length;
-    if (m2Candidate) {
-        const storedSet = new Set(stored.envelope.map((e) => e.id));
-        const allUnknown = input.incoming.every((id) => !storedSet.has(id));
-        // The plane's max stamped seq: rows are stamped ledgerSeq = pos+1
-        // (the D-lane contract, snapshot-render.ts:154), so the frontier is
-        // derivable from the row pos alone — no post_json parse.
-        let planeMaxSeq = 0;
-        for (const r of rows) {
-            if (r.active === 1 && r.pos + 1 > planeMaxSeq) planeMaxSeq = r.pos + 1;
-        }
-        let contig = seqs[0] === planeMaxSeq + 1;
-        if (contig) {
-            for (let i = 1; i < seqs.length; i++) {
-                if (seqs[i] !== seqs[i - 1] + 1) {
-                    contig = false;
-                    break;
+        input.incoming.every((id) => storedSet.has(id)) &&
+        (seqs === null || seqs.every((s) => s <= planeMaxSeq))
+    ) {
+        decision = {
+            mode: "echo",
+            replay: true,
+            envelope: stored.envelope,
+            envelopeChecksum: stored.envelopeChecksum,
+            newIdPos: [],
+            goneIds: [],
+            issuedAt: stored.issuedAt,
+            witness: `replay: all ${input.incoming.length} ids known (maxSeq ${seqs ? Math.max(...seqs) : "-"} <= frontier ${planeMaxSeq})`,
+        };
+    } else {
+        // M2 pure append (brief 19544722): the client sent ONLY new elements —
+        // every incoming id is unknown to the canon — and the seqs carrier says
+        // they land as a contiguous run starting exactly after the plane's max
+        // stamped seq. That is the 世界匹配定位序列位置 evidence: issue append-
+        // only pos (maxPos+1..) without any head/order risk. Anything less
+        // certain (missing seqs, a gap, a known id mixed in) falls through to
+        // matchWorld — an all-unknown full array there is usually a re-mint and
+        // diverges → resync, one-round convergence. Never guess.
+        const m2Candidate =
+            stored !== null &&
+            !input.resync &&
+            input.incoming.length > 0 &&
+            seqs !== null &&
+            seqs.length === input.incoming.length;
+        if (m2Candidate) {
+            const allUnknown = input.incoming.every((id) => !storedSet!.has(id));
+            let contig = seqs![0] === planeMaxSeq + 1;
+            if (contig) {
+                for (let i = 1; i < seqs!.length; i++) {
+                    if (seqs![i] !== seqs![i - 1] + 1) {
+                        contig = false;
+                        break;
+                    }
                 }
             }
+            decision = allUnknown && contig
+                ? matchAppend(stored, input.incoming)
+                : matchWorld({
+                      stored,
+                      incoming: input.incoming,
+                      explainedGone,
+                      sessRaw: input.sessRaw,
+                      ledgerId: input.ledgerId,
+                      now,
+                      resync: input.resync,
+                  });
+        } else {
+            decision = matchWorld({
+                stored,
+                incoming: input.incoming,
+                explainedGone,
+                sessRaw: input.sessRaw,
+                ledgerId: input.ledgerId,
+                now,
+                resync: input.resync,
+            });
         }
-        decision = allUnknown && contig
-            ? matchAppend(stored, input.incoming)
-            : matchWorld({
-                  stored,
-                  incoming: input.incoming,
-                  explainedGone,
-                  sessRaw: input.sessRaw,
-                  ledgerId: input.ledgerId,
-                  now,
-                  resync: input.resync,
-              });
-    } else {
-        decision = matchWorld({
-            stored,
-            incoming: input.incoming,
-            explainedGone,
-            sessRaw: input.sessRaw,
-            ledgerId: input.ledgerId,
-            now,
-            resync: input.resync,
-        });
     }
 
     // Persist the canon for every verdict EXCEPT diverge (zero side effects).

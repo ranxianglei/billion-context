@@ -2023,7 +2023,7 @@ export type Prepared = {
      *  it (null) so the next round RE-SEEDS (at-least-once: over-serving is
      *  safe, under-serving is the context loss). Absent (undefined) = no
      *  delta was selected this turn. */
-    pendingResponsesDelta?: { frontierPos: number; servedAnchors: string[] } | null;
+    pendingResponsesDelta?: { state: { frontierPos: number; servedAnchors: string[] }; kind: "full" | "noop" | "partial" } | null;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND
      *  anthropic system (pre-anchor). Preflight summary calls must carry it —

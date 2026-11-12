@@ -70,6 +70,16 @@ export interface Stage0Result {
     /** True when stage 0 reset the plane this turn (diverge / explicit
      *  re-baseline) — the lane must clear session.responsesDelta (M6). */
     resynced: boolean;
+    /** Review-round-2 Residual 2: the highest PLANE row pos of the STORED
+     *  world at decision time (the new rows are not flushed yet) — present
+     *  only when the decision is a strict extension (mode probe, nothing
+     *  gone, new elements only) AND the assembly succeeded. The responses
+     *  lane uses it to INITIALIZE the delta frontier on the first chained
+     *  round of a keepResponseId chain: the provider's chain — built from
+     *  this proxy's own full-view round — already holds exactly the stored
+     *  world, so the outbound is the new elements only, never a re-seed.
+     *  null = the lane re-seeds as before (every other shape). */
+    storedFrontierPos: number | null;
 }
 
 export function runStage0(opts: Stage0Input): Stage0Result {
@@ -129,6 +139,7 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     }
     let kernelInput: BiliMessage[] | undefined;
     let resynced = false;
+    let storedFrontierPos: number | null = null;
     if (armed) {
         try {
             const store = getStore();
@@ -184,6 +195,21 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                         coverMax: cores.coverMax,
                     });
                     kernelInput = asm.kernelInput;
+                    // Residual 2: at THIS moment every active plane row is a
+                    // stored-world row (this round's new rows land only in the
+                    // lane's in-request flush, which runs AFTER stage 0). The
+                    // stored world's boundary is therefore the max active row
+                    // pos — a strict-extension decision (probe, nothing gone,
+                    // new elements) is what makes "the chain holds exactly
+                    // these rows" provable; every other shape stays null and
+                    // the lane re-seeds as before.
+                    if (
+                        stage0.decision.mode === "probe"
+                        && stage0.decision.goneIds.length === 0
+                        && stage0.decision.newIdPos.length > 0
+                    ) {
+                        storedFrontierPos = cores.rows.reduce((mx, r) => (r.pos > mx ? r.pos : mx), -1);
+                    }
                     log("info", `[${sessionId}] [2x2:${lane}] stage-0 ${stage0.decision.mode} — kernel input from plane (old=${asm.oldCount}, new=${newCores.length}, anchors=${anchors.length})`);
                 }
             }
@@ -203,5 +229,5 @@ export function runStage0(opts: Stage0Input): Stage0Result {
             log("warn", `[${sessionId}] [2x2:${lane}] stage-0 failed (${why}) — legacy full path`);
         }
     }
-    return { pinned, kernelInput, cohortRan: armed, resynced };
+    return { pinned, kernelInput, cohortRan: armed, resynced, storedFrontierPos };
 }
