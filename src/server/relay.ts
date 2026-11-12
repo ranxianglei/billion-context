@@ -1274,6 +1274,19 @@ async function forwardCaptured(
         try {
             upstreamResult = await fetchPromise;
             firstAttemptClear = upstreamResult.clearTimer;
+            // #6181 B4: commit the delta frontier ONLY after the upstream
+            // accepts the request (fetch resolves on 4xx too — check the
+            // status). A 4xx/failed forward DROPS the pending state: the
+            // next round re-seeds (at-least-once — over-serving the full
+            // view is safe, under-serving is the context loss). The pending
+            // field is consumed at this single point (the first forward of
+            // the turn; compress-loop re-requests carry full views).
+            if (prepared && prepared.pendingResponsesDelta !== undefined) {
+                const accepted = upstreamResult.response.status < 400;
+                prepared.session.responsesDelta = accepted ? prepared.pendingResponsesDelta : null;
+                markDirty(prepared.session);
+                prepared.pendingResponsesDelta = undefined;
+            }
         } finally {
             clearTimeout(firstByteTimer);
         }

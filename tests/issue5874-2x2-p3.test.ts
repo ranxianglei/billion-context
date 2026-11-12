@@ -659,3 +659,311 @@ test("S1 the full M1→M2 round trip: seed (issue) → M1 probe → M2 append �
     assert.deepEqual(echo.decision.newIdPos, []);
     void rows;
 });
+
+// ---------------------------------------------------------------------------
+// Fix-round tests: M4 codec-level pin, B0 plane bypass, M3 latch persistence,
+// and the HTTP e2e pins (B1 400 funnel, B3 pure continuation, B4 frontier
+// commit on upstream accept).
+// ---------------------------------------------------------------------------
+
+import http from "node:http";
+import { once } from "node:events";
+import { defaultConfig } from "acp-kernel";
+import { openaiToCore } from "acp-kernel/wire";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { _resetSnapEgressForTests, applySnapEgress } from "../src/server/snap-egress.ts";
+
+test("A1d M4: the codec-level pin — parsing the new element ALONE (M2 wire) yields the same core as parsing it inside the full array (M1 wire), wireIndex aside", () => {
+    const contents = Array.from({ length: 11 }, (_, i) => `codec content ${i + 1}`);
+    const fullBody = { model: "gpt-m4", messages: contents.map((c) => ({ role: "user", content: c })) };
+    const full = openaiToCore(fullBody as never);
+    assert.equal(full.msgs.length, 11);
+    // M2 wire: the client sends ONLY the 11th element — a fresh parse with a
+    // fresh ClusterCounter. The canonical id derives from (role, contentType,
+    // text), so the counter state cannot change the id for an element whose
+    // content appears once.
+    const inc = openaiToCore({ model: "gpt-m4", messages: [fullBody.messages[10]!] } as never);
+    assert.equal(inc.msgs.length, 1);
+    const strip = (m: BiliMessage): Record<string, unknown> => {
+        const c = { ...(m as unknown as Record<string, unknown>) };
+        delete c.wireIndex; // position on the wire — legitimately differs (10 vs 0)
+        return c;
+    };
+    assert.equal(
+        JSON.stringify(strip(full.msgs[10]!)),
+        JSON.stringify(strip(inc.msgs[0]!)),
+        "the new element's core is byte-identical between the full-array parse (M1) and the standalone parse (M2), so the assembled kernel cores are codec-level identical, not just assembly-level identical",
+    );
+
+    // And through the assembly: plane rows m1..m10 + the new core from each
+    // leg's own parse — the kernel input bytes must match.
+    const sid = "a1d";
+    const store = storeWithRows(10, sid);
+    store.snapStage0(sid, Array.from({ length: 10 }, (_, i) => `m${i + 1}`));
+    const rows10 = store.snapStage0Cores(sid).rows.map((r) => ({ pos: r.pos, ids: r.ids, msg: JSON.parse(r.postJson) as BiliMessage }));
+    const ten = Array.from({ length: 10 }, (_, i) => `m${i + 1}`);
+    const m1 = store.snapStage0(sid, [...ten, "codec-11"], { seqs: ten.map((_, i) => i + 1).concat(11) });
+    const asm1 = assembleKernelInput({ decision: m1.decision, rows: rows10, newCores: [full.msgs[10]!] });
+    const store2 = storeWithRows(10, sid);
+    store2.snapStage0(sid, ten);
+    const m2 = store2.snapStage0(sid, ["codec-11"], { seqs: [11] });
+    const rows10b = store2.snapStage0Cores(sid).rows.map((r) => ({ pos: r.pos, ids: r.ids, msg: JSON.parse(r.postJson) as BiliMessage }));
+    const asm2 = assembleKernelInput({ decision: m2.decision, rows: rows10b, newCores: [inc.msgs[0]!] });
+    // wireIndex is the parse-time position artifact (10 in the full parse, 0
+    // in the standalone parse). It does not change the re-emitted wire: the
+    // plane rows carry no wireIndex, so the new element groups as its own
+    // wire message in BOTH legs. The semantic kernel cores must match.
+    const stripAll = (arr: BiliMessage[]) => JSON.stringify(arr.map(strip));
+    assert.equal(stripAll(asm1.kernelInput), stripAll(asm2.kernelInput), "assembled kernel input byte-identical with codec-produced new cores (M1 full parse vs M2 standalone parse), wireIndex aside");
+});
+
+test("B0a: a skipPlaneFlush save leaves the plane rows untouched — a collapsed view cannot delete history", () => {
+    const sid = "b0a";
+    const store = storeWithRows(10, sid);
+    store.snapStage0(sid, Array.from({ length: 10 }, (_, i) => `m${i + 1}`));
+    assert.equal(store.snapStage0Cores(sid).rows.length, 10);
+
+    // A chained delta turn: the kernel view holds only the 4 messages it was
+    // given (a collapse). Without the flag, deriving events from this view
+    // would DELETE every row it does not contain. With the flag, the save
+    // runs the legacy ingest but skips ALL plane work.
+    const collapsed = [core(1, "m1"), core(2, "m2"), core(3, "m3"), core(4, "m4")];
+    const plan = planIngest(plainSession(sid, 4));
+    plan.planeMessages = collapsed as never;
+    plan.skipPlaneFlush = true;
+    store.ingestSession(plan);
+    const rows = store.snapStage0Cores(sid).rows;
+    assert.equal(rows.length, 10, "the plane still holds all 10 rows after the flagged save");
+    assert.deepEqual(rows.map((r) => r.ids).flat().sort(), Array.from({ length: 10 }, (_, i) => `m${i + 1}`).sort(), "and the ids are exactly the original ten (nothing deleted, nothing added)");
+
+    // The flag is one-shot: the next save (full view, no flag) runs the plane
+    // path and stays at 10 rows (idempotent final-state diff).
+    const full = Array.from({ length: 10 }, (_, i) => core(i + 1, `m${i + 1}`));
+    const plan2 = planIngest(plainSession(sid, 10));
+    plan2.planeMessages = full as never;
+    store.ingestSession(plan2);
+    assert.equal(store.snapStage0Cores(sid).rows.length, 10);
+});
+
+test("B0b: egress bypass serves the legacy bytes verbatim — a stale plane never leaks into a delta turn", () => {
+    _resetSnapEgressForTests();
+    const sid = "b0b";
+    const store = storeWithRows(3, sid);
+    store.snapStage0(sid, ["m1", "m2", "m3"]);
+    // Register the store under test through the global seam (egress reads
+    // getStore() — the P2 G-test pattern).
+    const shadow = {
+        stats: { disabled: false },
+        snapEgressView: (s: string) => store.snapEgressView(s),
+    } as never;
+    _setStoreForTest(new SessionStore({ enabled: true, shadow, log: () => undefined }));
+
+    const state = { blocks: [] } as never;
+    const legacy = [core(1, "m1"), core(2, "m2"), core(3, "m3")];
+    const deps = { sessionId: sid, protocol: "responses" as never, isCompressTool: (name: string) => name === "compress", log: () => undefined, transform: (msgs: BiliMessage[]) => msgs };
+    const bypassed = applySnapEgress(state, legacy, { ...deps, bypass: true });
+    assert.equal(bypassed, legacy, "bypass returns the legacy array BY REFERENCE (zero plane involvement for the turn)");
+});
+
+test("M3: the R3 latch persists across store instances — a latched session degrades forever, never 400s again", () => {
+    const p = path.join(hermetic, "m3", "index.db");
+    const a = openPlane(p);
+    assert.equal(a.snapR3Latched("sid-m3"), false);
+    a.snapR3Latch("sid-m3");
+    // A FRESH instance over the same file — the process restart case: the
+    // in-memory breaker is cold, the persisted latch must carry the state.
+    const b = openPlane(p);
+    assert.equal(b.snapR3Latched("sid-m3"), true, "the latch survives a new store instance (process restart)");
+    assert.equal(b.snapR3Latched("other-sid"), false, "other sessions are unaffected");
+});
+
+// ── HTTP e2e (real proxy + fake upstream) ───────────────────────────────────
+
+function listenT(server: http.Server): Promise<void> {
+    if (server.listening) return Promise.resolve();
+    return once(server, "listening").then(() => undefined);
+}
+function closeT(server: http.Server): Promise<void> {
+    return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+}
+function sseT(type: string, data: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+function sseDone(): string {
+    return [
+        sseT("response.output_item.done", { item: { type: "message", id: "msg_1", role: "assistant", content: [{ type: "output_text", text: "ok" }] }, output_index: 0 }),
+        sseT("response.completed", { response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } } }),
+    ].join("");
+}
+
+type UpstreamBehavior = (n: number, body: string) => { status: number; payload: string };
+
+async function withProxyT(
+    behavior: UpstreamBehavior,
+    fn: (url: string, bodies: string[]) => Promise<void>,
+    opts: { storeDir?: string; env?: Record<string, string> } = {},
+): Promise<void> {
+    const bodies: string[] = [];
+    let reqN = 0;
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            bodies.push(body);
+            const { status, payload } = behavior(++reqN, body);
+            const streaming = payload.startsWith("event: ");
+            res.writeHead(status, streaming ? { "content-type": "text/event-stream", "cache-control": "no-cache" } : { "content-type": "application/json" });
+            res.write(payload);
+            res.end();
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await listenT(upstream);
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const savedEnv: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(opts.env ?? {})) { savedEnv[k] = process.env[k]; process.env[k] = v; }
+    let store: SessionStore | undefined;
+    try {
+        if (opts.storeDir) {
+            process.env.BILI_STORAGE_UNIFIED = "shadow";
+            store = new SessionStore({ enabled: true, dir: opts.storeDir, debounceMs: 0 });
+            _setStoreForTest(store);
+        } else {
+            _setStoreForTest(new SessionStore({ enabled: false }));
+        }
+        const proxyOpts: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1",
+            routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-e2e": { context: 400_000 } } } },
+            modelContextLimit: 400_000,
+            kernelConfig: defaultConfig(400_000),
+            compress: { injectTool: true, injectNudge: true },
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: true,
+            logFile: "off",
+            debug: false,
+            passthrough: false,
+            autoUpdate: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            mitm: { enabled: false, domains: [] },
+        };
+        const proxy = await startServer(proxyOpts);
+        await listenT(proxy);
+        const proxyPort = (proxy.address() as { port: number }).port;
+        try {
+            await fn(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`, bodies);
+        } finally {
+            await closeT(proxy);
+        }
+    } finally {
+        await closeT(upstream);
+        for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+        delete process.env.BILI_STORAGE_UNIFIED;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        void store;
+    }
+}
+
+const PLUGIN_HEADERS = { "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": "e2e-sess" } as Record<string, string>;
+
+test("B1: a declared host that fails to collect msgids (count mismatch) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            const res = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    input: [
+                        { type: "message", role: "user", content: "first" },
+                        { type: "message", role: "user", content: "second" },
+                    ],
+                    biliMsgIds: ["b1m1"], // 1 declared vs 2 elements — the R3 fault
+                }),
+            });
+            assert.equal(res.status, 400, "the identity fault is a 400 (the B1 control channel — not the generic 503)");
+            assert.equal(res.headers.get("x-bili-snapshot"), "identity");
+            const err = JSON.parse(await res.text()) as { error: { type: string; message: string } };
+            assert.equal(err.error.type, "snapshot_identity_fault");
+            assert.ok(err.error.message.includes("R3"), "the error names the fault class");
+            assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
+        },
+        { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
+    );
+});
+
+test("B3: a plugin chained round with EMPTY input is a pure continuation — the raw body passes through verbatim (no dev injection, id kept)", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            const reqBody = { model: "gpt-e2e", stream: true, previous_response_id: "resp_b3", input: [] };
+            const res = await fetch(url, { method: "POST", headers: PLUGIN_HEADERS, body: JSON.stringify(reqBody) });
+            assert.equal(res.status, 200);
+            await res.text();
+            assert.equal(bodies.length, 1);
+            const fwd = JSON.parse(bodies[0]!) as Record<string, unknown>;
+            assert.equal(fwd.previous_response_id, "resp_b3", "the chain id is forwarded intact");
+            assert.deepEqual(fwd.input, [], "the empty input passes through (NOT rebuilt, NOT dropped)");
+            assert.ok(!JSON.stringify(fwd).includes("You are bili"), "no developer-message injection on the pure continuation (the B3 blind-response fix)");
+        },
+        {},
+    );
+});
+
+test("B4: the delta frontier commits only when the upstream ACCEPTS — a 400 turn leaves the frontier at its previous value (the next round re-seeds)", async () => {
+    await withProxyT(
+        (n) => (n === 2 ? { status: 400, payload: JSON.stringify({ error: { message: "upstream refused" } }) } : { status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            // Turn 1: seed (no chain ref yet).
+            const r1 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({ model: "gpt-e2e", stream: true, input: [{ type: "message", role: "user", content: "one" }], biliMsgIds: ["b4m1"], biliLedgerSeqs: [1] }),
+            });
+            assert.equal(r1.status, 200);
+            await r1.text();
+
+            // Turn 2: CHAINED cohort turn (M2 append). Its outbound is the
+            // SEED round of the delta chain (no frontier yet) — and the
+            // upstream REFUSES it. The selected frontier must NOT commit.
+            const r2 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({ model: "gpt-e2e", stream: true, previous_response_id: "resp_t1", input: [{ type: "message", role: "user", content: "two" }], biliMsgIds: ["b4m2"], biliLedgerSeqs: [2] }),
+            });
+            assert.equal(r2.status, 400, "the upstream refusal passes through");
+            await r2.text();
+
+            // Turn 3: another chained cohort turn. With the frontier
+            // uncommitted, the outbound must be a RE-SEED: the FULL view
+            // (all 3 world elements over the wire). If the 400 turn had
+            // advanced the frontier, this round would send a 1-element delta.
+            const r3 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({ model: "gpt-e2e", stream: true, previous_response_id: "resp_t2", input: [{ type: "message", role: "user", content: "three" }], biliMsgIds: ["b4m3"], biliLedgerSeqs: [3] }),
+            });
+            assert.equal(r3.status, 200);
+            await r3.text();
+            const fwd3 = JSON.parse(bodies[2]!) as { input: { content?: unknown }[] };
+            const texts = fwd3.input.flatMap((x) => (Array.isArray(x.content) ? x.content.map((p) => (p as { text?: string }).text ?? "") : [String(x.content ?? "")]));
+            for (const c of ["one", "two", "three"]) assert.ok(texts.some((t) => t.includes(c)), `turn 3's reseed view carries world element \"${c}\"`);
+            assert.equal(fwd3.input.length, 4, "the 3 world elements plus the re-injected developer message (a reseed round sends the full self-contained view + dev; a delta would have sent 1 world element and no dev)");
+        },
+        { storeDir: path.join(hermetic, "b4-store"), env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1", ACP_KEEP_RESPONSE_ID: "1" } },
+    );
+});

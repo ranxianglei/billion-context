@@ -66,6 +66,9 @@ export interface LegacySessionLike {
      *  runs only the light transform. Carried into IngestSessionInput as
      *  planeMessages. */
     lastPlaneMessages?: CoreMessage[];
+    /** #6181 B0: one-shot plane-write skip — see Session.skipPlaneFlush.
+     *  Consumed (cleared) by snapShadowSync on the save that carries it. */
+    skipPlaneFlush?: boolean;
     pluginSnapshot?: CoreMessage[];
     /** #3301: external-converter import payload — original message
      *  decompositions interned BEFORE the snapshot/tail so their rows get the
@@ -133,6 +136,8 @@ export function toLegacyLike(s: {
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
     lastPlaneMessages?: LegacySessionLike["lastPlaneMessages"];
+    /** #6181 B0: one-shot plane-write skip (see Session.skipPlaneFlush). */
+    skipPlaneFlush?: LegacySessionLike["skipPlaneFlush"];
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
     decompositionLog?: LegacySessionLike["decompositionLog"];
     contentStore?: LegacySessionLike["contentStore"];
@@ -149,6 +154,7 @@ export function toLegacyLike(s: {
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
         lastPlaneMessages: s.lastPlaneMessages,
+        skipPlaneFlush: s.skipPlaneFlush,
         pluginSnapshot: s.pluginSnapshot,
         decompositionLog: s.decompositionLog,
         contentStore: s.contentStore,
@@ -514,7 +520,7 @@ function finishPlan(
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs, planeMessages: session.lastPlaneMessages ?? null };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs, planeMessages: session.lastPlaneMessages ?? null, ...(session.skipPlaneFlush ? { skipPlaneFlush: true } : {}) };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */

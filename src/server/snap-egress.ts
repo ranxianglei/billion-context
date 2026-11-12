@@ -55,6 +55,13 @@ interface SnapEgressDeps {
      *  succeeds — a failed round keeps the old state and re-sends the same
      *  delta: at-least-once). */
     onSelection?: (sel: DeltaSelection, totalElements: number) => void;
+    /** #6181 B0: this turn cannot be addressed against the plane (a
+     *  non-cohort chained delta whose kernel view is a delta, not the
+     *  world) — serve the LEGACY bytes verbatim for this turn: the plane
+     *  is one turn stale (its write was skipped), and serving it would
+     *  drop the new input element. The legacy bytes are exactly what
+     *  master serves for this turn (the delta the provider chains from). */
+    bypass?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +447,7 @@ export function applySnapEgress(
     const flags = snapEgressFlags();
     if (!flags.egress || !flags.cohorts.has(deps.protocol)) return legacyProcessed;
     if (isSnapPlaneDead(deps.sessionId)) return legacyProcessed;
+    if (deps.bypass) return legacyProcessed; // #6181 B0 — one turn; the plane stays stale-but-intact
 
     let view: SnapView | null;
     try {

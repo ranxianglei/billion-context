@@ -2467,6 +2467,19 @@ export class SessionStore {
         this.liveShadow().snapStage0Reset(sessionId);
     }
 
+    /** #6181 M3: whether this sid's R3 breaker latch persisted from a
+     *  previous process (a restart must not re-arm a misbehaving host). */
+    snapR3Latched(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapR3Latch(sessionId);
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check

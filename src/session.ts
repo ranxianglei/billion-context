@@ -694,6 +694,13 @@ export type Session = {
      *  only the light transform (absorb/attach/strip/drop) — no seam walk,
      *  no re-tagging, no id re-keying. Cleared per turn like lastMessages. */
     lastPlaneMessages?: CoreMessage[];
+    /** #6181 B0: one-shot "skip the snapshot-plane write on the next
+     *  save" — set by the lane for a turn that CANNOT be addressed against
+     *  the plane (a non-cohort chained delta whose kernel view is a delta,
+     *  not the world): deriving events from it would delete every row the
+     *  view does not contain. snapShadowSync clears it when it consumes it
+     *  (one save, then the flag is gone). */
+    skipPlaneFlush?: boolean;
     /** 2×2 Part B (出站增量, responses lane only): the incremental-outbound
      *  frontier — the highest plane row pos + anchor summary ids the provider
      *  already has via its retained chain. Persisted with the session; lost
