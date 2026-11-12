@@ -1055,6 +1055,19 @@ export async function handleIncrementalTurn(
         inFlight.delete(conversationId);
         const session = peekSession(sessionId);
         settled = true;
+        // #3397 (PR #6326): durability-before-render — the turn's ledger rows are made
+        // durable NOW (synchronous unified-index ingest) so a crash before the
+        // debounced envelope save (#5155) cannot leave the refs the model just
+        // saw unbacked (the #3397 orphaned-generation gap: the lane rendered the
+        // delta, the model could cite it, but the rows only settled in the
+        // debounced flush). The large JSON envelope itself stays debounced —
+        // only the small row ingest moves ahead of it. Best-effort: the
+        // debounced save below retries the full path on failure.
+        try {
+            if (session) getStore().ingestRowsNow(session);
+        } catch {
+            // best-effort, same failure posture as the debounced save
+        }
         // #5155: the debounced save coalesces consecutive turns' full-envelope
         // flushes (a synchronous writeNow per turn serialized + fsynced the
         // whole ~24MB envelope on large histories); pointer upkeep no longer

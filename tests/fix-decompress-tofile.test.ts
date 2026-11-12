@@ -176,3 +176,52 @@ test("#1691 range toFile: writes the span to the caller path and queues only a l
         rmrf(scratch);
     }
 });
+
+test("automatic whole-block spills keep different views written in one millisecond", (t) => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-tofile-unique-"));
+    const tempKey = process.platform === "win32" ? "TEMP" : "TMPDIR";
+    const previousTmp = process.env[tempKey];
+    process.env[tempKey] = scratch;
+    try {
+        const { ctx, session, blockId } = foldBlock("unique-views", 8);
+        const one = "one-level view\n".repeat(1_000);
+        const full = "full original view\n".repeat(1_000);
+        session.blockContents.set(blockId, { one: { text: one, count: 1 }, full: { text: full, count: 2 } });
+        const now = Date.now();
+        t.mock.method(Date, "now", () => now);
+        const first = resolveDecompress({ blockId }, ctx).text.match(/written to: (.+)$/m)?.[1];
+        const second = resolveDecompress({ blockId, full: true }, ctx).text.match(/written to: (.+)$/m)?.[1];
+        assert.ok(first);
+        assert.ok(second);
+        assert.notEqual(first, second, "each export owns its file even when the clock has not advanced");
+        assert.equal(fs.readFileSync(first, "utf8"), one);
+        assert.equal(fs.readFileSync(second, "utf8"), full);
+    } finally {
+        if (previousTmp === undefined) delete process.env[tempKey];
+        else process.env[tempKey] = previousTmp;
+        rmrf(scratch);
+    }
+});
+
+test("automatic range spills do not register the same path twice in one millisecond", (t) => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "bili-tofile-range-unique-"));
+    const tempKey = process.platform === "win32" ? "TEMP" : "TMPDIR";
+    const previousTmp = process.env[tempKey];
+    process.env[tempKey] = scratch;
+    try {
+        const f = foldCcr();
+        const ctx = { core: f.core, config: f.config, messages: f.msgs, session: f.session, log: () => {} };
+        const now = Date.now();
+        t.mock.method(Date, "now", () => now);
+        for (let i = 0; i < 2; i++) {
+            assert.equal(resolveDecompress({ blockId: f.blockId, startId: "m00001", endId: "m00007" }, ctx).outcome, "success");
+        }
+        const files = fs.readdirSync(scratch).filter((name) => name.startsWith("acp-decompress-"));
+        assert.equal(files.length, 2, "each retention entry refers to a distinct file");
+        for (const file of files) assert.match(fs.readFileSync(path.join(scratch, file), "utf8"), /Historical detail 0\./);
+    } finally {
+        if (previousTmp === undefined) delete process.env[tempKey];
+        else process.env[tempKey] = previousTmp;
+        rmrf(scratch);
+    }
+});
