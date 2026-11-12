@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isAntigravityClient, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isAntigravityClient, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isDshLiveCompactEntry, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -325,6 +325,68 @@ test("dsh scan: missing profiles root yields empty result without throwing", () 
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
     const res = scanClientPlugins("dsh", { env, cwd: root });
     assert.deepEqual(res.findings, []);
+});
+
+test("dsh scan: dsh-live-compact is a KNOWN conflict (competing compaction engine, #5984)", () => {
+    clearScanCache();
+    const root = tmp("bili-1206-dsh-dlc-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({
+        dependencies: {
+            "dsh-live-compact": "^1.1.2",
+            "billion-context": "^0.1.0",
+        },
+    }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-live-compact");
+    assert.ok(f, "dsh-live-compact must be flagged");
+    // Build the recorded detail string (same shape as src/server/handle.ts:
+    // recordConflict) BEFORE the assert.equal below narrows f.match —
+    // node:assert/strict's strictEqual carries `asserts actual is T`.
+    const detail = `${f.client}: ${f.entry} (${f.source})${f.match === "keyword" ? " [suspected]" : ""}`;
+    assert.equal(f.match, "known");
+    assert.equal(f.knownId, "dsh-live-compact");
+    // A known finding is never design-benign, even with bili driving dsh —
+    // it is a live competing compressor, unlike the sibling integrations.
+    assert.equal(isDesignBenign(f, "dsh"), false);
+    const d = parsePluginConflictDetail(detail);
+    assert.ok(d, "the recorded detail must parse back");
+    assert.equal(d.entry, "dsh-live-compact");
+    assert.equal(d.suspected, false, "a known finding must not carry the [suspected] tag");
+    assert.ok(!isSiblingConflictDetail(detail), "a dsh finding is not a sibling detail");
+    assert.ok(!isDisplayOnlyConflictDetail(detail), "dsh-live-compact is a live compressor, never display-only");
+});
+
+test("dsh scan: versioned dsh-live-compact npm spec is a KNOWN conflict too (#5984)", () => {
+    clearScanCache();
+    const root = tmp("bili-1206-dsh-dlc-spec-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({ dependencies: { "dsh-live-compact@1.1.2": "1.1.2" } }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-live-compact@1.1.2");
+    assert.ok(f, "the spec-form entry must be flagged");
+    assert.equal(f?.match, "known");
+    assert.equal(f?.knownId, "dsh-live-compact");
+});
+
+test("dsh scan: dsh-live-compact lookalike stays keyword-suspected, not known (#5984)", () => {
+    clearScanCache();
+    const root = tmp("bili-1206-dsh-dlc-lookalike-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const file = path.join(root, "dsh", "profiles", "main", "package.json");
+    assertTestOwned(file, root);
+    writeFile(file, JSON.stringify({ dependencies: { "dsh-live-compact-viewer": "^0.1.0" } }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const f = res.findings.find((x) => x.entry === "dsh-live-compact-viewer");
+    assert.ok(f, "the 'compact' action token still flags the lookalike for user confirmation");
+    assert.equal(f?.match, "keyword");
+    assert.equal(isDshLiveCompactEntry("dsh-live-compact-viewer"), false);
+    assert.equal(isDshLiveCompactEntry("dsh-live-compact"), true);
+    assert.equal(isDshLiveCompactEntry("/home/u/dsh/profiles/main/node_modules/dsh-live-compact"), true);
 });
 
 test("claude scan: enabledPlugins keys + plugins dir scanned", () => {

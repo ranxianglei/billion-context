@@ -128,7 +128,7 @@ test(`real OpenCode V2: native Responses WebSockets, fold and post-fold tools ($
     assert.ok(ref);
     assert.ok(main.some(row => row.full.some(item => item.type === "function_call_output" && String(item.output).includes("ACP Context Analysis"))));
     for (let i = 0; i < 3; i++) await ocRun(`push-back round ${i}`, sid as string);
-    const foldArgs = { content: [{ startId: ref, endId: ref, summary: "E2E-WS-SUMMARY: the original material consisted of deterministic bulky filler and established the WebSocket ACP integration test context." }] };
+    const foldArgs = { content: `${ref}–${ref} fold\nE2E-WS-SUMMARY: the original material consisted of deterministic bulky filler and established the WebSocket ACP integration test context.` };
     await ocRun(`WS_FOLD_REQUEST_B64 ${Buffer.from(JSON.stringify(foldArgs)).toString("base64")}`, sid as string);
     const afterFold = rows.filter(row => row.transport === "ws" && row.full.some(item => item.type === "function_call_output" && String(item.output).includes("Compressed")));
     assert.equal(afterFold.length, 2);

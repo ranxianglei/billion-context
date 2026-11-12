@@ -16,6 +16,13 @@ process.env.BILI_IMAGE_RESCALE = "0";
 // what the committed test run hashes, and every freshly regenerated golden
 // would red on the next CI run.
 process.env.BILI_SNAPSHOT_SHADOW = "0";
+// Parity #3: every CI test process runs under tests/preload-test-env.mjs,
+// which pins BILI_MESSAGE_TIMESTAMPS="0" (#4313's display gate defaults ON
+// in production; byte-comparing baselines keep their pre-feature wire bytes).
+// A bare `node --import tsx` regen without this pin bakes time-stamped ACP
+// tags plus the timestamp-aware ACP-TAGS doc variant into every per-turn
+// digest, so the freshly committed goldens would red all four wires again.
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tests", "golden", "storage-render");
 fs.mkdirSync(GOLDEN_DIR, { recursive: true });

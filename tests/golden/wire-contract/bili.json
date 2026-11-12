@@ -7,94 +7,9 @@
         "input_schema": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
+              "type": "string",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -157,15 +72,40 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "input_schema": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -175,7 +115,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -190,94 +130,9 @@
           "parameters": {
             "type": "object",
             "properties": {
-              "topic": {
-                "type": "string",
-                "description": "Optional short title for the compressed range"
-              },
               "content": {
-                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "anyOf": [
-                        {
-                          "type": "string",
-                          "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startId",
-                            "endId",
-                            "summary"
-                          ]
-                        },
-                        {
-                          "type": "object",
-                          "properties": {
-                            "topic": {
-                              "type": "string"
-                            },
-                            "startId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the start of the range"
-                            },
-                            "endId": {
-                              "type": "string",
-                              "description": "mNNNNN ref at the end of the range"
-                            },
-                            "startRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of startId"
-                            },
-                            "endRef": {
-                              "type": "string",
-                              "description": "Alternate spelling of endId"
-                            },
-                            "summary": {
-                              "type": "string",
-                              "description": "Self-contained summary replacing the range"
-                            }
-                          },
-                          "required": [
-                            "startRef",
-                            "endRef",
-                            "summary"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "type": "string"
-                  }
-                ]
+                "type": "string",
+                "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
               }
             }
           }
@@ -349,10 +204,35 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
           "parameters": {
             "type": "object",
-            "properties": {}
+            "properties": {
+              "scope": {
+                "type": "string",
+                "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+              },
+              "view": {
+                "type": "string",
+                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              },
+              "tool": {
+                "type": "string",
+                "description": "With view:\"messages\": only list results of this tool name"
+              },
+              "sort": {
+                "type": "string",
+                "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+              },
+              "limit": {
+                "type": "number",
+                "description": "Max entries to list"
+              },
+              "archiveDetail": {
+                "type": "boolean",
+                "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+              }
+            }
           }
         }
       },
@@ -360,7 +240,7 @@
         "type": "function",
         "function": {
           "name": "acp_cache",
-          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -370,7 +250,7 @@
                   "summary",
                   "full"
                 ],
-                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
               }
             }
           }
@@ -385,94 +265,9 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line"
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startId",
-                          "endId",
-                          "summary"
-                        ]
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "topic": {
-                            "type": "string"
-                          },
-                          "startId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the start of the range"
-                          },
-                          "endId": {
-                            "type": "string",
-                            "description": "mNNNNN ref at the end of the range"
-                          },
-                          "startRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of startId"
-                          },
-                          "endRef": {
-                            "type": "string",
-                            "description": "Alternate spelling of endId"
-                          },
-                          "summary": {
-                            "type": "string",
-                            "description": "Self-contained summary replacing the range"
-                          }
-                        },
-                        "required": [
-                          "startRef",
-                          "endRef",
-                          "summary"
-                        ]
-                      }
-                    ]
-                  }
-                },
-                {
-                  "type": "string"
-                }
-              ]
+              "type": "string",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
           }
         }
@@ -538,16 +333,41 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -557,7 +377,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -570,43 +390,11 @@
         "parameters": {
           "type": "object",
           "properties": {
-            "topic": {
-              "type": "string",
-              "description": "Optional short title for the compressed range"
-            },
             "content": {
-              "type": "array",
-              "description": "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "topic": {
-                    "type": "string"
-                  },
-                  "startId": {
-                    "type": "string",
-                    "description": "mNNNNN ref at the start of the range"
-                  },
-                  "endId": {
-                    "type": "string",
-                    "description": "mNNNNN ref at the end of the range"
-                  },
-                  "summary": {
-                    "type": "string",
-                    "description": "Self-contained summary replacing the range"
-                  }
-                },
-                "required": [
-                  "startId",
-                  "endId",
-                  "summary"
-                ]
-              }
+              "type": "string",
+              "description": "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range."
             }
-          },
-          "required": [
-            "content"
-          ]
+          }
         }
       },
       {
@@ -667,10 +455,52 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
+            }
+          }
         }
       }
     ],
@@ -736,16 +566,41 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -755,7 +610,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -1000,7 +855,7 @@
     "absorbResponses": {
       "type": "function",
       "name": "absorb",
-      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. '(nothing needed)') — that discards the output cleanly.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1110,7 +965,7 @@
     "retrieveAcpRetrieve": {
       "anthropic": {
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -1128,7 +983,7 @@
         "type": "function",
         "function": {
           "name": "acp_retrieve",
-          "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+          "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -1146,7 +1001,7 @@
       "responses": {
         "type": "function",
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -1162,7 +1017,7 @@
       },
       "google": {
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "parameters": {
           "type": "object",
           "properties": {
