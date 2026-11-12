@@ -64,6 +64,7 @@ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
+import { checkInstructionsOverflow, dedupInstructionsKeepLatest, RESPONSES_INSTRUCTIONS_CHAR_LIMIT } from "../instructions-guard.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
@@ -584,8 +585,33 @@ async function handleRequest(
             logRequestCost(log, "passthrough", null, inboundBytes, reqT0);
             return;
         }
+        // #6258: instructions size guard — DSH in-history mode appends a full
+        // system-prompt copy on every change; pi-ai concatenates all copies
+        // into body.instructions. OpenAI rejects at 1,048,576 chars, killing
+        // the whole session. On this unclaimed lane (no compression runs) the
+        // only backstop is here: diagnose + dedup (keep latest) to rescue the
+        // session. Plain-JSON bodies only (no content-encoding) — re-encoding
+        // a compressed body would corrupt the content-encoding header.
+        let passthroughBody = bodyBuffer;
+        if (protocol === "responses" && req.method === "POST" && bodyBuffer.length > 0
+            && (headerValue(req, "content-encoding") === undefined || headerValue(req, "content-encoding") === "identity")) {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(bodyBuffer.toString("utf8"));
+            } catch {
+                parsed = undefined;
+            }
+            const overflow = checkInstructionsOverflow(parsed);
+            if (overflow !== null) {
+                const { body: deduped, modified } = dedupInstructionsKeepLatest(parsed);
+                log("warn", `[passthrough] instructions overflow on unclaimed lane (#6258): ${overflow.length.toLocaleString("en-US")}/${overflow.limit.toLocaleString("en-US")} chars — DSH in-history system accumulation will 400 every turn on the Responses lane${modified ? "; deduped to latest copy, session rescued" : "; no dedup applied (no \\n\\n separator found)"}`);
+                if (modified) {
+                    passthroughBody = Buffer.from(JSON.stringify(deduped), "utf8");
+                }
+            }
+        }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, passthroughBody, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     // #5795: pre-ingest 429-hold fast path — while the egress governor holds

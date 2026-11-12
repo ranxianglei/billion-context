@@ -16,6 +16,7 @@ import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
+import { checkInstructionsOverflow, RESPONSES_INSTRUCTIONS_CHAR_LIMIT } from "../instructions-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
@@ -1782,6 +1783,30 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                             if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — dsh native compaction summarize call refused locally (#5686)`);
                             logHostEvent("error", "[native-client]", `bili-native: dsh native compaction summarize call refused LOCALLY (422) instead of a direct send — no usable bili proxy at this moment, and forwarding would let the checkpoint land upstream and durably shadow this session's raw history (#1729/#5686); dsh logs 'step compaction failed' and continues the turn: ${dispatchUrl}`);
                             return compactionDirectRefusal(dispatchUrl);
+                        }
+                    }
+                }
+                // #6258: instructions size diagnostic on the direct-send path.
+                // DSH in-history mode appends a full system-prompt copy on every
+                // change; pi-ai concatenates all copies into body.instructions.
+                // OpenAI rejects at 1,048,576 chars, killing the whole session.
+                // This lane cannot safely modify the body (it may be a stream on
+                // the fallback path), so this is diagnostic-only: make the
+                // failure visible in the terminal so the user knows WHY every
+                // subsequent turn 400s. The passthrough lane (handle.ts) does
+                // the actual dedup rescue.
+                if (bodyText !== undefined) {
+                    const hint = modelProtocolHintFromUrl(dispatchUrl);
+                    if (hint === "responses") {
+                        let parsed: unknown;
+                        try {
+                            parsed = JSON.parse(bodyText);
+                        } catch {
+                            parsed = undefined;
+                        }
+                        const overflow = checkInstructionsOverflow(parsed);
+                        if (overflow !== null) {
+                            logHostEvent("error", "[native-client]", `bili-native: instructions overflow on direct-send path (#6258): ${overflow.length.toLocaleString("en-US")}/${overflow.limit.toLocaleString("en-US")} chars — DSH in-history system accumulation will 400 every turn on the Responses lane; the passthrough lane (handle.ts) dedupes to rescue, but this direct-send path cannot modify the body (stream risk) — start a new session or wait for the DSH root fix (deepseek-harness discussions/13010): ${dispatchUrl}`);
                         }
                     }
                 }
