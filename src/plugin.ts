@@ -534,7 +534,7 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 // passes the original parse result, not the envelope-unwrapped/chain-stripped
 // graph) so the bookkeeping here is byte-for-byte what the old post-forward
 // hash+walk produced; only the scalars cross the boundary.
-export type RawWireBookkeeping = { wireHash: string; textComparable: boolean };
+type RawWireBookkeeping = { wireHash: string; textComparable: boolean };
 
 export function computeRawWireBookkeeping(rawWire: Buffer, wireJson: unknown): RawWireBookkeeping {
     const wireHash = createHash("sha256").update(rawWire).digest("hex");
