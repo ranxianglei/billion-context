@@ -26,7 +26,7 @@ test("attachConfigDriftNote: pre-#4705 resident (no epoch) -> unknown, silent", 
     assert.equal(attachConfigDriftNote(undefined, "abc123"), undefined);
 });
 
-test("attachConfigDriftNote: unreadable local file (empty epoch) -> cross-lane, silent", () => {
+test("attachConfigDriftNote: blank epoch sentinel on either side -> silent", () => {
     assert.equal(attachConfigDriftNote("abc123", ""), undefined);
     assert.equal(attachConfigDriftNote("", ""), undefined);
 });
