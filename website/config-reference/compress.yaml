@@ -206,7 +206,7 @@ entries:
     site_en: "\"off\" | \"warn\" | \"repair\" (default repair): reconcile folded state when the client rewinds or rewrites history between turns."
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
   - key: compress.promptPack
-    type: "string (builtin: \"default\", \"lean\", \"chat\")"
+    type: "string (builtin: \"default\", \"lean\"; shipped: \"chat\")"
     default: "builtin \"default\""
     group: compress
     id: cw.ppk
