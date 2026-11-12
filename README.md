@@ -48,6 +48,8 @@
 
 ## Community
 
+Discord: [discord.gg/wSejsBdRf](https://discord.gg/wSejsBdRf)
+
 QQ Group:
 1056132097 (full)
 1108730198 (full)
