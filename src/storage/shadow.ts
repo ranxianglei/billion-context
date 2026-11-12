@@ -1608,29 +1608,61 @@ class BatchedViewVerification {
     }
 
     private compareMessages(key: "lastMessages" | "pluginSnapshot", seqs: number[] | null): void {
+        // The two legs intentionally hold different SLICES of the same log. The rows are
+        // the raw tail interned at save time (`tailSeqs`, oldest-first, the whole resident
+        // window); the envelope carries only `boundedFoldedSnapshot`, which prunes from the
+        // FRONT and keeps the NEWEST messages under `persist.tailTokens` (#2960 (5), caveat
+        // 2a). Measured on live sessions the envelope is an exact SUFFIX of the row tail —
+        // tail=1095/envelope=10 and tail=752/envelope=22, element-wise aligned at the end,
+        // zero id and zero content mismatches inside the overlap.
+        //
+        // Comparing positionally from index 0 therefore compared the oldest row against the
+        // oldest RETAINED message, i.e. off by `tail.length - messages.length`, so `want` was
+        // undefined for every slot outside the envelope window: `changed()` for every
+        // tailSeq, the streak latched, and each save paid a multi-second FULL ingest
+        // (measured: 44 full ingests, avg 4522 ms, max 9363 ms, 170.8 s of stalled event
+        // loop in one episode). Align the envelope to its suffix position instead and
+        // compare only the overlap — a genuine content divergence inside that window still
+        // reports, and a leg that is not a suffix produces mismatches rather than silence.
+        //
+        // Absence of a leg is handled by the header digest, which distinguishes `undefined`
+        // from `[]` (`withoutBulk`), so it must not be re-litigated here. Row PRESENCE is
+        // still checked (tailGaps, #4390) for every seq.
         const expected = this.legacy[key];
+        const tailLen = seqs?.length ?? 0;
+        const offset = expected === undefined ? 0 : Math.max(0, tailLen - expected.length);
         let index = 0;
         for (const seq of seqs ?? []) {
             const rec = this.messages.get(seq);
             if (!rec) {
+                // A recorded tail pointer with no row: the table leg is shorter than the tail
+                // it claims, so this is a real divergence (#4390), not an alignment artifact.
                 this.tailGaps++;
+                this.changed(key);
+                if (key === "lastMessages" && !this.tailSlot) {
+                    this.tailSlot = { index, expect: missingSlot(), got: missingSlot() };
+                }
+                index++;
                 continue;
             }
-            const want = expected && index < expected.length ? messageSignature(expected[index]) : undefined;
-            if (!want || want.digest !== rec.sig.digest) {
+            const wantIndex = index - offset;
+            const want = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length ? messageSignature(expected[wantIndex]) : undefined;
+            if (want !== undefined && want.digest !== rec.sig.digest) {
                 this.changed(key);
                 if (key === "lastMessages" && expected && !this.tailSlot) {
-                    const fields = diffFieldNames(expected[index], rec.raw);
+                    const fields = diffFieldNames(expected[wantIndex], rec.raw);
                     this.tailSlot = fields === undefined
-                        ? { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot }
-                        : { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot, fields };
+                        ? { index, expect: want.slot, got: rec.sig.slot }
+                        : { index, expect: want.slot, got: rec.sig.slot, fields };
                 }
             }
             index++;
         }
-        if (seqs && expected && index < expected.length) {
+        // The envelope claims MORE messages than the row tail holds: the table leg lost rows
+        // the envelope still carries. That is a real divergence in either direction.
+        if (seqs && expected && expected.length > tailLen) {
             this.changed(key);
-            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index, expect: messageSignature(expected[index]).slot, got: missingSlot() };
+            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index: tailLen, expect: messageSignature(expected[tailLen]).slot, got: missingSlot() };
         }
     }
 
