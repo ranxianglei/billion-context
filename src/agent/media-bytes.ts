@@ -5,7 +5,7 @@
 // tokens and tripped a "provably over window" refusal the real upstream never
 // would have made. The relay's egress fuse already excludes media from its
 // byte math (server/relay.ts — same caliber as preflight's doomed probe);
-// this is the agent-lane twin: a recursive, protocol-agnostic walk of the
+// this is the agent-lane twin: an iterative, protocol-agnostic walk of the
 // wire shapes that carry inline media (anthropic {type:"base64",data} source
 // blocks and redacted_thinking payloads, openai input_audio parts and data:
 // URLs incl. file file_data, responses input_image whose image_url is a bare
@@ -25,12 +25,14 @@ export function mediaBytesOfWireBody(raw: string): number {
     const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
     const bytesOf = (s: string): number => Buffer.byteLength(s);
     const dataUrlBytes = (s: string): number => (s.startsWith("data:") ? bytesOf(s) : 0);
-    const walk = (v: unknown): void => {
+    const pending: unknown[] = [parsed];
+    while (pending.length > 0) {
+        const v = pending.pop();
         if (Array.isArray(v)) {
-            for (const item of v) walk(item);
-            return;
+            for (const item of v) pending.push(item);
+            continue;
         }
-        if (!isObj(v)) return;
+        if (!isObj(v)) continue;
         if (typeof v.data === "string" && (v.type === "base64" || v.type === "redacted_thinking")) mediaBytes += bytesOf(v.data);
         if (typeof v.url === "string") mediaBytes += dataUrlBytes(v.url);
         if (typeof v.file_data === "string") mediaBytes += dataUrlBytes(v.file_data);
@@ -39,8 +41,7 @@ export function mediaBytesOfWireBody(raw: string): number {
         if (typeof v.image_url === "string") mediaBytes += dataUrlBytes(v.image_url);
         if (isObj(v.input_audio) && typeof v.input_audio.data === "string") mediaBytes += bytesOf(v.input_audio.data);
         if (isObj(v.inlineData) && typeof v.inlineData.data === "string") mediaBytes += bytesOf(v.inlineData.data);
-        for (const child of Object.values(v)) walk(child);
-    };
-    walk(parsed);
+        for (const child of Object.values(v)) pending.push(child);
+    }
     return mediaBytes;
 }

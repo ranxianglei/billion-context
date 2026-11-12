@@ -139,7 +139,7 @@ test("full mode: viewFor decodes only pointer rows and matches the full-log deco
         assert.deepEqual(via, reference, "bounded decode byte-equal to the full-log decode");
         assert.equal(delta, expectedPointers, `viewFor read ${delta} message rows for ${expectedPointers} pointer seqs (full log = ${liveSeqs.size})`);
     } finally {
-        store.cancelAll();
+        store.closeQuietly();
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
         rmrf(dir);
@@ -178,7 +178,7 @@ test("full mode: dropped metadata restores from the index alone (narrow read, no
         assert.ok(again, "envelope rewritten by later save");
         assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(again, "utf8")).payload.metadata as object).sort(), persistedKeys);
     } finally {
-        store.cancelAll();
+        store.closeQuietly();
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
         rmrf(dir);
