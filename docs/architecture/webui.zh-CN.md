@@ -21,7 +21,7 @@
 
 **数据源。** 活会话池 + 存储行（层树，#3917）；`acp_status` 的 ranges/nudge 每次渲染**现算**、从不缓存陈旧（`acp-status.ts`）；缓存账本经济性（`cache-ledger.ts`，#1536）；USD 价格计费与回本视图（#4899）；通告关闭回执在统一存储（kv_store namespace `notices`）。
 
-**渲染。** 服务端渲染 HTML 壳（`page.ts`）+ 一个 JS 包（`client.ts`）+ 样式；`i18n.ts` 承载 zh-CN/en 文案表（死键有测试守卫）；`markdown.ts` 转义安全；`report.ts` 生成零依赖 MD+SVG 会话报告；`diagnostics.ts` 产出可粘贴的诊断块供报 issue（#3040）。
+**渲染。** 服务端渲染 HTML 壳（`page.ts`）+ 一个 JS 包（`client.ts`）+ 样式；`i18n.ts` 承载 zh-CN/en 文案表（死键有测试守卫）；`mdrender.ts` 是唯一的转义优先 Markdown + 手写语法高亮核心（json/diff/js/ts/py/sh 词法器，GitHub 明/暗双配色，零运行时依赖——与 JSONC 辅助函数完全相同的方式经 `.toString()` 内联进浏览器 IIFE），`markdown.ts` 在服务端（博客文章 + 交接文档 fallback）包一层；`report.ts` 生成零依赖 MD+SVG 会话报告；`diagnostics.ts` 产出可粘贴的诊断块供报 issue（#3040）。
 
 **通告。** `mergedNotices()`（`src/announcements.ts`）合并三个源；远端 feed 是本仓 `announcements/remote.json`，按 ~3 分钟 watcher 节拍轮询、fail-open（取不到就留最后已知良好快照；模型流量永不受影响）；内置通告由 `tests/notice-registry.test.ts` 死键守卫。
 
