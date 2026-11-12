@@ -29,6 +29,7 @@ import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendB
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { StorageSchemaFloorError } from "./schema.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -342,6 +343,24 @@ export class UnifiedShadow {
             store.resetAllIngestWatermarks();
         } catch (err) {
             const errStr = String(err);
+            // #5788: the store's reader floor is above this build — a newer
+            // build migrated it with a non-additive change this build cannot
+            // read. Refuse (same bucket as CANTOPEN/readonly — the file is
+            // NOT corrupt, it is newer). The generic tail below must NOT
+            // apply here: "move index.db aside to force a fresh rebuild"
+            // would DESTROY the newer build's data, so the floor error gets
+            // its own line naming the real remediation (upgrade bili, or
+            // restore a pre-upgrade backup). The explicit legacy opt-out is
+            // offered like the other environment-refusals — the JSON
+            // envelopes keep being written and stay the load path.
+            if (err instanceof StorageSchemaFloorError) {
+                loggerLog(
+                    "error",
+                    `[storage] unified sidecar refused to open ${dir}/index.db (${errStr}) — REFUSING TO START (owner policy 2026-10-30: NO degradation in any case — upgrade bili to a build that can read this store, or restore a pre-upgrade index.db{,-wal,-shm} backup, or set BILI_STORAGE_UNIFIED=legacy explicitly to serve JSON-only)`,
+                );
+                recordSidecarOpenFailure(errStr);
+                throw err;
+            }
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
             // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
             // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
@@ -414,6 +433,20 @@ export class UnifiedShadow {
             return shadow;
         } catch (err) {
             const errStr = String(err);
+            // #5788: the library's reader floor is above this build — a
+            // newer build migrated it with a non-additive change this build
+            // cannot read. Refuse with the real remediation (upgrade bili /
+            // restore a pre-upgrade backup) instead of the generic
+            // "fix the connection" line, which would mislead the operator
+            // into thinking the DSN is at fault.
+            if (err instanceof StorageSchemaFloorError) {
+                loggerLog(
+                    "error",
+                    `[storage] mysql backend refused to open (${errStr}) — REFUSING TO START (no degradation in any case, 2026-10-30 owner policy); upgrade bili to a build that can read this library, or restore a pre-upgrade backup`,
+                );
+                recordSidecarOpenFailure(errStr);
+                throw err;
+            }
             loggerLog("error", `[storage] mysql backend failed to open (${errStr}) — REFUSING TO START (no degradation in any case, 2026-10-30 owner policy); fix the connection or unset storage.backend`);
             recordSidecarOpenFailure(errStr);
             throw err;

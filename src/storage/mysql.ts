@@ -40,6 +40,7 @@ import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { StorageSchemaFloorError } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -75,6 +76,15 @@ export type Mysql2Module = typeof import("mysql2/promise");
  *  ALTER ADD INDEX); fresh installs pick the keys up from the CREATE TABLE
  *  DDL. */
 const MYSQL_SCHEMA_VERSION = 11;
+
+/** #5788: parity with STORAGE_MIN_READER_VERSION (src/storage/schema.ts) —
+ *  the oldest schema version this build can still read. v8 is the only
+ *  non-additive migration (identity backfill, #4390/#4677); v9/v10/v11 are
+ *  additive and do not raise it. Persisted per library (bili_meta key
+ *  "schema_reader_floor") so an older build opening a library a newer
+ *  build migrated can REFUSE instead of silently writing rows it cannot
+ *  read back (rolling upgrade / rollback). */
+const MYSQL_MIN_READER_VERSION = 8;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -322,7 +332,28 @@ export class MysqlBackend implements StorageBackend {
             const rawStamp = (metaRows[0] as Row | undefined)?.meta_value;
             const parsedStamp = Number(rawStamp);
             const current = Number.isFinite(parsedStamp) ? parsedStamp : 0;
-            if (current < MYSQL_SCHEMA_VERSION) {
+            // #5788: reader floor gate — a library stamped by a NEWER build
+            // whose non-additive migration floor is above this build's
+            // schema version cannot be read by this build. Refuse (same
+            // bucket as CANTOPEN/readonly — the data is not corrupt, it is
+            // newer; degrading or writing would let the newer build's rows
+            // lose their semantics). A missing floor row (pre-feature
+            // library) is UNKNOWN, not "too new" — it passes, so existing
+            // libraries never false-refuse. Math: floor ≤ the build that
+            // wrote it stamped schema_version, so floor > runningVersion
+            // implies the stamp is above runningVersion; the explicit stamp
+            // check documents the intent.
+            const [floorRows] = (await conn.query(
+                "SELECT meta_value FROM bili_meta WHERE meta_key = 'schema_reader_floor'",
+            )) as unknown as Row[][];
+            const rawFloor = (floorRows[0] as Row | undefined)?.meta_value;
+            const parsedFloor = Number(rawFloor);
+            const floor = Number.isFinite(parsedFloor) ? parsedFloor : 0;
+            if (current > MYSQL_SCHEMA_VERSION && floor > MYSQL_SCHEMA_VERSION) {
+                throw new StorageSchemaFloorError(floor, MYSQL_SCHEMA_VERSION);
+            }
+            const migrated = current < MYSQL_SCHEMA_VERSION;
+            if (migrated) {
                 // #4390 v8: position-independent identity + historian
                 // tombstones. CREATE TABLE IF NOT EXISTS does not upgrade an
                 // existing v7 table — probe information_schema and ALTER
@@ -391,13 +422,40 @@ export class MysqlBackend implements StorageBackend {
                 // from the committed sessions on the next boot.
                 await this.migrateV8Identities();
             }
-            // Stamp advances but never downgrades: a future library stamped
-            // higher than this build keeps its stamp.
-            await conn.query(
-                "INSERT INTO bili_meta (meta_key, meta_value) VALUES ('schema_version', ?) " +
-                    "ON DUPLICATE KEY UPDATE meta_value = GREATEST(CAST(meta_value AS UNSIGNED), CAST(? AS UNSIGNED))",
-                [String(MYSQL_SCHEMA_VERSION), String(MYSQL_SCHEMA_VERSION)],
-            );
+            // #5788: stamp the schema version AND (when a migration just
+            // ran) the reader floor in ONE transaction — a crash between
+            // the two statements would leave a torn pair. The gate reads
+            // the floor only when the stamp is already above this build,
+            // so a torn pair (floor committed, stamp not yet advanced)
+            // would under-report the floor and let a too-old build in.
+            // The floor row is written only when a migration ran (parity
+            // with sqlite's migrateSchema): a pre-feature library already
+            // at this build's version keeps "unknown" and passes the gate.
+            await conn.beginTransaction();
+            try {
+                // Stamp advances but never downgrades: a future library
+                // stamped higher than this build keeps its stamp.
+                await conn.query(
+                    "INSERT INTO bili_meta (meta_key, meta_value) VALUES ('schema_version', ?) " +
+                        "ON DUPLICATE KEY UPDATE meta_value = GREATEST(CAST(meta_value AS UNSIGNED), CAST(? AS UNSIGNED))",
+                    [String(MYSQL_SCHEMA_VERSION), String(MYSQL_SCHEMA_VERSION)],
+                );
+                if (migrated) {
+                    await conn.query(
+                        "INSERT INTO bili_meta (meta_key, meta_value) VALUES ('schema_reader_floor', ?) " +
+                            "ON DUPLICATE KEY UPDATE meta_value = GREATEST(CAST(meta_value AS UNSIGNED), CAST(? AS UNSIGNED))",
+                        [String(MYSQL_MIN_READER_VERSION), String(MYSQL_MIN_READER_VERSION)],
+                    );
+                }
+                await conn.commit();
+            } catch (err) {
+                try {
+                    await conn.rollback();
+                } catch {
+                    /* connection-level failure — the rethrow below propagates */
+                }
+                throw err;
+            }
         } finally {
             conn.release();
         }
