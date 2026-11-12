@@ -146,12 +146,16 @@ describe("dshSystemPromptPath units", () => {
         assert.equal(dshSystemPromptPath(oaiTools), undefined, "tools-carrying system (chat-completions wire)");
     });
 
-    test("lane wiring: slot registry resolves it, drift-accounting registry is untouched, allowlist stays dsh-only", () => {
+    test("lane wiring: the dsh slot registry resolves it, the drift-accounting registry does not, no other lane does", () => {
         const m = mk("w", "system", PROMPT_V2);
         assert.equal(durableMessageToolPaths.dsh!(m), "durable/system-prompt");
         assert.equal(oneShotCarrierPaths.dsh!(m), undefined, "expected-rebase accounting is deliberately unchanged by this identity");
-        assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "KDD #9: no other lane gains a classifier");
-        assert.deepEqual(Object.keys(oneShotCarrierPaths), ["dsh"]);
+        for (const registry of [durableMessageToolPaths, oneShotCarrierPaths]) {
+            for (const [lane, classify] of Object.entries(registry)) {
+                if (lane === "dsh") continue;
+                assert.notEqual(classify(m), "durable/system-prompt", `KDD #9: lane ${lane} must not project a plain-text system`);
+            }
+        }
     });
 
     test("the twelve user-channel identities resolve exactly as before", () => {
@@ -177,6 +181,9 @@ describe("dshSystemPromptPath units", () => {
             // marker is still the system prompt, and must not take that
             // carrier's latest slot away from the real user-channel instance.
             assert.equal(durableMessageToolPaths.dsh!(mk("s", "system", `${text}\n${PROMPT_V2}`)), "durable/system-prompt", `system-role text quoting the ${expected} marker`);
+            // The drift registry is not re-ordered: for that same message it
+            // still answers by marker, as it did before this identity existed.
+            assert.equal(oneShotCarrierPaths.dsh!(mk("s", "system", `${text}\n${PROMPT_V2}`)), expected, `drift registry, system-role text quoting the ${expected} marker: unchanged`);
         }
         assert.equal(durableMessageToolPaths.dsh!(mk("u", "user", "an ordinary human request")), undefined);
     });
@@ -399,8 +406,10 @@ const E2E_V3 = `PROMPT-REV-3 answer in German. ${"q".repeat(600)}`;
  *  forwarded upstream after the fold.
  *  "messages": llm-deepseek shape — head prompt in the top-level field, each
  *  update a text-block system AFTER the user turn it was admitted with.
- *  "chat": the chat-completions shape #6193 reports — head prompt as the
- *  leading system message, each update a string-content system in history. */
+ *  "chat": llm-pi-ai's chat-completions shape, as its conversation-updates
+ *  wire test pins it ("preserves update placement": assistant, system, user)
+ *  — head prompt as the leading system message, each update a string-content
+ *  system BEFORE the user turn it was admitted with. */
 async function runFoldScenario(wire: Wire, agent: string, conv: string): Promise<{ raw: string; messages: WireMsg[] }> {
     const rig = await startRig();
     try {
@@ -456,7 +465,14 @@ describe("real fold through /__bili/plugin/tool", () => {
     test("dsh lane, Messages wire: the forwarded request still carries the prompt in force after a fold that covers it", async () => {
         const { raw, messages } = await runFoldScenario("messages", "dsh", "sysprompt-dsh-messages");
         assert.ok(raw.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
-        assert.equal(carrying(messages, "PROMPT-REV-3").length, 1, "the newest in-history system prompt must still reach the model, once, verbatim in history");
+        const kept = carrying(messages, "PROMPT-REV-3");
+        assert.equal(kept.length, 1, "the newest in-history system prompt must still reach the model, once, verbatim in history");
+        // Known limit, pinned so it cannot change silently: the fold removed
+        // the assistant that followed the prompt, and the kernel's position
+        // heal (healIllegalSystemPositions) re-voices a plain system it finds
+        // in such a spot as user. The text survives; the system role does not.
+        // A kernel that relocates instead of demoting flips this to "system".
+        assert.equal(kept[0]!.role, "user", "Messages wire today: prompt text kept, role demoted by the position heal");
         assert.ok(!raw.includes("PROMPT-REV-2"), "the superseded copy is ordinary history and folds away");
         assert.ok(!raw.includes("A1-"), "folded filler before the prompt must be gone (the fold really consumed its range)");
         assert.ok(!raw.includes("A5-"), "folded filler after the prompt must be gone");

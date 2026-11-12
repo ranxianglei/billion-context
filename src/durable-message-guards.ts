@@ -193,7 +193,10 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
  *  rendered role system (KDD #7) and is never host state. (3) An empty node
  *  supplies no prompt. dsh core has no other plain-text system producer: its
  *  only developer-role emitter (agent-loop tool-registry updates) carries
- *  tool blocks exclusively. */
+ *  tool blocks exclusively. A developer message WITH text would share this
+ *  identity where the serializer splits the text off the tool blocks
+ *  (llm-pi-ai on chat-completions and responses: its own plain system /
+ *  developer item); no such emitter is evidenced. */
 export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
     return msg.role === "system" && msg.contentType === "text" && typeof msg.text === "string" &&
         msg.text.trim().length > 0 && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
@@ -469,7 +472,12 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
  *  pinned. Same KDD #9 discipline: per-host entries with traffic evidence.
  *  durable/system-prompt is deliberately NOT listed: its superseded copies
  *  were unclassified history before that identity existed, and their drift
- *  accounting stays exactly as it was until retirement evidence is measured. */
+ *  accounting stays exactly as it was until retirement evidence is measured.
+ *  Consequence, also unchanged: this chain has no system-role step, so
+ *  system-role text containing a carrier marker is still accounted under
+ *  that marker's path here while the slot chain above calls it the prompt.
+ *  The two answer different questions (may this id vanish from a resend /
+ *  may this message fold) and agree on every user-channel carrier. */
 export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
     dsh: (msg) =>
         dshSkillCatalogPath(msg) ??

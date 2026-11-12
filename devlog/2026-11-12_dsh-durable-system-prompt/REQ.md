@@ -5,7 +5,7 @@
 - Created: 2026-11-12
 - Status: Done
 - Priority: proposed P1 (the model runs on a stale system prompt; no error, no log)
-- References: #2419 / #2446 / #2447 / #2481 (the four existing durable carriers), #2766 (role gate), #6193 (same host behavior, cost side), #4818 / PR #5800 (same family: dsh in-history system messages)
+- References: #6352 (the issue this task fixes), #2419 / #2446 / #2447 / #2481 (the four existing durable carriers), #2766 (role gate), #6193 (same host behavior, cost side), #4818 / PR #5800 (same family: dsh in-history system messages), #4172 (Messages wire: system re-voiced as user)
 
 ## 1. Background & Problem Statement
 
@@ -28,7 +28,8 @@
   - No config field, env var, persistence or wire-shape change.
 - **Non-Goals**:
   - De-duplicating identical prompt copies at parse time (#6193's proposal).
-  - Changing how the kernel positions or re-voices a surviving in-history system on the Messages wire (`healIllegalSystemPositions`).
+  - Changing how the kernel positions or re-voices a surviving in-history system on the Messages wire (`healIllegalSystemPositions`): there the pinned prompt keeps its text but is forwarded with role `user` once the fold removes its following assistant.
+  - Reopening blocks created before this change: a newest prompt that an existing block already covers stays covered until the host sends the next prompt update.
   - Expected-rebase (drift) accounting for retired prompt copies.
 
 ## 4. Acceptance Criteria

@@ -32,16 +32,20 @@
 
 ## 4. Testing & Verification
 
-- New file: 14 tests. On master c26c31ac (same assertions, classifier import shimmed): 10 fail, 4 pass — the 4 are the "unchanged" pins (unregistered lane ×3, Rule-3 anchor).
+- New file: 14 tests. On master c26c31ac (same file, the new export stubbed to return `undefined` so the file loads): 9 fail, 5 pass — the 5 are the classifier negatives and the "unchanged" pins (unregistered lane ×3, Rule-3 anchor).
 - Targeted suites (every test file that references the dsh lane or the durable guards, plus the in-history system suites): 85 files, all green except `tests/dsh-native.test.ts`, which is timing-flaky on unmodified master as well (2 of 5 baseline runs cancel 4 subtests; the file does not import the changed module).
 - `npm run typecheck`, `npm run build`, `check-unused-exports`, `check-test-import-graph`, `config-surface-guard`, `check-architecture-docs`, `gen-config-docs generate` (no drift): clean.
 
 ## 5. Risk Assessment & Rollback
 
-- **Risk points**: a third-party dsh plugin that emits a text-only developer message would serialize as a plain-text system and take the prompt identity (dsh core's only developer-role emitter carries tool blocks exclusively).
+- **Risk points**:
+  - A dsh plugin that emits a developer message with text would take the prompt identity wherever the serializer ships that text as its own plain system/developer item: `llm-pi-ai` on chat-completions and responses does so even when the message also carries tool blocks; on the Messages wire only a text-only one does (text plus tool blocks stay one structured system). dsh core's only developer-role emitter (tool-registry) carries tool blocks exclusively.
+  - Token cost: the newest copy is never folded, so its size is permanently outside what compress or preflight can reclaim (#6193 reports a 45,463-character prompt).
 - **Rollback method**: revert the commit; no data format or config schema is involved.
 
 ## 7. Follow-ups
 
-- [ ] Messages wire: once its neighbours are folded, the surviving prompt can sit in a position Anthropic-style APIs reject for `system`, and the kernel's position heal re-voices it as `user` (text intact). Keeping the system role there needs a kernel change (relocation, as PR #5800 does for tool-delta systems).
+- [ ] Messages wire: once its neighbours are folded, the surviving prompt can sit in a position Anthropic-style APIs reject for `system`, and the kernel's position heal re-voices it as `user` (text intact). The end-to-end test pins that role so a kernel change shows up. Keeping the system role there needs a kernel change (relocation, as PR #5800 does for tool-delta systems); #4172 is the same class.
+- [ ] No retroactive unfold: `prune` drops covered ids without consulting protection, and a merge takes a consumed block's coverage whole, so a newest prompt covered by a block from an older build stays hidden until the next prompt update.
+- [ ] `oneShotCarrierPaths` has no system-role step: system-role text containing a carrier marker is the prompt for the slot chain and that marker's carrier for drift accounting (unchanged from before; pinned in the test file).
 - [ ] Expected-rebase accounting for prompt copies the host retires when it re-baselines a request series.
