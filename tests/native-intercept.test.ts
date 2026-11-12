@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, MAX_SILENT_DIRECT_BODY_BYTES, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, MAX_SILENT_DIRECT_BODY_BYTES, noteRoutedOrigin, observeRoutedOrigin, setDeclaredModelEndpoints, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { parseModelEndpointPatterns } from "../src/model-endpoints.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 import * as pfChannel from "../src/agent/pf-channel.ts";
 
@@ -73,6 +74,26 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:predict"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:generatecontent"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:18787/bili/http://127.0.0.1:8317/v1beta/models/m:generateContent"), false);
+});
+
+test("isModelApiUrl: declared modelEndpointPatterns claim custom paths (#1295)", () => {
+    _resetForTest();
+    try {
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate"), false);
+        setDeclaredModelEndpoints(parseModelEndpointPatterns([
+            { match: "https://api.commandcode.ai/alpha/generate", wire: "commandcode" },
+            { match: "http://127.0.0.1:8199/custom", wire: "openai" },
+        ]));
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate"), true);
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate?x=1"), true);
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate2"), false);
+        assert.equal(isModelApiUrl("http://127.0.0.1:8199/custom/run"), true);
+        // declarations never override bili's own control-plane exclusions
+        assert.equal(isModelApiUrl("http://127.0.0.1:36485/bili/http://127.0.0.1:8199/custom"), false);
+        assert.equal(isModelApiUrl("http://127.0.0.1:36485/__bili/plugin/manifest"), false);
+    } finally {
+        _resetForTest();
+    }
 });
 
 function fakeFetch(sink: string[]) {
