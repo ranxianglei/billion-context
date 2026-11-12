@@ -2722,8 +2722,6 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
         // (#4237), autoReviewBlock (#4634) are the LIVE keys in the section —
         // everything else found here is removed/unknown and gets named.
         const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel", "autoReviewBlock"]);
-        // (#4237) are the LIVE keys in the section — everything else found
-        // here is removed/unknown and gets named.
         for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();
