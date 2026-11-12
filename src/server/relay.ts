@@ -2478,6 +2478,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    prepared.session?.id,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2507,6 +2508,11 @@ async function forwardCaptured(
             // the main conversation (see pipePluginChatWithStrip docs).
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
+            // #6433: pass the session id (not the full session) so the pipe can
+            // ring-record outbound tool calls for the unbound shim's witness
+            // route, while keeping usage accounting off (the full session would
+            // turn it on and clobber lastInputTokens for title-gen / side calls).
+            const witnessSid = p.session?.id;
             if (p.protocol === "responses") {
                 await pipePluginResponsesWithStrip(
                     responseBody,
@@ -2530,6 +2536,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    witnessSid,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2557,6 +2564,7 @@ async function forwardCaptured(
                     upstreamMeta,
                     reply,
                     opts.streamErrorShape,
+                    witnessSid,
                 );
             }
         } else if (

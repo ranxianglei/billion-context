@@ -2722,6 +2722,11 @@ export async function pipePluginChatWithStrip(
     // default); hosts that need the legacy completed-turn shape opt back in with
     // streamErrorShape:"completion".
     streamErrorShape?: "protocol" | "completion",
+    // #6433: session id for witness recording only — lets the non-plugin lane
+    // ring-record outbound tool calls (so the unbound shim's witness route can
+    // match) without passing the full session (which would turn on usage
+    // accounting and clobber lastInputTokens for title-gen / side calls).
+    witnessSessionId?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2867,14 +2872,15 @@ export async function pipePluginChatWithStrip(
     const compressDeltaFrame = (index: number, partialJson: string): string =>
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: partialJson } })}\n\n`;
     const settleWitnesses = () => {
-        if (!session) return;
+        const sid = witnessSessionId ?? session?.id;
+        if (!sid) return;
         for (const tc of seenToolCalls.values()) {
             if (tc.name.length === 0) continue;
-            recordToolWitness(session.id, tc.name, tc.args);
+            recordToolWitness(sid, tc.name, tc.args);
             // #4580: the same observation carries the host's tool_use id —
             // ring it so a later tools/call stamped with that id routes to
             // THIS lane even when the shared MCP shim is bound elsewhere.
-            if (tc.id.length > 0) recordToolUseId(tc.id, session.id);
+            if (tc.id.length > 0) recordToolUseId(tc.id, sid);
         }
     };
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
@@ -4226,6 +4232,8 @@ export async function pipePluginResponsesWithStrip(
     // #2328 Q2 — see pipePluginChatWithStrip.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    // #6433: session id for witness recording only — see pipePluginChatWithStrip.
+    witnessSessionId?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -4288,15 +4296,16 @@ export async function pipePluginResponsesWithStrip(
     // function_call_arguments.done; both are accumulate-then-record at settle.
     const witnessedCalls = new Map<string, { name: string; args: string; named: boolean }>();
     const settleWitnesses = () => {
-        if (!session) return;
+        const sid = witnessSessionId ?? session?.id;
+        if (!sid) return;
         for (const [itemId, wc] of witnessedCalls) {
             if (!wc.named || wc.name.length === 0) continue;
-            recordToolWitness(session.id, wc.name, wc.args);
+            recordToolWitness(sid, wc.name, wc.args);
             // #4580: the map key is the output item's id (fc_…), i.e. the
             // host's per-call id — ring it for id-stamped tools/call routing.
             // Synthetic fallback keys ("oi:<index>") are never host-stamped;
             // skip them so cross-session index keys can't shadow real ids.
-            if (itemId.length > 0 && !itemId.startsWith("oi:")) recordToolUseId(itemId, session.id);
+            if (itemId.length > 0 && !itemId.startsWith("oi:")) recordToolUseId(itemId, sid);
         }
     };
     let sawReasoning = false;
