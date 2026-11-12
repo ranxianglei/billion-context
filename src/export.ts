@@ -408,6 +408,81 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
     return `${lines.join("\n")}\n`;
 }
 
+async function renderSelectedSessionJsonl(store: SessionStore, session: Session, full: boolean): Promise<string> {
+    // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
+    // exports straight from MySQL; everything else (and every fallback)
+    // stays on the local sqlite index. A mysql failure degrades to the
+    // legacy-tail renderer exactly like a corrupt index does.
+    const backendName = resolveBackendName(process.env, fileStorageBackend());
+    if (backendName === "mysql") {
+        const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
+        if (dsn.length > 0) {
+            try {
+                const backend = await openBackend("mysql", dsn);
+                try {
+                    await backend.init?.();
+                    if (await backend.getSessionRow(session.id)) {
+                        return await renderSessionJsonlFromTables(backend, session.id, full);
+                    }
+                } finally {
+                    await backend.close();
+                }
+            } catch (err) {
+                process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
+`);
+            }
+        }
+    }
+    const index = path.join(store.dir, "index.db");
+    const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
+    if (existsSync(index) && !encrypted) {
+        // #3931: the selection is enforced at open time, mirroring the lane-boot
+        // split — a registered-but-unshipped choice (mysql, step 2) fails here
+        // with its documented backend error before any file access, so a deliberate
+        // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
+        const selected = selectedBackendRaw(process.env, fileStorageBackend());
+        if (selected && selected !== "sqlite") {
+            if (listBackendNames().includes(selected)) {
+                // #3931 step 2: open is async now. The contract from the
+                // #3932 review holds — a deliberate selection never
+                // silently reads sqlite: without a DSN the open rejects
+                // with the documented error (bubbles out of the export);
+                // with a DSN the probe opens + closes cleanly (the real
+                // mysql export above already ran; if it degraded, its
+                // stderr notice announced the sqlite fallback).
+                const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
+                await probe.close();
+            } else {
+                const notice = backendSelectionNotice(selected);
+                if (notice) process.stderr.write(`[export] ${notice}\n`);
+            }
+        }
+        // Guarded open: a corrupt/foreign index.db must degrade to the
+        // legacy-tail renderer, not fail the export (#2690 review notes).
+        // Encryption gates the read for the same reason the ingest side
+        // does — index.db holds cleartext payloads, so an encrypted lane
+        // must never read from it.
+        try {
+            // #3931 step 2: openBackend is async (network backends
+            // open a pool + DDL init); the sqlite path resolves
+            // immediately.
+            const backend = await openBackend("sqlite", index);
+            try {
+                if (await backend.getSessionRow(session.id)) {
+                    const disk = store.loadContentStore(session);
+                    const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
+                    return await renderSessionJsonlFromTables(backend, session.id, full, extra);
+                }
+            } finally {
+                await backend.close();
+            }
+        } catch (err) {
+            process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
+        }
+    }
+    return renderSessionJsonlFromSession(session, full, store.loadContentStore(session));
+}
+
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
     try {
@@ -430,87 +505,15 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const ids = matches.map((s) => s.id).join(", ");
         throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
     }
-    if (opts.jsonl) {
-        // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
-        // exports straight from MySQL; everything else (and every fallback)
-        // stays on the local sqlite index. A mysql failure degrades to the
-        // legacy-tail renderer exactly like a corrupt index does.
-        const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (backendName === "mysql") {
-            const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
-            if (dsn.length > 0) {
-                try {
-                    const backend = await openBackend("mysql", dsn);
-                    try {
-                        await backend.init?.();
-                        if (await backend.getSessionRow(matches[0]!.id)) {
-                            return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false);
-                        }
-                    } finally {
-                        await backend.close();
-                    }
-                } catch (err) {
-                    process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
-`);
-                }
-            }
-        }
-        const index = path.join(store.dir, "index.db");
-        const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
-        if (existsSync(index) && !encrypted) {
-            // #3931: the selection is enforced at open time, mirroring the lane-boot
-            // split — a registered-but-unshipped choice (mysql, step 2) fails here
-            // with its documented backend error before any file access, so a deliberate
-            // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
-            const selected = selectedBackendRaw(process.env, fileStorageBackend());
-            if (selected && selected !== "sqlite") {
-                if (listBackendNames().includes(selected)) {
-                    // #3931 step 2: open is async now. The contract from the
-                    // #3932 review holds — a deliberate selection never
-                    // silently reads sqlite: without a DSN the open rejects
-                    // with the documented error (bubbles out of the export);
-                    // with a DSN the probe opens + closes cleanly (the real
-                    // mysql export above already ran; if it degraded, its
-                    // stderr notice announced the sqlite fallback).
-                    const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
-                    await probe.close();
-                } else {
-                    const notice = backendSelectionNotice(selected);
-                    if (notice) process.stderr.write(`[export] ${notice}\n`);
-                }
-            }
-            // Guarded open: a corrupt/foreign index.db must degrade to the
-            // legacy-tail renderer, not fail the export (#2690 review notes).
-            // Encryption gates the read for the same reason the ingest side
-            // does — index.db holds cleartext payloads, so an encrypted lane
-            // must never read from it.
-            try {
-                // #3931 step 2: openBackend is async (network backends
-                // open a pool + DDL init); the sqlite path resolves
-                // immediately.
-                const backend = await openBackend("sqlite", index);
-                try {
-                    if (await backend.getSessionRow(matches[0]!.id)) {
-                        const disk = store.loadContentStore(matches[0]!);
-                        const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                        return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false, extra);
-                    }
-                } finally {
-                    await backend.close();
-                }
-            } catch (err) {
-                process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
-            }
-        }
-        return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));
-    }
-    const markdown = renderHandoff(matches[0]!, opts.full ?? false);
+    const content = opts.jsonl
+        ? await renderSelectedSessionJsonl(store, matches[0]!, opts.full ?? false)
+        : renderHandoff(matches[0]!, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
-        writeFileSync(opts.output, markdown, "utf8");
+        writeFileSync(opts.output, content, "utf8");
         return `written to ${opts.output}`;
     }
-    return markdown;
+    return content;
     } finally {
         // The one-shot store holds index.db open in unified modes; close it or
         // Windows callers cannot delete their temp dirs (EPERM).

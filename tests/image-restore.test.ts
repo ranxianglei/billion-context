@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
@@ -14,6 +14,7 @@ import {
     type RestorableImage,
 } from "../src/image-restore.ts";
 import { resolveDecompress, type ProxyToolCtx } from "../src/decompress-shared.ts";
+import { imagePlaceholdersForSummary } from "../src/image-note.ts";
 import type { WireProtocol } from "../src/util.js";
 
 // Isolate stateDir() (hence restoreExportDir()) under a throwaway dir before any
@@ -191,6 +192,22 @@ test("writeRestoredImage: a rebase that restarts refs never restores the previou
     assert.equal(writeRestoredImage("m00001", 0, pngImg, "sess-rebase"), gen1);
 });
 
+for (const length of [0, 8]) {
+    test(`image index repairs an incomplete ${length}-byte spill when the original is resent`, () => {
+        const body = { model: "gpt", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] };
+        const sessionId = `sess-incomplete-${length}`;
+        const original = buildIndex("openai", body, false, sessionId);
+        const file = [...original.values()][0][0].path;
+        writeFileSync(file, Buffer.from(PNG, "base64").subarray(0, length));
+        const repaired = buildIndex("openai", body, false, sessionId);
+        assert.equal([...repaired.values()][0][0].path, file, "stable refs retain the same spill path");
+        assert.deepEqual(readFileSync(file), Buffer.from(PNG, "base64"), "resending the original must recover a partial write");
+        const mtime = statSync(file).mtimeMs;
+        buildIndex("openai", body, false, sessionId);
+        assert.equal(statSync(file).mtimeMs, mtime, "complete files retain the skip-write fast path");
+    });
+}
+
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {
     const p = writeRestoredImage("m00042", 0, pngImg, "sess-A")!;
     const idx = new Map<string, IndexedImage[]>([["m00042", [{ mediaType: "image/png", bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: p }]]]);
@@ -299,4 +316,30 @@ test("buildIncomingImageIndex: end-to-end nested tool_result recovery (anthropic
     assert.match(ref, /^m\d+$/);
     assert.ok(existsSync(imgs[0].path), "nested image spilled at index time");
     assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "nested pixels round-trip");
+});
+
+test("buildIncomingImageIndex: Gemini $ref image notes resolve to their inline pixels", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+        parts: [{ inlineData: { mimeType: "image/png", displayName: "capture.png", data: PNG } }],
+    } }] }] };
+    const original = JSON.stringify(body);
+    const message = googleToCore(body).msgs[0];
+    const index = buildIndex("google", body);
+    assert.equal(index.size, 1);
+    const [ref, images] = [...index.entries()][0];
+    assert.deepEqual(imagePlaceholdersForSummary(message, ref), [`[image: png 1x1 · ${ref}]`]);
+    assert.match(resolveDecompress({ imageRef: ref }, ctxWith(index)).text, /Restored 1 image\(s\)/);
+    assert.deepEqual(readFileSync(images[0].path), Buffer.from(PNG, "base64"));
+    assert.equal(JSON.stringify(body), original, "indexing preserves the complete wire response");
+});
+
+test("buildIncomingImageIndex: a Gemini $ref without inline bytes adds no image", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+    } }] }] };
+    const message = googleToCore(body).msgs[0];
+    assert.deepEqual(messageImageBytes(message), []);
+    assert.deepEqual(imagePlaceholdersForSummary(message, "m00001"), []);
+    assert.equal(buildIndex("google", body).size, 0);
 });
