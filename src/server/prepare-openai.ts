@@ -49,7 +49,6 @@ import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
 import { activeBlocksSignature, boundCoveredPositions, bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
-import { getStore } from "../persist.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
