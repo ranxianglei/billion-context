@@ -1,9 +1,10 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
 
@@ -72,9 +73,13 @@ export function mergeCompress(
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
+        maxEstimateHoldRounds: pick("maxEstimateHoldRounds"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
+        requireNudge: pick("requireNudge"),
+        requireRecommendation: pick("requireRecommendation"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -93,6 +98,10 @@ export function mergeCompress(
         rules: pick("rules"),
 
         visibilityMarkers: pick("visibilityMarkers"),
+        // #4313 (PR #5236): display gate — global level only; provider/model
+        // values are merged here but the consumer (resolveMessageTimestamps)
+        // reads the GLOBAL setting, mirroring the single shared core.
+        messageTimestamps: pick("messageTimestamps"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
@@ -121,7 +130,7 @@ export function resolveCompress(
     global?: CompressSettings,
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
-    return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+    return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
 
 let warnedPromptsRisk = false;
@@ -162,24 +171,35 @@ interface SurfaceResolution {
     packVersion?: string;
 }
 
+function packResolver(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): ReturnType<typeof createPackResolver> {
+    // #5319: host-shipped packs sit between the user dirs and the kernel
+    // builtin registry — same-name user/project files still win, and the
+    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
+    // must not require a kernel/** change).
+    return createPackResolver([
+        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
+        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
+        shippedPacksSource,
+        builtinSource,
+    ]);
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
- *  kernel's resolver chain [project `./.billion-context/packs` > user
- *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
- *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
- *  warning, so a typo never degrades the compression prompts. Directory
- *  layout is host policy; resolution/sanitization is the kernel's. */
+ *  host's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > shipped host-bundled packs (`chat`, #5319) > kernel
+ *  builtin registry]. Unknown names fall back to the identity surface
+ *  ({} — kernel defaults everywhere) with a one-time-per-name warning, so a
+ *  typo never degrades the compression prompts. Directory layout is host
+ *  policy; resolution/sanitization is the kernel's. */
 export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    const resolver = createPackResolver(
-        defaultPackSources({
-            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
-            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
-        }),
-    );
+    const resolver = packResolver(dirs);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
@@ -189,6 +209,14 @@ export function resolveCompressSurfaceDetailed(
         return { surface: {}, packName: "default" };
     }
     return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+/** Every pack resolvable by name right now (first-wins per name) — the panel
+ *  picker's inventory (#5319 web half). Same chain as per-request resolution. */
+export function listResolvedPacks(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): Pack[] {
+    return packResolver(dirs).listPacks();
 }
 
 export function resolveCompressSurface(
@@ -298,9 +326,20 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // Experimental fold-point carrier relocation (#view-transform-A): the env
+    // tier wins over every file level per knob doctrine (#2030), resolved
+    // per request like every other wire-facing knob. Off = byte-identical
+    // pre-change behavior (the kernel node fast-paths to the same array ref).
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
+    // Phantom-pressure guard: an explicit false is meaningful (legacy
+    // estimate-driven pressure injection), so pass it through instead of
+    // skipping like absent knobs.
+    if (s.requireUsageSampleForPressure !== undefined) nudge.requireUsageSampleForPressure = s.requireUsageSampleForPressure;
+    // #5865 estimate-hold backstop bound — pass through like every numeric
+    // knob (0 is meaningful: it disables the hold).
+    if (s.maxEstimateHoldRounds !== undefined && typeof s.maxEstimateHoldRounds === "number") nudge.maxEstimateHoldRounds = Math.floor(s.maxEstimateHoldRounds);
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
