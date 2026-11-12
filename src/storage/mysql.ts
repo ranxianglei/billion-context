@@ -1794,13 +1794,9 @@ export class MysqlBackend implements StorageBackend {
             if (c !== null) content[hash] = c;
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
+        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
-            // #6317: serialize the export inside the sweep transaction. A
-            // locked or failed sweep must leave NO archive line, or restore
-            // will later prefer that stale dump and lose newer messages.
-            appendFileSync(exportPath, archiveLine);
             const rel: string[] = [];
             for (const m of messages) rel.push(str(m.content_hash));
             for (const mm of mediaMaps) rel.push(str(mm.media_hash));
@@ -1847,7 +1843,6 @@ export class MysqlBackend implements StorageBackend {
             checkpoints: Record<string, unknown>[];
         };
         let lineNo = -1;
-        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
@@ -1860,8 +1855,8 @@ export class MysqlBackend implements StorageBackend {
                     continue;
                 }
                 if (candidate.sessionId === sessionId) {
-                    matchCount += 1;
                     lineNo = i;
+                    break;
                 }
             }
         } catch {
@@ -1874,9 +1869,6 @@ export class MysqlBackend implements StorageBackend {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
-        if (matchCount > 1) {
-            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
-        }
         const sess = dump.session;
         await this.tx(async (c) => {
             for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
