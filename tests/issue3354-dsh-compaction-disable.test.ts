@@ -146,7 +146,9 @@ test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the
     const bundle = fs.readFileSync(path.join(TESTS_DIR, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
     for (const id of ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"]) {
         const row = `- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`;
-        assert.ok(bundle.includes(row), `bundle yml must carry the ${id} gate row`);
+        assert.ok(!bundle.includes(row), `bundle yml must NOT drop the host inject list for ${id} (#6456)`);
+        const merged = `- id: ${id}\n  inject: [agentPresets, ${BILI_COMPACTION_DISABLE_SERVICE}]\n`;
+        assert.ok(bundle.includes(merged), `bundle yml must restate agentPresets + gate for ${id} (#6456)`);
     }
     assert.ok(bundle.includes(PRESET_ROWS), "bundle yml must carry the gate rows contiguously");
     assert.ok(bundle.includes(GATE_INSERT), "bundle yml must mount the always-on gate entry (#3662)");

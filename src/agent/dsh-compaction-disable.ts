@@ -38,6 +38,16 @@ const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
 const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
 /** The agent-preset entry whose resolved config carries the plugin rows. */
 const DSH_AGENT_PRESET_PACKAGE = "@deepseek-ai/dsh-agent-preset";
+/** The host service the factory preset registers itself with:
+ *  `@deepseek-ai/dsh-agent-preset` declares `static inject = ["agentPresets"]`
+ *  and its init runs `this.ctx.agentPresets.register(this.config)` — the web
+ *  app's preset roster (and everything that lists sessions per preset) hangs
+ *  off it. #6456: dsh 0.2.2-rc.2 ships that inject list on the preset entries,
+ *  and because a patch REPLACES the entry's inject list, the gate rows below
+ *  must restate it — dropping it left the presets unable to register (session
+ *  list empty, titles falling back to the session id, entries vanishing on
+ *  open). */
+const DSH_AGENT_PRESETS_SERVICE = "agentPresets";
 /** Gate service name referenced by the preset `inject:` entries in
  *  dsh.bundle.patch.yml and the launcher overlay patch. A preset cannot
  *  register until this service is provided, so the middleware below is
@@ -59,10 +69,12 @@ const DSH_WEB_PRESET_IDS = ["preset-standard", "preset-ptc", "preset-minimal", "
  *  single source of truth shared by the launcher overlay string and pinned
  *  against dsh.bundle.patch.yml by tests (the two layers must stay in sync,
  *  cf. #2605). Entry inject lists are REPLACED by patches, not concatenated —
- *  if a future dsh ships its own inject list on these entries, merge manually
- *  here AND in both patch layers. */
+ *  the row must therefore restate the host's own inject list (the factory
+ *  preset's `agentPresets` dependency, #6456) AND append the gate service.
+ *  If a future dsh ships a different inject list on these entries, merge it in
+ *  manually here AND in both patch layers. */
 export function compactionDisablePatchRows(): string {
-    return DSH_WEB_PRESET_IDS.map((id) => `- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`).join("");
+    return DSH_WEB_PRESET_IDS.map((id) => `- id: ${id}\n  inject: [${DSH_AGENT_PRESETS_SERVICE}, ${BILI_COMPACTION_DISABLE_SERVICE}]\n`).join("");
 }
 
 // #3662: process-level verdict between the two entries. They are SEPARATE
