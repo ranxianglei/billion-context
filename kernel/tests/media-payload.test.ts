@@ -7,6 +7,7 @@ import {
   hasUnrecoverableMediaPayload,
 } from "../src/protected.js";
 import { assignRefs, BLOCKED_REF } from "../src/refs.js";
+import { MEDIA_REFS_MARKER, collectFoldMediaRefs } from "../src/media-refs.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
 import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
@@ -313,7 +314,7 @@ test("hasMediaPayload detects each sidecar carrier and ignores plain/tool-result
   );
 });
 
-test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store", () => {
+test("hasUnrecoverableMediaPayload pins only control-plane state and refless media (#5620)", () => {
   assert.equal(
     hasUnrecoverableMediaPayload(textMsg("a", "user", "x")),
     false,
@@ -342,15 +343,15 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         },
       }),
     ),
-    true,
-    "remote URL image cannot be archived",
+    false,
+    "remote URL image is ref-recoverable — the handle rides the summary (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
       mediaUserMsg("e", "x", { rawOpenaiContent: FILE_PART }),
     ),
-    true,
-    "opaque part in singular slot pins",
+    false,
+    "file ref in singular slot is ref-recoverable (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
@@ -371,15 +372,24 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         ],
       }),
     ),
-    true,
-    "one remote URL among inline images pins the whole message",
+    false,
+    "one remote URL among inline images makes the message ref-recoverable (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
       mediaUserMsg("h", "x", { rawOpenaiContentParts: [FILE_PART] }),
     ),
+    false,
+    "DeepSeek file ref is ref-recoverable — the id rides the summary (#5620; #1205 bytes stay unrecoverable)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("h2", "x", {
+        rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+      }),
+    ),
     true,
-    "DeepSeek file ref pins (#1205 payload remains unrecoverable)",
+    "unknown opaque part without a re-access handle still pins (#5620 conservative enumeration)",
   );
   // Anthropic
   assert.equal(
@@ -402,7 +412,8 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         },
       }),
     ),
-    true,
+    false,
+    "anthropic url-source remote image is ref-recoverable (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
@@ -463,7 +474,8 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         },
       }),
     ),
-    true,
+    false,
+    "responses-wire remote input_image is ref-recoverable (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
@@ -507,8 +519,8 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         ],
       }),
     ),
-    true,
-    "fileData URI ref pins (#2609)",
+    false,
+    "fileData URI ref is ref-recoverable — the URI rides the summary (#5620/#2609)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
@@ -534,8 +546,8 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
         ],
       }),
     ),
-    true,
-    "nested functionResponse fileData pins",
+    false,
+    "nested functionResponse fileData is ref-recoverable (#5620)",
   );
   assert.equal(
     hasUnrecoverableMediaPayload(
@@ -545,11 +557,22 @@ test("hasUnrecoverableMediaPayload pins only media whose bytes bili cannot store
   );
 });
 
-test("assignRefs folds archivable media like text and pins unrecoverable media", () => {
+test("assignRefs folds archivable and ref-based media like text; only refless media gets BLOCKED (#5620)", () => {
   const messages = [
     textMsg("a", "user", "alpha"),
     mediaUserMsg("img", "", { imageBase64: IMG_DATA }),
+    mediaUserMsg("refimg", "", {
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
     mediaUserMsg("file", "", { rawOpenaiContentParts: [FILE_PART] }),
+    mediaUserMsg(
+      "mystery",
+      "",
+      { rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }] },
+    ),
     textMsg("b", "assistant", "beta"),
   ];
   const state = createInitialState();
@@ -560,8 +583,10 @@ test("assignRefs folds archivable media like text and pins unrecoverable media",
   });
   assert.equal(res.map.byRaw["a"], "m00001");
   assert.equal(res.map.byRaw["img"], "m00002");
-  assert.equal(res.map.byRaw["file"], BLOCKED_REF);
-  assert.equal(res.map.byRaw["b"], "m00003");
+  assert.equal(res.map.byRaw["refimg"], "m00003", "#5620: citable");
+  assert.equal(res.map.byRaw["file"], "m00004", "#5620: citable");
+  assert.equal(res.map.byRaw["mystery"], BLOCKED_REF);
+  assert.equal(res.map.byRaw["b"], "m00005");
 });
 
 test("assignRefs migrates a legacy BLOCKED ref to a fresh number when protection lifts", () => {
@@ -613,11 +638,43 @@ test("buildCompressibleRanges spans archivable media (foldable since #2607)", ()
   );
 });
 
-test("buildCompressibleRanges still never spans an unrecoverable media message", () => {
+test("buildCompressibleRanges spans ref-based media since #5620", () => {
   const messages = [
     textMsg("a", "user", "alpha ".repeat(50).trim()),
     mediaUserMsg("img", "see attached", {
-      rawOpenaiContentParts: [FILE_PART],
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const mediaIndex = messages.findIndex((m) => m.id === "img");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= mediaIndex && mediaIndex <= e;
+    }),
+    "ref-based media no longer splits the compressible range (#5620)",
+  );
+});
+
+test("buildCompressibleRanges still never spans a refless media message", () => {
+  const messages = [
+    textMsg("a", "user", "alpha ".repeat(50).trim()),
+    mediaUserMsg("img", "see attached", {
+      rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
     }),
     textMsg("b", "assistant", "beta ".repeat(50).trim()),
   ];
@@ -639,7 +696,7 @@ test("buildCompressibleRanges still never spans an unrecoverable media message",
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= mediaIndex && mediaIndex <= e),
-      `range ${r.startRef}..${r.endRef} must not span the unrecoverable media message`,
+      `range ${r.startRef}..${r.endRef} must not span the refless media message`,
     );
   }
   for (const r of ranges.protected) {
@@ -647,7 +704,7 @@ test("buildCompressibleRanges still never spans an unrecoverable media message",
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= mediaIndex && mediaIndex <= e),
-      "unrecoverable media must not be advertised as protected either",
+      "refless media must not be advertised as protected either",
     );
   }
   assert.ok(
@@ -699,14 +756,70 @@ test("applyCompression folds archivable media into the block (#2607)", () => {
   );
 });
 
-test("applyCompression excludes unrecoverable media from the block and warns", () => {
+test("applyCompression folds ref-based media and records its handle in the summary (#5620)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
     textMsg("u", "user", "the task"),
     textMsg("t1", "assistant", "thinking out loud"),
     mediaUserMsg("img", "see the screenshot", {
-      rawOpenaiContentParts: [FILE_PART],
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
+    textMsg("t2", "assistant", "analyzing"),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00004",
+        summary: "task + analysis summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  assert.equal(result.state.blocks.length, 1);
+  const block = result.state.blocks[0]!;
+  assert.deepEqual(block.directMessageIds.sort(), ["img", "t1", "t2", "u"]);
+  assert.ok(
+    block.summary.includes(MEDIA_REFS_MARKER),
+    `handle section appended, got: ${JSON.stringify(block.summary)}`,
+  );
+  assert.ok(
+    block.summary.includes("- https://example.com/x.png"),
+    `handle listed verbatim, got: ${JSON.stringify(block.summary)}`,
+  );
+  assert.ok(
+    !result.result.warnings.some((w) => w.includes("unrecoverable")),
+    `no unrecoverable warning expected, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("applyCompression excludes refless media from the block and warns", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    textMsg("t1", "assistant", "thinking out loud"),
+    mediaUserMsg("img", "see the screenshot", {
+      rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
     }),
     textMsg("t2", "assistant", "analyzing"),
     textMsg("u2", "user", "and now?"),
@@ -762,6 +875,10 @@ const TR_IMG_URL = {
   type: "image",
   source: { type: "url", url: "https://example.com/x.png" },
 };
+const TR_DOC = {
+  type: "document",
+  source: { type: "url", url: "https://example.com/d.pdf" },
+};
 
 function mediaToolResult(
   id: string,
@@ -800,8 +917,13 @@ test("media predicates split tool_result images by recoverability", () => {
   );
   assert.equal(
     hasUnrecoverableMediaPayload(mediaToolResult("ru", "done\n", TR_IMG_URL)),
+    false,
+    "remote URL image in tool_result is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(mediaToolResult("rd", "done\n", TR_DOC)),
     true,
-    "remote URL image cannot be archived",
+    "document block in tool_result still pins (no established ref semantics)",
   );
 });
 
@@ -849,7 +971,7 @@ test("buildCompressibleRanges spans an archivable media tool_result with its cal
   );
 });
 
-test("buildCompressibleRanges still never spans an unrecoverable media tool_result and never strands its call", () => {
+test("buildCompressibleRanges spans a ref-based media tool_result with its call since #5620", () => {
   const messages = [
     textMsg("u", "user", "alpha ".repeat(50).trim()),
     {
@@ -875,12 +997,56 @@ test("buildCompressibleRanges still never spans an unrecoverable media tool_resu
   );
   const resIdx = messages.findIndex((m) => m.id === "res");
   const callIdx = messages.findIndex((m) => m.id === "call");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= resIdx && resIdx <= e;
+    }),
+    "ref-based media tool_result no longer splits the range (#5620)",
+  );
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= callIdx && callIdx <= e;
+    }),
+    "its paired call stays foldable too",
+  );
+});
+
+test("buildCompressibleRanges still never spans a refless media tool_result and never strands its call", () => {
+  const messages = [
+    textMsg("u", "user", "alpha ".repeat(50).trim()),
+    {
+      id: "call",
+      role: "assistant" as const,
+      contentType: "tool-call" as const,
+      toolName: "screenshot",
+      toolCallId: "t1",
+      text: "{}",
+    },
+    mediaToolResult("res", "done\n", TR_DOC),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const resIdx = messages.findIndex((m) => m.id === "res");
+  const callIdx = messages.findIndex((m) => m.id === "call");
   for (const r of ranges.compressible) {
     const s = refToIndex.get(r.startRef)!;
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= resIdx && resIdx <= e),
-      `range ${r.startRef}..${r.endRef} must not span the unrecoverable media tool_result`,
+      `range ${r.startRef}..${r.endRef} must not span the refless media tool_result`,
     );
     assert.ok(
       !(s <= callIdx && callIdx <= e),
@@ -959,7 +1125,7 @@ test("applyCompression keeps an unrecoverable media tool_result and its paired c
       toolCallId: "t1",
       text: "{}",
     },
-    mediaToolResult("res", "done\n", TR_IMG_URL),
+    mediaToolResult("res", "done\n", TR_DOC),
     textMsg("u2", "user", "and now?"),
   ];
   state.messageRefs = assignRefs(messages, {
@@ -1035,4 +1201,16 @@ test("openai: non-array single-object content never throws (legacy empty-text co
     Array.isArray(back) && back.length >= 1,
     "round-trip renders",
   );
+});
+
+test("collectFoldMediaRefs applies the ephemeral filter to carried-forward block refs (#5865 review)", () => {
+  // An OLDER build recorded a signed S3 URL in its block's MEDIA REFS section
+  // (pre-#5620 semantics). The carry-forward into a merged block must drop
+  // it — the URL is dead and no live message holds it — while keeping the
+  // durable handle next to it.
+  const signed = "https://bucket.s3.amazonaws.com/img.png?X-Amz-Expires=3600&X-Amz-Signature=abc";
+  const durable = "https://cdn.example.com/img.png";
+  const oldBlockSummary = `analysis summarized\n\n${MEDIA_REFS_MARKER}\n- ${signed}\n- ${durable}`;
+  const carried = collectFoldMediaRefs([], [{ id: "b1", summary: oldBlockSummary } as never]);
+  assert.deepEqual(carried, [durable]);
 });
