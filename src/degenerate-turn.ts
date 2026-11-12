@@ -79,7 +79,7 @@ export function endsWithDraftClose(text: string): boolean {
 // difference (#2303's single generic nudge ignored both, and on OpenAI-lane
 // compression turns the model read "take your next concrete action" as
 // permission to do anything else — Edit/Bash instead of the compress call).
-export type DraftTailKind = "complete" | "truncated";
+type DraftTailKind = "complete" | "truncated";
 const DRAFT_CLOSE_COMPLETE_TAIL = /\x3c\/summary\x3e\s*$/i;
 export function draftTailKind(text: string): DraftTailKind | null {
     if (text.length === 0) return null;
