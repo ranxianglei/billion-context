@@ -72,6 +72,28 @@ entries:
     desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
     site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
     site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
+  - key: compress.requireUsageSampleForPressure
+    type: boolean
+    default: "true"
+    group: compress
+    id: cw.rusfp
+    render: compress-row
+    desc_en: "Phantom-pressure guard: when this round's meter is a local estimate (no billing sample — aborted turn, TTL expiry), the pressure band waits up to compress.maxEstimateHoldRounds rounds (default 2) for the real sample instead of firing EMERGENCY off an inflated reading, then falls back to the legacy estimate-driven decision so never-reporting upstreams cannot starve it forever. false = always legacy."
+    desc_zh: "幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后至多 compress.maxEstimateHoldRounds 轮（默认 2）等真样本，再回落到老的估算驱动决定，防止永不回传计费的线路被无限挂起。false＝始终老行为。"
+    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred for at most compress.maxEstimateHoldRounds rounds (default 2) until either a usage-grade reading decides or the bound runs out and the estimate decides (legacy); billed readings keep byte-identical behavior while within the hold. Set false to restore immediate estimate-driven pressure injection."
+    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后至多 compress.maxEstimateHoldRounds 轮（默认 2），等实际 usage 级读数决定；到期仍未等到则按老行为用估算判，永不回传计费的会话因此不会被无限挂起。设 false 恢复旧的立即估算驱动行为。"
+  - key: compress.maxEstimateHoldRounds
+    type: number
+    default: "2"
+    group: compress
+    id: cw.mehr
+    render: compress-row
+    desc_en: "Backstop for the phantom-pressure guard (#5865 ruling): how many CONSECUTIVE estimate-grade rounds the pressure band may wait before firing on the estimate anyway. Capped so an upstream that never reports usage (anonymous zero-baseline forks, silent backends — where the local estimate is the only pressure signal) still gets automatic compression. 0 = no waiting at all. Only consulted while requireUsageSampleForPressure is on."
+    desc_zh: "幻影压力守卫的兜底（#5865 裁定）：压力带最多连等多少轮估算读数就必须照估算动手。兜底保证从不回传计费的会话（匿名零基线 fork、静默后端——本地估算是它们唯一的压力信号）也能拿到自动压缩。0＝完全不等待。仅在 requireUsageSampleForPressure 开启时生效。"
+    site_en: "Caps how many consecutive no-billing-sample rounds the pressure band may wait before deciding on the local estimate anyway (default 2), so a backend that never reports usage still gets automatic compression instead of being held forever; 0 waits not at all."
+    site_zh: "限制压力带最多连等多少轮无计费样本的估算读数就必须照估算判（默认 2），保证从不回传计费的后端也能自动压缩、不会永远等待；设 0 表示不等待。"
+    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred one round until a usage-grade reading decides; billed readings keep byte-identical behavior. Set false to restore estimate-driven pressure injection."
+    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后一轮等实际 usage 级读数再决定；计费级读数行为逐字节不变。设 false 恢复旧的估算驱动行为。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
@@ -92,6 +114,26 @@ entries:
     desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。"
     site_en: "Output budget (tokens) of the model-decision side call (default 200). Must be > 0."
     site_zh: "模型决策 side call 的输出预算（token，默认 200）。必须 > 0。"
+  - key: compress.requireNudge
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rnug
+    render: compress-row
+    desc_en: "Forbid UNPROMPTED model-initiated compression (#5683/#5943): a compress call is refused unless a NUDGE CREDIT is live — a window of 20 MODEL rounds minted by the last compression nudge that actually reached the model (advisory, decide-directive and emergency injections all mint; \"gated\"/\"vetoed\"/\"skipped\" never do), refreshed by each new injection and decayed one per un-nudged model round (non-model request shapes hold it open). Successful folds do NOT consume the credit, so finishing a nudge's recommended cleanup over several rounds stays legal. Refusal sends the model an error receipt instead of folding; bili's own overflow backstop folds are exempt. For models that fold on their own (e.g. qwen 27b); can be scoped per provider/model. Off unless explicitly enabled."
+    desc_zh: "禁止未提示的模型主动压缩（#5683/#5943）：只有 nudge 信用存活时才允许 compress——即距最近一次真正送达模型的压缩提醒不超过 20 个 MODEL 轮的窗口（advisory、模型自决指令、紧急提醒都算铸券；\"gated\"/\"vetoed\"/\"skipped\" 不算）；每次新注入刷新窗口，每个未提示的模型轮衰减 1（非模型请求形态既不刷新也不衰减）。成功折叠**不消耗**信用，分几轮压完 nudge 推荐的剩余范围仍然合法。否则拒绝并回错误回执；bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。"
+    site_en: "Forbid unprompted compression (off by default): a model compress call is refused unless a nudge credit is live — a delivered nudge opens a 20-model-round window, refreshed by each new nudge; the refusal returns an error receipt instead of folding."
+    site_zh: "禁止未提示压缩（默认关闭）：只有 nudge 信用存活（送达的提醒开启 20 个模型轮窗口，新提醒刷新窗口）才允许模型调用 compress，否则拒绝并回错误回执。"
+  - key: compress.requireRecommendation
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rrec
+    render: compress-row
+    desc_en: "Forbid OUT-OF-BOUNDS model-initiated compression (#5683): every submitted range must stay within what bili currently recommends folding — the same live compressible set the nudge text and acp_status show (this request's prepare-time offer when present, else a live recompute). Judgment is by COVERAGE: subdividing a recommended span passes, and messages already folded into active blocks (refolds updating an existing summary) are exempt. A range carrying any other live message is refused whole with an error receipt naming the offending span(s). Off unless explicitly enabled."
+    desc_zh: "禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。"
+    site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
+    site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
@@ -148,10 +190,10 @@ entries:
     group: compress
     id: cw.mnl
     render: compress-row
-    desc_en: "Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635)."
-    desc_zh: "生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。"
-    site_en: "Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635)."
-    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：过短的回复被整段拒绝；0 禁下限。外部摘要模型受同一下限约束（#3635）。"
+    desc_en: "Character floor for generated summaries: a single range must meet it alone; a multi-range batch passes when its combined summaries reach it (#5894). 0 = disabled. External summarizers remain held to the per-summary floor (#3635)."
+    desc_zh: "生成摘要的字符下限：单段压缩按自身判定；批量压缩按合计判定——一段偷懒不再拖垮整批（#5894）。0 = 禁用。外部摘要模型仍受逐段下限约束（#3635）。"
+    site_en: "Floor, in characters, for generated summaries (kernel default 50): a single range must meet it on its own; a multi-range batch passes when its COMBINED summaries reach it — one lazy paragraph no longer sinks the whole batch (#5894). 0 disables the floor. External summarizers remain held to the per-summary floor (#3635)."
+    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：单段压缩按自身判定；批量压缩按各段合计判定——一段偷懒不再拖垮整批（#5894）。0 禁用下限。外部摘要模型仍受逐段下限约束（#3635）。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""
@@ -235,15 +277,15 @@ entries:
     site_zh: "在 compress/decompress/search_context/acp_status 结果后追加 📦/❌ 可见性标记（默认开；关闭可抑制模型模仿叙述）。"
   - key: compress.messageTimestamps
     type: boolean
-    default: "false"
+    default: "true"
     env: BILI_MESSAGE_TIMESTAMPS
     group: compress
     id: ct.mt
     render: compress-row
-    desc_en: "Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. Default off keeps every byte identical to pre-feature master (#4313, PR #5236)."
-    desc_zh: "为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time=\"…\" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认关闭，线上字节与特性前 master 逐字节一致（#4313，PR #5236）。"
-    site_en: "Opt-in message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; default off keeps wire bytes pre-feature-identical. Env BILI_MESSAGE_TIMESTAMPS wins (0 forces off, any other value forces on); resolved once per instance — restart required."
-    site_zh: "可选的消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认关闭时线上字节与特性前完全一致。env BILI_MESSAGE_TIMESTAMPS 优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启。"
+    desc_en: "Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly."
+    desc_zh: "为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time=\"…\" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。"
+    site_en: "Message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; ON by default. Set `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS=0 to keep every byte identical to pre-feature master. Env wins when defined (0 forces off, any other value forces on); resolved once per instance — changing the flag needs a restart, and the first restart with the flag on pays one frozen-prefix cache rewrite per active session."
+    site_zh: "消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认开启。设 `compress.messageTimestamps: false` 或 env BILI_MESSAGE_TIMESTAMPS=0 可让线上字节与特性前逐字节一致。env 有定义时优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启，开关生效后的首个重启每个活跃会话付一次冻结前缀缓存重写。"
   - key: compress.rules
     type: boolean
     default: "false"
@@ -296,6 +338,16 @@ entries:
     desc_zh: "可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。"
     site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
     site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
+  - key: compress.blockOps
+    type: object
+    default: "off"
+    group: compress
+    id: co.blockops
+    render: obj-item
+    desc_en: "Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765."
+    desc_zh: "可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。"
+    site_en: "<code>blockOps</code> — opt-in compressed-block lifecycle tools (acp_retire / acp_restore / acp_rewrite); off by default so the wire surface stays byte-identical to pre-#5765 (<span class='mech'>enabled</span>)."
+    site_zh: "<code>blockOps</code> —— 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，线上表面与 #5765 之前逐字节一致（<span class='mech'>enabled</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -422,6 +474,12 @@ entries:
     group: compress
     desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
     desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
+  - key: compress.blockOps.enabled
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost."
+    desc_zh: "启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"

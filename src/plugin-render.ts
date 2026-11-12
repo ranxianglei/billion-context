@@ -99,15 +99,17 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
     const coveredSeqs = new Set<number>();
     const anchors: { pos: number; msg: BiliMessage }[] = [];
     for (const block of activeBlocks) {
-        const blockSeqs: number[] = [];
+        let maxCover: number | undefined;
         for (const id of block.effectiveMessageIds) {
             const seq = idToSeq.get(id);
-            if (seq !== undefined) blockSeqs.push(seq);
+            if (seq !== undefined) {
+                coveredSeqs.add(seq);
+                maxCover = maxCover === undefined ? seq : Math.max(maxCover, seq);
+            }
         }
-        if (blockSeqs.length === 0) continue;
-        for (const s of blockSeqs) coveredSeqs.add(s);
-        const maxCover = Math.max(...blockSeqs);
-        const pos = viewRows.findIndex((r) => r.seq > maxCover);
+        if (maxCover === undefined) continue;
+        const lastCoveredSeq = maxCover;
+        const pos = viewRows.findIndex((r) => r.seq > lastCoveredSeq);
         // #4732: pos === -1 means the fold reaches the END of the window — the
         // covered rows are suppressed below, so the anchor MUST still land
         // (at the tail) or the rendered prefix silently drops the whole fold
@@ -115,7 +117,7 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
-    const merged: BiliMessage[] = [];
+    let merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < viewRows.length; i++) {
         while (ai < anchors.length && anchors[ai].pos === i) {
