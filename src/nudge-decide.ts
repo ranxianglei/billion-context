@@ -213,7 +213,7 @@ export function consumeFallback(metadata: Record<string, unknown>): void {
  *    reasoning:{effort:"none"}) so default-thinking models (glm-5.3)
  *    cannot burn the output budget on hidden reasoning. Verified against
  *    z.ai: "none" yields reasoning_tokens 0 and a normal short answer. */
-export type NudgeDecisionReasoning = "strip" | "follow" | "off";
+type NudgeDecisionReasoning = "strip" | "follow" | "off";
 
 export function applyDecisionReasoningPolicy(
     protocol: "anthropic" | "openai" | "google" | "responses",
