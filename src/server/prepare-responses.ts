@@ -527,7 +527,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
             const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive));
-            const devParts = [...projection.systemParts, ...forgedSummaries, prompt, ...(historyNav ? [historyNav] : [])];
+            const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             if (blockOpsActive) devParts.push(buildBlockOpsSystemPrompt(responsesTextProtocol ? "hybrid" : "function"));
@@ -544,17 +544,21 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                     ? injectResponsesTool(parsed.tools, [...(ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE), ...(blockOpsActive ? blockOps.responses : [])], surface?.toolPrompts, externalSummaryEnabled(config))
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
             }
-        } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0 || historyNav) {
-            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : []), ...(historyNav ? [historyNav] : [])].join("\n\n---\n\n");
+        } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
+            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
-        if (sysNotes.length > 0) {
+        // The closed-history navigation index is an EPHEMERAL tail note, not
+        // part of the developer layer: the developer/system prefix must stay
+        // byte-identical across turns so the provider cache survives (#2596).
+        const notes = historyNav === null ? sysNotes : [...sysNotes, historyNav];
+        if (notes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                 ? [{ type: "message", role: "user", content: rebuiltInput }]
                 : rebuiltInput;
-            for (const text of sysNotes) {
+            for (const text of notes) {
                 inputItems.push({ type: "message", role: "user", content: text });
             }
             rebuiltInput = inputItems;

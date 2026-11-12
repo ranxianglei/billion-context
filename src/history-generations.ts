@@ -366,7 +366,7 @@ export function historyNavNote(session: Session, generations?: readonly HistoryG
     });
     const omitted = index.length - tail.length;
     return [
-        `[bili] ${index.length} closed history generation(s) are preserved read-only and stay searchable.`,
+        `[billion-context] Closed history generations — ${index.length} generation(s) are preserved read-only and stay searchable.`,
         ...(omitted > 0 ? [`- ${omitted} older generation(s) omitted from this index (still searchable)`] : []),
         ...lines,
         ...(index.length > 1 && generations !== undefined

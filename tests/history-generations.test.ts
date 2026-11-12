@@ -198,7 +198,7 @@ test("consecutive remote compactions archive each generation and keep every bloc
     const ctx = ctxFor(session, second.messages);
     assert.match(resolveDecompress({ blockId: firstBlock }, ctx).text, /generation 1/);
     assert.match(resolveDecompress({ blockId: second.blockId }, ctx).text, /generation 2/);
-    assert.match(historyNavNote(session) ?? "", /2 closed history generation/);
+    assert.match(historyNavNote(session) ?? "", /Closed history generations — 2 generation\(s\)/);
 });
 
 test("generations survive a restart: old refs and blocks restore from the sidecar alone", () => {

@@ -184,7 +184,7 @@ test("codex checkpoint header rebases once, archives a generation, and old refs 
         // gets a compact navigation index instead, on the very turn that closed
         // the generation.
         const wire = JSON.stringify(h.bodies.at(-1)?.input ?? []);
-        assert.match(wire, /closed history generation\(s\) are preserved read-only/, "navigation note reaches the model");
+        assert.match(wire, /Closed history generations — \d+ generation\(s\) are preserved read-only/, "navigation note reaches the model");
         assert.doesNotMatch(wire, /message 0 /, "archived history is not resent to the model");
         const forwarded = Object.keys(h.headers.at(-1) ?? {});
         assert.ok(forwarded.every((k) => !k.startsWith("x-bili-codex-checkpoint")), `internal checkpoint headers must not reach the upstream: ${forwarded.join(",")}`);

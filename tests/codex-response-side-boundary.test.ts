@@ -224,7 +224,7 @@ test("a compaction item in the response closes the generation on the same turn",
         }).then((r) => r.text());
         assert.equal(historyGenerationsOf(findSession(conv)).length, 1, "replay does not rebase twice");
         // From the next turn on, the model gets the compact navigation index.
-        assert.match(JSON.stringify(h.bodies.at(-1)?.input ?? []), /closed history generation\(s\) are preserved read-only/);
+        assert.match(JSON.stringify(h.bodies.at(-1)?.input ?? []), /Closed history generations — \d+ generation\(s\) are preserved read-only/);
         assert.doesNotMatch(JSON.stringify(h.bodies.at(-1)?.input ?? []), /message 0 /);
         const restored = await fetch(h.pluginToolUrl, {
             method: "POST",

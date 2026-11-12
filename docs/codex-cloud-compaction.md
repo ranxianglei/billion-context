@@ -78,7 +78,10 @@ much to the next request's compaction threshold — once, never permanently.
    above every archived value: old `mNNNNN` and `bN` are never re-issued onto
    different content.
 4. A compact navigation note (generation numbers, ref spans, how they closed)
-   is injected as developer text; no archived payload is re-sent to the model.
+   is appended as an **ephemeral tail note** (`[billion-context] Closed history
+   generations — …`), never as part of the developer/system layer: that prefix
+   must stay byte-identical across turns so the provider cache survives
+   (`#2596`). No archived payload is re-sent to the model.
 
 If the generation cannot be persisted (and persistence is on), the boundary is
 **not** rebased: live state stays intact and the next request retries. When

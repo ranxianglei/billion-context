@@ -197,7 +197,7 @@ const sent2 = upstreamBodies[beforeBodyCount] ?? ''
 assert.ok(!sent2.includes('history 0 lorem'), 'the replay must NOT resend the summarized history')
 assert.ok(sent2.includes('encrypted_content'), 'the replay must carry the real encrypted checkpoint')
 assert.ok(/REAL-COMPACT-TOKEN-9/.test(t2.text), `the model must answer from the compacted context, got ${JSON.stringify(t2.text.slice(0, 200))}`)
-assert.ok(sent2.includes('closed history generation(s) are preserved read-only'), 'the model gets the compact navigation index')
+assert.ok(sent2.includes('Closed history generations —'), 'the model gets the compact navigation index')
 
 // ── old refs and blocks restore / stay searchable across the generation ──
 const dec = await toolCall('decompress', { blockId: g1.blockIds[0], full: true })

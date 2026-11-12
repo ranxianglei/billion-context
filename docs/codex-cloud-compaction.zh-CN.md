@@ -61,7 +61,9 @@ bili（`src/codex-checkpoint.ts`）把**新身份**——新 id 或更大的 `se
    可恢复：`historyGenerationsOf()` 会重读旁车并自愈索引。
 3. 活跃状态被重置，但 ref floor 与 `state.nextBlockId` 钉在所有已归档值之上：
    旧的 `mNNNNN`、`bN` 永远不会被发给不同内容。
-4. 以 developer 文本注入一段精简导航（代数、ref 区间、关闭原因）；不会把任何
+4. 以**尾部临时注记**（`[billion-context] Closed history generations — …`）追加一段精简导航
+   （代数、ref 区间、关闭原因），绝不写进 developer/system 层——该前缀必须逐轮字节
+   一致，否则 provider 缓存失效（`#2596`）；不会把任何
    归档载荷重新发给模型。
 
 若历史代无法持久化（且持久化开启），边界**不会**回卷：活跃状态保持原样，下一次
