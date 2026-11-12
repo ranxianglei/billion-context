@@ -1,4 +1,4 @@
-export { runCompressLoop, executeProxyTool, MAX_LOOP_ROUNDS } from "./core.js";
+export { runCompressLoop, executeProxyTool, MAX_LOOP_ROUNDS, failedCallSignature } from "./core.js";
 export type {
     LoopCtx,
     RequestOptions,
