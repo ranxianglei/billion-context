@@ -1308,7 +1308,7 @@ function durablePairedPayload(message: CoreMessage): CoreMessage | null {
 
 /** Empty hashes are unprovable tool edges, never reusable evidence. Callers
  * sending a fork receipt omit them; server mirrors must not match empty hashes. */
-export function forkDurableMessageIdentities(messages: CoreMessage[]): Array<{ rawId: string; identityHash: string }> {
+function forkDurableMessageIdentities(messages: CoreMessage[]): Array<{ rawId: string; identityHash: string }> {
     const byToolId = new Map<string, number[]>();
     const rawIdCounts = new Map<string, number>();
     const identities = messages.map((message, index) => {
