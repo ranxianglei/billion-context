@@ -65,7 +65,7 @@ import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -637,8 +637,16 @@ async function handleRequest(
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
     // here would double-manage it. Raw forward, zero state touched.
-    if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
-        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
+    // #6220: BILI_PLUGIN_BYPASS overrides this decision per request —
+    //   "on"  → force bypass (every request forwarded verbatim)
+    //   "off" → never bypass (ignore the header)
+    //   unset → current behavior (the header decides)
+    const bypassOverride = pluginBypassOverride();
+    const bypass = bypassOverride === "on"
+        || (bypassOverride === "auto" && headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1");
+    if (bypass) {
+        const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
+        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
