@@ -14,17 +14,18 @@ import type { AddressInfo } from "node:net";
 
 process.env.NODE_TEST_CONTEXT = "1";
 
-const { maybeIncrementalOpencode, opencodeIncrementalOnResponse, __resetOpencodeIncrementalForTests } = await import("../src/agent/opencode-native.ts");
+const { maybeIncrementalOpencode, opencodeIncrementalOnResponse, opencodeIncrementalOnHttpResponse, __resetOpencodeIncrementalForTests } = await import("../src/agent/opencode-native.ts");
+const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { __resetIncrementalClientForTests } = await import("../src/agent/incremental-client.ts");
 import type { V2HttpRequestEvent, V2State } from "../src/agent/opencode-v2.ts";
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
-async function fakeLane(enabled: boolean): Promise<{ base: string; close: () => Promise<void> }> {
+async function fakeLane(enabled: boolean, cacheControlRetouch?: boolean): Promise<{ base: string; close: () => Promise<void> }> {
     const srv = createServer((req, res) => {
         if (req.method === "GET" && req.url === "/__bili/plugin/turn") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only" }));
+            res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only", cacheControlRetouch }));
             return;
         }
         res.writeHead(404); res.end("{}");
@@ -94,6 +95,34 @@ test("opencode incremental: seed swap (marker + shaped body, headers preserved),
     assert.equal(body2.sinceSeq, 1, "second turn rides the acked watermark");
     assert.equal((body2.messages as unknown[]).length, 2, "only the delta rides");
 });
+
+for (const supported of [undefined, false, true]) {
+    test(`opencode rolling marks: capability ${String(supported)} gates retouch`, async () => {
+        __resetIncrementalClientForTests();
+        __resetOpencodeIncrementalForTests();
+        const lane = await fakeLane(true, supported);
+        lanes.push(lane);
+        const s = state(lane.base);
+        const marked = { type: "text", text: "first", cache_control: { type: "ephemeral" } };
+        const first = fakeEvent({ model: "claude-test", messages: [{ role: "user", content: [marked] }] }, "oc-capability");
+        await maybeIncrementalOpencode(first.e, s);
+        opencodeIncrementalOnResponse(first.url, new Response("{}", { headers: { "x-bili-applied-seq": "1" } }), headersOf(first.e.request as Request));
+        const next = fakeEvent({ model: "claude-test", messages: [
+            { role: "user", content: [{ type: "text", text: "first" }] },
+            { role: "assistant", content: "reply" },
+            { role: "user", content: [{ ...marked, text: "next" }] },
+        ] }, "oc-capability");
+        const original = next.e.request;
+        await maybeIncrementalOpencode(next.e, s);
+        if (supported !== true) {
+            assert.equal(next.e.request, original, "old server gets unchanged full request");
+        } else {
+            const body = await (next.e.request as Request).json() as { messages: unknown[]; retouch?: unknown };
+            assert.equal(body.messages.length, 2);
+            assert.deepEqual(body.retouch, [{ index: 0, message: { role: "user", content: [{ type: "text", text: "first" }] } }]);
+        }
+    });
+}
 
 test("opencode incremental: probe disabled leaves the request untouched", async () => {
     __resetIncrementalClientForTests();
@@ -273,4 +302,56 @@ test("opencode incremental: late response crossing the TTL attributes by turn id
     } finally {
         Date.now = realNow;
     }
+});
+
+test("opencode incremental: V2 http.response seam acks the turn (attach/spawn mode has no fetch intercept)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true);
+    lanes.push(lane);
+    const s = state(lane.base);
+
+    const msgs1 = [{ role: "user", content: "hello v2" }];
+    const t1 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs1 }, "oc-inc-v2");
+    await maybeIncrementalOpencode(t1.e, s);
+    const sent = t1.e.request as Request;
+    assert.equal(sent.headers.get("x-bili-plugin-turn"), "1");
+
+    // ignored: events without a response, or for requests the lane never stamped
+    opencodeIncrementalOnHttpResponse({ request: sent } as unknown as V2HttpRequestEvent);
+    opencodeIncrementalOnHttpResponse({ request: new Request(MODEL_URL, { method: "POST", body: "{}" }), response: new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "7" } }) } as unknown as V2HttpRequestEvent);
+
+    // the host's http.response event: the SENT request + the upstream reply
+    opencodeIncrementalOnHttpResponse({ request: sent, response: new Response("{}", { status: 200, headers: { "x-bili-applied-seq": "1" } }) } as unknown as V2HttpRequestEvent);
+
+    const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "next" }];
+    const t2 = fakeEvent({ model: "claude-test", max_tokens: 512, system: "be terse", messages: msgs2 }, "oc-inc-v2");
+    await maybeIncrementalOpencode(t2.e, s);
+    const body2 = await (t2.e.request as Request).clone().json() as Record<string, unknown>;
+    assert.equal(body2.sinceSeq, 1, "the http.response ack advanced the watermark");
+    assert.equal((body2.messages as unknown[]).length, 2, "only the delta rides");
+});
+
+test("opencode v2 setup: onResponse registers the http.response hook and never throws into the host", async () => {
+    const hooks = new Map<string, (e: Record<string, unknown>) => unknown>();
+    const seen: unknown[] = [];
+    const ctx = {
+        session: {
+            hook: async (name: string, cb: (e: Record<string, unknown>) => unknown) => {
+                hooks.set(name, cb);
+                return { dispose: () => {} };
+            },
+        },
+    };
+    const setup = createOpencodeV2Setup({ onResponse: (e) => { seen.push(e); throw new Error("boom"); } });
+    try {
+        await (setup as unknown as (c: unknown) => Promise<unknown>)(ctx);
+    } catch {
+        // other seams of this minimal fake ctx may be missing; only the hook registration matters here
+    }
+    const cb = hooks.get("http.response");
+    assert.ok(cb, "http.response hook registered");
+    const ev = { response: new Response("{}") };
+    await cb(ev);
+    assert.deepEqual(seen, [ev], "callback receives the host event; its throw is swallowed");
 });

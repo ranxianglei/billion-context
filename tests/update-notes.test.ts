@@ -331,7 +331,7 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
         const deps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
 
         const r0 = mockRes();
-        handlePluginStatus("never-seen", r0.res, deps, true);
+        await handlePluginStatus("never-seen", r0.res, deps, true);
         assert.equal(r0.status, 200);
         const p0 = JSON.parse(r0.body).panel as string;
         assert.ok(!p0.includes("Update ready") && !p0.includes("Update available") && !p0.includes("Critical update"), "no update line when clean");
@@ -339,7 +339,7 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
 
         _setReleaseNotesStateForTest({ entries: SURFACE_ENTRIES, diskVersion: NEXT2 });
         const r1 = mockRes();
-        handlePluginStatus("never-seen", r1.res, deps, true);
+        await handlePluginStatus("never-seen", r1.res, deps, true);
         const p1 = JSON.parse(r1.body).panel as string;
         assert.ok(p1.includes(`Critical update ready: ${NEXT2} — restart to finish.`), "panel line present");
         assert.ok(p1.includes(PANEL_BOX_FOOTER), "footer still present with the update line");
@@ -355,7 +355,7 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
             diskVersion: NEXT,
         });
         const r2 = mockRes();
-        handlePluginStatus("never-seen", r2.res, deps, true);
+        await handlePluginStatus("never-seen", r2.res, deps, true);
         const p2 = JSON.parse(r2.body).panel as string;
         assert.ok(p2.includes(dollarSummary), "dollar-sign summary survives byte-exact");
     } finally {
@@ -430,7 +430,7 @@ test("#4295 status and panel agree when only some critical updates are installed
                 : "CRITICAL UPDATE AVAILABLE (instance-level):"), status);
             assert.equal(status.includes("UPDATE READY"), ready, "restart must deliver the critical fixes");
             const res = mockRes();
-            handlePluginStatus("never-seen", res.res, { core: createCore(), config: defaultConfig(200000), log: () => {} }, true);
+            await handlePluginStatus("never-seen", res.res, { core: createCore(), config: defaultConfig(200000), log: () => {} }, true);
             const body = JSON.parse(res.body) as { panel: string };
             assert.ok(body.panel.includes(ready
                 ? `Critical update ready: ${disk} — restart to finish.`

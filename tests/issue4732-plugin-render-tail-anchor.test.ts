@@ -38,7 +38,7 @@ async function harness() {
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 15 });
     _setStoreForTest(store);
     _setForTest({});
     const upstream = http.createServer((req, res) => {

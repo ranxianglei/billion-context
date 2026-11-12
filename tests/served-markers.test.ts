@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createServedMarkerWriter, findContestedWriters, reapStaleWriterMarkers, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
+import { createServedMarkerWriter, findContestedWriters, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type WriterIdentity } from "../src/served-markers.ts";
 
 // #3923: per-session writer markers — session-level split-brain visibility.
 // Two live bili processes sharing one sessions directory already warn at
@@ -111,6 +111,63 @@ test("dead-pid peer counts while its marker is fresh, stops counting once stale"
     assert.equal(found.length, 0, "dead pid + stale mtime = gone");
 });
 
+test("graceful dispose records stoppedAt and never contests a fresh predecessor (#4982 gate restart)", () => {
+    const dir = writerMarkerDir(freshDir("bili-3923-stop-"));
+    const logs: Array<[string, string]> = [];
+    // predecessor committed sess-a, then shut down gracefully (SIGTERM → dispose)
+    const pred = createServedMarkerWriter({ ...PEER }, dir, () => {});
+    pred.noteServed("sess-a");
+    pred.__flushForTest();
+    pred.dispose();
+    const body = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(typeof body.stoppedAt, "number", "dispose records a graceful stop");
+    // successor rebinds seconds later and commits the same session — the
+    // predecessor's marker is still FRESH, but a known-dead instance must not
+    // raise an alarm
+    const w = createServedMarkerWriter(SELF, dir, (level, msg) => logs.push([level, msg]));
+    w.noteServed("sess-a");
+    assert.equal(logs.length, 0, "a gracefully-stopped predecessor is not a concurrent writer");
+    w.dispose();
+});
+
+test("stoppedAt skips even when the peer pid is alive", () => {
+    const dir = writerMarkerDir(freshDir("bili-3923-stopped-pid-"));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "peer-1.json"), JSON.stringify({
+        v: 1, ...PEER, servedAt: { "sess-x": Date.now() - 1_000 }, stoppedAt: Date.now() - 2_000,
+    }));
+    assert.deepEqual(findContestedWriters(dir, SELF.instanceId, "sess-x", Date.now()), [], "stoppedAt outranks liveness — a recorded stop is positively-known death");
+});
+
+test("#4626 gracefully-shutdown peer (disposedAt stamp) never contests, even with fresh mtime", () => {
+    const dir = writerMarkerDir(freshDir("bili-4626-disposed-"));
+    const deadPeer: WriterIdentity = { ...PEER, pid: DEAD_PID };
+    fs.mkdirSync(dir, { recursive: true });
+    // The exact shape dispose() leaves behind: dead pid, mtime ≈ death time,
+    // a commit inside the window seconds earlier.
+    const file = path.join(dir, `${deadPeer.instanceId}.json`);
+    fs.writeFileSync(file, JSON.stringify({ v: 1, ...deadPeer, servedAt: { "sess-h": Date.now() - 1000 }, disposedAt: Date.now() - 9000 }));
+    backdate(file, 8000);
+    assert.deepEqual(findContestedWriters(dir, SELF.instanceId, "sess-h", Date.now()), [], "handover tombstone is attribution-only — no false split-brain verdict");
+});
+
+test("#4626 e2e: graceful rotation — successor commits the same session without a verdict", () => {
+    const dir = writerMarkerDir(freshDir("bili-4626-handover-"));
+    const logs: Array<[string, string]> = [];
+    const outgoing = createServedMarkerWriter(PEER, dir, (level, msg) => logs.push([level, msg]));
+    outgoing.noteServed("sess-rot");
+    outgoing.__flushForTest();
+    const mid = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(mid.disposedAt, undefined, "periodic flushes carry no disposedAt stamp");
+    outgoing.dispose();
+    const final = JSON.parse(fs.readFileSync(path.join(dir, "peer-1.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(typeof final.disposedAt, "number", "the final shutdown write is stamped disposedAt");
+    const incoming = createServedMarkerWriter(SELF, dir, (level, msg) => logs.push([level, msg]));
+    incoming.noteServed("sess-rot");
+    assert.equal(logs.length, 0, "sequential handover inside the 10m window raises no [split-brain] line");
+    incoming.dispose();
+});
+
 test("malformed or foreign-shape marker files are skipped, never fatal", () => {
     const dir = writerMarkerDir(freshDir("bili-3923-malformed-"));
     fs.mkdirSync(dir, { recursive: true });
@@ -139,4 +196,37 @@ test("reapStaleWriterMarkers removes dead+stale files, keeps live and recent one
     reapStaleWriterMarkers(dir, Date.now());
     assert.equal(fs.existsSync(deadFile), false, "provably-dead + beyond reap horizon → removed");
     assert.equal(fs.existsSync(liveFile), true, "live pid → kept regardless of age");
+});
+
+test("container restart with same PID (pid 1) does not falsely contest prior generation", () => {
+    const dir = writerMarkerDir(freshDir("bili-container-pid1-"));
+    // Anchor to THIS process's boot so the assertion holds no matter how long
+    // the test process has been alive (a fixed offset from Date.now() only
+    // works while uptime stays under ~29 s).
+    const selfBoot = processStartMs(Date.now());
+    const priorPeer: WriterIdentity = {
+        instanceId: "prior-container-gen",
+        pid: process.pid,
+        origin: "http://127.0.0.1:8787",
+        version: "0.1.204",
+        startedAt: selfBoot - 30_000,
+    };
+    writePeerMarker(dir, priorPeer, { "sess-container": Date.now() - 5000 });
+    const found = findContestedWriters(dir, SELF.instanceId, "sess-container", Date.now());
+    assert.equal(found.length, 0, "prior container generation with same PID is not a live peer");
+});
+
+test("same-PID peer that booted after this process still contests (generation gate is one-way)", () => {
+    const dir = writerMarkerDir(freshDir("bili-container-pid1-young-"));
+    const selfBoot = processStartMs(Date.now());
+    const youngerTwin: WriterIdentity = {
+        instanceId: "younger-twin-gen",
+        pid: process.pid,
+        origin: "http://127.0.0.1:8788",
+        version: "0.1.204",
+        startedAt: selfBoot + 5_000,
+    };
+    writePeerMarker(dir, youngerTwin, { "sess-container": Date.now() - 5000 });
+    const found = findContestedWriters(dir, SELF.instanceId, "sess-container", Date.now());
+    assert.equal(found.length, 1, "a same-PID twin that booted later than us is still a live peer");
 });
