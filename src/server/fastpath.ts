@@ -440,6 +440,8 @@ function addStripCounts(a: RawStripCounts, b: RawStripCounts): RawStripCounts {
         markerLines: a.markerLines + b.markerLines,
         nudges: a.nudges + b.nudges,
         carriers: a.carriers + b.carriers,
+        // both fragments were really walked — the sum is this request's strip wall time
+        strippedMs: Number((a.strippedMs + b.strippedMs).toFixed(1)),
     };
 }
 

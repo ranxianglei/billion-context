@@ -276,6 +276,8 @@ export interface PreflightDeps {
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
+    /** #5974: tokens by which this pass's blind view (processTurn on the client re-send) understates the ACTUAL outbound body, measured by the caller against a fresh full-pipeline rebuild (#4543-① — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about). When > 0, every fit judgment in this pass runs on the corrected scale (exit bar, futility deficit, relax triggers, tier-distillation funnel, final fitsWindow), so the walk keeps folding until the reconstruction is predicted to fit too. Absent/0 → byte-identical legacy behavior; only the bounded corrective second pass sets it. */
+    viewDeltaCorrection?: number;
 }
 
 type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -1780,7 +1782,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // for k̂=1 / absent / mismatched-origin (applyEstimateCalibration → raw), so
     // the uncalibrated #1841 path stays byte-identical.
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
-    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
+    // #5974: measured view-vs-reconstruction divergence (see PreflightDeps.viewDeltaCorrection).
+    // Every fit judgment in this pass runs on the corrected scale; 0 keeps legacy behavior.
+    const viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve - viewDeltaCorrection);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
     // #4288: set when the round-top fit exit fired — the walk ended in a
     // forward decision, and no later verdict may override it (see the final
@@ -2020,7 +2025,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // the old blanket "every compression tier is exhausted" conflated.
         let exhaustedWhy: string | undefined;
         let est = measureEst();
-        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
+        // #5974: judge recovery on the corrected scale too — a blind-view est under the window can still leave the true body over.
+        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est + viewDeltaCorrection >= limit && !deps.signal?.aborted) {
             const active = deps.session.state.blocks.filter((b) => b.active);
             const t1 = active.filter((b) => b.tier === 1);
             const t2 = active.filter((b) => b.tier === 2);
@@ -2140,13 +2146,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             netSaved += gained;
             est = after;
-            if (est < limit) { stopReason = "fit"; break; }
+            // #5974: corrected scale — the fit must hold for the predicted OUTBOUND body, not just the blind view.
+            if (est + viewDeltaCorrection < limit) { stopReason = "fit"; break; }
             deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged b-range ${first.blockId}..${last.blockId} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
         }
-        if (stopReason === "fit" && est >= limit) stopReason = "cap";
-        const recovered = est < limit;
+        if (stopReason === "fit" && est + viewDeltaCorrection >= limit) stopReason = "cap";
+        const recovered = est + viewDeltaCorrection < limit;
         if (recovered) currentTokens = Math.min(currentTokens, est);
-        const overBy = Math.max(0, est - limit);
+        const overBy = Math.max(0, est + viewDeltaCorrection - limit);
         // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
         // only when there was genuinely nothing left to distill; a call-cap hit or an
         // unavailable summary is not tier exhaustion. #3646: when the search really
@@ -2346,7 +2353,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 return si !== undefined && ei !== undefined && si <= ei ? sum + r.tokens : sum;
             }, 0);
             let potential = resolvableMass(ranges);
-            const deficit = result.payloadEstimate - limit;
+            // #5974: corrected scale — the blind view understates the outbound body by viewDeltaCorrection.
+            const deficit = result.payloadEstimate + viewDeltaCorrection - limit;
             if (potential > 0 && deficit > 0 && calibrateFoldMass(potential) * FUTILITY_SLACK < deficit) {
                 if (!relaxed) {
                     // The soft-protected recent zone is not in `ranges` yet; #330
@@ -2368,7 +2376,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (calibrateFoldMass(relaxedPotential) * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
                         relaxed = true;
-                        textTarget = Math.max(0, limit - imageReserve);
+                        // #5974: keep the correction through the relax reset, or it silently drops out mid-pass.
+                        textTarget = Math.max(0, limit - imageReserve - viewDeltaCorrection);
                         summaryCalls = 0;
                         budgetHit = false;
                         transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
@@ -2406,10 +2415,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && result.payloadEstimate >= limit) {
+            // #5974: corrected scale — otherwise a blind-view fit skips relaxing the recent zone while the true body still overflows.
+            if (!relaxed && result.payloadEstimate + viewDeltaCorrection >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
-                textTarget = Math.max(0, limit - imageReserve);
+                // #5974: keep the correction through the relax reset, or it silently drops out mid-pass.
+                textTarget = Math.max(0, limit - imageReserve - viewDeltaCorrection);
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -2783,7 +2794,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const ei = refToIdx.get(rj.endRef);
                     if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
                 }
-                const deficit = result.payloadEstimate - limit;
+                // #5974: corrected scale — keep parity with the pre-walk gate above (the blind view understates the outbound body by viewDeltaCorrection).
+                const deficit = result.payloadEstimate + viewDeltaCorrection - limit;
                 if (remaining > 0 && deficit > 0 && calibrateFoldMass(remaining) * FUTILITY_SLACK < deficit) {
                     futileBail = true;
                     bailRemaining = calibrateFoldMass(remaining);
@@ -3153,7 +3165,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #330 relax path below is still available (!relaxed AND the payload
             // overflows the window) — in that case fall through to it; the next
             // round re-judges on the relaxed view.
-            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate < limit)) {
+            // #5974: corrected scale — the "payload already fits" escape must not trigger on the blind view when the true body still overflows.
+            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate + viewDeltaCorrection < limit)) {
                 const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
                 // #1372 contract: per-range skip notes are the diagnosis of WHY
                 // candidates died — carry them into the bail verdict too.
@@ -3172,7 +3185,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
-            if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
+            // #5974: corrected scale (mirror of the gate above).
+            if (!failure && !budgetHit && !relaxed && result.payloadEstimate + viewDeltaCorrection >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 summaryCalls = 0;
@@ -3241,7 +3255,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if ((currentTokens >= limit && !fitExitForward) || failure?.kind === "aborted") result.failure = failure;
     // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
     // char-count upper bound was the trigger arm, never the reject-forward gate.
-    result.fitsWindow = result.payloadEstimate < limit;
+    // #5974: corrected scale — fitsWindow must reflect the predicted OUTBOUND size, not just the blind view.
+    result.fitsWindow = result.payloadEstimate + viewDeltaCorrection < limit;
     if (deps.externalSummary !== undefined) {
         result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
     }

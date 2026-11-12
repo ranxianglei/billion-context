@@ -13,7 +13,7 @@ import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
-import type { UnpromptedGate } from "./unprompted-gate.js";
+import type { UnpromptedGateState } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -338,12 +338,14 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
-        /** #5683: the conversation's latest model-round compression-prompt facts
-         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
-         *  Re-stamped on every prepare; in-memory only — a restart reads the
-         *  all-off default until the first round re-stamps, which is safe: no
-         *  tool call can reach applyRanges before its own round's prepare. */
-        unpromptedGate?: UnpromptedGate;
+        /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
+         *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare (injected rounds re-mint the window,
+         *  un-nudged model rounds decay it); in-memory only — a restart lapses
+         *  any live credit to the all-off default until the first round
+         *  re-stamps, which is safe: no tool call can reach applyRanges before
+         *  its own round's prepare. */
+        unpromptedGate?: UnpromptedGateState;
         /** #5981: the last model stream on this conversation was CUT before its
          *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
          *  call dispatched out of such a stream can carry EMPTY arguments —
@@ -645,6 +647,15 @@ export type Session = {
      *  the message that now owns the number). A fresh process that never
      *  re-stamped has no map and every ref behaves normally. */
     restampSuperseded?: Map<string, string>;
+    /** #5608-D: set when a fold commits on a not-yet-aligned session. The
+     *  #4316 citation-space alignment used to run at cold load — every
+     *  restart renumbered ALL refs and burned ONE full-prefix provider
+     *  re-bill on the very first post-restart round. Now it defers to the
+     *  NEXT successful fold: that rewrite already invalidates history once,
+     *  so the renumbering rides its boundary free; sessions that never fold
+     *  keep their legacy refs forever (zero cost). Persist consumes the
+     *  marker exactly once on the save path. Process-lifetime only. */
+    pendingLedgerAlign?: boolean;
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when

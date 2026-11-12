@@ -40,10 +40,15 @@ Two lanes, same plugin (#941):
   remove — user entries and comments survive, an emptied file gets its
   placeholder `[]` back. Run dsh once in each profile first so the profile
   dirs exist. The plugin spawns its own proxy at load (attaches to a healthy
-  one instead of doubling; parent-pid watchdog), rewrites model-API traffic
-  to `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
-  manifest tools verbatim, and gates plugin-mode headers on tool readiness
-  (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
+   one instead of doubling; parent-pid watchdog), rewrites model-API traffic
+   to `<proxy>/bili/<upstream-url>` via global fetch and Codex Responses
+   WebSocket patches (#5838), registers the manifest tools verbatim, and gates
+   plugin-mode headers on tool readiness. WS upgrades await registration and
+   carry DSH session/model headers; every `response.create` awaits attribution
+   and fork preparation. Cached sockets refuse sends after identity/model,
+   plugin activation, or proxy-origin changes, requiring reconnect (or the
+   provider's SSE fallback). Other WebSockets remain untouched. Opt-out:
+   `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh` or `dsh plugin --profile <name> remove
   billion-context` — both go through the same channel. Registry installs
   require a published release that carries `dsh.bundle.patch.yml`; use the
@@ -54,6 +59,26 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Codex WebSocket leg (#5838):** the embedded pi-ai `openai-codex` provider
+  defaults to `transport: auto`, which prefers a direct WebSocket exchange —
+  a successful WS round trip never calls fetch. Builds shipped before the
+  WS-lane fix therefore never see those model requests: ACP tools answer 404
+   and nothing compresses until the context limit. On such builds set DSH's
+   existing `providers.openai-codex.transport` setting to `sse` (hot settings;
+   no new bili configuration key is needed) so the traffic rides the fetch
+   leg; from the fix release onward the WebSocket leg is intercepted and
+   header-stamped automatically.
+- **Boundary — third-party Codex transports:** plugins that build their OWN
+  Codex WebSocket client bypass bili's intercepts by construction. Example
+  found in the wild 2026-11-08: `dsh-codex-subscription` with
+  `connectionMode: websocket` imports the `ws` package directly and swaps
+  `globalThis.WebSocket` for a per-host Proxy, so model frames never pass the
+  global fetch/WS patches — no proxy visibility, ACP tools answer 404, and
+  with native compaction suppressed there is no compaction path at all (the
+  second #5838 source). Use `connectionMode: sse` (the plugin default) until
+  the plugin passes the ambient `globalThis.WebSocket` through when no CONNECT
+  proxy agent is needed; bili cannot intercept module-scoped `ws` imports
+  inside a host-owned profile bundle.
 - **Desktop app (Electron host):** the same plugin also runs inside the
   deepseek-harness **desktop** app, installed through its in-app plugin
   manager. There the bootstrap spawns its proxy from within the app process,
@@ -661,8 +686,8 @@ integration is the ceiling for v1). Launcher-only by design.
 
 Pi has a full native mode (`bili plugin install pi`, README quickstart
 option 1); this section covers what the one-line table can't — **which model
-transports the native intercept actually covers**. Pi is the only host that
-brings WebSocket model traffic into the loop.
+transports the native intercept actually covers**. DSH also intercepts Codex
+Responses WebSockets (#5838); its host-specific lifecycle is described above.
 
 **Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
 delegate tools, roles, fleet inspector — wired by `bili pi` through the
@@ -828,11 +853,13 @@ Verified entry points (community-maintained list — the mechanism is generic):
 | **Void** | custom OpenAI-compatible endpoint setting |
 | **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | custom-model base URL setting |
+| **Command Code** (`cmd`, commandcode.ai) | `~/.commandcode/providers.json` — per-provider (and per-model) `baseURL` (keys live in `auth.json`, never in this file) |
 
 Notes:
 
 - **Crush** is a launcher lane now — prefer `bili crush` (config untouched, HTTPS domains MITM'd automatically).
 - **Zed** is a launcher lane too — prefer `bili zed` (Linux; config untouched, model domains MITM'd automatically, loopback providers stay direct). The settings.json `api_url` path above remains the cross-platform alternative.
+- **Command Code**: the row above covers its BYOK models (standard wires, compressed today). Its catalog/gateway models ride a custom wire (`POST /alpha/generate`) that relays byte-for-byte — see [below](#an-unrecognized-endpoint-goes-direct-and-nothing-compresses-1290); the declarable-wire fix is tracked in #1295.
 - Clients you **sign into** (OAuth/subscription) usually hardcode the endpoint — the prefix trick doesn't apply; see the [MITM section below](#client-uses-httpproxy-connect-but-nothing-compresses) instead.
 - Plain **web apps** (browser-only products) have no local traffic to intercept.
 - VS Code extensions keep their base-URL fields in plain-text settings but secrets in the OS keychain — only the base URL ever needs editing here.
@@ -882,7 +909,7 @@ the V1 shape and 2.x hosts load the V2 `setup()`. The standalone
 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) extension is
 V1-only and does **not** load under 2.x — for OpenCode 2.x, billion-context
 is the recommended context manager. Everything below is verified end-to-end
-on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
+on `@opencode/cli` 2.1.0 (V1 lane: 1.14.46 and 1.18.31).
 
 | Path | Command | When |
 |---|---|---|
@@ -935,13 +962,20 @@ Registers a self-spawning plugin in your real opencode config and sets
 face is added by default (the native plugin already provides the bili tools,
 session-bound); pass `--with-mcp` to add one — the entry then carries no
 origin pin, so it survives the plugin's ephemeral-port proxy restarts (#926).
-Entry form depends on how THIS bili was installed: an **npm install** writes
-the bare package name (`"plugin": ["billion-context"]`) — the package
-publishes `exports["./server"]` → `dist/agent/opencode-native.js`, so
-opencode loads it through its own Npm.add machinery; zero absolute paths, portable. (That exact bare-name entry doubles as a hand-install without bili — see README Quickstart Option 1.) A **git checkout / dev build** falls back to a local shim dir
-(`<configDir>/plugins/billion-context/index.js` → this checkout's
-`dist/agent/opencode-native.js`) — machine-local by construction; re-running
-install from an npm install migrates the entry back to the bare name.
+Entry form depends on the host generation AND how THIS bili was installed.
+An **OpenCode 1.x npm install** writes the bare package name
+(`"plugin": ["billion-context"]`) — the package publishes
+`exports["./server"]` → `dist/agent/opencode-native.js`, so opencode loads
+it through its own Npm.add machinery; zero absolute paths, portable. (That
+exact bare-name entry doubles as a hand-install without bili — see README
+Quickstart Option 1.) On an **OpenCode 2.x host** — and for any **git
+checkout / dev build** — the installer writes a local shim dir instead
+(`<configDir>/plugins/billion-context/index.js` → this install's
+`dist/agent/opencode-native.js`): 2.x resolves a bare package name through
+the package `main` field (`dist/index.js`, the CLI — no plugin definition),
+so the bare name never loads there (#3976); re-running install (or a reinstall
+to a new path) regenerates the shim to point at the current root, and a
+legacy bare-name entry in a 2.x config is migrated to the shim automatically.
 
 At load the plugin bootstraps its own proxy (attaches to a healthy instance
 instead of doubling; parent-pid watchdog kills it when opencode exits),

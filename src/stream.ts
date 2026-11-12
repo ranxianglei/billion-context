@@ -20,7 +20,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
-import { unpromptedGateOf } from "./unprompted-gate.js";
+import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
@@ -1057,32 +1057,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
-    // #5683: unprompted-compression policy gate (timing). Model-initiated calls
-    // only — bili's own overflow backstop folds ride loopTracking:false above
-    // and never reach this check, so availability is unaffected even when the
-    // nudge channel itself is suppressed.
+    // #5683/#5943: unprompted-compression policy gate (timing). Model-initiated
+    // calls only — bili's own overflow backstop folds ride loopTracking:false
+    // above and never reach this check, so availability is unaffected even when
+    // the nudge channel itself is suppressed. "armed" here reads as LIVE NUDGE
+    // CREDIT (#5943): a window of NUDGE_CREDIT_ROUNDS model rounds minted by the
+    // last actually-injected nudge, refreshed by each new one and decayed by
+    // every un-nudged model round (see src/unprompted-gate.ts) — NOT this-round
+    // arm, which refused every multi-round cleanup continuation.
     const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
     if (gate?.requireNudge && !gate.armed) {
-        ctx.log("[acp-proxy: refused unprompted compress — no nudge was injected this turn (compress.requireNudge)]");
-        return compressResult("[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress in a round where a compression nudge was actually injected, and no nudge accompanied this round. Continue the task without folding; when a nudge appears, follow its ranges.]", "refused", 0, "unprompted");
+        ctx.log("[acp-proxy: refused unprompted compress — no live nudge credit (window expired or never minted) (compress.requireNudge)]");
+        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.]`, "refused", 0, "unprompted");
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
-        // compressAtFoldPoint v2 pointer echo (kind=already-folded-echo): the
-        // call's content was the relocation ack text of an earlier fold — the
-        // model copied the most recent compress call's rewritten args as its
-        // template (field report on #5949's v2: four identical
-        // content-not-array receipts in 25 minutes, each receipt feeding the
-        // next retry). Nothing is wrong with the format and nothing is
-        // foldable: ack a no-op instead of lecturing. NOT routed through
-        // recordCompressFailure (no repeat-guard counter for the model to
-        // misread as "the user asked N times"), but loop-tracked so a runaway
-        // echo burst still collapses to the #2146 short refusal.
-        if (diagnostics.kind === "already-folded-echo") {
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, "already-folded-echo") : "";
-            ctx.log("[acp-proxy: compress call echoed a fold-point relocation pointer (compressAtFoldPoint v2) — acked as no-op]");
-            return compressResult(`[bili: nothing was compressed — the text you sent is the relocation pointer of an earlier, already-completed fold (its summary lives at its fold point in the history). Do not re-send it. To fold NEW consumed ranges, issue one compress call whose content holds fresh 'mNNNNN–mNNNNN optional topic' header lines with their summaries.]${loopGuard}`, "refused", 0, "already-folded-echo");
-        }
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
@@ -1360,6 +1349,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // #5608-D: this fold is the session's next legitimate cache-breaking
+        // boundary — flag the one-time #4316 citation-space alignment to ride
+        // it (persist.scheduleSave consumes the marker before serializing).
+        ctx.session.pendingLedgerAlign = true;
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs

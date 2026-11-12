@@ -1,4 +1,4 @@
-import { defaultCountTokens, orderedRefPair } from "acp-kernel";
+import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
@@ -1439,29 +1439,48 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // absent from BOTH keep the honest missing marker.
     // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
-    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    // #6029: hydrate pruned leaves by their STABLE msg_id (the content-derived
+    // identity), never by the live ref number. restampRefsToLedger renumbers the
+    // live refs at cold load — the #5196 parked band lands on fresh high numbers
+    // while messages.ref_num stays frozen at index time — so a ref-number join
+    // silently misses every renumbered row (~37% of a long session's block-detail
+    // leaves read as "gone"). msg_id never moves under a restamp, so it is the
+    // correct join key; the ref below stays display-only.
+    const hydratedByMsgId = new Map<string, { role: string; content: string }>();
     try {
-        const pending: number[] = [];
+        const pending: string[] = [];
         for (const b of session.state.blocks) {
             for (const raw of b.directMessageIds || []) {
                 if (!messageById.has(raw)) {
                     const r = byRaw[raw];
                     const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
-                    if (num) pending.push(Number(num[1]));
+                    if (num) pending.push(raw);
                 }
             }
         }
         if (pending.length > 0) {
-            const rows = getStore().unifiedMessageContentByRefs(session.id, pending);
+            const rows = getStore().unifiedMessageContentByIds(session.id, pending);
             for (const row of rows ?? []) {
                 const text = storedMessageText(row.content);
-                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+                if (text !== null) hydratedByMsgId.set(row.msgId, { role: row.role, content: text });
             }
         }
     } catch {
         // sidecar unavailable/degraded: fall through to legacy missing leaves
     }
-    const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
+    // Frozen-snapshot hydration for THIS detail build, memoized per block —
+    // a block's rows all come from one call, so at most one snapshot parse
+    // per block, and only when a row actually misses window + store.
+    const snapIndexMemo = new Map<string, Map<string, BlockSnapItem> | null>();
+    const snapshotRefIndex = (block: CompressionBlock): Map<string, BlockSnapItem> | null => {
+        let idx = snapIndexMemo.get(block.blockId);
+        if (idx === undefined) {
+            idx = snapshotRefIndexFor(session, block);
+            snapIndexMemo.set(block.blockId, idx);
+        }
+        return idx;
+    };
+    const messageLeaves = (rawIds: string[], block?: CompressionBlock): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
         for (const raw of rawIds) {
             const ref = byRaw[raw];
@@ -1470,11 +1489,28 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             // #3917: a folded message whose bytes are gone from the resident
             // window still gets a row — the ref is the identity the user asked
             // for. #4738: bytes gone from the window but stored are hydrated,
-            // never missed; nothing invented either way.
+            // never missed; nothing invented either way. #6029: the lookup keys
+            // off the stable msg_id (raw), not the possibly-restamped ref number.
             if (!msg) {
                 const num = /^m(\d+)$/.exec(ref);
-                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
-                out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
+                const stored = num ? hydratedByMsgId.get(raw) : undefined;
+                if (stored) {
+                    out.push({ ref, role: stored.role, preview: messagePreview(stored.content) });
+                    continue;
+                }
+                // Window and store are both empty, but the bytes may live on in
+                // the block's frozen content snapshot — leaf blocks re-align by
+                // position (marker-validated); every other case stays an
+                // honest miss.
+                const item = block ? (snapshotRefIndex(block)?.get(ref) ?? undefined) : undefined;
+                out.push(item
+                    ? {
+                          ref,
+                          role: item.role,
+                          ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                          preview: messagePreview(item.text),
+                      }
+                    : { ref, missing: true });
                 continue;
             }
             out.push({
@@ -1568,7 +1604,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 effectiveMessageCount: (b.effectiveMessageIds || []).length,
                 directMessageCount: (b.directMessageIds || []).length,
                 directMessageRefs: refsOf(b.directMessageIds || []),
-                directMessages: messageLeaves(b.directMessageIds || []),
+                directMessages: messageLeaves(b.directMessageIds || [], b),
                 summaryTokens: defaultCountTokens(b.summary),
                 summaryBytes: utf8Bytes(b.summary),
             };
@@ -1599,6 +1635,158 @@ function messagePreview(text: string): string {
     const flat = text.replace(/\s+/g, " ").trim();
     const chars = Array.from(flat);
     return chars.length > MESSAGE_PREVIEW_CHARS ? chars.slice(0, MESSAGE_PREVIEW_CHARS).join("") + "…" : flat;
+}
+
+/** A frozen full-view snapshot (collectBlockContent) renders each original
+ *  message as a `[role]` (or `[role • toolName]`) header line followed by its
+ *  text; a pi-host user message additionally opens its body with an ACP ref
+ *  marker, which pins one exact ref→position alignment. */
+const BLOCK_ROLE_LINE_RE = /^\[([a-zA-Z]+)(?: • ([^\]]+))?\]$/;
+const ACP_REF_MARK_RE = /^<acp [^>]*>(m\d+)<\/acp>$/;
+
+type BlockSnapItem = { role: string; toolName?: string; text: string; ref?: string };
+
+/** Re-parse a frozen full-view snapshot into its ordered message fragments.
+ *  A body line that merely LOOKS like a role header splits the message — the
+ *  count/marker validation in snapshotRefIndexFor is what keeps a bad parse from
+ *  ever being served. The \n\n delimiter between messages leaves one empty
+ *  line at the tail of every body — stripped, since it is the separator, not
+ *  message text. */
+function parseBlockContentMessages(text: string): BlockSnapItem[] {
+    const items: BlockSnapItem[] = [];
+    let cur: BlockSnapItem | null = null;
+    const close = () => {
+        if (!cur) return;
+        cur.text = cur.text.replace(/\n+$/, "");
+        items.push(cur);
+        cur = null;
+    };
+    for (const line of text.split("\n")) {
+        const roleM = BLOCK_ROLE_LINE_RE.exec(line);
+        if (roleM) {
+            close();
+            cur = {
+                role: roleM[1],
+                ...(roleM[2] !== undefined ? { toolName: roleM[2] } : {}),
+                text: "",
+            };
+            continue;
+        }
+        if (!cur) continue; // one-view summary preamble — never hydrated
+        const markM = ACP_REF_MARK_RE.exec(line);
+        if (markM && cur.ref === undefined && cur.text === "") {
+            cur.ref = markM[1];
+            continue;
+        }
+        cur.text = cur.text === "" ? line : cur.text + "\n" + line;
+    }
+    close();
+    return items;
+}
+
+/** ref → snapshot fragment for ONE block, or null when no alignment can be
+ *  proven. The frozen full view is an ordered subsequence of the block's
+ *  direct messages (host native compaction may have pruned some of them
+ *  before the snapshot was taken), so alignment is anchored on the ACP ref
+ *  markers the pi host stamps into user-message bodies. Each marker must be
+ *  anchored by at least one of two independent proofs — otherwise the whole
+ *  block is rejected:
+ *
+ *  · IDENTITY: the marker names the CURRENT ref sitting at the marker's own
+ *    snapshot position (marker number never restamped since creation);
+ *  · ARITHMETIC: the marker's FROZEN number falls inside the block's frozen
+ *    span and `frozenNumber − frozenSpanStart === snapshot position` (the
+ *    span and the markers were written together, so this is immune to the
+ *    cold-load ref RESTAMP — #5196 parked bands take fresh numbers, which
+ *    invalidates the identity proof for exactly the blocks that were
+ *    renumbered). A marker proving neither (foreign content, or a span that
+ *    does not start where the block's messages do) aborts the block.
+ *
+ *  With no markers at all the block degrades to the strict whole-block zip
+ *  (leaf span, exact counts), which is the only unanchored case that can be
+ *  proven; a pinless NON-leaf block can never be aligned (its frozen view
+ *  spans the effective messages, a superset of the direct list).
+ *
+ *  A marker proving neither anchor is rejected for the whole block; between
+ *  anchors, a segment zips positionally ONLY when its fragment count equals
+ *  its ref count — unbalanced segments stay missing. Never serve shifted
+ *  bytes under a ref. */
+function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<string, BlockSnapItem> | null {
+    const direct = block.directMessageIds || [];
+    const effective = block.effectiveMessageIds || [];
+    if (direct.length === 0) return null;
+    let content: BlockContent | undefined;
+    try {
+        content = session.blockContents.get(block.blockId);
+    } catch {
+        return null;
+    }
+    const full = content ? content.full : undefined;
+    if (!full || full.text.length === 0) return null;
+    const byRaw = session.state.messageRefs.byRaw;
+    const refs: string[] = [];
+    for (const raw of direct) {
+        const r = byRaw[raw];
+        if (typeof r !== "string" || r.length === 0) return null; // unaligned ledger — abort
+        refs.push(r);
+    }
+    const refPos = new Map<string, number>();
+    refs.forEach((r, i) => refPos.set(r, i));
+    const items = parseBlockContentMessages(full.text);
+    if (items.length === 0) return null;
+    const startN = refNumber(block.startRef);
+    const endN = refNumber(block.endRef);
+    const pins: Array<[number, number]> = []; // [snapshot position, ledger position]
+    for (let i = 0; i < items.length; i++) {
+        const mark = items[i].ref;
+        if (mark === undefined) continue;
+        if (refs[i] === mark) {
+            pins.push([i, i]); // identity — marker number never restamped
+            continue;
+        }
+        // arithmetic — frozen numbering vs the frozen span. Restamp-immune:
+        // the span and the markers were written together, so the offset still
+        // holds even after cold-load restamping renumbers the block's refs.
+        // Takes precedence over a coincidental current-ref match (a restamped
+        // number may equal some OTHER message's new ref).
+        const n = refNumber(mark);
+        if (n !== null && startN !== null && endN !== null && n >= startN && n <= endN && n - startN === i) {
+            pins.push([i, i]);
+            continue;
+        }
+        const p = refPos.get(mark);
+        if (p === undefined) return null; // foreign message in the frozen context — abort
+        pins.push([i, p]); // marker still names a current ref inside the block
+    }
+    if (pins.length === 0 && direct.length !== effective.length) return null; // pinless non-leaf — unprovable
+    for (let k = 1; k < pins.length; k++) {
+        if (pins[k][0] <= pins[k - 1][0] || pins[k][1] <= pins[k - 1][1]) return null; // order disagreement — abort
+    }
+    const map = new Map<string, BlockSnapItem>();
+    const bounds: Array<[number, number]> = [[-1, -1], ...pins, [items.length, refs.length]];
+    for (let s = 0; s < bounds.length - 1; s++) {
+        const [i0, p0] = bounds[s];
+        const [i1, p1] = bounds[s + 1];
+        if (i1 - i0 !== p1 - p0) continue; // segment not balanced — unprovable, stays missing
+        for (let i = i0 + 1; i < i1; i++) {
+            const p = p0 + (i - i0);
+            if (p >= 0 && p < refs.length) map.set(refs[p], items[i]);
+        }
+    }
+    for (const [i, p] of pins) map.set(refs[p], items[i]);
+    return map;
+}
+
+/** mNNNNN → N, or null when not a well-formed message ref. */
+function refNumber(ref: string | undefined): number | null {
+    if (typeof ref !== "string" || ref.length < 2 || ref[0] !== "m") return null;
+    let n = 0;
+    for (let i = 1; i < ref.length; i++) {
+        const c = ref.charCodeAt(i);
+        if (c < 48 || c > 57) return null;
+        n = n * 10 + (c - 48);
+    }
+    return n;
 }
 
 function utf8Bytes(s: string): number {
@@ -1735,7 +1923,10 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
         const num = /^m(\d+)$/.exec(ref);
         if (typeof raw === "string" && num) {
             try {
-                const rows = getStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                // #6029: query by the stable msg_id — the live ref may have been
+                // restamped onto a fresh high number while messages.ref_num stays
+                // frozen at index time, so a ref-number join misses the row.
+                const rows = getStore().unifiedMessageContentByIds(id, [raw]);
                 const row = rows && rows.length > 0 ? rows[0] : undefined;
                 const stored = row ? storedMessageText(row.content) : null;
                 if (row && stored !== null) {
@@ -1753,6 +1944,31 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
                 }
             } catch {
                 // sidecar degraded mid-request: report the miss, never 500
+            }
+        }
+        // Last resort: the bytes only survive in the frozen block-content
+        // snapshot (marker-anchored alignment). The ledger still owns
+        // identity — the ref we were asked for must be the one the block's
+        // alignment produced for this raw id; a shifted parse yields null,
+        // never wrong bytes.
+        if (typeof raw === "string") {
+            for (const b of session.state.blocks) {
+                const direct = b.directMessageIds || [];
+                if (direct.indexOf(raw) === -1) continue;
+                const item = snapshotRefIndexFor(session, b)?.get(ref);
+                if (!item) continue;
+                const totalBytes = utf8Bytes(item.text);
+                const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                return {
+                    ok: true,
+                    ref,
+                    role: item.role,
+                    ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                    bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                    totalBytes,
+                    truncated,
+                    text: truncated ? sliceUtf8(item.text, BLOCK_CONTENT_MAX_BYTES) : item.text,
+                };
             }
         }
         return { ok: false, reason: "unknown-message" };

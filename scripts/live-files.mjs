@@ -128,6 +128,12 @@ export const LIVE_FILES = [
     // fake origins only, so no zone band is needed — the entry is for the
     // tripwire alone, like #3890/#5114/#5666
     "tests/issue5955-wedged-same-lane-takeover.test.ts",
+    // #5940: the wiring facet spawnSyncs one bare node child (--import tsx) that
+    // drives the real background quick_check worker on a per-run mkdtemp fixture
+    // DB; the spawn is synchronous (blocks the shard runner while it runs), the
+    // child binds no port and does no network I/O, so no zone band is needed —
+    // the entry is for the tripwire alone, like #3890/#5114
+    "tests/integrity-worker-stderr.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

@@ -1116,7 +1116,7 @@ function fallbackOversizeRefusal(
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_fallback", message, retryable: true } }), { status: 422, headers });
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+export async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
         timer = setTimeout(() => resolve(undefined), ms);
@@ -1906,7 +1906,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5403/#5418: the watermark handshake (x-bili-pf-count / -tail-ids)
             // is emitted ONCE here for every routed model request — lanes differ
             // only in where their ids are captured (pfChannel.pfCaptureIds).
-            const pfExtra = pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {});
+            // pfRequestHeaders must see the MERGED view: the conversation header
+            // may come from headersFor (dsh lane) rather than the client request (#5813).
+            const pfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const pfExtra = pfChannel.pfRequestHeaders({ ...pfOutgoing, ...(routedExtra ?? {}) });
             const allExtra = { ...(routedExtra ?? {}), ...pfExtra };
             captureStampedWindow(allExtra); // #5996: remember this lane's resolved window
             let target = url;
@@ -2139,7 +2142,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5418: hosts that dial the proxy directly (dsh profile bundles,
             // #809 attach probes) land here already addressed — stamp + learn
             // here or their watermark channel silently never seeds.
-            const selfStamp = withHeaders(input, hoplessForLoopback(url, init), pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}));
+            // Same merge discipline as the routed branch (#5813): headersFor may
+            // be the sole source of the conversation header.
+            const selfRouted = state.headersFor?.(url);
+            const selfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const selfPfExtra = pfChannel.pfRequestHeaders({ ...selfOutgoing, ...(selfRouted ?? {}) });
+            const selfStamp = withHeaders(input, hoplessForLoopback(url, init), { ...(selfRouted ?? {}), ...selfPfExtra });
             const resp = await send(selfStamp.input, selfStamp.init);
             pfChannel.pfLearnStamp(outgoingHeadersOf(selfStamp.input, selfStamp.init) ?? {}, resp.status, resp.headers);
             noteDispatchMode("proxy");
@@ -2158,8 +2166,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         state.onDispatch?.(rewritten, "rewrite");
         // #5403/#5418: same single chokepoint as the routed branch — the
         // rewrite path is where attach-mode hosts (and the V1 fetch patch)
-        // ride the proxy without a settings overlay.
-        const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
+        // ride the proxy without a settings overlay. Same merged-view fix (#5813).
+        const rwRouted = state.headersFor?.(url) ?? {};
+        const rwOutgoing = outgoingHeadersOf(input, init) ?? {};
+        const branchExtra = { ...rwRouted, ...pfChannel.pfRequestHeaders({ ...rwOutgoing, ...rwRouted }), ...(resignExtra ?? {}) };
         captureStampedWindow(branchExtra); // #5996: remember this lane's resolved window
         try {
             const stamped = withHeaders(first, hoplessForLoopback(rewritten, init), branchExtra);

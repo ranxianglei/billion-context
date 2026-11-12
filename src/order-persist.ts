@@ -6,6 +6,7 @@ import path from "node:path";
 import { applyOrderSnapshot, orderSnapshot, type OrderSkeletonEntry } from "./session-resolve.js";
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
+import { persistDebounceMs, persistMaxDelayMs } from "./knobs.js";
 import { kvStore } from "./persist.js";
 
 /**
@@ -23,10 +24,10 @@ import { kvStore } from "./persist.js";
  */
 
 // Same quiesce/max-delay discipline as #1834's affinity persistence: a busy
-// proxy must not starve the write indefinitely, and disk stays within ~500ms
-// of the last mutation (or 5s under sustained traffic).
-const PERSIST_DEBOUNCE_MS = 500;
-const PERSIST_MAX_DELAY_MS = 5_000;
+// proxy must not starve the write indefinitely. Both windows resolve through
+// the shared persist.* knobs (#6058 QLC field report: under sustained traffic
+// the 5s max-delay cap set the steady-state rewrite rate, so tuning only the
+// debounce window changed nothing); defaults keep the historical 500ms / 5s.
 const MAX_ORDER_ENTRIES = 1024;
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -160,9 +161,12 @@ function writeSnapshotLegacy(): void {
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
  *  union), merge ours in fresher-wins, re-apply bounds, write back. Writes are
  *  chained so back-to-back schedules never lose updates against each other. */
-function persistUnifiedNow(): void {
+function persistUnifiedNow(): Promise<void> {
+    // This batch now owns its queued write; later mutations need a fresh
+    // debounce window even while the store is still settling this one.
+    pendingSince = null;
     const store = kvStore();
-    if (!store) return;
+    if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
         let live: OrderSkeletonEntry[] | null = null;
         try {
@@ -181,6 +185,7 @@ function persistUnifiedNow(): void {
         // matching what the warning promises; a healthy store stays primary.
         kvReady = false;
     });
+    return kvChain;
 }
 
 /** Once per process (wired at cli start): layer the kv snapshot over what the
@@ -239,7 +244,7 @@ export function scheduleOrderPersist(): void {
     const now = Date.now();
     if (pendingSince === null) pendingSince = now;
     if (timer) clearTimeout(timer);
-    const budget = PERSIST_MAX_DELAY_MS - (now - pendingSince);
+    const budget = persistMaxDelayMs() - (now - pendingSince);
     timer = setTimeout(
         () => {
             timer = null;
@@ -252,7 +257,7 @@ export function scheduleOrderPersist(): void {
                 writeSnapshotLegacy();
             }
         },
-        Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, budget)),
+        Math.max(0, Math.min(persistDebounceMs(), budget)),
     );
     timer.unref?.();
 }

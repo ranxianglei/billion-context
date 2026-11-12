@@ -3,6 +3,7 @@ import path from "node:path";
 import { prefixAffinity, type AffinitySnapshotEntry, MAX_TRACKED_SESSIONS } from "./prefix-affinity.js";
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
+import { persistDebounceMs, persistMaxDelayMs } from "./knobs.js";
 import { kvStore } from "./persist.js";
 
 /**
@@ -19,9 +20,10 @@ import { kvStore } from "./persist.js";
  *  lost EVERYTHING since the last flush, not just 5s worth), and the
  *  max-delay budget caps how long a pending write can be starved: the file
  *  is on disk within ~500ms of the last mutation, or within 5s under
- *  sustained traffic — previously a flat 5s trailing window. */
-const PERSIST_DEBOUNCE_MS = 500;
-const PERSIST_MAX_DELAY_MS = 5_000;
+ *  sustained traffic — previously a flat 5s trailing window. Both windows
+ *  resolve through the shared persist.* knobs (#6058: under sustained
+ *  traffic the max-delay cap, not the debounce, sets the steady-state
+ *  rewrite rate); defaults keep the historical 500ms / 5s. */
 
 // #5753: chains ride the UNIFIED storage (kv_store namespace
 // "prefix-affinity", single row "v1" holding the snapshot) under the #5548
@@ -161,9 +163,12 @@ function writeSnapshotLegacy(): void {
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
  *  union), merge ours in per the #1724 rule, re-apply the cap, write back.
  *  Writes are chained so back-to-back schedules never lose updates. */
-function persistUnifiedNow(): void {
+function persistUnifiedNow(): Promise<void> {
+    // This batch now owns its queued write; later mutations need a fresh
+    // debounce window even while the store is still settling this one.
+    pendingSince = null;
     const store = kvStore();
-    if (!store) return;
+    if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
         let live: AffinitySnapshotEntry[] | null = null;
         try {
@@ -184,6 +189,7 @@ function persistUnifiedNow(): void {
         // (subsequent timer/flush writes there), matching the warning.
         kvReady = false;
     });
+    return kvChain;
 }
 
 /** Presence check independent of content (an empty-but-present row still
@@ -251,7 +257,7 @@ export function scheduleAffinityPersist(): void {
     const now = Date.now();
     if (pendingSince === null) pendingSince = now;
     if (timer) clearTimeout(timer);
-    const budget = PERSIST_MAX_DELAY_MS - (now - pendingSince);
+    const budget = persistMaxDelayMs() - (now - pendingSince);
     timer = setTimeout(
         () => {
             timer = null;
@@ -263,7 +269,7 @@ export function scheduleAffinityPersist(): void {
                 writeSnapshotLegacy();
             }
         },
-        Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, budget)),
+        Math.max(0, Math.min(persistDebounceMs(), budget)),
     );
     timer.unref?.();
 }

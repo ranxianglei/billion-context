@@ -104,21 +104,12 @@ export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.
 export async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string, name: string): Promise<void> {
     const { mkdirSync, createWriteStream } = await import("node:fs");
     const { join } = await import("node:path");
+    const { pipeline } = await import("node:stream/promises");
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
-        ws.on("error", (e) => { logDumpFailure("SSE stream dump", e); });
-        const reader = stream.getReader();
-        try {
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                ws.write(Buffer.from(value));
-            }
-        } finally {
-            reader.releaseLock();
-            ws.end(() => gcDumpDirIfConfigured(dir));
-        }
+        await pipeline(stream, ws);
+        gcDumpDirIfConfigured(dir);
     } catch (err) {
         logDumpFailure("SSE stream dump", err);
     }
