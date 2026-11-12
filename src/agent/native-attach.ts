@@ -1,14 +1,22 @@
 // Shared attach/recovery lifecycle for the native host lanes (#5241 phase 1).
 //
 // Transplanted verbatim from pi-native.ts (PR-1a): pi/omp/opencode carried
-// near-identical copies of this function — dsh carries a thicker variant — so
-// every fix had to be applied four times and the same bug class kept
-// reappearing on lane after lane (port pinning #926→#4566→#5127, cold-start
-// tools #4134→#4998→#5001→#4641; see umbrella #5241). One lane migrates per
-// PR; each lane's answers are frozen by the phase-0 stakes
+// near-identical copies of this function, so every fix had to be applied
+// three times and the same bug class kept reappearing on lane after lane
+// (port pinning #926→#4566→#5127, cold-start tools #4134→#4998→#5001→#4641;
+// see umbrella #5241). One lane migrates per PR; each lane's answers are
+// frozen by the phase-0 stakes
 // (tests/contract-v2-stake-verify-attach.test.ts) — a change here that changes
 // any lane's observable behavior must update those stakes in the same PR, by
 // design.
+//
+// PR-1d deliberately did NOT migrate dsh onto this implementation: dsh's
+// verify is a thicker state machine (stale-resident rotation #3544,
+// world-generation flight guards #3616, register-based publishing) whose
+// per-branch check points do not transpose onto branch hooks — see the
+// verifyAttachAndRecover doc comment in dsh-native.ts. dsh shares the
+// armNativeLane guard, the #1365 precedence chain and the probe/wait
+// primitives; its flow stays lane-local by decision, not by neglect.
 
 import { nativeAttachOrigin, singleFlight } from "./native-bootstrap.js";
 import { observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
