@@ -469,15 +469,26 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 14, "fourteen raw markers for the twelve known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 17, "seventeen raw markers for the twelve known dsh carrier families");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).
         const MARKER_CONTEXT: Record<string, string> = {
             " sent a message: ": "Agent session-1",
+            "Updated instructions from:": "\x3csystem-reminder\x3e ",
+            "Additional instructions from:": "\x3csystem-reminder\x3e ",
+            "Instructions removed:": "\x3csystem-reminder\x3e ",
+        };
+        // The workspace-instructions classifiers are anchored AND require a
+        // non-empty path after the colon, so those markers also need a sample
+        // path appended (their real rows always carry one).
+        const MARKER_SUFFIX: Record<string, string> = {
+            "Updated instructions from:": "/x/AGENTS.md",
+            "Additional instructions from:": "/x/AGENTS.md",
+            "Instructions removed:": "/x/AGENTS.md",
         };
         for (const marker of dshCarrierRawMarkers) {
-            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}` } as CoreMessage;
+            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}${MARKER_SUFFIX[marker] ?? ""}` } as CoreMessage;
             assert.notEqual(cls(msg), undefined, `marker ${JSON.stringify(marker)} no longer matches any dsh classifier`);
         }
     });

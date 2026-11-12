@@ -135,7 +135,38 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshWorkspaceInstructionsPath(msg("text", INSTR_MSG)), "durable/agents-md", "the merged global+project baseline projects");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", "plain prose about workspace setup")), undefined);
-    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), undefined, "lowercase reconciliation variants stay consumable history");
+    // Revisions are the SAME durable carrier, not consumable history: the
+    // baseline is re-emitted only when baselineIdentity changes (projectRoot +
+    // discovery/budget config, NOT file contents), so a mid-session edit rides
+    // this message ALONE. Identity is per path so a revision cannot demote the
+    // (multi-file) baseline under the default latest-per-identity policy.
+    assert.equal(dshWorkspaceInstructionsPath(msg("text", CHANGE_MSG)), "durable/agents-md-update/AGENTS.md", "an Updated revision projects to its own per-path identity");
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nAdditional instructions from: neighbor-help-frontend/AGENTS.md\n\nThese instructions apply to work under \x60neighbor-help-frontend\x60.\n\nmost-specific rules first\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/neighbor-help-frontend/AGENTS.md",
+        "an Additional revision (a file the baseline never carried) projects too",
+    );
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nInstructions removed: AGENTS.md\n\nThe previously loaded instructions from this file no longer apply.\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/AGENTS.md",
+        "a removal notice projects (folding it would keep applying deleted rules)",
+    );
+    // The baseline's BODY may quote the uppercase label (documenting this very
+    // matcher is a realistic AGENTS.md line). Guards against a silent no-op:
+    // if the injection ever stops landing, the assertion below would pass
+    // vacuously on an unmodified fixture.
+    const baselineQuotingLabel = INSTR_MSG.replace("## \u89c4\u5219", "## \u89c4\u5219\n(see bili's `Instructions from:` matcher)");
+    assert.notEqual(baselineQuotingLabel, INSTR_MSG, "fixture injection must actually land");
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", baselineQuotingLabel)),
+        "durable/agents-md",
+        "a baseline whose BODY quotes the uppercase label is still a baseline",
+    );
+    assert.equal(
+        dshWorkspaceInstructionsPath(msg("text", `\x3csystem-reminder\x3e\nUpdated instructions from: AGENTS.md\n\nThe old copy said \x60Instructions from: AGENTS.md\x60.\n\x3c/system-reminder\x3e`)),
+        "durable/agents-md-update/AGENTS.md",
+        "the revision shape wins even when its body quotes the uppercase baseline label",
+    );
     assert.equal(dshWorkspaceInstructionsPath(msg("tool-call", "Instructions from: AGENTS.md")), undefined, "non-text content types never match");
     assert.equal(dshWorkspaceInstructionsPath(msg("text", undefined)), undefined, "missing text is safe");
     const dshClassifier = durableMessageToolPaths["dsh"];
@@ -148,7 +179,7 @@ test("dshWorkspaceInstructionsPath: projects the baseline label to durable/agent
  *  instructions baseline (it sits mid-history between two tagged fillers),
  *  execute a real compress through /__bili/plugin/tool, and return the next
  *  turn's upstream body. */
-async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
+async function runFoldScenario(agent: string, conv: string, revision?: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -165,6 +196,13 @@ async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldB
         msgs.push({ role: "user", content: INSTR_MSG });
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A2") });
+        // …optionally a mid-session REVISION of the same carrier (same shape as
+        // dsh's changedSectionText when the file is edited after load)…
+        if (revision !== undefined) {
+            msgs.push({ role: "user", content: revision });
+            await (await post(msgs)).text();
+            msgs.push({ role: "assistant", content: filler("A2b") });
+        }
         // …and turns 3–8 grow past it.
         for (let i = 3; i <= 8; i++) {
             msgs.push({ role: "user", content: filler(`F${i}`) });
@@ -214,6 +252,21 @@ test("dsh lane (#2447): the workspace-instructions baseline survives a fold that
     // F1 would survive any fold and cannot witness consumption.
     assert.ok(!postFoldBody.includes("A1-"), "folded filler before the baseline must be gone (the fold really consumed its range)");
     assert.ok(!postFoldBody.includes("F5-"), "folded filler after the baseline must be gone");
+});
+
+test("dsh lane: a mid-session REVISION of the instructions survives a fold that covers it", async () => {
+    // The baseline above proves the FIRST copy of the rules is pinned. This one
+    // pins the SECOND half of the contract: dsh never re-emits a baseline when
+    // file CONTENTS change (baselineIdentity excludes content), so this
+    // `Updated instructions from:` message is the only carrier of the new
+    // rules. Before the revision identity landed, the fold dropped it and left
+    // the model with the superseded baseline alone.
+    const { postFoldBody } = await runFoldScenario("dsh", "i2447-dsh-revision", CHANGE_MSG);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("always run lint AND typecheck before committing"), "the revised rule text must survive the fold (it exists nowhere else)");
+    assert.ok(postFoldBody.includes(RULE_MARKER), "the baseline survives alongside it (separate per-path identity)");
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the carrier must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the carrier must be gone");
 });
 
 test("unregistered lane: without the guard the baseline folds away (pins lane scoping)", async () => {
