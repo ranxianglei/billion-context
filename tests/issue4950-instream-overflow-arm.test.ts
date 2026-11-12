@@ -647,6 +647,7 @@ test("#4950 e2e model-switch: generic errors and incomplete streams never poison
     assert.equal(r1.status, 200, `body: ${b1.slice(0, 600)}`);
     assert.ok(b1.includes("Rate limit reached"), "the generic error reaches the client verbatim");
     assert.notEqual(s!.stats.lastInputTokensSource, "overflow-arm", "a generic error must not arm the shrink (#570)");
+    assert.equal(s!.stats.lastInputTokensSource, "estimate", "and the seeded stuck baseline survives (not armed, not reset)");
 
     // The conversation keeps working afterwards — nothing was poisoned.
     const r2 = await postC([{ role: "user", content: "still alive?" }]);
