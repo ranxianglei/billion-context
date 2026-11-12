@@ -117,16 +117,22 @@ export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
  *  short-lived openers (export fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
     return [
+        // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
+        // back to the filesystem by `PRAGMA incremental_vacuum`
+        // (gc({vacuum:"incremental"})) without the offline full rewrite.
+        // MUST stay FIRST: SQLite only honours auto_vacuum while the database
+        // file is still empty, and switching to WAL already writes page 1 —
+        // set after journal_mode, a brand-new index.db silently stays at
+        // auto_vacuum=0 and incremental_vacuum reclaims nothing. On an
+        // existing file the pragma only arms the mode for this connection's
+        // next full VACUUM: a database created with auto_vacuum=0 keeps that
+        // layout until a one-time gc({vacuum:"full"}) / ?vacuum=full.
+        "PRAGMA auto_vacuum = INCREMENTAL",
         "PRAGMA journal_mode = WAL",
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
         `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
-        // #3901/#3463: freed pages return to the pool incrementally so an
-        // archive/GC sweep actually shrinks the file going forward. Databases
-        // created before this pragma keep their original layout until a
-        // one-time full VACUUM (gc({vacuum:"full"}) / ?vacuum=full).
-        "PRAGMA auto_vacuum = INCREMENTAL",
     ];
 }
 
