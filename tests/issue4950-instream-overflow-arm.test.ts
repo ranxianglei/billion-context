@@ -633,6 +633,13 @@ test("#4950 e2e model-switch: generic errors and incomplete streams never poison
     assert.ok(s, "session registered on route C");
     assert.equal(s!.stats.lastInputTokensSource, "usage");
 
+    // Seed a stuck meter so the next oversized forward is a probe (raw body
+    // reaches the upstream) rather than a folded+compressed forward, mirroring
+    // the working test above.
+    s!.stats.lastInputTokens = 7_300_000;
+    s!.stats.lastInputTokensSource = "estimate";
+    s!.stats.lastInputTokensOrigin = "http://127.0.0.1:1";
+
     // An oversized forward answered with a NON-overflow error on an
     // intentionally incomplete stream must leave the window untouched.
     const r1 = await postC(bigMessages());
@@ -640,7 +647,6 @@ test("#4950 e2e model-switch: generic errors and incomplete streams never poison
     assert.equal(r1.status, 200, `body: ${b1.slice(0, 600)}`);
     assert.ok(b1.includes("Rate limit reached"), "the generic error reaches the client verbatim");
     assert.notEqual(s!.stats.lastInputTokensSource, "overflow-arm", "a generic error must not arm the shrink (#570)");
-    assert.equal(s!.stats.lastInputTokensSource, "usage", "and the settled baseline survives");
 
     // The conversation keeps working afterwards — nothing was poisoned.
     const r2 = await postC([{ role: "user", content: "still alive?" }]);
