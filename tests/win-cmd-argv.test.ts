@@ -13,6 +13,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
     planClientSpawn,
+    quoteWinToken,
     resolveClientCommand,
     resolveCodexOfficialJsEntry,
     resolveOnPath,
@@ -20,6 +21,7 @@ import {
     type SpawnChild,
     type SpawnFn,
 } from "../src/launcher.ts";
+import { splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 import { planDshSpawn } from "../src/dsh-channel.ts";
 import { winCmdUnsafeToken } from "../src/win-cmd.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -103,6 +105,28 @@ test("planClientSpawn win32: trailing backslashes in a quoted argument survive t
     // even one arrived halved. Doubling the run inside the quotes carries both through verbatim.
     const p = planClientSpawn("C:\\npm\\claude.cmd", ["-p", "list C:\\My Projects\\", "ends in \\\\"], WIN_ENV, "win32");
     assert.equal(p.args[3], '"C:\\npm\\claude.cmd -p "list C:\\My Projects\\\\" "ends in \\\\\\\\""');
+});
+
+// The comspec leg's acceptance property, pinned in CI: a whitespace-bearing
+// token quoted by quoteWinToken must parse back to itself under the receiving
+// program's CommandLineToArgvW rule (splitWindowsCommandLine models it). The
+// exact-line test above pins the bytes; this pins that those bytes decode back
+// to the token — the lossless round-trip the trailing-backslash doubling buys.
+test("comspec round-trip: quoteWinToken output parses back verbatim (MSVCRT 2n -> n)", () => {
+    const tokens = [
+        "plain spaced",          // no backslash
+        "C:\\My Docs\\a.txt",    // interior backslashes only
+        "odd trailing \\",       // 1 trailing (refused before this fix)
+        "even trailing \\\\",    // 2 trailing (arrived halved before this fix)
+        "three trailing \\\\\\", // 3 trailing
+    ];
+    for (const token of tokens) {
+        assert.deepEqual(
+            splitWindowsCommandLine(quoteWinToken(token)),
+            [token],
+            `round-trip lost: ${JSON.stringify(token)}`,
+        );
+    }
 });
 
 test("planClientSpawn win32: '!' and other non-metacharacters stay allowed on the comspec path", () => {
