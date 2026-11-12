@@ -2076,13 +2076,14 @@ export class UnifiedStore {
             if (c) content[hash as string] = Buffer.from(c.bytes).toString("utf8");
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        // One JSONL line per archived session: append-only (cheap, crash =
-        // at worst one truncated line which the reader skips), restore
-        // rewrites the file without the restored session's lines.
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
+            // #6317: serialize the export inside the sweep transaction. A
+            // locked or failed sweep must leave NO archive line, or restore
+            // will later prefer that stale dump and lose newer messages.
+            appendFileSync(exportPath, archiveLine);
             const rel: string[] = [];
             for (const m of messages) rel.push(m.content_hash as string);
             for (const mm of mediaMaps) rel.push(mm.media_hash as string);
@@ -2125,10 +2126,13 @@ export class UnifiedStore {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
-        // Scan the JSONL for the session's line (skip malformed/truncated
+        // Scan the JSONL for the session's NEWEST line (#6317: a pre-fix
+        // failed archive can leave stale lines behind; a later successful
+        // archive appends the newest dump). Skip malformed/truncated
         // trailing lines — an archive append interrupted by a crash must not
-        // block restoring OTHER sessions).
+        // block restoring OTHER sessions.
         let lineNo = -1;
+        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
@@ -2140,7 +2144,7 @@ export class UnifiedStore {
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+                if (candidate.sessionId === sessionId) { matchCount += 1; lineNo = i; }
             }
         } catch {
             return { ok: false, reason: "export-corrupt" };
@@ -2152,6 +2156,9 @@ export class UnifiedStore {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        if (matchCount > 1) {
+            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
+        }
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
             for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
@@ -2191,9 +2198,10 @@ export class UnifiedStore {
                     sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
                 );
         });
-        // Drop the restored session's line(s) from the JSONL (a same-session
-        // archive can theoretically appear more than once across reinstalls;
-        // rewrite removes them all). Other sessions' lines are untouched.
+        // Drop the restored session's line(s) from the JSONL. #6317: a
+        // pre-fix failed archive can leave more than one line; restore now
+        // already used the newest match and removes all matches, warning when
+        // stale lines were present so the loss pattern is diagnosable.
         const kept: string[] = [];
         for (const l of rawLines) {
             if (!l.trim()) continue;
