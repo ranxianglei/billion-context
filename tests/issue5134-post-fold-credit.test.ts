@@ -98,12 +98,12 @@ test("T4 estimate-grade baselines are not promoted by pending credit", () => {
         "#1492: only usage-grade baselines size the meter — credit presence must not launder an estimate");
 });
 
-test("T5 #4383 cycle-stale outranks the credit exemption (unreported send rides its own measurement)", () => {
+test("T5 pending credit outranks cycle-staleness (2026-11-08 burst fix; unreported growth rides preflight until the next settle)", () => {
     const s = incidentSession();
     noteOutboundContextEstimates(s, { upperBound: 350_000, scaledText: 190_000, imageTokens: 0, calibrated: true });
     const r = effectiveTokenCount(s, towerHistory());
-    assert.deepEqual(r, { tokens: 350_000, source: "estimate" },
-        "a newer unreported main send postdates the settle — its calibrated estimate wins (#4383)");
+    assert.deepEqual(r, { tokens: 180_353, source: "usage" },
+        "the cycle-stale estimate is the resend's raw upper bound, not real growth — with credit pending from a just-applied fold, the netted usage anchor sizes the meter. Letting the stale estimate win re-pressures a session that JUST compressed (field incident: nudge read 112% = 238112/212992 while the real outbound was ~84K) and restarts the compress loop. #4383's unreported-growth protection is unchanged whenever no fold is pending (credit = 0), and while credit IS pending preflight still measures the actual outbound before every forward; the next settle re-baselines exactly as before.");
 });
 
 test("T6 a new post-fold usage report takes over once settled", () => {

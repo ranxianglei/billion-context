@@ -139,10 +139,21 @@ const CAP_SLACK = 4 * KiB;
  * ~±12 KiB between runner images). Same drift class as #4506: the
  * truncate-at-checkpoint invariant is intact (every reset lands exactly on
  * the cap), so the budget widens to 128 KiB rather than pinning the tail.
- * Still discriminating: if the configured cap failed to reach the pragma the
- * file would sit at its ~4.4 MiB high-water mark, far above the bound.
+ *
+ * #5539 (schema v11): the six FK-child indexes (messages.content_hash,
+ * blocks.one_hash/summary_hash, ccr_entries.content_hash,
+ * message_media.media_hash, checkpoints.state_hash) add index-maintenance
+ * frames to inserts on all five child tables, so each post-reset ingest
+ * appends more frames before the file grows past the cap — the tail grew
+ * from 54.3 KiB locally / 66.4 KiB on CI (pre-v11) to 130.8–146.9 KiB
+ * (1182472–1198952; identical 1198952 on ubuntu-24 shard 3, ~±16 KiB
+ * run-to-run packing jitter plus the usual ~±12 KiB image variance). Same
+ * drift class: every reset still lands exactly on the cap, so the budget
+ * widens to 256 KiB instead of pinning the tail. Still discriminating: if
+ * the configured cap failed to reach the pragma the file would sit at its
+ * ~4.4 MiB high-water mark, far above the bound.
  */
-const CUSTOM_CAP_SLACK = 128 * KiB;
+const CUSTOM_CAP_SLACK = 256 * KiB;
 
 test("#3250: close() converges the WAL so a clean exit leaves nothing to replay", () => {
     const dir = tmpdir("bili-3250-close-");

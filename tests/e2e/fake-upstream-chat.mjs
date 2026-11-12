@@ -41,6 +41,14 @@ function flatContent(c) {
     return String(c ?? "");
 }
 
+/** Ref of the message's own ACP render tag (the tag wraps the first line of
+ *  the rendered message). Null when the message carries no tag (untagged side
+ *  lanes, or the first-request stamp race #1243). */
+function acpRefOf(msg) {
+    const m = flatContent(msg?.content ?? "").match(/\x3cacp\s+[^>]*?\x3e(m\d+)\x3c\/acp\x3e/);
+    return m ? m[1] : null;
+}
+
 function acpRefs(body, role) {
     const raw = role === undefined
         ? JSON.stringify(body.messages ?? [])
@@ -216,11 +224,28 @@ function answerFor(convKey, firstUserText, body) {
     if (isTitleCall) return { content: "e2e-title", queueIdx: -1, title: true };
     const lastUserText = users.length > 0 ? flatContent(users[users.length - 1].content) : firstUserText;
     let sourceText = lastUserText;
+    let sourceRef = users.length > 0 ? acpRefOf(users[users.length - 1]) : null;
     if (parseDirectives(lastUserText).length === 0 && users.length > 1) {
         const firstText = flatContent(users[0].content);
-        if (firstText !== lastUserText && parseDirectives(firstText).length > 0) sourceText = firstText;
+        if (firstText !== lastUserText && parseDirectives(firstText).length > 0) {
+            sourceText = firstText;
+            sourceRef = acpRefOf(users[0]);
+        }
     }
-    const queueKey = `${convKey}|${sourceText.slice(0, 64)}`;
+    // Queue identity = conv + source message REF + tag-stripped body head.
+    // The ACP render tag around the body is VOLATILE by design: the post-fold
+    // ledger alignment (#5608-D — refs renumber onto store-row seats at the
+    // next successful fold) and the #5608-C time-attribute high-water gate both
+    // rewrite the tag bytes of messages that already went out the wire. Keying
+    // on the RAW text (old behavior) therefore split one scripted turn into
+    // two queues the instant a fold landed — the tag prefix inside the 64-char
+    // slice changed (time= dropped, ref reminted) and the directive queue
+    // replayed from scratch (#2791 "compress called twice" flake). The ref
+    // names the message OCCURRENCE (stable for the queue's lifetime; a remint
+    // voids the script anyway — the message's bytes are in a fold block), and
+    // stripAcps pins the body itself. Two distinct prompts stay distinct via
+    // their refs even when their bodies are byte-identical.
+    const queueKey = `${convKey}|${sourceRef ?? "noref"}|${stripAcps(sourceText).slice(0, 64)}`;
     if (!convs.has(queueKey)) {
         convs.set(queueKey, { directives: parseDirectives(sourceText), idx: 0 });
     }

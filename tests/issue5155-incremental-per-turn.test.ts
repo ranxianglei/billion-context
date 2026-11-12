@@ -173,6 +173,20 @@ async function integration(debounceMs: number): Promise<Integration> {
 const uMsg = (text: string): { role: string; content: { type: string; text: string }[] } => ({ role: "user", content: [{ type: "text", text }] });
 const aMsg = (text: string): { role: string; content: { type: string; text: string }[] } => ({ role: "assistant", content: [{ type: "text", text }] });
 
+// The old settle() trusted ONE fixed sleep (debounceMs + 60 — 80ms for these
+// fixtures). On loaded Windows shards the debounced disk flush outran that
+// budget once (#5522 run 41407086184, 'duplicate-content ... converge pointers'
+// saw 9 of 11 rows). Poll a bounded window instead: identical assertions, no
+// unbounded waits.
+async function waitUntil(cond: () => boolean, timeoutMs = 10_000): Promise<void> {
+    const end = Date.now() + timeoutMs;
+    for (;;) {
+        if (cond()) return;
+        if (Date.now() > end) throw new Error(`waitUntil timed out after ${timeoutMs}ms`);
+        await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    }
+}
+
 test("#5155 integration: multi-turn traffic through the splice path stays correct and pointers converge after the debounced settle", async () => {
     const h = await integration(20);
     try {
@@ -196,6 +210,10 @@ test("#5155 integration: multi-turn traffic through the splice path stays correc
         const tail = await h.turn({ sinceSeq: seq, messages: [aMsg("final answer"), uMsg("final question")] });
         assert.equal(tail.status, 200);
         await h.settle();
+        await waitUntil(() => {
+            const p = h.pointers();
+            return Array.isArray(p) && p.length === 11 && JSON.stringify([...p].sort((x, y) => x - y)) === "[0,1,2,3,4,5,6,7,8,9,10]";
+        });
         const ptrs = h.pointers();
         assert.ok(Array.isArray(ptrs), `pointers recorded after settle: ${JSON.stringify(ptrs)}`);
         assert.deepEqual(ptrs, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "windowed upkeep records the full row mapping");
@@ -229,6 +247,10 @@ test("#5155 integration: duplicate-content messages (clustered `<base>_<n>` rows
         await h.settle();
         await h.turn({ sinceSeq: seq, messages: [aMsg("dup answer"), uMsg("dup question")] });
         await h.settle();
+        await waitUntil(() => {
+            const p = h.pointers();
+            return Array.isArray(p) && p.length === 11;
+        });
         const ptrs = h.pointers();
         assert.ok(Array.isArray(ptrs), `pointers recorded despite clustered duplicates: ${JSON.stringify(ptrs)}`);
         assert.equal(ptrs.length, 11, "every duplicate occurrence matched its own settled row");
