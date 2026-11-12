@@ -135,6 +135,13 @@ export async function prepareResponses(
     // provider's retained chain carries the rest) — gates the developer
     // message re-injection and the previous_response_id strip below.
     let deltaServed = false;
+    // 2×2 Part B (review-round-2 Residual 1a): a chained round whose plane
+    // frontier is ALREADY at the top of the world — nothing new to send.
+    // The outbound is an EMPTY input with the chain id KEPT and no developer
+    // message: the provider's retained chain holds the whole world. Without
+    // this classification the no-op read as "no delta" → id stripped + dev
+    // injected + empty input = a BLIND response the host would chain from.
+    let noopServed = false;
     // 2×2 Part B: a persisted delta frontier existed BEFORE this round's
     // outbound selection (the provider's retained context equals exactly the
     // elements sent up to it) — see the strip site below for the contract.
@@ -143,7 +150,7 @@ export async function prepareResponses(
     // frontier to the relay (committed only after the upstream accepts).
     let deltaState: DeltaState | null | undefined;
     let selectionFired = false;
-    let pendingDelta: { frontierPos: number; servedAnchors: string[] } | null = null;
+    let pendingDelta: { state: { frontierPos: number; servedAnchors: string[] }; kind: "full" | "noop" | "partial" } | null = null;
     // #6181 B0: a chained turn that cannot be addressed against the plane
     // (non-cohort — its kernel view is a delta, not the world) skips BOTH
     // the plane write for this turn's flush and the plane egress — see the
@@ -558,6 +565,31 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // state) → reseed (full send, frontier reset).
         const chains = knobKeepResponseId() && typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
         deltaState = chains ? (session.responsesDelta ?? null) : undefined;
+        // #6181 review round 2, Residual 2: the first CHAINED round of a
+        // keepResponseId chain carries a previous_response_id but NO committed
+        // frontier — round 1 carried no id, so no selection fired and B4 had
+        // nothing to commit. A plain re-seed would resend the WHOLE world that
+        // the provider's chain already holds from this proxy's own round-1
+        // full view (2× the world's tokens, the conversation twice). Stage 0
+        // can PROVE the safe case: the current world is a strict extension of
+        // the world the plane last held (probe, nothing gone, new elements).
+        // The chain was built from the client's own resends of exactly that
+        // world, so initialize the frontier at the stored-world boundary and
+        // serve the new elements only. Every other shape (scatter / issue /
+        // resync / degraded stage 0 / no chain) falls through to the plain
+        // re-seed — worst case there is the one-time duplication the re-seed
+        // always had, never a loss. Gated on !responsesChainBroken: a rejected
+        // selection (B4) means the provider never ran that round, so the plane
+        // holds more than the provider's chain — the stored-world boundary is
+        // NOT safe and the round must re-seed the full view.
+        if (
+            deltaState === null && chains
+            && !session.responsesChainBroken
+            && s0.kernelInput !== undefined && s0.storedFrontierPos !== null
+        ) {
+            deltaState = { frontierPos: s0.storedFrontierPos, servedAnchors: [] };
+            log("info", `[${sessionId}] [snaplane] frontier seeded at the stored-world boundary (pos ${s0.storedFrontierPos}) — the provider chain from this proxy's own prior round holds the stored world; serving the new elements only instead of re-seeding (Residual 2)`);
+        }
         // True once THIS proxy has established a delta chain with the provider
         // (a persisted frontier exists). Only then may a non-delta round strip
         // the id: the provider's retained context equals exactly the elements
@@ -588,12 +620,26 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 deltaState,
                 onSelection: (sel, totalElements) => {
                     selectionFired = true;
-                    pendingDelta = sel.nextState;
+                    // kind (review round 2, Residual 2 companion): the relay
+                    // needs to know WHAT went out to maintain responsesChainBroken.
+                    // full = reseed/full-resend (the provider now provably holds
+                    // the whole world) · noop = nothing new requested (the chain
+                    // is intact) · partial = the held world extended by the new
+                    // suffix only.
+                    pendingDelta = {
+                        state: sel.nextState,
+                        kind: sel.reseed || sel.delta.length >= totalElements ? "full" : sel.delta.length === 0 ? "noop" : "partial",
+                    };
                     // deltaServed = a PARTIAL delta went out: new content only.
                     // A reseed (state lost / first round) and a full-resend
                     // (delta grew to the whole view — isFullResend) both send
                     // the FULL view, which must read as "no delta" for the id
                     // handling below.
+                    // noopServed = the frontier already covers the whole world
+                    // (Residual 1a: same-body retry of an M1/M2 turn) — empty
+                    // input goes out WITH the chain id kept and NO developer
+                    // message: pure chain continuation.
+                    noopServed = !sel.reseed && sel.delta.length === 0;
                     deltaServed = !sel.reseed && sel.delta.length > 0 && sel.delta.length < totalElements;
                 },
             } : {}),
@@ -609,7 +655,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             session.responsesDelta = null;
         }
         if (deltaServed) {
-            log("info", `[${sessionId}] [snaplane] outbound=delta frontier=${(pendingDelta as { frontierPos: number } | null)?.frontierPos} — input carries only the unsent suffix; the retained chain carries the rest (re-injected developer message / forged summaries skipped to avoid duplicating what the provider keeps)`);
+            log("info", `[${sessionId}] [snaplane] outbound=delta frontier=${(pendingDelta as { state: { frontierPos: number } } | null)?.state.frontierPos} — input carries only the unsent suffix; the retained chain carries the rest (re-injected developer message / forged summaries skipped to avoid duplicating what the provider keeps)`);
         }
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
@@ -653,8 +699,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             // 2×2 Part B: on a delta round the provider KEEPS the seed round's
-            // developer message — re-injecting would duplicate it.
-            if (!deltaServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            // developer message — re-injecting would duplicate it. On a no-op
+            // round (Residual 1a) there is NO new content at all — the provider
+            // chain holds everything, so injecting dev + sending an empty input
+            // would be a BLIND response.
+            if (!deltaServed && !noopServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
@@ -668,7 +717,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            if (!deltaServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            // Residual 1a: a no-op round sends an EMPTY input — injecting the
+            // developer message there would make the provider answer from the
+            // dev prompt alone (a blind response the host would chain from).
+            if (!deltaServed && !noopServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -862,7 +914,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // a reseed / full-resend / degraded-legacy round STRIPS it (the chain
     // breaks, the client re-chains from this round's fresh response id and the
     // frontier re-seeds — one-round convergence, acceptance #7).
-    if (!knobKeepResponseId() || (hadFrontier && !deltaServed)) {
+    if (!knobKeepResponseId() || (hadFrontier && !deltaServed && !noopServed)) {
         const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;

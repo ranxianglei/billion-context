@@ -707,6 +707,17 @@ export type Session = {
      *  state → next round reseeds (full send), one-round convergence. See
      *  src/snapshot/delta.ts. */
     responsesDelta?: { frontierPos: number; servedAnchors: string[] } | null;
+    /** #6181 review round 2, Residual 2 companion: the provider's chain may
+     *  NOT be assumed to hold the stored world. Set when a delta-selection
+     *  round was REFUSED upstream (the provider never ran it — its chain
+     *  holds at most the previously-accepted world while the plane already
+     *  holds more). While set, the first-chained-round frontier seed is
+     *  blocked and the round re-seeds the FULL view (at-least-once —
+     *  over-serving is safe, under-serving is the context loss). Cleared
+     *  when a full-view round is accepted (the provider provably holds the
+     *  whole world again). Transient within a turn? No — persisted with the
+     *  session, like responsesDelta. */
+    responsesChainBroken?: boolean;
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient

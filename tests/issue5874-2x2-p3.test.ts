@@ -51,6 +51,7 @@ import {
     stage0Decide,
 } from "../src/snapshot/plane.ts";
 import { snapL1Lookup, snapL1EnvelopeRead, snapL1Record } from "../src/storage/snap.ts";
+import { runStage0 } from "../src/snapshot/stage0.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5874-p3-"));
@@ -274,10 +275,12 @@ test("A1 #2 M1 vs M2: same turn, full-inbound vs incremental-inbound kernel inpu
     assert.deepEqual(m1.decision.newIdPos, [{ id: "m11", pos: 11 }]);
     const asm1 = assembleKernelInput({ decision: m1.decision, rows: rowCores, newCores: [newCore] });
 
-    // A FRESH store for the M2 leg (the same plane state, a different client
-    // behavior on the SAME turn): the client sends ONLY the new element,
-    // with the seqs carrier locating it after the plane frontier (10).
-    const store2 = storeWithRows(10, sid);
+    // A FRESH store (a different DB — the two legs are ALTERNATIVE client
+    // behaviors on the same turn; sharing the file would let leg M1's canon
+    // contaminate leg M2's stage-0 verdict) with the same plane state:
+    // rows m1..m10 only.
+    const store2 = openPlane(path.join(hermetic, `a-${sid}-m2-10`, "index.db"));
+    store2.ingestSession(planIngest(plainSession(sid, 10)));
     // Enroll the canon first (the M2 branch requires a stored canon): the
     // seed turn was the M1 full resend of 10.
     store2.snapStage0(sid, ten);
@@ -706,7 +709,10 @@ test("A1d M4: the codec-level pin — parsing the new element ALONE (M2 wire) yi
     const ten = Array.from({ length: 10 }, (_, i) => `m${i + 1}`);
     const m1 = store.snapStage0(sid, [...ten, "codec-11"], { seqs: ten.map((_, i) => i + 1).concat(11) });
     const asm1 = assembleKernelInput({ decision: m1.decision, rows: rows10, newCores: [full.msgs[10]!] });
-    const store2 = storeWithRows(10, sid);
+    // Isolated DB for the M2 leg (see A1: the legs are alternative client
+    // behaviors on the same turn and must not share stage-0 canon state).
+    const store2 = openPlane(path.join(hermetic, `a-${sid}-m2-10`, "index.db"));
+    store2.ingestSession(planIngest(plainSession(sid, 10)));
     store2.snapStage0(sid, ten);
     const m2 = store2.snapStage0(sid, ["codec-11"], { seqs: [11] });
     const rows10b = store2.snapStage0Cores(sid).rows.map((r) => ({ pos: r.pos, ids: r.ids, msg: JSON.parse(r.postJson) as BiliMessage }));
@@ -965,5 +971,133 @@ test("B4: the delta frontier commits only when the upstream ACCEPTS — a 400 tu
             assert.equal(fwd3.input.length, 4, "the 3 world elements plus the re-injected developer message (a reseed round sends the full self-contained view + dev; a delta would have sent 1 world element and no dev)");
         },
         { storeDir: path.join(hermetic, "b4-store"), env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1", ACP_KEEP_RESPONSE_ID: "1" } },
+    );
+});
+
+test("Residual 2 (unit): storedFrontierPos is set only for a strict extension — probe + nothing gone + new elements; every other shape is null", () => {
+    const dir = path.join(hermetic, "r2u");
+    fs.mkdirSync(dir, { recursive: true });
+    const plane = openPlane(path.join(dir, "index.db"));
+    const sid = "r2-sid";
+    const saved = process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY;
+    const savedUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = "1";
+    process.env.BILI_STORAGE_UNIFIED = "shadow"; // the SessionStore facade's snap* delegates need a live shadow
+    // The facade's replicasAvailable() reads shadow.stats.disabled — the raw
+    // UnifiedStore has no such surface, so shim it (the P2 G-test pattern).
+    const shadow = new Proxy(plane, {
+        get: (t: object, p: string | symbol) => (p === "stats" ? { disabled: false } : (t as Record<string | symbol, unknown>)[p]),
+    });
+    _setStoreForTest(new SessionStore({ enabled: true, shadow: shadow as never, log: () => undefined }));
+    try {
+        // Seed the plane with a 3-element world (rows pos 0..2).
+        plane.ingestSession(planIngest(plainSession(sid, 3)));
+        const run = (ids: string[]) => runStage0({
+            sessionId: sid,
+            lane: "responses",
+            msgs: ids.map((id) => core(Number(id.slice(1)), id)),
+            incomingMsgIds: ids,
+            incomingSeqs: null,
+            pluginMode: true,
+            log: () => undefined,
+        });
+
+        // First stage-0 call: issue (the l1 envelope is recorded here — the
+        // plane rows already exist from the ingest above).
+        const seed = run(["m1", "m2", "m3"]);
+        assert.equal(seed.storedFrontierPos, null, "issue (no stored world yet) → null");
+
+        // Strict extension (+m4) → the stored world's boundary = max active
+        // row pos (the new rows are not flushed at stage-0 time).
+        const ext = run(["m1", "m2", "m3", "m4"]);
+        assert.equal(ext.storedFrontierPos, 2, "probe + nothing gone + new → the stored-world boundary (max active row pos)");
+
+        // A full resend with nothing new → echo → null (a re-seed is the
+        // honest answer; there is no provable chain boundary).
+        const echo = run(["m1", "m2", "m3", "m4"]);
+        assert.equal(echo.storedFrontierPos, null, "echo → null");
+
+        // An extension WITH a deletion (m2 gone) is not provable — the
+        // chain may not hold the hole → null, the lane re-seeds.
+        const del = run(["m1", "m3", "m4", "m5"]);
+        assert.equal(del.storedFrontierPos, null, "an extension with a deletion is not a strict prefix → null");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY;
+        else process.env.BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY = saved;
+        if (savedUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = savedUnified;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+    }
+});
+
+test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain serves the new elements ONLY, and a same-body RETRY of it is a no-op (id kept, empty input, no dev)", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url, bodies) => {
+            const msg = (role: string, content: string) => ({ type: "message", role, content });
+            // Round 1: the full world, NO chain ref. The provider's chain
+            // starts here; no selection fires (no id in) → no frontier.
+            const r1 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two")],
+                    biliMsgIds: ["r2m1", "r2m2", "r2m3"],
+                }),
+            });
+            assert.equal(r1.status, 200);
+            await r1.text();
+
+            // Round 2: CHAINED (KEEP=1 forwards the id) + one new element.
+            // WITHOUT Residual 2 this would re-seed the full 4-element view;
+            // WITH it the outbound is exactly the new element, id kept, no
+            // developer re-injection.
+            const r2 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    previous_response_id: "resp_r1",
+                    input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two"), msg("assistant", "ack two")],
+                    biliMsgIds: ["r2m1", "r2m2", "r2m3", "r2m4"],
+                }),
+            });
+            assert.equal(r2.status, 200);
+            await r2.text();
+            const fwd2 = JSON.parse(bodies[1]!) as Record<string, unknown>;
+            assert.equal(fwd2.previous_response_id, "resp_r1", "the chain id is kept on the delta round");
+            const texts2 = ((fwd2.input as unknown as { content?: unknown }[])).flatMap((x) => (Array.isArray(x.content) ? x.content.map((p) => (p as { text?: string }).text ?? "") : [String(x.content ?? "")]));
+            assert.ok(texts2.some((t) => t.includes("ack two")), "the new element is sent");
+            assert.ok(!texts2.some((t) => t.includes("one")), "the stored world is NOT re-sent (the provider chain holds it)");
+            assert.equal((fwd2.input as unknown[]).length, 1, "exactly one element on the wire (a re-seed would carry 4)");
+            assert.ok(!JSON.stringify(fwd2).includes("You are bili"), "no developer re-injection on the delta round");
+
+            // Round 3: the host retries the SAME body as round 2 (upstream
+            // 200 lost in transit — the B4 retry class). Residual 1a: the
+            // delta comes out EMPTY — the no-op classification keeps the id,
+            // sends an EMPTY input, and injects NO dev message (the blind-
+            // response path). The plane must stay intact.
+            const r3 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    previous_response_id: "resp_r2",
+                    input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two"), msg("assistant", "ack two")],
+                    biliMsgIds: ["r2m1", "r2m2", "r2m3", "r2m4"],
+                }),
+            });
+            assert.equal(r3.status, 200);
+            await r3.text();
+            const fwd3 = JSON.parse(bodies[2]!) as Record<string, unknown>;
+            assert.equal(fwd3.previous_response_id, "resp_r2", "the no-op round KEEPS the chain id (stripping it orphans the provider's context)");
+            assert.deepEqual(fwd3.input, [], "the no-op round sends an EMPTY input (pure chain continuation)");
+            assert.ok(!JSON.stringify(fwd3).includes("You are bili"), "no developer message on the no-op round (it would make a blind response)");
+        },
+        { storeDir: path.join(hermetic, "r2-store"), env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1", ACP_KEEP_RESPONSE_ID: "1" } },
     );
 });

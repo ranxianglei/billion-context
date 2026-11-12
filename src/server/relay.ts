@@ -1290,7 +1290,24 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // the turn; compress-loop re-requests carry full views).
             if (prepared && prepared.pendingResponsesDelta !== undefined) {
                 const accepted = upstreamResult.response.status < 400;
-                prepared.session.responsesDelta = accepted ? prepared.pendingResponsesDelta : null;
+                const pending = prepared.pendingResponsesDelta;
+                prepared.session.responsesDelta = accepted ? (pending ? pending.state : null) : null;
+                // #6181 review round 2, Residual 2 companion (B4 hardening):
+                // a REFUSED selection means the provider never ran that round —
+                // its chain holds at most the previously-accepted world while
+                // the plane already holds more (the in-request flush wrote the
+                // refused turn's rows before the forward). While broken, the
+                // first-chained-round frontier seed is blocked and the round
+                // re-seeds the FULL view (at-least-once). A full-view or noop
+                // acceptance re-proves the chain holds the whole world and
+                // clears the flag; a partial acceptance leaves it as-is (it
+                // cannot be set — a partial needs a valid frontier, and the
+                // broken state forces a reseed instead).
+                if (accepted) {
+                    if (pending && pending.kind !== "partial") prepared.session.responsesChainBroken = false;
+                } else {
+                    prepared.session.responsesChainBroken = true;
+                }
                 markDirty(prepared.session);
                 prepared.pendingResponsesDelta = undefined;
             }

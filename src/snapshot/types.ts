@@ -64,5 +64,11 @@ export interface WorldDecision {
     armedAt?: number;
     /** Diagnostic witness sample (echo spot-check) — warn stream only. */
     witness?: string;
+    /** Review-round-2 Residual 1b: the host re-sent a body this proxy ALREADY
+     *  processed (every id known, carrier seqs at/below the frontier) — an
+     *  upstream-200 retry. The lane must neither wipe the plane (the diverge
+     *  this would otherwise cause) nor strip the chain id (the egress no-op
+     *  classification does the continuation). Zero side effects. */
+    replay?: boolean;
 }
 
