@@ -549,8 +549,20 @@ export type Session = {
          *  CURRENT request routes elsewhere: a billing scale learned on one
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
-        lastInputTokensOrigin?: string;
-         /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
+         lastInputTokensOrigin?: string;
+          /** #6430: model id that measured lastInputTokens — written by
+           *  settleUsageReport (and the overflow-arm paths) alongside the
+           *  origin. The preflight gate demotes a usage-grade baseline to
+           *  untrusted when the CURRENT request runs on a different model:
+           *  tokenizers bill differently across models, so a cross-model
+           *  baseline (e.g. a 282K opus reading on a fable lane) is not
+           *  authoritative for this request's size. The k̂ read gate
+           *  (currentCalibrationFactor) already demotes on model mismatch;
+           *  the baseline floor must match it, or a stale cross-model
+           *  baseline keeps arming preflight on the same route. Absent on
+           *  legacy session files → baseline keeps legacy behavior. */
+         lastInputTokensModel?: string;
+          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
          *  correction can inflate OR deflate the estimate toward the route's
@@ -1765,6 +1777,8 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    // #6430: the baseline's model provenance dies with the baseline.
+    delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
