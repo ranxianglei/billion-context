@@ -103,6 +103,28 @@ export function syncBlocks(
         )
       : undefined,
     viewLatchConfigDigest: state.viewLatchConfigDigest,
+    // #4797: the one-time ledger-alignment gate MUST survive the sync clone —
+    // dropping it re-arms restampRefsToLedger on every turn, re-populating
+    // the host's superseded map forever (the "one-time" restamp stops being
+    // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
+    refLedgerAligned: state.refLedgerAligned,
+    // #5608-C: the visibility mark must survive the sync clone — dropping it
+    // re-arms the "first pass" write and could lower/refresh the mark (attr
+    // bytes would flap turn-to-turn = prefix churn). Conditional spread:
+    // legacy states carry no key and must stay key-free.
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    // #5608-B: the host arm rides the clone too; it self-clears on the first
+    // enabled stamp pass, and dropping it early would just re-open the mint.
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
+    // #4313: first-sight time stamps must survive the sync clone — dropping
+    // them here would re-mint every stamped message a fresh wall-clock value
+    // on the very next turn (timestamp drift = receipt range churn, and the
+    // stored-value contract of the tag's time attribute broken).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so
@@ -139,6 +161,16 @@ export function syncBlocks(
     // it inactive; a fresh compress of the same range creates a NEW block.
     if (block.expanded) {
       block.active = false;
+      continue;
+    }
+    // #5765 retire: the summary is intentionally absent from the view AND the
+    // folded messages are pruned — no presence signal survives by design, so
+    // the stillPresent check below would deactivate the block every turn once
+    // the stale rendered copy leaves the client's history. Deactivation would
+    // let orphan GC reap the stored content and break decompress. Keep it
+    // active: the retired flag is the only switch, acp_restore clears it.
+    if (block.retired) {
+      block.active = true;
       continue;
     }
     block.active = true;

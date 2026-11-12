@@ -5,6 +5,7 @@ import { decideEaddrinuse, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEME
 const base: EaddrinuseContext = {
     upgradeReplacement: false,
     twinHolds: false,
+    newerHolderHolds: false,
     launchToken: true,
     strictPort: false,
     attempts: 0,
@@ -74,6 +75,25 @@ test("decideEaddrinuse: strict-port and manual launches keep their fail-fast rea
 
 test("decideEaddrinuse: env marker name is stable (#3044)", () => {
     assert.equal(UPGRADE_REPLACEMENT_ENV, "BILI_UPGRADE_REPLACEMENT");
+});
+
+test("decideEaddrinuse: a proven strictly-newer same-lane holder gets the adopt signal (#4125)", () => {
+    // Nothing over there is draining: no wait variant may touch the port...
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, newerHolderHolds: true }),
+        { kind: "fail-fast", reason: "twin-collision" },
+    );
+    // ...not even a recognized draining predecessor may delay the verdict...
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, newerHolderHolds: true, predecessorHolds: true }),
+        { kind: "fail-fast", reason: "twin-collision" },
+    );
+    // ...and the upgrade-replacement overlap wait stays out too (the replacement's
+    // spawner drives that flow separately — an adoption signal would mislead it).
+    assert.deepEqual(
+        decideEaddrinuse({ ...base, newerHolderHolds: true, upgradeReplacement: true }),
+        { kind: "fail-fast", reason: "twin-collision" },
+    );
 });
 
 test("postBindCanLadder: a marked upgrade replacement never gains post-bind ladder rights (#3044/#2941)", () => {

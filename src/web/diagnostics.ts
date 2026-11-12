@@ -21,9 +21,10 @@
  * zero log signatures and no client version (#4648), stalling triage on data
  * the reporter had to dig out by hand. The conflict tail now also matches the
  * codex compaction evidence chain (intercepted / not-intercepted / forge
- * failed), and the versions section lists the live pool's distinct
- * `clientHint`s — for UA-carried clients like codex the hint IS the version
- * string (`codex_cli_rs/<ver>`), recorded per session at first request.
+ * failed) plus the client-agnostic #2695 zombie reap verdict (#4688), and the
+ * versions section lists the process's recent observed client User-Agents
+ * (src/client-ua-registry) — for UA-carried clients like codex the UA IS the
+ * version string (`codex_cli_rs/<ver>`), seen on every request.
  *
  * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body (copied
  * verbatim AND embedded in the prefilled URL). Every byte passes redactForPublish
@@ -50,8 +51,11 @@ import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
+import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
+import { readLogLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
 import { safeSuffix } from "../text-safe.js";
@@ -68,7 +72,9 @@ const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
 const DSH_PROFILE_CAP = 8;
-const CLIENT_HINT_CAP = 8;
+// #4649: display budget for the observed-UA lines (the registry itself is
+// bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
+const OBSERVED_UA_LINES = 12;
 const DSH_REPORT_PACKAGES = ["@deepseek-ai/dsh", "@deepseek-ai/dsh-compaction-basic", "@deepseek-ai/dsh-web-app"] as const;
 
 function humanUptime(seconds: number): string {
@@ -96,24 +102,42 @@ function baseLines(): string[] {
 // contract (a regression to per-tail reads would re-double the cost).
 let candidateLogReads = 0;
 
-/** All non-empty lines across the rotated log pair; [] on any fs failure. */
-function candidateLogLines(): string[] {
+/** All non-empty lines across every retained generation (sealed history oldest-
+ *  first, then the active file); [] on any fs failure. ONE enumeration shared
+ *  with the other default readers, read once per report (#3813).
+ *  Streaming: the retention set is a byte budget of many generations, so this
+ *  keeps only the two bounded tails the report publishes instead of every line
+ *  of every generation. */
+async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
+    storage: string[];
+    conflict: string[];
+    /** Files that could not be read — the tails are then INCOMPLETE and the
+     *  report must say so rather than present a partial scan as the whole
+     *  retained history. */
+    unreadable: string[];
+}> {
     candidateLogReads += 1;
+    const storage: string[] = [];
+    const conflict: string[] = [];
+    const unreadable: string[] = [];
+    const pushBounded = (into: string[], line: string, cap: number): void => {
+        into.push(line);
+        if (into.length > cap) into.shift();
+    };
     try {
-        const logFile = getLogPath() ?? defaultLogFile();
-        const dir = logFile ? path.dirname(logFile) + path.sep : "";
-        const candidates = [dir + "bili.log.old", dir + "bili.log"];
-        let lines: string[] = [];
-        for (const f of candidates) {
-            try { if (!statSync(f).isFile()) continue; } catch { continue; }
-            try {
-                lines = lines.concat(readFileSync(f, "utf8").split("\n").filter((l) => l.length > 0));
-            } catch { continue; }
+        const files = logGenerations(getLogPath() ?? defaultLogFile()).map((g) => g.path);
+        for await (const line of readLogLines(files, { onError: (f) => unreadable.push(f) })) {
+            if (needStorage && line.includes("[storage]")) pushBounded(storage, line, STORAGE_LOG_TAIL_LINES);
+            if (needConflict && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                pushBounded(conflict, line, CONFLICT_LOG_TAIL_LINES);
+            }
         }
-        return lines;
     } catch {
-        return [];
+        // Enumeration or iteration blew up: report nothing rather than a
+        // half-scan dressed as the full retained history.
+        return { storage: [], conflict: [], unreadable: ["*"] };
     }
+    return { storage, conflict, unreadable };
 }
 
 /** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
@@ -123,13 +147,10 @@ function candidateLogLines(): string[] {
  * length bound as conflictLogTail — a [storage] line can carry a URL with
  * credentials, a private host, or an absolute path. */
 function storageLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => l.includes("[storage]"))
-        .slice(-STORAGE_LOG_TAIL_LINES)
-        .map((l) => {
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -137,14 +158,17 @@ function storageLogTail(lines: string[]): string[] {
 // routed-call refusals (#1729), the destruction verdict (#2193), successful
 // rebases (#2432), and the web-app preset notice that says whether the #3354
 // load-time overlay applies to this machine's profiles.
-// #4649: the codex lane's equivalent chain — whether a compaction was
-// intercepted (and forged locally) or passed through unrecognized; without
-// these a codex conflict report carries no log evidence at all (#4648).
+// #4649: the same evidence chain for the codex lane — before these entries a
+// codex conflict report matched ZERO lines and could not be adjudicated
+// without a manual log round-trip (#4648). One entry per distinct message
+// shape (a shape may fire on more than one site): the not-intercepted forward
+// (src/server/handle.ts), the inline auto-compact detection + rebase
+// (#3008/#2372, both openai and responses wires), the intercepted forge
+// (trigger form AND endpoint form share the prefix), and the forge failure
+// that passes through (src/server/prepare-responses.ts).
 // #4688: the client-agnostic tail of the chain — the #2695 zombie reap verdict
 // (the line a pure orphan-reap ledger lives on; without it such reports ship
-// an empty evidence section even with the reap in the log pair) and the
-// OpenAI-lane codex local auto-compaction detection (#2372/#4521) that lands
-// beside it once PR #4542 ships.
+// an empty evidence section even with the reap in the log pair).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
@@ -152,23 +176,20 @@ const CONFLICT_LOG_PATTERNS = [
     "native compaction boundary",
     "profile bundles include @deepseek-ai/dsh-web-app",
     "codex compaction_trigger request not intercepted",
+    "codex local auto-compaction detected",
     "codex compact intercepted",
     "codex compact forge failed",
     "zombie fold reap",
-    "codex local auto-compaction detected",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
-    return lines
-        .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
-        .slice(-CONFLICT_LOG_TAIL_LINES)
-        .map((l) => {
-            // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
-            // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
-            // on-disk log) the published tail still cannot leak them.
-            const masked = redactForPublish(l);
-            return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
-        });
+    return lines.map((l) => {
+        // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
+        // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
+        // on-disk log) the published tail still cannot leak them.
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 function safeSessionCount(): number {
@@ -223,24 +244,20 @@ function dshPackageVersion(profileDir: string, pkg: string): string | undefined 
     }
 }
 
-// #4649: for clients whose version lives in the User-Agent (codex et al.),
-// the per-session clientHint recorded at first request IS the version
-// evidence — list the live pool's distinct hints so a conflict report names
-// what actually talked to this proxy. Label hints ("claude", "opencode") and
-// UA strings ("codex_cli_rs/<ver>") both appear verbatim; dedupe keeps
-// long-lived multi-session machines readable.
-function observedClientHintLines(): string[] {
-    const seen: string[] = [];
-    try {
-        for (const s of listSessions()) {
-            const h = s.metadata.clientHint;
-            if (typeof h !== "string" || h.length === 0 || seen.includes(h)) continue;
-            seen.push(h);
-        }
-    } catch { /* degrade: no hint line */ }
-    if (seen.length === 0) return [];
-    const listed = seen.slice(0, CLIENT_HINT_CAP).join(" | ");
-    return [`observed client hints (${seen.length} distinct, live sessions): ${listed}${seen.length > CLIENT_HINT_CAP ? ` (+${seen.length - CLIENT_HINT_CAP} more)` : ""}`];
+// #4649: the dsh profile bundles only carry the version truth for the dsh lane;
+// every OTHER client's version lives in its User-Agent, which bili sees on each
+// request. The registry (src/client-ua-registry.ts) keeps a bounded recent
+// sample; publish this so a non-dsh conflict report carries its own client
+// version instead of forcing `codex --version` round-trips (#4648). The values
+// are raw header bytes — the sink-level redactForPublish in buildDiagnostics
+// (#4427) is what makes them publish-safe, same as every other section here.
+function observedUaLines(): string[] {
+    const obs = recentClientUas();
+    if (obs.length === 0) return ["observed client user-agents: (none recorded by this process yet)"];
+    const shown = obs.slice(0, OBSERVED_UA_LINES);
+    const lines = shown.map((o) => `observed client user-agents: ${o.family}: ${o.ua}`);
+    if (obs.length > OBSERVED_UA_LINES) lines.push(`observed client user-agents: … ${obs.length - OBSERVED_UA_LINES} more observation(s)`);
+    return lines;
 }
 
 function hostClientVersionLines(): string[] {
@@ -251,14 +268,25 @@ function hostClientVersionLines(): string[] {
         lines.push(`dsh: no profiles under DSH_HOME (${path.basename(resolveDshHome(process.env)) || "?"}/profiles missing — dsh has never run here, or DSH_HOME points elsewhere)`);
     } else {
         for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-            const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-            lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+            const versions = DSH_REPORT_PACKAGES.map((p) => dshPackageVersion(dir, p));
+            if (versions.every((v) => v === undefined)) {
+                // #5146: three bare "?"s told triage nothing about WHERE the version
+                // truth lives — on DSH Desktop bundle installs the @deepseek-ai core
+                // ships inside the app, not under the profile's node_modules (which
+                // holds third-party plugins like billion-context alone), so every
+                // lookup missed and reports lost the host-version dimension entirely.
+                lines.push(`dsh profile ${path.basename(dir)}: (no @deepseek-ai packages under this profile bundle — on desktop installs the core ships inside the app; include the app version)`);
+            } else {
+                const vers = DSH_REPORT_PACKAGES.map((p, i) => `${p.split("/")[1]} ${versions[i] ?? "?"}`).join(", ");
+                lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+            }
         }
         if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     }
-    // #4649: the hint line must appear even when no dsh profile exists — a
-    // codex-only machine is exactly the case the old early-return hid.
-    lines.push(...observedClientHintLines());
+    // #4649: appended AFTER the dsh part and outside the early-return path — a
+    // machine with no dsh profiles at all (the #4648 codex case) must still get
+    // its observed client versions.
+    lines.push(...observedUaLines());
     return lines;
 }
 
@@ -323,6 +351,8 @@ interface TopicContext {
     storageLogLines: string[];
     conflicts: ReturnType<typeof summarizeConflicts> | null;
     conflictLogLines: string[];
+    /** Generations that could not be read; both tails are partial when set. */
+    unreadableLogs: string[];
 }
 
 interface TopicDef {
@@ -333,7 +363,12 @@ interface TopicDef {
 const TOPICS: Record<string, TopicDef> = {
     "storage-legacy-only": {
         title: () => `SQLite unified storage degraded to legacy-only (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
-        section: (ctx) => storageDiagnosticsLines(ctx),
+        section: (ctx) => [
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the storage tail below covers only the readable ones)`]
+                : []),
+            ...storageDiagnosticsLines(ctx),
+        ],
     },
     // #3235: the compression-conflict banner rides the same #3040 facility —
     // "copy diagnostics / report on GitHub" buttons straight on the banner.
@@ -348,6 +383,9 @@ const TOPICS: Record<string, TopicDef> = {
         section: (ctx) => [
             ...conflictDiagnosticsLines(ctx.conflicts),
             "--- recent conflict-related log lines ---",
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the tails below cover only the readable ones)`]
+                : []),
             ...(ctx.conflictLogLines.length > 0
                 ? ctx.conflictLogLines
                 : ["(no matching lines in the current log pair)"]),
@@ -388,19 +426,26 @@ function snapshotShadowDiagnosticsLines(): string[] {
     return lines;
 }
 
-export function buildDiagnostics(topic?: string): DiagnosticsReport {
+export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
     const t = topic?.trim().slice(0, 64) ?? "";
     const def = t ? TOPICS[t] : undefined;
     // #3813: read the rotated log pair at most ONCE per report — the storage
     // tail and the conflict banner filter the SAME candidate lines, so a
     // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously.
-    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
+    // possible), stalling the event loop synchronously. Both tails are now
+    // collected in the same streaming pass, which retains only their bounded
+    // buffers instead of every line of every generation.
+    const needStorage = Boolean(def);
+    const needConflict = t === "conflict-banner";
+    const tails = needStorage || needConflict
+        ? await candidateLogTails(needStorage, needConflict)
+        : { storage: [], conflict: [], unreadable: [] };
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail(logLines) : [],
-        conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
+        storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
+        conflicts: needStorage ? safeConflictSummary() : null,
+        conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
+        unreadableLogs: tails.unreadable,
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);

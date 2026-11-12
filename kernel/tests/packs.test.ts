@@ -9,6 +9,8 @@ import {
   defaultPack,
   leanPack,
   LEAN_HOW_TO_COMPRESS,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   leanHowToCompress,
   HOW_TO_COMPRESS_RULES,
   TIER2_DISTILL_RULES,
@@ -116,6 +118,12 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
   ]) {
     assert.ok(howTo.includes(marker), `missing: ${marker}`);
   }
+  // #4313 toggle: the BASE pack stays pre-feature; the timestamped variant is
+  // base + the diary-line rule, selected at host exits by the flag.
+  assert.equal(howTo, LEAN_HOW_TO_COMPRESS);
+  assert.ok(!howTo.includes("TIMELINE"), "base lean pack must not carry the timeline rule");
+  assert.ok(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.includes(TIMELINE_RULE_LINE));
+  assert.equal(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.replace(TIMELINE_RULE_LINE + "\n", ""), LEAN_HOW_TO_COMPRESS);
   // #265: summariesInContext is a compact trust guardrail now, not null
   assert.equal(
     typeof pi.promptSections.summariesInContext,
@@ -375,31 +383,13 @@ test("lean surface applies to wire tools via applyAcpToolOverrides", () => {
     leanPack.surface.toolPrompts?.compress?.description,
   );
   const params = compress.function.parameters as {
-    properties: {
-      content: {
-        anyOf: {
-          items?: {
-            anyOf: {
-              type: string;
-              properties?: Record<string, { description?: string }>;
-            }[];
-          };
-        }[];
-      };
-    };
+    properties: { content: { type?: string; description?: string } };
   };
-  const objectForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "object",
-  );
-  assert.ok(objectForm?.properties?.startId);
+  assert.equal(params.properties.content.type, "string");
   assert.equal(
-    objectForm!.properties!.startId!.description,
-    "Inclusive first mNNNNN or bN ref.",
+    params.properties.content.description,
+    leanPack.surface.toolPrompts?.compress?.paramDescriptions?.content,
   );
-  const lineForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "string",
-  );
-  assert.ok(lineForm, "line-form string variant is taught in the schema");
 });
 
 test("pack promptSections flow into buildCompressSystemPrompt", () => {
