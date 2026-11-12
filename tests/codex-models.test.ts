@@ -75,17 +75,17 @@ test("codexAlignedWindow: min() semantics per acceptance (in-table / not-in-tabl
     const codex = { "user-agent": CODEX_UA };
     const other = { "user-agent": "node-fetch/3.1" };
     // in-table: bili 400K (built-in table) → clamped to codex's 272K
-    assert.deepEqual(codexAlignedWindow(400_000, "gpt-5.5", codex), { limit: 272_000, clamped: true });
+    assert.deepEqual(codexAlignedWindow(400_000, "gpt-5.5", codex), { limit: 272_000, clamped: true, source: "bundled-snapshot" });
     // not-in-table: bili 1M → clamped to the 272K fallback
-    assert.deepEqual(codexAlignedWindow(1_000_000, "qwen3.8-27b", codex), { limit: 272_000, clamped: true });
+    assert.deepEqual(codexAlignedWindow(1_000_000, "qwen3.8-27b", codex), { limit: 272_000, clamped: true, source: "codex-fallback" });
     // bili below perception: untouched (min keeps bili's)
-    assert.deepEqual(codexAlignedWindow(200_000, "gpt-5.5", codex), { limit: 200_000, clamped: false });
+    assert.deepEqual(codexAlignedWindow(200_000, "gpt-5.5", codex), { limit: 200_000, clamped: false, source: "bundled-snapshot" });
     // equal: untouched
-    assert.deepEqual(codexAlignedWindow(272_000, "gpt-5.5", codex), { limit: 272_000, clamped: false });
+    assert.deepEqual(codexAlignedWindow(272_000, "gpt-5.5", codex), { limit: 272_000, clamped: false, source: "bundled-snapshot" });
     // non-codex client: never touched
     assert.deepEqual(codexAlignedWindow(400_000, "gpt-5.5", other), { limit: 400_000, clamped: false });
     // user override below perception (PR-D style -c model_context_window=100000): untouched
-    assert.deepEqual(codexAlignedWindow(100_000, "gpt-5.5", codex), { limit: 100_000, clamped: false });
+    assert.deepEqual(codexAlignedWindow(100_000, "gpt-5.5", codex), { limit: 100_000, clamped: false, source: "bundled-snapshot" });
 });
 
 test("test hooks: table replacement + reset", () => {

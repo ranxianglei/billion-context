@@ -115,7 +115,7 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
-    const merged: BiliMessage[] = [];
+    let merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < viewRows.length; i++) {
         while (ai < anchors.length && anchors[ai].pos === i) {

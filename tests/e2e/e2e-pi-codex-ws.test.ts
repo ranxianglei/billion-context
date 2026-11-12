@@ -722,7 +722,14 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
         assert.ok(r.stdout.includes("WS_E2E_OK"));
     };
 
-    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED"));
+    // #5428 flipped the pi lane's DEFAULT posture to inline (in-process proxy):
+    // left unpinned, X's proxy would die with its pi process and unregister its
+    // instance record — nothing left to discover, nothing for Y to attach to.
+    // This scenario pins the legacy spawn/attach posture it was built on;
+    // scenarios A–D intentionally ride the new inline default.
+    const legacyPosture: NodeJS.ProcessEnv = { BILI_PI_INLINE: "0" };
+
+    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED", { extraEnv: legacyPosture }));
     const origin = proxyOriginOf(ctxX);
     assert.ok(origin, "X's proxy origin discovered from its instance record");
     // Y attaches to X's proxy (real subagent posture: inherited
@@ -733,7 +740,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Same tool args ({}) from both sessions, interleaved.
     const [xStatus, yStatus] = await Promise.all([
-        piRun(ctxX, "WS_STATUS alpha status", { resume: true }),
+        piRun(ctxX, "WS_STATUS alpha status", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "WS_STATUS beta status", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X status", xStatus);
@@ -763,7 +770,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Concurrent plain turns, same proxy, no cross-talk afterwards.
     const [xFin, yFin] = await Promise.all([
-        piRun(ctxX, "concurrent X tail", { resume: true }),
+        piRun(ctxX, "concurrent X tail", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "concurrent Y tail", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X concurrent", xFin);

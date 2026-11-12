@@ -4,9 +4,21 @@ on:
   push:
     branches: [master]
 
+# 2026-10-31 queue-starvation incident: every master merge triggered a Release run;
+# a busy day stacked eight of them and, once runner capacity returned, they all
+# started CONCURRENTLY, burning ~8x slots while each mostly no-ops ("not a release
+# merge" check). Grouping serializes them — a queued no-op costs ~2 min.
+# cancel-in-progress stays FALSE deliberately: two real back-to-back releases must
+# publish in order; cancelling a publishing run mid-tag / mid-npm-publish would
+# strand its version (#3071 discipline).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: write
       id-token: write
