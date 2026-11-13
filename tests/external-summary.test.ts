@@ -186,7 +186,14 @@ test("external summary: late rejections are observed and release capacity", asyn
     const executor = new ExternalSummaryExecutor(1);
     const leave = deferred<string>();
     const result = await executor.execute(work, [{ summarize: async () => leave.promise }], { ...budget, targetTimeoutMs: 10 });
-    assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "timeout" }] });
+    assert.equal(result.status, "failed");
+    if (result.status !== "failed") throw new Error("unreachable");
+    assert.equal(result.reason, "exhausted");
+    assert.equal(result.attempts.length, 1);
+    assert.equal(result.attempts[0].targetIndex, 0);
+    assert.equal(result.attempts[0].outcome, "timeout");
+    // #4833: the timeout names its source and budget instead of staying opaque.
+    assert.match(result.attempts[0].detail ?? "", /^target-timeout 10ms \(elapsed \d+ms\)$/);
     leave.reject(new Error("late private provider error"));
     await leave.promise.catch(() => undefined);
     assert.equal((await executor.execute(work, [successful()], budget)).status, "success");

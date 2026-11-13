@@ -199,6 +199,33 @@ The workflow then:
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`, and creates
    the GitHub Release with notes generated from `git log` since the last tag.
 
+**Emergency bypass (`skip_ci_gate`, owner decision 2026-11-01):** ticking the checkbox
+skips the full-CI dispatch AND wait on BOTH paths (direct push and fallback PR) — the
+run finishes right after the fast pre-flight instead of waiting up to 60 minutes for
+every lane at the publish sha. A loud `::warning::` line in the job log is the permanent
+audit record, and on the fallback path the auto-PR body is stamped with an EMERGENCY
+BYPASS banner so whoever merges knows the sha shipped without lane verification.
+Leave it UNTICKED for normal releases: an unticked run publishes exactly as before,
+a green release branch included.
+
+**Nuclear option (`raw_publish`):** ticking this checkbox puts nothing between you and
+npm but a one-time dependency download (`npm install --no-audit --no-fund`, a plain
+lockfile fetch that executes no project code) and `npm run build` — no typecheck,
+no tests, no CI lanes, no push to master, no release PR. The run still enforces the drift guard
+and the release-notes check, then publishes to npm, pushes the git tag, creates the
+GitHub Release (body carries a RAW EMERGENCY PUBLISH banner), and opens a version-sync
+PR so master converges. Until that sync PR merges, the NEXT one-click release aborts
+on the drift guard (master sits exactly one patch behind npm) — that is deliberate:
+it forces a visible convergence instead of silently re-bumping. A loud warning line in
+the job log is the permanent audit record. Use it when even the fast path is too slow
+and you accept shipping an unverified tree.
+
+**Local zero-install variant:** on your own machine (where `node_modules` already
+exists) run `NPM_TOKEN=*** GITHUB_TOKEN=*** node scripts/emergency-publish.mjs` for the
+literal `npm run build && npm publish`: no dependency install step at all, then tag
+push + GitHub Release when the token is present. Add `--dry-run` to preview with zero
+side effects.
+
 A successful one-click run does NOT double-trigger `release.yml`: its check only
 matches release-branch merges / date-prefixed commits, never a plain `release v{VERSION}`
 commit. The standard branch/PR flow above remains the canonical path for anything
@@ -361,7 +388,12 @@ protected lane described above):**
 
 **Emergency fallback:** a manual `workflow_dispatch` run against an explicitly chosen
 ref (picked in the Actions UI) still works and runs every guard above — for when the
-PR dance is slower than the fire.
+PR dance is slower than the fire. It also carries the emergency FAST valve (#3613,
+restored 2026-10-28 after the #4718 removal): ticking `fast` AND typing exactly
+`FAST PUBLISH CONFIRMED` into `confirm_fast` skips the full-CI dispatch/gate and the
+local full test while keeping every version guard + npm ci + typecheck + build;
+any partial or default input silently keeps the normal slow path (the typed phrase
+is the anti-misfire guard from #4718).
 
 **Label publish: DECOMMISSIONED (2026-10-25).** The former `backport-ship`
 label path (a single label made CI publish WITHOUT any merge decision) is

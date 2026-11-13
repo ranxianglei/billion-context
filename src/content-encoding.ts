@@ -14,6 +14,21 @@ export class DecompressedTooLargeError extends Error {
     }
 }
 
+/** #5794 item 2: raised for a decoded body above the INGEST cost band
+ *  (network.ingestBodyBytes / BILI_INGEST_BODY_BYTES, default 32 MiB). Distinct
+ *  from DecompressedTooLargeError (a decode-cap bomb guard): this one bounds the
+ *  JSON.parse + normalization sweep itself — a 51.2 MiB / 29,619-message body
+ *  spent 5.5–7.2 s per round there (54.6% of local CPU → 747 s event-loop
+ *  FATAL → every session's cache went cold). Any parseable body above the band
+ *  is already ≥ ~8M tokens, beyond every real model window, so refusing it is
+ *  free. The message is the operator-facing actionable guidance. */
+export class IngestBodyTooLargeError extends Error {
+    constructor(public readonly limit: number, public readonly bytes: number) {
+        super(`request body ${bytes.toLocaleString("en-US")} B (after decode) exceeds the ingestion cost band ${limit.toLocaleString("en-US")} B (#5794: bodies this large are ≥ ~8M tokens — beyond every model window — and burn the event loop for seconds in the parse sweep). Reduce the session history — restart the session or rewind to an earlier point — and retry.`);
+        this.name = "IngestBodyTooLargeError";
+    }
+}
+
 /** Stream-decompress under a hard byte cap: rejects with DecompressedTooLargeError
  *  the instant output exceeds `max`, so a bomb never inflates in memory and the
  *  cap is enforced deterministically per codec. node's one-shot `maxOutputLength`

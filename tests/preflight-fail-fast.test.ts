@@ -224,7 +224,7 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
     }
 });
 
-test("e2e #301: payload fits the window + preflight 429 → request still forwarded (no false positive)", async () => {
+test("e2e #301: fitting payload + stale usage floor → forwarded with zero summarization calls (#4288)", async () => {
     const calls: Call[] = [];
     let streamCalls = 0;
     const upstream = http.createServer((req, res) => {
@@ -270,17 +270,19 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
         await r1.text();
 
         // The ~13k-token conversation FITS the 20k window, but the trigger
-        // fires on the stale 300k floor: preflight runs, its summarization
-        // call 429s — and the proxy must STILL forward the fitting payload.
+        // fires on the stale 300k floor. Since #4288 the round-top exit judges
+        // on the payload's own floorless estimate: preflight runs, spends ZERO
+        // summarization calls (no 429 can even happen), and the proxy forwards
+        // the fitting payload immediately instead of burning the ladder.
         const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers,
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
         });
-        assert.equal(r2.status, 200, "a fitting payload is forwarded even when preflight 429s");
+        assert.equal(r2.status, 200, "a fitting payload is forwarded past the stale floor");
         await r2.text();
 
-        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight did attempt the (429'd) summarization call");
+        assert.equal(calls.filter((c) => !c.stream).length, 0, "#4288: no summarization call is spent on an already-fitting payload");
         assert.equal(calls.filter((c) => c.stream).length, 2, "both requests were forwarded upstream");
     } finally {
         proxy.close();

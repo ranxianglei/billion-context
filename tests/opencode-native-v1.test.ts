@@ -14,7 +14,7 @@ import {
 import { rmrf } from "./tmp-rm.ts";
 
 // Minimal structural stand-in for the host's zod module: only the builders
-// jsonSchemaToZodShape touches. Real zod (4.1.8) is exercised implicitly by
+// jsonSchemaToZodShape touches. Real zod (4.6.7) is exercised implicitly by
 // the shape assertions below via the actual import.
 const fakeZ = {
     any: () => ({ __fake: "any" }),
@@ -59,7 +59,7 @@ describe("jsonSchemaToZodShape", () => {
 
     it("produces fields the real host zod accepts in z.object()", async () => {
         // The v1 registry wraps our shape with the HOST's zod: simulate with
-        // the real zod dependency (4.1.8) to prove cross-instance interop.
+        // the real zod dependency (4.6.7) to prove cross-instance interop.
         const real = await import("zod");
         const shape = jsonSchemaToZodShape(
             { type: "object", properties: { range: { type: "string" }, limit: { type: "number" } } },
