@@ -3745,7 +3745,10 @@ export async function pipePluginChatWithStrip(
         // structured or user data (#1039) and are excluded from the audit.
         if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // #5848 twin on the google lane: a frame carrying only empty parts has
+        // nothing a held tail must precede, and draining on it split a render tag
+        // so the remainder reached the host as prose (the #5192 shape).
+        if (!hadText && anyPending() && googleFrameHasNonText(ev)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     try {
