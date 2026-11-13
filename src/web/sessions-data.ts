@@ -7,7 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
-import { resolveBillingPrice, savedUsdFromFolds, validCostUsd } from "../billing.js";
+import { resolveBillingPrice, savedUsdFromFolds, validCostUsd, validUnpricedTokens } from "../billing.js";
 
 /** Shape of a resolved price row — taken via ReturnType so this module never
  *  couples to billing.ts's internal export surface (see #4916 unused-export
@@ -128,6 +128,10 @@ interface WebSessionSummary {
      *  currently resolved tier rates — so pre-upgrade sessions show dollars
      *  too. Absent only when no price resolves at all. */
     costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean };
+    /** #5647: raw tokens that flowed while no price resolved — excluded from
+     *  costUsd by construction. Nonzero means costUsd understates spend
+     *  ("unknown"), not that the traffic was free. */
+    unpricedTokens?: { input: number; cacheRead: number; cacheWrite: number; output: number };
     /** #4899 v2: money mirror of netSaved — the folds priced with the CURRENTLY
      *  resolved tier rates (live price table); stamped profiles are only a
      *  fallback when the model resolves nowhere today; fold-less sessions
@@ -638,7 +642,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
 interface SummarySource {
     id: string;
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
-    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean; costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number } };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean; costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number }; unpricedTokens?: { input: number; cacheRead: number; cacheWrite: number; output: number } };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
@@ -731,6 +735,7 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
             costUsd: validCostUsd(stats.costUsd),
+            unpricedTokens: validUnpricedTokens(stats.unpricedTokens),
         },
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
@@ -855,6 +860,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // output @ output rate). Unpriced model → undefined: tokens only, never
     // fabricated dollars.
     const costLedger = validCostUsd(s.stats.costUsd);
+    const unpricedTokens = validUnpricedTokens(s.stats.unpricedTokens);
     const persistedSum = costLedger === undefined ? 0 : costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output;
     const costUsd: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean } | undefined =
         costLedger !== undefined && persistedSum > 0
@@ -999,6 +1005,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(unpricedTokens !== undefined ? { unpricedTokens } : {}),
         ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
         ...(savedUsdGross !== undefined ? { savedUsdGross: Math.round(savedUsdGross * 1e4) / 1e4 } : {}),
         ...(payback !== undefined ? { payback } : {}),

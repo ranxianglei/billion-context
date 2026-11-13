@@ -192,27 +192,55 @@ export function validCostUsd(v: unknown): { input: number; cacheRead: number; ca
     return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
+/** #5647: validate the persisted unpriced-token ledger blob
+ *  (`stats.unpricedTokens`). Same discipline as validCostUsd — only finite
+ *  non-negative fields survive, a partially-valid blob zero-fills missing
+ *  lanes, an all-invalid one reads as "no ledger". */
+export function validUnpricedTokens(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const input = nonNegNum(o.input), cacheRead = nonNegNum(o.cacheRead), cacheWrite = nonNegNum(o.cacheWrite), output = nonNegNum(o.output);
+    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
+    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
+}
+
 /** Bill one settled usage report's input side: fresh input at the input
  *  rate, cache reads at cacheRead, cache writes (anthropic-style creation)
  *  at cacheWrite. `total` is the normalized prompt total (split semantics:
- *  fresh + read + creation; inclusive semantics: cached folded in). */
+ *  fresh + read + creation; inclusive semantics: cached folded in). No
+ *  resolvable price → the tokens still flowed: they are counted in
+ *  `stats.unpricedTokens` instead (#5647), so a zero USD ledger means "free"
+ *  rather than "unknown". */
 export function billInputUsage(session: Session, s: { total: number; cached: number | null; creation?: number }): void {
-    const price = stampedBillingPrice(session);
-    if (price === undefined || !(s.total > 0)) return;
-    const st = session.stats.costUsd ?? (session.stats.costUsd = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+    if (!(s.total > 0)) return;
     const cached = Math.max(0, s.cached ?? 0);
     const creation = Math.max(0, s.creation ?? 0);
     const fresh = Math.max(0, s.total - cached - creation);
+    const price = stampedBillingPrice(session);
+    if (price === undefined) {
+        const st = session.stats.unpricedTokens ?? (session.stats.unpricedTokens = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+        st.input += fresh;
+        st.cacheRead += Math.min(cached, Math.max(0, s.total));
+        st.cacheWrite += creation;
+        return;
+    }
+    const st = session.stats.costUsd ?? (session.stats.costUsd = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
     st.input += (fresh * price.input) / 1e6;
     st.cacheRead += (Math.min(cached, Math.max(0, s.total)) * price.cacheRead) / 1e6;
     st.cacheWrite += (creation * price.cacheWrite) / 1e6;
 }
 
-/** Bill output tokens — called exactly where stats.outputTokens accumulates. */
+/** Bill output tokens — called exactly where stats.outputTokens accumulates.
+ *  Unpriced sessions count raw tokens in `stats.unpricedTokens` instead
+ *  (#5647). */
 export function billOutputUsage(session: Session, out: number): void {
     if (!(out > 0)) return;
     const price = stampedBillingPrice(session);
-    if (price === undefined) return;
+    if (price === undefined) {
+        const st = session.stats.unpricedTokens ?? (session.stats.unpricedTokens = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
+        st.output += out;
+        return;
+    }
     const st = session.stats.costUsd ?? (session.stats.costUsd = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 });
     st.output += (out * price.output) / 1e6;
 }

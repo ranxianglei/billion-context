@@ -408,6 +408,10 @@ export type Session = {
          *  (metadata.billingPrice). Absent while no price resolves — the UI
          *  shows tokens only, never fabricated dollars. */
         costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
+        /** #5647: raw token counts that flowed while NO price resolved for
+         *  the session — excluded from costUsd by construction. Nonzero means
+         *  costUsd understates spend ("unknown"), it does not mean free. */
+        unpricedTokens?: { input: number; cacheRead: number; cacheWrite: number; output: number };
         /** Approximate tokens saved by compression (legacy/rough — kept for
          *  backward compat with old session files, not shown in UI). */
         tokensSaved: number;

@@ -33,7 +33,7 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
-import { validCostUsd } from "./billing.js";
+import { validCostUsd, validUnpricedTokens } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
@@ -240,6 +240,9 @@ interface PersistedSession {
         // buildSession restores it (dropping it zeroed historical spend on
         // every cold load).
         costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
+        // #5647: unpriced-token ledger — same round-trip requirement as
+        // costUsd (buildRecord spreads, buildSession whitelists).
+        unpricedTokens?: { input: number; cacheRead: number; cacheWrite: number; output: number };
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -4223,6 +4226,8 @@ function buildSession(parsed: PersistedSession): Session {
             // wrote that loss into BOTH stores (envelope + index.db). Restored
             // through the shared validator; corrupt blobs read as "no ledger".
             costUsd: validCostUsd(stats.costUsd),
+            // #5647: unpriced-token ledger — same drop-class as #5303's costUsd.
+            unpricedTokens: validUnpricedTokens(stats.unpricedTokens),
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
