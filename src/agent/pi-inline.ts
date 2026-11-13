@@ -46,12 +46,12 @@ export function installInlineTransport(): boolean {
                 if (err instanceof Error && err.name === "AbortError") throw err;
                 const msg = err instanceof Error ? err.message : String(err);
                 if (url.startsWith(MODEL_PREFIX)) {
-                    // Engine down → degrade exactly like a spawn-mode bootstrap
-                    // failure: strip the pseudo-origin prefix (the embedded
+                    // Startup or dispatch failed: try the direct fallback by
+                    // stripping the pseudo-origin prefix (the embedded
                     // upstream URL is absolute) and send direct, uncompressed.
                     if (!degradeWarned) {
                         degradeWarned = true;
-                        logHostEvent("error", "[native-client]", `[bili-native] inline engine unavailable — model traffic goes direct (uncompressed): ${msg}`);
+                        logHostEvent("error", "[native-client]", `[bili-native] inline request failed — attempting direct model fallback (uncompressed): ${msg}`);
                     }
                     const target = url.slice(MODEL_PREFIX.length);
                     if (input instanceof Request) {
