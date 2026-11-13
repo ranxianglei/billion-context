@@ -287,7 +287,7 @@ function substrateDestructionPauseParagraph(n: number): string {
 // recovery step — acp_status once, then ONE live range — still goes through
 // and can clear the breaker.
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
-    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects as that string also works), using refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
 // #5986 review fix: the observed failure mode after a compress rejection is the
@@ -1349,10 +1349,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
-        // #5608-D: this fold is the session's next legitimate cache-breaking
-        // boundary — flag the one-time #4316 citation-space alignment to ride
-        // it (persist.scheduleSave consumes the marker before serializing).
-        ctx.session.pendingLedgerAlign = true;
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs
@@ -1500,6 +1496,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             }
             return compressResult(receipt, "refused", 0, gateReason);
         }
+        // #5608-D: this fold is the session's next legitimate cache-breaking
+        // boundary — flag the one-time #4316 citation-space alignment to ride
+        // it (persist.scheduleSave consumes the marker before serializing).
+        // Armed only HERE, past the blocksCreated === 0 returns above: a
+        // refused or no-op compress rewrites no history, so it is not a
+        // boundary — arming on it let the next save run the alignment (and
+        // its time-attribute mark raise) on a call that folded nothing.
+        ctx.session.pendingLedgerAlign = true;
         clearCompressFailures(ctx.session);
         clearCompressLoopStreak(ctx.session);
 
