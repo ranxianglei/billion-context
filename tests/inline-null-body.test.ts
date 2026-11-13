@@ -2,7 +2,23 @@ import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
+
+// Hermetic storage BEFORE anything store-touching loads (same pattern as
+// inline-streaming.test.ts): the engine boot below creates config + sqlite
+// state, which must not land in a developer's real XDG dirs.
+const STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-inline-null-body-state-"));
+const DATA_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-inline-null-body-data-"));
+const CONFIG_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-inline-null-body-config-"));
+const PREV_STATE = process.env.XDG_STATE_HOME;
+const PREV_DATA = process.env.XDG_DATA_HOME;
+const PREV_CONFIG = process.env.XDG_CONFIG_HOME;
+process.env.XDG_STATE_HOME = STATE_ROOT;
+process.env.XDG_DATA_HOME = DATA_ROOT;
+process.env.XDG_CONFIG_HOME = CONFIG_ROOT;
 
 const upstream = http.createServer((req, res) => {
     req.resume();
@@ -20,9 +36,20 @@ const ie = await import("../src/inline-engine.ts");
 after(async () => {
     upstream.closeAllConnections();
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
-    const { flushAllSessions } = await import("../src/session.ts");
-    await flushAllSessions();
+    try {
+        const { flushAllSessions } = await import("../src/session.ts");
+        await flushAllSessions();
+    } catch { /* engine never booted in this run */ }
     ie._resetInlineEngineForTest();
+    if (PREV_STATE === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_STATE;
+    if (PREV_DATA === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = PREV_DATA;
+    if (PREV_CONFIG === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = PREV_CONFIG;
+    fs.rmSync(STATE_ROOT, { recursive: true, force: true });
+    fs.rmSync(DATA_ROOT, { recursive: true, force: true });
+    fs.rmSync(CONFIG_ROOT, { recursive: true, force: true });
 });
 
 for (const status of [204, 205, 304]) {
