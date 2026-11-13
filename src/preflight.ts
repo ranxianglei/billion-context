@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, calibrationOriginApplies, currentCalibrationFactor, effectiveCalibration } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
@@ -1758,13 +1758,37 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // kernel's own truncation/absorb behavior stays byte-identical.
     let imageReserve = deps.imageReserve ?? 0;
     const wireOverhead = deps.wireOverhead ?? 0;
-    // #1933 F1: capture k̂ once — it only mutates on usage settlement (outside
-    // this invocation), while every fit judgment in this loop must stay on
-    // one consistent scale with the gate that started it.
+    // #1933 F1: capture k̂ once — it only mutates on usage/overflow settlement
+    // (outside this invocation), while every fit judgment in this loop must
+    // stay on one consistent scale with the gate that started it.
     // #2117 B: model-provenance gate — a factor learned on another model acts
     // as absent (raw estimate) rather than deciding with a cross-model scale.
-    const kFactor = currentCalibrationFactor(deps.session.stats, deps.session.metadata?.lastModel);
-    const kOrigin = deps.session.stats.calibratedEstimateOrigin;
+    // #5373: effectiveCalibration falls back to the provisional overflow-stated
+    // bias when the ring has nothing applicable to this route, so an
+    // overflow-only session folds on the upstream-stated scale from the first
+    // rejection onward.
+    let calibration = effectiveCalibration(deps.session.stats, deps.session.metadata?.lastModel, deps.upstreamOrigin);
+    // #1195 B: an UNCLAMPED overflow arm — the measured count already exceeds
+    // the stated ceiling (declared window wider than the provider's real one) —
+    // keeps master's raw-scale fit judgments. The provisional bias there declares
+    // an unfoldable payload over-limit, the walk books a non-materializable
+    // emergency-truncate credit, and the #1987 anchor then clobbers the
+    // upstream-measured arm baseline (source flips to "estimate"). Only the
+    // ring-published factor (master's established behavior) may steer such a
+    // session; clamped arms and post-retire sessions steer at stated calibre.
+    {
+        const s = deps.session.stats;
+        const unclampedArm = s.lastInputTokensSource === "overflow-arm"
+            && !(s.overflowArmTokens !== undefined && s.lastInputTokens < s.overflowArmTokens);
+        if (unclampedArm) {
+            const ringK = currentCalibrationFactor(s, deps.session.metadata?.lastModel);
+            calibration = ringK !== undefined && calibrationOriginApplies(s.calibratedEstimateOrigin, deps.upstreamOrigin)
+                ? { k: ringK, origin: s.calibratedEstimateOrigin }
+                : { k: undefined, origin: undefined };
+        }
+    }
+    const kFactor = calibration.k;
+    const kOrigin = calibration.origin;
     // #3645: kernel range.tokens are the UNCALIBRATED count, but
     // result.payloadEstimate (hence every deficit derived from it) sits on the
     // CALIBRATED scale once a matching-origin k̂ is set (#1933 F1). Folding a
@@ -2282,8 +2306,34 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // marathon — that burn was driven by a stale USAGE-sourced baseline
         // measured under a prior wider-window model, which keeps the floorless
         // roundText path.
+        // #5373 carve-out of the exception: when a route-calibration factor applies
+        // to this origin (ring-published k̂ or the provisional overflow-stated bias),
+        // roundText is ALREADY projected onto the upstream-stated scale above — the
+        // distrust premise ("the local estimate may not outrank the rejection") is
+        // exactly the gap the factor closes. Without it, a clamped arm makes the
+        // floored comparator unsatisfiable (floor == compressionTarget == stated
+        // budget ⇒ floor−img never < target−img) and the rescue burns the whole
+        // ladder, forwarding whatever remains over the window again. With the
+        // factor the calibrated roundText exits early at raw < target/k̂ — the
+        // stated budget expressed in local units. k̂>1 keeps the raw floor implied
+        // (calRound<target ⟹ rawRound<target/k̂≤target≤floor); k̂≤1 makes the
+        // calibrated clause strictly weaker than the raw one, so behavior only
+        // relaxes in the direction the measurement says is safe. No factor → the
+        // legacy floored path stays byte-identical.
+        // Clamped-arm restriction (#1195 B regression): the carve-out exists for
+        // CLAMPED arms — the baseline capped by the judging limit below the stated
+        // ceiling (overflowArmTokens) — where the floored comparator is provably
+        // unsatisfiable. An unclamped arm whose measured count already exceeds the
+        // stated ceiling (declared window wider than the provider's real one) has
+        // no foldable range when the payload is unfoldable; the floorless path
+        // there books a kernel emergency-truncate credit the rebuild cannot
+        // materialize, and the #1987 anchor then clobbers the upstream-measured
+        // arm baseline. Unclamped arms keep the legacy floored passthrough.
+        const armClamped = deps.session.stats.overflowArmTokens !== undefined
+            && deps.session.stats.lastInputTokens < deps.session.stats.overflowArmTokens;
+        const armedFactorApplies = armClamped && kFactor !== undefined && calibrationOriginApplies(kOrigin, deps.upstreamOrigin);
         const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
-        if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+        if (armedBaseline && !armedFactorApplies ? decisionTokens < textTarget : roundText < textTarget) {
             // #4288: the walk ends in a fit-forward — the caller's gate judges
             // on the same floorless payloadEstimate and forwards. The final
             // verdict below must not stamp an exhausted/failure verdict over
