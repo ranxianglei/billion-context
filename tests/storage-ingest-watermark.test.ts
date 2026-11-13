@@ -591,7 +591,7 @@ test("watermark: sampled verification still catches drift through the delta path
     }
 });
 
-test("watermark: v4 database migrates to v11 additively; newer user_version no-ops", async () => {
+test("watermark: v4 database migrates to v12 additively; newer user_version no-ops", async () => {
     const dir = tmpdir("bili-wm-migrate-");
     try {
         const dbPath = path.join(dir, "index.db");

@@ -202,7 +202,7 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
-// #4491/#5825 + #5874 2×2 stage 0 (brief 19544722 / #6181): the
+        // #4491/#5825 + #5874 2×2 stage 0 (brief 19544722 / #6181): the
         // SHARED pin + world-match + kernel-input assembly for cohort
         // traffic (src/snapshot/stage0.ts — the responses lane runs the
         // SAME helper, same red gate, same one-round-convergence
