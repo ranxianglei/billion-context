@@ -486,7 +486,7 @@ test("plugin chat keeps the legacy completed-turn shape when streamErrorShape is
     const refetch = () => Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
     await pipePluginChatWithStrip(
         streamOf(unclosedEchoTurn()), makeRes(out), "openai", makeSession(), undefined, refetch,
-        undefined, undefined, undefined, undefined, undefined, "completion",
+        undefined, undefined, undefined, undefined, undefined, undefined, "completion",
     );
     const text = out.join("");
     // The opt-in escape hatch restores the #870/#2689 shape: the error text rides
@@ -525,7 +525,7 @@ test("plugin chat (anthropic) #870: the in-band error block is well-formed at th
     // "completion" get the well-formed block lifecycle (ZCode schema compat).
     await pipePluginChatWithStrip(
         streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch,
-        undefined, undefined, undefined, undefined, undefined, "completion",
+        undefined, undefined, undefined, undefined, undefined, undefined, "completion",
     );
     const text = out.join("");
     assert.ok(text.includes("[ACP] stream error"), "#870 fired");
