@@ -89,6 +89,32 @@ test("#5192: a drain drop carries no closing bracket, so it is never mistakable 
     assert.equal(drops[0]!.snippet.includes(">"), false);
 });
 
+test("#5192: a swallowed tag tail discarded at EOF is reported as a drain drop", () => {
+    const { drops, onDrop } = recorder();
+    const f = createTagEchoFilter(onDrop);
+    // A complete opening tag followed by content, but no close: the stream
+    // died mid-tag. The opening tag is an ordinary strip; the swallowed tail
+    // held at EOF is a drain drop (previously silent).
+    assert.equal(f.push(`prose ${LT}acp tokens="12" type="text">m00582`), "prose ");
+    assert.equal(f.flush(), "");
+    assert.equal(drops.length, 2, "the drain drop must not be swallowed by the one-shot notice");
+    assert.equal(drops[0]!.duringDrain, false, "the opening tag strip is an ordinary drop");
+    assert.equal(drops[1]!.snippet, "m00582");
+    assert.equal(drops[1]!.duringDrain, true, "the swallowed tail is a drain drop");
+});
+
+test("#5192: a swallowed tag tail drain drop is reported even after an earlier strip claimed the one-shot notice", () => {
+    const { drops, onDrop } = recorder();
+    const f = createTagEchoFilter(onDrop);
+    // An earlier completed tag claims the one-shot strip notice; the swallowed
+    // tail of a later unclosed tag is a drain drop (previously silent).
+    assert.equal(f.push(`前${tag("m00011")}中${LT}acp tokens="12" type="text">m00582`), "前中");
+    assert.equal(f.flush(), "");
+    assert.equal(drops.length, 2, "the drain drop must not be swallowed by the one-shot notice");
+    assert.equal(drops[1]!.snippet, "m00582");
+    assert.equal(drops[1]!.duringDrain, true, "the swallowed tail is a drain drop");
+});
+
 function makeSession(): Session {
     return {
         id: "drainsess",
