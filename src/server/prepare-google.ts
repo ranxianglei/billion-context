@@ -386,14 +386,18 @@ export async function prepareGoogle(
     {
         const inAudit = auditGoogleSignatures(Array.isArray(parsed.contents) ? parsed.contents : []);
         const outAudit = auditGoogleSignatures(rebuiltContents);
-        if (inAudit.signedCalls + inAudit.signedThoughts + outAudit.signedCalls + outAudit.signedThoughts > 0) {
-            session.metadata.googleModelSigns = true;
-        }
+        const modelSigns = session.metadata.googleModelSigns === true
+            || inAudit.signedCalls + inAudit.signedThoughts + outAudit.signedCalls + outAudit.signedThoughts > 0;
+        if (modelSigns) session.metadata.googleModelSigns = true;
         const unsignedIn = inAudit.unsignedCalls + inAudit.unsignedThoughts;
         const unsignedOut = outAudit.unsignedCalls + outAudit.unsignedThoughts;
-        const warnedTurns = typeof session.metadata.googleSigWarnedTurns === "number" ? session.metadata.googleSigWarnedTurns as number : 0;
-        if (unsignedOut > 0) session.metadata.googleSigWarnedTurns = warnedTurns + 1;
-        const decision = googleSigWarnDecision({ modelSigns: session.metadata.googleModelSigns === true, unsignedIn, unsignedOut, warnedTurns });
+        // The warn-cadence counter only matters on a model that signs its calls
+        // — for non-signing models unsigned parts are the normal state, and
+        // persisting a per-turn counter would perturb the session state the
+        // storage goldens pin (#5253).
+        let warnedTurns = typeof session.metadata.googleSigWarnedTurns === "number" ? session.metadata.googleSigWarnedTurns as number : 0;
+        if (modelSigns && unsignedOut > 0) session.metadata.googleSigWarnedTurns = ++warnedTurns;
+        const decision = googleSigWarnDecision({ modelSigns, unsignedIn, unsignedOut, warnedTurns });
         if (decision.warn) {
             log("warn", `[${sessionId}] [google-sig] forwarding ${unsignedOut} unsigned functionCall/thought part(s) (${outAudit.sites.join("; ") || "thought parts"}) to a model that signs its calls — upstream will reject with 400 'missing thought_signature'; ${decision.clientOrigin ? `${unsignedIn} arrived UNSIGNED in the client resend — bili forwards parts verbatim, so the loss is upstream of bili (host/plugin signature replay after history rework)` : "the client resent them SIGNED but bili's rebuild dropped the signature — bili-side defect, re-report with ACP_DUMP_BODY captures"} (#5253)`);
         }
