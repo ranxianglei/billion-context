@@ -39,7 +39,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
-import { perfTelemetryInit } from "./perf-telemetry.js";
+import { perfTelemetryInit, perfTelemetryReleaseIfBound } from "./perf-telemetry.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -3931,6 +3931,7 @@ export class SessionStore {
         await this.flushScheduledSaves();
         await this.store.flushAll();
         this.shadow?.close();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** #3406: drain the host-owned debounced saves before the kernel store's
@@ -3971,11 +3972,12 @@ export class SessionStore {
     /** Close the unified sidecar without flushing pending writes. Intended for
      *  short-lived stores (CLI export, one-shot loaders): cancels debounced
      *  writes first so nothing builds against a closed handle. Windows cannot
-     *  delete a directory while index.db is open, so leaking the handle pins
-     *  the caller's cleanup. Never throws. */
+     *  delete a directory while index.db (or perf.sqlite, #5460) is open, so
+     *  leaking the handle pins the caller's cleanup. Never throws. */
     closeQuietly(): void {
         this.cancelAll();
         this.shadow?.close();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** #3931 step 3: async twin of closeQuietly for network backends —
@@ -3987,6 +3989,7 @@ export class SessionStore {
         await this.ready();
         this.cancelAll();
         await this.shadow?.closeAsync();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
