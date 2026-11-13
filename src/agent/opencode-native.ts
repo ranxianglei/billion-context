@@ -5,20 +5,26 @@
 //   1. spawn the package's own proxy (`dist/index.js start`, ephemeral port,
 //      parent-pid watchdog = this opencode process) via ensureProxyRunning —
 //      a healthy compatible instance is ATTACHED, not doubled;
-//   2. register an http.request hook that rewrites model-API URLs to
-//      `<proxy>/bili/<full-upstream-url>` and stamps nothing else — header
+//   2. register an http.request hook that DISCOVERS the proxy per request
+//      (liveness gate below) and marks routing via state.proxyBase — header
 //      stamping / tools / compaction reporting all reuse the shared V2 setup
-//      (opencode-v2.ts), which detects the proxy through the env var set in
-//      step 1;
+//      (opencode-v2.ts); the actual URL rewrite to
+//      `<proxy>/bili/<full-upstream-url>` happens at FETCH time in the shared
+//      native intercept chain installed by setup() (#4276: opencode hands the
+//      same request object to every later hook — provider plugins included —
+//      so it must keep seeing the original upstream URL);
 //   3. set BILLION_CONTEXT_PROXY after bootstrap so tool execute() and the
 //      compaction reporter find the proxy through their existing env path.
 //
-// Why URL rewrite instead of pi's global fetch patch: opencode's plugins have
-// no fetch seam they can patch — the only observed egress hook is http.request
-// with the outgoing fetch Request at e.request. WHATWG Request.url is
-// read-only at runtime (verified live on 2.0.x, #810), so the request REFERENCE
-// is replaced with a new Request to `<proxy>/bili/<url>` carrying the same
-// method/headers/body.
+// #4276: this lane USED to rewrite the request REFERENCE in the http.request
+// hook (opencode plugins have no other egress seam; WHATWG Request.url is
+// read-only, verified live on 2.0.x, #810) — but opencode hands that same
+// mutated Request to EVERY later hook, including provider-ID-scoped hooks of
+// other plugins that validate the upstream URL (Kiro's response bridge,
+// Antigravity's base-URL guard), breaking them silently. Provider SDKs resolve
+// globalThis.fetch at call time (probed in the 2.0.x binary), so setup() now
+// installs pi's global fetch patch for V2 as well: the hook keeps
+// discovery/stamping/refusal, the chain owns the rewrite.
 //
 // Liveness gate (differs from pi by design): an http.request hook CANNOT
 // observe send failures (the host swallows them; #809 verification list), so
@@ -76,17 +82,17 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
-import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2PluginContext, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
-import { loadConfigFile } from "../config.js";
+import { loadConfigFile, zcodeDirectPrefixes } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
 // installInlineTransport is defined in pi-inline.ts but host-agnostic: any
 // request whose origin is INLINE_ORIGIN dispatches to the in-process engine.
@@ -261,8 +267,11 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
             return;
         }
         warned = false;
+        // #4276: discovery only — the fetch-time chain (installed in setup)
+        // rewrites this URL to `<target>/bili/<url>` when the host sends it.
+        // Mutating e.request here leaked the proxy URL into every later hook
+        // (provider plugins pattern-match upstream URLs and broke on it).
         s.proxyBase = target;
-        replaceRequestTarget(e, `${target}/bili/${url}`);
     };
 }
 
@@ -289,6 +298,9 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 // #3304: the opencode swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
 state.prepareDirectSend = createPrepareDirectSend();
+// #4276: providers.<url>.direct client-side exemptions apply to BOTH fetch
+// chains sharing this state (V1 server() + V2 setup) and to the V2 hook.
+state.directPrefixes = zcodeDirectPrefixes(process.env);
 // #5032: arm the guard's second window source — the V1 header stamp never runs
 // on the no-proxy path, so without this arm the reader was always empty there.
 state.declaredWindowForDirect = opencodeDeclaredWindowForDirect;
@@ -1000,7 +1012,21 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, onResponse: opencodeIncrementalOnHttpResponse }), server };
+const v2Setup = createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, directPrefixes: state.directPrefixes, onResponse: opencodeIncrementalOnHttpResponse });
+
+// #4276: V2 processes install the shared fetch chain too — routing happens at
+// fetch time so every later hook (provider plugins included) sees the original
+// upstream URL. Same guards as the V1 install in server(); skipped under
+// NODE_TEST_CONTEXT so test processes keep a pristine globalThis.fetch (tests
+// drive the chain explicitly through _resetForTest).
+async function setup(ctx: V2PluginContext): Promise<() => void> {
+    if (plan.mode !== "off" && process.env.NODE_TEST_CONTEXT === undefined && installNativeFetchIntercept(state)) {
+        logHostEvent("info", "[native-client]", "[bili-opencode-native] v2: fetch patch installed (routes model traffic at fetch time; provider plugins see original URLs)");
+    }
+    return v2Setup(ctx);
+}
+
+export default { id: "billion-context-opencode-native", setup, server };
 
 /** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
  *  http.request hook (routing + header stamping already happened, so the

@@ -1297,7 +1297,7 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 - **类型：** `boolean`
 - **默认值：** *（无 —— 路由走 bili）*
 - **状态：** ACTIVE
-- **说明：** 客户端侧路由豁免（#1622）：设为 `true` 时，这个上游在**客户端侧**永不被指向 bili。改写 provider store 的原生通道（目前是 ZCode）会跳过匹配的 provider 条目而非包装它们 —— 流量客户端 → 上游原样直达；与 [`passthrough`](#passthrough) 不同（后者仍在代理处终止）。匹配规则与其他 provider 字段相同（最长 URL 前缀），因此任何 lane 都能以同一方式遵守。用于必须看到客户端真实 origin 的上游（例如请求签名从 origin 派生的账号），或单纯不想让某 provider 走本机 bili 的场景：
+- **说明：** 客户端侧路由豁免（#1622、#4276、#5625）：设为 `true` 时，这个上游在**客户端侧**永不被指向 bili。改写 provider store 的原生通道（ZCode）会跳过匹配的 provider 条目而非包装它们；OpenCode V2 通道（native 与 launcher 入口）在自己的 `http.request` 钩子里把匹配的模型请求标记为 direct —— 不带 bili 身份头、不做增量 body 替换 —— 共享 fetch 链把请求原样直发、不经代理。无论哪种方式，流量都是客户端 → 上游原样直达；与 [`passthrough`](#passthrough) 不同（后者仍在代理处终止）。匹配规则与其他 provider 字段相同（URL 边界规则：精确匹配或 `<prefix>/`），因此任何 lane 都能以同一方式遵守。用于必须看到客户端真实 origin 的上游（例如请求签名从 origin 派生的账号），或单纯不想让某 provider 走本机 bili 的场景：
 
   ```jsonc
   {
