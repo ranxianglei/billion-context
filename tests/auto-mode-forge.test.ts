@@ -53,7 +53,12 @@ test("estimateCjkTokens: #2740 incident calibration — 2,669,226 chars billed 1
 
 const SEVERITY_SYS = "You are a safety classifier. 50 is exactly the allow/block boundary.";
 const BLOCK_SYS = 'Respond with <block>yes</block> or <block>no</block>.';
-const TRANSCRIPT_USER = [{ type: "text" as const, text: "<transcript>\n[user] run deploy\n[assistant] done\n</transcript>" }];
+// Realistic scale: the wrapper carries the ENTIRE flattened session — even the
+// smallest genuine one (a single classified-tool exchange rendered from CC's
+// jsonl envelope) is KB-scale. Sub-KB fixtures would paper over the #3908 span
+// floor and let quoted-artifact shapes through undetected.
+const BIG_TRANSCRIPT = "<transcript>\n" + "[user] run deploy\n[assistant] ok\n".repeat(40) + "</transcript>";
+const TRANSCRIPT_USER = [{ type: "text" as const, text: BIG_TRANSCRIPT }];
 
 test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences corroborated by the <transcript> wrapper", () => {
     assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
@@ -81,18 +86,23 @@ test("isAutoModeClassifier: no-stop shapes (stage-1-fast / stage-2) — policy w
     assert.ok(isAutoModeClassifier(req({
         system: "You are a safety classifier.",
         messages: [{ role: "user", content: [
-            { type: "text", text: "<transcript>…</transcript>" },
+            { type: "text", text: BIG_TRANSCRIPT },
             { type: "text", text: "Err on the side of blocking when uncertain." },
         ] }],
     })));
 });
 
-test("isAutoModeClassifier: marker inside a tool_result payload counts (messageTextOf walk)", () => {
-    assert.ok(isAutoModeClassifier(req({
+test("isAutoModeClassifier: policy wording in a tool_result payload does NOT count (#3908)", () => {
+    // Inverted from the pre-#3908 assertion: the one-shot classifier request
+    // carries no tool results, so executed output is outside the frame. Letting
+    // it count is exactly how a source snippet poisoned a whole session. The
+    // wrapper is a genuine-scale one so this pins PLACEMENT alone, independent
+    // of the span floor.
+    assert.ok(!isAutoModeClassifier(req({
         system: "You are a safety classifier.",
         messages: [{ role: "user", content: [
             { type: "tool_result", tool_use_id: "t1", content: "Review the classification process before finalizing." },
-            { type: "text", text: "<transcript>…</transcript>" },
+            { type: "text", text: BIG_TRANSCRIPT },
         ] }],
     })));
 });
@@ -103,6 +113,45 @@ test("isAutoModeClassifier: negatives — each signal alone is not enough", () =
     assert.ok(!isAutoModeClassifier(req({ system: SEVERITY_SYS })), "policy wording without transcript wrapper");
     assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["\n\n"] })), "unrelated stop sequence");
     assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })), "magic stop sequence without the transcript wrapper");
+});
+
+test("isAutoModeClassifier: #3908 regression — quoted source snippet in a tool_result no longer poisons the session", () => {
+    // The incident shape: a multi-turn session whose tool result carried
+    // src/auto-mode-forge.ts itself — "<transcript>" literal, the paired
+    // comment span, and "Err on the side of blocking" all in ONE payload. Every
+    // later request resends that history and matched forever.
+    const sourceSnippet = [
+        "// the flattened conversation rides in a <transcript>…</transcript> wrapper",
+        'const TRANSCRIPT_MARKER = "<transcript>";',
+        'const SHARED_POLICY_MARKERS = ["Err on the side of blocking"];',
+    ].join("\n");
+    const msgs: Array<{ role: string; content: unknown }> = [];
+    for (let i = 0; i < 30; i++) {
+        msgs.push({ role: "user", content: `turn ${i} question` });
+        msgs.push({ role: "assistant", content: `turn ${i} answer` });
+    }
+    msgs.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: sourceSnippet }] });
+    msgs.push({ role: "assistant", content: "continuing the task" });
+    assert.ok(!isAutoModeClassifier(req({ messages: msgs as AnthropicRequestBody["messages"] })), "poisoned multi-turn session");
+});
+
+test("isAutoModeClassifier: #3908 regression — sub-floor paired span in plain user text is not the wrapper", () => {
+    // Chat-paste variant of the same defect: both marker families in typed
+    // text, but the paired span is a comment-style ellipsis (1 char), far under
+    // the MIN_TRANSCRIPT_SPAN floor.
+    assert.ok(!isAutoModeClassifier(req({
+        messages: [{ role: "user", content: "look:\n<transcript>…</transcript>\nand remember: Err on the side of blocking." }],
+    })));
+});
+
+test("isAutoModeClassifier: magic stops still require a SUBSTANTIAL wrapper", () => {
+    // Pre-#3908, stops + a bare mention matched. A genuine stage-1 non-fast
+    // always wraps the full session, so sub-floor spans stay negative even with
+    // magic stops present.
+    assert.ok(!isAutoModeClassifier(req({
+        stop_sequences: ["</severity>"],
+        messages: [{ role: "user", content: "<transcript>…</transcript> please classify" }],
+    })));
 });
 
 // --- variant resolution ---

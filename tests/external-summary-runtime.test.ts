@@ -127,6 +127,61 @@ test("all candidates failing preserves state and refuses without borrowing main 
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
 });
 
+test("SSE framing overhead does not consume the summary content budget", async () => {
+    const text = "s".repeat(2000);
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "success", JSON.stringify(batch));
+        const result = batch.results[0];
+        if (result?.status === "success") assert.equal(result.summary, text);
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        for (const char of text) res.write(`data: ${JSON.stringify({ id: "synthetic", padding: "x".repeat(256), choices: [{ delta: { content: char }, finish_reason: null }] })}\n\n`);
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance remains bounded independently of summary content", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        // Valid SSE with a legal small summary: without the transport byte
+        // guard this succeeds, so parser rejection cannot satisfy the test.
+        res.end(`: ${"x".repeat(8 * 1024 * 1024)}\n\ndata: ${JSON.stringify({ choices: [{ delta: { content: SUMMARY }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance does not relax the summary content byte limit", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+        assert.equal(batch.results[0]?.attempts[0]?.outcome, "invalid_summary");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "s".repeat(2049) }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
 test("disabled setting preserves the legacy supplied-summary path without HTTP calls", async () => {
     let calls = 0;
     await fixture(async (_base, _externalSummary) => {
@@ -149,14 +204,65 @@ test("missing primary key skips its network call and tries the configured backup
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
-test("protected ranges cause no paid call and no fold", async () => {
+test("protected ranges return an idempotent no-op without a paid call", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.match(result.text, /^\[Compression no-op:/);
+        assert.equal(ctx.session.state.blocks.length, 0);
+        assert.equal(calls, 0);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("already-folded ranges return a no-op without another paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const input = args(ctx);
+        const first = await applyConfiguredCompression(input, ctx);
+        assert.equal(first.outcome, "applied", first.text);
+        const blockId = ctx.session.state.blocks[0]?.blockId;
+        assert.ok(blockId);
+        const again = await applyConfiguredCompression(input, ctx);
+        assert.equal(again.outcome, "applied", again.text);
+        assert.match(again.text, /^\[Compression no-op:/);
+        assert.match(again.text, /covered by active block/);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0]?.blockId, blockId);
+        assert.equal(calls, 1);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("restamped stale refs fold through the external summarizer, never under a probe summary", async () => {
+    const paths: string[] = [];
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // #4797 restamp shape: the model still cites a number vacated by the
+        // ledger alignment; the map holds old-ref -> raw id (message id) of
+        // the SAME message under its current label.
+        ctx.session.restampSuperseded = new Map([["m00999", "history"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0].summary, SUMMARY);
+        assert.deepEqual(paths, ["/primary"]);
+    }, (req, res) => { paths.push(req.url ?? ""); success(res); });
+});
+
+test("dead-end restamped refs keep the specific superseded-ref refusal without a paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // The vacated number's raw id lost its mapping entirely — an honest
+        // stale cite that translation cannot repair.
+        ctx.session.restampSuperseded = new Map([["m00999", "gone"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
         assert.equal(result.outcome, "refused");
+        assert.match(result.text, /re-numbered by the ledger alignment/);
         assert.equal(ctx.session.state.blocks.length, 0);
         assert.equal(calls, 0);
     }, (_req, res) => { calls++; success(res); });

@@ -457,7 +457,9 @@ describe("#2752: the shim's tools/call response carries structuredContent on the
         assert.ok(r.result, "a result object comes back");
         assert.notEqual(r.result!.isError, true, "partial is NOT an error on the wire");
         assert.equal(r.result!.content?.[0]?.text, `${PARTIAL_TEXT}\n${partialOutcomeNote(1)}`);
-        assert.deepEqual(r.result!.structuredContent, { outcome: "partial", blocksCreated: 1 });
+        // #3472: structuredContent also carries the full report text so
+        // structured-preferring hosts do not lose the receipt body.
+        assert.deepEqual(r.result!.structuredContent, { text: `${PARTIAL_TEXT}\n${partialOutcomeNote(1)}`, outcome: "partial", blocksCreated: 1 });
     });
 
     it("failure: isError true with its outcome still on structuredContent", async () => {
@@ -465,7 +467,8 @@ describe("#2752: the shim's tools/call response carries structuredContent on the
         const r = await client.request(2, "tools/call", { name: "decompress", arguments: { blockId: "b999" } });
         assert.ok(!r.error, `no JSON-RPC error: ${JSON.stringify(r.error)}`);
         assert.equal(r.result?.isError, true);
-        assert.deepEqual(r.result?.structuredContent, { outcome: "failure" });
+        // #3472: the failure receipt text rides structuredContent too.
+        assert.deepEqual(r.result?.structuredContent, { text: FAILURE_TEXT, outcome: "failure" });
     });
 
     it("legacy envelope: no structuredContent field at all", async () => {

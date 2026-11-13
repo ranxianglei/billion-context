@@ -12,7 +12,7 @@
 //      full-resend request with the marker removed — behavior equals the
 //      pre-incremental world for that turn.
 //
-// Wire contract: see PLUGIN.md "Incremental turns". Messages are raw wire
+// Wire contract: see docs/plugin-protocol.md "Incremental turns". Messages are raw wire
 // messages ({role, content: string | blocks[]}) — the lane derives stable
 // content ids server-side, so hosts without their own message ids work.
 
@@ -172,11 +172,44 @@ export interface IncrementalWireMessage {
     content: unknown;
 }
 
+/** #4491 host msgids: the host's stable message ids for the NEXT outgoing
+ *  request of a conversation, as (id, role) pairs in session order. Stashed
+ *  by the host-side extension event (it owns the sessionManager) and read
+ *  back by the fetch-layer planner (it owns the actually-sent messages);
+ *  the consumer aligns by count+role against the real wire set and refuses
+ *  the whole field on any mismatch — a misaligned id would pin the wrong
+ *  identity server-side, while a missing field merely falls back to
+ *  content-derived ids. */
+export interface HostMsgIdHintEntry {
+    id: string;
+    role: string;
+}
+
+const HOST_MSGID_HINT_TTL_MS = 30_000;
+const hostMsgIdHints = new Map<string, { entries: HostMsgIdHintEntry[]; at: number }>();
+
+/** Record the branch-entry (id, role) snapshot for a conversation's next
+ *  outgoing request. Overwrites per request — one hint per conversation,
+ *  always the generation of the payload being dispatched. */
+export function noteHostMsgIdHint(conversationId: string, entries: HostMsgIdHintEntry[]): void {
+    sweepStale(hostMsgIdHints, HOST_MSGID_HINT_TTL_MS);
+    hostMsgIdHints.set(conversationId, { entries, at: Date.now() });
+}
+
+/** The stashed hint for a conversation, or undefined when none is fresh. */
+export function hostMsgIdHintFor(conversationId: string): HostMsgIdHintEntry[] | undefined {
+    const entry = hostMsgIdHints.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= HOST_MSGID_HINT_TTL_MS) return undefined;
+    return entry.entries;
+}
+
 interface ConvState {
     /** Last server ack (x-bili-applied-seq) — flat message count. */
     sinceSeq: number;
     /** Wire hashes of everything the server has acknowledged, in order. */
     sent: string[];
+    /** Raw (cache_control-inclusive) wire hashes parallel to `sent` — detects decoration-only changes that must ride as retouch. */
+    sentRaw?: string[];
     /** Sticky system (JSON) we told the lane; resend only on change. */
     systemJson: string | undefined;
     /** Per-conversation kill switch after unrecoverable failures. */
@@ -185,8 +218,66 @@ interface ConvState {
 
 const convs = new Map<string, ConvState>();
 
+// #4491 host msgids: ids this client has already put on an envelope for the
+// conversation — the client-side mirror of the lane's canonical id set. The
+// lane HARD-FAILS a non-resync turn (400) whose msgIds reuse a live canonical
+// id ("msgIds reuse an existing canonical id"), so a delta candidate already
+// in this set degrades to "no field" instead of killing the request: the
+// realistic trigger is a host retry re-planning the same delta after the
+// first attempt may have landed server-side. A resync/seed replaces the set
+// wholesale, exactly like the server replaces the canonical.
+const msgidClaims = new Map<string, Set<string>>();
+
+/** Local mirror of the lane's validateMsgIds reject classes
+ *  (src/msgid-pin.ts — keep in sync; the host bundle must not import server
+ *  modules). The lane hard-fails a turn on a poisoned id array, so the host
+ *  screens candidates BEFORE they ride the envelope: anything the server
+ *  would reject degrades to "no field" here (content-derived ids) instead of
+ *  a 400 that kills the whole request. */
+const MSGID_MAX_LEN = 512;
+const MSGID_RESERVED_PREFIX = "acp_summary_";
+const MSGID_BAD_CHARS = /[\s\p{C}]/u;
+
+function screenMsgIds(ids: unknown): ids is string[] {
+    if (!Array.isArray(ids) || ids.length === 0) return false;
+    const seen = new Set<string>();
+    for (const v of ids) {
+        if (typeof v !== "string" || v.length === 0 || v.length > MSGID_MAX_LEN) return false;
+        if (v.startsWith(MSGID_RESERVED_PREFIX)) return false;
+        if (MSGID_BAD_CHARS.test(v)) return false;
+        if (seen.has(v)) return false;
+        seen.add(v);
+    }
+    return true;
+}
+
+/** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
+ *  Production callers use screenMsgIds directly. */
+export const _screenMsgIdsForTest = screenMsgIds;
+
+/** Delta-turn claim gate: undefined when any candidate id was already sent
+ *  on an earlier envelope of this conversation (the lane would 400 — see
+ *  msgidClaims); otherwise the ids are claimed and returned. */
+function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] | undefined {
+    const claims = msgidClaims.get(conversationId);
+    if (claims === undefined) {
+        msgidClaims.set(conversationId, new Set(ids));
+        return ids;
+    }
+    for (const id of ids) if (claims.has(id)) return undefined;
+    for (const id of ids) claims.add(id);
+    return ids;
+}
+
 const PROBE_TTL_MS = 30_000;
-const probeCache = new Map<string, { ok: boolean; at: number }>();
+const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; at: number }>();
+
+/** The optional envelope extension must be positively advertised by the server.
+ * Older servers ignore unknown fields, so sending retouches to them is unsafe. */
+export function incrementalCacheRetouchEnabled(proxyBase: string): boolean {
+    const cached = probeCache.get(proxyBase);
+    return cached !== undefined && cached.ok && cached.cacheControlRetouch && Date.now() - cached.at < PROBE_TTL_MS;
+}
 
 /** Probe the lane's incremental support. Cached per proxy base for 30s; any
  * error or non-200 → not enabled (older servers 404 the GET). */
@@ -195,16 +286,18 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     const cached = probeCache.get(proxyBase);
     if (cached && now - cached.at < PROBE_TTL_MS) return cached.ok;
     let ok = false;
+    let cacheControlRetouch = false;
     try {
         const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (res.ok) {
-            const body = await res.json() as { enabled?: unknown };
+            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown };
             ok = body.enabled === true;
+            cacheControlRetouch = body.cacheControlRetouch === true;
         }
     } catch {
         ok = false;
     }
-    probeCache.set(proxyBase, { ok, at: now });
+    probeCache.set(proxyBase, { ok, cacheControlRetouch, at: now });
     return ok;
 }
 
@@ -227,6 +320,28 @@ export function wireMessagesLookAnthropic(messages: unknown): messages is Increm
 
 function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
+}
+
+/** Content with block-level cache_control removed. Hosts that keep a rolling
+ *  breakpoint on the newest messages (OpenCode moves its ephemeral marks to
+ *  the last messages every request) change the bytes of already-acked
+ *  messages only by that decoration; alignment must ignore it or every turn
+ *  degrades into a full resync. */
+function contentWithoutCacheControl(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    let changed = false;
+    const out = content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return b;
+        changed = true;
+        const { cache_control: _drop, ...rest } = b as Record<string, unknown>;
+        return rest;
+    });
+    return changed ? out : content;
+}
+
+/** Alignment hash: the wire hash with cache_control decorations stripped. */
+function alignHash(m: IncrementalWireMessage): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(contentWithoutCacheControl(m.content))}`).digest("hex").slice(0, 16);
 }
 
 /** Public twin of the internal wire hash for boundary comparisons. The
@@ -277,6 +392,8 @@ type IncrementalPlan =
     | { mode: "skip" };                         // nothing to gain / state dead → full resend
 
 interface PlanArgs {
+    /** Only true after the server's capability probe advertised support. */
+    cacheControlRetouch?: boolean;
     conversationId: string;
     /** Forward path of the ORIGINAL request (the marker divert uses it);
      * optional — the lane defaults a bare `path` to /v1/messages. */
@@ -287,9 +404,18 @@ interface PlanArgs {
     /** Anthropic request params from the original body (model, max_tokens…);
      * optional — missing params ride the lane's defaults. */
     request?: Record<string, unknown>;
+    /** #4491: host-stable message ids aligned 1:1 with `messages` (same
+     *  length), or undefined when the host cannot vouch for every entry.
+     *  Carried onto the envelope as `msgIds` parallel to the messages the
+     *  mode actually sends (seed/resync: the full set; delta: the suffix),
+     *  so the server pins the client's identity instead of content-derived
+     *  hashes. All-or-nothing: a length mismatch, a screen failure, or an
+     *  already-claimed id drops the WHOLE field — never a partial or
+     *  misaligned array. */
+    msgIds?: string[];
 }
 
-function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean): string {
+function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: { index: number; message: IncrementalWireMessage }[]): string {
     // `request` is optional at the call sites (a host may plan with only
     // messages+system); missing params simply ride their lane defaults.
     const src = args.request ?? {};
@@ -305,6 +431,10 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
     };
     if (resync) body.resync = true;
     if (includeSystem) body.system = args.system === undefined ? null : args.system;
+    // #4491: only a provably-parallel, non-empty array rides the envelope —
+    // an empty delta (pure sticky-system update) pins nothing and stays off.
+    if (msgIds !== undefined && msgIds.length === messages.length && msgIds.length > 0) body.msgIds = msgIds;
+    if (retouch !== undefined && retouch.length > 0) body.retouch = retouch;
     return JSON.stringify(body);
 }
 
@@ -313,6 +443,9 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
 export function planIncrementalTurn(args: PlanArgs, forceResync = false): IncrementalPlan {
     const state = convs.get(args.conversationId);
     if ((state !== undefined && state.dead) || args.messages.length === 0) return { mode: "skip" };
+    // #4491: vouched ids must be exactly parallel to the outgoing set and
+    // pass the local screen; anything else means "no field" this turn.
+    const fullIds = args.msgIds !== undefined && args.msgIds.length === args.messages.length && screenMsgIds(args.msgIds) ? args.msgIds : undefined;
     const systemJson = args.system === undefined ? undefined : JSON.stringify(args.system);
     if (state === undefined || forceResync) {
         const includeSystem = state === undefined || systemJson !== state.systemJson;
@@ -322,31 +455,49 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         // empty (fresh conversation) or already live (interop with
         // full-resend traffic: the client's view is authoritative and
         // identical-or-newer). Only DELTA turns can 409.
-        return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem) };
+        if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
+        return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem, fullIds) };
     }
-    const hashes = args.messages.map(wireHash);
-    // Prefix alignment: everything previously acked must still lead the list.
+    const hashes = args.messages.map(alignHash);
+    // Prefix alignment: everything previously acked must still lead the list
+    // (cache_control decorations ignored — they ride as retouch below).
     const n = Math.min(state.sent.length, hashes.length);
     let aligned = true;
     for (let i = 0; i < n; i++) {
         if (state.sent[i] !== hashes[i]) { aligned = false; break; }
     }
     if (!aligned || hashes.length < state.sent.length) {
-        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson) };
+        if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
+        return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson, fullIds) };
     }
+    const retouch: { index: number; message: IncrementalWireMessage }[] = [];
+    if (state.sentRaw !== undefined && state.sentRaw.length === state.sent.length) {
+        for (let i = 0; i < state.sent.length; i++) {
+            if (state.sentRaw[i] !== wireHash(args.messages[i])) retouch.push({ index: i, message: args.messages[i] });
+        }
+    } else {
+        for (let i = 0; i < state.sent.length; i++) retouch.push({ index: i, message: args.messages[i] });
+    }
+    // An older server would accept but ignore retouch. Keep the original
+    // request on the normal path instead of forwarding stale cache marks.
+    if (retouch.length > 0 && args.cacheControlRetouch !== true) return { mode: "skip" };
     if (hashes.length === state.sent.length) {
         // Equal message set: normally a retry of the same turn → normal path.
         // But a SYSTEM change is still a real outgoing turn — send an empty
         // delta so the lane forwards the assembled request with the new
         // sticky system (the canonical itself is unchanged).
         if (systemJson !== state.systemJson) {
-            return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true) };
+            return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true, undefined, retouch) };
         }
         return { mode: "skip" }; // retry of the same turn → normal path
     }
+    const deltaIds = fullIds !== undefined ? claimableDeltaMsgIds(args.conversationId, fullIds.slice(state.sent.length)) : undefined;
+    // Acked messages whose bytes changed only by cache_control: send them
+    // whole so the server re-derives their breakpoints and the assembled
+    // request stays byte-identical to the host's full body.
     return {
         mode: "delta",
-        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson),
+        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson, deltaIds, retouch),
     };
 }
 
@@ -357,7 +508,8 @@ export function noteIncrementalAck(conversationId: string, appliedSeq: number, m
     rejectionCircuit.delete(conversationId);
     convs.set(conversationId, {
         sinceSeq: appliedSeq,
-        sent: messages.map(wireHash),
+        sent: messages.map(alignHash),
+        sentRaw: messages.map(wireHash),
         systemJson: system === undefined ? undefined : JSON.stringify(system),
         dead: false,
     });
@@ -411,4 +563,6 @@ export function __resetIncrementalClientForTests(): void {
     droppedParamWarned.clear();
     droppedParamWarnPairs = 0;
     originalBodies.clear();
+    hostMsgIdHints.clear();
+    msgidClaims.clear();
 }

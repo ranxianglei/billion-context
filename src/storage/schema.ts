@@ -63,7 +63,27 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-const STORAGE_SCHEMA_VERSION = 8;
+//      - v10: immutable per-message local time-of-occurrence (#4313) —
+//        messages gains nullable `ts` (epoch ms, stamped once at ingest,
+//        never updated). No backfill: pre-feature rows stay NULL and keep
+//        rendering without the tag's time attribute. Same both-directions
+//        compatibility as v5 (older build ignores, newer build ALTERs).
+//      - v11: FK child indexes on content.hash (#5539) — every column that
+//        REFERENCES content(hash) gains its own index: messages(content_hash),
+//        blocks(one_hash), blocks(summary_hash), ccr_entries(content_hash),
+//        message_media(media_hash), checkpoints(state_hash). With
+//        foreign_keys=ON, deleting a parent content row must prove no child
+//        row still references it; without an index on the child column
+//        SQLite full-scans the whole child table once PER deleted parent row.
+//        releaseContent() removes one parent per released hash (~3K/turn on a
+//        busy session), so every turn paid ~3K × 6 full scans — field report
+//        #5539: 20–35 s/turn at ~18K messages, 4–5 s after adding the five
+//        child indexes he listed (checkpoints.state_hash is this fix's sixth,
+//        same mechanism, missed by the field audit). Same idempotent-CREATE
+//        discipline as v9 (#4796); building them once costs about what
+//        open-time quick_check pays on EVERY open (#4175). Additive-only: an
+//        older build opening a v11 file ignores the extra indexes.
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -82,22 +102,29 @@ export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
  *  short-lived openers (export fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
     return [
+        // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
+        // back to the filesystem by `PRAGMA incremental_vacuum`
+        // (gc({vacuum:"incremental"})) without the offline full rewrite.
+        // MUST stay FIRST: SQLite only honours auto_vacuum while the database
+        // file is still empty, and switching to WAL already writes page 1 —
+        // set after journal_mode, a brand-new index.db silently stays at
+        // auto_vacuum=0 and incremental_vacuum reclaims nothing. On an
+        // existing file the pragma only arms the mode for this connection's
+        // next full VACUUM: a database created with auto_vacuum=0 keeps that
+        // layout until a one-time gc({vacuum:"full"}) / ?vacuum=full.
+        "PRAGMA auto_vacuum = INCREMENTAL",
         "PRAGMA journal_mode = WAL",
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
         `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
-        // #3901/#3463: freed pages return to the pool incrementally so an
-        // archive/GC sweep actually shrinks the file going forward. Databases
-        // created before this pragma keep their original layout until a
-        // one-time full VACUUM (gc({vacuum:"full"}) / ?vacuum=full).
-        "PRAGMA auto_vacuum = INCREMENTAL",
     ];
 }
 
 export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 
 import { identityOfStoredContent } from "./identity.js";
+import { log as loggerLog } from "../logger.js";
 
 const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
@@ -143,6 +170,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash    TEXT NOT NULL REFERENCES content(hash),
     identity        TEXT NOT NULL DEFAULT '',
     retired_at      INTEGER,
+    ts              INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -270,6 +298,17 @@ CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_dead_refs_session ON dead_refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_refs_session ON refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, created_at);
+-- FK child indexes (#5539): with foreign_keys=ON, every DELETE from the
+-- content parent proves no child row still references it by scanning each
+-- child table UNLESS the child's ref column is indexed. releaseContent()
+-- removes one parent per released hash (~3K/turn), so unindexed = ~3K × 6
+-- full scans per turn (field: 20–35 s/turn at ~18K messages).
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
+CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
+CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -281,6 +320,7 @@ export function migrateSchema(db: {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
+    let needV8Backfill = false;
     db.transaction(() => {
         if (from < 1) db.exec(STORAGE_DDL_V1);
         if (from < 2) {
@@ -358,69 +398,163 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE messages ADD COLUMN retired_at INTEGER");
             }
             db.exec("CREATE INDEX IF NOT EXISTS idx_messages_identity ON messages (session_id, msg_id, identity)");
-            // Backfill from stored bytes, healing the wireIndex-split
-            // generations the polluted formula minted: same (msg_id,
-            // identity) after the strip → keep the FIRST arrival (lowest
-            // seq), drop the later duplicates and hand their CAS refs back.
-            // Message bytes live in the content CAS (messages carry only the
-            // hash) — join in, decompress nothing (bytes are stored raw).
-            const rows = db
-                .prepare("SELECT m.session_id AS session_id, m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS content FROM messages m JOIN content c ON c.hash = m.content_hash")
-                .all() as { session_id: string; seq: number; msg_id: string; content: string; content_hash: string }[];
-            const keep = new Map<string, { session_id: string; seq: number; content_hash: string }>();
-            const drop: { session_id: string; seq: number; content_hash: string }[] = [];
-            const rawByIdentityKey = new Map<string, string>();
-            for (const r of rows) {
-                // node:sqlite returns BLOB as Uint8Array — normalize to utf8
-                // before hashing (JSON.parse would coerce it to a comma list
-                // and silently hash the wrong input).
-                const raw = typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8");
-                const identity = identityOfStoredContent(raw);
-                rawByIdentityKey.set(`${r.session_id}\u0000${r.msg_id}\u0000${identity}`, raw);
-                const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
-                const seen = keep.get(key);
-                if (seen === undefined) {
-                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
-                } else if (r.seq < seen.seq) {
-                    // an earlier arrival discovered late — swap the keeper
-                    drop.push({ session_id: seen.session_id, seq: seen.seq, content_hash: seen.content_hash });
-                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
-                } else {
-                    drop.push({ session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
-                }
-            }
-            const identityBySeq = new Map<string, string>();
-            for (const r of rows) {
-                const raw = rawByIdentityKey.get(`${r.session_id}\u0000${r.msg_id}\u0000${identityOfStoredContent(typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"))}`) ?? (typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"));
-                const identity = identityOfStoredContent(raw);
-                const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
-                if (keep.get(key)?.seq === r.seq) identityBySeq.set(`${r.session_id}\u0000${r.seq}`, identity);
-            }
-            const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
-            for (const [k, identity] of identityBySeq) {
-                const [sessionId, seqStr] = k.split("\u0000");
-                upd.run(identity, sessionId, Number(seqStr));
-            }
-            // Duplicates: delete their media mappings + message rows and
-            // decrement CAS refcounts (delete referencing rows FIRST — the
-            // #4242 discipline; refcount may reach 0, the next gc run
-            // collects those content rows).
-            const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ?");
-            const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
-            const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
-            const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
-            for (const d of drop) {
-                for (const mm of mediaOf.all(d.session_id, d.seq) as { media_hash: string }[]) {
-                    decRef.run(mm.media_hash);
-                }
-                delMedia.run(d.session_id, d.seq);
-                delMsg.run(d.session_id, d.seq);
-                decRef.run(d.content_hash);
+            // The identity backfill runs AFTER this transaction (see
+            // migrateV8Identities below), one session per transaction:
+            // v0.1.207 loaded EVERY message's content bytes into memory in a
+            // single .all() here inside one transaction, so multi-GB stores
+            // OOM'd on first open — and because the user_version bump sat in
+            // the same transaction, every subsequent open re-ran the whole
+            // migration and re-OMM'd: permanently unopenable stores (#4677).
+            needV8Backfill = true;
+        }
+        if (from < 9) {
+            // v9 zero-ref collection index (#4796): gc()'s sweep and the
+            // dry-run count address content BY refcount — without this index
+            // every run full-scans the CAS table. Field report: 766K rows /
+            // ~20 GB, one uncommitted `DELETE ... WHERE refcount <= 0` ran
+            // 8 hours with zero committed rows, its WAL frames could never
+            // checkpoint, and the held write lock starved live proxies. The
+            // index makes candidate selection an index range scan; building
+            // it once on an already-bloated db costs about what open-time
+            // quick_check pays on EVERY open (#4175). Idempotent CREATE so a
+            // dev-window lib that already carried it re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
+        }
+        if (from < 10) {
+            // v10 (#4313): immutable message wall-clock stamp. Nullable, no
+            // backfill — pre-feature rows read NULL and render without the
+            // time attribute (legacy bytes unchanged). Probe-first like v8.
+            const tsCols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!tsCols.includes("ts")) {
+                db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
         }
-        db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
+        if (from < 11) {
+            // v11 (#5539): FK child indexes on content.hash — see the header
+            // note and the DDL comment above for the mechanism and field
+            // evidence. Idempotent CREATEs, same discipline as v9; a
+            // dev-window lib that already carried them re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
+        }
     });
+    if (needV8Backfill) migrateV8Identities(db);
+    db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     return { from, to: STORAGE_SCHEMA_VERSION };
+}
+
+/** Same v7 shape as the wireIndex-split generations the polluted formula
+ *  minted: same (msg_id, identity) after the strip → keep the FIRST arrival
+ *  (lowest seq), drop the later duplicates and hand their CAS refs back —
+ *  but streamed one session per transaction (#4677): a crash between sessions
+ *  leaves the done sessions committed and user_version still 7, so the next
+ *  open skips them (no rows with identity = '') and resumes; memory holds one
+ *  page window + one session's keeper keys, never the store's bytes. Rows
+ *  whose content bytes are missing from the CAS get the ABSENT marker — a
+ *  "absent:" prefix — a string no sha256 hex output can equal (it carries a
+ *  ':' and is shorter than 64 hex chars), so their session terminates
+ *  instead of rescanning forever; joins treat it exactly like the v0.1.207
+ *  leftover '' (neither can match a live-computed identity). Printable on
+ *  purpose: node:sqlite truncates bound strings at an embedded NUL, so the
+ *  \u0000-shaped marker silently bound as '' — the row looked unmigrated
+ *  forever and got rescanned on every open. */
+const ABSENT_IDENTITY = "absent:";
+const V8_BACKFILL_PAGE = 500;
+
+function migrateV8Identities(db: {
+    exec(sql: string): void;
+    prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[]; run(...a: unknown[]): unknown };
+    transaction<T>(fn: () => T): T;
+}): void {
+    const sessions = db.prepare("SELECT DISTINCT session_id FROM messages WHERE identity = ''").all() as { session_id: string }[];
+    if (sessions.length === 0) return;
+    // Backfilling a multi-GB store takes minutes-to-hours — log start,
+    // steady-state progress and completion so a slow first open reads as
+    // "migrating", not "hung" (#4677 fix direction 4).
+    loggerLog(
+        "info",
+        `[storage] schema v8 migration: streaming identity backfill over ${sessions.length} session(s), one transaction per session (resumable — committed sessions are not reprocessed after a crash)`,
+    );
+    const total = sessions.length;
+    let done = 0;
+    const page = db.prepare(
+        "SELECT m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS content " +
+            "FROM messages m LEFT JOIN content c ON c.hash = m.content_hash " +
+            "WHERE m.session_id = ? AND m.identity = '' AND m.seq > ? ORDER BY m.seq LIMIT ?",
+    );
+    const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
+    const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0");
+    const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+    const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
+    const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
+    try {
+        for (const s of sessions) {
+            const keep = new Set<string>();
+            const updates: { seq: number; identity: string }[] = [];
+            const drops: { seq: number; content_hash: string }[] = [];
+            let cursor = -1;
+            for (;;) {
+                const rows = page.all(s.session_id, cursor, V8_BACKFILL_PAGE) as {
+                    seq: number;
+                    msg_id: string;
+                    content_hash: string;
+                    content: string | Uint8Array | null;
+                }[];
+                if (rows.length === 0) break;
+                for (const r of rows) {
+                    cursor = r.seq;
+                    // node:sqlite returns BLOB as Uint8Array — normalize to utf8
+                    // before hashing (JSON.parse would coerce it to a comma list
+                    // and silently hash the wrong input).
+                    const identity =
+                        r.content == null
+                            ? ABSENT_IDENTITY
+                            : identityOfStoredContent(
+                                  typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"),
+                              );
+                    const key = `${r.msg_id}\u0000${identity}`;
+                    if (keep.has(key)) drops.push({ seq: r.seq, content_hash: r.content_hash });
+                    else {
+                        keep.add(key);
+                        updates.push({ seq: r.seq, identity });
+                    }
+                }
+                if (rows.length < V8_BACKFILL_PAGE) break;
+            }
+            // One transaction per session: keepers get their identity, the later
+            // duplicates hand their media mappings + message rows + CAS refs back
+            // (delete referencing rows FIRST — the #4242 discipline; refcount may
+            // reach 0, the next gc run collects those content rows). The > 0
+            // floor on decRef mirrors the releaseContent guards so an
+            // already-corrupt ledger cannot go negative during migration.
+            db.transaction(() => {
+                for (const u of updates) upd.run(u.identity, s.session_id, u.seq);
+                for (const d of drops) {
+                    for (const mm of mediaOf.all(s.session_id, d.seq) as { media_hash: string }[]) {
+                        decRef.run(mm.media_hash);
+                    }
+                    delMedia.run(s.session_id, d.seq);
+                    delMsg.run(s.session_id, d.seq);
+                    decRef.run(d.content_hash);
+                }
+            });
+            done += 1;
+            if (done % 100 === 0 || done === total) {
+                loggerLog("info", `[storage] schema v8 migration: ${done}/${total} session(s) backfilled`);
+            }
+        }
+    } catch (err) {
+        loggerLog(
+            "error",
+            `[storage] schema v8 migration failed after ${done}/${total} session(s) — committed sessions keep their progress and the migration resumes automatically on the next open (no data loss, no need to touch user_version by hand). Error: ${String(err)}`,
+        );
+        throw err;
+    }
 }
 
 /** Test-only alias of the fresh-install DDL (unused-export gate: INTERNAL_ONLY

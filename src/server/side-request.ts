@@ -3,7 +3,7 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
-import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
@@ -115,6 +115,168 @@ export function isDshTitleRequest(parsed: unknown): boolean {
     return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
 }
 
+// #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
+// classifyRisk()) fires before every native tool call under the Auto permission
+// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
+// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
+// no tools, same conversation id as the main turn. On at least one deployment
+// class (web profile behind a gateway) the extension's own model client reaches
+// bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
+// keeps the #2432 rebase gate armed for it: every header-gated isolation gate
+// (persona fork #1916, title clause #2503) misses the request, the blob rides
+// the raw main key through the FULL pipeline, its embedded old-checkpoint
+// framing false-positives the local-compaction carrier (#2621 class, total fold
+// state wipe), and its usage sample clobbers the main baseline so the next turn
+// skips the output clamp (#453) into permanent upstream 400s.
+// Shape-decisive WITHOUT a caller-side header gate — deliberately different from
+// isDshTitleRequest's discipline: the shape carries its own client evidence
+// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
+// gate is precisely what failed here. A main turn can never match: it carries a
+// tools surface and multi-turn history; the single-blob bar rejects every
+// history-replaying request.
+export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn, not the reviewer's one-shot call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // The fixed reviewer policy on ANY wire's system carrier (top-level system,
+    // instructions, systemInstruction.parts, or a role:system entry in
+    // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
+    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    // Exactly ONE non-system message with content: the freshly-flattened review
+    // snapshot. A replayed history (any assistant/tool turn or a second user
+    // message) vetoes — see the comment above the constant.
+    return users === 1 && userHasContent;
+}
+
+// #5656/#5584: dsh's per-feature sidecar pins above (title #2503, auto-review
+// #4438) are whack-a-mole — every NEW one-shot sidecar dsh ships around the
+// main conversation (prompt-enhance in #5656: "请重写以下提示词…" rewrites the
+// user's input before sending) arrives under the SAME conversation id, with
+// its OWN system prompt, no tools, one user blob — and misses every pinned
+// prefix. If it fires before the first main turn it CLAIMS the raw-key anchor
+// (first-seen-instructions semantics), exiling the real conversation onto
+// `<id>|sub:<fp>` for the session lifetime: the host-stamped management calls
+// (compress / acp_status) resolve the bare id, see the 1-message ghost, never
+// match a ref, trip the circuit breaker — compression is permanently dead and
+// the context grows unbounded (the session-drift explosion family; 11 of 13
+// sessions on the reporter's machine, feeding #5671's terminal 7.3×-window
+// deaths). This is the STRUCTURAL close: the two things a one-shot sidecar can
+// never fake, per #546 ("a non-empty tools array marks an agent MAIN turn") and
+// #4438's replay veto — NO action surface (tools absent/empty; dsh's own
+// request builder emits no tools key only when the resolved tool set is
+// empty, agent-loop buildRequest) and a single-shot body (exactly ONE
+// non-system message with content, no assistant/tool turn anywhere). System
+// text is deliberately NOT pinned: the next sidecar must not reopen the hole.
+// A non-empty system carrier is REQUIRED so the kernel's empty-instructions
+// path (aux calls riding the main session through the full pipeline, pinned in
+// tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
+// Residual, accepted: a tool-less MAIN turn 1 matches the single-shot shape and
+// rides the verbatim side lane for that one turn (tiny — nothing to compress);
+// turn 2+ replays history and rejoins the full pipeline. The caller must gate
+// on the dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // A sidecar carries its own persona; an empty system is the kernel's
+    // empty-instructions path, not this gate's business.
+    if (!systemCarrierTexts(p).some((t) => t.trim().length > 0)) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    return users === 1 && userHasContent;
+}
+
+// #5135: Claude Code's session-title sidecar (terminal CLI, proxy mode — no
+// x-bili-plugin stamp). It fires at session start UNDER THE SAME
+// x-claude-code-session-id as the first main turn, ~1ms ahead of it. Field
+// shape (0.1.209, three machines): a single user message wrapping the first
+// prompt in \x3csession\x3e…\x3c/session\x3e, no tools, an output budget past
+// the <=200 heuristic, and its OWN system prompt — so pre-fix it entered the
+// #4774 order resolver on the virgin id and CLAIMED the raw key as kernel
+// anchor; the main turn then arrived tagChanged and history-disjoint and
+// forked onto a |sub:<fp> lane for the session lifetime (#2156 form: side
+// requests must never claim the anchor). A main turn can never match: it
+// carries a tools surface and multi-turn history; the one-entry bar rejects
+// every history-replaying request. The caller must gate on
+// claudeAnthropicPersonaOrderApplies (evidence-per-client discipline): the
+// wrapper alone is not client proof.
+export const CLAUDE_CODE_TITLE_SESSION_TAG = "\x3csession\x3e";
+
+export function isClaudeCodeTitleRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    // Exactly ONE entry total: on the anthropic wire the system rides top-level,
+    // so any extra messages[] row (a role:system entry included) is a replayed
+    // history, not the one-shot title call.
+    if (!Array.isArray(entries) || entries.length !== 1) return false;
+    const entry = entries[0];
+    if (entry === null || typeof entry !== "object") return false;
+    const rec = entry as Record<string, unknown>;
+    if (rec.role !== "user") return false;
+    if (rec.type !== undefined && rec.type !== "message") return false;
+    const c = rec.content ?? rec.parts;
+    let text = "";
+    if (typeof c === "string") {
+        text = c;
+    } else if (Array.isArray(c)) {
+        for (const b of c) {
+            if (b !== null && typeof b === "object" && typeof (b as Record<string, unknown>).text === "string") {
+                text += (b as Record<string, unknown>).text as string;
+            }
+        }
+    }
+    return text.trimStart().startsWith(CLAUDE_CODE_TITLE_SESSION_TAG);
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the
@@ -186,6 +348,10 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
 // guaranteed bili-owned, and any host tool vetoes the demotion.
 export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...ACP_TOOL_NAMES,
+    // #5765: block ops are opt-in but kernel-fixed (no rename surface) —
+    // bili-owned names, so they count toward the "entire array is bili's set"
+    // structural signal like the other kernel-fixed ACP names.
+    ...BLOCK_OP_TOOL_NAMES,
     ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
@@ -457,7 +623,7 @@ export function restoreOutputBudget(
         clearNoCeilingDegraded(session, modelName);
         // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
         // collapse from intent here, so forward verbatim but surface the gap once.
-        if (dshLane === true && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
+        if (dshLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
             log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
         }
         return;

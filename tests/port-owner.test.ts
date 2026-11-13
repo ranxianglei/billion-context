@@ -4,7 +4,8 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { findForeignOwner, mayClobberPointer, probeOwnerInfo, resolvePortClaim, type HealthFetcher } from "../src/port-owner.ts";
+import { Agent, fetch as directFetch } from "undici";
+import { findForeignOwner, holderHintFragment, holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, type HealthFetcher } from "../src/port-owner.ts";
 import { atomicWriteInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "../src/instance.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -256,4 +257,80 @@ test("mayClobberPointer: end-to-end through the real proxy-origin file", async (
         else process.env.XDG_STATE_HOME = prev;
         await rmrf(dir);
     }
+});
+
+// ── #4762: EADDRINUSE holder diagnostics (serving vs wedged/dead) ──────────
+
+test("holderProbeOrigin: wildcard binds probe through loopback (#4762)", () => {
+    assert.equal(holderProbeOrigin("127.0.0.1", 18789), "http://127.0.0.1:18789");
+    assert.equal(holderProbeOrigin("0.0.0.0", 18789), "http://127.0.0.1:18789");
+    assert.equal(holderProbeOrigin("::", 18789), "http://127.0.0.1:18789");
+});
+
+test("holderProbeOrigin: IPv6 literals remain valid URL authorities", () => {
+    assert.equal(holderProbeOrigin("::1", 18789), "http://[::1]:18789");
+    assert.equal(holderProbeOrigin("2001:db8::1", 18789), "http://[2001:db8::1]:18789");
+    assert.equal(holderProbeOrigin("[::1]", 18789), "http://[::1]:18789");
+    assert.equal(holderProbeOrigin("localhost", 18789), "http://localhost:18789");
+});
+
+test("probeHolderForHint: a healthy IPv6 listener is not diagnosed as wedged", async () => {
+    const server = http.createServer((req, res) => {
+        assert.equal(req.url, "/__bili/health");
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true, pid: FOREIGN_PID, instanceId: "ipv6-holder" }));
+    });
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "::1", resolve);
+    });
+    const port = (server.address() as { port: number }).port;
+    const dispatcher = new Agent();
+    try {
+        const hint = await probeHolderForHint({
+            origin: holderProbeOrigin("::1", port),
+            fetchImpl: (url, init) => directFetch(url, { signal: init?.signal, dispatcher }),
+        });
+        assert.match(hint, /answered \/__bili\/health \(pid 4242424\)/);
+        assert.doesNotMatch(hint, /wedged or dead|kill it/);
+    } finally {
+        await dispatcher.close();
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("holderHintFragment: serving vs wedged/dead wording, with and without a pid (#4762)", () => {
+    const serving = holderHintFragment(true, 4242);
+    assert.match(serving, /answered \/__bili\/health \(pid 4242\)/);
+    assert.match(serving, /spawner should attach to it/);
+    // #5907: the serving branch names the expected duplicate-instance outcome
+    // and cross-references a nearby [split-brain] notice so the EADDRINUSE +
+    // split-brain log pair reads as routine host-relaunch churn, not fatal.
+    assert.match(serving, /expected duplicate-instance outcome when a host relaunches/);
+    assert.match(serving, /no action is needed/);
+    assert.match(serving, /\[split-brain\] notice near these timestamps names this exiting pid/);
+    assert.match(serving, /not data corruption in progress/);
+    const wedged = holderHintFragment(false, 4242);
+    assert.match(wedged, /did NOT answer \/__bili\/health within 2s/);
+    assert.match(wedged, /wedged or dead/);
+    assert.match(wedged, /taskkill \/PID 4242/);
+    assert.match(wedged, /kill it to free the port/);
+    assert.match(wedged, /\(#4762\)/);
+    const anonymous = holderHintFragment(false);
+    assert.doesNotMatch(anonymous, /taskkill/);
+    assert.match(anonymous, /netstat\/lsof on the port/);
+});
+
+test("probeHolderForHint: live responder pid beats stale registry pid; unresponsive reads as not serving (#4762)", async () => {
+    const live = await probeHolderForHint({ origin: "http://127.0.0.1:1", knownPid: 99, fetchImpl: healthFetch({ ok: true, pid: 7 }) });
+    assert.match(live, /answered \/__bili\/health \(pid 7\)/);
+    assert.doesNotMatch(live, /pid 99/);
+    const throwing: HealthFetcher = async () => { throw new Error("ECONNREFUSED"); };
+    const dead = await probeHolderForHint({ origin: "http://127.0.0.1:1", knownPid: 99, fetchImpl: throwing });
+    assert.match(dead, /did NOT answer \/__bili\/health/);
+    assert.match(dead, /taskkill \/PID 99/);
+    const starting: HealthFetcher = async () => ({ ok: false, json: async () => ({ ok: false, reason: "starting" }) });
+    const pre = await probeHolderForHint({ origin: "http://127.0.0.1:1", knownPid: 99, fetchImpl: starting });
+    assert.match(pre, /did NOT answer \/__bili\/health/);
 });

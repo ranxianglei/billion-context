@@ -204,9 +204,60 @@ test("deterministicDigest: falls back through forms until both bounds fit", () =
     const out = deterministicDigest(entries, "m00001", "m00008", {
         maxSummary: 300, minSummaryLength: 50, shrinkBound: 300, countText: (t: string) => t.length,
     });
-    assert.ok(out.length <= 300, `header-only form fits maxSummaryLength (got ${out.length})`);
+    assert.ok(out.length <= 300, `form fits maxSummaryLength (got ${out.length})`);
     assert.ok(out.startsWith("[deterministic digest m00001:m00008]"));
-    assert.ok(!out.includes("\n"), "per-entry lines were dropped");
+    assert.ok(!out.includes("[m00001 user]"), "per-entry lines were dropped");
+    assert.ok(out.includes("Structure:"), "#4224: structural conclusion survives when per-entry lines drop");
+});
+
+test("deterministicDigest: #4224 dynamic head trimming keeps short excerpts for large spans", () => {
+    const entries = Array.from({ length: 150 }, (_, i) => ({
+        ref: `m${String(10000 + i).padStart(5, "0")}`,
+        label: "assistant tool-call bash",
+        text: `echo hello world number ${i} ` + "x".repeat(200),
+    }));
+    const out = deterministicDigest(entries, "m10000", "m10149", {
+        maxSummary: 20_000, minSummaryLength: 50, shrinkBound: 100_000, countText: (t: string) => t.length,
+    });
+    assert.ok(out.length <= 20_000, `digest fits maxSummaryLength (got ${out.length})`);
+    assert.ok(out.includes("Structure:"), "structural conclusion present");
+    assert.ok(out.includes("×bash"), "tool verb counted in structure");
+    assert.ok(out.includes(":: "), "per-entry excerpts present (not dropped entirely)");
+    const headMatch = / :: (.+?)(?:\n|$)/.exec(out.split("\n").find((l) => l.includes(":: ")) ?? "");
+    assert.ok(headMatch && headMatch[1].length < 120, `head trimmed below 120 chars (got ${headMatch?.[1]?.length})`);
+});
+
+test("deterministicDigest: #4224 structure counts merge a tool call with its result under one verb", () => {
+    const entries = [
+        { ref: "m00001", label: "assistant tool-call bash", text: "ls -la" },
+        { ref: "m00002", label: "tool result bash", text: "total 8" },
+        { ref: "m00003", label: "assistant tool-call read", text: "path/a.ts" },
+        { ref: "m00004", label: "tool result read", text: "const x = 1;" },
+        { ref: "m00005", label: "user", text: "go" },
+    ];
+    const out = deterministicDigest(entries, "m00001", "m00005", {
+        maxSummary: 20_000, minSummaryLength: 50, shrinkBound: 100_000, countText: (t: string) => t.length,
+    });
+    const struct = out.split("\n").find((l) => l.startsWith("Structure:"));
+    assert.ok(struct, "structure line present");
+    assert.ok(struct.includes("2\u00d7bash"), `bash call and its result merged under one verb (got: ${struct})`);
+    assert.ok(struct.includes("2\u00d7read"), `read call and its result merged under one verb (got: ${struct})`);
+    assert.ok(struct.includes("1\u00d7user"), `plain role kept as-is (got: ${struct})`);
+    assert.ok(!struct.includes("tool result"), "no raw 'tool result <verb>' category leaks into the counts");
+});
+
+test("deterministicDigest: extreme bounds still fall back to header-only", () => {
+    const entries = Array.from({ length: 8 }, (_, i) => ({
+        ref: `m${String(i + 1).padStart(5, "0")}`,
+        label: "user",
+        text: "z".repeat(1000),
+    }));
+    const out = deterministicDigest(entries, "m00001", "m00008", {
+        maxSummary: 240, minSummaryLength: 50, shrinkBound: 240, countText: (t: string) => t.length,
+    });
+    assert.ok(out.length <= 240, `header-only form fits (got ${out.length})`);
+    assert.ok(out.startsWith("[deterministic digest m00001:m00008]"));
+    assert.ok(!out.includes("\n"), "structure line also dropped at extreme bounds");
 });
 
 test("deterministicDigest: pathological bounds yield a padded marker at the minimum length", () => {

@@ -376,8 +376,9 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
  *  partial note in `text`. Absent on legacy envelopes without the fields. */
 export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
-    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false, toolCallId?: string): Promise<ForwardedToolResult> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string } = { conversationId, tool, args: args ?? {} };
+    if (toolCallId !== undefined) body.toolCallId = toolCallId;
     // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
     // by the host's own session manager — declare it so a stale sibling witness
     // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
@@ -428,9 +429,13 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
 
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
- *  conversation not seen yet" — an armed-but-idle state, not an error. */
-export async function fetchProxyVersion(proxyBase: string): Promise<string | undefined> {
-    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, STATUS_TIMEOUT_MS);
+ *  conversation not seen yet" — an armed-but-idle state, not an error.
+ *  #5167: `init` lets callers send Connection: close so the probe rides a
+ *  FRESH connection — the drain-aware rotation wait relies on it (a pooled
+ *  keep-alive socket keeps being answered by a resident that already closed
+ *  its listener and is merely draining, which reads as a false "alive"). */
+export async function fetchProxyVersion(proxyBase: string, init?: RequestInit): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;
     const m = json as { version?: unknown; commit?: unknown };
     const version = m.version;
@@ -486,8 +491,8 @@ export const V2_SYNTHETIC_TEXT = "[bili-acp-status] ACP status panel was display
 
 /** Armed-but-idle /acp notice (proxy live, no model request sent yet). One
  *  source of truth for pi / dsh / opencode (#883). */
-export function armedIdleNotice(version: string): string {
-    return `billion-context@${version} — proxy connected, compression armed. No model request yet; send one, then run /acp again.`;
+export function armedIdleNotice(version: string, base?: string): string {
+    return `billion-context@${version} — proxy connected${base ? ` via ${base}` : ""}, compression armed. No model request yet; send one, then run /acp again.`;
 }
 
 /** Fallback when the version probe also fails — a warning, not an info notice. */

@@ -45,7 +45,7 @@ import { USER_IMAGE_PLACEHOLDER, normalizeMessageText } from "./fold-reconcile.j
  * conversation, truncated replay" from "a different conversation quoting
  * shared content" (templated tool outputs, standard files, stock errors —
  * parallel agents on one codebase produce these naturally). Removed in
- * #1115; rejected alternatives are documented in SESSION-IDENTITY.md.
+ * #1115; rejected alternatives are documented in docs/session-identity.md.
  *
  * Safety: matching a stored chain requires holding a byte-identical HEAD, so
  * the folded state reveals nothing the requester does not already hold.
@@ -134,16 +134,9 @@ export interface AnonymousAffinity {
     /** Lineage for a NEW session: the discarded match candidates and why they
      *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
-    /** #2791: IDENTIFIED session ids whose #2601 normalized tail fingerprint
-     *  matches this request even though the byte chain diverged — the shape of
-     *  a conversation replayed ANONYMOUSLY under a re-serialization the exact
-     *  ladder cannot see (e.g. dsh switching the profile's wire protocol: every
-     *  message changes shape, so chainHashes/itemHashes diverge from position 0
-     *  and fork-lineage LCP is 0). Diagnostics ONLY: #1486 stands, the
-     *  anonymous world never adopts an identified session — this field exists
-     *  so the server can WARN that the identified conversation just lost its
-     *  client to an anonymous fork (orphaned fold ledger, silent re-fold
-     *  downstream) instead of the loss being fully silent. */
+    /** A unique identified history replayed without identity, verified by its
+     *  full prefix at the resume evidence floor. Diagnostics only: no adoption
+     *  and no proof that the identified client stopped using its original id. */
     orphanSuspect?: string[];
 }
 
@@ -520,6 +513,88 @@ function containsRun(haystack: string[], needle: string[]): boolean {
     return false;
 }
 
+/** #4264: one judged candidate inside a ResumeMissReport. Module-private:
+ *  consumers use the report structurally through describeResumeMiss. */
+interface ResumeMissCandidate {
+    sessionId: string;
+    /** Stored chain depth (neutral turns for hv2, raw messages for hv1). */
+    chainDepth: number;
+    /** Incoming depth in the candidate's hash domain. */
+    incomingDepth: number;
+    /** 2 = wire-neutral domain, 1 = pre-upgrade raw-wire domain. */
+    hashDomain: 1 | 2;
+    /** Why this candidate was not accepted as a resume parent — the same
+     *  gates findResumeParent applies, reported: "equal-depth" is a
+     *  byte-exact replay at exactly the stored depth under another id —
+     *  either a duplicate conversation or a branch taken at the parent's
+     *  last-request depth; content cannot tell them apart, and neither is a
+     *  resume (rejected by design #1486); "prefix-break" is
+     *  a deeper incoming history whose head-anchored progressive hash at
+     *  the stored depth differs (the shared prefix broke somewhere);
+     *  "truncated" is an incoming history SHORTER than the stored chain
+     *  (cannot be a resume — a resume adds at least one message). */
+    kind: "equal-depth" | "prefix-break" | "truncated";
+    /** First cell index whose per-item hash differs from the stored chain,
+     *  when verifiable from the stored trailing window. null: the whole
+     *  inspectable overlap matched (the break sits before windowStart) or
+     *  no overlap exists at all. */
+    firstDivergence: number | null;
+    /** First stored position inspectable via the trailing itemHashes window
+     *  (0 for chains ≤ MAX_STORED_ITEMS deep). */
+    windowStart: number;
+    /** true when the inspectable overlap is non-empty and every overlapped
+     *  cell matches byte-for-byte. */
+    tailWindowIntact: boolean;
+    /** 8-hex fragments of the diverging cells (log correlation only). */
+    incomingCell?: string;
+    storedCell?: string;
+}
+
+/** #4264: diagnostics-only report for a resume-inheritance miss. */
+interface ResumeMissReport {
+    /** Tracked chains that passed the pre-screen (depth ≥
+     *  MIN_RESUME_PREFIX, id ≠ self, in-domain floor) and were actually
+     *  judged. 0 with no declaredParentState = nothing eligible to begin
+     *  with (parent chain absent — LRU eviction or never noted). */
+    eligible: number;
+    /** Scoped match only: state of the declared parent's own chain when it
+     *  could not even be judged. */
+    declaredParentState?: "untracked" | "too-shallow";
+    /** Best near-miss candidate (closest by kind rank, then deepest chain,
+     *  then most recently seen), when any eligible candidate existed. */
+    best?: ResumeMissCandidate;
+}
+
+/** #4264: render a ResumeMissReport as the bounded log-line body. Pure
+ *  formatting — the caller picks the level (info when report.best exists,
+ *  debug otherwise). */
+export function describeResumeMiss(report: ResumeMissReport): string {
+    const b = report.best;
+    if (!b) {
+        const scope = report.declaredParentState !== undefined ? `; declared parent chain ${report.declaredParentState}` : "";
+        return `no eligible tracked chain (floor ${MIN_RESUME_PREFIX}${scope})`;
+    }
+    switch (b.kind) {
+        case "equal-depth":
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} cells == incoming ${b.incomingDepth}) — rejected by design; either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish`;
+        case "truncated":
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} cells)${b.tailWindowIntact ? `, visible cells ${b.windowStart}..${b.incomingDepth - 1} intact — truncated replay` : ""}`;
+        case "prefix-break": {
+            let detail: string;
+            if (b.firstDivergence !== null) {
+                detail = b.windowStart > 0
+                    ? `first divergence found at cell ${b.firstDivergence} (stored ${b.storedCell} vs incoming ${b.incomingCell}; cells 0..${b.windowStart - 1} uninspectable — chain deeper than the ${MAX_STORED_ITEMS}-cell window)`
+                    : `first divergence at cell ${b.firstDivergence} (stored ${b.storedCell} vs incoming ${b.incomingCell})`;
+            } else if (b.tailWindowIntact) {
+                detail = `tail window (cells ${b.windowStart}..${Math.min(b.chainDepth, b.incomingDepth) - 1}) byte-intact — break sits BEFORE cell ${b.windowStart}`;
+            } else {
+                detail = "head-anchored prefix broken (no inspectable overlap)";
+            }
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}, incoming ${b.incomingDepth}): ${detail}`;
+        }
+    }
+}
+
 export class PrefixAffinityResolver {
     private trackedChains = new Map<string, ChainEntry>();
 
@@ -713,34 +788,17 @@ export class PrefixAffinityResolver {
         if (lineage === undefined && v1Depth > 0) {
             lineage = this.lineageOf(perItemHashes(messages).slice(-MAX_STORED_ITEMS), v1Depth);
         }
-        // #2791 orphan-suspect scan (diagnostics only): a cross-shape replay
-        //  breaks EVERY per-item hash, so the ladders above are structurally
-        //  blind to "the same conversation, replayed without identity". The
-        //  #2601 normalized tail fingerprint (churn keys dropped, content
-        //  leaves ≥ MIN_NORM_LEAF_LEN only, folded through
-        //  normalizeMessageText) survives re-serialization of the SAME turn:
-        //  fingerprint the incoming list AT THE POSITION where the identified
-        //  chain ended (entry.depth ≤ incomingDepth — a stateless replay may
-        //  have appended turns since). Matching is not adoption evidence —
-        //  it is orphan evidence: that conversation's client went anonymous
-        //  and its fold ledger is about to be orphaned by this fresh mint.
-        //  Append bound uses the simhash rung's yardstick.
+        // Identified histories are diagnostic candidates only. Reuse the resume
+        // evidence floor and require a unique full-prefix match in its hash domain;
+        // one shared tail (e.g. a title request's opener) cannot establish replay.
         let orphanSuspect: string[] | undefined;
         for (const entry of tracked.values()) {
-            if (!entry.identified) continue;
-            if (entry.normTailHash === undefined) continue;
-            if (incomingDepth < entry.depth || incomingDepth > entry.depth + ALIGN_TAIL_APPEND_MAX) continue;
-            // #2791: judge in the entry's hash domain — hv2 entries (noted
-            //  after the wire-neutral switch) carry a neutral-domain
-            //  normTailHash over NEUTRAL TURNS (turn count != raw message
-            //  count once assistants merge or multi-tool_result user
-            //  messages split); pre-upgrade hv1 entries keep the raw-wire
-            //  #2601 fingerprint.
-            const suspectTail = entry.hv === 2
-                ? neutralTailHashOf(turns, entry.depth)
-                : normalizedTailHashOf(messages, entry.depth);
-            if (suspectTail === undefined || suspectTail !== entry.normTailHash) continue;
-            (orphanSuspect ?? (orphanSuspect = [])).push(entry.sessionId);
+            if (!entry.identified || entry.depth < MIN_RESUME_PREFIX) continue;
+            const domainHashes = entry.hv === 2 ? hashes : v1Hashes;
+            if (domainHashes.length < entry.depth || domainHashes.length > entry.depth + ALIGN_TAIL_APPEND_MAX) continue;
+            if (domainHashes[entry.depth - 1] !== entry.tailHash) continue;
+            if (orphanSuspect) { orphanSuspect = undefined; break; }
+            orphanSuspect = [entry.sessionId];
         }
         const sessionId = `pfa-${sha256(`${tailHash}\u0000${incomingDepth}`).slice(0, 16)}`;
         return {
@@ -937,8 +995,9 @@ export class PrefixAffinityResolver {
      *  window used for lineage lookups). The candidate must be STRICTLY
      *  deeper than the parent: a real resume adds at least one new message,
      *  while an equal-depth byte-exact replay under a DIFFERENT id is a
-     *  duplicate conversation, not a resume — linking it would adopt foreign
-     *  blocks and trip the derived-parent restrictions (#1486). The parent
+     *  duplicate conversation or a tail-branch replay, not a resume —
+     *  linking it would adopt foreign blocks and trip the derived-parent
+     *  restrictions (#1486). The parent
      *  chain must be >= MIN_RESUME_PREFIX deep. Deepest match wins; ties go
      *  to the most recently seen. */
     findResumeParent(messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number } | null {
@@ -988,6 +1047,92 @@ export class PrefixAffinityResolver {
         if (len <= entry.depth) return null;
         if (hashes[entry.depth - 1] !== entry.tailHash) return null;
         return { sessionId: parentId, sharedDepth: entry.depth };
+    }
+
+    /** #4264: diagnostics-only explanation of a resume-inheritance MISS
+     *  (the gate passed but findResumeParent/findResumeParentWithin returned
+     *  null). It re-runs the SAME gates in reporting mode and names why the
+     *  closest near-miss was rejected; it never influences matching. The
+     *  three causes need completely different fixes, so they are reported
+     *  distinctly: equal-depth replay (duplicate or tail-branch —
+     *  indistinguishable from content; rejected by design),
+     *  parent-chain absence (LRU eviction / never noted), head break (host
+     *  rebuild drift desynchronizes the byte-exact prefix). Cost-bounded:
+     *  the candidate scan does only O(1) progressive-hash checks per entry;
+     *  the per-item divergence scan runs ONCE on the single best near-miss,
+     *  over its stored trailing window (≤ MAX_STORED_ITEMS compares). */
+    diagnoseResumeMiss(messages: unknown[], selfSessionId: string, declaredParent?: string): ResumeMissReport {
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return { eligible: 0 };
+        // #2791: judge each candidate in the hash domain it was noted in —
+        // same dual-domain discipline as findResumeParent. #2824: hashes-only
+        // consumers pay nothing for sketches; itemHashes come from the same
+        // fused pass at no extra cost.
+        const turns = neutralTurns(messages);
+        const fp2 = neutralFingerprints(turns, 0);
+        const hashesV2 = fp2.hashes;
+        const hashesV1 = chainHashes(msgs);
+        if (hashesV2.length === 0 && hashesV1.length === 0) return { eligible: 0 };
+        type Candidate = { id: string; entry: ChainEntry; kind: ResumeMissCandidate["kind"]; rank: number };
+        const cands: Candidate[] = [];
+        let declaredParentState: "untracked" | "too-shallow" | undefined;
+        const consider = (id: string, entry: ChainEntry): void => {
+            if (id === selfSessionId) return;
+            if (entry.depth < MIN_RESUME_PREFIX) return;
+            const hv2 = entry.hv === 2;
+            const hashes = hv2 ? hashesV2 : hashesV1;
+            const len = hv2 ? turns.length : msgs.length;
+            if (hashes.length < MIN_RESUME_PREFIX) return;
+            let kind: ResumeMissCandidate["kind"];
+            if (len < entry.depth) kind = "truncated";
+            else if (len === entry.depth && hashes[entry.depth - 1] === entry.tailHash) kind = "equal-depth";
+            else kind = "prefix-break";
+            cands.push({ id, entry, kind, rank: kind === "equal-depth" ? 0 : kind === "prefix-break" ? 1 : 2 });
+        };
+        if (declaredParent !== undefined && declaredParent !== selfSessionId) {
+            const entry = this.trackedChains.get(declaredParent);
+            if (entry === undefined) declaredParentState = "untracked";
+            else if (entry.depth < MIN_RESUME_PREFIX) declaredParentState = "too-shallow";
+            else consider(declaredParent, entry);
+        } else if (declaredParent === undefined) {
+            for (const [id, entry] of this.trackedChains) consider(id, entry);
+        }
+        if (cands.length === 0) return { eligible: 0, ...(declaredParentState !== undefined ? { declaredParentState } : {}) };
+        cands.sort((a, b) => a.rank - b.rank || b.entry.depth - a.entry.depth || b.entry.lastSeen - a.entry.lastSeen);
+        const top = cands[0]!;
+        const hv2 = top.entry.hv === 2;
+        const depth = top.entry.depth;
+        const len = hv2 ? turns.length : msgs.length;
+        // Lazy v1 per-item pass: only paid when the winner is a legacy raw-wire entry.
+        const itemIncoming = hv2 ? fp2.itemHashes : perItemHashes(msgs);
+        const windowStart = Math.max(0, depth - top.entry.itemHashes.length);
+        const end = Math.min(depth, len);
+        let firstDivergence: number | null = null;
+        let tailWindowIntact = false;
+        if (windowStart < end) {
+            tailWindowIntact = true;
+            for (let i = windowStart; i < end; i++) {
+                if (itemIncoming[i] !== top.entry.itemHashes[i - windowStart]) {
+                    firstDivergence = i;
+                    tailWindowIntact = false;
+                    break;
+                }
+            }
+        }
+        const best: ResumeMissCandidate = {
+            sessionId: top.id,
+            chainDepth: depth,
+            incomingDepth: len,
+            hashDomain: hv2 ? 2 : 1,
+            kind: top.kind,
+            firstDivergence,
+            windowStart,
+            tailWindowIntact,
+            ...(firstDivergence !== null
+                ? { incomingCell: itemIncoming[firstDivergence]?.slice(0, 8), storedCell: top.entry.itemHashes[firstDivergence - windowStart]?.slice(0, 8) }
+                : {}),
+        };
+        return { eligible: cands.length, ...(declaredParentState !== undefined ? { declaredParentState } : {}), best };
     }
 
     /** #2241: does `messages` continue the tracked chain of `sessionId`?
@@ -1068,18 +1213,18 @@ export class PrefixAffinityResolver {
             //  malformed list degrades the entry to exact-hash resolution.
             let sketches: string[] | undefined;
             if (hv === 2 && Array.isArray(e.sketches)) {
-                const valid = (e.sketches as unknown[]).filter(
-                    (s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s),
-                );
-                if (valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
+                const slots: unknown[] = Array.from(e.sketches);
+                if (slots.every((s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s)) &&
+                    slots.length >= ALIGN_MIN_DEPTH) sketches = slots.slice(0, SKETCH_MAX_DEPTH);
             }
             // #2265: user-role flags for the ownership-anchor gate — optional,
             //  malformed lists simply degrade the entry (no user anchor → the
             //  simhash rung skips it, exact-hash resolution still works).
             let userFlags: boolean[] | undefined;
             if (sketches !== undefined && Array.isArray(e.userFlags)) {
-                const validU = (e.userFlags as unknown[]).filter((u): u is boolean => typeof u === "boolean");
-                if (validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
+                const flags: unknown[] = Array.from(e.userFlags);
+                if (flags.every((u): u is boolean => typeof u === "boolean") &&
+                    flags.length > 0) userFlags = flags.slice(-MAX_STORED_ITEMS);
             }
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
@@ -1096,9 +1241,13 @@ export class PrefixAffinityResolver {
             // #2807: optional tail-turn fragments for the append-continuation
             //  rung — hv2 only (a v1 entry's fragments were never noted),
             //  malformed lists degrade the entry to exact-ladder behavior.
+            //  Whole-carrier validation like sketches/userFlags above: a
+            //  filtered middle slot would shift later fragments onto the
+            //  wrong source message.
             if (hv === 2 && Array.isArray(e.tailFrags)) {
-                const validF = (e.tailFrags as unknown[]).filter((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f));
-                if (validF.length > 0) entry.tailFrags = validF.slice(0, MAX_TURN_FRAGS);
+                const frags: unknown[] = Array.from(e.tailFrags);
+                if (frags.every((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f)) &&
+                    frags.length > 0) entry.tailFrags = frags.slice(0, MAX_TURN_FRAGS);
             }
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);

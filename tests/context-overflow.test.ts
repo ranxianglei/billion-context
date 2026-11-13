@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../src/util.ts";
+import { inspectContextOverflow, provenCompletionReserve, reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../src/util.ts";
 
 // A context-overflow error is the only reliable signal that the configured
 // window is wrong (e.g. the 200k fallback for an unknown model on a relay).
@@ -107,6 +107,41 @@ test("DeepSeek/OpenAI counts survive comma grouping (#3450)", () => {
     assert.equal(info.requestedTotal, 1160518);
     assert.equal(info.requestedMessages, 904518);
     assert.equal(info.requestedCompletion, 256000);
+});
+
+test("LiteLLM/SGLang: colon-separated input and completion counts survive the wrapper", () => {
+    for (const counts of [
+        ["131072", "134000", "100000", "34000"],
+        ["131,072", "134,000", "100,000", "34,000"],
+    ]) {
+        const [window, total, messages, completion] = counts;
+        const message = `litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of ${window} tokens. You requested a total of ${total} tokens: ${messages} tokens from the input messages and ${completion} tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.\n\nLiteLLM: model group 'test-model' failed with the error above. No fallback was attempted.`;
+        const body = JSON.stringify({ error: { message, type: "BadRequestError", param: null, code: "400" } });
+        const info = inspectContextOverflow(400, body);
+        assert.equal(info.isOverflow, true);
+        assert.equal(info.window, 131072);
+        assert.equal(info.requestedTotal, 134000);
+        assert.equal(info.requestedMessages, 100000);
+        assert.equal(info.requestedCompletion, 34000);
+        assert.equal(inspectContextOverflow(429, body).isOverflow, false);
+    }
+});
+
+test("LiteLLM counts require the explicit input/completion split", () => {
+    for (const split of [
+        "100000 tokens from the input messages",
+        "100000 input messages and 34000 tokens for the completion",
+        "100000 tokens from the input messages and 34000 output tokens",
+    ]) {
+        const info = inspectContextOverflow(400, JSON.stringify({ error: {
+            message: `Requested token count exceeds the model's maximum context length of 131072 tokens. You requested a total of 134000 tokens: ${split}.`,
+        } }));
+        assert.equal(info.isOverflow, true);
+        assert.equal(info.window, 131072);
+        assert.equal(info.requestedTotal, undefined);
+        assert.equal(info.requestedMessages, undefined);
+        assert.equal(info.requestedCompletion, undefined);
+    }
 });
 
 test("Anthropic 'prompt is too long' states the prompt count — no completion split (#3450)", () => {
@@ -345,4 +380,33 @@ test("shouldReserveOutputHeadroom: reserve-by-default, real-Claude routing exemp
     assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "claude-test"), false, "claude-* model id → exempt (gateway front)");
     assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "DeepSeek-V3.2-Exp"), true, "#3900 shape: deepseek model on the anthropic wire → reserve");
     assert.equal(shouldReserveOutputHeadroom("anthropic", "https://api.anthropic.com.evil.example"), true, "host match is exact — no suffix tricks");
+});
+
+// #3450 follow-up: a stated completion share is a PROVIDER fact, so it outlives
+// the one-shot arm — but only for the origin+model that stated it.
+const PROVEN = { provenCompletionWall: 7_000, provenCompletionWallOrigin: "http://127.0.0.1:9", provenCompletionWallModel: "deepseek-flash" };
+
+test("provenCompletionReserve: matching origin+model returns the proven share", () => {
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", "deepseek-flash"), 7_000);
+});
+
+test("provenCompletionReserve: no proof / incomplete proof → 0 (protocol rule unchanged)", () => {
+    assert.equal(provenCompletionReserve(undefined, "http://127.0.0.1:9", "deepseek-flash"), 0);
+    assert.equal(provenCompletionReserve({}, "http://127.0.0.1:9", "deepseek-flash"), 0);
+    assert.equal(provenCompletionReserve({ provenCompletionWallOrigin: PROVEN.provenCompletionWallOrigin, provenCompletionWallModel: PROVEN.provenCompletionWallModel }, "http://127.0.0.1:9", "deepseek-flash"), 0);
+});
+
+test("provenCompletionReserve: a different origin or model cannot claim the proof", () => {
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:10", "deepseek-flash"), 0, "different upstream");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", "deepseek-chat"), 0, "different model");
+    assert.equal(provenCompletionReserve(PROVEN, undefined, "deepseek-flash"), 0, "unknown origin");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", undefined), 0, "unknown model");
+    assert.equal(provenCompletionReserve(PROVEN, "", "deepseek-flash"), 0, "empty origin");
+    assert.equal(provenCompletionReserve(PROVEN, "http://127.0.0.1:9", ""), 0, "empty model");
+});
+
+test("provenCompletionReserve: corrupt walls are rejected outright", () => {
+    for (const wall of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "7000"]) {
+        assert.equal(provenCompletionReserve({ ...PROVEN, provenCompletionWall: wall as number }, "http://127.0.0.1:9", "deepseek-flash"), 0, `wall=${String(wall)}`);
+    }
 });

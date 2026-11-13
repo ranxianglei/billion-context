@@ -100,7 +100,9 @@ jobs:
         if: failure()
         run: |
           mkdir -p tmp/e2e-artifacts
-          for d in tmp/e2e-codex-fake-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+          # Every hermetic workdir this suite creates (#1802 env / #1965 / #2195 /
+          # #2222 / #3203 lanes use their own prefixes, not e2e-codex-fake-).
+          for d in tmp/e2e-codex-fake-* tmp/e2e-codex-env-* tmp/e2e-codex-1965-* tmp/e2e-codex-2195-* tmp/e2e-codex-2222-* tmp/e2e-codex-3203-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
 
       - uses: actions/upload-artifact@v4
         if: failure()

@@ -124,18 +124,24 @@ jobs:
   # mtime and a WAL-only commit leaves the main db's bytes AND mtime untouched,
   # so the stale-generation-wins failure is reproducible HERE but not on POSIX
   # (the deterministic unit twin lives in tests/launcher-sqlite-overlay.test.ts).
-  # Zero tokens: every model call goes to the local fake upstream.
+   # #2222 adds the shared-state lane (CODEX_SQLITE_HOME): the overlay must hold
+   # no sqlite files at all and native runs see every thread immediately.
+   # #3203 adds the CONCURRENT lane: two bili codex sessions on one CODEX_HOME
+   # both run, each in its own -s<N> slot, threads land in one live db.
+   # Zero tokens: every model call goes to the local fake upstream.
   windows-codex-sequential-home:
     needs: [gate]
     if: needs.gate.outputs.run == 'true'
     name: sequential bili codex launches keep all threads in the real home (#2195)
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 30 (not 20): the #2222 shared-state lane and the #3203 concurrent lane
+    # add real-launch steps to this job.
     # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
     # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
     # instead of aborting setup. Job-level → covers every registry op here
     # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
     # genuine sustained outage still fails fast.
+    timeout-minutes: 30
     env:
       npm_config_fetch_retries: '5'
       npm_config_fetch_retry_mintimeout: '5000'
@@ -160,9 +166,9 @@ jobs:
       - name: Build
         shell: pwsh
         run: npm run build
-      - name: Run the #2195 + #1965 real-launch lanes
+      - name: Run the #2195 + #1965 + #2222 + #3203 real-launch lanes
         shell: pwsh
-        run: $env:ACP_TEST_E2E_FAKE = "1"; node --import tsx --test --test-name-pattern "#2195|#1965" tests/e2e/e2e-codex-fake.test.ts
+        run: $env:ACP_TEST_E2E_FAKE = "1"; node --import tsx --test --test-name-pattern "#2195|#1965|#2222|#3203" tests/e2e/e2e-codex-fake.test.ts
       - name: Collect E2E artifacts
         if: failure()
         shell: pwsh
@@ -170,6 +176,8 @@ jobs:
           New-Item -ItemType Directory -Force tmp/e2e-artifacts | Out-Null
           Get-ChildItem -Directory tmp/e2e-codex-2195-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
           Get-ChildItem -Directory tmp/e2e-codex-1965-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+          Get-ChildItem -Directory tmp/e2e-codex-2222-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
+          Get-ChildItem -Directory tmp/e2e-codex-3203-* -ErrorAction SilentlyContinue | Copy-Item -Recurse -Force -Destination tmp/e2e-artifacts
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

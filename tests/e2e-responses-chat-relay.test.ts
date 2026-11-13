@@ -118,7 +118,7 @@ function compressScript(): string[] {
                                 function: {
                                     name: "compress",
                                     arguments: JSON.stringify({
-                                        content: [{ startId: "m00001", endId: "m00002", topic: "e2e", summary: "e2e summary" }],
+                                        content: [{ startId: "m00001", endId: "m00002", topic: "e2e", summary: "e2e chat relay compress round trip: fixture history folded into one block" }],
                                     }),
                                 },
                             },
@@ -217,14 +217,14 @@ function parseSse(raw: string): ClientEvent[] {
     return events;
 }
 
-async function callResponses(h: Harness, input: unknown[], tools?: unknown[]): Promise<{ raw: string; events: ClientEvent[]; arrivals: { t: number; text: string }[] }> {
+async function callResponses(h: Harness, input: unknown[], tools?: unknown[], sessionId = "e2e-responses-chat-relay"): Promise<{ raw: string; events: ClientEvent[]; arrivals: { t: number; text: string }[] }> {
     const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.bridgePort}/v1/responses`;
     const body: Record<string, unknown> = {
         model: "gpt-test",
         stream: true,
         instructions: "You are a test assistant.",
         input,
-        session_id: "e2e-responses-chat-relay",
+        session_id: sessionId,
     };
     if (tools) body.tools = tools;
     const resp = await fetch(url, {
@@ -335,12 +335,25 @@ test("e2e chat relay: reasoning item lifecycle preserved end-to-end (issue #94 r
 
 test("e2e chat relay: compress tool-call round-trip on responses path (marker protocol)", async () => {
     const h = await startHarness((i) => (i === 0 ? compressScript() : roundTwoTextScript()), true);
-    const big = "y".repeat(2000);
+    // History shaped so the mock's m00001–m00002 fold genuinely SUCCEEDS: the
+    // two leading messages clear the 5000-char minCompressRange and the seven
+    // trailing ones push them past the soft-protected recent zone
+    // (preserveRecentTokens walks back 5000 tokens from the tail). A failed
+    // compress ends the turn under #156/#4186 and would un-test this path.
+    const big = "y".repeat(3000);
+    const fillerMsg = { type: "message", role: "user", content: [{ type: "input_text", text: big }] };
     try {
         const { events } = await callResponses(h, [
-            { type: "message", role: "user", content: [{ type: "input_text", text: big }] },
-            { type: "message", role: "user", content: [{ type: "input_text", text: big }] },
-        ]);
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            fillerMsg,
+            { type: "message", role: "user", content: [{ type: "input_text", text: "please compress the conversation now" }] },
+        ], undefined, "e2e-responses-compress");
         assert.ok(h.captured.length >= 2, `expected >= 2 upstream requests (compress re-request), got ${h.captured.length}`);
         const second = JSON.parse(h.captured[1]!.body) as { messages: Array<{ role: string; tool_call_id?: string }> };
         assert.ok(

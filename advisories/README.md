@@ -22,10 +22,10 @@ Machine-readable critical-defect advisories for [billion-context](https://github
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `id` | yes | Stable identifier, e.g. `bc-2026-001`. Used to dedupe warnings per process; never reuse an id. |
+| `id` | yes | Stable identifier, e.g. `bc-2026-001`. Used to dedupe warnings per process; never reuse an id. Keep it short: clients cut it at 80 chars. |
 | `affected` | yes | Semver range of broken versions, e.g. `>=0.1.155 <0.1.158`. |
 | `target` | yes | Exact version to force-install. May be OLDER than the user's current version (rollback semantics) when a newer release is also affected. Must be a published version of `billion-context`. |
-| `reason` | yes | User-facing explanation, shown verbatim in the log warning and the web UI banner. Write it for end users, not developers. |
+| `reason` | yes | User-facing explanation, shown in the log warning, the web UI banner, the `/acp` panel and `acp_status`. Write it for end users, not developers. One line, ≤500 chars: clients collapse line breaks into spaces and truncate anything longer (the advisory itself still applies). |
 | `publishedAt` | no | ISO timestamp. |
 
 ## Retiring an advisory

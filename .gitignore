@@ -6,5 +6,11 @@ dist/
 .bili-coop-build-stamp
 tmp/
 tests/.pp-stamp-state-*/
+tests/.billing-state-*/
+tests/.billing-web-state-*/
 .tmp/
 plugin-lanes/
+
+# local tool scratch (esbuild temp redirection, see persona-fork tests)
+.esbuild-tmp/
+

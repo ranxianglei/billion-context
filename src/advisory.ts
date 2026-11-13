@@ -33,6 +33,7 @@ import semver from "semver";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import type { FetchOptions } from "./fetch-util.js";
+import { boundedLine } from "./text-safe.js";
 import {
     CHECK_INTERVAL_MS,
     egressDispatcher,
@@ -45,6 +46,14 @@ import {
 
 const ADVISORY_PACKAGE = "billion-context-advisories";
 const SUPPORTED_SCHEMA = 1;
+/** Client-side bounds for the two free-text fields of an entry. Both are
+ *  printed on ONE line of acp_status (model context), the /acp panel, the
+ *  doctor report and the log warning (describeAdvisory and the warn lines
+ *  below), so they are flattened to a single line and capped when the document is
+ *  parsed. Over-long text is TRUNCATED, never a reason to skip the entry: an
+ *  advisory still has to force its target. */
+const CAP_ADVISORY_ID = 80;
+const CAP_ADVISORY_REASON = 500;
 
 export type AdvisoryEntry = {
     /** Stable id, e.g. "bc-2026-001" — dedupes warnings per process. */
@@ -181,10 +190,10 @@ export function parseAdvisoryDoc(raw: unknown): { entries: AdvisoryEntry[]; erro
     for (const item of p.advisories) {
         if (typeof item !== "object" || item === null) continue;
         const e = item as Record<string, unknown>;
-        const id = typeof e.id === "string" ? e.id.trim() : "";
+        const id = typeof e.id === "string" ? boundedLine(e.id, CAP_ADVISORY_ID) : "";
         const affected = typeof e.affected === "string" ? e.affected.trim() : "";
         const target = typeof e.target === "string" ? e.target.trim() : "";
-        const reason = typeof e.reason === "string" ? e.reason.trim() : "";
+        const reason = typeof e.reason === "string" ? boundedLine(e.reason, CAP_ADVISORY_REASON) : "";
         if (!id || !affected || !semver.valid(target) || !reason) continue;
         entries.push({
             id,

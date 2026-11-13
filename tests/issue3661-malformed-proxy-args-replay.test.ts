@@ -7,6 +7,11 @@
 // recovery mechanism (breaker / nudge gating) strands behind a dead round.
 // The re-request must carry guaranteed-valid JSON for proxy-tool calls:
 // byte-exact when parseable, a self-describing placeholder otherwise.
+// #4186: unsalvageable failures now end the turn BEFORE any re-request (the
+// ephemeral failure frame never rides upstream — pinned in
+// tests/issue1502-raw-args-salvage.test.ts), so the substitution below is
+// exercised on salvage-SUCCESSFUL rounds: strict JSON.parse still fails on the
+// raw bytes, but the kernel's lenient ladder recovers a real fold.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
@@ -67,6 +72,21 @@ function makeLoopCtx(): {
     };
 }
 
+// Salvage-success geometry: refs m00001-m00012, target m00001-m00006 compressible,
+// tail heavy enough to clear the protected recent zone (same shape as the gate
+// negative below).
+function salvageCtx(): ReturnType<typeof makeLoopCtx> {
+    const ctx = makeLoopCtx();
+    ctx.messages = Array.from({ length: 12 }, (_, i): CoreMessage => ({
+        id: `a${i + 1}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        contentType: "text",
+        text: `msg-${i + 1}-` + "x".repeat(6000),
+    }));
+    ctx.session.state.messageRefs = assignRefs(ctx.messages, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    return ctx;
+}
+
 // One round whose only output is a proxy compress call carrying `args`.
 function compressCallStream(callId: string, args: string): ReadableStream<Uint8Array> {
     return mockStream(
@@ -113,38 +133,53 @@ async function drain(stream: ReadableStream<Uint8Array>, ctx: ReturnType<typeof 
 }
 
 test("#3661 form 1: malformed compress args are NOT echoed verbatim — re-request replays a valid-JSON placeholder", async () => {
-    const malformed = '{"content":m00001–m00006 <raw string, values unquoted, never closed>';
+    // Trailing comma: strict JSON.parse fails (premise) but the kernel's lenient
+    // ladder salvages a real fold, so the round succeeds and the re-request still
+    // fires — the only shape that can exercise the substitution under #4186.
+    const malformed = '{"content":[{"startId":"m00001","endId":"m00006","summary":"' + "salvaged-range-summary-long-enough-for-the-kernel-min-length-check" + '"}],}';
+    assert.throws(() => JSON.parse(malformed), "premise: strict JSON.parse really fails");
     const probe = reFetchProbe();
     try {
-        await drain(compressCallStream("call_c", malformed), makeLoopCtx());
-        assert.equal(probe.calls(), 1, "one re-request after the proxy tool executed");
+        await drain(compressCallStream("call_c", malformed), salvageCtx());
+        assert.equal(probe.calls(), 1, "one re-request after the salvaged compress executed");
         const body = probe.bodies()[0]!;
         const args = assistantToolArgs(body);
         assert.equal(args.length, 1, "the compress tool-call rides the re-request");
         assert.ok(args[0]!.includes("non-JSON tool-call arguments"), "placeholder explains the substitution to the model");
         for (const a of args) JSON.parse(a);
-        assert.ok(!JSON.stringify(body).includes("values unquoted"), "raw malformed bytes do not reach the wire");
+        // The summary TEXT legitimately rides the wire (block carrier + receipt
+        // head/tail) — the invariant is that the RAW MALFORMED SKELETON (the
+        // trailing-comma byte sequence) does not.
+        assert.ok(!JSON.stringify(body).includes('"],}'), "raw malformed bytes do not reach the wire");
         const receipts = (body.messages ?? []).filter((m) => m.role === "tool").map((m) => String(m.content));
-        assert.ok(receipts.some((r) => /not parseable JSON|no valid ranges|FAILED/i.test(r)), "the rejection receipt still reaches the model");
+        assert.ok(receipts.some((r) => /Compressed m00001/.test(r)), "the successful compression result reaches the model");
     } finally {
         probe.restore();
     }
 });
 
 test("#3661 form 2: stream-truncated compress args (unclosed JSON) are replaced the same way", async () => {
-    const truncated = '{"content":[{"startId":"m00001","endId":"m00006","summary":"' + "x".repeat(300);
+    // Stream cut landing right after the range item's closing brace: the outer
+    // containers stay unclosed so strict JSON.parse fails, but the item is
+    // complete and the kernel's truncated ladder salvages it (an unterminated
+    // value or un-closed item is rejected as unrecoverable by design) — same
+    // substitution surface as form 1, via the salvage-success path under #4186.
+    const truncated = '{"content":[{"startId":"m00001","endId":"m00006","summary":"' + "y".repeat(300) + '"}';
+    assert.throws(() => JSON.parse(truncated), "premise: strict JSON.parse really fails");
     const probe = reFetchProbe();
     try {
-        await drain(compressCallStream("call_t", truncated), makeLoopCtx());
-        assert.equal(probe.calls(), 1, "one re-request after the proxy tool executed");
+        await drain(compressCallStream("call_t", truncated), salvageCtx());
+        assert.equal(probe.calls(), 1, "one re-request after the salvaged compress executed");
         const body = probe.bodies()[0]!;
         const args = assistantToolArgs(body);
         assert.equal(args.length, 1, "the compress tool-call rides the re-request");
         assert.ok(args[0]!.includes("non-JSON tool-call arguments"), "placeholder replaces the truncated bytes");
         for (const a of args) JSON.parse(a);
-        assert.ok(!JSON.stringify(body).includes("x".repeat(50)), "truncated raw payload does not reach the wire");
+        // Summary TEXT legitimately rides the wire (block carrier + receipt
+        // head/tail) — the invariant is that the RAW MALFORMED SKELETON does not.
+        assert.ok(!JSON.stringify(body).includes('{"content":[{"startId":"m00001"'), "truncated raw payload does not reach the wire");
         const receipts = (body.messages ?? []).filter((m) => m.role === "tool").map((m) => String(m.content));
-        assert.ok(receipts.some((r) => /not parseable JSON|no valid ranges|FAILED/i.test(r)), "the rejection receipt still reaches the model");
+        assert.ok(receipts.some((r) => /Compressed m00001/.test(r)), "the successful compression result reaches the model");
     } finally {
         probe.restore();
     }
@@ -153,14 +188,7 @@ test("#3661 form 2: stream-truncated compress args (unclosed JSON) are replaced 
 // Gate negative (#3617 discipline): well-formed arguments must ride back
 // byte-exact — the substitution must NOT fire for valid JSON (wire fidelity).
 test("#3661 gate negative: well-formed compress args replay byte-exact (no placeholder)", async () => {
-    const ctx = makeLoopCtx();
-    ctx.messages = Array.from({ length: 12 }, (_, i): CoreMessage => ({
-        id: `a${i + 1}`,
-        role: i % 2 === 0 ? "user" : "assistant",
-        contentType: "text",
-        text: `msg-${i + 1}-` + "x".repeat(6000),
-    }));
-    ctx.session.state.messageRefs = assignRefs(ctx.messages, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    const ctx = salvageCtx();
     const legal = JSON.stringify({ content: [{ startId: "m00001", endId: "m00006", summary: "The early setup exchanges distilled into one block." }] });
     const probe = reFetchProbe();
     try {

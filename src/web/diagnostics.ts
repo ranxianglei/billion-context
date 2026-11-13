@@ -17,16 +17,18 @@
  * `--- recent conflict-related log lines ---` (the exact signatures a
  * maintainer greps to adjudicate a native-compaction episode).
  *
- * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body. The single
- * publish boundary is buildDiagnostics itself: before serialization it runs the
- * whole blob through redactForPublish (secrets → non-public hosts → $HOME paths),
- * so EVERY topic's section is scrubbed uniformly and the copied blob plus the
- * prefilled issue body derive from one string (they can never diverge). Secret
- * values are also replaced structurally (maskSecretValues) for the config block,
- * and only profile NAMES are included, never absolute paths (a $HOME prefix is
- * rewritten to `~` at the boundary instead). The scrubbing is unconditional — it
- * ignores BILI_LOG_MASK_HOSTS, so the local host-visibility preference can never
- * weaken the publish boundary (#3811/#4499).
+ * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body (copied
+ * verbatim AND embedded in the prefilled URL). Every byte passes redactForPublish
+ * at the SINK (buildDiagnostics) — unconditional host masking + credential-shape
+ * scrubbing, ignoring BILI_LOG_MASK_HOSTS so the local host-visibility preference
+ * can never weaken the publish boundary (#3811/#4427). Per-section redaction
+ * (config values, log tails, storage reason strings) runs upstream too; the sink
+ * is the guarantee that NO topic — present or future — can leak a private host, a
+ * credential shape, or a user-identifying home path (redactForPublish also rewrites
+ * $HOME→~ across the whole blob) even if its author forgets. Only profile NAMES are
+ * included; the storage force-retry lever keeps its absolute marker path for
+ * actionability, but the sink ~-normalizes any $HOME prefix so no username reaches
+ * the public body (#4427).
  *
  * Contract: NEVER throws — every fs/listSessions access is guarded so a
  * broken log file or an unbuilt store degrades the blob, not the endpoint.
@@ -40,8 +42,11 @@ import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
+import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
+import { readLogLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
+import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
 import { safeSuffix } from "../text-safe.js";
@@ -58,6 +63,9 @@ const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
 const DSH_PROFILE_CAP = 8;
+// #4649: display budget for the observed-UA lines (the registry itself is
+// bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
+const OBSERVED_UA_LINES = 12;
 const DSH_REPORT_PACKAGES = ["@deepseek-ai/dsh", "@deepseek-ai/dsh-compaction-basic", "@deepseek-ai/dsh-web-app"] as const;
 
 function humanUptime(seconds: number): string {
@@ -85,42 +93,55 @@ function baseLines(): string[] {
 // contract (a regression to per-tail reads would re-double the cost).
 let candidateLogReads = 0;
 
-/** All non-empty lines across the rotated log pair; [] on any fs failure. */
-function candidateLogLines(): string[] {
+/** All non-empty lines across every retained generation (sealed history oldest-
+ *  first, then the active file); [] on any fs failure. ONE enumeration shared
+ *  with the other default readers, read once per report (#3813).
+ *  Streaming: the retention set is a byte budget of many generations, so this
+ *  keeps only the two bounded tails the report publishes instead of every line
+ *  of every generation. */
+async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
+    storage: string[];
+    conflict: string[];
+    /** Files that could not be read — the tails are then INCOMPLETE and the
+     *  report must say so rather than present a partial scan as the whole
+     *  retained history. */
+    unreadable: string[];
+}> {
     candidateLogReads += 1;
+    const storage: string[] = [];
+    const conflict: string[] = [];
+    const unreadable: string[] = [];
+    const pushBounded = (into: string[], line: string, cap: number): void => {
+        into.push(line);
+        if (into.length > cap) into.shift();
+    };
     try {
-        const logFile = getLogPath() ?? defaultLogFile();
-        const dir = logFile ? path.dirname(logFile) + path.sep : "";
-        const candidates = [dir + "bili.log.old", dir + "bili.log"];
-        let lines: string[] = [];
-        for (const f of candidates) {
-            try { if (!statSync(f).isFile()) continue; } catch { continue; }
-            try {
-                lines = lines.concat(readFileSync(f, "utf8").split("\n").filter((l) => l.length > 0));
-            } catch { continue; }
+        const files = logGenerations(getLogPath() ?? defaultLogFile()).map((g) => g.path);
+        for await (const line of readLogLines(files, { onError: (f) => unreadable.push(f) })) {
+            if (needStorage && line.includes("[storage]")) pushBounded(storage, line, STORAGE_LOG_TAIL_LINES);
+            if (needConflict && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                pushBounded(conflict, line, CONFLICT_LOG_TAIL_LINES);
+            }
         }
-        return lines;
     } catch {
-        return [];
+        // Enumeration or iteration blew up: report nothing rather than a
+        // half-scan dressed as the full retained history.
+        return { storage: [], conflict: [], unreadable: ["*"] };
     }
-}
-
-/** #4499: per-line publish treatment shared by BOTH log tails — scrub with
- * redactForPublish (secrets → non-public hosts → $HOME paths), then bound to
- * LOG_LINE_MAX_CHARS so one long error line can't blow out the pasteable blob.
- * Idempotent with the boundary scrub in buildDiagnostics (defense in depth). */
-function publishRedactLine(line: string): string {
-    const masked = redactForPublish(line);
-    return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    return { storage, conflict, unreadable };
 }
 
 /** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). #4499: each
- * line is publish-redacted and bounded — parity with conflictLogTail — because
- * raw [storage] lines carried credentials, private hosts and absolute paths into
- * the public blob. */
+ * match). The caller reads the rotated pair once per report (#3813). #4427:
+ * these are VERBATIM on-disk bytes (written under whatever BILI_LOG_MASK_HOSTS
+ * was in effect), so each line gets the same publish-boundary redaction +
+ * length bound as conflictLogTail — a [storage] line can carry a URL with
+ * credentials, a private host, or an absolute path. */
 function storageLogTail(lines: string[]): string[] {
-    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES).map(publishRedactLine);
+    return lines.map((l) => {
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -128,22 +149,34 @@ function storageLogTail(lines: string[]): string[] {
 // routed-call refusals (#1729), the destruction verdict (#2193), successful
 // rebases (#2432), and the web-app preset notice that says whether the #3354
 // load-time overlay applies to this machine's profiles.
+// #4649: the same evidence chain for the codex lane — before these entries a
+// codex conflict report matched ZERO lines and could not be adjudicated
+// without a manual log round-trip (#4648). One entry per distinct message
+// shape (a shape may fire on more than one site): the not-intercepted forward
+// (src/server/handle.ts), the inline auto-compact detection + rebase
+// (#3008/#2372, both openai and responses wires), the intercepted forge
+// (trigger form AND endpoint form share the prefix), and the forge failure
+// that passes through (src/server/prepare-responses.ts).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
     "compression substrate appears destroyed",
     "native compaction boundary",
     "profile bundles include @deepseek-ai/dsh-web-app",
+    "codex compaction_trigger request not intercepted",
+    "codex local auto-compaction detected",
+    "codex compact intercepted",
+    "codex compact forge failed",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
-    // #4499: same publish treatment as the storage tail — redactForPublish scrubs
-    // credentials AND unconditionally masks non-public hosts (so BILI_LOG_MASK_HOSTS=0
-    // real hosts in the on-disk log still can't leak, #3811), plus $HOME paths (#4499).
-    return lines
-        .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
-        .slice(-CONFLICT_LOG_TAIL_LINES)
-        .map(publishRedactLine);
+    return lines.map((l) => {
+        // #3811: redactForPublish scrubs credential shapes AND masks URL hosts
+        // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
+        // on-disk log) the published tail still cannot leak them.
+        const masked = redactForPublish(l);
+        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+    });
 }
 
 function safeSessionCount(): number {
@@ -198,27 +231,60 @@ function dshPackageVersion(profileDir: string, pkg: string): string | undefined 
     }
 }
 
+// #4649: the dsh profile bundles only carry the version truth for the dsh lane;
+// every OTHER client's version lives in its User-Agent, which bili sees on each
+// request. The registry (src/client-ua-registry.ts) keeps a bounded recent
+// sample; publish this so a non-dsh conflict report carries its own client
+// version instead of forcing `codex --version` round-trips (#4648). The values
+// are raw header bytes — the sink-level redactForPublish in buildDiagnostics
+// (#4427) is what makes them publish-safe, same as every other section here.
+function observedUaLines(): string[] {
+    const obs = recentClientUas();
+    if (obs.length === 0) return ["observed client user-agents: (none recorded by this process yet)"];
+    const shown = obs.slice(0, OBSERVED_UA_LINES);
+    const lines = shown.map((o) => `observed client user-agents: ${o.family}: ${o.ua}`);
+    if (obs.length > OBSERVED_UA_LINES) lines.push(`observed client user-agents: … ${obs.length - OBSERVED_UA_LINES} more observation(s)`);
+    return lines;
+}
+
 function hostClientVersionLines(): string[] {
     const lines: string[] = ["--- host client versions ---"];
     let dirs: string[] = [];
     try { dirs = dshProfileDirs(process.env); } catch { dirs = []; }
     if (dirs.length === 0) {
         lines.push(`dsh: no profiles under DSH_HOME (${path.basename(resolveDshHome(process.env)) || "?"}/profiles missing — dsh has never run here, or DSH_HOME points elsewhere)`);
-        return lines;
+    } else {
+        for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
+            const versions = DSH_REPORT_PACKAGES.map((p) => dshPackageVersion(dir, p));
+            if (versions.every((v) => v === undefined)) {
+                // #5146: three bare "?"s told triage nothing about WHERE the version
+                // truth lives — on DSH Desktop bundle installs the @deepseek-ai core
+                // ships inside the app, not under the profile's node_modules (which
+                // holds third-party plugins like billion-context alone), so every
+                // lookup missed and reports lost the host-version dimension entirely.
+                lines.push(`dsh profile ${path.basename(dir)}: (no @deepseek-ai packages under this profile bundle — on desktop installs the core ships inside the app; include the app version)`);
+            } else {
+                const vers = DSH_REPORT_PACKAGES.map((p, i) => `${p.split("/")[1]} ${versions[i] ?? "?"}`).join(", ");
+                lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+            }
+        }
+        if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     }
-    for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-        const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-        lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
-    }
-    if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
+    // #4649: appended AFTER the dsh part and outside the early-return path — a
+    // machine with no dsh profiles at all (the #4648 codex case) must still get
+    // its observed client versions.
+    lines.push(...observedUaLines());
     return lines;
 }
 
-// #3611/#4499: two-layer config scrubbing. maskSecretValues replaces values under
-// secret-NAMED keys with *** (structural); redactForPublish then catches shapes the
-// key-based pass cannot see — credential tokens, bare endpoint HOSTS (a providers[]
-// upstream or route-prefix key), and any $HOME prefix → `~`. Unconditional: publish
-// boundary, ignores BILI_LOG_MASK_HOSTS.
+// #3611: the user's config file AS WRITTEN (not the resolved options — a
+// maintainer must see what the user actually typed), secret-bearing values
+// replaced before serialization; redactSecretsInText then scrubs credential
+// SHAPES that survive (bearer/sk-/xai-/AIza/JWT, key=value pairs). #3811: none
+// of those touch a bare endpoint HOST — providers[].upstream / route-prefix
+// keys / proxy URLs are masked after serialization by maskUrlsForPublish, which
+// runs unconditionally (publish boundary, ignores BILI_LOG_MASK_HOSTS) and drops
+// userinfo/query/hash, so the old userinfo-only strip below is subsumed.
 const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|auth/i;
 
 function maskSecretValues(node: unknown, key?: string): unknown {
@@ -250,10 +316,11 @@ function configSectionLines(): string[] {
     }
     let text: string;
     try {
-        // #3811/#4499: redactForPublish is the outermost sink net — it scrubs
-        // credential shapes, masks every non-public endpoint host whether it
-        // appears as a VALUE (upstream/proxy) or a providers-table KEY, and
-        // rewrites any $HOME prefix to `~`. Always on: the blob is publish-boundary.
+        // #3811: redactForPublish is the outermost sink net for this section — it
+        // masks every non-public endpoint host whether it appears as a VALUE
+        // (upstream/proxy) or a providers-table KEY, drops userinfo/query/hash
+        // (subsuming the old userinfo-only strip), AND scrubs credential shapes.
+        // Always on: the blob is publish-boundary.
         text = redactForPublish(JSON.stringify(maskSecretValues(parsed)));
     } catch {
         lines.push("(config could not be serialized)");
@@ -271,6 +338,8 @@ interface TopicContext {
     storageLogLines: string[];
     conflicts: ReturnType<typeof summarizeConflicts> | null;
     conflictLogLines: string[];
+    /** Generations that could not be read; both tails are partial when set. */
+    unreadableLogs: string[];
 }
 
 interface TopicDef {
@@ -281,7 +350,12 @@ interface TopicDef {
 const TOPICS: Record<string, TopicDef> = {
     "storage-legacy-only": {
         title: () => `SQLite unified storage degraded to legacy-only (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
-        section: (ctx) => storageDiagnosticsLines(ctx),
+        section: (ctx) => [
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the storage tail below covers only the readable ones)`]
+                : []),
+            ...storageDiagnosticsLines(ctx),
+        ],
     },
     // #3235: the compression-conflict banner rides the same #3040 facility —
     // "copy diagnostics / report on GitHub" buttons straight on the banner.
@@ -296,6 +370,9 @@ const TOPICS: Record<string, TopicDef> = {
         section: (ctx) => [
             ...conflictDiagnosticsLines(ctx.conflicts),
             "--- recent conflict-related log lines ---",
+            ...(ctx.unreadableLogs.length > 0
+                ? [`(INCOMPLETE: ${ctx.unreadableLogs.length} log generation(s) could not be read — the tails below cover only the readable ones)`]
+                : []),
             ...(ctx.conflictLogLines.length > 0
                 ? ctx.conflictLogLines
                 : ["(no matching lines in the current log pair)"]),
@@ -336,29 +413,41 @@ function snapshotShadowDiagnosticsLines(): string[] {
     return lines;
 }
 
-export function buildDiagnostics(topic?: string): DiagnosticsReport {
+export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
     const t = topic?.trim().slice(0, 64) ?? "";
     const def = t ? TOPICS[t] : undefined;
     // #3813: read the rotated log pair at most ONCE per report — the storage
     // tail and the conflict banner filter the SAME candidate lines, so a
     // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously.
-    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
+    // possible), stalling the event loop synchronously. Both tails are now
+    // collected in the same streaming pass, which retains only their bounded
+    // buffers instead of every line of every generation.
+    const needStorage = Boolean(def);
+    const needConflict = t === "conflict-banner";
+    const tails = needStorage || needConflict
+        ? await candidateLogTails(needStorage, needConflict)
+        : { storage: [], conflict: [], unreadable: [] };
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail(logLines) : [],
-        conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
+        storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
+        conflicts: needStorage ? safeConflictSummary() : null,
+        conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
+        unreadableLogs: tails.unreadable,
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);
     if (def) lines.push(...def.section(ctx));
     lines.push(...hostClientVersionLines());
     lines.push(...configSectionLines());
-    // #4499: THE single publish boundary. Scrub every topic's blob uniformly
-    // (secrets → non-public hosts → $HOME paths) before serialization; the copied
-    // blob and the prefilled issue body both derive from this ONE string, so they
-    // can never diverge. Unconditional — ignores BILI_LOG_MASK_HOSTS.
+    // #4427: sink-level publish net — the blob lands in a PUBLIC GitHub issue
+    // body (copied verbatim AND embedded in the prefilled URL), so EVERY byte of
+    // every topic passes unconditional host masking + credential scrubbing right
+    // before serialization. This is the real choke point the header promises: it
+    // stops relying on each topic author remembering to sanitize its own fields
+    // (the storage section's raw log tail / free-form reason strings are exactly
+    // what slipped through before). Idempotent over the per-section redaction
+    // already applied upstream; both `blob` and the URL body derive from this one
+    // string so they can never diverge.
     const blob = redactForPublish(lines.join("\n"));
     const title = def
         ? def.title()

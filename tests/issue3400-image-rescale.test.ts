@@ -1,4 +1,7 @@
 import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { responsesToCoreWithToolImages, coreToResponsesWithToolImages } from "../src/responses-tool-output.js";
+import { shedWireImages } from "../src/egress-shed.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,7 +87,7 @@ test("big image shrunk: anthropic standalone gets copied block + adjacent note m
     assert.notEqual(out[0], input[0], "input object not mutated in place");
     assert.equal(out[1].id, "acp_imgnote_msg_img_1");
     assert.equal(out[1].role, "user");
-    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB\(约 [\d.]+ 倍\)。需要原分辨率细节\(小字、颜色、对齐\)时,调用 acp_read_original_image\("m12345"\) 读取原图。原图较大,按需读取。$/);
+    assert.match(String(out[1].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled: now \d+×\d+ \(\d+KB\), original 2400×1800 \(\d+KB\)\. \(≈[\d.]+×\) Call acp_read_original_image\("m12345"\) to read the original when full-resolution detail matters \(small text, colors, alignment\)\. 需要原分辨率细节时调用该工具读取原图,按需读取。$/);
     // original sidecar untouched in the input array
     assert.equal((input[0].rawAnthropicBlock as { source: { data: string } }).source.data, BIG.b64);
 });
@@ -134,6 +137,31 @@ test("byte-stable: same history → identical outbound bytes across cache states
     assert.equal(out2, out1, "two independent encodes of the same history must be byte-identical (upstream prefix-cache protection)");
 });
 
+for (const [firstDim, nextDim] of [[1600, 800], [800, 1600]]) {
+    test(`encode cache respects a changed dimension limit (${firstDim} to ${nextDim})`, async () => {
+        const { ctx } = ctxFor(`s-cache-dim-${firstDim}`);
+        const input = [anthropicImageMsg("msg_dim", BIG.b64)];
+        const first = await applyImageRescalePass(input, { ...ctx, maxDim: firstDim });
+        const next = await applyImageRescalePass(input, { ...ctx, maxDim: nextDim });
+        const imageData = (messages: BiliMessage[]) => (messages[0].rawAnthropicBlock as { source: { data: string } }).source.data;
+        const decoded = await Jimp.read(Buffer.from(imageData(next), "base64"));
+        assert.equal(decoded.width, nextDim, "cached encodes must use the current policy");
+        assert.notEqual(imageData(first), imageData(next));
+        assert.deepEqual(await applyImageRescalePass(input, { ...ctx, maxDim: nextDim }), next, "the same policy still reuses byte-identical output");
+        assert.equal(logLines.filter((line) => line.includes("[image-rescale]")).length, 2);
+    });
+}
+
+test("a cached low-benefit result does not suppress a later stricter resize", async () => {
+    const { ctx } = ctxFor("s-cache-null-dim");
+    const input = [anthropicImageMsg("msg_null_dim", BMP.b64, "image/bmp")];
+    assert.equal((await applyImageRescalePass(input, { ...ctx, maxDim: 1600 }))[0], input[0]);
+    const next = await applyImageRescalePass(input, { ...ctx, maxDim: 800 });
+    const block = next[0].rawAnthropicBlock as { source: { data: string } };
+    const decoded = await Jimp.read(Buffer.from(block.source.data, "base64"));
+    assert.equal(decoded.width, 800);
+});
+
 test("openai singular image_url converts to plural parts with inline note", async () => {
     const { session, ctx } = ctxFor("s-openai");
     session.state.messageRefs.byRaw["msg_o"] = "m20001";
@@ -169,7 +197,7 @@ test("google inlineData shrunk, note appended to core text (never a raw text par
     const parts = out[0].rawGoogleParts as Array<{ inlineData?: { data?: string } }>;
     assert.equal(parts.length, 1);
     assert.notEqual(parts[0].inlineData?.data, BIG.b64);
-    assert.match(String(out[0].text), /^hello\n\n\[bili\] 本图已降采样:.*acp_read_original_image\("m30001"\)/);
+    assert.match(String(out[0].text), /^hello\n\n\[bili\]\[resized\] 本图已降采样\/downsampled:.*acp_read_original_image\("m30001"\)/);
 });
 
 test("responses item: image url replaced, NO text part inside item, note rides separate message", async () => {
@@ -201,7 +229,7 @@ test("items walker (responses steady path): shrinks + inserts input_text note af
     assert.equal(out.length, 1);
     assert.equal(out[0].content.length, 3);
     assert.equal(out[0].content[2].type, "input_text");
-    assert.match(String(out[0].content[2].text), /^\[bili\] 本图已降采样:/);
+    assert.match(String(out[0].content[2].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled:/);
 });
 
 test("items walker exemption: output answering acp_read_original_image passes verbatim", async () => {
@@ -245,16 +273,16 @@ test("size-only note when the tool lane is not armed (codex/plugin lanes)", asyn
     const input = [anthropicImageMsg("msg_c", BIG.b64)];
     const out = await applyImageRescalePass(input, ctx);
     assert.equal(out.length, 2);
-    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB。$/);
+    assert.match(String(out[1].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled: now \d+×\d+ \(\d+KB\), original 2400×1800 \(\d+KB\)。$/);
     assert.doesNotMatch(String(out[1].text), /acp_read_original_image/);
 });
 
 test("buildRescaleNote: deterministic templates (full + size-only)", () => {
     const full = buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
-    assert.equal(full, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB(约 4.3 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image(\"m12345\") 读取原图。原图较大,按需读取。");
+    assert.equal(full, "[bili][resized] 本图已降采样/downsampled: now 1600×1173 (73KB), original 2140×1560 (317KB). (≈4.3×) Call acp_read_original_image(\"m12345\") to read the original when full-resolution detail matters (small text, colors, alignment). 需要原分辨率细节时调用该工具读取原图,按需读取。");
     assert.equal(full, buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 }));
     const sizeOnly = buildRescaleNote({ ref: "m12345", toolArmed: false, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
-    assert.equal(sizeOnly, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB。");
+    assert.equal(sizeOnly, "[bili][resized] 本图已降采样/downsampled: now 1600×1173 (73KB), original 2140×1560 (317KB)。");
     const noRef = buildRescaleNote({ ref: undefined, toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
     assert.equal(noRef, sizeOnly);
 });
@@ -373,5 +401,150 @@ test("persistence invariant: remembered session view keeps ORIGINAL image bytes 
     } finally {
         await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
         await fake.close();
+    }
+});
+
+test("PTC original receipt: real restore survives an Anthropic ipython tool result", async () => {
+    const { session, ctx } = ctxFor("s-ptc-original");
+    const imgPath = path.join(root, "ptc-original.png");
+    const buf = Buffer.from(BIG.b64, "base64");
+    writeFileSync(imgPath, buf);
+    session.incomingImageIndex = new Map([["m12345", [{ mediaType: "image/png", bytes: buf.length, width: 2400, height: 1800, path: imgPath }]]]);
+    const restored = await executeReadOriginalImage({ ref: "m12345" }, session, log);
+    assert.ok(restored.image);
+    const input: BiliMessage[] = [{
+        id: "ptc-result", role: "tool", contentType: "tool-result", toolName: "ipython", text: restored.text,
+        rawAnthropicBlock: { type: "tool_result", tool_use_id: "ptc", content: [
+            { type: "text", text: restored.text },
+            { type: "image", source: { type: "base64", media_type: restored.image.mediaType, data: restored.image.base64 } },
+        ] },
+    }];
+    const before = JSON.stringify(input);
+    const out = await applyImageRescalePass(input, ctx);
+    assert.equal(out[0], input[0], "receipt-bound original must survive PTC unchanged");
+    assert.equal(JSON.stringify(input), before, "history remains byte-exact");
+    assert.match(restored.text, /^Original image for m12345 restored .*\nBillion original image receipt v1 sha256=[a-f0-9]{64}$/);
+});
+
+const RECEIPT = `Billion original image receipt v1 sha256=${createHash("sha256").update(Buffer.from(BIG.b64, "base64")).digest("hex")}`;
+const OTHER = (await makePng(2200, 1700)).b64;
+type ImageTestPart = { type: string; text?: string; image_url?: string };
+const responseImage = (b64: string): ImageTestPart => ({ type: "input_image", image_url: `data:image/png;base64,${b64}` });
+
+test("PTC original receipt: Responses steady and rebuilt outputs protect only matching images", async () => {
+    const { ctx } = ctxFor("s-ptc-responses");
+    for (const type of ["function_call_output", "custom_tool_call_output"]) {
+        const input = [{ type, call_id: "ptc", output: [
+            { type: "input_text", text: RECEIPT }, responseImage(BIG.b64), responseImage(OTHER),
+        ] }];
+        const before = JSON.stringify(input);
+        const steady = await applyImageRescaleItems(input, ctx) as typeof input;
+        assert.ok(steady[0].output[1].image_url === responseImage(BIG.b64).image_url, "matching original survives steady egress");
+        assert.ok(steady[0].output[2].image_url !== responseImage(OTHER).image_url, "unrelated PTC image still shrinks");
+        const projection = responsesToCoreWithToolImages({ input });
+        const generic = await applyImageRescalePass(projection.msgs, ctx);
+        const rebuilt = coreToResponsesWithToolImages(generic, projection.customToolCallIds) as typeof input;
+        assert.ok(rebuilt[0].output[1].image_url === responseImage(BIG.b64).image_url, "matching original survives generic/rebuilt egress");
+        assert.ok(rebuilt[0].output[2].image_url !== responseImage(OTHER).image_url, "unrelated rebuilt image still shrinks");
+        assert.equal(JSON.stringify(input), before, "history is untouched");
+    }
+});
+
+test("PTC original receipt: byte-shed keeps matching originals but sheds unrelated images", async () => {
+    for (const tail of [0, 9]) {
+        for (const protocol of ["responses", "anthropic"] as const) {
+            const output = protocol === "responses"
+                ? [{ type: "input_text", text: RECEIPT }, responseImage(BIG.b64), responseImage(OTHER)]
+                : [{ type: "text", text: RECEIPT },
+                    { type: "image", source: { type: "base64", media_type: "image/png", data: BIG.b64 } },
+                    { type: "image", source: { type: "base64", media_type: "image/png", data: OTHER } }];
+            const body = protocol === "responses"
+                ? { input: [{ type: "function_call_output", call_id: "ptc", output }, ...Array.from({ length: tail }, () => ({ type: "message", role: "user", content: "padding" }))] }
+                : { messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "ptc", content: output }] }, ...Array.from({ length: tail }, () => ({ role: "user", content: "padding" }))] };
+            const result = await shedWireImages(JSON.stringify(body), protocol, 1000);
+            assert.ok(result.body.includes(BIG.b64), "original survives both archiving and forced downscale");
+            assert.ok(!result.body.includes(OTHER), "unrelated image remains eligible for byte-shed");
+            assert.ok(tail ? result.stats.archived > 0 : result.stats.downscaled > 0);
+        }
+    }
+});
+
+test("PTC original receipt: missing, malformed, mismatched and unrelated receipts never exempt", async () => {
+    const { ctx } = ctxFor("s-ptc-negative");
+    const cases = ["", RECEIPT.replace("v1", "v2"), RECEIPT.slice(0, -1), `${RECEIPT} extra`,
+        `Billion original image receipt v1 sha256=${"0".repeat(64)}`];
+    for (const receipt of cases) {
+        const input = [{ type: "function_call_output", call_id: "ptc", output: [
+            { type: "input_text", text: receipt }, responseImage(BIG.b64),
+        ] }];
+        const steady = await applyImageRescaleItems(input, ctx) as typeof input;
+        assert.ok(steady[0].output[1].image_url !== responseImage(BIG.b64).image_url, "invalid receipt follows ordinary shrink");
+        const generic = await applyImageRescalePass(responsesToCoreWithToolImages({ input }).msgs, ctx);
+        const rebuilt = coreToResponsesWithToolImages(generic) as typeof input;
+        assert.ok(rebuilt[0].output[1].image_url !== responseImage(BIG.b64).image_url);
+        const anth: BiliMessage = { id: "negative", role: "tool", contentType: "tool-result", toolName: "run_code", text: receipt,
+            rawAnthropicBlock: { type: "tool_result", tool_use_id: "ptc", content: [
+                { type: "text", text: receipt }, { type: "image", source: { type: "base64", media_type: "image/png", data: BIG.b64 } },
+            ] } };
+        const out = await applyImageRescalePass([anth], ctx);
+        assert.ok(out[0] !== anth, "Anthropic invalid receipt follows ordinary shrink");
+    }
+    const otherOutput = [
+        { type: "function_call_output", call_id: "receipt-only", output: [{ type: "input_text", text: RECEIPT }] },
+        { type: "function_call_output", call_id: "image-only", output: [responseImage(BIG.b64)] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: RECEIPT }, responseImage(BIG.b64)] },
+    ];
+    const before = JSON.stringify(otherOutput);
+    const out = await applyImageRescaleItems(otherOutput, ctx);
+    assert.ok(!JSON.stringify(out).includes(BIG.b64), "receipt elsewhere or in a user message grants no exemption");
+    assert.equal(JSON.stringify(otherOutput), before);
+    clearRescaleEncodeCache();
+    const freshCtx = ctxFor("s-fresh-process").ctx;
+    const valid = [{ type: "function_call_output", call_id: "ptc", output: [{ type: "input_text", text: RECEIPT }, responseImage(BIG.b64)] }];
+    assert.deepEqual(await applyImageRescaleItems(valid, freshCtx), valid, "receipt is stateless after cache/session reset");
+    const ordinary = [{ type: "function_call_output", call_id: "ordinary", output: [responseImage(BIG.b64)] }];
+    const normal = await applyImageRescaleItems(ordinary, ctxFor("s-other-session").ctx) as typeof ordinary;
+    assert.ok(normal[0].output[0].image_url !== responseImage(BIG.b64).image_url, "exemption never leaks into encode cache");
+    const shed = await shedWireImages(JSON.stringify({ input: otherOutput }), "responses", 1000);
+    assert.ok(!shed.body.includes(BIG.b64), "byte-shed does not search unrelated outputs or user text for receipts");
+});
+
+test("PTC original receipt: Google-wire tool results protect only matching images", async () => {
+    const { ctx } = ctxFor("s-ptc-google");
+    const pos: BiliMessage = {
+        id: "g-pos", role: "tool", contentType: "tool-result", toolName: "ipython", text: "",
+        rawGoogleParts: [
+            { text: RECEIPT },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+            { inlineData: { mimeType: "image/png", data: OTHER } },
+        ],
+    };
+    const out = await applyImageRescalePass([pos], ctx);
+    assert.equal(out.length, 1);
+    assert.notEqual(out[0], pos, "unrelated image must still produce a rescaled copy");
+    const gp = out[0].rawGoogleParts as Array<{ inlineData?: { data?: string } }>;
+    assert.equal(gp[1].inlineData?.data, BIG.b64, "receipt-bound original survives Google egress byte-identical");
+    assert.notEqual(gp[2].inlineData?.data, OTHER, "unrelated PTC image still shrinks");
+    const neg: BiliMessage = {
+        id: "g-neg", role: "tool", contentType: "tool-result", toolName: "ipython", text: "",
+        rawGoogleParts: [
+            { text: RECEIPT.replace("v1", "v2") },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+        ],
+    };
+    const nout = await applyImageRescalePass([neg], ctx);
+    assert.notEqual(nout[0], neg, "invalid receipt follows ordinary shrink on the Google wire");
+    for (const tail of [0, 9]) {
+        const entry = { role: "user", parts: [
+            { functionResponse: { name: "ipython", response: {} } },
+            { text: RECEIPT },
+            { inlineData: { mimeType: "image/png", data: BIG.b64 } },
+            { inlineData: { mimeType: "image/png", data: OTHER } },
+        ] };
+        const body = { contents: [entry, ...Array.from({ length: tail }, () => ({ role: "user", parts: [{ text: "padding" }] }))] };
+        const result = await shedWireImages(JSON.stringify(body), "google", 1000);
+        assert.ok(result.body.includes(BIG.b64), "original survives both archiving and forced downscale");
+        assert.ok(!result.body.includes(OTHER), "unrelated image remains eligible for byte-shed");
+        assert.ok(tail ? result.stats.archived > 0 : result.stats.downscaled > 0);
     }
 });

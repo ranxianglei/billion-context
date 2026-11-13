@@ -232,7 +232,7 @@ test("e2e #1195 B: an unfoldable payload passes the ORIGINAL overflow 400 throug
     assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
 });
 
-test("#2777: an internal failed-compress continuation retains the accepted overflow fold", async (t) => {
+test("#2777: a failed compress after an accepted overflow fold keeps the fold for the next turn", async (t) => {
     const upstream = await recordedUpstream((call, res) => {
         if (call === 0) {
             res.writeHead(400, { "content-type": "application/json" });
@@ -262,15 +262,31 @@ test("#2777: an internal failed-compress continuation retains the accepted overf
     });
     assert.equal(response.status, 200);
     const stream = await response.text();
-    const forwards = upstream.bodies.filter((raw) => (JSON.parse(raw) as { stream?: boolean }).stream !== false);
-    assert.equal(forwards.length, 3, "original overflow, accepted folded retry, internal continuation");
-    assert.ok(forwards[0].includes("MARKER_1_"), "original request contains early history");
-    assert.ok(forwards[1].includes(SUMMARY_TEXT) && !forwards[1].includes("MARKER_1_"), "accepted retry folded early history");
-    assert.match(stream, /Compression FAILED/, "invalid range leaves the existing fold unchanged");
-    assert.ok(forwards[2].includes(SUMMARY_TEXT), "continuation retains the accepted summary");
-    assert.ok(!forwards[2].includes("MARKER_1_"), "continuation does not resurrect folded early history");
-    assert.ok(forwards[2].includes("MARKER_11_"), "continuation preserves the recent tail");
-    assert.ok(forwards[2].length < forwards[0].length, "internal rebuild stays smaller than the rejected original");
+    const forwards = () => upstream.bodies.filter((raw) => (JSON.parse(raw) as { stream?: boolean }).stream !== false);
+    // #4186→#5220: the failed-only compress round no longer ends the turn —
+    // the receipt re-request is the third forward. It must carry the streamed
+    // ❌ receipt (client-visible bytes) and NONE of this round's ephemeral
+    // failure frames (#1548/#4186 seam invariant).
+    assert.equal(forwards().length, 3, "original overflow + accepted folded retry + recovery-receipt re-request (#5220)");
+    assert.ok(forwards()[0].includes("MARKER_1_"), "original request contains early history");
+    assert.ok(forwards()[1].includes(SUMMARY_TEXT) && !forwards()[1].includes("MARKER_1_"), "accepted retry folded early history");
+    assert.ok(forwards()[2].includes("Compression FAILED"), "receipt re-request carries the ❌ receipt as assistant text");
+    assert.ok(!forwards()[2].includes("tool_result"), "ephemeral failure frames stay off the wire (#1548/#4186)");
+    assert.match(stream, /Compression FAILED/, "the invalid-range receipt reaches the client");
+    // #2777 core property under the new contract: the accepted fold survives
+    // the failed compress into the NEXT turn's rebuild.
+    const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-acp-session": "refold-2777" },
+        body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() }),
+    });
+    assert.equal(r2.status, 200);
+    const f = forwards();
+    assert.equal(f.length, 4, "next turn hits the upstream once more");
+    assert.ok(f[3].includes(SUMMARY_TEXT), "next-turn rebuild retains the accepted summary");
+    assert.ok(!f[3].includes("MARKER_1_"), "next-turn rebuild does not resurrect folded early history");
+    assert.ok(f[3].includes("MARKER_11_"), "next-turn rebuild preserves the recent tail");
+    assert.ok(f[3].length < f[0].length, "rebuild stays smaller than the rejected original");
 });
 
 test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the RETRY's verdict, not the stale first 400 — and the arm stays for the next turn", async (t) => {

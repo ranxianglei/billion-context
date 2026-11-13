@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { DUMP_PLAINTEXT_BANNER, stripDumpBanner } from "../src/dump-banner.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -162,7 +163,9 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
             const files = fs.readdirSync(dumpDir).filter((f) => f.startsWith("err-"));
             assert.equal(files.length, 1, `expected exactly one 4xx dump, got: ${files.join(", ")}`);
             assert.match(files[0]!, /^err-\d+-re400-1-400\.json$/);
-            const dumped = JSON.parse(fs.readFileSync(path.join(dumpDir, files[0]!), "utf8")) as { model: string; messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }> };
+            const rawText = fs.readFileSync(path.join(dumpDir, files[0]!), "utf8");
+            assert.ok(rawText.startsWith(`${DUMP_PLAINTEXT_BANNER}\n`), "#4482: plaintext warning banner must lead the dump");
+            const dumped = JSON.parse(stripDumpBanner(rawText)) as { model: string; messages: Array<{ role?: string; content?: unknown; tool_calls?: unknown }> };
             assert.equal(dumped.model, "gpt-test");
             // #1881: injectTool=false sessions still carry the ACP-TAGS prohibition —
             // the client's 6 messages + the injected head system.

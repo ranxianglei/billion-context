@@ -44,7 +44,7 @@ VERIF_PYTHON=/path/to/python-with-cvc5 node --import tsx --test tests/verif-bug*
 | `verif-view-latch-discipline` | **锁存纪律判官**(#3989) | 安静轮 latch 字节逐字回放(Q1 UNSAT)+ 新鲜消息直通不受污染(Q2 UNSAT,任意 pre/post/latch 文本)+ 真代码行为矩阵(quiet 回放 / 到达锁存 / 折叠重置 / 稳态零churn) |
 | `verif-conflict-watch` / `verif-snapshot-render` / `verif-wire-anthropic-roundtrip` / `verif-wire-google-rebuild-stability` | 定向不变量 | conflict-watch 降落门限纪律(#2709/#3806 形状,边界 749/1000 vs 750/1000);snapshot-render 尾保真(发现 **#4052**:新消息与已压缩消息同文本被整条丢弃,钉为翻转断言);anthropic 同类对序+载荷保真;google 重建 append-only 稳定 |
 | `verif-responses-ingress` | 定向不变量(#3837 家族) | 入站三件套(normalize→sanitize→drop,真实管线顺序)幂等/规范化/局部性全部 UNSAT + 各阶段可达性 SAT + 60 轮随机回放锚 |
-| `verif-tag-echo-filter` | **回放性质判官(无求解器)** | tag-echo-filter 真实代码上的流式分块等价 / strip 幂等 / 单调不增 / 干净保全 / 残留对偶 + 逐 issue 控制(#644/#1720/#1760/#1881/#2023/#2862/#717/#2405)。**发现 #4106(strip 不幂等:marker 门控序)与 #4107(流式输出依赖分块,两种形状)——均钉为已坏控制,修复后翻转**。strip 链的 lookaround+\p{So} 正则与流式 re.exec 循环在翻译子语言之外,故此判官用真实代码回放性质而非求解器 |
+| `verif-tag-echo-filter` | **回放性质判官(无求解器)** | tag-echo-filter 真实代码上的流式分块等价 / strip 幂等 / 单调不增 / 干净保全 / 残留对偶 + 逐 issue 控制(#644/#1720/#1760/#1881/#2023/#2862/#717/#2405)。**发现 #4106(strip 不幂等:marker 门控序)与 #4107(流式输出依赖分块,两种形状)——均钉为已坏控制,修复后翻转(#4107 形状 2 已由 #4170 关闭并翻转为恒等钉;形状 1 仍钉)**。strip 链的 lookaround+\p{So} 正则与流式 re.exec 循环在翻译子语言之外,故此判官用真实代码回放性质而非求解器 |
 
 ## 无作弊规则(写新 harness 前必读)
 

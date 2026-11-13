@@ -602,18 +602,23 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(JSON.stringify(session.metadata[METADATA_FOLD_COVERAGE]), covBefore, "coverage records untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchors), anchorsBefore, "anchors untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchorOrder), orderBefore, "backbone untouched");
-        // The next conversation-sized total-loss pass escalates on its own merit
-        // AND completes the #2695 zombie streak (z was 2 before the side pass;
-        // h3 makes it 3): the block is reaped — removed from state.blocks, the
-        // loss recorded as a conflict event, blockContents semantics preserved
-        // by the reap helper (kept, so derived decompress still works).
+        // The next full pass reaches the epoch-confirm gate. That gate must
+        // retain the fold snapshot, including on later foreign-history passes.
         const h3 = reconcileFoldCoverage(session, filler("h3"), opts);
         assert.equal(logs.filter((l) => l.level === "error").length, 1);
-        assert.equal(h3.reaped, 1, "third consecutive majority-loss pass reaps the zombie block");
-        assert.equal(session.state.blocks.length, 0, "reaped block removed from state.blocks");
-        assert.ok(!covOf(session)["blk3"], "coverage record for the reaped block dropped");
-        const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
-        assert.equal(conflict?.kind, "orphan-reap");
+        assert.equal(h3.reaped, 0, "epoch confirmation takes priority over zombie reaping");
+        assert.equal(session.metadata.foldEpochConfirmPending, true);
+        for (let i = 4; i <= 6; i++) {
+            assert.equal(reconcileFoldCoverage(session, filler(`h${i}`), opts).reaped, 0);
+        }
+        assert.equal(session.state.blocks.length, 1, "pending confirmation retains the original fold");
+        assert.ok(covOf(session)["blk3"], "coverage evidence survives for recovery");
+        assert.equal(conflictEventsOf(session).filter((e) => e.kind === "orphan-reap").length, 0);
+        assert.equal(logs.filter((l) => l.level === "error").length, 1, "one epoch warning per episode");
+        const recovered = reconcileFoldCoverage(session, originals, opts);
+        assert.equal(recovered.missing, 0);
+        assert.notEqual(session.metadata.foldEpochConfirmPending, true);
+        assert.equal(session.state.blocks[0].blockId, "blk3");
     });
 
     test("majority-reasoning span survives a sanctioned thinking drop (no false reap, #2732)", () => {
@@ -694,10 +699,10 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         ];
         for (const w of wires) {
             assert.ok(w.msgs.length >= 10, `${w.name}: fixture must defeat the core-count guard, got ${w.msgs.length}`);
-            const ctrlIds = Array.from({ length: 12 }, (_, i) => `c${i}`);
+            const ctrlIds = Array.from({ length: 5 }, (_, i) => `c${i}`);
             const ctrl = blockSession("main-fold", ctrlIds);
             const ctrlOriginals = ctrlIds.map((id, i) => msg(id, "user", `control evidence ${i}`));
-            reconcileFoldCoverage(ctrl, ctrlOriginals, makeOpts());
+            reconcileFoldCoverage(ctrl, [...ctrlOriginals, ...filler("control")], makeOpts());
             for (let i = 0; i < 4; i++) reconcileFoldCoverage(ctrl, w.msgs, makeOpts());
             assert.equal(ctrl.state.blocks.length, 0, `${w.name}: uncounted expanded short passes feed deletion evidence and reap the main fold (pre-fix behavior)`);
             const ids = Array.from({ length: 12 }, (_, i) => `main${i}`);
@@ -1065,7 +1070,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

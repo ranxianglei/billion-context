@@ -150,7 +150,7 @@ async function rescaleImage(mediaType: string, b64: string, maxDim: number): Pro
     const dims = decodeImageDims(b64);
     const gated = (dims !== undefined && Math.max(dims.w, dims.h) > maxDim) || origBytes > RESCALE_TRIGGER_BYTES;
     if (!gated) return null;
-    const hash = createHash("sha256").update(b64, "utf8").digest("hex");
+    const hash = createHash("sha256").update(`${mime}:${maxDim}:${b64}`, "utf8").digest("hex");
     let pending = encodeCache.get(hash);
     const cacheHit = pending !== undefined;
     if (!pending) {
@@ -216,9 +216,9 @@ export function buildRescaleNote(opts: {
     origKb: number;
     ratio: number;
 }): string {
-    const head = `[bili] 本图已降采样:当前 ${opts.width}×${opts.height} / ${opts.kb}KB;原图 ${opts.origWidth}×${opts.origHeight} / ${opts.origKb}KB`;
+    const head = `[bili][resized] 本图已降采样/downsampled: now ${opts.width}×${opts.height} (${opts.kb}KB), original ${opts.origWidth}×${opts.origHeight} (${opts.origKb}KB)`;
     if (opts.ref !== undefined && opts.toolArmed) {
-        return `${head}(约 ${opts.ratio.toFixed(1)} 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image("${opts.ref}") 读取原图。原图较大,按需读取。`;
+        return `${head}. (≈${opts.ratio.toFixed(1)}×) Call acp_read_original_image("${opts.ref}") to read the original when full-resolution detail matters (small text, colors, alignment). 需要原分辨率细节时调用该工具读取原图,按需读取。`;
     }
     return `${head}。`;
 }
@@ -274,6 +274,26 @@ function asPart(v: unknown): Part | undefined {
 // never mutated (session state and persistence keep the originals).
 // ---------------------------------------------------------------------------
 
+/** Non-security, caller-fabricable convention: only exact decoded image bytes in
+ *  this tool output match. The receipt line may ride any text part of the same
+ *  output — typed on the Anthropic/Responses wires ({type:"text"} /
+ *  {type:"input_text"}), untyped on the Google wire ({text}) — so the scan is
+ *  shape-agnostic over string .text fields. Never search other messages or
+ *  cache an exemption. */
+export function matchesOriginalImageReceipt(b64: string, parts: unknown[]): boolean {
+    const hashes = new Set<string>();
+    for (const part of parts) {
+        const p = asPart(part);
+        if (typeof p?.text !== "string") continue;
+        for (const line of p.text.split(/\r?\n/)) {
+            const match = /^Billion original image receipt v1 sha256=([a-f0-9]{64})$/.exec(line);
+            if (match) hashes.add(match[1]);
+        }
+    }
+    if (hashes.size === 0) return false;
+    return hashes.has(createHash("sha256").update(Buffer.from(b64, "base64")).digest("hex"));
+}
+
 async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessage[] | undefined> {
     const block = asPart(m.rawAnthropicBlock);
     if (!block) return undefined;
@@ -300,7 +320,7 @@ async function rescaleAnthropic(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMe
             const p = asPart(part);
             if (p?.type === "image") {
                 const src = asPart(p.source);
-                if (src?.type === "base64" && typeof src.data === "string") {
+                if (src?.type === "base64" && typeof src.data === "string" && !matchesOriginalImageReceipt(src.data, content)) {
                     const r = await rescaleImage(typeof src.media_type === "string" ? src.media_type : "image/png", src.data, ctx.maxDim);
                     if (r) {
                         any = true;
@@ -386,7 +406,7 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
     for (const part of parts) {
         const p = asPart(part);
         const inline = p ? asPart(p.inlineData) : undefined;
-        if (inline && typeof inline.data === "string") {
+        if (inline && typeof inline.data === "string" && !matchesOriginalImageReceipt(inline.data, parts)) {
             const r = await rescaleImage(typeof inline.mimeType === "string" ? inline.mimeType : "image/png", inline.data, ctx.maxDim);
             if (r) {
                 any = true;
@@ -409,8 +429,11 @@ async function rescaleGoogle(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessa
 
 async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<BiliMessage[] | undefined> {
     const item = asPart(m.rawResponsesItem);
-    if (!item || item.type !== "message" || !Array.isArray(item.content)) return undefined;
-    const content = item.content as unknown[];
+    if (!item) return undefined;
+    const toolOutput = item.type === "function_call_output" || item.type === "custom_tool_call_output";
+    const partsKey = toolOutput ? "output" : item.type === "message" ? "content" : undefined;
+    if (partsKey === undefined || !Array.isArray(item[partsKey])) return undefined;
+    const content = item[partsKey] as unknown[];
     const changed: unknown[] = [];
     let first: RescaledImage | undefined;
     const ref = refFor(ctx.session, m.id);
@@ -418,7 +441,7 @@ async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<Bi
         const p = asPart(part);
         if (p?.type === "input_image" && typeof p.image_url === "string" && p.image_url.startsWith("data:")) {
             const d = parseDataUrl(p.image_url);
-            if (d) {
+            if (d && !(toolOutput && matchesOriginalImageReceipt(d.base64, content))) {
                 const r = await rescaleImage(d.mediaType, d.base64, ctx.maxDim);
                 if (r) {
                     if (!first) first = r;
@@ -436,7 +459,8 @@ async function rescaleResponsesItem(m: BiliMessage, ctx: RescaleCtx): Promise<Bi
         changed.push(part);
     }
     if (!first) return undefined;
-    const copy: BiliMessage = { ...m, rawResponsesItem: { ...item, content: changed } };
+    const copy: BiliMessage = { ...m, rawResponsesItem: { ...item, [partsKey]: changed } };
+    if (toolOutput) return [{ ...copy, text: `${m.text ?? ""}\n\n${noteFor(ctx, ref, first)}` }];
     const noteMsg: BiliMessage = { id: `acp_imgnote_${m.id}`, role: "user", contentType: "text", text: noteFor(ctx, ref, first) };
     return [copy, noteMsg];
 }
@@ -555,7 +579,7 @@ export async function applyImageRescaleItems(items: unknown[], ctx: RescaleCtx):
                 const p = asPart(part);
                 if (p?.type === "input_image" && typeof p.image_url === "string" && p.image_url.startsWith("data:")) {
                     const d = parseDataUrl(p.image_url);
-                    if (d) {
+                    if (d && !(partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) {
                         const r = await rescaleImage(d.mediaType, d.base64, ctx.maxDim);
                         if (r) {
                             any = true;
@@ -588,8 +612,9 @@ const REF_PATTERN = /^m\d{5,}$/;
 /** Execute acp_read_original_image: fetch the ORIGINAL bytes for a message ref
  *  from the local session storage (incoming-image index + spill dir) and
  *  return them as an image attachment — the tool result itself stays TEXT.
- *  The caller attaches the bytes to an ephemeral carrier message whose
- *  toolName marks it structurally exempt from further rescaling. */
+ *  Direct callers use the structural toolName exemption. PTC hosts must forward
+ *  the receipt text beside the actual image in the SAME tool output. The digest
+ *  is a caller-fabricable convention, not authenticated restore provenance. */
 export async function executeReadOriginalImage(
     args: Record<string, unknown>,
     session: Session,
@@ -624,7 +649,7 @@ export async function executeReadOriginalImage(
     // carries TEXT only — the host agent opens this file with its own tools.
     const dims = `${entry.width ?? "?"}x${entry.height ?? "?"}`;
     return {
-        ...toolOk(`Original image for ${ref} restored (${dims}, ${formatKb(buf.length)}KB${entry.mediaType ? `, ${entry.mediaType}` : ""}). Local copy: ${entry.path}. It is larger than the downscaled copy you saw — use it for fine detail (small text, colors, alignment).`),
+        ...toolOk(`Original image for ${ref} restored (${dims}, ${formatKb(buf.length)}KB${entry.mediaType ? `, ${entry.mediaType}` : ""}). Local copy: ${entry.path}. It is larger than the downscaled copy you saw — use it for fine detail (small text, colors, alignment).\nBillion original image receipt v1 sha256=${createHash("sha256").update(buf).digest("hex")}`),
         image: { base64: buf.toString("base64"), mediaType: entry.mediaType },
     };
 }

@@ -13,21 +13,29 @@ import {
 import { keepaliveStatusFor } from "./cache-keepalive.js";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { activeThrottleHolds } from "./upstream-throttle.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
+import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { withoutTurnSeparators } from "./turn-separator.js";
+import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { getResolverWedgeState } from "./resolver-wedge.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
+import { loadOptions } from "./config.js";
+import { pckNoticeActive } from "./pck-notice.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
 import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { formatContextAnalysis } from "./context-analysis.js";
 
 interface AcpStatusCtx {
     core: CompressionCore;
@@ -70,7 +78,10 @@ export function excludeDeadRefRanges<T extends { startRef: string; endRef: strin
 
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
-        messages: ctx.messages,
+        // #5139: the send view's outbound-only ordering markers have no ids in
+        // the apply view — endpoints landing on them die at projection and
+        // their whole units vanish from the offer silently.
+        messages: withoutTurnSeparators(ctx.messages),
         state: ctx.session.state,
         config: ccrLoopConfig(ctx.session, ctx.config),
         tokenCount: statusInputBaseline(ctx.session),
@@ -180,6 +191,17 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     });
     if (scope) return toolOk(base);
     const extra: string[] = [];
+    // #3925 → #3011 C9: a fork that started with zero inherited blocks used to
+    // be invisible here — "COMPRESSED BLOCKS — none" reads as "nothing folded
+    // yet", not "inheritance was skipped". Name the gap and its recovery path:
+    // the lineage link recorded at fork detection means a bili restart lets the
+    // startup sweep inherit the parent's blocks. Suppressed once any active
+    // block exists (the gap is closed by then, however it was closed).
+    const forkSkipped = forkAdoptionSkippedOf(ctx.session);
+    if (forkSkipped && !ctx.session.state.blocks.some((b) => b.active)) {
+        extra.push("");
+        extra.push(`FORK ADOPTION SKIPPED — this session forked from ${forkSkipped.parentId} with ${forkSkipped.blocks} parent block(s) (~${Math.round(forkSkipped.tokens / 1000)}K tokens) NOT inherited because forkAdoption is disabled; the parent's already-folded history replays raw and will re-fold from scratch. Set "forkAdoption": true (or BILI_FORK_ADOPTION=1) and restart bili — the recorded lineage link lets the startup sweep inherit those blocks.`);
+    }
     // #2366: everything in the report above is LOCAL ESTIMATES (defaultCountTokens);
     // on CJK-heavy routes upstream billing runs 2–4× higher, so an agent judging
     // pressure from those figures misreads a filling window as healthy and folds
@@ -224,6 +246,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(kaLine);
     }
+    // Context analysis: init size, nudge cadence, harvest (acceptance) rate and
+    // the plain-language verdict — the question that used to take hours of
+    // manual log forensics (session-aedc188c investigation, 2026-11-08).
+    const caLines = formatContextAnalysis(ctx.session.id);
+    if (caLines && caLines.length > 0) {
+        extra.push("");
+        extra.push("CONTEXT ANALYSIS (this process's lifetime):");
+        extra.push(...caLines);
+    }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and
     // feeds the exact retry loop the breaker exists to kill — every model that
@@ -242,10 +273,12 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const lastCause = compressLastFailureCause(ctx.session);
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
+    let offeredSpans: Array<{ startRef: string; endRef: string }> | undefined;
     try {
         const live = liveCompressionRanges(ctx);
         if (live) {
             const { nudge, ranges } = live;
+            offeredSpans = ranges;
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
             // #2366: high billed pressure + exhausted compressible mass is the
@@ -271,9 +304,42 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
+        } else {
+            // False-advertising fix: the tool advertises "compressible ranges"
+            // unconditionally, but the live table only exists while
+            // processTurn arms a nudge (growth >= floor). Say so instead of
+            // going silent — silence reads as "no refs exist at all" and
+            // sends first-call models into retry loops.
+            extra.push("");
+            extra.push("Compressible ranges: none offered right now — context growth has not reached the compression-nudge threshold, so nothing is worth folding yet. Continue the task; the live table appears once growth arms the nudge.");
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
+    }
+    // #4331: uncovered history — contiguous runs outside every active block AND
+    // outside the live offer above (older than the protected recent window).
+    // They keep going upstream raw while no surface names them; additive
+    // section, rendered only when non-trivial. Advisory: any failure skips it.
+    try {
+        const runs = uncoveredHistoryRuns({
+            core: ctx.core,
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrLoopConfig(ctx.session, ctx.config),
+            tokenCount: billed,
+            contentStore: contentStoreOf(ctx.session),
+            applyView: ctx.compressMessages,
+            actionableSpans: offeredSpans ?? [],
+            normalRanges: offeredSpans,
+        });
+        if (runs.length > 0) {
+            const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
+            const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
+            extra.push("");
+            extra.push(`UNCOVERED HISTORY — ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are absent from the Compressible-ranges list above (older than the protected recent window): ${describeUncoveredRuns(runs)}. They keep going upstream raw (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect their rows with scope:"uncompressed".`);
+        }
+    } catch {
+        // Advisory section; never break the status report.
     }
     // #2362: dead refs — known to the session but no longer backed by any
     // visible or folded message (client history rewrite / host-native
@@ -283,6 +349,27 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     if (deadRefs !== undefined && deadRefs.length > 0) {
         extra.push("");
         extra.push(`DEAD REFS — ${deadRefs.length} ref(s) no longer back any visible or folded message (the client history no longer carries them — host-native compaction or a bulk rewrite). Ranges citing them can NEVER compress; target only the live refs listed above: ${formatDeadRefSpans(deadRefs)}`);
+    }
+    // #4458: host-native compaction landed under this session — an explicit per-session
+    // marker so an operator/agent can tell "the host compacted this conversation" from
+    // "bili folded it" BEFORE a follow-up call burns a ref minted before the boundary.
+    // Display-only; the boundary record is set server-side by every prepare/relay path in
+    // BOTH compression modes, so the marker is lane-neutral (hermes/codex/omp/...).
+    const nativeBnd = ctx.session.metadata.nativeCompactionBoundary;
+    if (nativeBnd && typeof nativeBnd === "object") {
+        const bnd = nativeBnd as { at?: number; pendingRebase?: boolean; rebasedAt?: number };
+        if (typeof bnd.at === "number") {
+            const lane = conflictClientOf(ctx.session);
+            const atIso = new Date(bnd.at).toISOString();
+            if (bnd.pendingRebase === true) {
+                extra.push("");
+                extra.push(`HOST-NATIVE COMPACTION — the client (${lane ?? "unknown lane"}) compacted this conversation natively at ${atIso}; bili has NOT yet rebased onto the compacted view (the rebase lands on the next turn). Refs minted before this boundary stop resolving once it completes — compress only live refs.`);
+            } else {
+                const rebasedIso = typeof bnd.rebasedAt === "number" ? new Date(bnd.rebasedAt).toISOString() : "?";
+                extra.push("");
+                extra.push(`HOST-NATIVE COMPACTION — the client (${lane ?? "unknown lane"}) compacted this conversation natively at ${atIso} and bili rebased onto it at ${rebasedIso}. Refs minted before that boundary no longer resolve — compress only the live refs listed above (DEAD REFS names which ones died).`);
+            }
+        }
     }
     if (breaker) {
         extra.push("");
@@ -321,6 +408,17 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
         }
         if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    // #4204: display counterpart of the egress-side 429 governor. Account
+    // holds are per origin+credential; a verified KeyRing model refusal has
+    // its own origin+credential+model hold. Both answer locally (zero egress).
+    const throttleHolds = activeThrottleHolds();
+    if (throttleHolds.length > 0) {
+        for (const h of throttleHolds.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM 429 HOLD — ${h.host}${h.model === undefined ? "" : ` (model ${h.model})`}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on a resolved non-429 response in the same scope (#4204).`);
+        }
+        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential[+model] key(s))`);
     }
     const shrinkAt = ctx.session.stats.emergencyShrinkAt;
     if (typeof shrinkAt === "number") {
@@ -411,6 +509,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
     }
+    // #5221 phase 2 (owner ruling 2026-10-31): suspected persistent local-resolver
+    // wedge — detection-only alarm surface, same lane as the advisory above.
+    const rw = getResolverWedgeState();
+    if (rw) {
+        extra.push("");
+        extra.push(`RESOLVER WEDGE SUSPECTED (instance-level): this process's OS name resolution keeps failing for ${rw.hosts.length} host(s) that resolved fine before (${rw.hosts.slice(0, 5).join(", ")}${rw.hosts.length > 5 ? ", …" : ""}) — model requests 502 until the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy). Live state: the resolverWedge field of GET /__bili/status.`);
+    }
     const upd = getUpdateVisibility(VERSION);
     const updateAction = updateBannerPayload(upd);
     if (updateAction) {
@@ -457,6 +562,22 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
         lines.push("If this destination is your relay/account pool, its prefix-cache affinity for the listed sessions may degrade until restart.");
         extra.push(...lines);
+    }
+    // #5079: bili's own prompt_cache_key stamping is OFF by default now. An
+    // operator upgrading onto a relay/account-pool upstream that routes its
+    // prefix cache by that key must re-enable it explicitly — surface it here
+    // (the /acp channel) while the effective routing is "disabled" and the
+    // notice has not been dismissed for this instance. Read through
+    // loadOptions() so the web switch and ACP_PROMPT_CACHE_ROUTING both show
+    // up without threading opts through the loop ctx; a config-read failure
+    // just hides the line rather than breaking status.
+    try {
+        if (pckNoticeActive(loadOptions().promptCache.routing)) {
+            extra.push("");
+            extra.push("PCK SELF-STAMPING OFF BY DEFAULT (instance-level, #5079): bili no longer adds OpenAI's prompt_cache_key to requests on its own. If your upstream routes prefix cache by this key (relays such as workbuddy panel/hub, account pools), turn it back on: set \"promptCache\": {\"routing\": \"auto\"} in billion-context.json or use the web UI switch (or ACP_PROMPT_CACHE_ROUTING=auto) — otherwise traffic may route randomly and miss the prefix cache. Direct official-API users can ignore this.");
+        }
+    } catch {
+        // config unreadable — hide the line, never break acp_status
     }
     const blind = getBlindTunnelStats();
     if (blind.total > 0) {

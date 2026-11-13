@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { maskHostInText, maskUrlForLog } from "./log-mask.js";
+import { maskHostInText, maskHostPortForDisplay, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
@@ -108,7 +108,7 @@ export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpPro
     }
     return {
         url: url.href,
-        host: url.hostname,
+        host: url.hostname.replace(/^\[|\]$/g, ""),
         port,
         protocol: url.protocol,
         ...(proxyAuthorization(url) ? { authorization: proxyAuthorization(url) } : {}),
@@ -140,6 +140,15 @@ function warnUnsupportedScheme(source: string, value: string, scheme: string): v
     loggerLog("warn", `[upstream-proxy] ignoring ${source}=${redactProxyUrl(value)}: scheme "${scheme}" is not supported — only http:// and https:// proxy origins work. For Clash/mihomo, point bili at the same mixed port over http:// (e.g. http://127.0.0.1:7890).`);
 }
 
+const warnedInvalidOrigins = new Set<string>();
+
+function warnInvalidProxyOrigin(value: string): void {
+    const key = redactProxyUrl(value) ?? value;
+    if (warnedInvalidOrigins.has(key)) return;
+    warnedInvalidOrigins.add(key);
+    loggerLog("warn", `[upstream-proxy] ignoring proxy=${key}: not a usable HTTP/HTTPS proxy origin (expected http://host:port).`);
+}
+
 export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
     if (!proxy?.trim()) return;
     const scheme = unsupportedProxyScheme(proxy);
@@ -169,7 +178,7 @@ function parseFallbackProxy(proxy: string | undefined, biliPort?: number): Parse
 }
 
 type NoProxyOptions = {
-    /** Windows ProxyOverride grammar (#2502): mid-token `*` entries (Clash's default
+    /** Windows ProxyOverride grammar (#2502): `*` entries (Clash's default
      *  bypass list is `localhost;127.*;192.168.*;…;<local>`) glob-match the hostname —
      *  `.` stays literal, `*` matches any characters. NO_PROXY lists keep their
      *  conventional grammar where `*` only appears as a standalone item. */
@@ -205,7 +214,7 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined, options
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
-        if (options.windowsBypass && !token.startsWith("*") && token.includes("*") && wildcardHostMatch(host, token)) return true;
+        if (options.windowsBypass && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
     }
@@ -362,6 +371,27 @@ export function proxyKeepAliveMaxMs(): number {
  *  PROXY_KEEPALIVE_MAX_MS. */
 export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
+    // Callers that hand over a RAW env value (the registry pre-warm at
+    // registry.ts fetchFresh) never pass through autoDetectProxy's scheme
+    // guard, so an unsupported scheme must degrade here instead of reaching
+    // ProxyAgent — its constructor throws synchronously, which turned the
+    // loader's memoized promise into a permanent rejection. Direct is the same
+    // egress autoDetectProxy would have chosen (#346/#357 intact) and the
+    // diagnostic stays identical.
+    const scheme = unsupportedProxyScheme(proxyUrl);
+    if (scheme) {
+        warnUnsupportedScheme("proxy", proxyUrl, scheme);
+        return undefined;
+    }
+    // A raw env value is not necessarily an absolute origin ("127.0.0.1:7890")
+    // and ProxyAgent throws on that too. Normalize/validate the same way the
+    // config and auto-detect paths do, and degrade instead of throwing.
+    const parsed = parseHttpProxy(proxyUrl);
+    if (!parsed) {
+        warnInvalidProxyOrigin(proxyUrl);
+        return undefined;
+    }
+    proxyUrl = parsed.url;
     const t = timeoutMs ?? upstreamTimeoutMs();
     const ka = proxyKeepAliveMaxMs();
     // #3776: include the CA identity in the key so a configured/rotated network.caFile rotates the cached agent.
@@ -427,7 +457,7 @@ export function _setConnectFactoryForTest(factory: ((port: number, host: string)
  *  branch's 10s handshake timeout (see #78). */
 export function connectDirect(host: string, port: number, timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
-        const socket = connectFactory(port, host);
+        const socket = connectFactory(port, host.replace(/^\[|\]$/g, ""));
         let settled = false;
         const finishError = (error: Error) => {
             if (settled) return;
@@ -467,9 +497,10 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
         socket.once("error", finishError);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
+            const authority = `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
             const headers = [
-                `CONNECT ${host}:${port} HTTP/1.1`,
-                `Host: ${host}:${port}`,
+                `CONNECT ${authority} HTTP/1.1`,
+                `Host: ${authority}`,
                 "Proxy-Connection: Keep-Alive",
                 ...(proxy.authorization ? [`Proxy-Authorization: ${proxy.authorization}`] : []),
                 "",
@@ -540,7 +571,12 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     // Error text from undici/OS layers embeds the endpoint identity
     // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
     // relay.internal") — swap in the placeholder when the upstream is a
-    // non-public host so the failure log leaks nothing either.
+    // non-public host so the failure log leaks nothing either. The free-text
+    // `message` stays fully masked (#255); #4254 surfaces the actionable endpoint
+    // only through the structured `host` field below (loopback-exempt), so one
+    // free-text message never mixes a raw host next to a masked <private-host>.
+    let targetHostPort = "";
+    try { targetHostPort = new URL(url).host; } catch { /* not a URL — no display host */ }
     const maskHostIn = (s: string): string => {
         try {
             return maskHostInText(s, new URL(url).hostname);
@@ -567,7 +603,7 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
         hint = `${hint}; ${tlsTrustRemediation()}`;
     }
     parts.push(`hint=${hint}`);
-    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), hint } };
+    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), ...(targetHostPort !== "" ? { host: maskHostPortForDisplay(targetHostPort) } : {}), hint } };
 }
 
 export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {

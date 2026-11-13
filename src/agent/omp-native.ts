@@ -24,8 +24,10 @@
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
+import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -104,6 +106,28 @@ const incPendingOmp = new Map<string, IncrementalPendingTurn>();
  *  (#3329): attribution is exact per turn id. Mirrors opencode. */
 const INC_PENDING_TTL_MS = 30_000;
 
+/** #4491 omp msgids: align the host's branch-entry ids (stashed by the omp
+ *  extension's before_provider_request for this conversation id) against the
+ *  ACTUALLY-sent wire messages — count + role, pairwise. Returns the id
+ *  sequence only on a provable 1:1 match; any mismatch (branch out of sync
+ *  with the sent history, a native-compaction summary that became a wire
+ *  message but has no entry id, an aux persona, an older host without
+ *  getBranch) returns undefined and the turn rides without the field. The
+ *  sent messages are the alignment authority: a sequence that cannot be
+ *  proven parallel is never sent — a misaligned id would pin the wrong
+ *  identity server-side, while a missing field merely falls back to
+ *  content-derived ids. */
+function ompTurnMsgIds(sid: string, messages: IncrementalWireMessage[]): string[] | undefined {
+    const hint = hostMsgIdHintFor(sid);
+    if (hint === undefined || hint.length !== messages.length) return undefined;
+    const ids: string[] = [];
+    for (let i = 0; i < hint.length; i++) {
+        if (hint[i].role !== messages[i].role) return undefined;
+        ids.push(hint[i].id);
+    }
+    return ids;
+}
+
 /** Test hook: drop all planned turns (module state across suites). */
 export function __resetOmpIncrementalForTests(): void {
     incPendingOmp.clear();
@@ -113,6 +137,21 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
     try {
         if (init === undefined || typeof init.body !== "string") { return; }
         sweepStale(incPendingOmp, INC_PENDING_TTL_MS);
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
+        let inflight = false;
+        for (const pending of incPendingOmp.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) { return; }
         let parsed: unknown;
         try {
             parsed = JSON.parse(init.body);
@@ -121,25 +160,35 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
         }
         if (parsed === null || typeof parsed !== "object") return;
         const b = parsed as { messages?: unknown; model?: unknown; system?: unknown; prompt_cache_key?: unknown };
-        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) { return; }
+        if (typeof b.model !== "string" || !Array.isArray(b.messages)) { return; }
         const sid = typeof b.prompt_cache_key === "string" ? b.prompt_cache_key.trim() : "";
         if (sid.length === 0) { return; }
+        // #5403/#5418: feed the SAME proven id list into the shared watermark
+        // channel (the fetch chokepoint emits x-bili-pf-count + tail-ids; core
+        // = pf-channel.ts) on EVERY parsed ANTHROPIC-WIRE model request —
+        // converting turns ride the envelope, skipped/degraded/full-resend
+        // turns ride this field instead. A failed alignment (undefined)
+        // CLEARS the stored list like every other adapter — never ride a
+        // stale one. OpenAI-shaped turns are deliberately NOT re-screened
+        // here: ompTurnMsgIds' strict count+role proof cannot bridge the
+        // config-assembled leading system|developer run of real egress (no
+        // branch entry ⇒ guaranteed length mismatch ⇒ clear), and this
+        // planner runs AFTER the shared before_provider_request capture — a
+        // clear here would ERASE that resolver's position-aware list
+        // (bili-ps-N tokens) for the same conversation id. Openai-wire turns
+        // stay covered by that resolver alone (#2583 per-model egress).
+        const anthropicWire = wireMessagesLookAnthropic(b.messages);
+        let turnMsgIds: string[] | undefined;
+        if (anthropicWire) {
+            turnMsgIds = ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]);
+            pfChannel.pfCaptureIds(sid, turnMsgIds);
+        }
+        if (!anthropicWire) { return; }
         const base = state.origin;
         if (base === undefined) { return; }
         if (!(await probeIncrementalTurns(base))) { return; }
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: turnMsgIds });
         if (plan.mode === "skip") { return; }
-        // #3378 single-flight (kept over #3329's removal per the rebase
-        // decision): while a marker'd request for this URL is still awaiting
-        // its ack, later requests ride the normal pipeline. Pending entries
-        // are keyed by turn id (#3329), so the guard scans for a live entry
-        // stashed on THIS url (sweepStale above already aged out the stale
-        // ones — an aged entry must not block a fresh conversion).
-        let inflight = false;
-        for (const pending of incPendingOmp.values()) {
-            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
-        }
-        if (inflight) { return; }
         const turnId = newIncrementalTurnId();
         // #3304: stash the pre-swap body under this turn's id — if the proxy
         // dies before the send lands, the direct-send guard restores these
@@ -370,6 +419,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.e
 // patch globalThis.fetch or bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     installNativeFetchIntercept(state);
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
 }
 
 /** Test hook: point the module state at a lane origin (the incremental

@@ -172,6 +172,67 @@ test("#3776 sub-defect 2: NODE_EXTRA_CA_CERTS entries are folded into the merge 
     }
 });
 
+for (const missingFirst of [false, true]) {
+    test(`configured CA path changes bypass the mtime throttle (previous file missing=${missingFirst})`, (t) => {
+        const dir = mkTmp("bili-ca-switch-");
+        const first = path.join(dir, "first.pem");
+        const second = path.join(dir, "second.pem");
+        const firstPem = "-----BEGIN CERTIFICATE-----\nFIRST\n-----END CERTIFICATE-----\n";
+        const secondPem = "-----BEGIN CERTIFICATE-----\nSECOND\n-----END CERTIFICATE-----\n";
+        if (!missingFirst) fs.writeFileSync(first, firstPem);
+        fs.writeFileSync(second, secondPem);
+        const prev = process.env.BILI_CA_FILE;
+        t.mock.method(Date, "now", () => 1_800_000_000_000);
+        try {
+            _resetUpstreamCaForTest();
+            process.env.BILI_CA_FILE = first;
+            const firstIdentity = upstreamCaIdentity();
+            const firstRoots = upstreamExtraCa();
+            assert.equal(firstRoots!.includes(firstPem), !missingFirst);
+
+            process.env.BILI_CA_FILE = second;
+            assert.notEqual(upstreamCaIdentity(), firstIdentity, "an explicit new path gets its own dispatcher identity immediately");
+            const secondRoots = upstreamExtraCa();
+            assert.ok(secondRoots!.includes(secondPem), "trust comes from the newly selected file within the same TTL window");
+            assert.ok(!secondRoots!.includes(firstPem), "the old configured root is no longer retained");
+            assert.ok(secondRoots!.includes(tls.rootCertificates[0]), "built-in trust is still merged");
+        } finally {
+            if (prev === undefined) delete process.env.BILI_CA_FILE; else process.env.BILI_CA_FILE = prev;
+            _resetUpstreamCaForTest();
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    });
+}
+
+test("unchanged CA paths retain the existing throttled file-rotation behavior", (t) => {
+    const dir = mkTmp("bili-ca-rotation-");
+    const caFile = path.join(dir, "root.pem");
+    const before = "original CA material";
+    const after = "rotated CA material";
+    fs.writeFileSync(caFile, before);
+    const initialMtime = fs.statSync(caFile).mtimeMs;
+    const prev = process.env.BILI_CA_FILE;
+    let now = 1_800_000_000_000;
+    t.mock.method(Date, "now", () => now);
+    try {
+        _resetUpstreamCaForTest();
+        process.env.BILI_CA_FILE = caFile;
+        const initialIdentity = upstreamCaIdentity();
+        const initialRoots = upstreamExtraCa();
+        fs.writeFileSync(caFile, after);
+        fs.utimesSync(caFile, new Date(initialMtime + 1000), new Date(initialMtime + 1000));
+        assert.equal(upstreamCaIdentity(), initialIdentity);
+        assert.equal(upstreamExtraCa(), initialRoots, "same-path probes stay cached inside the 30-second window");
+        now += 30_001;
+        assert.notEqual(upstreamCaIdentity(), initialIdentity);
+        assert.ok(upstreamExtraCa()!.includes(after), "same-path rotation is picked up after the existing TTL");
+    } finally {
+        if (prev === undefined) delete process.env.BILI_CA_FILE; else process.env.BILI_CA_FILE = prev;
+        _resetUpstreamCaForTest();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 // --- e2e: a self-signed MITM upstream, through a real in-process bili proxy ---
 
 function close(server: http.Server | https.Server): Promise<void> {
@@ -278,7 +339,10 @@ test("#3776 e2e (A): untrusted MITM upstream => 502 carrying structured upstream
     const { resp, body } = await startTlsScenario(false);
     assert.equal(resp.status, 502);
     const parsed = JSON.parse(body) as { error?: string; detail?: string; upstreamFailure?: { kind?: string; code?: string; hint?: string } };
-    assert.equal(parsed.error, "acp-proxy failure");
+    // #4254: `error` is now informative (the client-rendered field); the legacy
+    // prefix is preserved so hosts matching the old constant still match.
+    assert.ok((parsed.error ?? "").startsWith("acp-proxy failure"), `legacy prefix kept, got: ${parsed.error}`);
+    assert.match(parsed.error ?? "", /tls/, "informative error carries the tls kind");
     assert.ok(parsed.detail?.includes("kind=tls"), `detail should name the kind, got: ${body}`);
     assert.equal(parsed.upstreamFailure?.kind, "tls");
     assert.ok(parsed.upstreamFailure?.code, "structured code present");

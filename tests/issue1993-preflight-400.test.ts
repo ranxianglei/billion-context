@@ -17,6 +17,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import { DUMP_PLAINTEXT_BANNER, stripDumpBanner } from "../src/dump-banner.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -319,7 +320,9 @@ test("#1993 BILI_DUMP_4XX persists the rejected summary exchange (request + resp
 
         const files = fs.readdirSync(dumpDir).filter((f) => f.startsWith("summary-err-") && f.endsWith("-400.json"));
         assert.ok(files.length >= 1, `expected at least one summary-err dump, dir has: ${JSON.stringify(fs.readdirSync(dumpDir))}`);
-        const parsed = JSON.parse(fs.readFileSync(path.join(dumpDir, files[0]!), "utf8")) as { status: number; request: unknown; response: unknown };
+        const text = fs.readFileSync(path.join(dumpDir, files[0]!), "utf8");
+        assert.ok(text.startsWith(`${DUMP_PLAINTEXT_BANNER}\n`), "#4482: plaintext warning banner must lead the dump");
+        const parsed = JSON.parse(stripDumpBanner(text)) as { status: number; request: unknown; response: unknown };
         assert.equal(parsed.status, 400);
         assert.ok(typeof parsed.request === "string" && parsed.request.includes("instructions"), "dump must carry the request bytes");
         assert.ok(typeof parsed.response === "string" && parsed.response.includes("request too large: 523200"), "dump must carry the response bytes");

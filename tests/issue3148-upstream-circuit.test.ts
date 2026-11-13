@@ -46,7 +46,10 @@ test("#3148: circuit opens after 3 consecutive pre-response failures and fast-fa
 
     const reason = upstreamCircuitBlockReason(URL_A);
     assert.ok(reason !== undefined, "blocked while open");
-    assert.ok(reason.includes("dead-host.invalid"), "reason names the host");
+    // #4254: the reason's free-text host follows the same masking rule as the
+    // embedded last-failure detail (non-public → <private-host>), so it no longer
+    // leaks the raw private hostname; the actionable endpoint rides upstreamFailure.host.
+    assert.ok(reason.includes("<private-host>"), "reason masks the private host consistently");
     assert.ok(reason.includes("consecutive pre-response failures"), "reason states the cause");
     assert.ok(reason.includes("next probe"), "reason gives the probe ETA");
     assert.equal(upstreamCircuitBlockReason(URL_B), undefined, "other hosts unaffected");

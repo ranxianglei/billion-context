@@ -10,7 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import os from "node:os";
 
 const PRIVATE_HOST = "<private-host>";
 
@@ -106,10 +106,20 @@ export function maskUrlForLog(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** Mask every http(s) URL embedded anywhere in an arbitrary string (request
- *  paths like /bili/http://relay.internal/v1/..., error text). */
+// #4191: find ANY scheme://… URL embedded in free text, not just http(s).
+// maskUrlForLog already strips userinfo/query/hash via new URL for every
+// scheme, but the entry regex had to actually LET non-http schemes through —
+// socks5://user:pass@host (self-relay forwarding addresses), ws/wss, ftp etc.
+// carried their inline credentials verbatim into logs / diagnostics / publish
+// blobs. No leading \b on purpose: a word-char-glued URL (xhttps://…) must
+// stay masked exactly as before; over-matching is safe, under-matching leaks.
+const EMBEDDED_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+/** Mask every scheme://… URL embedded anywhere in an arbitrary string
+ *  (request paths like /bili/http://relay.internal/v1/..., error text,
+ *  socks5://user:pass@host forwarding addresses — #4191). */
 export function maskUrlsInText(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForLog(m));
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForLog(m));
 }
 
 /** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
@@ -130,60 +140,64 @@ function maskUrlForPublish(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** #3811: mask the host of every http(s) URL embedded in an arbitrary string,
- *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
- *  in serialized text — object values AND object keys (the providers table
- *  uses upstream URLs as keys). */
-function maskUrlsForPublish(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+/** #3811: mask the host of every scheme://… URL embedded in an arbitrary string,
+ *  unconditionally (see maskUrlForPublish; any scheme since #4191). Catches URLs
+ *  wherever they appear in serialized text — object values AND object keys (the
+ *  providers table uses upstream URLs as keys). */
+export function maskUrlsForPublish(text: string): string {
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForPublish(m));
 }
 
-// Escape a literal string for safe embedding in a RegExp (maskPathsForPublish
-// builds its pattern from the live home path, which may carry metacharacters).
 function escapeRegExp(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** #4499: publish-path filesystem-path masking for artifacts that land in a
- * PUBLIC GitHub issue body (the diagnostics blob). Rewrites the process home
- * directory prefix ($HOME) to `~`, so an absolute path like
- * /home/<user>/.cache/billion-context/sqlite/.bootstrap-failed.json publishes
- * as ~/.cache/billion-context/sqlite/.bootstrap-failed.json — the recovery lever
- * stays ACTIONABLE while no username leaks. This closes the bare-absolute-path
- * vector the other primitives did not cover: #3959 proved an absolute user path
- * reached a public issue body through exactly this flow.
- *
- * Anchored on both flanks so word-embedded neighbours are never touched:
- *   - LEFT — the char before the home prefix must not be a word char or `/`.
- *     Rejects relative paths (`foo/home/<user>`) and URL pathnames, whose
- *     preceding segment ends in a hostname word-char (and, after
- *     maskUrlsForPublish runs first, query/hash are already dropped and hosts
- *     masked, so a home-shaped segment inside a URL is left alone);
- *   - RIGHT — the char after it must not be a word char. Rejects word-suffixed
- *     sibling homes (`/home/<user>2` when $HOME=/home/<user>). Dot/hyphen
- *     siblings (`/home/<user>.bak`, `/home/<user>-bob`) DO get rewritten to
- *     `~…`: deliberate safe-side over-masking — widening the anchor to spare
- *     them would under-mask a real home followed by punctuation (e.g. the
- *     sentence-final period in `path /home/<user>.`).
- */
+/** #4427: strip the running user's home directory out of absolute paths in
+ *  publish-boundary text, rewriting it to `~` (the shell universal for $HOME).
+ *  This is the identity leak #3959 proved in the wild — a public diagnostics
+ *  report naming /home/<user>/... hands a stranger the reporter's username and
+ *  home layout. Every spelling of THIS machine's home root is rewritten —
+ *  os.homedir() plus the $HOME and %USERPROFILE% env values (on Windows they
+ *  diverge: os.homedir() reads USERPROFILE while git-bash-style tool output
+ *  carries $HOME paths, so masking only one leaks the other; POSIX values
+ *  dedupe to one root) — each as an ANCHORED match on BOTH flanks: preceded by
+ *  start-of-string or a non-token boundary (whitespace / quote / bracket /
+ *  colon / equals) AND followed by a path separator (/ or \), a quote,
+ *  whitespace or end-of-string — so sibling homes (/home/<other>), URL hosts
+ *  and URL pathnames are all left alone. The result stays actionable:
+ *  ~/.cache/billion-context/... is exactly where the user looks to recover.
+ *  Idempotent (~ has no homedir in it). */
+function publishHomeRoots(): string[] {
+    const roots = new Set<string>();
+    for (const raw of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+        if (typeof raw !== "string") continue;
+        const r = raw.replace(/[/\\]+$/, "");
+        if (r) roots.add(r);
+    }
+    return [...roots].sort((a, b) => b.length - a.length);
+}
+
 export function maskPathsForPublish(text: string): string {
     if (!text) return text;
-    const home = homedir();
-    if (!home || home === "/") return text;
-    const re = new RegExp(`(?<![\\w/])${escapeRegExp(home)}(?![\\w])`, "g");
+    const roots = [...new Set(publishHomeRoots().flatMap((root) => [
+        root,
+        JSON.stringify(root).slice(1, -1),
+    ]))].sort((a, b) => b.length - a.length);
+    if (roots.length === 0) return text;
+    const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
 }
 
-/** #4499: THE single publish-boundary scrubber. Composes the three layers in
- * order — secret scrubbing → non-public host masking → home-path stripping — so
- * every topic's diagnostics blob is uniformly cleaned before it lands in a
- * PUBLIC GitHub issue body. Applied ONCE at the serialization point
- * (buildDiagnostics); the copied blob and the prefilled issue body both derive
- * from that one string so they can never diverge. Like maskUrlsForPublish and
- * redactSecretsInText it is NEVER gated by BILI_LOG_MASK_HOSTS: the local
- * host-visibility preference must not weaken the publish boundary. */
+/** #4427: the single publish-boundary redaction primitive for any byte that
+ *  lands in a PUBLIC artifact (the diagnostics blob / prefilled issue body) —
+ *  credential-shape scrubbing, then UNCONDITIONAL non-public URL-host masking,
+ *  then home-dir path stripping. Composes the three existing nets in one fixed
+ *  order so every caller applies them instead of re-deriving it; idempotent, so
+ *  a second pass over already-redacted text is a no-op (the sink-level net in
+ *  buildDiagnostics re-runs this over per-section output safely). Never gated by
+ *  BILI_LOG_MASK_HOSTS — the local log host-visibility preference must not
+ *  weaken the publish boundary (#3811). */
 export function redactForPublish(text: string): string {
-    if (!text) return text;
     return maskPathsForPublish(maskUrlsForPublish(redactSecretsInText(text)));
 }
 
@@ -196,13 +210,15 @@ export function maskUrlForDiagnostics(url: string): string {
     try {
         const u = new URL(url);
         // Node keeps the brackets in hostname for bracketed IPv6 ([::1]).
-        // Loopback is returned VERBATIM (not re-serialized): URL.pathname
-        // normalizes pathless URLs by appending "/", which would drift
-        // byte-pinned local-origin lines for no security benefit — loopback
-        // identifies bili's own proxy, and secrets are scrubbed separately
-        // by redactSecretsInText upstream of every call site.
+        // Keep clean loopback URLs verbatim: URL.pathname would add "/" to
+        // pathless local-origin lines. The exemption covers host visibility,
+        // never userinfo/query/hash; generic text redaction cannot recognize
+        // arbitrary passwords or every query parameter carrying a secret.
         const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        if (h === "localhost" || isLoopbackIp(h)) return url;
+        if (h === "localhost" || isLoopbackIp(h)) {
+            if (!u.username && !u.password && !u.search && !u.hash) return url;
+            return `${u.protocol}//${u.host}${u.pathname}`;
+        }
     } catch {
         // unparseable — fall through to the generic masker
     }
@@ -210,10 +226,11 @@ export function maskUrlForDiagnostics(url: string): string {
 }
 
 /** Text-level twin of maskUrlForDiagnostics (#3651): masks every embedded
- *  http(s) URL with the loopback-exempt rule; unparseable fragments pass
- *  through (the IP scrubber neutralizes bare IP literals separately). */
+ *  scheme://… URL with the loopback-exempt rule (any scheme since #4191);
+ *  unparseable fragments pass through (the IP scrubber neutralizes bare IP
+ *  literals separately). */
 export function maskUrlsForDiagnostics(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
+    return text.replace(EMBEDDED_URL_RE, (m) => {
         try {
             void new URL(m);
             return maskUrlForDiagnostics(m);
@@ -278,6 +295,27 @@ function isLoopbackIp(ip: string): boolean {
     return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
 }
 
+/** #4254: is this a loopback host name/address? Loopback identifies a LOCAL
+ *  relay/endpoint, never an external party, so the diagnostic DISPLAY path
+ *  renders it verbatim (matching maskUrlForDiagnostics / maskIpsInText's
+ *  exemption) instead of masking it. Bracketed IPv6 and letter-case normalize. */
+export function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || isLoopbackIp(h);
+}
+
+/** #4254: display form of a `host[:port]` target under the LOOPBACK-EXEMPT rule —
+ *  the user-facing counterpart of maskHostPortForLog. Loopback renders verbatim
+ *  (so "127.0.0.1:7864" stays readable and actionable); any other non-public host
+ *  is masked with its port kept. Used by the upstream-failure egress path so one
+ *  message never mixes a raw loopback next to a masked <private-host>. */
+export function maskHostPortForDisplay(target: string): string {
+    const i = target.lastIndexOf(":");
+    if (i <= 0) return isLoopbackHost(target) ? target : maskHostForLog(target);
+    const host = target.slice(0, i);
+    return `${isLoopbackHost(host) ? host : maskHostForLog(host)}${target.slice(i)}`;
+}
+
 /**
  * Sink-level safety net (#1718): scrub non-loopback IP literals out of
  * arbitrary log text. undici/OS error messages embed the dialed endpoint
@@ -321,7 +359,11 @@ export function redactSecretsInText(text: string): string {
     return text
         .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
+        // Groq (gsk_…) and Hugging Face (hf_…) keys, both on PUBLIC_HOST_SUFFIXES.
+        .replace(/(?<![A-Za-z0-9])(?:gsk|hf)_[A-Za-z0-9]{20,}/g, "<masked key>")
         .replace(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{20,}/g, "<masked key>")
         .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "<masked jwt>")
-        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
+        // The optional quote after the name covers JSON/dict keys ("api_key": "…"), the shape
+        // upstream error bodies and config dumps use; without it only key=value / key: value matched.
+        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b["']?\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
 }

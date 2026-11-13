@@ -198,7 +198,11 @@ test("formatConflictSection: identity-orphan-only ledger gets identity-loss fram
     ];
 
     const activeText = formatConflictSection(orphan(Date.now() - 60_000), Date.now(), "dsh").join("\n");
-    assert.ok(activeText.includes("identity-loss takeovers"), activeText);
+    assert.ok(activeText.includes("possible identity-loss replays"), activeText);
+    assert.ok(activeText.includes("does NOT prove"), activeText);
+    assert.ok(activeText.includes("Original session state is retained"), activeText);
+    assert.ok(!activeText.includes("THIS session's fold continuity broke"), activeText);
+    assert.ok(!activeText.includes("or start a fresh conversation"), activeText);
     assert.ok(activeText.includes("NO second compressor to hunt for"), activeText);
     assert.ok(activeText.includes("pfa-c911250bdddebd02"), "raw event line still names the fork");
     // the misclassification this test pins: no plugin-hunt advice, no per-client

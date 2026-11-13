@@ -6,7 +6,7 @@ import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kerne
 import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -458,6 +458,31 @@ test("restoreOutputBudget: the <=200 starve log keeps its original wording, the 
     assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band restore names itself");
 });
 
+test("restoreOutputBudget: a KNOWN ceiling with value >= ceiling is healthy — no spurious 'NO known output ceiling' warn (#4501)", () => {
+    _resetDshMidBandWarningsForTest();
+    const warns: string[] = [];
+    const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
+    const tools = [{ name: "t" }];
+    const M = "prov/capped-model";
+    const CEIL = 131_072;
+    const midBandWarns = (): number => warns.filter((w) => w.includes("NO known output ceiling")).length;
+    // Pre-#4501 the mid-band warn fired on any dsh-lane tool-carrying budget in
+    // the healthy branch — including when a ceiling WAS known (value >= ceiling) —
+    // spamming operators who had declared one. A known ceiling makes it healthy.
+    const s = metaSession("dsh-cap-known");
+    const atCap = { max_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(atCap, s, log, CEIL, true);
+    assert.equal(atCap.max_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(midBandWarns(), 0, "a KNOWN ceiling suppresses the mid-band warn");
+    const over = { max_tokens: CEIL + 1, tools, model: M };
+    restoreOutputBudget(over, s, log, CEIL, true);
+    assert.equal(over.max_tokens, CEIL + 1, "above-ceiling passes verbatim (not a collapse)");
+    assert.equal(midBandWarns(), 0, "above-ceiling is also not a missing-ceiling gap");
+    const s2 = metaSession("dsh-cap-none");
+    restoreOutputBudget({ max_tokens: CEIL, tools, model: M }, s2, log, undefined, true);
+    assert.equal(midBandWarns(), 1, "no ceiling -> the warn still fires exactly once");
+});
+
 test("resolveKnownOutputCeiling: runtime-info > launcher > declared > registry rank order (#1840)", () => {
     _resetPluginStateForTest();
     setRegistryForTest({ "stepfun/step-5-preview": { limit: { context: 1_000_000, output: 1_000_000 } } });
@@ -519,10 +544,38 @@ test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#
     assert.equal(estimateRawBodyTokens({ url: "http://x/y".repeat(1000) }), 0, "url field excluded");
     assert.equal(estimateRawBodyTokens({ b64_json: "A".repeat(10_000) }), 0, "b64_json field excluded");
     assert.equal(estimateRawBodyTokens({ file_data: "data:application/pdf;base64,".padEnd(10_000, "A") }), 0, "file_data data-URL excluded");
+    // #5932: responses-lane image — the data-URL sits DIRECTLY under image_url
+    // (not under a `url` key); it must be excluded like every other binary-
+    // carrying field, or a screenshot body "measures" millions of tokens.
+    assert.equal(estimateRawBodyTokens({ image_url: `data:image/png;base64,${"A".repeat(10_000)}` }), 0, "image_url data-URL excluded (#5932)");
     assert.equal(estimateRawBodyTokens(null), 0, "null body");
     assert.equal(estimateRawBodyTokens(42), 0, "non-object body");
     // CJK must not be undercounted by the chars/4 fast path.
     assert.ok(estimateRawBodyTokens({ content: "汉".repeat(100) }) >= 100, "CJK counted per-char");
+});
+
+test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5000 item 3)", () => {
+    const toolsMass = 120 * defaultCountTokens("d".repeat(40_000));
+    const body = {
+        system: "s".repeat(1_000),
+        tools: Array.from({ length: 120 }, () => ({ type: "function", function: { name: "t", description: "d".repeat(40_000) } })),
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+    };
+    const b = estimateRawBodyBreakdown(body);
+    assert.equal(b.total, estimateRawBodyTokens(body), "total equals the plain meter exactly (same walk, same exclusions)");
+    assert.ok(b.tools >= toolsMass, "tools[] mass lands in the tools bucket");
+    assert.ok(b.messages >= defaultCountTokens("m".repeat(1_000)), "message text lands in the messages bucket");
+    assert.ok(b.system >= defaultCountTokens("s".repeat(1_000)), "system text lands in the system bucket");
+    assert.equal(b.total, b.messages + b.tools + b.system + b.other, "buckets are exhaustive");
+    // the #5000 shape: a body whose mass rides tools[] — the doom message must
+    // be able to name THAT dimension, not "trim the oversized content".
+    assert.ok(b.tools > b.messages + b.system + b.other, "tools-dominant body reports tools-dominant");
+    // image payloads still excluded from every bucket (#5932).
+    const img = estimateRawBodyBreakdown({ image_url: `data:image/png;base64,${"A".repeat(50_000)}` });
+    assert.equal(img.total, 0, "image_url stays excluded in every bucket");
+    // non-object bodies bucket into other (or nothing) without throwing.
+    assert.equal(estimateRawBodyBreakdown(null).total, 0, "null body");
+    assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
 });
 
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {
@@ -1010,6 +1063,11 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
         const s = getSession(SESSION);
         assert.ok(s, "session row exists (created before the gate)");
         assert.equal(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state untouched by side requests (blocked or not)");
+        // Named poison-field pin (#5608-B fix for exactly this shape): a resume-miss
+        // under UNPROVEN identity (cross-lane boilerplate prefix match) must not arm
+        // honest-NULL on a side lane — a lane that never runs a kernel pass could
+        // never self-clear the flag, and it would ride into persisted state.
+        assert.equal(s.state.suppressMintingOnce, undefined, "unproven-identity miss must not arm honest-NULL on a side request (#554/#5608-B)");
         assert.equal(s.stats.requests, 0, "side requests do not count as main requests");
     } finally {
         await closeRig(rig);
@@ -1280,5 +1338,18 @@ test("e2e: google-lane dsh side request resolves verbatim — no kernel state, n
         upstream.close();
         upstream.closeIdleConnections?.();
         await once(upstream, "close");
+    }
+});
+
+// #5765: the bili-owned structural name set must cover the kernel-fixed ACP
+// names plus the (opt-in) block-lifecycle ops — kernel-fixed names can never
+// collide with a client tool, so they count toward the "entire declared
+// array is bili's set" signal regardless of the per-session switch. Renamed
+// config-gated tools (absorb/rule/retrieve custom names) stay out.
+test("#5765: BILI_TOOL_NAMES covers the kernel-fixed ACP names + block ops", async () => {
+    const { BILI_TOOL_NAMES } = await import("../src/server/side-request.ts");
+    const { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } = await import("acp-kernel");
+    for (const name of [...ACP_TOOL_NAMES, ...BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME]) {
+        assert.ok(BILI_TOOL_NAMES.has(name), `${name} must be bili-owned`);
     }
 });

@@ -104,7 +104,12 @@ test("#2029: acp_status nudge recompute feeds the provenance-aware baseline", ()
         const statsBefore = snap(ctx.session.stats);
         const stateBefore = snap(ctx.session.state);
         const out = handleAcpStatus({}, ctx);
-        assert.deepStrictEqual(ctx.seen, [sc.expected], `${sc.name}: tokenCount handed to the kernel`);
+        // #4331 added the uncovered-history audit, which runs its own
+        // processTurn passes on this surface — the contract is that EVERY
+        // kernel call on a status reader feeds the provenance-aware baseline,
+        // not that there is exactly one call.
+        assert.ok(ctx.seen.length >= 1 && ctx.seen.every((v) => v === sc.expected),
+            `${sc.name}: every kernel call fed the provenance-aware baseline (got ${JSON.stringify(ctx.seen)})`);
         assert.equal(snap(ctx.session.stats), statsBefore, `${sc.name}: stats must stay read-only`);
         assert.equal(snap(ctx.session.state), stateBefore, `${sc.name}: state must stay read-only`);
         const nudgeLine = out.text.split("\n").find((l) => l.startsWith("Nudge:"));
@@ -129,11 +134,12 @@ function mockRes(): { res: http.ServerResponse; status: number; body: string } {
     return out;
 }
 
-test("#2029: plugin status nudge + panel feed the provenance-aware baseline", () => {
+test("#2029: plugin status nudge + panel feed the provenance-aware baseline", async () => {
     _resetSessionsForTest();
     _resetPluginStateForTest();
     try {
-        SCENARIOS.forEach((sc, i) => {
+        for (let i = 0; i < SCENARIOS.length; i++) {
+            const sc = SCENARIOS[i];
             const session = getSession(`issue2029-plugin-${i}`, { protocol: "anthropic" });
             session.metadata.effectiveContextLimit = WINDOW;
             session.stats = { ...zeroStats(), ...sc.stats } as Session["stats"];
@@ -145,7 +151,7 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", ()
             const deps = { core: createCore(), config: defaultConfig(WINDOW), log: () => {} };
             const seen = captureTokenCounts(deps.core);
             const r = mockRes();
-            handlePluginStatus(session.id, r.res, deps);
+            await handlePluginStatus(session.id, r.res, deps);
             assert.equal(r.status, 200, `${sc.name}: status answered`);
             assert.deepStrictEqual(seen, [sc.expected], `${sc.name}: nudge recompute tokenCount`);
             const panel = JSON.parse(r.body).panel as string | undefined;
@@ -163,7 +169,7 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", ()
                 assert.ok(!nudgeLine.includes("EMERGENCY") && !nudgeLine.includes("OVER-LIMIT"),
                     `${sc.name}: no phantom pressure (got: ${nudgeLine})`);
             }
-        });
+        }
     } finally {
         _resetSessionsForTest();
         _resetPluginStateForTest();

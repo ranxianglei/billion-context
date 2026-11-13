@@ -206,6 +206,35 @@ test("streaming filter matches stripAcpTags for every split position", () => {
     }
 });
 
+// #4179: prose GLUED to a multi-ref run + orphan close. When the chunk boundary
+// falls between prose and run, the leftmost ORPHAN_REF_CLOSE match sits at the
+// buffer head and its head is voided by the cross-chunk lookbehind (#644); the
+// fix must re-scan for the valid MID-RUN start (a ref preceded by a joiner)
+// instead of abandoning the drop, or the deletion depends on the chunking.
+test("streaming filter matches stripAcpTags for a word-glued multi-ref orphan run at every split position (#4179)", () => {
+    const cases = [
+        `textm00123\u2013m00124${CLOSE} tail.`,
+        `textm00123,m00124${CLOSE} tail.`,
+        `textm00123-m00124${CLOSE} tail.`,
+        `textm00123\u2013m00124,m00125${CLOSE} tail.`,
+        `text m00123\u2013m00124${CLOSE} tail.`,
+        `textm00124${CLOSE} tail.`,
+    ];
+    for (const full of cases) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+    // Pin the drop semantics explicitly (parity alone would track any future
+    // whole-text drift): word-glued head ref survives; joiner + last ref + close
+    // die as one unit; a single word-glued ref is NOT an orphan (lone close only).
+    assert.equal(stripAcpTags(`textm00123\u2013m00124${CLOSE} tail.`), `textm00123\u2013 tail.`);
+    assert.equal(stripAcpTags(`textm00124${CLOSE} tail.`), `textm00124 tail.`);
+});
+
 test("streaming filter: unterminated open tag at flush is dropped", () => {
     const f = createTagEchoFilter();
     const out = f.push(`text ${OPEN}tokens="9"`);
@@ -503,6 +532,38 @@ test("streaming filter still drops a ref echo whose open tag arrives alone in a 
     visible += f.flush();
     assert.equal(visible, "");
     assert.ok(f.dropped());
+});
+
+// #4169: a nested bare open inside an attrs payload must take the same verdict
+// in streaming as in whole-text (LONE_OPEN pass) — the close-resolution release
+// used to hand the body to the client verbatim, leaking the nested tag while
+// whole-text stripped it.
+test("streaming strips a nested bare open inside an attrs payload like whole-text, at every split (#4169)", () => {
+    const full = `A ${OPEN}tokens="1" type="text">junk${LT}acp>text${CLOSE}B.`;
+    const expected = stripAcpTags(full);
+    assert.equal(expected, "A junktextB.", "whole-text reference strips the nested bare open");
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+test("streaming matches whole-text for nested structures inside attrs payloads (#4169)", () => {
+    const shapes = [
+        `A ${OPEN}tokens="1" type="text">x${LT}acp>y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2">y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">${LT}acp>m00001${CLOSE}${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2 y${CLOSE}z`,
+    ];
+    for (const full of shapes) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
 });
 
 // #1731 replaced the old open-side attr caps ({0,256}/{0,512}): a longer run

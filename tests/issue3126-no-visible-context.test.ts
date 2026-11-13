@@ -103,17 +103,23 @@ test("#3126: three consecutive refusals arm the breaker with the honest cause", 
     assert.equal(streak.cause, "no-visible-context", "honest cause persisted on the streak");
 });
 
-test("#3126: a block-touching request passes the gate to the kernel (refold path intact)", () => {
+test("#3859: a block-touching request on an EMPTY view is refused too — no dead refs", () => {
     const ctx = makeCtx({ messages: MESSAGES, refs: true });
     const first = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00020", summary: "z".repeat(60) }] }), ctx);
     assert.equal(first.outcome, "applied", `setup fold lands: ${first.text}`);
-    // Proxy-shaped next round: the originals left the view; SPEC (m00010–m00040)
-    // partially overlaps the fresh block m00001–m00020, so the gate must yield
-    // and let the kernel apply its own per-range diagnostics.
+    // Evicted/restarted next round: the view is empty while SPEC (m00010–m00040)
+    // partially overlaps the fresh block m00001–m00020. The pre-#3859 span-overlap
+    // exemption handed this to the kernel, which could anchor neither endpoint on
+    // an empty view and tombstoned m00040 (not point-covered by any block) as
+    // DEAD — live refs killed by memory eviction. Now the gate refuses
+    // unconditionally and writes nothing.
     ctx.messages = [];
     ctx.compressMessages = [];
     const res = applyRanges(SPEC(), ctx);
-    assert.notEqual(res.reason, "gate:no-visible-context", `block-touching request must reach the kernel: ${res.text}`);
+    assert.equal(res.outcome, "refused");
+    assert.equal(res.reason, "gate:no-visible-context", `block-touching request must be refused on an empty view: ${res.text}`);
+    assert.equal(ctx.session.state.deadRefs, undefined, "no deadRefs recorded (the #3859 corruption)");
+    assert.equal(ctx.session.state.blocks.length, 1, "the setup block is untouched");
 });
 
 test("#3126: the external-summary lane hits the same gate before any network call", async () => {

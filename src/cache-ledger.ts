@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
     computeFoldEconomics,
     decomposeSample,
@@ -17,6 +18,8 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
+import { isForeignMembership } from "./request-membership.js";
+import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -81,6 +84,9 @@ interface LedgerFold {
 }
 
 interface LedgerLine {
+    captureId?: string;
+    captureRound?: number;
+    evidence?: "out-of-order";
     seq: number;
     at: number;
     input: number;
@@ -354,7 +360,7 @@ function round1(n: number): number {
  *  sum of first-render token counts of all refs chronologically before it.
  *  Refs are assigned in message order and never reused (kernel contract),
  *  so numeric order IS view order. */
-function prefixTokensBeforeRef(session: Session, ref: string): number {
+export function prefixTokensBeforeRef(session: Session, ref: string): number {
     const byRef = session.state?.messageRefs?.byRef;
     const snap = session.state?.tokenSnapshot;
     if (!byRef || !snap || refNum(ref) === 0) return 0;
@@ -418,6 +424,9 @@ const BODY_FULL_CAP = 8 * 1024 * 1024;
  *  UTF-8 bytes). #2923: slots live under session.transient so the retained
  *  copies release with the session. */
 export interface SeamSlot {
+    order?: number;
+    requestId?: string;
+    round?: number;
     /** Capped head (≤ SEAM_BODY_CAP bytes) — seam forensics + JSON parse side. */
     head: Buffer;
     /** Exact outbound body size in bytes — precise cap/full detection. */
@@ -433,6 +442,11 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #564/#2627: exit-core indexes of THIS body that bili proved are its own
+     *  ordering separators, as the invariant judge returned them at send. The
+     *  next loop round's continuity verdict reads them as entry-side ownership.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    ownedSeparatorCores?: ReadonlySet<number>;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -460,13 +474,98 @@ export interface InboundSlot {
     meta: { role: string; len: number; cls: string }[];
 }
 
+// #4043: host-generated metering fields — present on Prepared.originalMessages
+// but NOT in the client's bytes. projectThinkingMass (#1320) stamps
+// CoreMessage.thinkingTokens onto the anthropic-lane list between conversion
+// and this capture, and re-derives the value every turn from the previous
+// usage report — so a byte-stable client list would otherwise show positional
+// fingerprint divergence at every signature-only reasoning message, and
+// detectSeam's #3023 client arm would attribute a bili-owned miss to "host
+// churn". Strip these fields from the ORIGIN EVIDENCE only: signatures, raw
+// payloads, tool ids and unknown semantic fields stay full evidence, and miss
+// accounting is untouched. Future host-projected metering fields MUST extend
+// this list before shipping (evidence-permitlist, same discipline as #1104/#1107).
+const GENERATED_METERING_FIELDS: readonly string[] = ["thinkingTokens"];
+
+/** Canonical JSON of ONE message as ORIGIN EVIDENCE — the message minus the
+ *  host-generated metering fields above. Fast path: messages without any
+ *  generated field stringify byte-identically to before this exclusion
+ *  existed, so every unaffected session keeps its legacy fingerprints. */
+function originEvidenceJson(m: CoreMessage): string {
+    const r = m as unknown as Record<string, unknown>;
+    if (!GENERATED_METERING_FIELDS.some((k) => k in r)) return JSON.stringify(m);
+    const stripped: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(r)) {
+        if (!GENERATED_METERING_FIELDS.includes(k)) stripped[k] = v;
+    }
+    return JSON.stringify(stripped);
+}
+
+// #4430: per-request pending-evidence isolation. Overlapping forwards on one
+// session (same-request re-tries, concurrent side lanes) used to share ONE
+// session.transient slot — the second forward's evidence clobbered the first's
+// before settle. Pending evidence now lives in an AsyncLocalStorage capture;
+// session.transient remains the fallback for callers outside the wrapper.
+type Capture = {
+    session: Session;
+    requestId: string;
+    round: number;
+    sentBody?: SeamSlot;
+    inBody?: InboundSlot;
+    imageFacts?: ForwardedImageFacts;
+};
+const captures = new AsyncLocalStorage<Capture>();
+let captureOrder = 0;
+
+/** Covers the entire forward, including awaited streaming/loop callbacks.
+ *  Concurrent requests keep independent pending evidence; only settled pairs
+ *  live on the session. It does not serialize upstream work or change the wire. */
+export async function withCacheCapture<T>(session: Session | undefined, fn: () => Promise<T>): Promise<T> {
+    if (!session) return fn();
+    return captures.run({ session, requestId: randomUUID(), round: 0 }, async () => {
+        try { return await fn(); }
+        finally {
+            const capture = captures.getStore();
+            if (capture) {
+                delete capture.sentBody;
+                delete capture.inBody;
+                delete capture.imageFacts;
+            }
+        }
+    });
+}
+
+function pendingCapture(session: Session): Capture | NonNullable<Session["transient"]> {
+    const capture = captures.getStore();
+    return capture?.session === session ? capture : (session.transient ??= {});
+}
+
+export function lastForwardedBody(session: Session): SeamSlot | undefined {
+    return pendingCapture(session).sentBody;
+}
+
+/** #4731: the pending evidence PAIR of the in-flight request — outbound body
+ *  AND inbound view from ONE source: the ALS capture when this code runs
+ *  inside withCacheCapture (relay lane), else session.transient (loop lane).
+ *  Callers that pair the two sides MUST take both from here; mixing one side
+ *  from the capture with the other from the fallback can mate an old body
+ *  with fresh usage and mis-attribute the seam. Settled baselines
+ *  (settledBody/settledInBody) always live on session.transient and stay
+ *  read from there on every lane. */
+export function pendingEvidencePair(session: Session): { sentBody?: SeamSlot; inBody?: InboundSlot } {
+    const pending = pendingCapture(session);
+    return { sentBody: pending.sentBody, inBody: pending.inBody };
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
  *  message (≈ one extra body serialization, the outbound path already does
- *  the same order of work hashing the wire body). */
+ *  the same order of work hashing the wire body). Fingerprints are computed
+ *  over origin evidence (#4043): host-generated metering never counts as
+ *  client-origin divergence, everything else does. */
 export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     if (msgs.length > INBOUND_MSG_CAP) {
         // Too many messages to fingerprint whole: keep the count (so the
         // settle-side guard can decline) but drop any stale slot from a
@@ -478,7 +577,7 @@ export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void
     const fps: string[] = [];
     const meta: { role: string; len: number; cls: string }[] = [];
     for (const m of msgs) {
-        const j = JSON.stringify(m);
+        const j = originEvidenceJson(m);
         fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
         meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
     }
@@ -548,30 +647,58 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+// #5795: single source of truth for the credential header names — the 429
+// governor's hold key (upstream-throttle.ts) and the pre-ingest fast path
+// (server/handle.ts) must read exactly these headers or holds go unmatched.
+export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
+
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
  *  key is ever persisted in (raw secrets never reach the ledger, logs or the
  *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") { cred = v; break; }
+            if (v !== "") {
+                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+                // re-signed EVERY request (Signature is an HMAC over the
+                // per-request date + body hash), so hashing the raw line
+                // yields a per-request-unique identity — downstream that
+                // meant the 429 governor's holds never matched (#4204 never
+                // throttled on the APIG lane it was built for), the #3376
+                // keepalive snapshot deleted itself after every forward, and
+                // #2131 cache-sample attribution fragmented into one bucket
+                // per request. The STABLE credential on that line is the
+                // Access key id — fingerprint only that.
+                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
+            }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
 // field reordering (a host that emits the same knobs in a different order must
-// NOT flip the cache-partition identity between requests).
-function canonicalJson(v: unknown): string {
+// NOT flip the cache-partition identity between requests). Exported: the
+// persist-side metadata fold gate (#5506) fingerprints with the same
+// canonicalization so live-vs-disk comparisons are like-for-like.
+export function canonicalJson(v: unknown): string {
     if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     const obj = v as Record<string, unknown>;
@@ -629,10 +756,13 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // re-deriving them.
     const buf = Buffer.from(body, "utf8");
     const digest = createHash("sha256").update(buf).digest("hex");
-    const transient = session.transient ??= {};
+    const transient = pendingCapture(session);
     const prior = transient.sentBody;
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
+        order: ++captureOrder,
+        requestId: "requestId" in transient ? transient.requestId : undefined,
+        round: "round" in transient ? ++transient.round : undefined,
         head: buf.byteLength > SEAM_BODY_CAP ? Buffer.from(buf.subarray(0, SEAM_BODY_CAP)) : buf,
         bytes: buf.byteLength,
         msgs: msgs ?? (samePayload ? prior.msgs : null),
@@ -640,7 +770,12 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        ownedSeparatorCores: samePayload ? prior.ownedSeparatorCores : undefined,
     };
+    if ("round" in transient && transient.round > 1) {
+        delete transient.imageFacts;
+        delete transient.inBody;
+    }
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
@@ -696,13 +831,17 @@ const imageFactsLastSent = new WeakMap<Session, ForwardedImageFacts>();
  *  with the image facts of the round about to be sent. The next settleUsageReport
  *  consumes exactly this entry (same pairing guarantee as the seam forensics). */
 export function noteForwardedImageFacts(session: Session, facts: ForwardedImageFacts): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
-    const facts = imageFactsLastSent.get(session);
+    const capture = captures.getStore();
+    const facts = capture?.session === session ? capture.imageFacts : imageFactsLastSent.get(session);
     if (!facts) return;
-    imageFactsLastSent.delete(session);
+    if (capture?.session === session) delete capture.imageFacts;
+    else imageFactsLastSent.delete(session);
     if (facts.nImages <= 0 || billedTotal <= 0) return;
     const observed = billedTotal - facts.textSide;
     if (observed <= 0) return; // text estimate overshot the bill — no signal
@@ -795,10 +934,20 @@ function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | n
 // returned UTF-16 code units, so CJK offsets were short by up to 3× and the
 // 1024-byte head threshold / ±64-byte append tolerance misfired on them.
 function byteLcp(a: Buffer, b: Buffer): number {
-    let lcp = 0;
     const n = Math.min(a.length, b.length);
-    while (lcp < n && a[lcp] === b[lcp]) lcp++;
-    return lcp;
+    if (n === 0 || a[0] !== b[0]) return 0;
+    // Same integer as the naive per-byte walk ("first k bytes equal" is
+    // monotone in k), but binary search over k with native Buffer.compare
+    // views (memcmp, no copies) — consecutive turns share the whole history
+    // as prefix, so the walk was O(body) of interpreter steps every turn.
+    let lo = 1;
+    let hi = n;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(a.subarray(0, mid), b.subarray(0, mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
 
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
@@ -810,9 +959,16 @@ function byteLcp(a: Buffer, b: Buffer): number {
 function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
     if (cur.length <= prev.length || lcp >= prev.length) return false;
     const room = prev.length - lcp;
-    let lcs = 0;
-    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
-    return lcp + lcs === prev.length;
+    // "the last k bytes of prev equal the last k of cur" is monotone in k —
+    // the same native-compare binary search as byteLcp, over the suffix.
+    let lo = 0;
+    let hi = room;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(prev.subarray(prev.length - mid), cur.subarray(cur.length - mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lcp + lo === prev.length;
 }
 
 // #2982: byte offset of the CLOSING bracket terminating the top-level
@@ -833,15 +989,21 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
     const n = body.length;
     let depth = 0; // object/array nesting depth
     let inStr = false;
-    let esc = false;
     let want = -1; // depth at which the tracked array closes (-1 = not tracking)
     let keyAt = -1; // opening-quote offset of a candidate top-level key
-    for (let i = 0; i < n; i++) {
+    let i = 0;
+    while (i < n) {
         const c = body[i];
         if (inStr) {
-            if (esc) esc = false;
-            else if (c === 92) esc = true; // backslash
-            else if (c === 34) {
+            if (c === 92) {
+                // Backslash run: JSON parity — an odd-length run escapes the
+                // single byte after it, an even run is pure content.
+                let j = i;
+                while (j < n && body[j] === 92) j++;
+                i = (j - i) % 2 === 1 ? j + 1 : j;
+                continue;
+            }
+            if (c === 34) {
                 inStr = false;
                 if (keyAt >= 0) {
                     // +1/-1 strip the surrounding quotes from the captured range.
@@ -859,16 +1021,35 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                         }
                     }
                 }
+                i++;
+                continue;
             }
+            // String content: hop to the next quote or backslash (native
+            // scans) instead of branching per byte — the bulk of any body.
+            let m = n;
+            const q = body.indexOf(34, i + 1);
+            if (q !== -1 && q < m) m = q;
+            const b = body.indexOf(92, i + 1);
+            if (b !== -1 && b < m) m = b;
+            i = m;
             continue;
         }
-        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; continue; }
-        if (c === 123 || c === 91) { depth++; continue; }
+        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
+        if (c === 123 || c === 91) { depth++; i++; continue; }
         if (c === 125 || c === 93) {
             if (want !== -1 && c === 93 && depth === want) return i;
             depth--;
+            i++;
             continue;
         }
+        // Inter-token filler (whitespace/commas/colons/literals): hop to the
+        // next structural byte, again natively.
+        let m = n;
+        for (const code of [34, 123, 125, 91, 93]) {
+            const p = body.indexOf(code, i + 1);
+            if (p !== -1 && p < m) m = p;
+        }
+        i = m;
     }
     return null;
 }
@@ -893,8 +1074,12 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
     const agg = led.agg;
-    const cur = session.transient?.sentBody;
+    const cur = pendingCapture(session).sentBody;
     const prev = session.transient?.settledBody;
+    if (cur?.order !== undefined && prev?.order !== undefined && cur.order <= prev.order) {
+        line.evidence = "out-of-order";
+        return;
+    }
     // #2929: split the provider-side arms by idle gap — a byte-stable miss
     // after a long idle is normal TTL expiry; the same miss seconds after the
     // previous request is the abnormal provider-side failure.
@@ -988,7 +1173,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // a bili rebuild seam. Requires BOTH inbound slots captured whole
     // (msgs <= INBOUND_MSG_CAP — an above-cap list cannot prove where it
     // broke, and a missing lane capture must keep the legacy bucket).
-    const curIn = session.transient?.inBody;
+    const curIn = pendingCapture(session).inBody;
     const prevIn = session.transient?.settledInBody;
     if (curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP) {
         const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1182,6 +1367,44 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
+    // #3307 P2-A: f.X (firstFoldStartTokens) is prefixTokensBeforeRef over the
+    // client's UN-SHRUNKEN resent history — for a stateless proxy client that far
+    // exceeds the billed input, so decomposeSample zeroes structuralExcess and the
+    // fold's re-pay falls into the unattributed seam bucket. When a genuine
+    // bili-side mid-history break is present, measure the stable prefix straight
+    // off the wire instead: the byte-LCP between this outbound and the previous
+    // marks where a summary replaced folded content, so (lcpBytes / cur.bytes) *
+    // billed input is a same-space lower bound on the pre-fold prefix. min() with
+    // the snapshot X leaves already-correct folds untouched. Gated to mid-list
+    // breaks only (a tail append lands lcpBytes near the end -> xMeasured ~= input
+    // -> no effect) and never on a client-side inbound rewrite (#3023), whose
+    // earlier divergence would understate the fold and mis-credit it.
+    if (pending.length > 0 && known && s.input > 0) {
+        const rawMissed = s.input - effCached;
+        if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
+            // #4731: both pending sides come from ONE source via
+            // pendingEvidencePair — on the relay lane the evidence lives in
+            // the #4430 ALS capture (session.transient.sentBody is never
+            // written there), on the loop lane it falls back to the transient
+            // slot byte-identically.
+            const { sentBody: curB, inBody: curIn } = pendingEvidencePair(session);
+            const prevB = session.transient?.settledBody;
+            if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
+                const prevIn = session.transient?.settledInBody;
+                const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
+                    const k = firstDivergentInboundMsg(prevIn, curIn);
+                    return k !== null && k < Math.min(prevIn.msgs, curIn.msgs);
+                })();
+                if (!clientBreak) {
+                    const lcp = seamLcp(prevB.head, curB.head);
+                    if (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs && lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength) {
+                        const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
+                        for (const p of pending) p.firstFoldStartTokens = Math.min(p.firstFoldStartTokens ?? Number.POSITIVE_INFINITY, xMeasured);
+                    }
+                }
+            }
+        }
+    }
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
@@ -1617,15 +1840,51 @@ export function settleOverflowCalibration(
     session.stats.lastLocalTextEstimateOrigin = undefined;
 }
 
+/** #4383: the relay main-lane send stamp for per-send context evidence,
+ *  extracted from the forward chokepoint so the write contract is nameable
+ *  and testable: localInputEstimate/contextTokens carry the char-count upper
+ *  bound (fail-closed caliber, #553/#728/#1493), contextEstimateTokens the
+ *  k̂-scaled billing-caliber reading (#2117), and contextTokensSource=
+ *  "estimate" is the cycle-freshness mark that only a real usage settle
+ *  flips back to "usage" (settleUsageReport) — usageAnchorCycleStale
+ *  (session.ts) reads exactly that flip. */
+export function noteOutboundContextEstimates(
+    session: Session,
+    est: { upperBound: number; scaledText: number; imageTokens: number; calibrated: boolean },
+): void {
+    session.stats.localInputEstimate = est.upperBound;
+    session.stats.contextEstimateTokens = Math.round(est.scaledText + est.imageTokens);
+    session.stats.contextEstimateCalibrated = est.calibrated;
+    session.stats.contextTokens = est.upperBound;
+    session.stats.contextTokensSource = "estimate";
+}
+
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4899: USD spend ledger — input/cache-read/cache-write billed at the
+        // per-request stamped price, in lockstep with the token counters above
+        // (foreign #4805 payloads bill too: the tokens were really spent, the
+        // gate only protects this conversation's anchor family).
+        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+        // #4805: id-membership gate — a report produced by a request whose
+        // message ids do not join this session's known id family is foreign
+        // billing data under a colliding session key (auxiliary host personas
+        // stamp the host conversation id on their own tiny payloads). It
+        // still counts toward cumulative usage, but it is not this
+        // conversation's truth and must not touch the anchor family. Abstain
+        // paths (no evidence / first turns / #2821 re-mints) settle exactly
+        // as before: the gate only ever refuses the clearly-foreign.
+        if (isForeignMembership(session.transient?.requestMembership)) {
+            const m = session.transient!.requestMembership!;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
+        } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
@@ -1635,6 +1894,7 @@ export function settleUsageReport(
         // never by estimate-grade samples or arming paths; dropped at native-
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
+        session.stats.lastUsagePayloadUpper = session.stats.localInputEstimate ?? 0;
         session.stats.lastInputTokensSource = "usage";
         // #3148: a real usage report supersedes the failed-round arm — drop the
         // visibility marker so acp_status stops advertising a stale emergency state.
@@ -1671,6 +1931,7 @@ export function settleUsageReport(
         // re-arms both in one event).
         delete session.stats.overflowArmTokens;
         delete session.stats.overflowArmCompletionReserve;
+        }
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane
@@ -1684,10 +1945,10 @@ export function settleUsageReport(
     // #2131: the credential fingerprint captured at the send chokepoint rides
     // the seam slot — read it BEFORE recordCacheSample so the line it pushes
     // already carries the identity (kp/kw) without a second slot lookup.
-    const curKeyFp = session.transient?.sentBody?.keyFp;
+    const curKeyFp = pendingCapture(session).sentBody?.keyFp;
     // #3803: the generation-parameter fingerprint noted for THIS request at the
     // send chokepoint — same transient-slot pairing as the credential one above.
-    const curEffFp = session.transient?.sentBody?.effFp;
+    const curEffFp = pendingCapture(session).sentBody?.effFp;
     // #2350: the host's system-prompt fingerprint as noted for THIS request by
     // fold-reconcile's wire sites (they precede this settle under the session
     // lock). Sparse: lanes that never noted one (title-gen / compaction-trigger
@@ -1704,17 +1965,26 @@ export function settleUsageReport(
     const lastMode = s.protocol === "responses" ? (session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown) : undefined;
     const led = getCacheLedger(session);
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, effFp: curEffFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
+    const capture = captures.getStore();
+    const sample = led.lines[led.lines.length - 1];
+    if (capture?.session === session && sample) {
+        sample.captureId = capture.requestId;
+        sample.captureRound = capture.round;
+    }
     // #2131: per-call body-stability proof on the just-recorded line — the same
     // pairing detectSeam uses (this request's forwarded body vs the previous
     // settled one), so "prefix unchanged between calls" is stored data, not an
     // interpretation. Digest equality decides; the LCP offset localizes where
     // a divergence started when both full bodies were retained.
-    const curSlot = session.transient?.sentBody;
+    const curSlot = pendingCapture(session).sentBody;
     if (curSlot !== undefined) {
         const curLine = led.lines[led.lines.length - 1];
         if (curLine !== undefined) {
             curLine.bd = curSlot.digest;
-            const prevSlot = session.transient?.settledBody;
+            const settled = session.transient?.settledBody;
+            const backwards = curSlot.order !== undefined && settled?.order !== undefined && curSlot.order <= settled.order;
+            const prevSlot = backwards ? undefined : settled;
+            if (backwards) curLine.evidence = "out-of-order";
             if (prevSlot !== undefined) {
                 if (curSlot.digest === prevSlot.digest) {
                     curLine.be = 1;
@@ -1759,14 +2029,23 @@ export function settleUsageReport(
     // actually sent (noteForwardedBody), then keep it as the next pair's
     // baseline. Lanes without body capture still get the aggregate flag.
     detectSeam(session, led);
-    const seamBody = session.transient?.sentBody;
-    if (seamBody !== undefined) (session.transient ??= {}).settledBody = seamBody;
-    delete session.transient?.sentBody;
-    // #3023: settle the inbound pair with the same lifecycle — the next
-    // settle's client arm compares against THIS request's client view.
-    const seamIn = session.transient?.inBody;
-    if (seamIn !== undefined) (session.transient ??= {}).settledInBody = seamIn;
-    delete session.transient?.inBody;
+    const pending = pendingCapture(session);
+    const settled = session.transient ??= {};
+    const seamBody = pending.sentBody;
+    const backwards = seamBody?.order !== undefined && settled.settledBody?.order !== undefined && seamBody.order <= settled.settledBody.order;
+    if (seamBody !== undefined && !backwards) settled.settledBody = seamBody;
+    else delete settled.settledBody;
+    delete pending.sentBody;
+    const seamIn = pending.inBody;
+    // #4731: noteForwardedBody deletes pending.inBody on round>1 of a capture,
+    // so a same-request retry settles without inbound evidence and drops the
+    // settledInBody baseline (the round-2 delete-then-miss). That conservative
+    // behavior stays BY DESIGN: #3023 attribution is diagnostic-only (nothing
+    // bills on settledInBody), and the pair accessor cannot cheaply recover
+    // the evidence here because the delete removes it from the capture itself.
+    if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
+    else delete settled.settledInBody;
+    delete pending.inBody;
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -1852,7 +2131,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
+    lines: Array<CacheReportLine & { captureId?: string; captureRound?: number; evidence?: "out-of-order"; bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
     modelSwitches: ModelSwitchStats;
     /** #3803: host generation-parameter switches (reasoning effort / thinking config) — a provider cache-namespace flip that re-bills the whole stable prefix once, distinct from any byte change. */
     effSwitches: ModelSwitchStats;
@@ -2042,6 +2321,9 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             foldSeq: l.foldSeq,
             seam: l.seam,
             prov: l.prov,
+            captureId: l.captureId,
+            captureRound: l.captureRound,
+            evidence: l.evidence,
             bodyDigest: l.bd,
             keyFp: l.kp,
             sysFp: l.sp,
@@ -2154,6 +2436,12 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2867: proxy-side mode/projection switches get their own section only
         // when observed — a session that never switches modes stays byte-identical.
         const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
+        // #3307: wire/upstream/restart carry per-event data in the report (switchEvents /
+        // restartEvents) but only their aggregate counts reached CACHE INVALIDATION — no
+        // per-line timestamps, so cross-checks (e.g. seam-vs-restart) were impossible.
+        const wireText = report.wireSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.wireSwitches, detail, "WIRE SWITCHES (client switched protocol wire between requests)") : "";
+        const upstreamText = report.upstreamSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.upstreamSwitches, detail, "UPSTREAM SWITCHES (relay/upstream origin changed between requests)") : "";
+        const restartText = report.restartDrops.count > 0 ? "\n\n" + formatModelSwitches(report.restartDrops, detail, "RESTART/REFORK (first bill under a fresh daemon boot — prefix re-billed once)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -2161,9 +2449,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + effText + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
@@ -2209,11 +2497,17 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.suspects > 0) {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
-        for (const e of r.seam.events) {
+        // #3307: seamEvents holds BOTH suspect and #3023 client-side events
+        // (one shared capped ring), so listing every event here echoed host-owned
+        // rewrites under the "suspected bili rebuild" header — the ✎ CLIENT
+        // section below already owns those. List only suspects here so the two
+        // sections stay disjoint and a client insert is never misread as a seam.
+        const suspectEvents = r.seam.events.filter((e) => !e.client);
+        for (const e of suspectEvents) {
             out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
-        if (r.seam.events.length === 0) {
-            out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
+        if (suspectEvents.length === 0) {
+            out.push("    (no body-pair forensics retained for the suspect samples on this lane — aggregate flag only; client-side rewrites are listed separately below)");
         }
         out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
     }

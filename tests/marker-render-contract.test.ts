@@ -15,6 +15,7 @@ import { handleAcpStatus } from "../src/acp-status.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { consumeAcpStatusBody } from "../src/marker/status-body.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 import type { Session } from "../src/session.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
@@ -47,7 +48,7 @@ function makeCtx(): { ctx: Parameters<typeof handleAcpStatus>[1]; } {
     return { ctx: ctx as never };
 }
 
-// The wire echo shape a client resends (loop/core.ts buildVisibilityMarker):
+// Legacy wire echo shape, before buildVisibilityMarker added wrapper pairs:
 // `\n${icon} [ACP] acp_status result:\n${result.trim()}\n`.
 const ICON = "\u{1F4CA}";
 function echo(result: string): string {
@@ -100,4 +101,29 @@ test("render contract: consumer leaves non-report marker lines alone", () => {
     const out = consumeAcpStatusBody(lone);
     assert.equal(out.bodies, 0);
     assert.equal(out.text, lone);
+});
+
+test("render contract: real visibility markers and already-orphaned wrappers are consumed", () => {
+    const { ctx } = makeCtx();
+    for (const v of VARIANTS) {
+        const marker = buildVisibilityMarker("acp_status", handleAcpStatus(v.args, ctx).text).trim();
+        for (const report of [marker, marker.slice(marker.indexOf("[acp-status]"))]) {
+            const out = consumeAcpStatusBody(`before prose\n${report}\nafter prose`);
+            assert.equal(out.bodies, 1, v.name);
+            assert.ok(out.lines > 0, v.name);
+            assert.equal(out.text, "before prose\nafter prose", v.name);
+            assert.deepEqual(consumeAcpStatusBody(out.text), { text: out.text, bodies: 0, lines: 0 });
+        }
+    }
+});
+
+test("render contract: wrapped reports do not depend on the legacy section whitelist", () => {
+    const marker = buildVisibilityMarker("acp_status", "A future report section\n  synthetic row").trim();
+    const out = consumeAcpStatusBody(`${marker}\nkept prose\n${marker}`);
+    assert.equal(out.bodies, 2);
+    assert.equal(out.text, "kept prose");
+    const incomplete = "[acp-status]\nnot a complete report\nuser prose";
+    assert.equal(consumeAcpStatusBody(incomplete).text, incomplete);
+    const literal = "Mention [acp-status] and [/acp-status] in prose.";
+    assert.equal(consumeAcpStatusBody(literal).text, literal);
 });

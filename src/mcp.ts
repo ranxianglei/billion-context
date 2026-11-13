@@ -21,6 +21,15 @@
 // to this shim's global conversationId — main/sub-agent threads sharing one
 // MCP process must not clobber each other's binding. Absent or malformed
 // metadata leaves the legacy channels untouched.
+// #4580: a sixth channel, Claude Code ≥2.1.308 — every tools/call carries the
+// originating tool_use id at _meta["claudecode/toolUseId"]. Its Task
+// subagents run through the SAME MCP shim process, so the shim's binding
+// names the parent conversation while the subagent's traffic streams through
+// a different proxy lane. The shim forwards the id as body toolCallId (the
+// field agent/shared.ts's forwardTool already uses) WITHOUT re-routing its
+// binding: the proxy witnessed that exact tool_use in exactly one session's
+// stream and routes the call there (id ring, host-stamped authority); an id
+// the proxy never saw falls back to the existing ladder unchanged.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -151,9 +160,12 @@ function ensureManifest(): Promise<void> {
 // partial note for clients that only render content text.
 export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
-    const effectiveConversationId = conversationIdOverride ?? conversationId;
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false, toolCallId: string | undefined = undefined): Promise<McpForwardedToolResult> {
     for (let attempt = 0; ; attempt++) {
+        // Recomputed per attempt: an in-loop adoption (#656/#4168) rewrites the
+        // global binding, and the retry must carry the NEW id — capturing it
+        // once above the loop would silently re-POST the stale one.
+        const effectiveConversationId = conversationIdOverride ?? conversationId;
         let res: Response;
         try {
             const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args };
@@ -162,6 +174,12 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             // bindings and model-transcribed ids are NOT flagged — their
             // precedence stays exactly as #1685 wrote it.
             if (nativeCaller && effectiveConversationId) body.nativeCaller = true;
+            // #4580: the host-stamped tool_use id rides alongside whichever id
+            // channel routed this call. The proxy's id ring (populated as it
+            // witnessed outbound tool_use blocks) resolves it to the lane that
+            // actually streamed the call — Task subagents sharing this shim get
+            // routed to their own lane instead of the shim's stale binding.
+            if (toolCallId) body.toolCallId = toolCallId;
             res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -172,7 +190,7 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown };
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown; code?: unknown; witnessSessions?: unknown; namedSessionLastSeen?: unknown; witnessLastSeen?: unknown };
         // #1875: ok:true means the tool RAN; the business effect rides outcome.
         // failure/refusal receipts become MCP isError so hosts surface them to
         // the model — partial still counts as success.
@@ -199,6 +217,33 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             typeof data.error === "string" && data.error.includes("no model request has arrived")
         ) {
             if (await adoptLatestActiveConversation()) continue;
+        }
+        // #4168: the captured id still RESOLVES, but the host moved the
+        // conversation to a new session id after this shim spawned (claude's
+        // native-compaction continuation / resume) — every call now fails
+        // closed on the outbound-witness conflict instead of ever 404ing, so
+        // the #656 adoption above never fires and the session is stuck for
+        // good. Extend the same one-shot adoption to this failure: adopt the
+        // UNIQUE witnessing session only when the proxy's recency facts prove
+        // traffic moved there AFTER the bound session's last activity.
+        // Multiple witnesses, missing facts (older proxy), or a still-fresh
+        // binding all stay on the loud 409 — fail closed, never guess.
+        if (
+            res.status === 409 && attempt === 0 && ORPHAN_ADOPT && conversationIdOverride === undefined && conversationId &&
+            data.code === "TOOL_CONVERSATION_CONFLICT"
+        ) {
+            const witnesses = Array.isArray(data.witnessSessions)
+                ? data.witnessSessions.filter((x): x is string => typeof x === "string" && x.length > 0)
+                : [];
+            const namedSeen = typeof data.namedSessionLastSeen === "number" ? data.namedSessionLastSeen : NaN;
+            const witnessSeen = typeof data.witnessLastSeen === "number" ? data.witnessLastSeen : NaN;
+            if (witnesses.length === 1 && witnesses[0] !== conversationId && Number.isFinite(namedSeen) && Number.isFinite(witnessSeen) && witnessSeen > namedSeen) {
+                process.stderr.write(
+                    `[bili-mcp] captured conversation id ${conversationId} is stale — the host moved this conversation to ${witnesses[0]} (resume/native compaction?); re-binding\n`,
+                );
+                conversationId = witnesses[0];
+                continue;
+            }
         }
         throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     }
@@ -227,13 +272,19 @@ async function adoptLatestActiveConversation(): Promise<boolean> {
     }
 }
 
+// Test seam: forwardTool's adoption rewrites the module-level binding, so
+// tests need a deterministic way to reset it between cases.
+export function _resetMcpBindingForTest(nextConversationId?: string): void {
+    conversationId = nextConversationId;
+}
+
 const ERR_TOOL = -32602;
 
 async function handleMessage(msg: {
     id?: JsonRpcId;
     method?: string;
     params?: {
-        _meta?: { ui?: { sessionId?: string }; threadId?: unknown };
+        _meta?: { ui?: { sessionId?: string }; threadId?: unknown; "claudecode/toolUseId"?: unknown };
         [k: string]: unknown;
     };
 }): Promise<void> {
@@ -333,6 +384,17 @@ async function handleMessage(msg: {
             // deliberately not consumed.
             const metaThreadId = params._meta?.threadId;
             const nativeThreadId = typeof metaThreadId === "string" && metaThreadId.trim().length > 0 ? metaThreadId.trim() : undefined;
+            // #4580: Claude Code (≥2.1.308) stamps the originating tool_use id
+            // on every tools/call via _meta["claudecode/toolUseId"] — including
+            // Task-subagent calls, whose traffic lives in a different proxy
+            // conversation than the one this shim bound at startup. Validated
+            // with the same strict rule as threadId: anything that is not a
+            // non-empty string after trim is treated as ABSENT. Per-call only;
+            // it never touches routing channels (routeOverride) or the global
+            // binding — the proxy resolves the id against its own witness of
+            // the outbound stream.
+            const metaToolUseId = params._meta?.["claudecode/toolUseId"];
+            const hostToolUseId = typeof metaToolUseId === "string" && metaToolUseId.trim().length > 0 ? metaToolUseId.trim() : undefined;
             // A native caller counts as "bound" for the search-target
             // exception (#841 extended by #2024): the call routes to the
             // native thread while args.conversation_id stays the read-only
@@ -347,13 +409,21 @@ async function handleMessage(msg: {
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined);
+                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined, hostToolUseId);
                 // #2752: the business state rides MCP structuredContent (spec
                 // field alongside content; clients predating it ignore it).
                 // isError semantics are unchanged — partial stays non-error.
+                // #3472: some hosts (Claude Code via its MCP bridge) prefer
+                // structuredContent when present and drop the content text —
+                // with only {outcome, blocksCreated} every success call reached
+                // the model as bare {"outcome":"success"} and the whole report
+                // was lost. Carry the full report inside structuredContent too
+                // (structured.text, byte-identical to content[0].text) so
+                // structured-only readers see the complete receipt; the machine
+                // fields stay additive alongside it.
                 const result: Record<string, unknown> = { content: [{ type: "text", text: out.text }], isError: out.failed };
                 if (out.outcome !== undefined || out.blocksCreated !== undefined) {
-                    const structured: Record<string, unknown> = {};
+                    const structured: Record<string, unknown> = { text: out.text };
                     if (out.outcome !== undefined) structured.outcome = out.outcome;
                     if (out.blocksCreated !== undefined) structured.blocksCreated = out.blocksCreated;
                     result.structuredContent = structured;

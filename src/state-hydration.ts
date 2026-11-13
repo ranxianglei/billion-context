@@ -38,6 +38,20 @@ export function mergeState(parsed: CompressionState): CompressionState {
         // #2362: without this a restart forgets which refs are dead and the
         // model re-learns each one by failing a compress call again.
         deadRefs: parsed.deadRefs ?? fresh.deadRefs,
+        refLedgerAligned: parsed.refLedgerAligned ?? fresh.refLedgerAligned,
+        // #5608-C: the visibility mark must survive a restart — dropping it
+        // re-arms the "first pass" write against a now-advanced ref space and
+        // could re-open the attribute window on old refs (prefix churn).
+        // NOTE: suppressMintingOnce is deliberately NOT carried — hydration
+        // rebuilds from disk, and re-arming honest-NULL after a restart would
+        // eat genuine first-sight mints of truly new messages; dropping it
+        // (the safe default) is what pre-arm states look like anyway.
+        // Conditional spread: legacy states carry no key and must stay key-free.
+        ...(parsed.timestampsHighWaterRefSeq !== undefined
+            ? { timestampsHighWaterRefSeq: parsed.timestampsHighWaterRefSeq }
+            : fresh.timestampsHighWaterRefSeq !== undefined
+                ? { timestampsHighWaterRefSeq: fresh.timestampsHighWaterRefSeq }
+                : {}),
         terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
         nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
         // Without this, a restart re-exposes absorbed tool outputs: state
@@ -62,6 +76,12 @@ export function mergeState(parsed: CompressionState): CompressionState {
         // re-derives transform output on still-cached carriers right after a
         // restart (silent mid-history rewrite, no fold in sight).
         viewLatches: parsed.viewLatches ?? fresh.viewLatches,
+        // #4313: first-sight wall-clock stamps must survive hydration —
+        // dropping them strips the <acp> tag's time attribute from every
+        // stamped message on the first post-restart turn (mid-history byte
+        // rewrite = prefix-cache break); ids being "known" again also means
+        // no re-minting happens, so the stamps are the ONLY carrier.
+        tsStamps: parsed.tsStamps ?? fresh.tsStamps,
         viewLatchConfigDigest: parsed.viewLatchConfigDigest ?? fresh.viewLatchConfigDigest,
     };
 }
@@ -71,6 +91,21 @@ export function mergeState(parsed: CompressionState): CompressionState {
  * at module load from the merge itself — no second list to keep in sync
  * (#4192). Consumers: kstate_json serialization order (storage/ingest.ts),
  * unified view rebuild, digest key order.
+ *
+ * #5608-C follow-up (CI red on #5609, 2026-11-06): mergeState spreads some
+ * fields CONDITIONALLY so legacy states stay key-free. Probing the merge with
+ * a bare fresh state therefore misses exactly those fields — the unified
+ * kstate_json whitelist silently dropped timestampsHighWaterRefSeq on every
+ * index write, so a full-mode reload diverged from the legacy file on that
+ * one key (shadow DIGEST DRIFT + permanent legacy fallback). Probe with a
+ * state that DEFINES every optional field the current build can persist:
+ * enumeration stays mechanical, and real hydrations are untouched (they parse
+ * what was actually written — legacy rows still lack the key and stay
+ * key-free). RULE: any future conditionally-spread field needs its probe line
+ * here or it vanishes from the index again.
  */
-export const COMPRESSION_STATE_FIELDS: readonly (keyof CompressionState)[] =
-    Object.keys(mergeState(createInitialState())) as (keyof CompressionState)[];
+export const COMPRESSION_STATE_FIELDS: readonly (keyof CompressionState)[] = (() => {
+    const probe = createInitialState();
+    probe.timestampsHighWaterRefSeq = 0; // conditionally-spread; undefined on a fresh state
+    return Object.keys(mergeState(probe)) as (keyof CompressionState)[];
+})();

@@ -118,16 +118,19 @@ test("#252: post-compress re-request usage is netted by the compress credit", as
 
 test("#252: failed compress accrues no credit", async () => {
     const ctx = makeCompressibleCtx();
-    // Sub-viability range (kernel minCompressRange) → compress FAILS.
+    // Sub-viability range (kernel minCompressRange) → compress FAILS. Under #5220
+// such a round re-requests with a recovery receipt (round 2 below carries no
+// usage report) — and the point still stands: NO credit may be netted off the
+// turn's only real usage figure.
     const badArgs = JSON.stringify({ content: [{ startId: "m00007", endId: "m00007", summary: "s" }] });
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", badArgs),
-        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [] } }),
+        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 50000, output_tokens: 5 } } }),
     ].join("");
-    const refetch = sse("response.completed", { response: { id: "resp_refetch", status: "completed", output: [], usage: { input_tokens: 50000 } } });
+    let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(refetch, { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(sse("response.completed", { response: { id: "resp_none", status: "completed", output: [] } }), { status: 200, headers: { "content-type": "text/event-stream" } }); }) as typeof fetch;
     try {
         await drain(
             new Response(round1, { status: 200 }).body!,
@@ -135,6 +138,7 @@ test("#252: failed compress accrues no credit", async () => {
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
+        assert.equal(fetchCalls, 1, "first-time failure re-requests once via recovery receipt (#5220)");
         assert.equal(ctx.session.stats.compressCreditTokens, 0, "no credit on failed compress");
         assert.equal(ctx.session.stats.lastInputTokens, 50000, "usage lands raw when nothing was compressed");
     } finally {

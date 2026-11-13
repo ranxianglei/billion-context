@@ -61,10 +61,13 @@ function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-const FC_COMPRESS = [
-    sse("response.output_item.added", { item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress" }, output_index: 0 }),
-    sse("response.function_call_arguments.delta", { item_id: "fc_c", delta: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] }) }),
-    sse("response.output_item.done", { item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress", arguments: "{}" }, output_index: 0 }),
+// acp_status vehicle: these tests pin marker visibility/suppression across execute
+// + re-request. A failing compress ends the turn before any re-request (#4186),
+// which would silently un-test the continuation path.
+const FC_STATUS = [
+    sse("response.output_item.added", { item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status" }, output_index: 0 }),
+    sse("response.function_call_arguments.delta", { item_id: "fc_s", delta: "{}" }),
+    sse("response.output_item.done", { item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status", arguments: "{}" }, output_index: 0 }),
 ].join("");
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
@@ -78,7 +81,7 @@ async function drainRound(ctx: Parameters<typeof runCompressLoop>[1]): Promise<{
     }) as typeof fetch;
     try {
         const chunks: Buffer[] = [];
-        const stream = new Response(FC_COMPRESS + COMPLETED, { status: 200 }).body!;
+        const stream = new Response(FC_STATUS + COMPLETED, { status: 200 }).body!;
         for await (const chunk of runCompressLoop(stream, ctx, { model: "gpt-4o", input: [], stream: true }, { url: "http://mock", headers: {} }, createResponsesAdapter(), buildCompressSystemPrompt())) {
             chunks.push(chunk);
         }

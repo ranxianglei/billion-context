@@ -73,6 +73,7 @@ const CORPUS: Array<{ name: string; text: string }> = [
     { name: "prose wearing pair #1720", text: "see \x3cacp tokens=\"2\" type=\"text\"\x3ethe module notes\x3c/acp\x3e for details." },
     { name: "bare ref citation", text: "as recorded in m00123 the build stayed green." },
     { name: "orphan ref close #2023", text: "Answer. m00123 m00124\x3c/acp\x3e tail." },
+    { name: "orphan ref run word-glued head #4179", text: "textm00123\u2013m00124\x3c/acp\x3e tail." },
     { name: "wrapped odd quotes", text: "Answer.\n\x3cacp tokens=\"1\" text=\"text\x3cparameter=ref\x3em00608\x3c/parameter\x3e\x3c/function\x3e tail." },
     { name: "broken attrs run-in", text: "Answer.\n\x3cacp tokens=\"1\" \x3ctool\u003e call \x3c/tool\u003e then \x3c/acp\x3e tail prose." },
     { name: "marker line #717", text: "Answer.\n📦 [ACP] Compressed m00120–m0300 → 1 block(s), ~12K tokens saved.\ntail." },
@@ -84,9 +85,26 @@ const CORPUS: Array<{ name: string; text: string }> = [
     { name: "trunc ref close #2348v4", text: "Answer.\nm00123\x3c/ap" },
     { name: "dead ref close #2862", text: "Answer.\n\x3cacp tokens=\"2\" type=\"text\"\x3em00123\x3c/acp\x3e then m00124\x3c/warn prose continues here." },
     { name: "two pairs adjacent", text: "A \x3cacp tokens=\"2\" type=\"text\"\x3em00123\x3c/acp\x3e B \x3cacp tokens=\"3\" type=\"text\"\x3em00124\x3c/acp\x3e C." },
+    { name: "two bare opens adjacent #4163", text: "Answer.\n\x3cacp\x3e\x3cacp\x3etext tail." },
+    { name: "bare open prose bare open #4163", text: "Answer.\n\x3cacp\x3emid prose\x3cacp\x3etext tail." },
+    { name: "three bare opens #4163", text: "Answer.\n\x3cacp\x3e\x3cacp\x3e\x3cacp\x3etext tail." },
+    { name: "bare open wrapping bare pair #4163", text: "Answer.\n\x3cacp\x3e\x3cacp\x3em00123\x3c/acp\x3etail." },
+    { name: "nested bare open in attrs payload #4169", text: "A \x3cacp tokens=\"1\" type=\"text\"\x3ejunk\x3cacp\x3etext\x3c/acp\x3eB." },
+    { name: "nested bare pair in attrs payload #4169", text: "A \x3cacp tokens=\"1\" type=\"text\"\x3ex\x3cacp\x3ey\x3c/acp\x3ez\x3c/acp\x3eB." },
+    { name: "nested attrs pair in attrs payload #4169", text: "A \x3cacp tokens=\"1\" type=\"text\"\x3ex\x3cacp tokens=\"2\"\x3ey\x3c/acp\x3ez\x3c/acp\x3eB." },
+    { name: "trunc nested open at body end #4169", text: "A \x3cacp tokens=\"1\" type=\"text\"\x3ex\x3cacp tokens=\"2 y\x3c/acp\x3ez" },
     { name: "pair split shape mid-tag", text: "Answer. \x3cacp to\nkens=\"2\" type=\"text\"\x3em00123\x3c/acp\x3e tail." },
     { name: "plain prose control", text: "the acpi.h include and caption and app stay untouched, a<b c>d." },
     { name: "empty", text: "" },
+    // #4164: dead ref-close unit settled ahead of an ambiguous tail — the
+    // tail's fate (acplike tag vs prose vs EOF) decides whether the unit dies
+    // or stays content, and the decision must not depend on the chunk split.
+    { name: "dead unit before open #4164", text: " m1234\x3c/ap\x3cACP\x3e" },
+    { name: "dead unit drift name #4164", text: " m1234\x3c/ap\x3caccessp\x3e" },
+    { name: "two dead units before open #4164", text: "m1111\x3c/ap x m2222\x3c/ap\x3cacp\x3e" },
+    { name: "dead unit prose follow #4164", text: " m1234\x3c/ap\x3cdiv\x3emore" },
+    { name: "dead unit dangling lt #4164", text: " m1234\x3c/ap\x3c" },
+    { name: "dead unit non-acplike close #4164", text: " m1234\x3c/ap\x3c/div\x3e" },
 ];
 
 test("tag-echo filter: chunk-boundary determinism (same input, any chunking, byte-identical output)", () => {

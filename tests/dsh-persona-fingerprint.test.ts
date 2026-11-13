@@ -142,7 +142,13 @@ const mainMsgs = (n: number): { role: string; content: string }[] =>
         content: `main-${i + 1}-` + "z".repeat(6000),
     }));
 
-test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+// #4438 supersedes the #1916/#2203 fork design for the auto-review shape:
+// successive review blobs are freshly re-serialized each call (ids churn, no
+// compression benefit in a persisted lane) and the forked lane is exactly the
+// state surface that overflowed in #3681. Reviews now ride the stateless #388
+// side passthrough on every wire — kernel-no-touch, no |sub: session, usage
+// never settles the main baseline. These tests pin THAT contract per lane.
+test("e2e openai lane #4438: review persona rides the stateless side passthrough — no |sub: fork, main session untouched", async () => {
     const rig = await startRig();
     const CONV = "dshp-openai";
     try {
@@ -164,7 +170,7 @@ test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untou
         assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
 
         // Phase 2 — auto-review shape (fixed REVIEW_POLICY system + flattened
-        // blob) under the SAME conversation id: forks onto `|sub:<fp>`.
+        // blob) under the SAME conversation id: stateless passthrough, no fork.
         const review = (blob: string) => ({
             model: MODEL,
             max_tokens: 384_000,
@@ -177,18 +183,17 @@ test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untou
         assert.equal(r2.status, 200);
         await r2.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        const fk = peekSession(fork);
-        assert.ok(fk, "review request landed on its own forked session");
-        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.ok(!peekSession(fork), "review request minted NO forked session (#4438 stateless passthrough)");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot still holds the main view");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
-        assert.equal(fk.stats.requests, 1, "forked session served the review");
+        assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length >= 12, "main refs intact after the review");
 
-        // Phase 3 — a second review (same policy system, fresh blob) reuses
-        // the SAME forked session (persona stability, not a fork per call).
+        // Phase 3 — a second review (same policy system, fresh blob) is just
+        // another stateless passthrough: still no fork, still no drift.
         const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
         assert.equal(r3.status, 200);
         await r3.text();
-        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.ok(!peekSession(fork), "successive reviews stay stateless — no fork accumulates");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
 
         // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
@@ -202,12 +207,12 @@ test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untou
         assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
 
         // Phase 5 — conversations map discipline (#970): the raw key points at
-        // the MAIN session even though the fork recorded itself; the fork is
-        // reachable under its own suffixed id. (peekSession — getSession is
-        // get-or-create and would mint the very session we are checking for.)
+        // the MAIN session; the review shape minted no conversation entry at
+        // all. (peekSession — getSession is get-or-create and would mint the
+        // very session we are checking for.)
         const mainId = getSession(CONV).id;
         assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
-        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+        assert.ok(!resolveConversation(fork)?.entry, "no conversation map entry was minted for the review shape");
 
         // Phase 6 — a system-less auxiliary call is non-anchoring: verbatim
         // key, rides the main session (kernel empty-instructions path).
@@ -220,7 +225,7 @@ test("e2e openai lane: review persona forks onto `|sub:<fp>`; main session untou
     }
 });
 
-test("e2e anthropic lane: the same persona fork applies to dsh-over-anthropic", async () => {
+test("e2e anthropic lane #4438: the same stateless passthrough applies to dsh-over-anthropic", async () => {
     const rig = await startRig();
     const CONV = "dshp-anthropic";
     try {
@@ -254,14 +259,14 @@ test("e2e anthropic lane: the same persona fork applies to dsh-over-anthropic", 
         assert.equal(r2.status, 200);
         await r2.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        assert.ok(peekSession(fork), "review request forked onto its own session on the anthropic lane too");
+        assert.ok(!peekSession(fork), "review request minted NO forked session on the anthropic lane either (#4438)");
         assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
     } finally {
         await closeRig(rig);
     }
 });
 
-test("e2e responses lane #2203: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+test("e2e responses lane #2203/#4438: review persona rides the stateless side passthrough — no |sub: fork, main session untouched", async () => {
     const rig = await startRig((req, res) => {
         req.resume();
         req.on("end", () => {
@@ -295,9 +300,10 @@ test("e2e responses lane #2203: review persona forks onto `|sub:<fp>`; main sess
         assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
 
         // Phase 2 — auto-review shape (fixed REVIEW_POLICY instructions +
-        // flattened blob) under the SAME conversation id: forks onto
-        // `|sub:<fp>` (#2203 — before the fix this request rode the main
-        // session on the responses wire and clobbered its snapshot/baseline).
+        // flattened blob) under the SAME conversation id: stateless passthrough.
+        // (#2203 fixed the pre-#4438 variant of this bug — the review riding
+        // the MAIN session and clobbering its snapshot/baseline; #4438 removes
+        // the persisted-fork middle ground entirely.)
         const review = (blob: string) => ({
             model: MODEL,
             max_output_tokens: 384_000,
@@ -308,20 +314,17 @@ test("e2e responses lane #2203: review persona forks onto `|sub:<fp>`; main sess
         assert.equal(r2.status, 200);
         await r2.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        const fk = peekSession(fork);
-        assert.ok(fk, "review request landed on its own forked session");
-        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.ok(!peekSession(fork), "review request minted NO forked session (#4438 stateless passthrough)");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot still holds the main view");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
-        assert.equal(fk.stats.requests, 1, "forked session served the review");
-        assert.equal(fk.metadata.personaNamespace, true, "fork stamped as a designed split (canary exemption, #2170 measure 4)");
-        assert.notEqual(getSession(CONV)?.metadata.personaNamespace, true, "main session is not namespaced");
+        assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length >= 12, "main refs intact after the review");
 
-        // Phase 3 — a second review (same policy instructions, fresh blob)
-        // reuses the SAME forked session (persona stability, not a fork per call).
+        // Phase 3 — a second review (same policy instructions, fresh blob) is
+        // just another stateless passthrough: still no fork, still no drift.
         const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
         assert.equal(r3.status, 200);
         await r3.text();
-        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.ok(!peekSession(fork), "successive reviews stay stateless — no fork accumulates");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
 
         // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
@@ -335,12 +338,11 @@ test("e2e responses lane #2203: review persona forks onto `|sub:<fp>`; main sess
         assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
 
         // Phase 5 — conversations map discipline (#970/#2156): the raw key
-        // points at the MAIN session even though the fork recorded itself
-        // (before the rawPersonaIdentity extension, the fork would have
-        // recorded under the raw id and flipped this map entry).
+        // points at the MAIN session; the stateless review minted no entry
+        // under any key.
         const mainId = getSession(CONV).id;
         assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
-        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+        assert.ok(!resolveConversation(fork)?.entry, "no conversation map entry was minted for the review shape");
 
         // Phase 6 — an instructions-less auxiliary call is non-anchoring:
         // verbatim key, rides the main session (kernel empty-instructions path).
@@ -404,8 +406,9 @@ test("e2e openai lane #2156: side request FIRST must not steal the persona ancho
         assert.ok(!peekSession(forkKey(CONV, SIDE_SYSTEM)), "post-anchor side request did not mint a junk forked session");
         assert.equal(peekSession(CONV)?.stats.requests, 1, "side request counted nowhere");
 
-        // Phase 4 — review persona still forks (the #1916 mechanism this fix
-        // must not disturb): full-pipeline request, own system, own fork.
+        // Phase 4 — the review persona now rides the stateless passthrough
+        // (#4438 supersedes the #1916 fork this phase used to pin): no |sub:
+        // session, main session untouched.
         const r4 = await fetch(url, {
             method: "POST",
             headers,
@@ -420,8 +423,7 @@ test("e2e openai lane #2156: side request FIRST must not steal the persona ancho
         });
         assert.equal(r4.status, 200);
         await r4.text();
-        const fork = peekSession(forkKey(CONV, REVIEW_SYSTEM));
-        assert.ok(fork, "review persona still forks onto |sub:<fp> after the fix");
+        assert.ok(!peekSession(forkKey(CONV, REVIEW_SYSTEM)), "review shape rides the side passthrough — no |sub: fork (#4438)");
         assert.equal(peekSession(CONV)?.stats.requests, 1, "main session untouched by the review");
     } finally {
         await closeRig(rig);
@@ -504,7 +506,7 @@ test("e2e allowlist pin: a non-dsh plugin agent with two different systems stays
 // main session exactly like #1916/#2203 did on the other wires. dsh CAN route
 // google: it stamps x-bili-plugin: dsh wire-agnostically (dsh-native.ts) and its
 // MODEL_API_SUFFIX gate accepts google paths.
-test("e2e google lane #2730: review persona forks onto `|sub:<fp>`; main session untouched; forks are stable", async () => {
+test("e2e google lane #2730/#4438: review persona rides the stateless side passthrough — no |sub: fork, main session untouched", async () => {
     const rig = await startRig((req, res) => {
         req.resume();
         req.on("end", () => {
@@ -536,7 +538,8 @@ test("e2e google lane #2730: review persona forks onto `|sub:<fp>`; main session
         assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot holds the main view");
 
         // Phase 2 — auto-review shape (fixed REVIEW_POLICY systemInstruction +
-        // flattened blob) under the SAME conversation id: forks onto `|sub:<fp>`.
+        // flattened blob) under the SAME conversation id: stateless passthrough
+        // on the google lane too (#4438 supersedes the #2730-era fork).
         const review = (blob: string) => ({
             contents: [{ role: "user", parts: [{ text: `Conversation transcript (flattened):\n${blob}\nDecide: risky?` }] }],
             systemInstruction: { parts: [{ text: REVIEW_SYSTEM }] },
@@ -546,20 +549,17 @@ test("e2e google lane #2730: review persona forks onto `|sub:<fp>`; main session
         assert.equal(r2.status, 200);
         await r2.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        const fk = peekSession(fork);
-        assert.ok(fk, "review request landed on its own forked session on the google lane too");
-        assert.equal((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, true, "main snapshot untouched (the review never even reached the main session)");
+        assert.ok(!peekSession(fork), "review request minted NO forked session on the google lane either (#4438)");
+        assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 12, "remembered snapshot still holds the main view");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the review");
-        assert.equal(fk.stats.requests, 1, "forked session served the review");
-        assert.equal(fk.metadata.personaNamespace, true, "fork stamped as a designed split (canary exemption, #2170 measure 4)");
-        assert.notEqual(getSession(CONV)?.metadata.personaNamespace, true, "main session is not namespaced");
+        assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length >= 12, "main refs intact after the review");
 
-        // Phase 3 — a second review (same policy systemInstruction, fresh blob)
-        // reuses the SAME forked session (persona stability, not a fork per call).
+        // Phase 3 — a second google-lane review is just another stateless
+        // passthrough: still no fork, still no drift.
         const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify(review("user: build it again\nassistant: done")) });
         assert.equal(r3.status, 200);
         await r3.text();
-        assert.equal(getSession(fork)?.stats.requests, 2, "successive reviews share one forked session");
+        assert.ok(!peekSession(fork), "successive reviews stay stateless on the google lane");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session still at one request");
 
         // Phase 4 — a main turn (MAIN_SYSTEM) keeps the raw key (anchor).
@@ -569,12 +569,10 @@ test("e2e google lane #2730: review persona forks onto `|sub:<fp>`; main session
         assert.equal(getSession(CONV)?.stats.requests, 2, "main turn still rides the raw key");
 
         // Phase 5 — conversations map discipline (#970/#2156): the raw key points
-        // at the MAIN session even though the fork recorded itself under its
-        // suffixed id (before the rawPersonaIdentity google case, the fork would
-        // have recorded under the raw id and flipped this map entry).
+        // at the MAIN session; the stateless review minted no entry under any key.
         const mainId = getSession(CONV).id;
         assert.equal(resolveConversation(CONV)?.entry?.sessionId, mainId, "raw conversation key still resolves to the main session id");
-        assert.equal(resolveConversation(fork)?.entry?.sessionId, fk.id, "forked conversation key resolves to the forked session");
+        assert.ok(!resolveConversation(fork)?.entry, "no conversation map entry was minted for the review shape");
 
         // Phase 6 — a systemInstruction-less auxiliary call is non-anchoring:
         // verbatim key, rides the main session (kernel empty-instructions path).
@@ -616,12 +614,11 @@ test("e2e google lane allowlist pin: a non-dsh plugin agent with two different s
 // the google one was left on the retired v1 personaNamespace ladder, its
 // import restored by a9378038). ONE dsh conversation id may be stamped on
 // requests that travel DIFFERENT wires (main turns on one, an auto-review
-// persona on another); persona attribution must not depend on which wire
-// carried the request: the aux persona forks onto its own `|sub:<fp>` key
-// on BOTH wires (the fp is over the persona system text — lane-independent,
-// so the same persona converges on ONE fork session), and the main
-// conversation keeps the raw key on both.
-test("e2e cross-lane #3134: one dsh conversation id across google + openai lanes keys personas consistently", async () => {
+// persona on another); attribution must not depend on which wire carried
+// the request. Under #4438 the review shape rides the stateless side
+// passthrough on EVERY wire (no `|sub:` fork, nothing recorded), while the
+// main conversation keeps the raw key on both wires.
+test("e2e cross-lane #3134/#4438: one dsh conversation id across google + openai lanes — reviews stateless everywhere, main raw-keyed everywhere", async () => {
     const rig = await startRig((req, res) => {
         req.resume();
         req.on("end", () => {
@@ -660,21 +657,21 @@ test("e2e cross-lane #3134: one dsh conversation id across google + openai lanes
         assert.equal(getSession(CONV)?.stats.requests, 1, "one main request on the raw key");
 
         // Phase 2 — the review persona rides the GOOGLE wire (same id, fixed
-        // REVIEW_POLICY systemInstruction + flattened blob): forks `|sub:<fp>`.
+        // REVIEW_POLICY systemInstruction + flattened blob): stateless passthrough.
         const r2 = await fetch(googleUrl, { method: "POST", headers, body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Conversation transcript (flattened):\nuser: build it\nassistant: ok\nDecide: risky?" }] }], systemInstruction: { parts: [{ text: REVIEW_SYSTEM }] }, generationConfig: { maxOutputTokens: 384_000 } }) });
         assert.equal(r2.status, 200);
         await r2.text();
         const fork = forkKey(CONV, REVIEW_SYSTEM);
-        assert.ok(peekSession(fork), "review persona on the google wire forked onto its own `|sub:` key");
+        assert.ok(!peekSession(fork), "google-wire review minted no `|sub:` session (#4438 stateless passthrough)");
         assert.equal(getSession(CONV)?.stats.requests, 1, "raw key untouched by the google-wire review");
-        assert.equal(peekSession(fork)?.stats.requests, 1, "forked session served the google-wire review");
 
-        // Phase 3 — the SAME review persona rides the openai wire: same fp,
-        // same fork key — ONE fork session across wires, not one per lane.
+        // Phase 3 — the SAME review persona rides the openai wire: still
+        // stateless — cross-lane consistency now means BOTH wires pass through
+        // without touching any session state.
         const r3 = await fetch(openaiUrl, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 384_000, messages: [{ role: "system", content: REVIEW_SYSTEM }, { role: "user", content: "Conversation transcript (flattened):\nuser: build it again\nassistant: done\nDecide: risky?" }] }) });
         assert.equal(r3.status, 200);
         await r3.text();
-        assert.equal(peekSession(fork)?.stats.requests, 2, "same persona on the openai wire reused the SAME forked session (cross-lane attribution consistency)");
+        assert.ok(!peekSession(fork), "openai-wire review also minted no `|sub:` session (cross-lane consistency under #4438)");
         assert.equal(getSession(CONV)?.stats.requests, 1, "main session still untouched");
 
         // Phase 4 — a google-wire main turn keeps the raw key.
@@ -684,9 +681,9 @@ test("e2e cross-lane #3134: one dsh conversation id across google + openai lanes
         assert.equal(getSession(CONV)?.stats.requests, 2, "google-wire main turn keeps the raw key (persona attribution is wire-independent)");
 
         // Phase 5 — conversations map discipline (#970): the raw key keeps
-        // resolving to the MAIN session despite the cross-wire fork.
+        // resolving to the MAIN session; neither wire's review minted an entry.
         assert.equal(resolveConversation(CONV)?.entry?.sessionId, getSession(CONV)?.id, "raw conversation key still resolves to the main session");
-        assert.equal(resolveConversation(fork)?.entry?.sessionId, peekSession(fork)?.id, "fork key resolves to the forked session");
+        assert.ok(!resolveConversation(fork)?.entry, "no conversation map entry was minted for the review shape on either wire");
     } finally {
         await closeRig(rig);
     }

@@ -441,13 +441,17 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
                     try {
                         const j = JSON.parse(fs.readFileSync(p, "utf8")) as { payload?: { id?: string; stats?: { requests?: number }; state?: { messageRefs?: { byRaw?: Record<string, unknown> }; blocks?: Record<string, unknown> } } };
                         const inner = j.payload;
-                        if (!inner?.id) return;
-                        found.push({
-                            id: String(inner.id),
-                            requests: inner.stats?.requests ?? null,
-                            refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
-                            blocks: Object.keys(inner.state?.blocks ?? {}).length,
-                        });
+                        // Skip (don't abort the walk on) non-envelope .json
+                        // sidecars — e.g. index.db.chk — so one stray file can't
+                        // blind the whole directory scan.
+                        if (inner?.id) {
+                            found.push({
+                                id: String(inner.id),
+                                requests: inner.stats?.requests ?? null,
+                                refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
+                                blocks: Object.keys(inner.state?.blocks ?? {}).length,
+                            });
+                        }
                     } catch { /* skip unreadable */ }
                 }
             }
@@ -627,8 +631,10 @@ test("real dsh #2791 C: a mid-session PROTOCOL switch (openai -> anthropic) keep
 //   - the profile settings.yaml legacy-import path does not settle within a
 //     one-shot run (the document is never consumed/renamed).
 // Until dsh exposes a headless surface (or adopts an event log we can seed
-// through supported means), the review FORK shape is pinned by the harness
-// e2e in tests/dsh-persona-continuity.test.ts (review e2e, both wires).
+// through supported means), the review passthrough shape (#4438 superseded
+// the #2241-era fork) is pinned by the harness e2e in
+// tests/dsh-persona-continuity.test.ts (review e2e, both wires) and
+// tests/issue4438-dsh-review-lane-isolation.test.ts.
 // Flip this gate when that changes.
 const gatedB = {
     skip: (!GATE || !dshAvailable())
@@ -638,7 +644,7 @@ const gatedB = {
             : "blocked: dsh 0.2.0-rc.2 exposes no headless surface to arm the Auto permission preset (web-UI /permission auto only) — set ACP_TEST_E2E_DSH_AUTO_REVIEW=1 to attempt anyway",
 };
 
-test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane keeps the raw key", gatedB, async (t) => {
+test("real dsh #2241/#4438 B: auto-review rides the stateless passthrough while the main lane keeps the raw key", gatedB, async (t) => {
     assert.ok(fs.existsSync(path.join(REPO_ROOT, "dist", "agent", "dsh-native.js")), "npm run build first — the profile loads dist/agent/dsh-native.js");
     const rig = buildRig("review", true);
     const fake = await startFakeUpstream(rig.reqLog);
@@ -659,7 +665,8 @@ test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane k
     assert.ok(mainTurns.length >= 2, `the main agent loop ran its rounds (rounds=${mainTurns.length})`);
     assert.ok(oracle.some((o) => o.hasToolResult), "the tool result round-tripped (reviewer allowed the call)");
 
-    // ---- acceptance: review forked, main stayed raw ----
+    // ---- acceptance: review minted nothing (#4438 stateless passthrough),
+    // main stayed raw ----
     await rig.stopAndFlush();
     const sessions = allSessions(rig).filter((s) => s.id === conv || s.id.startsWith(`${conv}|sub:`));
     const main = sessions.find((s) => s.id === conv);
@@ -667,5 +674,5 @@ test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane k
     assert.ok(main, "the main lane persisted under the RAW conversation key");
     assert.ok((main?.requests ?? 0) >= 2, `main rounds rode the raw key (requests=${main?.requests})`);
     assert.ok((main?.refs ?? 0) >= 3, `main refs never reset (refs=${main?.refs})`);
-    assert.ok(forks.length >= 1, `the review request forked onto its own |sub: session — isolation preserved (forks=${JSON.stringify(forks.map((f) => f.id.slice(-12)))})`);
+    assert.equal(forks.length, 0, `#4438: the review request rides the stateless passthrough — no |sub: session minted (forks=${JSON.stringify(forks.map((f) => f.id.slice(-12)))})`);
 });

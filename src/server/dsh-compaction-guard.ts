@@ -213,15 +213,18 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *
  *  A LANDED checkpoint is specifically ONE user-role, plain-text message
  *  (dsh-compaction-basic replaces the shadowed region with a single
- *  user/message whose text starts with CHECKPOINT_PREAMBLE). The framing bytes
- *  are matched as before (open tag anywhere — it sits mid-message after
- *  preamble + blank line; or the preamble at message start). But #2621 taught
- *  that matching the framing BYTES ALONE is a false-positive machine: the
- *  string survives anywhere history QUOTES it — a tool result that read a
- *  transcript containing it, the model citing it in reasoning, bili's own
- *  compress summaries quoting it, an assistant message paraphrasing the
- *  preamble. Those carriers are structurally incapable of being a checkpoint,
- *  so two gates tighten the match to "a checkpoint just landed":
+ *  user/message whose text starts with CHECKPOINT_PREAMBLE; the open tag sits
+ *  mid-message after preamble + blank line). #2621 taught that matching the
+ *  framing BYTES ALONE is a false-positive machine: the string survives
+ *  anywhere history QUOTES it — a tool result that read a transcript
+ *  containing it, the model citing it in reasoning, bili's own compress
+ *  summaries quoting it, an assistant message paraphrasing the preamble. And
+ *  #4438 proved the QUOTE class is live even among novel messages: dsh's
+ *  auto-review snapshot replays retained history that CONTAINS a landed
+ *  checkpoint inside its FILTERED_HISTORY section, and the freshly-synthesized
+ *  blob passes the novelty gate by construction (new content-hash id) — one
+ *  such 433KiB aux request wiped a live session's entire fold state. So three
+ *  gates tighten the match to "a checkpoint just landed":
  *
  *   ① CARRIER — the message must be role="user" AND plain text
  *      (contentType "text" when typed). Tool results, reasoning blocks,
@@ -237,6 +240,15 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *      message; a historical quote/replay hits an OLD id. This closes the
  *      residual of ①: a user who literally typed/pasted the framing into a
  *      user message in an EARLIER turn is replayed as an old id, not a landing.
+ *   ③ STANDALONE (#4438) — the message must START with the framing
+ *      (preamble-first today; tag-first if the preamble ever drops out). A
+ *      landed checkpoint IS the whole message; a quote embeds it inside other
+ *      content. This costs nothing against real landings and removes the
+ *      mid-blob false positive entirely. Consequence accepted per this file's
+ *      version-pin doctrine (header): if dsh rewords BOTH the preamble AND
+ *      moves the tag off the message head, detection degrades to a miss —
+ *      the pre-#2432 unannounced-rewrite archive path — never a false
+ *      positive wiping live fold state.
  *
  *  Reads the core-flattened text first (BiliMessage/CoreMessage carry prose in
  *  `.text`), falling back to a raw wire content field for direct callers. When
@@ -255,7 +267,11 @@ export function carriesDshLocalCompactionSummary(
         if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
-        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
+        // ③ STANDALONE (#4438): the framing must open the message — see the
+        // gate list above for why mid-text matching is a false-positive
+        // machine on synthesized aux blobs that quote old checkpoints.
+        const head = text.trimStart();
+        if (head.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX) || head.startsWith(DSH_CHECKPOINT_OPEN_TAG)) return true;
     }
     return false;
 }
@@ -266,8 +282,19 @@ const REFUSAL_MESSAGE =
     `dsh native compaction call refused by billion-context: bili owns compression on this lane (#1729, cf. #1772/#1206). ` +
     `A landed dsh compaction checkpoint durably shadows the raw conversation history, which destroys the proxy's compression substrate. ` +
     `No action is needed: your conversation is intact and bili compresses automatically as turns grow too large — if the session is currently over its window, it starts folding on the next turn (#3453). ` +
-    `This refusal is unconditional — the former allowDshCompaction opt-in was removed (#3651, superseding #2028); ` +
+    `This refusal is unconditional and terminal (bili_final) — the same call will be refused every time, so stop retrying (#3013: one session burned 5069 refused retries); the former allowDshCompaction opt-in was removed (#3651, superseding #2028); ` +
     `to keep dsh-side checkpoints out entirely, apply host-side suppression instead (#3354/#2474).`;
+
+/** #3013/#3022 (A1): the refusal is a DECISION, not a transient error — dsh's
+ * retry loop is driven by its own raw pressure ledger which nothing on bili's
+ * side can shrink (#2490), so every retry of the same call fails identically.
+ * `bili_final: true` gives clients an unambiguous machine-readable terminal
+ * marker to latch and stop retrying (consumption needs dsh-upstream
+ * coordination; `retryable:false` alone did not stop the field-reported
+ * 5038-retry storm). Present at the top level of both protocol shapes and,
+ * for the openai error envelope (where `retryable` lives), inside `error`
+ * too. */
+const BILI_FINAL_FIELD = "bili_final" as const;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
  * clients render it natively). 422: a policy refusal of this one request — not
@@ -278,18 +305,29 @@ export function dshCompactionRefusal(protocol: string): Refusal {
     if (protocol === "anthropic") {
         return {
             status: 422,
-            body: { type: "error", error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
+            body: { type: "error", [BILI_FINAL_FIELD]: true, error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
         };
     }
     return {
         status: 422,
         body: {
+            [BILI_FINAL_FIELD]: true,
             error: {
                 type: "server_error",
                 code: "dsh_compaction_refused",
                 message: REFUSAL_MESSAGE,
                 retryable: false,
+                [BILI_FINAL_FIELD]: true,
             },
         },
     };
 }
+
+/** #3013/#3022 (A3): cadence for the pipeline-lane storm log. The first
+ * refusal warns once (once-warn dedup on session.metadata), then refusals are
+ * silent unless this many more arrive — the field-reported storm re-fired
+ * every ~328ms for hours with ZERO log lines after the first, leaving the
+ * user staring at a stuck "生成中" with no clue (#3013). Same cadence caps the
+ * passthrough lane's per-refusal warn so an agentless storm cannot spam the
+ * log either. Constant, not config (#2155 precedent). */
+export const DSH_REFUSAL_STORM_LOG_EVERY = 100;

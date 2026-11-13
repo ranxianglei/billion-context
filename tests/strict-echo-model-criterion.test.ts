@@ -117,9 +117,13 @@ test("#1027: gateway-hosted deepseek model gets proactive strict-echo repair, no
         seenBodies.push(bodyText);
         res.writeHead(200, { "content-type": "text/event-stream" });
         if (n === 1) {
+            // acp_status drives the loop re-request deterministically: an
+            // empty-range compress fails and ends the turn under the
+            // failed-only breaker (#156/#4186), which would un-test the
+            // loop-path repair below.
             res.write(sseChunk("c1", { role: "assistant" }));
-            res.write(sseChunk("c1", { tool_calls: [{ index: 0, id: "tc-loop", type: "function", function: { name: "compress", arguments: "" } }] }));
-            res.write(sseChunk("c1", { tool_calls: [{ index: 0, function: { arguments: "{\"content\":[]}" } }] }));
+            res.write(sseChunk("c1", { tool_calls: [{ index: 0, id: "tc-loop", type: "function", function: { name: "acp_status", arguments: "" } }] }));
+            res.write(sseChunk("c1", { tool_calls: [{ index: 0, function: { arguments: "{}" } }] }));
             res.write(sseChunk("c1", {}, "tool_calls"));
         } else {
             res.write(sseChunk("c2", { content: "done" }));

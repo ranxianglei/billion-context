@@ -62,15 +62,26 @@
 //   block flavor → <block>no</block>
 //     (begins with <block>, single agreeing occurrence, no → allow)
 //
-// Detection: the magic stop sequences are the strongest signal but ONLY
-// stage-1 non-fast carries them — stage-1-fast and stage-2 have none. The
-// second signal is structural: the flattened conversation rides in a
-// <transcript>…</transcript> wrapper in the user message(s), and the request
-// carries the classifier's policy wording (product copy, stable across
-// versions). Either signal alone can appear in legitimate traffic; the
-// conjunction cannot reasonably be faked by a coding session. If detection
-// fires but the flavor is undecidable, we do NOT forge — we fall back to
-// verbatim passthrough (never emit a malformed verdict, #353 discipline).
+// Detection: three-part gate, biased toward FALSE NEGATIVES — a miss degrades
+// to raw forwarding (pre-#2740 behavior: billed upstream, safe); a hit either
+// forges an allow verdict on a real turn or kills the session's compression
+// silently (#3908: a tool result quoting this very file carried both marker
+// families and poisoned every later request of that session).
+//   1. STRUCTURE — a well-formed <transcript>…</transcript> pair in the USER
+//      TEXT enclosing >= MIN_TRANSCRIPT_SPAN chars: the wrapper carries the
+//      ENTIRE flattened session (KB..MB scale from the first classified-tool
+//      exchange on); quoted mentions (source literals, doc examples, comment
+//      spans) enclose at most ~100 chars.
+//   2. PLACEMENT — the corroborating signal must sit where CC actually puts
+//      it: the magic stop_sequences (top-level field) OR policy wording
+//      (product copy, stable across versions) in SYSTEM or the same user text
+//      blocks. tool_result payloads / assistant text / tools JSON never count
+//      — the one-shot carries no tool results, and scanning executed output is
+//      what made #3908 possible.
+// Magic stops are the strongest signal but ONLY stage-1 non-fast carries them;
+// stage-1-fast and stage-2 have none, so the policy-wording arm covers those.
+// If detection fires but the flavor is undecidable, we do NOT forge — verbatim
+// passthrough (never emit a malformed verdict, #353 discipline).
 
 import type { AnthropicRequestBody } from "acp-kernel/wire";
 import { extractSystem } from "acp-kernel/wire";
@@ -96,6 +107,14 @@ const SHARED_POLICY_MARKERS = [
     "explicit (not suggestive or implicit) user confirmation is required to override blocks",
 ];
 const TRANSCRIPT_MARKER = "<transcript>";
+const TRANSCRIPT_CLOSE = "</transcript>";
+/** Smallest span a genuine wrapper encloses. The flattened transcript starts
+ *  KB-scale at the first classified-tool exchange (CC's jsonl envelope per
+ *  entry); the largest quoted-artifact span observed in the #3908 class
+ *  (source literal / comment "…" span) is under ~100 chars. 512 sits between
+ *  with >=5x margin per side; a miss below the floor forwards raw upstream —
+ *  the safe direction (see the Detection block above). */
+const MIN_TRANSCRIPT_SPAN = 512;
 
 function messageTextOf(m: { role?: string; content?: unknown }): string {
     const c = m.content;
@@ -128,22 +147,64 @@ export function requestText(parsed: AnthropicRequestBody): string {
     return parts.join("\n");
 }
 
-/** True for BOTH stages and BOTH flavors — see the module header for why each
- *  signal exists and which shapes carry it. The <transcript> wrapper is the
- *  load-bearing structural signal (every stage, every flavor carries it); the
- *  magic stop sequences corroborate but are NOT sufficient alone — "</severity>"
- *  / "</block>" are ordinary XML tags a legitimate session can legitimately use
- *  as stop hints (any harness emitting severity/block verdict XML). Detecting on
- *  stops alone would forge a local "always allow" verdict for such traffic. */
+/** Text of one message as far as the classifier FRAME is concerned: plain
+ *  user text blocks only. The one-shot request carries no assistant turns and
+ *  no tool results, so executed output must never count toward detection —
+ *  a tool_result quoting marker-bearing source poisoned whole sessions
+ *  (#3908). */
+function frameTextOf(m: { role?: string; content?: unknown }): string {
+    if (m.role !== "user") return "";
+    const c = m.content;
+    if (typeof c === "string") return c;
+    if (!Array.isArray(c)) return "";
+    let out = "";
+    for (const b of c) {
+        if (b === null || typeof b !== "object") continue;
+        const rec = b as Record<string, unknown>;
+        if (rec.type === "tool_result") continue;
+        if (typeof rec.text === "string") out += rec.text;
+    }
+    return out;
+}
+
+/** Largest char span enclosed by any well-formed <transcript>…</transcript>
+ *  pair (greedy left-to-right pairing, max over all pairs). Bare mentions
+ *  without a close tag score 0. */
+function maxTranscriptSpan(text: string): number {
+    let best = 0;
+    let from = 0;
+    for (;;) {
+        const open = text.indexOf(TRANSCRIPT_MARKER, from);
+        if (open < 0) break;
+        const close = text.indexOf(TRANSCRIPT_CLOSE, open + TRANSCRIPT_MARKER.length);
+        if (close < 0) break;
+        const span = close - open - TRANSCRIPT_MARKER.length;
+        if (span > best) best = span;
+        from = close + TRANSCRIPT_CLOSE.length;
+    }
+    return best;
+}
+
+/** True for BOTH stages and BOTH flavors — see the module header's Detection
+ *  block for why each gate exists. Order matters: the substantial wrapper is
+ *  checked FIRST because it is the load-bearing structural signal (every stage,
+ *  every flavor carries one, and a genuine wrapper encloses the entire
+ *  flattened session); magic stops corroborate but are NOT sufficient alone —
+ *  "</severity>" / "</block>" are ordinary XML tags a legitimate session can
+ *  legitimately use as stop hints (any harness emitting severity/block verdict
+ *  XML). Policy wording is searched in the FRAME only (system + user text
+ *  blocks): scanning tool_result/assistant/tools history for it was the #3908
+ *  poison channel. */
 export function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const text = requestText(parsed);
-    if (!text.includes(TRANSCRIPT_MARKER)) return false;
+    const userText = (parsed.messages ?? []).map(frameTextOf).join("\n");
+    if (maxTranscriptSpan(userText) < MIN_TRANSCRIPT_SPAN) return false;
     const stops = parsed.stop_sequences;
     const hasMagicStops =
         Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
     if (hasMagicStops) return true; // wrapper + magic stops: stage-1 non-fast, even if policy copy drifts
+    const frame = extractSystem(parsed.system) + "\n" + userText;
     return [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
-        .some((marker) => text.includes(marker));
+        .some((marker) => frame.includes(marker));
 }
 
 /** Which forged verdict shape this request expects. null = undecidable →

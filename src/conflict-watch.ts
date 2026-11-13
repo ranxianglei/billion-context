@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption";
 
 export interface ConflictEvent {
     at: number;
@@ -120,10 +120,10 @@ export function conflictClientOf(session: Session): string | undefined {
 
 /** #2219: where the full client×mechanism matrix lives — every hint surface
  *  points here instead of duplicating the matrix. */
-export const CONFLICT_DOCS_POINTER = 'CONFIGURATION.md → "Detecting other compression plugins (#1206)"';
+export const CONFLICT_DOCS_POINTER = 'docs/configuration.md → "Detecting other compression plugins (#1206)"';
 
 // #2219: one-line per-client remediation for the conflict surfaces. Each entry
-// mirrors its doc anchor (README opencode section / CONFIGURATION.md claude
+// mirrors its doc anchor (README opencode section / docs/configuration.md claude
 // auto-compact alignment + BILI_CODEX_COMPACT / pi·omp carriage evidence
 // #851/#1382); keep each entry ONE line — these render inline in acp_status
 // text, the web banner, and launcher stderr.
@@ -248,14 +248,11 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
             ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (orphanOnly) {
-        // #2802 review: identity-loss takeover (#2791 family) — bili KNOWS what
-        // happened (its own resolver detected the headerless replay of this
-        // conversation); commanding a plugin hunt or an auto-compaction toggle
-        // on this ledger would send the reader after a compressor that does
-        // not exist.
+        // A headerless replay does not prove that the original client moved.
+        // Older ledgers may contain tail-only matches; neither proves state loss.
         advice = active.length > 0
-            ? "The events above are identity-loss takeovers (#2791 family): the client's lane stopped stamping its conversation id mid-conversation, so a headerless replay minted a fresh anonymous fork and THIS session's fold continuity broke — there is NO second compressor to hunt for and no auto-compaction to disable. Restore the lane that stamps identity (host/plugin wiring — e.g. a profile wire-protocol switch the identity patch missed), or start a fresh conversation."
-            : "All events above are identity-loss takeovers older than 7 days (historical stock): the anonymous forks named above already happened and the continuity loss is in the past. Verify the client's lane stamps its conversation id again (host/plugin wiring), then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+            ? "The events above are possible identity-loss replays (#2791 family): an anonymous request shared history with an identified conversation. This does NOT prove that the original client stopped sending its id or that fold continuity was lost; older tail-only matches can also come from unrelated auxiliary requests. Original session state is retained. Verify whether subsequent main requests still use the original conversation id. There is NO second compressor to hunt for and no auto-compaction to disable."
+            : "All events above are possible identity-loss replays older than 7 days (historical stock), not proof of continuity loss. Older tail-only matches may be unrelated auxiliary requests. Verify the client's main requests still use their conversation id, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (signals.length === 0) {
         advice = active.length > 0
             ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."

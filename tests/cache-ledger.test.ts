@@ -683,6 +683,36 @@ test("handleAcpCache renders the CACHE INVALIDATION breakdown incl. unmeasured (
     assert.match(text, /unmeasured .*excluded from hit rate/);
 });
 
+test("handleAcpCache renders per-line WIRE/UPSTREAM SWITCHES with timestamps like MODEL/KEY (#3307)", () => {
+    // wire-only flip (mirrors the #1536 wire fixture) — wire wins its own partition
+    const wireSession = makeSession();
+    wireSession.metadata.lastModel = "gpt-5";
+    recordCacheSample(wireSession, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "anthropic" });
+    recordCacheSample(wireSession, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai" });
+    const wireText = handleAcpCache(wireSession).text;
+    assert.match(wireText, /WIRE SWITCHES/);
+    assert.match(wireText, /anthropic → openai/);
+    // upstream-only flip (mirrors the #1536 upstream fixture) — upstream wins its own partition
+    const upSession = makeSession();
+    upSession.metadata.lastModel = "gpt-5";
+    recordCacheSample(upSession, { at: T0 + 1000, input: 10000, cached: 9000, protocol: "openai", upstream: "https://api.openai.com" });
+    recordCacheSample(upSession, { at: T0 + 2000, input: 11000, cached: 0, protocol: "openai", upstream: "https://relay.example.com" });
+    const upText = handleAcpCache(upSession).text;
+    assert.match(upText, /UPSTREAM SWITCHES/);
+    assert.match(upText, /https:\/\/api\.openai\.com → https:\/\/relay\.example\.com/);
+});
+
+test("handleAcpCache renders a per-line RESTART/REFORK section with its event (#3307)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "gpt-5";
+    recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
+    (session.metadata["cacheLedger"] as Record<string, unknown>).lastBoot = "previous-boot";
+    recordCacheSample(session, { at: T0 + 2000, input: 11000, cached: 0 });
+    const text = handleAcpCache(session).text;
+    assert.match(text, /RESTART\/REFORK/);
+    assert.match(text, /→ \(restart\)/);
+});
+
 test("per-cause buckets partition a multi-flag sample's residual (#1847)", () => {
     const session = makeSession();
     session.metadata.lastModel = "gpt-5";

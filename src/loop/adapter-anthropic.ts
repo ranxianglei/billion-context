@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
+import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
@@ -152,6 +153,14 @@ function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: stri
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
+// The loop's own early ends say "length", OpenAI's word; Anthropic has no
+// such stop reason, and Claude Code stops mid-task on one it does not know.
+// "max_tokens" makes it resume the turn instead (#5179).
+function anthropicStopReason(reason: string | undefined): string {
+    if (!reason) return "end_turn";
+    return reason === "length" ? "max_tokens" : reason;
+}
+
 function buildTextDeltaEvent(index: number, text: string): Buffer {
     return Buffer.from(
         `event: content_block_delta\n` +
@@ -240,12 +249,28 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         return Object.keys(out).length > 0 ? out : undefined;
     };
 
+    // #4072: the cache_creation breakdown object (e.g. { ephemeral_5m_input_tokens })
+    // rides inside a frame's `usage`. Plain-object guard only — values are passed
+    // through verbatim, never synthesized (the upstream knows whether the write was
+    // 5m or 1h).
+    const cacheCreationOf = (u: Record<string, unknown>): Record<string, unknown> | undefined => {
+        const cc = u["cache_creation"];
+        return cc !== null && typeof cc === "object" && !Array.isArray(cc) ? (cc as Record<string, unknown>) : undefined;
+    };
+    // Same relays that echo `input_tokens: 0` in an incomplete message_delta usage
+    // (#660) may echo a schema-shaped all-zero breakdown — adopting it would clobber
+    // the real start-frame values. Mirror the numerics' adoption rule: only a
+    // breakdown carrying tokens is an update.
+    const cacheCreationMeaningful = (cc: Record<string, unknown>): boolean =>
+        Object.values(cc).some((v) => typeof v === "number" && v > 0);
+
     const buildTerminal = (
         stopReason: string,
         outputTokens: number,
         inputTokens: number,
         cachedTokens: number,
         creationTokens?: number,
+        cacheCreation?: Record<string, unknown>,
         extras?: Record<string, unknown>,
     ): Buffer => {
         const usage: Record<string, unknown> = {
@@ -254,6 +279,11 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             cache_read_input_tokens: cachedTokens,
         };
         if (typeof creationTokens === "number") usage.cache_creation_input_tokens = creationTokens;
+        // #4072: the breakdown's only upstream home is message_start, which is
+        // forwarded usage-neutral (#1315) — re-carry it here or hosts deriving
+        // their prompt-cache TTL from it (Claude Code VS Code countdown icon)
+        // lose it. Absent when no frame carried one; never synthesized.
+        if (cacheCreation) usage.cache_creation = cacheCreation;
         const extra: Record<string, unknown> = {};
         // #2701: report the thread tail (latest round's id) when present — on a
         // threads turn the client's next continue must target it, not round 1's id.
@@ -278,22 +308,32 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // steady path does (`anthropicCacheMarks ?? cacheControls`) — a
             // client-managed session has no bili marks, and dropping its
             // breakpoint leaves the post-fold prefix unwritten to cache.
-            const messages = coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls);
+            // [#5688] round-2 re-renders from the core view fold reconstruction
+            // can leave adjacent effort directives in — collapse like the
+            // steady egress or the rebuild 400s where the main request passed.
+            const messages = dedupeAdjacentOutputConfig(coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls));
             // #1876: same append-not-merge rebuild as the steady path's
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
+            // #5432: notes go BEFORE a trailing client system run; the #4570
+            // backstop heals whatever still arrives illegal (fold orphans).
             const withNotes = notes && notes.length > 0
-                ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
+                ? healAnthropicSystemPositions(insertBeforeTrailingSystemRun(messages, notes.map((text) => ({ role: "user" as const, content: text }))))
                 : messages;
             return { ...body, system: stamped, messages: withNotes };
         },
 
-        async *parseStream(upstream, round) {
+        async *parseStream(upstream, round, opts) {
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
             let roundCreation: number | undefined;
+            // #4072: verbatim cache_creation breakdown for THIS round's frames —
+            // like the numerics above, the final round's value is what the
+            // synthetic terminal carries (stitched turns take the post-fold
+            // round, matching how the totals are chosen).
+            let roundCacheCreation: Record<string, unknown> | undefined;
             let roundOutput: number | undefined;
             // #4128: upstream billing_usage declaration that input_tokens is inclusive of cache_read.
             let roundDeclaredInclusive: boolean | undefined;
@@ -338,6 +378,21 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let lastTextIndex: number | null = null;
             let lastThinkingIndex: number | null = null;
             let sawThinking = false;
+            // round2-hold: thinking deltas of a bili-owned round, buffered off the
+            // client wire until their signature releases them. Per-parse by design:
+            // a dead attempt's buffer must vanish with it (that is what keeps the
+            // #413 blind re-fetch zero-side-effect), while heldThinkingStarts lives
+            // at factory level so a re-fetched parse can discard the dead attempt's
+            // still-held start. The frames are stored UN-remapped: a held block has
+            // no client index yet (the start frame is what allocates it), so the
+            // index remap happens at flush time.
+            const heldThinkingDeltas = new Map<number, string[]>();
+            // round2-hold: hold ONLY when the upstream is evidenced to sign — a
+            // relay that never signs (GLM/DeepSeek anthropic-compat) has no
+            // signature contract to violate, so holding would just delay its
+            // thinking to a burst at block end for nothing. Self-arms below the
+            // moment this parse sees a signature_delta.
+            let upstreamSignsThinking = opts?.upstreamSignsThinking === true;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
@@ -413,6 +468,11 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     // #4128: an anthropic-wire relay stamps billing_usage on the start frame.
                     const declared = declaredInclusiveFromUsage(u);
                     if (declared !== undefined) roundDeclaredInclusive = declared;
+                    // #4072: the breakdown lives in exactly this frame — capture
+                    // it before neutralizeStartUsage scrubs the usage object from
+                    // the forwarded copy below.
+                    const startCacheCreation = cacheCreationOf(u);
+                    if (startCacheCreation) roundCacheCreation = startCacheCreation;
                     // #1455: suppression keys off ACTUAL forwarding state, not the round
                     // parameter — a re-fetched stream (blind truncation retry) re-parses
                     // at the SAME round, and re-emitting the start frame would hand the
@@ -502,17 +562,42 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             // persists the filtered bytes and re-sends them forever). So the
                             // #1881/#1882 prose filters NEVER touch thinking; cosmetic
                             // tag/marker echoes inside a thinking pane are accepted.
-                            const startBuf = releaseHeldThinking(upstreamIndex);
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            lastThinkingIndex = ci;
-                            if (startBuf) {
-                                yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                            if (round > 1 && upstreamSignsThinking && heldThinkingStarts.has(upstreamIndex)) {
+                                // round2-hold: bili owns round ≥ 2 (its own re-request
+                                // after a proxy tool) — the client CANNOT replay it,
+                                // because round 1 already committed its own bytes to
+                                // the client's stream. On a signing upstream a cut
+                                // that leaves an unsigned thinking block on the wire
+                                // is unrecoverable: #2501 proves the re-fetch cannot
+                                // fix it (next replay 400 "thinking.signature: Field
+                                // required" → the client strips all thinking). So the
+                                // payload is buffered and the block stays invisible
+                                // until `signature_delta`, which releases start +
+                                // payload + signature together (block below). A death
+                                // before that leaves zero client state, and the #413
+                                // blind re-fetch heals the turn by re-running the
+                                // same round. Round 1 keeps its live stream: that
+                                // turn is the client's own and it can replay it.
+                                const held = heldThinkingDeltas.get(upstreamIndex) ?? [];
+                                held.push(eventStr);
+                                heldThinkingDeltas.set(upstreamIndex, held);
+                                // Accounting only — the loop still accumulates the
+                                // text for the re-request rebuild; `withheld` keeps
+                                // it off the wire (core.ts reasoning branch).
+                                yield { kind: "reasoning", delta: delta.thinking, withheld: true } as ParsedStreamEvent;
+                            } else {
+                                const startBuf = releaseHeldThinking(upstreamIndex);
+                                const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                                lastThinkingIndex = ci;
+                                if (startBuf) {
+                                    yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                                }
+                                yield {
+                                    kind: "reasoning",
+                                    delta: delta.thinking,
+                                    raw: remapIndexInEvent(eventStr, ci),
+                                } as ParsedStreamEvent;
                             }
-                            yield {
-                                kind: "reasoning",
-                                delta: delta.thinking,
-                                raw: remapIndexInEvent(eventStr, ci),
-                            } as ParsedStreamEvent;
                         } else if (!heldThinkingStarts.has(upstreamIndex)) {
                             // #2501: empty thinking_delta with the start already on the
                             // wire — inert, forwarded like any unknown round-1 delta.
@@ -528,10 +613,34 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
                         // #2501: a signature is payload-bearing — release the held start
                         // first (Opus 5.5 sends ONLY this between start and stop).
+                        // round2-hold: the signature is what makes the block VALID
+                        // client history, so this is the one moment the buffered
+                        // deltas may be released — start, payload, signature, all in
+                        // this burst. From here this upstream has PROVEN it signs, so
+                        // later blocks of the same response are held too (the loop's
+                        // evidence can only be computed before the parse starts).
+                        upstreamSignsThinking = true;
                         const startBuf = releaseHeldThinking(upstreamIndex);
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         if (startBuf) {
                             yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                        }
+                        const held = heldThinkingDeltas.get(upstreamIndex);
+                        if (held !== undefined) {
+                            heldThinkingDeltas.delete(upstreamIndex);
+                            if (held.length > 0) {
+                                lastThinkingIndex = ci;
+                                // One frame per held event, concatenated and remapped to
+                                // the index the start frame just allocated: the client
+                                // sees the whole payload arrive with its start, inside
+                                // the SAME single block (never one block per delta — the
+                                // #1455/round-2 duplicate-thinking trap).
+                                yield {
+                                    kind: "meta",
+                                    chunk: Buffer.concat(held.map((h) => Buffer.concat([remapIndexInEvent(h, ci), Buffer.from("\n\n", "utf8")]))),
+                                    firstRoundOnly: false,
+                                } as ParsedStreamEvent;
+                            }
                         }
                         yield {
                             kind: "reasoning",
@@ -562,7 +671,23 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // stop may surface: a signature-less thinking block in the client's
                         // history is the exact poison #2501 fixes. Discard silently.
                         // (Map.delete returns a BOOLEAN — true iff an entry was removed.)
-                        if (heldThinkingStarts.delete(upstreamIndex)) continue;
+                        // round2-hold: this is also the discard point for a bili-owned
+                        // round whose block ended WITHOUT a signature — the upstream
+                        // proved it signs (that is why the payload was held), so a
+                        // signature-less block from it is invalid history by
+                        // definition and must never reach the client. The withheld
+                        // text still lives in the loop's accounting, where the
+                        // re-request rebuild drops unsigned reasoning segments for
+                        // signing protocols (core.ts requiresThinkingSignature).
+                        if (heldThinkingStarts.delete(upstreamIndex)) {
+                            if (heldThinkingDeltas.delete(upstreamIndex)) {
+                                // The loop accumulated a reasoning segment for the
+                                // withheld payload; seal it so the NEXT thinking
+                                // block cannot inherit it.
+                                yield { kind: "reasoning", delta: "", blockEnd: true, withheld: true } as ParsedStreamEvent;
+                            }
+                            continue;
+                        }
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
                         // #1960: a redacted block has no captured reasoning — replay its
@@ -613,6 +738,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         roundInput = input;
                         roundCached = cached;
                         if (creation !== undefined) roundCreation = creation;
+                        const completeCacheCreation = cacheCreationOf(u);
+                        if (completeCacheCreation) roundCacheCreation = completeCacheCreation;
                     } else {
                         // Incomplete usage object: the input context is FIXED within
                         // a turn, so message_start is authoritative for input/cache
@@ -625,6 +752,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         if (input !== undefined && input > 0) roundInput = input;
                         if (cached !== undefined && cached > 0) roundCached = cached;
                         if (creation !== undefined && creation > 0) roundCreation = creation;
+                        const incompleteCacheCreation = cacheCreationOf(u);
+                        if (incompleteCacheCreation && cacheCreationMeaningful(incompleteCacheCreation)) {
+                            roundCacheCreation = incompleteCacheCreation;
+                        }
                     }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
@@ -638,6 +769,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
+                            cacheCreation: roundCacheCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -662,6 +794,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             cachedTokens: roundCached,
                             creationTokens: roundCreation,
                             declaredInclusive: roundDeclaredInclusive,
+                            cacheCreation: roundCacheCreation,
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
@@ -699,13 +832,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {
-            const stopReason = opts?.finishReason ?? "end_turn";
             return buildTerminal(
-                stopReason,
+                anthropicStopReason(opts?.finishReason),
                 opts?.usage?.outputTokens ?? 0,
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,
                 opts?.usage?.creationTokens,
+                opts?.usage?.cacheCreation,
                 opts?.terminalExtra,
             );
         },

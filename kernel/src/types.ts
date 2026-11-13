@@ -40,6 +40,18 @@ export interface CoreMessage {
    *  to the counter path for the loser. Not serialized into wire payloads —
    *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
   ledgerSeq?: number;
+  /** #4313: immutable local wall-clock timestamp (epoch ms) of WHEN this
+   *  message happened, stamped ONCE at first sight and never changed again.
+   *  Rendered into the <acp> tag as time="yyyy-mm-dd hh:mm:ss"; absent =
+   *  pre-feature message, rendered without the attribute (legacy bytes stay
+   *  byte-identical). Set by store-served views from the unified messages
+   *  table's ts column (fork inheritance is a plain row clone); for
+   *  memory-only lanes the stamp-timestamps pipeline node mints it via
+   *  Date.now() at intake and persists it through
+   *  {@link CompressionState.tsStamps} so restarts replay the same value.
+   *  The render path only ever READS this stored value — it never calls
+   *  Date.now() itself (prefix-cache invariant). */
+  ts?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -81,10 +93,35 @@ export interface CompressionBlock {
    *  is likewise restored — instead of rejecting it as "already compressed".
    *  Optional: old persisted states lack the field, which reads as false. */
   restoredInline?: boolean;
+  /** #5765 retire: the user marked this block retired — its summary is no
+   *  longer injected into the resident view (prune skips its anchor) while its
+   *  folded messages stay covered and decompress/search keep working. The
+   *  block remains `active` (its absence from the view is intentional, so
+   *  syncBlocks must not deactivate it and orphan GC must not reap it).
+   *  acp_restore clears the flag. Optional: old persisted states lack the
+   *  field, which reads as false (never retired). */
+  retired?: boolean;
+  /** #5765 rewrite: the summary text immediately before the last acp_rewrite,
+   *  kept one step deep so a rewrite is roll-backable without re-compressing.
+   *  A further rewrite overwrites this slot (only the immediate predecessor
+   *  is retained by design). */
+  previousSummary?: string;
+  /** #5765 rewrite: Date.now() of the last acp_rewrite on this block. */
+  rewrittenAt?: number;
   durationMs?: number;
   compressCallId?: string;
   startRef?: string;
   endRef?: string;
+  /** #4316 layer 3: the block's coverage as a unified-ledger seq interval
+   *  [startSeq, endSeq] (inclusive, 1-based display space — same space as
+   *  CoreMessage.ledgerSeq). Recorded ONLY when the fold can prove the claim
+   *  exact: every direct folded message carried a ledgerSeq stamp, every
+   *  consumed block carried its own bounds, and the union of those segments
+   *  is one contiguous span (a hole means min/max would swallow uncovered
+   *  messages, so no bounds are recorded — the id path stays authoritative).
+   *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
+  startSeq?: number;
+  endSeq?: number;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */
@@ -111,6 +148,39 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
+  /** #5415: growth debt + absorb count booked by the host's #5293
+   *  abort-absorb. absorbAbortedTurnGrowth() re-anchors the reference to
+   *  the current meter, which skips not just the aborted turn's unreported
+   *  partial (intended, #5293) but also the MEASURED growth from the old
+   *  reference up to the pre-abort anchor. That skipped-but-real growth is
+   *  banked here; absorbCount tracks how many absorbs happened. Debt pays
+   *  into the growth floor (and unlocks the backlog-drain guard) only once
+   *  absorbCount >= 2 — a SINGLE abort stays exactly as quiet as #5293
+   *  pinned (no nudge on the user's redirect), while abort-heavy clients
+   *  (85 absorbs in one reported 4.5h log) recover the 209-era cadence
+   *  instead of starving with a huge ready mass idle for hours. Both reset
+   *  by applyCompression alongside the other baselines. */
+  absorbedDebt?: number;
+  absorbCount?: number;
+  /** #5698: pendingT1 (effective) recorded at the last tier-1 nudge fire —
+   *  the denominator for T1 harvest-stall detection. Consumed by the first
+   *  applyCompression after the fire; re-recorded at every tier-1 fire. */
+  lastT1FirePending?: number;
+  /** #5698: the last tier-1 fire was answered by a fold harvesting <
+   *  STALL_HARVEST_RATIO of the offered pending — the T1 channel is not
+   *  draining (partial model compliance). While set, tier arbitration lets
+   *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
+   *  Cleared by a compliant harvest or any distillation. */
+  t1HarvestStall?: boolean;
+  /** #5865 estimate-hold backstop: count of CONSECUTIVE processTurn events
+   *  whose meter reading was estimate-grade. Reset to 0 by any usage-grade
+   *  reading. Only consulted while nudge.requireUsageSampleForPressure is on:
+   *  the pressure band defers while this count <=
+   *  nudge.maxEstimateHoldRounds and falls back to estimate-driven injection once it exceeds the bound, so a
+   *  backend that never reports usage cannot starve its pressure nudges
+   *  forever. Persisted so the streak survives restarts like the rest of
+   *  NudgeState. */
+  estimateHoldStreak?: number;
 }
 
 export interface CompressionStats {
@@ -155,6 +225,14 @@ export interface AbsorbConfig {
   excludeTools: string[];
   /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
   mediaOnly?: boolean;
+}
+
+/** #5765: opt-in switch for the block-lifecycle tools (acp_retire /
+ *  acp_restore / acp_rewrite). Absent/disabled = off: the tools are not
+ *  advertised, not injected, not in the prompt, and a stray call gets a
+ *  "not enabled" receipt (host-side). */
+export interface BlockOpsConfig {
+  enabled: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -295,7 +373,32 @@ export interface CompressionState {
    *  the next successful fold (applyCompression) — after a fold the watermark
    *  re-evaluates from scratch. Optional: pre-feature states have none (the
    *  pre-latch node clipped from scratch each turn). */
+  /** #3939 ③: emergency truncation latch entries (see above). Optional:
+     pre-existing persisted states lack it. */
   emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** #4316 layer 3 PR3/3: refs have been aligned onto the unified ledger
+     (ref = store row seq + 1) exactly once. Set by restampRefsToLedger;
+     assignRefs' stamp path keeps new arrivals aligned from then on. */
+  refLedgerAligned?: boolean;
+  /** #5608-C: high-water mark of ref index for time-attribute visibility.
+     Written exactly once by the first enabled stamp pass (= its PRE-PASS
+     highest ref index). A stored timestamp renders into a tag only when the
+     message's CURRENT ref index exceeds it — i.e. its ref was minted after
+     this session first ran with #4313 on; older refs keep their attribute-free
+     bytes until an edit/fold re-mints them (the number change already broke
+     those bytes, so the attribute costs zero extra). Restamp/ledger alignment
+     raises it as well (#5608-C), so alignment never re-grants attributes to
+     old refs mid-prefix. Optional: absent until the feature first runs. */
+  timestampsHighWaterRefSeq?: number;
+  /** #5608-B: one-shot honest-NULL arm for the stamp node. Set by the host
+     right before a FRESH-state child's first turn when that child inherited a
+     parent's history (resume adoption / fork clone): the stamp node must not
+     mint Date.now() for ids it did not actually watch arrive — unknown times
+     stay NULL instead of being fabricated as "today" (#5608-A display tier).
+     Consumed by the first enabled stamp pass whether or not anything was
+     stamped. Process-lifetime only — hydration never carries it across a
+     restart (dropping it is the safe default). */
+  suppressMintingOnce?: boolean;
   /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
    *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
    *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps
@@ -339,6 +442,15 @@ export interface CompressionState {
    *  NEVER removed from messageRefs (Kernel Contract: ids are never re-issued).
    *  Optional: pre-feature persisted states lack it. */
   deadRefs?: string[];
+  /** #4313: first-sight wall-clock stamps per RAW message id (epoch ms).
+   *  Written by the stamp-timestamps pipeline node on the turn each id is
+   *  first seen (Date.now() once per id; hydrated/carrying ids record their
+   *  stored value instead). Persists with kstate so a restart re-renders
+   *  every tagged message byte-identically — same tokenSnapshot discipline.
+   *  Never pruned: raw ids are never re-issued (Kernel Contract), so the map
+   *  can only grow like messageRefs.byRaw does. Optional: pre-feature states
+   *  lack it (their messages keep rendering without the time attribute). */
+  tsStamps?: Record<string, number>;
   /** Exact inbound ids of the PREVIOUS processTurn pass (pre-pipeline,
    * converter-derived). Continuity signal for reconcile-live-ids (#462): an
    * id that is covered by a fold but was present in the prior pass is the
@@ -400,6 +512,33 @@ export interface NudgeConfig {
    *  (zero-yield loop, #198). Default: max(5000, round(modelContextLimit ×
    *  0.01)). Set 0 to restore the legacy any-pending behavior. */
   minPressureBenefitTokens?: number;
+  /** Phantom-pressure guard: require the meter reading behind the pressure
+   *  band (usage >= maxContextLimitPct / emergencyThresholdPct) to be
+   *  usage-grade (a billing-sample-backed token count, i.e. the host passed
+   *  processTurn({ tokenCountSource: "usage" })) before injecting an
+   *  EMERGENCY/OVER-LIMIT nudge. Estimate-grade readings (char-bound local
+   *  fallback — e.g. right after an aborted turn or a cache-TTL expiry that
+   *  left no usage report) structurally run high, and acting on them
+   *  rewrites content off a bad meter; deferring costs at most one round
+   *  because the very next request carries a fresh billing report.
+   *  Default true; set false to restore estimate-driven pressure injection.
+   *  Non-pressure tiers (growth/cadence arms) are unaffected either way. */
+  requireUsageSampleForPressure?: boolean;
+  /** #5865 ruling (estimate-hold backstop): while that guard is on, a run of
+   *  consecutive ESTIMATE-grade readings is only held for at most
+   *  `maxEstimateHoldRounds` rounds; from the following round onward the
+   *  pressure band acts on the estimate again (legacy behavior). Without the
+   *  bound, an upstream that NEVER reports usage (anonymous zero-baseline /
+   *  silent-backend sessions — see #728/#553, where the local estimate is
+   *  the only pressure signal) would be deferred forever: every round is
+   *  estimate-grade and the "next request carries a fresh billing report"
+   *  premise never materializes. Default 2: covers the observed double-ghost
+   *  windows (aborted turn + its follow-up before the aborted cycle's report
+   *  can land) while capping worst-case starvation at two missed
+   *  opportunities. 0 disables the hold entirely (the pressure band fires on
+   *  the very first estimate round — same practical effect as
+   *  requireUsageSampleForPressure=false for the pressure band). */
+  maxEstimateHoldRounds?: number;
 }
 
 export interface TruncateConfig {
@@ -419,7 +558,11 @@ export interface CompressValidationConfig {
   minCompressRange: number;
   /** Maximum summary length (chars). Summary exceeding this is rejected unless summaryMaxChars override is used. 0 = disabled. Default 20000. */
   maxSummaryLength: number;
-  /** Minimum summary length (chars). Summary shorter than this is rejected. 0 = disabled. Default 50. */
+  /** Minimum summary length (chars). A single folding range with a shorter
+   *  summary is rejected; a multi-range batch is judged on the COMBINED total
+   *  of its fold candidates' summaries (#5894) — one trivial span may earn a
+   *  short summary without killing the batch. Empty summaries are always
+   *  rejected per range. 0 = disabled. Default 50. */
   minSummaryLength: number;
 }
 
@@ -500,6 +643,9 @@ export interface Config {
   modelContextLimit: number;
   /** Instant tool-result absorption (see absorb.ts). Absent/disabled = feature off. */
   absorb?: AbsorbConfig;
+  /** #5765: block-lifecycle tools (acp_retire/acp_restore/acp_rewrite).
+   *  Absent/disabled = feature off (default). */
+  blockOps?: BlockOpsConfig;
   /** Persistent acp_rule reminders (see rules.ts). Absent/disabled = feature off. */
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
@@ -641,6 +787,13 @@ export interface NudgeBreakdown {
   /** Max pending across all tiers — compared against minPressureBenefit by the
    *  emergency-truncate node to detect a terminal floor (#300). */
   maxPending: number;
+  /** Open numeric ledger for debug/reason fields. Documented special keys:
+   *   - pressureDeferredNoSample (1/0): the pressure-band injection was
+   *     deferred for lack of a usage-grade sample
+   *     (NudgeConfig.requireUsageSampleForPressure); the host early-
+   *     advertising arm (emergencyNudge) must mirror this bit. Absent on
+   *     hand-built decisions — pre-fix semantics apply there.
+   */
   [key: string]: number;
 }
 
@@ -665,6 +818,15 @@ export interface ApplyCompressionResult {
      *  result so the model knows its input was changed (#310). Omitted when
      *  empty. */
     notes?: string[];
+    /** True when every requested range resolved legally but NOTHING needed
+     *  folding — all content already covered by active blocks or inside the
+     *  protected zone (#4521 no-op class). Not an error: the model
+     *  re-submitting an already-folded bill of work gets an idempotent
+     *  success-shaped receipt instead of a refusal, so the retry ladder that
+     *  used to spin on "Batch rejected before folding any range" dies at the
+     *  source. Hosts render it with the "[Compression no-op:" prefix and fold
+     *  the exchange away like other zero-applied compress results (#4289). */
+    noop?: true;
   };
 }
 
@@ -672,6 +834,14 @@ export interface ProcessTurnResult {
   messages: CoreMessage[];
   state: CompressionState;
   nudge?: NudgeDecision;
+  /** Compact always-current boundary line, present only on turns where a
+   *  compression round is live (nudge plan with offered ranges) but the
+   *  advisory banner itself is NOT being delivered this request. Carries the
+   *  session's highest allocated ref and the currently offered ranges so the
+   *  model never has to guess refs between banner deliveries (#4521). Hosts
+   *  append it as an ephemeral trailing user message, same carrier as a
+   *  nudge. */
+  statusLine?: string;
   /** Terminal floor detected (#300): compression and truncation are both
    *  exhausted while usage stays at/above truncate.threshold. Emitted every
    *  event while the condition holds; hosts surface it once. */

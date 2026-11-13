@@ -1,44 +1,53 @@
+import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
+import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, buildBlockOpsSystemPrompt, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleOverflowCalibration, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
+import { rewrapCommandcodeBody } from "../commandcode-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
+import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
+import { compressLoopAnthropicJson } from "../compress-loop-anthropic.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
+import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
-import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, type ShedStats } from "../egress-shed.js";
-import { conversationPromptSections, externalSummaryEnabled } from "../external-summary-surface.js";
+import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats, type ShedWireImagesResult } from "../egress-shed.js";
+import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
+import { applyEgressTransforms, type EgressTransformBase } from "../egress-transforms.js";
 import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
-import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
+import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
-import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
+import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
+import { createCommandcodeAdapter } from "../loop/adapter-commandcode.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
-import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
+import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -51,18 +60,22 @@ import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
-import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
-import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
+import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { billOutputUsage } from "../billing.js";
+import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
+import { detectThinkingSignatureRejection, rememberStrictThinkingPosture, stripUnsignedThinkingFromWire, thinkingPostureIsStrict } from "./thinking-posture.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -178,11 +191,14 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
 /** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
  *  exact bytes, why shedding could not fit, and the current budget for context.
  *  Deliberately does NOT suggest raising the budget: the gateway just proved it
- *  rejects this size, so a bigger budget would only send the fat frame again. */
-function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
-    const why = !stats || (!stats.archived && !stats.downscaled)
+ *  rejects this size, so a bigger budget would only send the fat frame again.
+ *  #4601: `why` overrides the derived reason when shedding was never ATTEMPTED
+ *  (e.g. a verbatim-passthrough body that shedWireImages cannot parse) — claiming
+ *  "no sheddable images" there was a lie about work that was not done. */
+function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number, why?: string): string {
+    const realWhy = why ?? (!stats || (!stats.archived && !stats.downscaled)
         ? "no sheddable images outside the protected recent messages"
-        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
+        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`);
     return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
@@ -243,7 +259,78 @@ export function armFirstByteWatchdog(o: {
     return timer;
 }
 
-export async function forward(
+// #5795: single source of truth for the local 429/424 hold response — shared by
+// the post-ingest gate below and the pre-ingest fast path in handle.ts so the
+// two sites cannot drift on status/headers/body shape.
+function answerLocalThrottleReject(
+    res: http.ServerResponse,
+    reject: ThrottleLocalReject,
+    protocol: WireProtocol | null | undefined,
+    streamErrorShape: "protocol" | "completion" | undefined,
+    log: (level: string, msg: string) => void,
+    label?: string,
+): void {
+    log(reject.status === 424 ? "warn" : "debug", `[${label ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${reject.status} without egress (#4204)`);
+    if (res.headersSent) {
+        emitStreamError(res, protocol ?? "openai", reject.message, undefined, streamErrorShape);
+        return;
+    }
+    res.writeHead(reject.status, reject.retryAfterSec !== null
+        ? { "content-type": "application/json", "retry-after": String(reject.retryAfterSec) }
+        : { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "rate_limit_error", code: reject.code, stage: "forward", message: reject.message, retryable: reject.status === 429, ...(reject.model === undefined ? {} : { scope: "model", model: reject.model }) } }));
+}
+
+// #5795: pre-ingest 429-hold fast path. While a hold is active for this
+// origin+credential the send will be answered locally anyway — answering
+// BEFORE prepare skips the O(history) parse/convert/pin cost of a request that
+// will not egress regardless (the held retry storms in the field report cost
+// ~6s of ingest per refused turn on multi-MiB histories). Completes #4204's
+// contract: zero egress while held → also zero ingest while held.
+// Read-only peek: never mints probe tokens or mutates governor state, so the
+// real gate in forwardCaptured keeps owning admission/probe accounting. The
+// conservative edges are deliberate: sub-threshold bodies keep their exact
+// pre-#5795 path (forge/classifier/compact-trigger shapes intercept locally
+// during prepare and must not be pre-empted), and lanes whose credential bili
+// itself overrides (#2336) key holds under the overridden fingerprint which
+// this raw-header peek cannot see — those fall through to the post-ingest gate
+// and are refused there exactly as before.
+export const EARLY_HOLD_GATE_MIN_BYTES = 1024 * 1024;
+
+export function tryAnswerEarlyHold(o: {
+    method?: string;
+    upstreamUrl: string;
+    credHeaders: Record<string, string>;
+    protocol: WireProtocol | null;
+    bodyBytes: number;
+    /** The request model — or a lazy supplier for it. The supplier form exists
+     *  because the only model source that is not a header read is a full-document
+     *  body scan: callers that pass a supplier pay that O(body) walk ONLY when
+     *  this function actually consults the model (i.e. the body cleared the
+     *  threshold and the wire is known). A sub-threshold or unknown-wire request
+     *  bails out above and never touches the payload (#5898 review: the eager
+     *  scan taxed every proxied POST with a result it could not use). */
+    requestModel?: string | (() => string | undefined);
+    res: http.ServerResponse;
+    streamErrorShape?: "protocol" | "completion";
+    log: (level: string, msg: string) => void;
+    /** Test seam: mirrors the governor's own explicit-now convention. */
+    now?: number;
+}): boolean {
+    if (o.method === "GET" || o.method === "HEAD") return false;
+    if (o.protocol === null || o.bodyBytes < EARLY_HOLD_GATE_MIN_BYTES) return false;
+    const requestModel = typeof o.requestModel === "function" ? o.requestModel() : o.requestModel;
+    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), requestModel);
+    if (reject === undefined) return false;
+    answerLocalThrottleReject(o.res, reject, o.protocol, o.streamErrorShape, o.log, "pre-ingest");
+    return true;
+}
+
+export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
+    return withCacheCapture(args[4]?.session, () => forwardCaptured(...args));
+}
+
+async function forwardCaptured(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     opts: ProxyOptions,
@@ -257,11 +344,15 @@ export async function forward(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
+    throttleModelHint?: string,
+    onWireBody?: (body?: Buffer | string) => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
+    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
+        onWireBody?.();
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
@@ -293,6 +384,9 @@ export async function forward(
     // forward, or a developer-role 400 would hit mid-stream on retry).
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
+    // Kiro: [input index, original role] for items re-voiced by the built-in map
+    // (judge-only; the wire keeps the rewritten roles).
+    let judgeRoleRestore: Array<[number, string]> = [];
     // #1757 resolved drop list, shared with wireTransform below (re-sent
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
@@ -348,6 +442,46 @@ export async function forward(
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
         }
     };
+    // #6003 phase 2: user-registerable egress body-rewrite pipeline. Runs AFTER
+    // session processing (shed above) and BEFORE the re-sign, so the signature
+    // always covers the final shipped bytes (the #1884 invariant). Unconfigured
+    // (absent/empty) → runEgress returns its input untouched (zero regression),
+    // so every call site below is a no-op unless a plugin is registered.
+    const egressEntries = opts.egressTransforms;
+    // Invariant context fields for the user egress-transform pipeline (#6003
+    // phase 2). `headers` is passed per call site rather than captured here
+    // because the compress-loop lane re-signs against its OWN header copy
+    // (reqHeaders / buildForwardHeaders), not the base forward-target headers —
+    // a plugin-set header must land on the exact object the signature will
+    // cover, or the shipped bytes and the signed bytes diverge.
+    const egressBaseFields =
+        egressEntries && egressEntries.length > 0
+            ? {
+                sessionId: prepared?.session.id,
+                upstreamUrl,
+                method: req.method ?? "GET",
+                url: upstreamUrl,
+                protocol: prepared?.protocol ?? "",
+                model: prepared?.model,
+            }
+            : undefined;
+    const runEgress = async (
+        body: string | Buffer,
+        stage: EgressTransformBase["stage"],
+        headers: Record<string, string>,
+    ): Promise<string | Buffer> => {
+        if (!egressBaseFields || !egressEntries || egressEntries.length === 0) return body;
+        return await applyEgressTransforms(body, { ...egressBaseFields, headers, stage }, egressEntries, log);
+    };
+    // Single egress chokepoint for every recovery re-send (#6003 groundwork): the
+    // re-sign (#1884) then v1internal re-wrap (#3129) each retry rung used to
+    // re-inline now lives here once. The egress pipeline (runEgress above) hooks in
+    // before the re-sign so the signature always covers the shipped bytes.
+    const finalizeEgress = async (variant: string | Buffer): Promise<string | Buffer> => {
+        const transformed = await runEgress(variant, "retry", headers);
+        applyResign(headers, transformed);
+        return v1Wrap(transformed);
+    };
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
     // The kernel decides (turn kind / verbosity / lower-effort); bili only lands it.
@@ -358,6 +492,87 @@ export async function forward(
     const steerCfg = steerResolved?.config ?? null;
     for (const w of steerResolved?.warnings ?? []) log("warn", `[${prepared?.session.id ?? "passthrough"}] [output-steering] ${w}`);
     let steerProtocol: WireProtocol | null = null;
+    // #564/#2627 final-wire provenance: the transformed object graph the bytes
+    // are (re)serialized from, and this turn's manifest re-anchored onto it.
+    // Everything below mutates ONE graph in place, so a marker carrier keeps its
+    // object identity across compat roles / steering / drops / the checkpoint —
+    // that identity is the only thing the manifest may re-index by.
+    let wireObj: Record<string, unknown> | null = null;
+    let separatorManifest = prepared?.separatorManifest;
+    // #564/#2627: IMPORTANT distinction. `separatorManifest === undefined` means
+    // "no producer claims were ever minted" (or they were proven dead) — the judge
+    // must still judge separators normally. This flag records a DIFFERENT state:
+    // a producer DID mint claims, then an opaque host rewrite invalidated the
+    // proof, so ownership of this send's separators is UNKNOWN. The judge then
+    // skips only its separator-ownership checks (I1/I2 for separators) for this
+    // send — it grants no exemption and every other integrity check still runs.
+    let separatorOwnershipUnknown = false;
+    // Opaque host rewrite: the producer DID mint claims, their proof is gone, and
+    // the bytes still contain separators we can no longer attribute. Dropping the
+    // manifest alone would tell the judge "no producer claims exist" and it would
+    // then report a genuine host separator as a client insertion; the flag keeps
+    // the distinction alive through to the judge.
+    const invalidateSeparatorOwnership = (): void => {
+        if (separatorManifest !== undefined) {
+            separatorOwnershipUnknown = true;
+            separatorManifest = undefined;
+        }
+    };
+    // The graph is parsed lazily, only when a step needs object access, and it is
+    // serialized lazily too: an unchanged fast path keeps the original string.
+    const wireGraph = (): Record<string, unknown> | null => {
+        if (wireObj !== null) return wireObj;
+        // Seed from prepare's own parsed graph whenever the bytes still match what
+        // it serialized: that object IS the graph the manifest's carriers live in
+        // (collectSeparatorManifest walked it), so identity survives. A fresh
+        // JSON.parse would mint new objects and no claim could ever re-anchor.
+        let parsed: unknown = null;
+        // Seed from prepare's OWN parsed graph only when the bytes are the ones it
+        // serialized AND the manifest still proves each carrier sits at its claimed
+        // index — identity without that proof would re-anchor a claim the producer
+        // never actually made.
+        const seedable = separatorManifest !== undefined
+            && typeof wireBody === "string"
+            && wireBody === prepared?.body
+            && separatorManifestAnchored(
+                separatorManifest,
+                (prepared?.parsedBody as { input?: unknown } | undefined)?.input as readonly unknown[] | undefined,
+                wireBody,
+            );
+        if (typeof wireBody === "string") {
+            if (seedable) {
+                parsed = prepared?.parsedBody;
+            } else {
+                try { parsed = JSON.parse(wireBody); } catch { parsed = null; }
+            }
+        }
+        wireObj = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+        // A body that no longer matches the prepared bytes (or an unparseable one,
+        // or a manifest whose anchor proof failed) cannot carry proven lineage
+        // forward — ownership becomes UNKNOWN, not "nobody owns this", so the judge
+        // stops asserting separator findings.
+        if (!seedable) invalidateSeparatorOwnership();
+        return wireObj;
+    };
+    // Publish an in-place mutation of `wireGraph()` as the new body: exactly one
+    // serialization per rewrite, and the manifest is re-anchored against THAT
+    // string so the judge's byte-equality binding stays honest.
+    const commitGraph = (): void => {
+        if (wireObj === null) return;
+        const serialized = JSON.stringify(wireObj);
+        wireBody = serialized;
+        if (separatorManifest !== undefined) {
+            const input = wireObj.input;
+            if (!Array.isArray(input)) {
+                // The container the carriers lived in is gone entirely — we cannot
+                // say whether they were deleted deliberately or the graph was
+                // replaced under us, so ownership is UNKNOWN.
+                invalidateSeparatorOwnership();
+                return;
+            }
+            separatorManifest = reanchorSeparatorManifest(separatorManifest, input, serialized);
+        }
+    };
     if (typeof body === "string") {
         // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
         // is undefined for zero-config requests and would skip provider compat.
@@ -367,7 +582,11 @@ export async function forward(
         // so later requests skip the 400 round-trip. Session-scoped only —
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
-        const roles = { ...configured, ...learned };
+        // Kiro CLI: its gateway takes only user/assistant items, so bili's
+        // injected developer prompt would 400 at input[0]. Built-in, lowest
+        // precedence — configured and learned roles still win per key.
+        const builtin = builtinCompatRoles(req.headers, upstreamUrl);
+        const roles = { ...builtin, ...configured, ...learned };
         const protocol = prepared?.protocol ?? route?.explicitProtocol ?? resolveDeclaredProtocol(opts.routes, upstreamUrl) ?? inferWireProtocol(req.url ?? "");
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
@@ -375,10 +594,36 @@ export async function forward(
             compatProtocol = protocol;
             if (Object.keys(roles).length > 0) {
                 compatRoles = roles;
-                const applied = applyCompatRoles(body, protocol, roles);
-                if (applied.rewritten > 0) {
-                    wireBody = applied.body;
-                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                // #564/#2627: when a separator manifest rides this turn, the role
+                // rewrite MUST land on the carriers' own object graph — the string
+                // wrapper re-serializes from an independent parse, which invalidates
+                // the claim binding with no way to re-prove it. Rewrite in place
+                // (identity-preserving) and re-anchor; anything opaque fails closed.
+                const graph = separatorManifest !== undefined && protocol === "responses" ? wireGraph() : null;
+                if (graph !== null) {
+                    const rewritten = applyCompatRolesJson(graph, protocol, roles);
+                    if (rewritten > 0) {
+                        commitGraph();
+                        log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
+                    }
+                } else {
+                    const applied = applyCompatRoles(body, protocol, roles);
+                    if (applied.rewritten > 0) {
+                        wireBody = applied.body;
+                        log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
+                    }
+                    // Unchanged bytes keep the prepare-time binding honest; a rewrite
+                    // here came from an independent parse, so no carrier lineage can
+                    // be proven against it — ownership is UNKNOWN from here on.
+                    if (applied.rewritten > 0) invalidateSeparatorOwnership();
                 }
             }
         }
@@ -387,10 +632,23 @@ export async function forward(
         // just the compat pair; idempotent, byte-identical when nothing changes.
         steerProtocol = protocol;
         if (steerCfg && steerCfg.enabled && typeof wireBody === "string") {
-            const applied = applyOutputSteering(wireBody, protocol, steerCfg);
-            if (applied.changed) {
-                wireBody = applied.body;
-                log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
+            // #564/#2627: same object-graph rule as the role rewrite above — when a
+            // manifest rides this turn, the steering must land on the carriers' own
+            // graph so the claims can be re-anchored instead of dropped.
+            const graph = separatorManifest !== undefined ? wireGraph() : null;
+            if (graph !== null) {
+                const labels = applyOutputSteeringJson(graph, protocol, steerCfg);
+                if (labels.length > 0) {
+                    commitGraph();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${labels.join(", ")})`);
+                }
+            } else {
+                const applied = applyOutputSteering(wireBody, protocol, steerCfg);
+                if (applied.changed) {
+                    wireBody = applied.body;
+                    invalidateSeparatorOwnership();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
+                }
             }
         }
         // #1757: compat.dropFields — AFTER every other body mutation (roles,
@@ -400,12 +658,35 @@ export async function forward(
         // rewrite above which is openai/responses-only.
         compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat?.dropFields);
         if (compatDropPaths.length > 0 && typeof wireBody === "string") {
-            const applied = applyCompatDropFields(wireBody, compatDropPaths);
-            if (applied.dropped > 0) {
-                wireBody = applied.body;
-                log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+            // #564/#2627: drops run on the SAME graph as every other transform, so
+            // identity decides — not the drop path's shape. A drop that deletes or
+            // rewrites a carrier simply removes it from the identity Map (or fails
+            // isSeparatorCarrier), while carriers it never touches keep their object
+            // identity and re-anchor. No path pattern is pre-judged.
+            const graph = separatorManifest !== undefined ? wireGraph() : null;
+            if (graph !== null) {
+                const dropped = dropCompatFieldsJson(graph, compatDropPaths);
+                if (dropped > 0) {
+                    commitGraph();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                }
+            } else {
+                const applied = applyCompatDropFields(wireBody, compatDropPaths);
+                if (applied.dropped > 0) {
+                    wireBody = applied.body;
+                    invalidateSeparatorOwnership();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                }
             }
         }
+    }
+    // #1295: restore the CLI envelope at the final forward boundary — AFTER
+    // every flat-body mutation above (compat roles, output steering) so the
+    // client's provider plugin receives its exact native shape.
+    if (prepared?.commandcode && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
+        } catch { /* malformed flat body — pass through unchanged */ }
     }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
@@ -421,13 +702,40 @@ export async function forward(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
+            // #564/#2627: stamp the SAME graph the manifest's carriers live in when
+            // one is riding this turn — `insertCheckpointCarrier` allocates a new
+            // input array but copies every other item by reference, so the carriers
+            // survive and are re-indexed at their shifted positions. The digest is
+            // computed over the graph, whose only difference from the parse is the
+            // dropped `undefined`-valued keys a raw parse would render back as null.
+            // When a manifest is riding this turn but the trusted graph is gone,
+            // the carriers' lineage is unprovable: stamp the plain parse for the
+            // upstream's sake, but record ownership as UNKNOWN rather than
+            // republishing bytes whose separator claims silently vanished.
+            const graphSeed = separatorManifest !== undefined ? wireGraph() : undefined;
+            const target: unknown = separatorManifest !== undefined
+                ? (graphSeed ?? JSON.parse(wireBody))
+                : (wireObj ?? JSON.parse(wireBody));
+            const stamped = stampOutbound(target, prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
-                wireBody = JSON.stringify(stamped);
+                // Whatever graph `target` was, the stamp's result replaces it: keep
+                // the identity (and re-anchor) only when `target` IS the graph this
+                // turn's carriers live in, otherwise publish plain bytes.
+                const targetWasGraph = target === wireObj && wireObj !== null;
+                const nextObj = stamped && typeof stamped === "object" && !Array.isArray(stamped) ? (stamped as Record<string, unknown>) : null;
+                if (targetWasGraph && nextObj !== null) {
+                    wireObj = nextObj;
+                    commitGraph();
+                } else {
+                    wireBody = JSON.stringify(stamped);
+                    wireObj = null;
+                    invalidateSeparatorOwnership();
+                }
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
             }
         } catch (err) {
             log("debug", `[${prepared.session.id}] [chain] outbound stamping failed (${String(err)}); forwarding unstamped`);
+            invalidateSeparatorOwnership();
         }
     }
     if (res.destroyed || res.writableEnded) return;
@@ -436,13 +744,20 @@ export async function forward(
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active
+    // #1295: commandcode re-sends must carry the envelope too — a compress-loop
+    // retry that dropped it would present flat OpenAI where the client's wire
+    // expects the CLI envelope.
+    const ccMetaForResend = prepared?.commandcode?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
-            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
-            if (compatDropPaths.length > 0) dropCompatFieldsJson(b, compatDropPaths);
+            let out = b;
+            if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
+            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(out, steerProtocol, steerCfg);
+            if (compatDropPaths.length > 0) dropCompatFieldsJson(out, compatDropPaths);
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
-            return v1Active ? wrapV1Internal(b, v1Meta) : b;
+            out = v1Active ? wrapV1Internal(out, v1Meta) : out;
+            if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            return out;
         }
         : undefined;
     // Show the final proxied URL (where the request actually lands) as the
@@ -490,9 +805,9 @@ export async function forward(
                 const out = path.join(dumpDir, `req-${Date.now()}-${safeSessionId(sid)}.json`);
                 try {
                     const pretty = JSON.stringify(JSON.parse(wireText), null, 2);
-                    fs.writeFileSync(out, pretty);
+                    fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${pretty}`);
                 } catch {
-                    fs.writeFileSync(out, wireText);
+                    fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${wireText}`);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
                 gcDumpDirIfConfigured(dumpDir);
@@ -513,7 +828,8 @@ export async function forward(
     // headers/exact body bytes; response status+headers) so two consecutive
     // requests can be byte-diffed to locate a cache-breaker that the JSON body
     // dump (which re-formats and omits headers) may hide. Enabled with
-    // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked).
+    // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked;
+    // #4482: body is plaintext by design — the leading banner warns).
     const rawBase =
         bodyDumpEnabled()
             ? (() => {
@@ -538,20 +854,52 @@ export async function forward(
                       ? wireBody
                       : Buffer.from(wireBody).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
-            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
+            fs.writeFileSync(reqPath, `${DUMP_PLAINTEXT_BANNER}\n${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
             gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
-    // #3701: WS-lane soft byte budget — shed older images from the OUTBOUND COPY before
-    // signing, so an oversized frame never reaches the gateway (it answers close 1009 with
-    // zero events, and no retry can fix a size rejection without a smaller payload). Runs
-    // only when this request actually rides the WebSocket transport and only above
-    // network.wsOutboundBytes; HTTP lanes are untouched.
+    // #3701/#3909: lane-keyed soft byte budget — shed older images from the OUTBOUND COPY
+    // before signing, so an oversized body never reaches the upstream (the WS gateway
+    // answers close 1009 with zero events, edge runtimes 503 on raw-byte limits, and no
+    // retry can fix a size rejection without a smaller payload). Runs only above the
+    // budget of the lane actually riding the request: network.wsOutboundBytes for a
+    // WS-tagged transport, network.httpOutboundBytes for the plain/proxy/pi-native relay
+    // (no transport installed); managed non-WS transports pass through untouched
+    // (#3701 Finding 1).
+    let outboundCopyRewritten = false;
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        if (shed.body !== wireBody) {
+            outboundCopyRewritten = true;
+            // #564/#2627: an opaque egress shed can delete or synthesize items —
+            // provenance cannot survive rewritten bytes it did not observe.
+            invalidateSeparatorOwnership();
+        }
         wireBody = shed.body;
+        // #4124: proactive per-prompt image-count cap — once this route PROVED a
+        // count wall via an upstream rejection (learned into stats.imageCountCaps),
+        // converge the outbound copy under it BEFORE send so the request never 400s
+        // on count again. Only acts when the count is over; under-cap bodies pass
+        // through byte-identical (deterministic walk → prefix-cache stable).
+        const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+        const imgCap = imgOrigin !== undefined ? prepared.session.stats.imageCountCaps?.[imgOrigin] : undefined;
+        if (typeof imgCap === "number" && imgCap > 0) {
+            const sess = prepared.session;
+            const countShed = await shedWireImagesToCount(wireBody, prepared.protocol, imgCap - 1, {
+                resolveRef: (mt, b64) => refForItemBytes(sess, mt, b64),
+            });
+            if (countShed.stats.changed) {
+                outboundCopyRewritten = true;
+                // #564/#2627: image shed rewrites item content (and can drop whole
+                // items) outside the carrier graph — fail closed on provenance.
+                invalidateSeparatorOwnership();
+                sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
+                log("info", `[${sess.id}] [image-count-shed] pre-send: archived ${countShed.stats.archived} oldest images to stay under the learned per-prompt cap ${imgCap} on this route (#4124) — originals stay in session storage`);
+                wireBody = countShed.body;
+            }
+        }
     }
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
@@ -563,7 +911,26 @@ export async function forward(
         // (non-retryable 400) — scrub before signing so the signature covers
         // the bytes actually sent. Buffer bodies are raw passthrough bytes
         // and are forwarded byte-faithfully, untouched.
-        if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
+        if (typeof wireBody === "string") {
+            const scrubbed = scrubLoneSurrogatesOnWire(wireBody);
+            // #564/#2627: the scrub rewrites escape sequences inside string leaves,
+            // including separator text — the manifest's byte binding dies with it.
+            if (scrubbed !== wireBody) invalidateSeparatorOwnership();
+            wireBody = scrubbed;
+        }
+        // #6003 phase 2: run the user egress-transform pipeline on the final
+        // session-processed body, BEFORE the re-sign so the signature covers the
+        // shipped bytes. A plugin that rewrites the body makes it opaque to both
+        // provenance (#564/#2627) and the image-fact parser, so mark the copy
+        // rewritten (raw-count fallback) and invalidate the byte-bound manifest.
+        if (egressBaseFields) {
+            const beforeEgress = wireBody;
+            wireBody = await runEgress(wireBody, "initial", headers);
+            if (wireBody !== beforeEgress) {
+                outboundCopyRewritten = true;
+                invalidateSeparatorOwnership();
+            }
+        }
         applyResign(headers, wireBody);
     }
     try {
@@ -608,9 +975,54 @@ export async function forward(
         const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            // #5000/#4543: the byte floor below prices only m.text — a body whose
+            // mass sits in tools[] / tool arguments / the system prompt clears it
+            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
+            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
+            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
+            // outbound body first with the #554 side-request meter (every string
+            // field, CJK-aware) and judge it against the SAME floored bar the
+            // byte floor uses (fuseWindow): the fuse's #4079 contract is
+            // "never block what a largest-common-window upstream might accept",
+            // and that contract binds a measurement just as much as a density
+            // guess — a wrong-small declaration must not false-block a body a
+            // 1M window would take. #4543 still lands: its declared 1,048,580
+            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
+            // body exceeds it. The byte floor stays as the fallback for
+            // unparseable bodies. No refusal record either way (#3974).
+            // #5000 item 2: the COUNT dimension — no window, tokenizer, or byte
+            // floor sees the messages[] array length (the 26,903-message #5000
+            // session cleared every size gate and died at the upstream). Same
+            // per-upstream opt-in as preflight (BILI_MAX_MESSAGES); the fuse is
+            // the last line for the no-model lane where preflight never ran.
+            const fuseMaxMessages = limitsMaxMessages();
+            if (fuseMaxMessages > 0 && fuseMsgs.length > fuseMaxMessages) {
+                const countMessage = `message count ${fuseMsgs.length.toLocaleString("en-US")} exceeds the upstream wire limit ${fuseMaxMessages.toLocaleString("en-US")} (COUNT dimension — a hard upstream constraint on the messages[] array that no byte/token estimate expresses, #5000); the send was stopped at the egress fuse instead of being forwarded. Reduce the session history — restart the session or rewind to an earlier point — and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse count gate: ${countMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, countMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: countMessage, retryable: false } }));
+                }
+                return;
+            }
+            const fuseMeasured = measuredOutbound(prepared);
+            const fuseRawTokens = fuseMeasured?.tokens;
+            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
+                }
+                return;
+            }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                log("warn", `413: [${prepared.session.id}] egress window fuse core-text profile: ${describeCoreTextDuplication(fuseMsgs)}`);
                 const fuseMessage = `outbound core text alone is ~${fuseBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${fuseFloorTokens} tokens vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); no upstream can accept it, so the send was stopped at the egress fuse instead of being forwarded (#4068/#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
@@ -622,11 +1034,32 @@ export async function forward(
             }
         }
     }
+    // [#5998] strict thinking-signature posture (learned per session by the
+    // probe below): this upstream rejects signature-less thinking blocks, so
+    // drop them before send instead of paying a 400 every turn. The body is
+    // otherwise untouched — signed blocks pass through byte-exact (KDD#10).
+    if (
+        prepared &&
+        !prepared.sidePassthrough &&
+        prepared.protocol === "anthropic" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        thinkingPostureIsStrict(prepared.session)
+    ) {
+        const dropped = stripUnsignedThinkingFromWire(wireBody);
+        if (dropped.removed > 0) {
+            wireBody = dropped.body;
+            log("debug", `[${prepared.session.id}] [thinking-posture] dropped ${dropped.removed} signature-less thinking block(s) before send (strict upstream learned for this session, #5998)`);
+        }
+    }
+    const requestBody = req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
-        body: req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody),
+        body: requestBody,
     };
+    onWireBody?.(requestBody);
     if (dispatcher) init.dispatcher = dispatcher;
     // #1843 L1: capture this round's image facts at the SEND chokepoint so the
     // turn's usage settle pairs with the bytes actually sent — streamed turns
@@ -637,12 +1070,26 @@ export async function forward(
     // (#5708/#5835 refolds) re-send near-identical image sets — first-send
     // facts stay the pairing source, same as noteForwardedBody's semantics.
     if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        const nImages = countImagesInRawBody(prepared.protocol, wireBody);
+        // parsedBody (the pre-serialization object) avoids re-parsing the
+        // whole wire body here; a body that fails to parse carries no image
+        // facts to learn — skip exactly like the old raw-probe miss. When a
+        // pre-send shed rewrote the bytes, though, the pre-shed object
+        // overcounts the images actually sent — count the final string then.
+        let nImages = 0;
+        try {
+            nImages = outboundCopyRewritten
+                ? countImagesInRawBody(prepared.protocol, wireBody)
+                : countImagesInParsedBody(prepared.protocol, prepared.parsedBody ?? JSON.parse(wireBody));
+        } catch { /* unparseable — no image facts */ }
         if (nImages > 0) {
             const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
             noteForwardedImageFacts(prepared.session, {
                 nImages,
+                // Overhead against the SENT bytes: parsedBody is the pre-shed memo and
+                // would drift from wireBody once an egress shed rewrites the body; when
+                // nothing was rewritten, measuring the serialized bytes is exactly what
+                // pre-#5131 measured — one fewer branch, identical value.
                 textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
                 host: upstreamHost(learnUpstream),
                 fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
@@ -674,7 +1121,8 @@ export async function forward(
     // previous request's body. Loop re-fetches re-note their own rebuilt bodies
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
-    if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+    const mainSend = prepared !== null && prepared.session !== undefined && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD";
+    if (mainSend && prepared?.session) {
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #2078: ONE parse of the outbound body for the whole seam block — the
         // estimate's projection, its wire-overhead term, and the image reserve
@@ -688,7 +1136,6 @@ export async function forward(
         }
         // Publish this send, not a historical usage baseline with a fresh timestamp.
         const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
-        prepared.session.stats.localInputEstimate = est.upperBound;
         // The char-count upper bound stays the published context value: it is
         // the fail-closed caliber decision paths and legacy displays trust for
         // never-reporting upstreams (#553/#728/#1493). #2117 additionally
@@ -697,12 +1144,17 @@ export async function forward(
         // factor's route+model provenance matches (#1933 F1 / #2117 B), plus
         // the image reserve — so display surfaces can show a calibrated reading
         // instead of the ~2–3.5× over-counting bound. Display-only field.
+        // #4383: the write itself lives in noteOutboundContextEstimates so the
+        // stamp contract (and its "estimate" freshness mark, which
+        // usageAnchorCycleStale reads) is testable.
         const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
         const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
-        prepared.session.stats.contextEstimateTokens = Math.round(scaledText + est.imageTokens);
-        prepared.session.stats.contextEstimateCalibrated = scaledText !== est.textOverhead;
-        prepared.session.stats.contextTokens = est.upperBound;
-        prepared.session.stats.contextTokensSource = "estimate";
+        noteOutboundContextEstimates(prepared.session, {
+            upperBound: est.upperBound,
+            scaledText,
+            imageTokens: est.imageTokens,
+            calibrated: scaledText !== est.textOverhead,
+        });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
@@ -721,12 +1173,47 @@ export async function forward(
         // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
         // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
         // judged a pre-rewrite snapshot.
-        maybeRunInvariantJudge({
-            originalMessages: prepared.originalMessages,
+        // #4241: on a snapshot-render turn the outbound prefix is server-rendered
+        // (transcript rows + summary carriers), not the raw inbound bytes — the
+        // judge must exempt that region and validate only the client tail. The
+        // boundary was recorded by prepare's maybeSnapshotView on the same session.
+        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
+            ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
+            : undefined;
+        // #564/#2627: keep the proven marker indexes with the body just noted, so a
+        // compress-loop round re-sending these markers judges them as bili's own.
+        const ownedSeparatorCores = maybeRunInvariantJudge({
+            // #2078: reuse the seam block's single parse of sentBody instead of
+            // paying another full JSON.parse of the largest payload per turn.
+            // Kiro: judge with the built-in role re-voicing undone (see judgeRoleRestore).
+            parsed: withRestoredRoles(sentParsed, judgeRoleRestore),
+            // #4241: a render-lane turn's outbound is built from the SERVER
+            // transcript (summary anchors + store rows), so its ground truth
+            // is the rendered view — reconciling the client's inbound bytes
+            // against it false-positives I2 on every folded render turn.
+            // judgeBaseline is set only when the view was actually replaced
+            // (reference-inequality); otherwise this is byte-identical to
+            // prepared.originalMessages.
+            originalMessages: prepared.judgeBaseline ?? prepared.originalMessages,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
+            // The judge validates this body-bound manifest while reusing its
+            // one actual-wire projection; relay does not decode the history again.
+            // #564/#2627: this is the manifest RE-ANCHORED onto the final graph by
+            // carrier identity (or dropped outright when a rewrite could not prove
+            // lineage), never prepare's stale index list.
+            ...(separatorManifest !== undefined ? { separatorManifest } : {}),
+            // #564/#2627: an opaque host rewrite may have destroyed the proof
+            // while the bytes still hold genuine host separators. Tell the judge
+            // ownership is UNKNOWN so it stops asserting separator findings for
+            // this send — rather than telling it "no producer claims exist",
+            // which would accuse the client of an insertion bili itself made.
+            ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
+            ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
+        const sentSlot = lastForwardedBody(prepared.session);
+        if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
@@ -734,15 +1221,44 @@ export async function forward(
     // thrown detail carries the actionable state (last failure + next probe)
     // that the dispatch catch renders into the 502 body.
     const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
-    if (circuitBlock !== undefined) {
-        log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+    if (circuitBlock !== undefined && !isCodexCatalogRequest(upstreamUrl, init)) {
+        // #4254: throttle the per-request warn to one line/window/host while the
+        // circuit stays OPEN (the OPEN/CLOSED/probe state flips log at their own
+        // sites) so a single dead upstream stops re-amplifying every blocked round.
+        if (noteCircuitFailFastLog(upstreamUrl)) {
+            log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+        }
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
         const lastKind = upstreamCircuitLastFailureKind(upstreamUrl);
-        throw withUpstreamFailure(new Error(`upstream circuit open: ${circuitBlock}`), {
+        const retryAfter = upstreamCircuitRetryAfterSeconds(upstreamUrl);
+        let displayHost: string | undefined;
+        try { displayHost = maskHostPortForDisplay(new URL(upstreamUrl).host); } catch { /* not a URL */ }
+        // #4254: carry host/circuitOpen/retryAfterSeconds so the egress can name the
+        // dead endpoint in the client-facing `error`, answer 503 + Retry-After, and
+        // skip its per-request [error] (markExpectedFailFast) since the throttled
+        // warn above is the canonical record.
+        throw markExpectedFailFast(withUpstreamFailure(new Error(`upstream circuit open: ${circuitBlock}`), {
             ...(lastKind !== undefined ? { kind: lastKind as UpstreamFailureKind } : {}),
+            ...(displayHost !== undefined ? { host: displayHost } : {}),
+            circuitOpen: true,
+            ...(retryAfter !== undefined ? { retryAfterSeconds: retryAfter } : {}),
             hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
-        });
+        }));
+    }
+    // #4204: account-wide holds stay origin+credential scoped. KeyRing's
+    // request-matched model-temporarily-unavailable error gets a separate
+    // origin+credential+model hold so unrelated models remain eligible.
+    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody, req));
+    let throttleProbeToken: symbol | undefined;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        const throttleGate = upstreamThrottleGate(upstreamUrl, headers, Date.now(), throttleModel);
+        throttleProbeToken = throttleGate.probeToken;
+        const throttleReject = throttleGate.reject;
+        if (throttleReject !== undefined) {
+            answerLocalThrottleReject(res, throttleReject, prepared?.protocol, opts.streamErrorShape, log, prepared?.session.id);
+            return;
+        }
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
@@ -751,9 +1267,9 @@ export async function forward(
     let firstAttemptClear: (() => void) | undefined;
     try {
         const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
-        const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+        const fetchPromise = fetchWithCodexCatalogCache(signal => fetchWithTransportRetry(upstreamUrl, init, undefined, signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
-        });
+        }), upstreamUrl, init, clientAbort.signal, log);
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
         try {
             upstreamResult = await fetchPromise;
@@ -761,13 +1277,16 @@ export async function forward(
         } finally {
             clearTimeout(firstByteTimer);
         }
-        recordUpstreamConnection(upstreamUrl, proxyUrl);
-        // #1682: any resolved response proves the host is reachable again.
-        clearUpstreamAlertsForHost(upstreamUrl);
-        recordUpstreamCircuitSuccess(upstreamUrl);
+        if (!(isCodexCatalogRequest(upstreamUrl, init) && upstreamResult.response.headers.get("x-bili-model-catalog") === "offline-cache")) {
+            recordUpstreamConnection(upstreamUrl, proxyUrl);
+            // #1682: a network response proves reachability; an offline replay does not.
+            clearUpstreamAlertsForHost(upstreamUrl);
+            recordUpstreamCircuitSuccess(upstreamUrl);
+        }
     } catch (error) {
         const oversize = extractWsOversizeError(error);
         if (oversize === undefined) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
             recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
             const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
@@ -778,7 +1297,10 @@ export async function forward(
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}`, { cause: error }), failure.detail);
+            // #2465/#5663: tag the classified transport envelope so the dispatch catch
+            // logs it as ONE line — failure.message already carries
+            // kind/code/errno/syscall/address/port/hint; the stack adds no signal.
+            throw withUpstreamFailure(Object.assign(new Error(`upstream request failed: ${failure.message}`, { cause: error }), { biliTransportFailure: true }), failure.detail);
         }
         // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
         // on endpoint health — the same gateway answers smaller frames fine. Deliberately
@@ -790,20 +1312,31 @@ export async function forward(
 
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
+        // #4601: a non-string (verbatim passthrough) body was reported as 0.0 MiB — measure it.
+        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
         const budget = limitsWsOutboundBytes();
         const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
         if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
-            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
+            releaseUpstreamThrottleProbe(throttleProbeToken);
+            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget, typeof wireBody !== "string" ? "the body is not a JSON wire body (verbatim passthrough) — image shedding cannot apply" : undefined));
         }
         const shedSession = prepared.session;
-        const { body: shrunk, stats } = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
-        if (!stats.changed || stats.finalBytes >= sentBytes) throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget));
+        let shedResult: ShedWireImagesResult;
+        try {
+            shedResult = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
+        } catch (error) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
+            throw error;
+        }
+        const { body: shrunk, stats } = shedResult;
+        if (!stats.changed || stats.finalBytes >= sentBytes) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
+            throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget));
+        }
         log("info", `[${prepared.session.id}] [ws-byte-shed] upstream closed 1009 with zero events at ${formatMiB(sentBytes)} MiB — shed to ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled}), resending once within this request`);
         try {
             const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
-            applyResign(headers, shrunkWire);
-            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(shrunkWire) }, undefined, clientAbort.signal);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(shrunkWire) }, undefined, clientAbort.signal);
             if (retried.response.ok) {
                 firstAttemptClear?.();
                 wireBody = shrunkWire;
@@ -835,20 +1368,23 @@ export async function forward(
             }
         } catch (retryErr) {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [ws-byte-shed] shrunken resend failed: ${formatUpstreamError(retryErr, upstreamUrl, proxyUrl, skippedProxy)}`);
+            releaseUpstreamThrottleProbe(throttleProbeToken);
             throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget), { cause: retryErr });
         }
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
-    // "Invalid role: developer") gets ONE auto-retry with the offending role
-    // rewritten to "system". On success the mapping is remembered on the
-    // session (never written to config — the log carries the permanent
-    // per-provider snippet instead). On failure the original response
-    // continues downstream verbatim. 400 bodies are small (buffered below).
+    // "Invalid role: developer", serde-based ones such as DeepSeek answer 422
+    // "messages[0].role: unknown variant `developer`", #6063) gets ONE
+    // auto-retry with the offending role rewritten to "system". On success the
+    // mapping is remembered on the session (never written to config — the log
+    // carries the permanent per-provider snippet instead). On failure the
+    // original response continues downstream verbatim. Error bodies for these
+    // request-validation statuses are small (buffered below).
     if (
         compatProtocol &&
         typeof wireBody === "string" &&
-        upstreamResult.response.status === 400 &&
+        (upstreamResult.response.status === 400 || upstreamResult.response.status === 422) &&
         upstreamResult.response.body
     ) {
         let roleErrText: string | null = null;
@@ -916,8 +1452,7 @@ export async function forward(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
-                        applyResign(headers, fixed.body);
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(fixed.body) }, undefined, clientAbort.signal);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(fixed.body) }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -1002,11 +1537,20 @@ export async function forward(
             } catch {
                 strippedPckBody = null;
             }
-            if (strippedPckBody !== null) {
+            // #4124: a 400 whose body names a CONTENT wall (image-count or
+            // token/context overflow) exonerates prompt_cache_key by inspection —
+            // the key-less re-send can only fail identically, and in the field it
+            // hit a secondary byte-wall 413 instead (#4124 turn 44). Skip the
+            // probe; the overflow paths below own this error.
+            const pckInspection = strippedPckBody !== null ? inspectContextOverflow(400, pckErrText) : null;
+            const contentWall = pckInspection !== null && (pckInspection.isOverflow || pckInspection.imageCountCap !== undefined);
+            if (contentWall) {
+                log("debug", `[${prepared.session.id}] [pck] 400 names a content wall (${pckInspection!.imageCountCap !== undefined ? `image count > ${pckInspection!.imageCountCap}` : "context overflow"}) — prompt_cache_key exonerated by inspection, A/B probe skipped (#4124)`);
+            }
+            if (strippedPckBody !== null && !contentWall) {
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
-                    applyResign(headers, strippedPckBody);
-                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(strippedPckBody) }, undefined, clientAbort.signal);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(strippedPckBody) }, undefined, clientAbort.signal);
                 } catch {
                     retried = null; // transport failure — inconclusive, original 400 stands
                 }
@@ -1036,6 +1580,79 @@ export async function forward(
                         }
                         retried.clearTimer();
                         log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
+                    }
+                }
+            }
+        }
+    }
+    // [#5998] learn-on-failure thinking-signature probe: this upstream rejected
+    // the send with the signature-verifying wording ("thinking.signature: Field
+    // required", #2501) and the body carries signature-less thinking blocks —
+    // re-send once with exactly those blocks dropped. Accepted ⇒ causation
+    // confirmed: adopt the retry, remember the strict posture for THIS session
+    // only (later sends drop proactively above). Still failing ⇒ NOT this field
+    // — discard the second response, forward the original 400 verbatim, learn
+    // nothing (same controlled-experiment discipline as the #2645 ladder).
+    // Never-signing relays (#5495) word their 400 differently ("must be passed
+    // back"), so they never enter this branch and keep their verbatim replay.
+    if (
+        prepared &&
+        !prepared.sidePassthrough &&
+        prepared.protocol === "anthropic" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let tsErrText: string | null = null;
+        try {
+            tsErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            tsErrText = null;
+        }
+        if (tsErrText !== null) {
+            upstreamResult = {
+                response: new Response(tsErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            if (detectThinkingSignatureRejection(400, tsErrText)) {
+                const dropped = stripUnsignedThinkingFromWire(wireBody);
+                if (dropped.removed > 0) {
+                    let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
+                    try {
+                        // #6003 phase 2: route through the unified egress chokepoint
+                        // like the other five recovery re-sends (was an inline
+                        // applyResign+v1Wrap that bypassed both the Phase-1 chokepoint
+                        // and the user transform pipeline). Unconfigured = byte-identical.
+                        retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(dropped.body) }, undefined, clientAbort.signal);
+                    } catch {
+                        retried = null; // transport failure — inconclusive, original 400 stands
+                    }
+                    if (retried !== null) {
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            wireBody = dropped.body;
+                            rememberStrictThinkingPosture(prepared.session);
+                            markDirty(prepared.session);
+                            log("info", `[${prepared.session.id}] [thinking-posture] upstream rejected signature-less thinking ("${tsErrText.slice(0, 120)}") — stripped ${dropped.removed} block(s), retry accepted; dropping them proactively for this session (#5998)`);
+                            upstreamResult = retried;
+                        } else {
+                            if (retried.response.body) {
+                                try {
+                                    await readStreamToBuffer(retried.response.body);
+                                } catch {
+                                    /* discarded either way */
+                                }
+                            }
+                            retried.clearTimer();
+                            log("warn", `[${prepared.session.id}] [thinking-posture] strip-and-resend probe also failed (${retried.response.status}) — not the unsigned blocks' fault; original 400 forwarded verbatim, nothing learned (#5998)`);
+                        }
                     }
                 }
             }
@@ -1121,7 +1738,18 @@ export async function forward(
             // against the same wall — remember it so preflight folds against
             // window − completion (the foldable quantity is MESSAGES).
             const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
-            if (reserve !== undefined) s.stats.overflowArmCompletionReserve = reserve;
+            if (reserve !== undefined) {
+                s.stats.overflowArmCompletionReserve = reserve;
+                // #3450 follow-up: same evidence on the provider's lifetime —
+                // the arm retires on the next usage report (#1110), this must
+                // not (see provenCompletionReserve). Scoped to the origin+model.
+                const provenOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (provenOrigin !== undefined && reqModel !== undefined) {
+                    s.stats.provenCompletionWall = reserve;
+                    s.stats.provenCompletionWallOrigin = provenOrigin;
+                    s.stats.provenCompletionWallModel = reqModel;
+                }
+            }
             // #3450: one-time mismatch warning — the upstream-stated window
             // differs from the window bili actually judges on. #4205: compare
             // against the UNRESERVED declaration, so routes that reserve output
@@ -1219,7 +1847,66 @@ export async function forward(
                 stopIdleTimer: upstreamResult.stopIdleTimer,
             };
             const overflowInfo = inspectContextOverflow(upstreamResult.response.status, overflowText);
-            if (overflowInfo.isOverflow) {
+            if (overflowInfo.imageCountCap !== undefined && prepared!.protocol && typeof wireBody === "string") {
+                // #4124: image-COUNT wall — a different dimension than the token
+                // overflow below; armOverflowShrink must NOT run (its no-window
+                // branch would arm a bogus token-space shrink at the payload
+                // estimate). Learn the cap per-origin, converge the outbound copy
+                // to cap−1 with the count-shed machinery, and re-send ONCE within
+                // this same request. An unchanged body (nothing archivable), a
+                // Buffer body (raw passthrough bytes), or a missing protocol falls
+                // through to the verbatim passthrough below, which still learns
+                // the cap there.
+                const s = prepared!.session;
+                const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (imgOrigin !== undefined) {
+                    const caps = s.stats.imageCountCaps ?? {};
+                    caps[imgOrigin] = overflowInfo.imageCountCap;
+                    s.stats.imageCountCaps = caps;
+                    markDirty(s);
+                }
+                const target = Math.max(0, overflowInfo.imageCountCap - 1);
+                const countShed = await shedWireImagesToCount(wireBody, prepared!.protocol, target, {
+                    resolveRef: (mt, b64) => refForItemBytes(s, mt, b64),
+                });
+                if (!countShed.stats.changed) {
+                    log("warn", `[${s.id}] image-count overflow (upstream cap ${overflowInfo.imageCountCap}, request carried ${overflowInfo.imageCountSeen ?? "?"}) — nothing archivable in the outbound copy (images sit in exempt tool outputs?) — passing the rejection through (#4124)`);
+                } else {
+                    try {
+                        s.metadata.imageCountShed = { at: Date.now(), phase: "same-request-retry", cap: overflowInfo.imageCountCap, archived: countShed.stats.archived };
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(countShed.body) }, undefined, clientAbort.signal);
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            wireBody = countShed.body; // track the accepted re-send as the wire base
+                            upstreamResult = retried;
+                            log("info", `[${s.id}] image-count overflow (upstream cap ${overflowInfo.imageCountCap}${overflowInfo.imageCountSeen !== undefined ? `, request carried ${overflowInfo.imageCountSeen}` : ""}) — archived ${countShed.stats.archived} oldest images, re-sent within the same request, upstream accepted (#4124)`);
+                        } else {
+                            let retryErrText: string | null = null;
+                            if (retried.response.body) {
+                                try {
+                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
+                                } catch {
+                                    retryErrText = null;
+                                }
+                            }
+                            // Answer with the retry's own verdict, not the stale first 400.
+                            upstreamResult.clearTimer();
+                            upstreamResult = {
+                                response: new Response(retryErrText ?? "", {
+                                    status: retried.response.status,
+                                    statusText: retried.response.statusText,
+                                    headers: new Headers(retried.response.headers),
+                                }),
+                                clearTimer: retried.clearTimer,
+                                stopIdleTimer: retried.stopIdleTimer,
+                            };
+                            log("warn", `[${s.id}] image-count overflow — converged to ${target} images but the re-send was still rejected (HTTP ${retried.response.status}; upstream counted ${overflowInfo.imageCountSeen ?? "?"}) — passing the retry verdict through (#4124)`);
+                        }
+                    } catch {
+                        // transport failure — the buffered original 400 answers below
+                    }
+                }
+            } else if (overflowInfo.isOverflow) {
                 armOverflowShrink(overflowInfo);
                 // #3787 follow-up: a NUMBERLESS overflow states no window; the
                 // armed baseline (min of declared and the rejected payload's
@@ -1242,8 +1929,7 @@ export async function forward(
                         // summaries — scrub string bodies again so a lone
                         // surrogate can't poison the retry (see the #1884 seam).
                         const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                        applyResign(headers, wireRefolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(wireRefolded) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
@@ -1347,9 +2033,33 @@ export async function forward(
         }
         if (prepared?.session && errBody) {
             const s = prepared.session;
-            const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
+            const errText = errBody.toString("utf8");
+            const info = inspectContextOverflow(upstream.status, errText);
             if (info.isOverflow) {
                 armOverflowShrink(info);
+            } else if (info.imageCountCap !== undefined) {
+                // #4124: an image-count wall reached this path without the
+                // same-request rescue above (no refold hook / response not
+                // writable / no protocol) — still LEARN the cap per-origin so
+                // the next request on this route converges pre-send. Never arms
+                // the token-space shrink (a count is not tokens).
+                const imgOrigin = normalizeUpstreamOrigin(upstreamUrl);
+                if (imgOrigin !== undefined) {
+                    const caps = s.stats.imageCountCaps ?? {};
+                    caps[imgOrigin] = info.imageCountCap;
+                    s.stats.imageCountCaps = caps;
+                    markDirty(s);
+                }
+                log("warn", `[${s.id}] upstream image-count wall (cap ${info.imageCountCap}, request carried ${info.imageCountSeen ?? "?"}) — learned for pre-send convergence on this route; no token-space arm (#4124)`);
+            } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
+                // #4452: the gateway rewrote this overflow-shaped reject into a body with no
+                // parseable marker, so bili's self-heal cannot engage from it — name that here
+                // (+ the last meter reading) so a body-rewriting gateway's silent starvation is
+                // diagnosable from the log rather than the opaque line further down.
+                const est = s.stats.lastInputTokens > 0 ? s.stats.lastInputTokens : 0;
+                const win = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
+                const meterNote = est > 0 && win > 0 ? `; last settled input ~${Math.round(est)} vs effective window ${win}` : "";
+                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -1357,7 +2067,8 @@ export async function forward(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errBody.toString("utf8"))) {
+            // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
+            if (upstream.status === 400 && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
@@ -1386,6 +2097,17 @@ export async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
+        // selected only by its structured code plus exact request-model match;
+        // keyring_all_limited and every ambiguous response remain account-wide.
+        if (req.method !== "GET" && req.method !== "HEAD") {
+            if (upstream.status === 429) {
+                const modelScope = throttle429ModelScope(upstream.status, throttleModel, errBody);
+                noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"), Date.now(), modelScope, throttleProbeToken);
+            } else {
+                noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);
+            }
+        }
         // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
         if (upstream.status >= 400 && upstream.status < 500) {
             dumpRejectedBody(upstream.status, errSid, wireBody);
@@ -1395,7 +2117,7 @@ export async function forward(
             // longer change, so deliver the upstream failure in-band (protocol error
             // event for streams; verbatim error body under 200 otherwise).
             if (prepared?.stream) {
-                emitStreamError(res, prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
+                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
             } else {
                 try { res.end(errBody ?? undefined); } catch { /* client gone */ }
             }
@@ -1425,8 +2147,13 @@ export async function forward(
         // it back). The dsh recall bridge does not need it (it learns at
         // beforeSend), but any client may adopt the header directly.
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
+        // #5418: the prepare lane's own success-response headers (watermark seq stamp).
+        if (prepared !== null && prepared.responseExtraHeaders !== undefined) Object.assign(respHeaders, prepared.responseExtraHeaders);
         res.writeHead(upstream.status, respHeaders);
     }
+    // #4204: a resolved response preserves the existing account-hold recovery
+    // signal and clears only the matching model hold.
+    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);
     // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
     // and arm the TTL-refresh timer. Pipeline-prepared requests only
     // (passthrough stays out of scope); internally gated to anthropic-wire
@@ -1504,7 +2231,9 @@ export async function forward(
         // signal, or end raw for permitlist hosts that own the handling.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
-            if (prepared.stream && maxFakeCompletionRetries() > 0) {
+            // #1295: the JSONL wire has no fake-completion shape to detect —
+            // its finish event IS the terminal frame.
+            if (prepared.stream && !prepared.commandcode && maxFakeCompletionRetries() > 0) {
                 // #1900: retry from wireBody — the exact bytes this request's main
                 // attempt shipped (post wireTransform and any same-request re-send),
                 // never the raw client body: upstream may have rejected those raw
@@ -1521,6 +2250,7 @@ export async function forward(
                     signal: clientAbort.signal,
                     session: prepared.session,
                     log,
+                    model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
@@ -1546,7 +2276,16 @@ export async function forward(
                     log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
                     clientAbort.abort();
                 });
-                if (prepared.protocol === "responses") {
+                if (prepared.commandcode) {
+                    // #1295: bare JSONL events — no SSE framing, no [DONE]; the
+                    // pipe strips render tags from the two prose fields only.
+                    await pipePluginJsonlWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                    );
+                } else if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
                     // when the turn completes with nothing visible.
@@ -1558,6 +2297,7 @@ export async function forward(
                         makeContinuationRefetch({
                             protocol: "responses",
                             body,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1570,6 +2310,7 @@ export async function forward(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -1585,6 +2326,7 @@ export async function forward(
                         makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1597,10 +2339,12 @@ export async function forward(
                         absorbInstructed,
                         wireBodyText,
                         upstreamMeta,
+                        reply,
+                        opts.streamErrorShape,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText, reply);
             }
         } finally {
             clearUpstreamTimer();
@@ -1647,7 +2391,9 @@ export async function forward(
     // skipped the trailing clearUpstreamTimer and leaked a live idle
     // timer plus its socket for the full window.
     try {
-        if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        // #1295: commandcode streams terminate with their own finish event —
+        // no fake-completion shape exists to buffer-and-retry (#371 off).
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -1663,6 +2409,7 @@ export async function forward(
                 signal: clientAbort.signal,
                 session: prepared.session,
                 log,
+                model: prepared.model ?? prepared.google?.model,
             });
             responseBody = bufferToStream(resolvedBuf);
         }
@@ -1717,6 +2464,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
+                        model: throttleModel ?? prepared.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1729,6 +2477,7 @@ export async function forward(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -1740,6 +2489,12 @@ export async function forward(
             } else {
                 log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
             }
+        } else if (prepared && prepared.commandcode && prepared.stream) {
+            // #1295: bare JSONL response on a non-injected turn — same prose-only
+            // strip pipe as plugin mode; no session (usage accounting stays off,
+            // same rationale as the SSE branch below).
+            const p = prepared;
+            await pipePluginJsonlWithStrip(responseBody, res, undefined, (msg) => log("info", `[${p.session.id}] ${msg}`));
         } else if (
             prepared &&
             prepared.stream &&
@@ -1761,6 +2516,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
+                        model: throttleModel ?? p.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1773,6 +2529,7 @@ export async function forward(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -1784,6 +2541,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
+                        model: throttleModel ?? p.google?.model,
                         wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
@@ -1797,6 +2555,8 @@ export async function forward(
                     undefined,
                     undefined,
                     upstreamMeta,
+                    reply,
+                    opts.streamErrorShape,
                 );
             }
         } else if (
@@ -1808,7 +2568,7 @@ export async function forward(
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol);
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
         } else {
             await pipeThrough(responseBody, res);
         }
@@ -1849,6 +2609,10 @@ export async function forward(
             // the first request (prefix-cache anchor).
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            // #5765 cache-seam parity: the block-ops section rides the round-2
+            // rebuild exactly like the steady prepare* paths (hybrid lane on
+            // text protocol — it is a function tool there).
+            const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
@@ -1859,6 +2623,9 @@ export async function forward(
             // the absorb boundary char).
             const absorbSection = absorbActive
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const blockOpsSection = blockOpsActive
+                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -1874,8 +2641,21 @@ export async function forward(
             // is proxy-loop-only today (proxy mode never sets the flag — bili
             // injects the bare tools there), so `prepared.mcpDialectNote === true`
             // is the explicit seam, not a live branch yet.
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // #4305 cache-seam parity: the standing generation-boundary note sits
+            // between the compress prompt and the absorb section on every steady
+            // prepare* path — the round-2 rebuild must keep that exact order or
+            // the system-element prefix forks at every fold of an affected session.
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
+            // #1295: commandcode keeps the internal protocol "openai" (request
+            // shape is openai-completions) but speaks bare JSONL on the wire.
+            const adapter = prepared.commandcode
+                ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
+                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // #564/#2627: separator slots for the CURRENT round's body, refreshed
+            // by each fold. The loop reads this through `ctx.separatorSlots` so the
+            // continuity judge sees the same producer record prepare sees.
+            let loopSeparatorSlots: readonly SeparatorSlot[] = [];
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -1916,7 +2696,8 @@ export async function forward(
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
-                    const out = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    const out = outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
@@ -1926,8 +2707,16 @@ export async function forward(
                     // turn rendered one history with two different shapes and the
                     // byte prefix broke mid-history on every fold.
                     const dropped = prepared.dropReasoning ? prepared.dropReasoning(out) : out;
-                    const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
-                    return ordered;
+                    if (prepared.protocol === "responses") {
+                        const ordered = repairResponsesAssistantOrdering(dropped, prepared.originalMessages);
+                        // #564/#2627: the round-2+ body is built from THIS array, so
+                        // re-minted separator positions must travel with it or the
+                        // continuity judge reads a newly added marker as a mid-insertion.
+                        loopSeparatorSlots = ordered.slots;
+                        return ordered.messages;
+                    }
+                    loopSeparatorSlots = [];
+                    return dropped;
                 });
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
@@ -1938,12 +2727,12 @@ export async function forward(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, separatorSlots: () => loopSeparatorSlots, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -1968,7 +2757,7 @@ export async function forward(
             }
             res.end();
         } catch (e) {
-            emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
+            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;
@@ -2006,7 +2795,26 @@ export async function forward(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers, signal: clientAbort.signal },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", requestHeaders) },
+                    );
+                }
+                // #5957: non-stream Anthropic runs the same proxy-tool loop as
+                // the stream path — the one-shot rewriter alone ended the client
+                // turn with the compress receipt (stop_reason end_turn) and the
+                // model never saw the fold result. Terminal/mixed rounds fall
+                // through to the one-shot rewriter below.
+                if (prepared.protocol === "anthropic") {
+                    const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+                    // #6003 phase 2: one header object shared by both the re-sign
+                    // and the egress pipeline — a plugin-set header must land on
+                    // the exact object the signature will cover.
+                    const anthropicReqHeaders = buildForwardHeaders(headers);
+                    json = await compressLoopAnthropicJson(
+                        json,
+                        ctx,
+                        { proxyUrl, signal: clientAbort.signal },
+                        requestBody,
+                        { url: upstreamUrl, headers: anthropicReqHeaders, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", anthropicReqHeaders) },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
@@ -2024,7 +2832,7 @@ export async function forward(
                 // `total` is always the true context size (see util.ts).
                 const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
                 const u = (rawUsage ?? {}) as Record<string, unknown>;
-                const { total, cached } = usageTotals(prepared.protocol, u);
+                const { total, cached, creation } = usageTotals(prepared.protocol, u);
                 const out = usageOutputTotal(prepared.protocol, u);
                 // #1547: settle through the shared path — stats AND the cache
                 // ledger. Before this, this branch updated stats only, so
@@ -2034,19 +2842,19 @@ export async function forward(
                 const reportedCached: number | null = typeof cached === "number" ? cached : null;
                 const billed = typeof total === "number" ? total : 0;
                 if (billed > 0 || reportedCached !== null) {
-                    // wireBody — not prepared.body — is what actually went out
-                    // (compat-role / steering / chain-stamp rewrites apply after
-                    // prepare); the main chokepoint above already noted it, this
-                    // keeps the pair byte-exact if that ever moves (#1891).
-                    noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    // Use the send-time capture; settlement is not another send.
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, creation });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
                 } else {
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
                 }
-                if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                if (typeof out === "number") {
+                    prepared.session.stats.outputTokens += out;
+                    // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+                    billOutputUsage(prepared.session, out);
+                }
                 if (prepared.protocol === "openai") {
                     await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponseAsync(json, ctx, clientAbort.signal));
                 } else if (prepared.protocol === "responses") {
@@ -2056,6 +2864,8 @@ export async function forward(
                 } else {
                     await withSessionLock(prepared.session, () => rewriteJsonResponseAsync(json, ctx, clientAbort.signal));
                 }
+                captureHandoffJson(reply, prepared.protocol, json);
+                reply?.save();
                 res.end(JSON.stringify(json));
             } catch {
                 res.end(text);
@@ -2107,6 +2917,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #5390: target model name — lets the google-wire part-order normalize
+         *  skip the WC-018 text-first reorder for Claude models. */
+        model?: string;
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
@@ -2122,7 +2935,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody, opts.model);
             if (hinted === null) break;
             const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);

@@ -60,6 +60,12 @@ export interface LegacySessionLike {
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: CoreMessage[];
+    /** #3301: external-converter import payload — original message
+     *  decompositions interned BEFORE the snapshot/tail so their rows get the
+     *  lowest seqs (they are the oldest evidence). Consumed by the full
+     *  ingest only; the delta planner falls back to the full path while it is
+     *  present (its rows would otherwise be skipped as "trusted prefix"). */
+    decompositionLog?: CoreMessage[];
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
@@ -98,6 +104,11 @@ interface LogEntry {
     kind: string;
     ref: string | null;
     media?: { hash: string; bytes: string }[];
+    /** #4313: first-sight wall-clock stamp carried by the message object
+     *  (absent for pre-feature / imported payloads). Stored into the
+     *  messages.ts column verbatim; the value is NEVER part of content
+     *  (see serializeForStore). */
+    ts?: number;
 }
 
 /** Adapts any Session-shaped object (persist loadSync output) to the
@@ -115,6 +126,7 @@ export function toLegacyLike(s: {
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
+    decompositionLog?: LegacySessionLike["decompositionLog"];
     contentStore?: LegacySessionLike["contentStore"];
 }): LegacySessionLike {
     return {
@@ -129,8 +141,37 @@ export function toLegacyLike(s: {
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
         pluginSnapshot: s.pluginSnapshot,
+        decompositionLog: s.decompositionLog,
         contentStore: s.contentStore,
     };
+}
+
+/** #4313: storage serialization of a message — ts rides the dedicated
+ *  column, NEVER the content bytes: stored content stays byte-identical to
+ *  what a pre-feature save wrote for the same logical message, so content
+ *  hash / identity / boundary probes cannot churn when stamps attach.
+ *  ts is appended last by its producers (stamper node, row hydration), so
+ *  deleting it restores the pre-feature key order exactly. */
+function serializeForStore(m: CoreMessage): string {
+    if (m.ts === undefined) return stringifyForStore(m);
+    const copy = { ...m };
+    delete copy.ts;
+    return stringifyForStore(copy);
+}
+
+/** #5627: V8's serializer recurses into arbitrarily nested data, so a
+ *  pathologically nested message dies as the generic "Maximum call stack
+ *  size exceeded" naming nothing. Re-throw naming the OFFENDING MESSAGE so
+ *  the failure forensics point at the exact row to remove or flatten. */
+function stringifyForStore(m: CoreMessage): string {
+    try {
+        return JSON.stringify(m);
+    } catch (err) {
+        if (err instanceof RangeError) {
+            throw new RangeError(`message ${m.id}: nesting too deep for JSON serialization (engine call-stack overflow) — remove or flatten this message to unblock the unified store`);
+        }
+        throw err;
+    }
 }
 
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
@@ -147,7 +188,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -161,9 +202,12 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}) });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
         return seq;
     };
+    // #3301: import payload first — its rows must sit below the snapshot/tail
+    // seqs so the stored log reads oldest-evidence-first.
+    if (session.decompositionLog && session.decompositionLog.length > 0) session.decompositionLog.forEach(intern);
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
     const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
 
@@ -229,6 +273,9 @@ export function planIngestDelta(
     head?: { msgId: string } | null,
 ): IngestPlan | null {
     if (session.pluginSnapshot && session.pluginSnapshot.length > 0) return null;
+    // #3301: an import payload would be skipped as "trusted prefix" here — force
+    // the full path so its rows actually land.
+    if (session.decompositionLog && session.decompositionLog.length > 0) return null;
     const tail = session.lastMessages;
     const trustedLen = trustedTailSeqs.length;
     if (
@@ -255,7 +302,7 @@ export function planIngestDelta(
     // at the trusted prefix's end. Identities are content-derived and
     // unique within one conversion pass, so a match proves this tail slot
     // IS the message the watermark was set from.
-    const probe = JSON.stringify(tail[trustedLen - 1]);
+    const probe = serializeForStore(tail[trustedLen - 1]);
     ingestSerializations.count++;
     // #3762: the stored boundary hash covers the MEDIA-SPLIT serialization;
     // split the probe the same way so image messages verify identically.
@@ -275,7 +322,7 @@ export function planIngestDelta(
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const raw = JSON.stringify(m);
+        const raw = serializeForStore(m);
         ingestSerializations.count++;
         const parsed = JSON.parse(raw) as { role: string; contentType?: string };
         const split = splitMediaContent(raw);
@@ -294,6 +341,7 @@ export function planIngestDelta(
             kind: parsed.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
             ...(split.media.length > 0 ? { media: split.media } : {}),
+            ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
         });
     }
     // planIngest's snapshot ternary replicated on the ORIGINAL value: an
@@ -339,6 +387,7 @@ function finishPlan(
         contentHash: e.hash,
         identity: e.identity,
         ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
+        ...(typeof e.ts === "number" ? { ts: e.ts } : {}),
     }));
 
     // #4316 layer 3: the ledger positions of a block's covered messages —
@@ -354,6 +403,8 @@ function finishPlan(
         const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
+        const summaryJson = JSON.stringify(full);
+        const oneJson = one === null ? null : JSON.stringify(one);
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
         let startSeq = -1;
         let endSeq = -1;
@@ -371,8 +422,13 @@ function finishPlan(
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
-            summary: JSON.stringify(full),
-            one: one === null ? null : JSON.stringify(one),
+            summary: summaryJson,
+            one: oneJson,
+            // #5744: carry the digests so ingestSession can compare against the
+            // stored row BEFORE any CAS op (putContent with a precomputed hash
+            // recomputes nothing — same bytes, same utf8, same sha256).
+            summaryHash: sha256Hex(summaryJson),
+            oneHash: oneJson === null ? null : sha256Hex(oneJson),
             supersedesBlockId: null,
             active: b.active,
             createdAt: b.createdAt,
@@ -402,11 +458,10 @@ function finishPlan(
     }));
 
     const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => ({
-              ord,
-              key,
-              content: JSON.stringify(value),
-          }))
+        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => {
+              const content = JSON.stringify(value);
+              return { ord, key, content, contentHash: sha256Hex(content) };
+          })
         : [];
 
     const kstate: Record<string, unknown> = {};
@@ -473,28 +528,28 @@ export function completeBlockContents(
     return out;
 }
 
-export function loadLegacyView(
-    rows: {
-        session: {
-            sessionId: string;
-            createdAt: number;
-            updatedAt: number;
-            nextBlockId: number;
-            nextRunId: number;
-            metaJson: string;
-            statsJson: string;
-            metadataJson: string;
-            kstateJson: string;
-            tailJson: string;
-            ccrJson: string | null;
-            orphansJson?: string | null;
-        };
-        messages: { seq: number; msgId: string; ref: string | null; content: string }[];
-        blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
-        deadRefs: { ord: number; ref: string }[];
-        refs: { ord: number; rawId: string; ref: string }[];
-    },
-): {
+interface LegacyViewRows {
+    session: {
+        sessionId: string;
+        createdAt: number;
+        updatedAt: number;
+        nextBlockId: number;
+        nextRunId: number;
+        metaJson: string;
+        statsJson: string;
+        metadataJson: string;
+        kstateJson: string;
+        tailJson: string;
+        ccrJson: string | null;
+        orphansJson?: string | null;
+    };
+    messages: { seq: number; msgId: string; ref: string | null; content: string }[];
+    blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
+    deadRefs: { ord: number; ref: string }[];
+    refs: { ord: number; rawId: string; ref: string }[];
+}
+
+interface LegacyView {
     id: string;
     createdAt: number;
     lastSeen: number;
@@ -509,105 +564,147 @@ export function loadLegacyView(
     contentStore?: LegacySessionLike["contentStore"];
     /** #4390: tail/pluginSnapshot pointers whose backing row is missing. */
     tailGaps?: number;
-} {
-    const s = rows.session;
-    const kstate = JSON.parse(s.kstateJson) as Record<string, unknown>;
-    const tail = JSON.parse(s.tailJson) as {
-        pluginSnapshotSeqs: number[] | null;
-        tailSeqs: number[] | null;
-        tailFolded: boolean;
-    };
+}
 
-    // messageRefs rebuilt from the ref ledger verbatim: ord preserves the
-    // persisted map's key order (digest-sensitive), and ghost ids survive
-    // even though no message row backs them (#2362 Kernel Contract).
-    const byRaw: Record<string, string> = {};
-    const byRef: Record<string, string> = {};
-    for (const r of rows.refs) {
-        byRaw[r.rawId] = r.ref;
-        // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
-        // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
-        // mints a key the persisted state never had (#2671 soak: sub-agent
-        // sessions with protected messages drifted on every save).
-        if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
-    }
+type BlockContents = LegacyView["blockContents"];
 
-    const state: Record<string, unknown> = {};
-    for (const field of MERGE_STATE_FIELDS) {
-        switch (field) {
-            case "blocks":
-                state.blocks = rows.blocks.map((b) => JSON.parse(b.payloadJson));
-                break;
-            case "messageRefs":
-                state.messageRefs = { byRaw, byRef };
-                break;
-            case "deadRefs":
-                state.deadRefs = rows.deadRefs.length > 0 ? rows.deadRefs.map((d) => d.ref) : undefined;
-                break;
-            case "nextBlockId":
-                state.nextBlockId = s.nextBlockId;
-                break;
-            case "nextRunId":
-                state.nextRunId = s.nextRunId;
-                break;
-            default:
-                if (kstate[field] !== undefined) state[field] = kstate[field];
-                break;
-        }
-    }
-
-    const blockContents = new Map<string, { one: BlockView | null; full: BlockView }>();
-    for (const b of rows.blocks) {
-        blockContents.set(b.blockId, {
+/** Shared by full-view and resident-field reads; each page is released after parsing. */
+export function appendBlockContents(contents: BlockContents, rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[]): void {
+    for (const b of rows) {
+        contents.set(b.blockId, {
             one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
             full: JSON.parse(b.summary) as BlockView,
         });
     }
-    // #3841 reap journal: journal'd orphan contents (reaped blocks) ride
-    // blockContents so the derived-decompress fallback survives restarts —
-    // WITHOUT resurrecting state.blocks (the reaped entries stay reaped).
-    if (s.orphansJson !== null && s.orphansJson !== undefined && s.orphansJson !== "") {
+}
+
+export function mergeOrphanBlockContents(contents: BlockContents, orphansJson: string | null | undefined): void {
+    // Reaped originals survive without resurrecting their state.blocks rows.
+    if (orphansJson !== null && orphansJson !== undefined && orphansJson !== "") {
         try {
-            const orphans = JSON.parse(s.orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
+            const orphans = JSON.parse(orphansJson) as Record<string, { one: BlockView | null; full: BlockView }>;
             for (const [blockId, view] of Object.entries(orphans)) {
-                if (!blockContents.has(blockId)) blockContents.set(blockId, view);
+                if (!contents.has(blockId)) contents.set(blockId, view);
             }
         } catch {
             // corrupt journal → skip; the JSON envelope still carries the text
         }
     }
+}
 
-    const messagesBySeq = new Map(rows.messages.map((m) => [m.seq, JSON.parse(m.content) as CoreMessage]));
-    // #4390: a tail pointer whose row is gone used to be silently filtered
-    // out — the view shrank with no trace. Count the gaps so callers can
-    // warn (persist logs them); the surviving members still load.
-    let tailGaps = 0;
-    const resolveSeqs = (seqs: number[]): CoreMessage[] => {
-        const out: CoreMessage[] = [];
-        for (const seq of seqs) {
-            const m = messagesBySeq.get(seq);
-            if (m === undefined) tailGaps++;
-            else out.push(m);
+/** Incremental cold-load assembly keeps raw CAS strings to one page at a time. */
+export class LegacyViewBuilder {
+    readonly messageSeqs: number[];
+    private readonly tail: {
+        pluginSnapshotSeqs: number[] | null;
+        tailSeqs: number[] | null;
+        tailFolded: boolean;
+    };
+    private readonly state: Record<string, unknown> = {};
+    private readonly blocks: unknown[] = [];
+    private readonly blockContents: BlockContents = new Map();
+    private readonly messagesBySeq = new Map<number, CoreMessage>();
+
+    constructor(
+        private readonly session: LegacyViewRows["session"],
+        refs: LegacyViewRows["refs"],
+        deadRefs: LegacyViewRows["deadRefs"],
+    ) {
+        const kstate = JSON.parse(session.kstateJson) as Record<string, unknown>;
+        this.tail = JSON.parse(session.tailJson);
+        this.messageSeqs = [...new Set([...(this.tail.tailSeqs ?? []), ...(this.tail.pluginSnapshotSeqs ?? [])])];
+
+        // messageRefs rebuilt from the ref ledger verbatim: ord preserves the
+        // persisted map's key order (digest-sensitive), and ghost ids survive
+        // even though no message row backs them (#2362 Kernel Contract).
+        const byRaw: Record<string, string> = {};
+        const byRef: Record<string, string> = {};
+        for (const r of refs) {
+            byRaw[r.rawId] = r.ref;
+            // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
+            // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
+            // mints a key the persisted state never had (#2671 soak: sub-agent
+            // sessions with protected messages drifted on every save).
+            if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
         }
-        return out;
-    };
-    const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
-    const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
 
-    const out: ReturnType<typeof loadLegacyView> = {
-        id: s.sessionId,
-        createdAt: s.createdAt,
-        lastSeen: s.updatedAt,
-        tailGaps,
-        meta: JSON.parse(s.metaJson),
-        stats: JSON.parse(s.statsJson),
-        metadata: JSON.parse(s.metadataJson),
-        state,
-        blockContents,
-        lastMessages,
-        lastMessagesFolded: tail.tailFolded,
-    };
-    if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-    if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
-    return out;
+        const state = this.state;
+        for (const field of MERGE_STATE_FIELDS) {
+            switch (field) {
+                case "blocks":
+                    state.blocks = this.blocks;
+                    break;
+                case "messageRefs":
+                    state.messageRefs = { byRaw, byRef };
+                    break;
+                case "deadRefs":
+                    state.deadRefs = deadRefs.length > 0 ? deadRefs.map((d) => d.ref) : undefined;
+                    break;
+                case "nextBlockId":
+                    state.nextBlockId = session.nextBlockId;
+                    break;
+                case "nextRunId":
+                    state.nextRunId = session.nextRunId;
+                    break;
+                default:
+                    if (kstate[field] !== undefined) state[field] = kstate[field];
+                    break;
+            }
+        }
+    }
+
+    addBlocks(rows: LegacyViewRows["blocks"]): void {
+        for (const b of rows) this.blocks.push(JSON.parse(b.payloadJson));
+        appendBlockContents(this.blockContents, rows);
+    }
+
+    addMessages(rows: LegacyViewRows["messages"]): void {
+        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+    }
+
+    finish(): LegacyView {
+        const s = this.session;
+        const tail = this.tail;
+        mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        // #4390: a tail pointer whose row is gone used to be silently filtered
+        // out — the view shrank with no trace. Count the gaps so callers can
+        // warn (persist logs them); the surviving members still load.
+        let tailGaps = 0;
+        const resolveSeqs = (seqs: number[]): CoreMessage[] => {
+            const out: CoreMessage[] = [];
+            for (const seq of seqs) {
+                const m = this.messagesBySeq.get(seq);
+                if (m === undefined) tailGaps++;
+                else out.push(m);
+            }
+            return out;
+        };
+        const lastMessages = tail.tailSeqs ? resolveSeqs(tail.tailSeqs) : undefined;
+        const pluginSnapshot = tail.pluginSnapshotSeqs ? resolveSeqs(tail.pluginSnapshotSeqs) : undefined;
+
+        const out: LegacyView = {
+            id: s.sessionId,
+            createdAt: s.createdAt,
+            lastSeen: s.updatedAt,
+            tailGaps,
+            meta: JSON.parse(s.metaJson),
+            stats: JSON.parse(s.statsJson),
+            metadata: JSON.parse(s.metadataJson),
+            state: this.state,
+            blockContents: this.blockContents,
+            lastMessages,
+            lastMessagesFolded: tail.tailFolded,
+        };
+        if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
+        if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
+        return out;
+    }
+}
+
+/** Compatibility wrapper for callers that already hold all rows. */
+export function loadLegacyView(rows: LegacyViewRows): LegacyView {
+    const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
+    builder.addBlocks(rows.blocks);
+    builder.addMessages(rows.messages);
+    return builder.finish();
 }

@@ -34,6 +34,8 @@ import {
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
+    applyAuxProxyHandoff,
+    childNamesProxy,
     buildIflowEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
@@ -86,6 +88,7 @@ import {
     resolveNodeRuntime,
     probeNodeWrapperTarget,
     probeNodeMajor,
+    probeNodeIdentity,
     MIN_PROXY_NODE_MAJOR,
     stopProxy,
     stopProxyGuarded,
@@ -295,10 +298,11 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
     assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
 });
 
-test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
+test("buildClaudeEnv: no HTTPS_PROXY + no NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
-    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.HTTPS_PROXY, undefined);
+    assert.equal(env.HTTP_PROXY, undefined);
+    assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
     assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.ANTHROPIC_API_KEY, "sk-x");
@@ -548,6 +552,99 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         else process.env.PI_BIN = prevPiBin;
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        rmrf(home);
+    }
+});
+
+// #5428: -s pi pins the proxy posture on the child. cli.ts records the pin as
+// overrides.BILI_PI_INLINE="0"; the launch path must layer it onto the child
+// env — stripInheritedProxy does NOT touch BILI_PI_INLINE, so without this a
+// hostile inherited BILI_PI_INLINE=1 would still arm the in-process engine in
+// the child while THIS launch's proxy sits idle.
+test("runLaunch pi #5428: -s posture override reaches the child env over a hostile inherited inline var", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pis-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiBin = process.env.PI_BIN;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    const prevInline = process.env.BILI_PI_INLINE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    // Hostile inheritance: the user's shell exported the inline opt-in.
+    process.env.BILI_PI_INLINE = "1";
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    process.env.PI_BIN = fakePi;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: {} }));
+
+    // runLaunch only injects -e when dist/agent/pi.js exists; create a stub
+    // when running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const childEnvs: NodeJS.ProcessEnv[] = [];
+    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+        if (cmd === fakePi) {
+            childEnvs.push({ ...(options?.env ?? {}) });
+            // runClient resolves on "exit" — fire it on next tick.
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const fetchHealthInfo = async () => ({ ok: true, pid: 42422 });
+
+    // runLaunch ends with process.exit() — stub it or it kills the test
+    // runner and every test registered after this one silently never runs.
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        // Control: without the pin the hostile inheritance reaches the child.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[0]?.BILI_PI_INLINE, "1", "inherited inline var still reaches the child without -s");
+
+        // -s pi: the pin must beat the inheritance in the child env.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: { BILI_PI_INLINE: "0" } },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[1]?.BILI_PI_INLINE, "0", "-s pin overrides the inherited inline var for the child");
+        assert.deepEqual(exitCalls, [0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevPiBin === undefined) delete process.env.PI_BIN;
+        else process.env.PI_BIN = prevPiBin;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
+        else process.env.BILI_PI_INLINE = prevInline;
         if (stubbed) fs.rmSync(distAgent, { force: true });
         rmrf(home);
     }
@@ -2981,7 +3078,7 @@ test("discoverRoutes: claude with http ANTHROPIC_BASE_URL → httpRewrites entry
     ]);
 });
 
-test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; undici ignores HTTPS_PROXY)", () => {
+test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; loopback NO_PROXY merged by buildClientEnv, #3446)", () => {
     const routes = discoverRoutes("claude", {});
     assert.deepEqual(routes.httpsDomains, []);
     assert.deepEqual(routes.httpsRewrites, []);
@@ -3244,20 +3341,78 @@ test("buildCodexArgs: #2281 `resume` with no trailing prompt still anchors the r
     );
 });
 
-test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
+test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env, no proxy env", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
     ];
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
-    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.HTTPS_PROXY, undefined);
+    assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/anthropic");
 });
 
 test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL unset", () => {
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.HTTPS_PROXY, undefined);
+});
+
+// The child's own proxy env is a pass-through on this lane: it is the user's,
+// and model traffic goes to loopback, so nothing here can hijack the model leg.
+test("buildClaudeEnv: a shell proxy in baseEnv rides through untouched", () => {
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", HTTPS_PROXY: "http://user.local:8080", ALL_PROXY: "http://user.local:8081" });
+    assert.equal(env.HTTPS_PROXY, "http://user.local:8080");
+    assert.equal(env.ALL_PROXY, "http://user.local:8081");
+    assert.equal(env.HTTP_PROXY, undefined);
+});
+
+// The egress handoff that replaces the leaked HTTPS_PROXY: a child with no proxy
+// env of its own gets the instance's aux proxy instead, and a child that already
+// has one is left strictly alone (no probe, no rewrite, no log line).
+test("childNamesProxy: any scheme, either case, counts as a configured child", () => {
+    assert.equal(childNamesProxy({}), false);
+    assert.equal(childNamesProxy({ PATH: "/usr/bin", HTTPS_PROXY: "  " }), false, "blank is not a proxy");
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+        assert.equal(childNamesProxy({ [key]: "http://user.local:8080" }), true, key);
+    }
+});
+
+test("applyAuxProxyHandoff: no proxy env of its own → both variables get the aux proxy", async () => {
+    const base: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
+    const env = await applyAuxProxyHandoff(base, "http://127.0.0.1:8787", async () => ({ ok: true, auxProxy: "http://aux.local:3128", auxProxySource: "httpsProxy" }));
+    assert.equal(env.HTTP_PROXY, "http://aux.local:3128");
+    assert.equal(env.HTTPS_PROXY, "http://aux.local:3128");
+    assert.equal(env.PATH, "/usr/bin");
+    assert.equal(base.HTTP_PROXY, undefined, "input env untouched");
+});
+
+test("applyAuxProxyHandoff: a child that names a proxy is left alone and never probed", async () => {
+    let probes = 0;
+    const fetchHealth = async () => {
+        probes++;
+        return { ok: true, auxProxy: "http://aux.local:3128" };
+    };
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+        const env = await applyAuxProxyHandoff({ [key]: "http://user.local:8080" }, "http://127.0.0.1:8787", fetchHealth);
+        assert.deepEqual(env, { [key]: "http://user.local:8080" }, key);
+    }
+    assert.equal(probes, 0, "no health round trip when the child already has a proxy");
+});
+
+test("applyAuxProxyHandoff: nothing to hand over → env unchanged, never bili's own origin", async () => {
+    const origin = "http://127.0.0.1:8787";
+    const cases: Array<[string, () => Promise<{ ok: boolean; auxProxy?: string } | undefined>]> = [
+        ["pre-handoff build (no field)", async () => ({ ok: true })],
+        ["probe failed", async () => undefined],
+        ["probe threw", async () => Promise.reject(new Error("boom"))],
+    ];
+    for (const [label, fetchHealth] of cases) {
+        const env: NodeJS.ProcessEnv = await applyAuxProxyHandoff({ PATH: "/usr/bin" }, origin, fetchHealth);
+        // a copy: assert.deepEqual is an assertion function and would narrow `env`
+        const got: NodeJS.ProcessEnv = { ...env };
+        assert.deepEqual(got, { PATH: "/usr/bin" }, label);
+        assert.notEqual(env.HTTPS_PROXY, origin, "routing the child back through bili is the leak, not the fix");
+    }
 });
 
 // Vertex port, phase 1 (decision 7): the Vertex variable is ADDITIVE. Both keys
@@ -3272,7 +3427,7 @@ test("buildClaudeEnv: Vertex route → ANTHROPIC_VERTEX_BASE_URL protocol-wrappe
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
     assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
-    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.HTTPS_PROXY, undefined);
 });
 
 test("buildClaudeEnv: Vertex off (no Vertex rewrite) → the key stays unset, never mirrored from the primary", () => {
@@ -3293,6 +3448,58 @@ test("buildIflowEnv: alias key still mirrors the primary rewrite (no per-key reg
     const env = buildIflowEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
     assert.equal(env.IFLOW_BASE_URL, "http://127.0.0.1:8787/bili/https://apis.iflow.cn/v1");
     assert.equal(env.IFLOW_baseUrl, env.IFLOW_BASE_URL);
+});
+
+test("buildClaudeEnv: /bili/-wrapped ANTHROPIC_BASE_URL → NO_PROXY/no_proxy loopback merge (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+});
+
+test("buildClaudeEnv: NO_PROXY merge unions both case variants, preserves user entries, dedupes (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], {
+        PATH: "/usr/bin",
+        NO_PROXY: "corp.example.com, 10.0.0.5 ",
+        no_proxy: "localhost,internal.corp",
+    });
+    assert.equal(env.NO_PROXY, "corp.example.com,10.0.0.5,localhost,internal.corp,127.0.0.1,::1");
+    assert.equal(env.no_proxy, env.NO_PROXY);
+});
+
+test("buildClaudeEnv: NO_PROXY already covering all loopback hosts → value unchanged (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], {
+        PATH: "/usr/bin",
+        NO_PROXY: "localhost,127.0.0.1,::1",
+    });
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
+});
+
+test("buildClaudeEnv: httpsRewrites raw upstream wins → no NO_PROXY merge (#3446)", () => {
+    const httpsRewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://relay.local/anthropic" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], httpsRewrites, { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "https://relay.local/anthropic");
+    assert.equal(env.NO_PROXY, undefined);
+    assert.equal(env.no_proxy, undefined);
+});
+
+test("buildCodexEnv: no base-URL lane → NO_PROXY untouched even with proxy set (#3446)", () => {
+    const env = buildCodexEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NO_PROXY, undefined);
+    assert.equal(env.no_proxy, undefined);
 });
 
 test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-free routing)", () => {
@@ -3944,6 +4151,72 @@ test("parseHermesYaml: v12 dict base_url/url forms + base_url wins over api", ()
         "    base_url: http://fresh:1/v1",
     ].join("\n"));
     assert.equal(priority.providers.p?.api, "http://fresh:1/v1", "base_url beats api (hermes priority)");
+});
+
+test("parseHermesYaml: top-level base_url next to provider: is the stock config shape (#6022)", () => {
+    // Stock Hermes config: no providers map — provider + endpoint at the root.
+    const stock = parseHermesYaml([
+        "provider: nous",
+        "model: qwen3.8-27b",
+        'base_url: "https://inference-api.example.com/v1"',
+    ].join("\n"));
+    assert.equal(stock.providers.nous?.api, "https://inference-api.example.com/v1",
+        "top-level base_url attributes to the active provider");
+
+    // No provider name → synthetic entry; url/api key forms work too.
+    const unnamed = parseHermesYaml("url: https://u.example.com/v1\n");
+    assert.equal(unnamed.providers["top-level"]?.api, "https://u.example.com/v1");
+    const apiForm = parseHermesYaml("provider: p\napi: http://a:1/v1\n");
+    assert.equal(apiForm.providers.p?.api, "http://a:1/v1");
+
+    // Coexists with a providers map: keep BOTH hosts routable rather than
+    // guessing which shape wins (a missing whitelist entry = blind tunnel).
+    const mixed = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  beta:",
+        "    base_url: https://beta.example.com/v1",
+        "base_url: https://alpha.example.com/v1",
+    ].join("\n"));
+    assert.equal(mixed.providers.beta?.api, "https://beta.example.com/v1");
+    assert.equal(mixed.providers.alpha?.api, "https://alpha.example.com/v1",
+        "active provider has no own entry → top-level URL lands under its name");
+
+    // Active provider DOES have an entry with a different URL: never overwrite.
+    const both = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://map.example.com/v1",
+        "base_url: https://top.example.com/v1",
+    ].join("\n"));
+    assert.equal(both.providers.alpha?.api, "https://map.example.com/v1", "existing entry survives");
+    assert.equal(both.providers["top-level"]?.api, "https://top.example.com/v1");
+
+    // Same URL in both shapes → deduped to one entry.
+    const dup = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://same.example.com/v1",
+        "base_url: https://same.example.com/v1",
+    ].join("\n"));
+    assert.deepEqual(Object.keys(dup.providers).sort(), ["alpha"]);
+});
+
+test("parseHermesYaml: quoted endpoint values survive (new URL() rejects quotes)", () => {
+    const q = parseHermesYaml([
+        "providers:",
+        "  bili:",
+        '    base_url: "http://127.0.0.1:8199/v1"',
+        "custom_providers:",
+        "  - name: sg",
+        "    url: 'http://s:1/v1'",
+        '  - api: "http://inline:1/v1"',
+    ].join("\n"));
+    assert.equal(q.providers.bili?.api, "http://127.0.0.1:8199/v1", "dict nested, double-quoted");
+    assert.equal(q.providers.sg?.api, "http://s:1/v1", "list nested, single-quoted");
+    assert.equal(q.providers["custom-1"]?.api, "http://inline:1/v1", "list inline, double-quoted");
 });
 
 test("readHermesConfig + resolveHermesHome", () => {
@@ -4892,6 +5165,117 @@ test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", ()
     assert.ok(lower.endsWith("node") || lower.endsWith("node.exe"), `expected a node path, got ${out}`);
 });
 
+test("probeNodeIdentity: the running Node reports its own execPath and no electron version; missing executable yields undefined (#5663)", () => {
+    const id = probeNodeIdentity(process.execPath, { ...process.env });
+    assert.ok(id !== undefined, "expected an identity for the running node");
+    assert.equal(id!.execPath.toLowerCase(), process.execPath.toLowerCase());
+    assert.equal(id!.electron, undefined);
+    assert.equal(probeNodeIdentity("/definitely/not/a/node", { ...process.env }), undefined);
+});
+
+test("resolveNodeRuntime: an Electron-as-node shim named node is rejected although --version passes (#5663)", () => {
+    // The field failure: PATH's first `node` is another desktop app's
+    // ELECTRON_RUN_AS_NODE shim answering v24.x to --version. Pre-fix it was
+    // accepted and the daemon ran under a foreign bundle whose owner app holds
+    // no Local Network grant → every LAN upstream connect died EHOSTUNREACH.
+    const shim = "/opt/host/bin/node";
+    const env = { PATH: "/opt/host/bin" };
+    const exists = (p: string): boolean => p === shim;
+    const probeNodeStub = (): number | undefined => 24;
+    const probeIdentityStub = (): { execPath: string; electron?: string } | undefined => ({
+        execPath: "/Applications/Other App.app/Contents/MacOS/Other App",
+        electron: "33.0.0",
+    });
+    // Electron host: the shim is skipped, nothing else exists → host-binary fallback, NOT the shim
+    assert.equal(
+        resolveNodeRuntime(
+            "/Applications/Host App.app/Contents/MacOS/Host App",
+            env,
+            "darwin",
+            exists,
+            "33.0.0",
+            undefined,
+            probeNodeStub,
+            probeIdentityStub,
+        ),
+        "/Applications/Host App.app/Contents/MacOS/Host App",
+    );
+    // non-Electron host: nothing usable resolves → actionable throw, not a doomed spawn
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", env, "linux", exists, undefined, undefined, probeNodeStub, probeIdentityStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: scanning continues past a rejected Electron shim to a real Node later (#5663)", () => {
+    const shim = "C:/shims/node.exe";
+    const real = "C:/Program Files/nodejs/node.exe";
+    const exists = (p: string): boolean => p === shim || p === real;
+    const probeNodeStub = (): number | undefined => 24;
+    const probeIdentityStub = (c: string): { execPath: string; electron?: string } | undefined =>
+        c === shim
+            ? { execPath: "C:/Users/x/AppData/Local/Programs/OtherApp/OtherApp.exe", electron: "33.0.0" }
+            : { execPath: real };
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/Users/x/AppData/Local/Programs/HostApp/HostApp.exe",
+            { PATH: "C:/shims;C:/Program Files/nodejs" },
+            "win32",
+            exists,
+            "33.0.0",
+            undefined,
+            probeNodeStub,
+            probeIdentityStub,
+        ),
+        real,
+    );
+});
+
+test("resolveNodeRuntime: an Electron-as-node shim of the HOST's own binary is accepted, like the sanctioned fallback (#5663)", () => {
+    const shim = "/opt/host/bin/node";
+    const host = "/Applications/Host App.app/Contents/MacOS/Host App";
+    const exists = (p: string): boolean => p === shim;
+    const probeIdentityStub = (): { execPath: string; electron?: string } | undefined => ({
+        execPath: host.toUpperCase().replace("HOST APP", "Host App"), // same file, case drift (APFS is case-insensitive)
+        electron: "33.0.0",
+    });
+    assert.equal(
+        resolveNodeRuntime(host, { PATH: "/opt/host/bin" }, "darwin", exists, "33.0.0", undefined, () => 24, probeIdentityStub),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: an unprovable identity keeps the pre-#5663 version-only verdict (fail-open)", () => {
+    const exotic = "/opt/host/bin/node";
+    const exists = (p: string): boolean => p === exotic;
+    // identity probe fails (timeout / non-JSON output) → old behavior stands
+    assert.equal(
+        resolveNodeRuntime("/usr/bin/opencode", { PATH: "/opt/host/bin" }, "linux", exists, undefined, undefined, () => 22, () => undefined),
+        exotic,
+    );
+});
+
+test("resolveNodeRuntime: a #1887 re-exec wrapper landing on real Node still passes the identity gate (#5663/#1887)", () => {
+    const wrapper = "C:/shims/node.exe";
+    const real = "C:/mise/installs/node-22.11.0/bin/node.exe";
+    const exists = (p: string): boolean => p === wrapper || p === real;
+    const probeIdentityStub = (c: string): { execPath: string; electron?: string } | undefined =>
+        c === real ? { execPath: real } : undefined;
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/opencode/opencode.exe",
+            { PATH: "C:/shims" },
+            "win32",
+            exists,
+            undefined,
+            () => real,
+            () => 22,
+            probeIdentityStub,
+        ),
+        real,
+    );
+});
+
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
     let spawnedCmd: string | null = null;
     const spawnImpl: SpawnFn = (cmd) => {
@@ -5670,6 +6054,16 @@ test("buildCodebuddyEnv: no CODEBUDDY_BASE_URL rewrite → env.CODEBUDDY_BASE_UR
     const env = buildCodebuddyEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.CODEBUDDY_BASE_URL, undefined);
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("buildCodebuddyEnv: /bili/-wrapped CODEBUDDY_BASE_URL → NO_PROXY/no_proxy loopback merge (#3446)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "CODEBUDDY_BASE_URL", realUpstream: "https://api.codebuddy.cn/v2" },
+    ];
+    const env = buildCodebuddyEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.CODEBUDDY_BASE_URL, "http://127.0.0.1:8787/bili/https://api.codebuddy.cn/v2");
+    assert.equal(env.NO_PROXY, "localhost,127.0.0.1,::1");
+    assert.equal(env.no_proxy, "localhost,127.0.0.1,::1");
 });
 
 test("discoverRoutes: codebuddy default → CODEBUDDY_BASE_URL /bili/ rewrite (CN platform endpoint)", () => {
@@ -6686,10 +7080,20 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
     return clientEnvs[0]!;
 }
 
-function assertInheritedProxyStripped(seenEnv: NodeJS.ProcessEnv, origin: string): void {
+function assertInheritedProxyStripped(
+    seenEnv: NodeJS.ProcessEnv,
+    origin: string,
+    launcherOwned?: Partial<Record<"NO_PROXY" | "no_proxy", string>>,
+): void {
     assert.equal(seenEnv.HTTPS_PROXY, origin, "HTTPS_PROXY points at bili");
     for (const k of INHERITED_PROXY_TEST_VARS) {
         if (k === "HTTPS_PROXY") continue;
+        if ((k === "NO_PROXY" || k === "no_proxy") && launcherOwned && k in launcherOwned) {
+            // #3446: base-URL lanes get a launcher-owned loopback NO_PROXY value;
+            // inherited entries must still be gone from it.
+            assert.equal(seenEnv[k], launcherOwned[k], `${k} carries only the launcher-owned value`);
+            continue;
+        }
         assert.equal(seenEnv[k], undefined, `inherited ${k} stripped`);
     }
     assert.equal(seenEnv.BILI_TEST_MARKER, "keep", "unrelated env vars preserved");
@@ -6740,8 +7144,13 @@ test("runLaunch codebuddy: inherited proxy vars stripped so loopback traffic can
     const seenEnv = await captureLaunchedClientEnv("codebuddy");
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
     assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
-    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
-    assertInheritedProxyStripped(seenEnv, String(origin));
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CERTS));
+    // #3446: codebuddy's base URL is bili's own /bili/ loopback form, so the launcher
+    // injects the loopback NO_PROXY triple; the inherited ".corp" entries stay stripped.
+    assertInheritedProxyStripped(seenEnv, String(origin), {
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        no_proxy: "localhost,127.0.0.1,::1",
+    });
 });
 
 async function runAiderLaunch(
@@ -7443,6 +7852,16 @@ test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), i
     assertInheritedProxyStripped(seenEnv, String(origin));
 });
 
+test("runLaunch kiro: cert-MITM env (HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS), inherited proxy stripped", async () => {
+    const seenEnv = await captureLaunchedClientEnv("kiro");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    const combined = path.join("billion-context", "ca", "combined-ca.pem");
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(combined), String(seenEnv.SSL_CERT_FILE));
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(combined), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin), { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" });
+});
+
 test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
     const seenEnv = await captureLaunchedClientEnv("amp");
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
@@ -7692,7 +8111,7 @@ test("default attach diagnostics go to the log file, never the terminal (#3200)"
         assert.equal(dbg, undefined);
         assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
         assert.ok(stderrWrites[0]!.includes("code-fingerprint-mismatch"), stderrWrites[0]);
-        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] native-attach: skip /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+ \[info\] \[v=\d+\.\d+\.\d+\] native-attach: skip /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
         const content2 = fs.readFileSync(logFile, "utf8");
         assert.equal(content2.split("code-fingerprint-mismatch").length - 1, 2, "one file line per run");
     } finally {
@@ -7890,7 +8309,7 @@ test("explicit debug keeps one controlled stderr copy of the attach banner (#340
         assert.equal(handle.attached, true);
         assert.equal(stderrWrites.length, 1, `debug stderr was: ${JSON.stringify(stderrWrites)}`);
         assert.ok(stderrWrites[0]!.includes("bili: attaching to running proxy at http://127.0.0.1:8787"), stderrWrites[0]);
-        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[info\] \[v=\d+\.\d+\.\d+\] /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
+        assert.ok(/^\d{4}-\d{2}-\d{2}T[\d:.]+ \[info\] \[v=\d+\.\d+\.\d+\] /.test(stderrWrites[0]!), `head format: ${stderrWrites[0]}`);
     });
 });
 
@@ -8050,7 +8469,7 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
 // first read sees nothing, so the #1753 squatter branch provably fires before
 // the handshake settles (gating on read count taken AT SPAWN, immune to
 // however many times pre-spawn discovery reads the file).
-const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin; if that never happens, kill pid 875250 or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead";
 function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
     let childToken = "";
     let preSpawnReads = -1;
@@ -8167,7 +8586,7 @@ test("ensureProxyRunning explicit debug: squatter diagnostic keeps one controlle
             const scenario = makeSquatterScenario(true);
             const handle = await ensureProxyRunning(scenario.opts, scenario.deps);
             assert.equal(handle.origin, "http://127.0.0.1:18790");
-            const expected = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z \\[info\\] \\[v=[^\\]]+\\] ${SQUATTER_MSG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
+            const expected = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T[0-9:.]+ \\[info\\] \\[v=[^\\]]+\\] ${SQUATTER_MSG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);
             const hits = writes.filter((w) => w.includes("but is not the proxy this launcher spawned"));
             assert.equal(hits.length, 1, `expected exactly one terminal line, got: ${JSON.stringify(writes)}`);
             assert.ok(expected.test(hits[0].trimEnd()), `stderr line format drifted: ${JSON.stringify(hits[0])}`);

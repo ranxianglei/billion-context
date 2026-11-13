@@ -28,6 +28,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession } from "../src/session.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { clampOutgoingOutput, dshLedgerFloorTokens } from "../src/server/budget.ts";
 import { DSH_COMPACTION_INSTRUCTION_PREFIX } from "../src/server/dsh-compaction-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -85,7 +86,7 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
     return { server, calls };
 }
 
-function proxyOptions(routes: Record<string, object>): ProxyOptions {
+function proxyOptions(routes: Record<string, object>, overrides?: Partial<ProxyOptions>): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
@@ -112,19 +113,20 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
         releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         mitm: { enabled: false, domains: [] },
+        ...overrides,
     } as ProxyOptions;
 }
 
 type Ctx = { url: string; headers: Record<string, string>; upstreamPort: number };
 
-async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
+async function setup(overrides?: Partial<ProxyOptions>): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream();
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: WINDOW } } } }));
+    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: WINDOW } } } }, overrides));
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
@@ -320,4 +322,55 @@ test("e2e #2490 c: an experiment-sized payload still probes (control — #2313/#
     } finally {
         await close();
     }
+});
+
+// ---------------------------------------------------------------------------
+// (d) #4079: the doomed 413 logs whether the payload GREW or REPEATED
+
+async function runDoomedScenario(
+    sessionId: string,
+    messages: Array<{ role: string; content: string }>,
+): Promise<{ status: number; profiles: string[] }> {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-4079-"));
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    try {
+        const { ctx, close } = await setup({ log: true, logFile: path.join(root, "bili.log") });
+        try {
+            await seedStuckMeter(ctx, sessionId);
+            const r = await post(ctx, messages);
+            const body = await r.text();
+            return { status: r.status, profiles: lines.filter((l) => l.includes("core-text profile")) };
+        } finally {
+            await close();
+        }
+    } finally {
+        setLogCapture(null);
+        rmrf(root);
+    }
+}
+
+test("e2e #4079: the doomed 413 logs one core-text profile line, reading an all-distinct payload as GROWN", async () => {
+    // Same shape as (b): 500 msgs × 4.4K chars ≈ 2.2MB core text — but every
+    // message is unique (`turn i:` prefix), so the ratio must read near zero:
+    // the payload grew by content, not by repetition.
+    const { status, profiles } = await runDoomedScenario("s-4079-grew", bigMessages(500, 4_400));
+    assert.equal(status, 413, "still fails fast on the same bars");
+    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
+    assert.match(profiles[0]!, /\d+ message\(s\), \d+B core over \d+ distinct text\(s\), \d+B unique/);
+    assert.match(profiles[0]!, /duplicateRatio=0\.0\d{2}/, "unique-per-message payload → growth, not repetition");
+});
+
+test("e2e #4079: the doomed 413 reads a repeated-text payload as REPEATED (the #4079 incident shape)", async () => {
+    const blob = "r".repeat(4_400);
+    const { status, profiles } = await runDoomedScenario("s-4079-repeat", Array.from({ length: 500 }, () => ({ role: "user", content: blob })));
+    assert.equal(status, 413, "the identical byte mass still trips the same bars");
+    assert.equal(profiles.length, 1, "exactly one profile line accompanies the refusal");
+    assert.match(profiles[0]!, /duplicateRatio=0\.9\d{2}/, "one blob repeated 500× → repetition, not growth");
+});
+
+test("e2e #4079: the non-doomed probe forward logs NO profile line (negative direction, #3617)", async () => {
+    const { status, profiles } = await runDoomedScenario("s-4079-control", bigMessages());
+    assert.equal(status, 200, "experiment-sized payload still probes (#2313/#1001 preserved)");
+    assert.equal(profiles.length, 0, "the diagnostic only fires on the refusal path, never on the hot path");
 });

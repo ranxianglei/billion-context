@@ -8,6 +8,13 @@ import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
+// This suite exercises the LEGACY ENVELOPE convergence machinery (rollback /
+// stale-snapshot guards against the on-disk JSON record). The storage default
+// flipped to pure-sqlite (index-only, no envelope) — pin explicit dual-write
+// so the envelopes these assertions read keep being written.
+process.env.BILI_STORAGE_UNIFIED = "full";
+process.env.BILI_STORAGE_JSON_WRITER = "1";
+
 function makeSession(id: string): Session {
     return {
         id,
@@ -36,7 +43,7 @@ function withTempStore(name: string, fn: (store: SessionStore, dir: string, warn
         try {
             await fn(store, dir, warnings);
         } finally {
-            store.cancelAll();
+            store.closeQuietly();
             rmrf(dir);
         }
     }) as unknown as Promise<void>;

@@ -10,6 +10,7 @@ entries:
     site_group: diag
     desc_en: "Local troubleshooting knobs (dumps, render/injection toggles, count-tokens passthrough)."
     desc_zh: "本地排障旋钮（转储、渲染/注入开关、count-tokens 透传）。"
+    desc_ja: "ローカルトラブルシューティング用ノブ（ダンプ、レンダリング/インジェクションのトグル、count-tokens のパススルー）。"
     site_en: "<code>diagnostics</code> — local troubleshooting knobs: <span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol \"tools\"</span>."
     site_zh: "<code>diagnostics</code> —— 本地排障旋钮：<span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol \"tools\"</span>。"
   - key: diagnostics.dumpBody
@@ -17,15 +18,17 @@ entries:
     default: "false"
     env: ACP_DUMP_BODY
     group: diagnostics
-    desc_en: "Dump full request/response bodies to the log for troubleshooting."
-    desc_zh: "把完整请求/响应体转储到日志用于排障。"
+    desc_en: "Dump full request/response bodies to the log for troubleshooting. Dumps are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把完整请求/响应体转储到日志用于排障。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
+    desc_ja: "トラブルシューティングのために、完全なリクエスト/レスポンスボディをログにダンプします。ダンプは PLAINTEXT であり、認証情報が含まれる可能性があります — 共有前にスクラブしてください（#4482）。"
   - key: diagnostics.dumpReq
     type: boolean
     default: "true"
     env: ACP_DUMP_REQ
     group: diagnostics
-    desc_en: "Log outgoing upstream request metadata per call."
-    desc_zh: "逐次调用记录发往上游的请求元数据。"
+    desc_en: "Log outgoing upstream request metadata per call; with dumpBody on, also gates the plaintext body dumps (scrub before sharing, #4482)."
+    desc_zh: "逐次调用记录发往上游的请求元数据；开启 dumpBody 时同时是明文请求体转储的闸门（分享前必须清洗，#4482）。"
+    desc_ja: "呼び出しごとに送信されるアップストリームリクエストのメタデータをログに記録します。dumpBody がオンの場合、PLAINTEXT ボディのダンプも制御します（共有前にスクラブしてください、#4482）。"
   - key: diagnostics.rawDumpDir
     type: string
     default: "<state dir>/raw"
@@ -33,13 +36,15 @@ entries:
     group: diagnostics
     desc_en: "Directory for raw wire dumps."
     desc_zh: "原始线路转储目录。"
+    desc_ja: "生ワイヤダンプのディレクトリ。"
   - key: diagnostics.dump4xx
     type: boolean
     default: "false"
     env: BILI_DUMP_4XX
     group: diagnostics
-    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection."
-    desc_zh: "把上游 4xx 响应落盘以便事后检查。"
+    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection. Bodies are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把上游 4xx 响应落盘以便事后检查。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
+    desc_ja: "事後検証のために、アップストリームの 4xx レスポンスをディスクに永続化します。ボディは PLAINTEXT であり、認証情報が含まれる可能性があります — 共有前にスクラブしてください（#4482）。"
   - key: diagnostics.dump4xxMaxBytes
     type: number
     default: "2097152 (floor 1024)"
@@ -47,6 +52,7 @@ entries:
     group: diagnostics
     desc_en: "Size cap for a single 4xx dump file."
     desc_zh: "单个 4xx 转储文件的大小上限。"
+    desc_ja: "単一の 4xx ダンプファイルのサイズ上限。"
   - key: diagnostics.maxTotalBytes
     type: number
     default: "unset (off)"
@@ -54,6 +60,7 @@ entries:
     group: diagnostics
     desc_en: "Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412)."
     desc_zh: "调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。"
+    desc_ja: "デバッグダンプディレクトリ（dumps/、raw/、SSE ダンプディレクトリ）の総サイズ上限。超過時は最も古いファイルから削除されます（下限 1 MiB）。デフォルトではダンプにローテーションがなく、アクティブなキャプチャ下では 1 日に数十 GB まで増加する可能性があります（#2412）。"
   - key: diagnostics.maxAgeDays
     type: number
     default: "unset (off)"
@@ -61,6 +68,31 @@ entries:
     group: diagnostics
     desc_en: "Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default."
     desc_zh: "调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。"
+    desc_ja: "デバッグダンプディレクトリの日数ベースの年齢上限。これより古いファイルは削除されます（下限 1 h）。デフォルトではオフです。"
+  - key: diagnostics.logRetentionHours
+    type: number
+    default: "48 (floor 1)"
+    plain_default: "48"
+    default_zh: "48（下限 1）"
+    env: BILI_LOG_RETENTION_HOURS
+    group: diagnostics
+    desc_en: "History the PRIVATE run log (`bili.log`) is retained to cover, in hours. The logger seals the active file at 10 MiB into an immutable, uniquely named generation instead of one `bili.log.old`, so every retained generation is enumerable and the window is real rather than accidental. This is a TARGET, not a promise: `diagnostics.logBudgetBytes` is the hard bound and always wins — a shorter window is reported, never silently claimed as complete. Reported coverage is the MEASURED span from the oldest retained line to now; generation files carry no lineage evidence, so `continuity` is always `unknown` and no status claims an unbroken window (out-of-order stamps are not treated as missing history either). Floor 1 h; a non-positive or non-numeric value falls back to the 48 h default, and because a SET env var owns the switch, an illegal `BILI_LOG_RETENTION_HOURS` falls back to that default rather than to this key."
+    desc_zh: "**私有**运行日志（`bili.log`）目标覆盖的历史小时数。日志器在 10 MiB 处把活动文件封存为**不可变、名字唯一**的一代，取代单个 `bili.log.old`，于是每一代都可枚举、窗口是真实的而不是碰巧的。这是**目标**而非承诺：`diagnostics.logBudgetBytes` 是硬上限且永远优先——更短的窗口会被如实报告，绝不悄悄宣称完整。报告的覆盖是**实测跨度**（最旧保留行 → 现在）：分代文件里没有谱系证据，所以 `continuity` 恒为 `unknown`，任何状态都不宣称窗口未中断（时间戳错序同样不被当作历史缺失）。下限 1 小时；非正数或非数值回落到默认 48 小时；按「env 一旦设置即拥有该开关」的约定，非法的 `BILI_LOG_RETENTION_HOURS` 回落到该默认值而不是本键。"
+    desc_ja: "PRIVATE 実行ログ（`bili.log`）を保持する時間（時間単位）で、カバーする範囲を指定します。ロガーはアクティブファイルを 10 MiB でシールし、1 つの `bili.log.old` ではなく、不変で一意の名前を持つジェネレーションに変換するため、保持されるすべてのジェネレーションが列挙可能であり、ウィンドウは偶然ではなく実在のものとなります。これは TARGET であり、約束ではありません：`diagnostics.logBudgetBytes` がハードバウンドであり、常に優先されます — より短いウィンドウは報告されますが、完全にカバーされていると黙って主張されることはありません。報告されるカバレッジは、最も古い保持行から現在までの測定されたスパンです。ジェネレーションファイルには系譜のエビデンスがないため、`continuity` は常に `unknown` となり、未断絶のウィンドウを主張するステータスはありません（順序が乱れたタイムスタンプも、履歴の欠落として扱われません）。下限 1 h。正でない値または数値でない値は 48 h のデフォルトにフォールバックし、SET された環境変数がスイッチを所有するため、不正な `BILI_LOG_RETENTION_HOURS` はこのキーではなくそのデフォルトにフォールバックします。"
+    site_en: "<code>diagnostics.logRetentionHours</code> — target hours of PRIVATE <code>bili.log</code> history (default 48, floor 1); the byte budget always wins, and reported coverage is a MEASURED span whose continuity is <code>unknown</code>."
+    site_zh: "<code>diagnostics.logRetentionHours</code> —— 私有 <code>bili.log</code> 的目标历史小时数（默认 48，下限 1）；字节预算永远优先，报告的覆盖是实测跨度且 continuity 恒为 <code>unknown</code>。"
+  - key: diagnostics.logBudgetBytes
+    type: number
+    default: "268435456 (256 MiB, floor 1 MiB)"
+    plain_default: "268435456"
+    default_zh: "268435456（256 MiB，下限 1 MiB）"
+    env: BILI_LOG_BUDGET_BYTES
+    group: diagnostics
+    desc_en: "Hard total-byte budget across the active log plus every sealed generation; oldest generations are deleted first when it is exceeded — oldest first by sealed stamp (legacy `.old` takes its own mtime), so a migrated legacy artifact is reclaimed in its real chronological place instead of being skipped in favour of newer stamped generations. Bounds disk cost and privacy exposure on a busy machine where the default window would otherwise run to many times this. When the bytes needed for `logRetentionHours` exceed the budget, the BUDGET WINS and the shortfall is surfaced (a start-time `[warn]`, and the `retention` object in `GET /__bili/logs`). The ACTIVE file is never deleted, so a single active file that alone exceeds the budget is reported as over budget rather than truncated. Floor 1 MiB; a non-positive or non-numeric value falls back to the 256 MiB default, and a set `BILI_LOG_BUDGET_BYTES` owns the switch the same way as the hours key. Files are owner-only: 0600 from the first byte, archive directories 0700 (win32 has no POSIX mode bits and the state-dir ACL governs)."
+    desc_zh: "活动日志 + 全部封存分代的总字节硬预算；超出时按**最旧优先**整代删除——排序按封存时间戳（遗留 `.old` 用自己的 mtime），所以迁移来的历史按其真实年代被回收，而不会被跳过、先去删更新的分代。它约束繁忙机器上的磁盘占用与隐私暴露面。当 `logRetentionHours` 所需的字节超出预算时**预算赢**，且不足会被上报（启动时一行 `[warn]`，以及 `GET /__bili/logs` 里的 `retention` 对象）。活动文件永不删除，所以单个活动文件本身就超过预算时会被报告为超预算，而不是被截断。下限 1 MiB；非正数或非数值回落到默认 256 MiB，且与小时键同理：设置了的 `BILI_LOG_BUDGET_BYTES` 拥有该开关。日志文件仅属主可读：首字节起 0600，归档目录 0700（win32 无 POSIX 权限位，由状态目录 ACL 决定）。"
+    desc_ja: "アクティブログおよびすべてのシール済みジェネレーション全体でのハードな総バイト予算。超過時は最も古いジェネレーションから削除されます — シール済みタイムスタンプ順に最も古いものから（レガシーの `.old` は独自の mtime を採用）ため、移行されたレガシー成果物は新しいタイムスタンプ付きジェネレーションを優先してスキップされるのではなく、実際の年代順の位置で回収されます。デフォルトのウィンドウがこれの何倍にも及ぶ多忙なマシンにおいて、ディスクコストとプライバシーリスクを制限します。`logRetentionHours` に必要なバイト数が予算を超える場合、BUDGET が優先され、不足分が表面化します（開始時の `[warn]`、および `GET /__bili/logs` の `retention` オブジェクト）。ACTIVE ファイルは決して削除されないため、単一のアクティブファイルが予算を単独で超過する場合、切り詰められるのではなく予算超過として報告されます。下限 1 MiB。正でない値または数値でない値は 256 MiB のデフォルトにフォールバックし、設定された `BILI_LOG_BUDGET_BYTES` は時間キーと同様にスイッチを所有します。ファイルは所有者のみアクセス可能：最初のバイトから 0600、アーカイブディレクトリは 0700（win32 には POSIX モードビットがなく、state-dir の ACL が支配します）。"
+    site_en: "<code>diagnostics.logBudgetBytes</code> — hard total-byte budget across the active log + all sealed generations (default 256 MiB, floor 1 MiB); oldest-first eviction, the active file is never deleted, and this budget beats <code>logRetentionHours</code>."
+    site_zh: "<code>diagnostics.logBudgetBytes</code> —— 活动日志 + 全部封存分代的总字节硬预算（默认 256 MiB，下限 1 MiB）；最旧优先回收、活动文件永不删除，且该预算优先于 <code>logRetentionHours</code>。"
   - key: diagnostics.renderNone
     type: boolean
     default: "false"
@@ -68,6 +100,7 @@ entries:
     group: diagnostics
     desc_en: "Disable all ACP tag rendering (raw wire study mode)."
     desc_zh: "禁用所有 ACP 标签渲染（原始线路研究模式）。"
+    desc_ja: "すべての ACP タグレンダリングを無効化します（生ワイヤ研究モード）。"
   - key: diagnostics.invariantJudge
     type: boolean
     default: "true"
@@ -75,6 +108,7 @@ entries:
     group: diagnostics
     desc_en: "Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false or BILI_INVARIANT_JUDGE=0 to silence it."
     desc_zh: "保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。"
+    desc_ja: "I1/I2 送信不変性ジャッジを L1 アドバイザリーとして武装したままにします（#3938）：すべてのリクエストの送信バイトがクライアントの受信履歴と照合されます。違反は warn でログに記録され、クリーンな判定は debug で記録され、トラフィックはブロックされません。無効にするには false を設定するか BILI_INVARIANT_JUDGE=0 を設定してください。"
   - key: diagnostics.noInjectTool
     type: boolean
     default: "false"
@@ -82,6 +116,7 @@ entries:
     group: diagnostics
     desc_en: "Stop injecting the acp_compress tool definition into requests."
     desc_zh: "停止向请求注入 acp_compress 工具定义。"
+    desc_ja: "リクエストへの acp_compress ツール定義のインジェクションを停止します。"
   - key: diagnostics.noCompressPrompt
     type: boolean
     default: "false"
@@ -89,6 +124,7 @@ entries:
     group: diagnostics
     desc_en: "Stop appending the compression doctrine to system prompts."
     desc_zh: "停止向系统提示词附加压缩教条文本。"
+    desc_ja: "システムプロンプトへの圧縮教義の追加を停止します。"
   - key: diagnostics.countTokensPassthrough
     type: boolean
     default: "false"
@@ -96,6 +132,7 @@ entries:
     group: diagnostics
     desc_en: "Forward /v1/messages/count_tokens to the upstream instead of answering locally."
     desc_zh: "把 /v1/messages/count_tokens 转发给上游，而不是本地应答。"
+    desc_ja: "ローカルで応答する代わりに、/v1/messages/count_tokens をアップストリームにフォワードします。"
   - key: diagnostics.compressProtocol
     type: "\"tools\" | \"marker\""
     default: "\"tools\""
@@ -103,6 +140,7 @@ entries:
     group: diagnostics
     desc_en: "ACP injection surface for compression: native tools (default) or legacy prompt markers."
     desc_zh: "压缩的 ACP 注入面：原生工具（默认）或旧版提示词标记。"
+    desc_ja: "圧縮用の ACP 注入サーフェス: ネイティブツール (デフォルト) またはレガシープロンプトマーカー。"
   - key: fakeCompletion
     type: object
     default: "{} (all defaults)"
@@ -111,6 +149,7 @@ entries:
     site_group: diag
     desc_en: "Retry loop that re-requests when a final chunk arrives truncated."
     desc_zh: "末块被截断时重新发起请求的重试环。"
+    desc_ja: "最終チャンクが切り詰められて到着した際に再リクエストを行うリトライループ。"
     site_en: "<code>fakeCompletion</code> — retry loop for truncated final chunks: <span class='mech'>retries 0 (opt-in) · bufCapBytes 16 MiB</span>."
     site_zh: "<code>fakeCompletion</code> —— 被截断末块的补完成重试环：<span class='mech'>retries 0 (可选) · bufCapBytes 16 MiB</span>。"
   - key: fakeCompletion.retries
@@ -120,6 +159,7 @@ entries:
     group: diagnostics
     desc_en: "How many times a truncated final completion may be re-requested; 0 disables the loop."
     desc_zh: "被截断的末块完成可被重新请求的次数；0 禁用该重试环。"
+    desc_ja: "切り詰められた最終完了を再リクエストできる回数; 0 でループを無効化。"
   - key: fakeCompletion.bufCapBytes
     type: number
     default: "16777216"
@@ -127,6 +167,7 @@ entries:
     group: diagnostics
     desc_en: "Buffer size cap for the retry loop's accumulated stream."
     desc_zh: "重试环累积流缓冲的大小上限。"
+    desc_ja: "リトライループの累積ストリームに対するバッファサイズ上限。"
   - key: codexCompact
     type: "\"intercept\" | \"pass\""
     default: "\"intercept\""
@@ -136,6 +177,7 @@ entries:
     site_group: adv
     desc_en: "Handle Codex's compaction requests inside bili (intercept, default) or forward them upstream (pass): the explicit forms (compaction_trigger + /responses/compact) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template (#3008) — a user-overridden compact_prompt falls out of detection and transits verbatim; a compaction bili only observed (pass/gate) is rebased post-hoc (#2372)."
     desc_zh: "在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。"
+    desc_ja: "bili 内で Codex のコンパクト化要求を処理する (intercept, デフォルト) または上流へ転送する (pass): 明示的な形式 (compaction_trigger + /responses/compact) と、通常のターンとして通過するインライン自動コンパクト化 (SUMMARIZATION_PROMPT テンプレート (#3008) によって検出) — ユーザーが上書きした compact_prompt は検出から外れ、そのまま通過する; bili が観察のみ (pass/gate) したコンパクト化は事後にリベースされる (#2372)。"
     site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex's compaction requests in bili or forward upstream — explicit forms plus the inline auto-compact transiting as an ordinary turn (prompt-form detection, #3008; overridden compact_prompt transits verbatim)."
     site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex 压缩请求或转给上游 —— 显式形态 + 以普通请求形态过线的内联自动压缩（prompt 文本检测，#3008；自定义 compact_prompt 按原样转发）。"
   - key: ccrRetrievalTtlMs
@@ -147,6 +189,7 @@ entries:
     site_group: adv
     desc_en: "Lifetime of CCR retrieval pointers before originals stop being fetchable via acp_retrieve."
     desc_zh: "CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。"
+    desc_ja: "acp_retrieve 経由でオリジナルを取得できなくなるまでの CCR 検索ポインタの生存期間。"
     site_en: "<code>ccrRetrievalTtlMs</code> — lifetime of CCR retrieval pointers (default 600000; 0 disables retrieval)."
     site_zh: "<code>ccrRetrievalTtlMs</code> —— CCR 回取指针有效期（默认 600000；0 禁用回取）。"
   - key: decompressTmpCap
@@ -158,5 +201,6 @@ entries:
     site_group: adv
     desc_en: "Size cap (blocks) for temporary decompressed content held in-session."
     desc_zh: "会话内临时展开内容的大小上限（按块计）。"
+    desc_ja: "セッション内で保持される一時的な展開済みコンテンツのサイズ上限 (ブロック数)。"
     site_en: "<code>decompressTmpCap</code> — size cap for temporary decompressed blocks (default 50)."
     site_zh: "<code>decompressTmpCap</code> —— 临时展开块的大小上限（默认 50）。"

@@ -17,6 +17,10 @@ import type {
 
 const PROXY_TOOL_SET = new Set([
     "compress", "decompress", "search_context", "acp_status",
+    // #5765: function-only tools added after the original four must be listed
+    // here or their chunks raw-replay to the client as "real" calls. acp_cache
+    // had the same gap before this change.
+    "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
@@ -535,6 +539,28 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     ? (delta.tool_calls as Array<Record<string, unknown>>)
                     : undefined;
                 if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
+
+                // #4488: include_usage relays may deliver usage on a trailing frame whose
+                // choices array stays NON-empty — one choice with an EMPTY delta and no
+                // finish_reason (OpenAI's own include_usage final-chunk shape, or a gateway
+                // variant of it). It matches neither the !choice branch above nor the
+                // finishReason branch below, so its usage never reached the internal ledger
+                // (settleUsageReport) and nudge froze on the last stale sample (growth=0,
+                // context grows until 502) even though the raw frame was still forwarded to
+                // the client. Harvest it here; the guards (no finish_reason, empty delta
+                // object) keep every content / finish / tool-call frame out. Deliberately no
+                // `continue`: the frame falls through to the empty-delta meta forward below
+                // unchanged, so the client-visible stream stays byte-identical to pre-fix and
+                // only the ledger gains the sample.
+                if (parsed.usage && !finishReason && delta && Object.keys(delta).length === 0) {
+                    const u = parsed.usage as Record<string, unknown>;
+                    yield {
+                        kind: "usage",
+                        inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                        outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+                        cachedTokens: openaiCachedTokens(u),
+                    } as ParsedStreamEvent;
+                }
 
                 if (finishReason) {
                     yield* flushFilter();

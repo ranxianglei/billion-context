@@ -176,9 +176,10 @@ test("unit: carriesDshLocalCompactionSummary matches framing only on a user/text
     // skipped, so these exercise the carrier gate alone.)
     assert.equal(carriesDshLocalCompactionSummary([]), false, "empty history");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "plain prose" }]), false);
-    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag mid-message");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag at message start (preamble-dropped drift)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), false, "#4438: framing embedded MID-message is a quote, not a landing");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " of the conversation…" }]), true, "preamble at message start");
-    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), true, "raw wire content fallback (user text)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), false, "#4438: mid-text quote via raw wire content is not a landing");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "compacted summary mentioned without tags" }]), false, "the WORD 'compacted' alone is not framing");
 });
 

@@ -317,3 +317,254 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
+
+// --- #4186 G2/G3: CCR placeholder substitution + emergency-truncation twins --
+
+const ccrPlaceholder = (ref: string, kind: string, tokens: string, title?: string): string =>
+  `\u{1F4E6} [acp-stored #${ref} · ${kind} · ${tokens} tok]${title !== undefined ? ` \`${title}\`` : ""}\n   → acp_retrieve("${ref}") returns the full text`;
+
+const truncatedTwin = (orig: string, keepPrefixChars = 40, keepSuffixChars = 40): string =>
+  `${orig.slice(0, keepPrefixChars)}\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig.slice(orig.length - keepSuffixChars)}`;
+
+test("I1 CCR-stored tool result: canonical placeholder on exit matches the client's full-text twin (#4186 G2)", () => {
+  const fullText = "total 8\n" + "Fuzz 4-0: pipeline clean, suite green, regions stable, deltas recorded. ".repeat(50);
+  const entry = [
+    mk("user", "text", "run"),
+    mk("tool", "tool-result", fullText, { toolName: "shell", toolCallId: "call_t4" }),
+    mk("assistant", "text", "done"),
+  ];
+  const exit = [
+    entry[0]!,
+    mk("tool", "tool-result", ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4"), { toolName: "shell", toolCallId: "call_t4" }),
+    entry[2]!,
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.exempt?.ccr, 1);
+});
+
+test("NEG CCR: prose merely MENTIONING the placeholder shape is not a sanctioned substitution (#1456 strict-parser gate)", () => {
+  const ph = ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4");
+  const entry = [mk("user", "text", "run"), mk("tool", "tool-result", "real shell bytes here", { toolCallId: "call_t4" }), mk("assistant", "text", "done")];
+  const exit = [entry[0]!, mk("tool", "tool-result", `example: ${ph}`, { toolCallId: "call_t4" }), entry[2]!];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
+
+test("NEG CCR: placeholder-shaped body under a changed role/contentType is not exempt", () => {
+  const ph = ccrPlaceholder("m00010", "shell output", "4,581");
+  const entry = [mk("user", "text", "hello"), mk("tool", "tool-result", "real bytes", { toolCallId: "call_t4" }), mk("assistant", "text", "hi")];
+  const exit = [entry[0]!, mk("user", "text", ph), entry[2]!];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});
+
+test("I1 emergency-truncation twin: prefix+marker+suffix clip of the same message passes (#4186 G3)", () => {
+  const orig = "Turn 1: analyze module 1. " + "pipeline clean, suite green, regions stable, deltas recorded. ".repeat(80);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "reply one")];
+  const exit = [mk("user", "text", truncatedTwin(orig)), mk("assistant", "text", "reply one")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.exempt?.truncate, 1);
+});
+
+test("I1 truncated twin directly before a fold carrier keeps carrier pinning green (live fuzz-1592 geometry)", () => {
+  const orig = "Turn 1: analyze module 1. " + "pipeline clean, suite green, regions stable, deltas recorded. ".repeat(80);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "old-1"), mk("user", "text", "new question")];
+  const exit = [
+    mk("user", "text", truncatedTwin(orig)),
+    mk("user", "text", "[Compressed conversation section]\nfolded", { summaryOfBlockId: "b9" }),
+    mk("user", "text", "new question"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+});
+
+test("NEG truncation: marker present but prefix NOT from the inbound message stays red (fabricated clip)", () => {
+  const orig = "Turn 1: analyze module 1. " + "alpha beta gamma delta epsilon zeta eta theta. ".repeat(80);
+  const fabricated = `Completely different opening words here\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig.slice(-40)}`;
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", fabricated), mk("assistant", "text", "a")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});
+
+test("NEG truncation: plain shrink WITHOUT the marker stays red (no marker, no sanction)", () => {
+  const orig = "long body " + "word ".repeat(300);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", orig.slice(0, 60)), mk("assistant", "text", "a")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite" || x.kind === "mid-history-drop"));
+});
+
+test("NEG truncation: INFLATED body carrying the marker stays red (#3935 regression shape)", () => {
+  const orig = "short original";
+  const inflated = `${orig}\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig}`;
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", inflated), mk("assistant", "text", "a")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});
+
+// #4241 — snapshot-render lane tail-fidelity. On a turn where prepare's snapshot
+// render served the outbound prefix, the raw inbound prefix was INTENTIONALLY
+// replaced by server rows + summary anchors; only the client tail (>= renderTailStart)
+// is promised byte-intact. The judge validates exactly that suffix; the rendered
+// prefix is exempt from the frozen-prefix rule while I2 stays armed on the tail.
+const renderCarrier = () => mk("system", "text", "[Compressed conversation section] b5", { summaryOfBlockId: "b5" });
+
+test("#4241 POS bug-repro: covered region replaced by server view + intact tail ⇒ green (was false-positive red)", () => {
+  const entry = [mk("user", "text", "old-a"), mk("assistant", "text", "old-b"), mk("user", "text", "old-c"), mk("user", "text", "new question")];
+  const exit = [mk("user", "text", "canon-x"), mk("assistant", "text", "canon-y"), renderCarrier(), mk("user", "text", "new question")];
+  // Without render-lane awareness this turn reads as a mid-history rewrite — the reported false positive:
+  const legacy = judgeInboundOutbound(entry, exit);
+  assert.equal(legacy.ok, false);
+  assert.ok(legacy.violations.some((x) => x.kind === "mid-history-rewrite"));
+  // With renderTailStart=3 (first client index of the live tail) only the tail is validated:
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 3 });
+  assert.equal(v.ok, true);
+  assert.equal(v.renderLane, true);
+  assert.equal(v.matched, 1);
+  assert.equal(v.total, 1);
+  assert.equal(v.folded, true);
+});
+
+test("#4241 NEG control: a corrupted tail message still goes red on the render lane (teeth remain)", () => {
+  const entry = [mk("user", "text", "old"), mk("user", "text", "original words")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "rewritten words")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 1 });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
+
+test("#4241 NEG control: a dropped tail message still goes red on the render lane", () => {
+  const entry = [mk("user", "text", "old"), mk("user", "text", "keep me"), mk("assistant", "text", "and me")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "keep me")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 1 });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop"));
+});
+
+test("#4241 POS: multiple intact tail messages all match in order across the server prefix", () => {
+  const entry = [mk("user", "text", "c0"), mk("assistant", "text", "c1"), mk("user", "text", "q"), mk("assistant", "text", "a"), mk("user", "text", "q2")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "q"), mk("assistant", "text", "a"), mk("user", "text", "q2")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 2 });
+  assert.equal(v.ok, true);
+  assert.equal(v.matched, 3);
+  assert.equal(v.total, 3);
+  assert.equal(v.renderLane, true);
+});
+
+test("#4241 POS edge: fully-covered turn (empty tail) is green with nothing to validate", () => {
+  const entry = [mk("user", "text", "covered-0"), mk("assistant", "text", "covered-1")];
+  const exit = [mk("user", "text", "canon-0"), renderCarrier()];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 2 });
+  assert.equal(v.ok, true);
+  assert.equal(v.matched, 0);
+  assert.equal(v.total, 0);
+  assert.equal(v.renderLane, true);
+});
+
+test("#4241 wiring: maybeRunInvariantJudge honors renderTailStart (green on rendered shape, red without)", () => {
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  try {
+    const body = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "canon" },
+      { role: "user", content: "new question" },
+    ] });
+    const entry = [mk("user", "text", "old"), mk("user", "text", "new question")];
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-r" });
+    assert.equal(seen.at(-1)?.ok, false);
+    assert.equal(seen.at(-1)?.renderLane, undefined);
+    assert.ok(seen.at(-1)!.violations.some((x) => x.kind === "mid-history-rewrite"));
+    seen.length = 0;
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-r", renderTailStart: 1 });
+    assert.equal(seen.at(-1)?.ok, true);
+    assert.equal(seen.at(-1)?.renderLane, true);
+  } finally {
+    _setInvariantJudgeForTest(false);
+  }
+});
+
+// --- #564/#2627 producer-owned separator provenance --------------------
+// bili's ordering separators exist only outbound, so the judge used to file a
+// mid-insertion finding for each. The producer now names the exact outbound
+// indexes it owns; only those are exempt. Client prose with the same text is
+// NOT owned, so it still reads as an insertion.
+
+const SEP_TEXT = "[The exchange between these two assistant turns was compressed.]";
+
+test("#2627 POS owned separator between two assistant turns is exempt", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  const legacy = judgeInboundOutbound(entry, exit);
+  assert.equal(legacy.ok, false, "without provenance the separator reads as an insertion");
+  assert.equal(legacy.violations.some((finding) => finding.kind === "mid-insertion"), true);
+  const owned = judgeInboundOutbound(entry, exit, { separatorProvenance: new Set([2]) });
+  assert.equal(owned.ok, true, JSON.stringify(owned.violations));
+});
+
+test("#2627 NEG identical CLIENT prose at a different index still fires", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  const v = judgeInboundOutbound(entry, exit, { separatorProvenance: new Set([3]) });
+  assert.equal(v.ok, false, "the unowned separator at index 1 is judged");
+  assert.equal(v.violations.some((finding) => finding.kind === "mid-insertion"), true);
+});
+
+test("#2627 NEG an empty/absent provenance set never exempts a separator", () => {
+  const entry = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [mk("user", "text", "q"), mk("assistant", "text", "A"), mk("user", "text", SEP_TEXT), mk("assistant", "text", "B")];
+  assert.equal(judgeInboundOutbound(entry, exit, { separatorProvenance: new Set() }).ok, false);
+  assert.equal(judgeInboundOutbound(entry, exit, {}).ok, false);
+});
+
+// --- #4862 compress pairing: complete pair vs vanished result -----------
+
+test("I3 POS a COMPLETE compress pair outbound is valid, not a finding", () => {
+  const entry = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+  ];
+  const exit = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+  ];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("I3 NEG compress call answered in the BASELINE whose result vanished outbound is a finding", () => {
+  const entry = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "done", { toolCallId: "c_1" }),
+    mk("assistant", "text", "summarized"),
+  ];
+  const exit = [
+    mk("user", "text", "compress it"),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+    mk("assistant", "text", "summarized"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false, "a completed compress pair losing its result is bili breaking the pair");
+  assert.equal(v.violations.some((finding) => finding.kind === "unpaired-tool-call"), true);
+});
+
+test("I3 POS truly PENDING compress call (no baseline answer) stays exempt", () => {
+  for (const name of ["compress", "mcp__bili__compress"]) {
+    const entry = [mk("user", "text", "compress it"), mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" })];
+    const exit = [mk("user", "text", "compress it"), mk("assistant", "tool-call", "{}", { toolName: name, toolCallId: "c_1" })];
+    assert.equal(judgeInboundOutbound(entry, exit).ok, true, name);
+  }
+});
+
+test("I3 POS original-host orphan attribution survives for compress ids", () => {
+  // The CLIENT sent the compress call orphaned (entry has no result for c_1):
+  // bili must not be blamed for a pair the host broke itself.
+  const entry = [mk("user", "text", "q"), mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" })];
+  const exit = [mk("user", "text", "q"), mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" })];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});

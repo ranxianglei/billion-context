@@ -52,7 +52,7 @@
 // historical latest-session behaviour); while no session exists yet the tab
 // shows an honest hint instead of an empty frame.
 
-import { createElement, useEffect, useState } from "react";
+import { createElement, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Dict = Record<string, string>;
 
@@ -94,7 +94,11 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"] as const;
+// #4906 follow-up (owner 2026-10-27): "blog" joins right after "updates" so
+// the master-pulled 博客 sits next to 版本 in the dsh bili设置 tab bar; an
+// older embedded frame without the #/blog route falls back to its own
+// default page inside the iframe (no blank pane).
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates", "blog"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
@@ -102,6 +106,7 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
     updates: "tab_updates",
+    blog: "tab_blog",
 };
 
 // #3816: the exact field a remote user adds to enable the #3373 relay. A
@@ -144,6 +149,34 @@ const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
         ? CTX_STATUS_PATH
         : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 const CTX_POLL_MS = 10000;
+// #4254: frame-level upstream-unavailable pill (shell.overlay) — same slow cadence
+// as the per-session Context tab. A dead circuit retries on its own ~60s probe, so
+// 10s keeps the "retry in ~Ns" hint fresh and clears the banner within one tick.
+const UPSTREAM_POLL_MS = 10000;
+// #4406: the Context tab renders a whole conversation surface, so the host
+// composer seat (input, todo dock, goal box) must not stay pinned under it.
+// The host exposes no registration switch for that, so the tab marks its own
+// scroll container and carries the one rule itself — the same shape dsh's own
+// context pane uses (data-lc-surface), scoped to our attribute so the two can
+// never fight over the same node. Approval / question / plan-review panels are
+// takeovers and keep the seat visible.
+const BILI_SURFACE_ATTR = "data-bili-surface";
+const BILI_SURFACE_CSS =
+    "[data-conversation-scroll][data-bili-surface]>[data-composer-seat]:not(:has([data-approval-key],[data-question-key],[data-plan-review-key])){display:none}";
+type BiliSurfaceDoc = {
+    querySelector: (selector: string) => unknown;
+    createElement: (tag: string) => { setAttribute: (name: string, value: string) => void; textContent: string };
+    head: { appendChild: (node: unknown) => void };
+};
+const biliSurfaceDoc = (): BiliSurfaceDoc | undefined => (globalThis as { document?: BiliSurfaceDoc }).document;
+const ensureBiliSurfaceStyle = (): void => {
+    const doc = biliSurfaceDoc();
+    if (doc === undefined || doc.querySelector("style[data-bili-surface]") !== null) return;
+    const style = doc.createElement("style");
+    style.setAttribute("data-bili-surface", "");
+    style.textContent = BILI_SURFACE_CSS;
+    doc.head.appendChild(style);
+};
 
 type CtxStatus = {
     ok: boolean;
@@ -182,8 +215,10 @@ function parseCtxStatus(raw: unknown): CtxStatus | undefined {
  *  The jump button targets the panel's config page (#/config) in a fresh tab;
  *  for a purely remote browser that address is still unreachable — the
  *  file-edit text is the primary route, the button serves same-LAN/tunneled
- *  access where it lands on the exact field to set. */
-function renderRemoteBlock(t: (key: string) => string, origin: string): ReturnType<typeof createElement> {
+ *  access where it lands on the exact field to set. #3693: an optional error
+ *  readout rides underneath — the raw probe failure that PROVES the loopback
+ *  address is unreachable from this browser (evidence + copyable for reports). */
+function renderRemoteBlock(t: (key: string) => string, origin: string, errorReadout?: unknown): ReturnType<typeof createElement> {
     const cfgUrl = `${origin}/__bili/#/config`;
     return createElement(
         "div",
@@ -209,6 +244,7 @@ function renderRemoteBlock(t: (key: string) => string, origin: string): ReturnTy
             { type: "button", title: cfgUrl, onClick: () => openExternal(cfgUrl), style: ACTION_BTN_STYLE },
             t("remote_open_config"),
         ),
+        errorReadout ?? null,
     );
 }
 
@@ -230,6 +266,123 @@ function openWebButton(origin: string | undefined, t: (key: string) => string, s
         );
 }
 
+// #3693: one self-contained line for a failed probe/status read — the raw
+// engine message plus the URL that failed, so the copied text makes sense in
+// a support report without extra context. Duck-typed on purpose: fetch
+// failures cross realms in test sandboxes, where instanceof fails.
+function describeProbeError(err: unknown, url: string): string {
+    let msg: string;
+    const o = err !== null && typeof err === "object" ? (err as { message?: unknown }) : undefined;
+    if (o !== undefined && typeof o.message === "string" && o.message.length > 0) {
+        msg = o.message;
+    } else if (typeof err === "string" && err.length > 0) {
+        msg = err;
+    } else {
+        try {
+            msg = String(err);
+        } catch {
+            msg = "unknown error";
+        }
+    }
+    return `${msg} (${url})`;
+}
+
+// #3693: clipboard write with a legacy fallback — LAN-http pages (the exact
+// remote-access posture of #3693) are NOT secure contexts, so
+// navigator.clipboard is absent there and the execCommand path is what
+// actually copies. Resolves to whether the text landed on the clipboard.
+function copyText(text: string): Promise<boolean> {
+    const g = globalThis as {
+        navigator?: { clipboard?: { writeText?: (t: string) => Promise<unknown> } };
+        document?: {
+            body?: { appendChild?: (n: unknown) => void; removeChild?: (n: unknown) => void } | null;
+            createElement?: (tag: string) => unknown;
+            execCommand?: (cmd: string) => boolean;
+        };
+    };
+    const legacy = (): boolean => {
+        const doc = g.document;
+        if (!doc || typeof doc.createElement !== "function" || !doc.body || typeof doc.body.appendChild !== "function") return false;
+        const ta = doc.createElement("textarea") as Record<string, unknown> & { select?: () => void };
+        ta.value = text;
+        ta.style = { position: "fixed", opacity: 0 };
+        doc.body.appendChild(ta);
+        try {
+            ta.select?.();
+        } catch {
+            // non-DOM stand-in (test harness): selection is decorative there
+        }
+        const ok = doc.execCommand?.("copy") ?? false;
+        try {
+            doc.body.removeChild?.(ta);
+        } catch {
+            // ditto
+        }
+        return ok;
+    };
+    const clip = g.navigator?.clipboard;
+    if (clip !== undefined && typeof clip.writeText === "function") {
+        return clip.writeText(text).then(
+            () => true,
+            () => legacy(),
+        );
+    }
+    return Promise.resolve(legacy());
+}
+
+// #3693: the failure readout shared by every connecting/degraded face — the
+// raw error line in a selectable block plus an explicit copy action, so no
+// failure state hides its evidence behind a friendly hint. The `copied` flag
+// and the copy kick-off live with the PARENT component: hook order must stay
+// stable across renders, so no hook is called here.
+function renderProbeError(t: (key: string) => string, error: string, copied: boolean, onCopy: () => void): ReturnType<typeof createElement> {
+    return createElement(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+        createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("probe_error")),
+        createElement(
+            "code",
+            {
+                style: {
+                    display: "block",
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "1px solid rgba(127,127,127,0.4)",
+                    background: "rgba(127,127,127,0.08)",
+                    fontSize: 13,
+                    lineHeight: 1.6,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                },
+            },
+            error,
+        ),
+        createElement(
+            "button",
+            {
+                type: "button",
+                title: error,
+                onClick: onCopy,
+                style: { ...ACTION_BTN_STYLE, fontSize: 13, lineHeight: "20px", padding: "4px 14px" },
+            },
+            copied ? t("copied") : t("copy"),
+        ),
+    );
+}
+
+// #3693: hint headline with the optional error readout riding beneath it —
+// the hint wording stays untouched, the evidence is additive.
+function hintColumn(hint: unknown, box: unknown): unknown {
+    return box === null
+        ? hint
+        : createElement(
+            "div",
+            { style: { display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-start" } },
+            hint,
+            box,
+        );
+}
+
 // #3100: pre-flight for the framed face. Auto-update refreshes the profile
 // bundle on DISK while the long-running proxy child keeps serving the code it
 // booted with — and this browser half always runs the freshest disk code — so
@@ -244,7 +397,10 @@ function openWebButton(origin: string | undefined, t: (key: string) => string, s
 // routes mid-session.
 const EMBED_PROBE_PATH = "/__bili/?embed=1";
 type EmbedVerdict = "ok" | "stale";
-type EmbedState = { origin: string; verdict: EmbedVerdict };
+// #3693: verdict undefined + error set means "probe failed with evidence" —
+// transient by definition (never cached; retried on every poll tick), so the
+// face can show WHAT failed instead of spinning on "connecting…" forever.
+type EmbedState = { origin: string; verdict: EmbedVerdict | undefined; error?: string };
 const embedVerdicts = new Map<string, EmbedVerdict>();
 const embedProbesInFlight = new Set<string>();
 
@@ -275,8 +431,12 @@ function probeEmbedRoute(origin: string, onVerdict: (state: EmbedState) => void)
             }
             onVerdict({ origin, verdict });
         })
-        .catch(() => {
-            // unreachable right now: no verdict, the next poll tick retries
+        .catch((err: unknown) => {
+            // #3693: unreachable right now — report the failure verbatim so
+            // the face shows WHAT failed instead of spinning forever. Unlike
+            // ok/stale this is deliberately NOT cached: a network error is
+            // transient, the next poll tick retries and replaces it.
+            onVerdict({ origin, verdict: undefined, error: describeProbeError(err, `${origin}${EMBED_PROBE_PATH}`) });
         })
         .finally(() => {
             embedProbesInFlight.delete(origin);
@@ -360,10 +520,18 @@ const zh: Dict = {
     "tab_config": "配置",
     "tab_logs": "日志",
     "tab_updates": "版本",
+    "tab_blog": "博客",
     "tab_ctx": "上下文",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
     "ctx_refresh": "刷新",
+    "upstreams_label": "bili 上游状态",
+    "upstreams_down_one": "1 个上游不可用",
+    "upstreams_down_many": "{n} 个上游不可用",
+    "upstream_retry_hint": "约 {s}s 后重试",
+    "probe_error": "连接 bili 代理失败——最近一次探测报出的错误（可复制，便于反馈）：",
+    "copy": "复制",
+    "copied": "已复制",
 };
 
 const en: Dict = {
@@ -381,10 +549,18 @@ const en: Dict = {
     "tab_config": "Config",
     "tab_logs": "Logs",
     "tab_updates": "Versions",
+    "tab_blog": "Blog",
     "tab_ctx": "Context",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
     "ctx_refresh": "Refresh",
+    "upstreams_label": "bili upstream status",
+    "upstreams_down_one": "1 upstream unavailable",
+    "upstreams_down_many": "{n} upstreams unavailable",
+    "upstream_retry_hint": "~{s}s until retry",
+    "probe_error": "Failed to reach the bili proxy — last probe error (copyable for reporting):",
+    "copy": "Copy",
+    "copied": "Copied",
 };
 
 function readOrigin(): string | undefined {
@@ -458,6 +634,37 @@ function remoteMismatch(origin: string | undefined): boolean {
     const g = globalThis as { location?: { hostname?: unknown } };
     const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
     return pageHost.length > 0 && !isLoopbackHost(pageHost);
+}
+
+// #4254: one row of GET /__bili/upstreams as consumed by the shell.overlay pill.
+// host already carries the port ("127.0.0.1:7864"); code is the errno token
+// (ECONNREFUSED/...), count the consecutive-failure tally, nextProbeInMs only
+// exists while that host's circuit is OPEN (it is the "retry in ~Ns" ETA).
+type UpstreamRow = { host: string; kind: string; code?: string; count: number; nextProbeInMs?: number };
+
+/** #4254: defensively parse the /__bili/upstreams report into render rows —
+ *  a malformed or partial payload yields fewer rows, never a throw, so a broken
+ *  health report can never break the DSH client. */
+function parseUpstreamHealth(raw: unknown): UpstreamRow[] {
+    if (typeof raw !== "object" || raw === null) return [];
+    const list = (raw as { upstreams?: unknown }).upstreams;
+    if (!Array.isArray(list)) return [];
+    const rows: UpstreamRow[] = [];
+    for (const item of list) {
+        if (typeof item !== "object" || item === null) continue;
+        const o = item as Record<string, unknown>;
+        const host = typeof o.host === "string" && o.host.length > 0 ? o.host : undefined;
+        if (host === undefined) continue;
+        const kind = typeof o.kind === "string" && o.kind.length > 0 ? o.kind : "unknown";
+        const code = typeof o.code === "string" && o.code.length > 0 ? o.code : undefined;
+        const count = typeof o.count === "number" && Number.isFinite(o.count) ? Math.max(0, Math.round(o.count)) : 0;
+        const circuit = (typeof o.circuit === "object" && o.circuit !== null ? o.circuit : undefined) as { state?: unknown; nextProbeInMs?: unknown } | undefined;
+        const probe = circuit !== undefined && circuit.state === "open" && typeof circuit.nextProbeInMs === "number" && Number.isFinite(circuit.nextProbeInMs)
+            ? Math.max(0, circuit.nextProbeInMs)
+            : undefined;
+        rows.push({ host, kind, code, count, ...(probe !== undefined ? { nextProbeInMs: probe } : {}) });
+    }
+    return rows;
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -556,6 +763,18 @@ export function apply(ctx: ClientContext): void {
     // request yet / chain-advisory) the tab shows an honest hint, never a
     // stale or empty frame.
     const contextPanel = (): ((props?: Record<string, unknown>) => unknown) => (props) => {
+        const surfaceRef = useRef<{ closest: (selector: string) => unknown } | null>(null);
+        useLayoutEffect(() => {
+            ensureBiliSurfaceStyle();
+            const node = surfaceRef.current;
+            const scroll = node !== null ? node.closest("[data-conversation-scroll]") : null;
+            if (scroll === null) return;
+            const marked = scroll as { setAttribute: (name: string, value: string) => void; removeAttribute: (name: string) => void };
+            marked.setAttribute(BILI_SURFACE_ATTR, "");
+            return () => {
+                marked.removeAttribute(BILI_SURFACE_ATTR);
+            };
+        }, []);
         // The host names this conversation to every conversation.view entry
         // (props.sessionId — the same id the dsh lane stamps on
         // x-bili-plugin-conversation), so the poll targets OUR session. Old
@@ -580,6 +799,11 @@ export function apply(ctx: ClientContext): void {
         const [sessionId, setSessionId] = useState<string | null>(null);
         const [status, setStatus] = useState<CtxStatus | undefined>(undefined);
         const [fetchFailed, setFetchFailed] = useState(false);
+        // #3693: last status-read failure — surfaced verbatim beneath the
+        // degraded hint instead of being swallowed by it. Declared
+        // unconditionally so hook order stays stable across renders.
+        const [statusError, setStatusError] = useState<string | undefined>(undefined);
+        const [copied, setCopied] = useState(false);
         const [reloadTick, setReloadTick] = useState(0);
         // #3100: every resolution probes the new origin's embed route in
         // flight, and every poll tick re-drives pending origins (snapshot-only
@@ -593,18 +817,25 @@ export function apply(ctx: ClientContext): void {
             let cancelled = false;
             const load = (): void => {
                 void fetch(`${origin}${statusPath}`)
-                    .then((res) => res.json() as Promise<unknown>)
+                    .then((res) => {
+                        // #3693: a non-ok answer carries no contract body —
+                        // surface its status code instead of parsing it blind.
+                        if (res.ok !== true) throw new Error(`HTTP ${typeof res.status === "number" ? res.status : "?"}`);
+                        return res.json() as Promise<unknown>;
+                    })
                     .then((raw) => {
                         if (cancelled) return;
                         const parsed = parseCtxStatus(raw);
                         setStatus(parsed);
                         setFetchFailed(parsed === undefined);
+                        setStatusError(undefined);
                         setSessionId(parsed !== undefined && parsed.sessionId !== null ? parsed.sessionId : null);
                     })
-                    .catch(() => {
+                    .catch((err: unknown) => {
                         if (!cancelled) {
                             setStatus(undefined);
                             setFetchFailed(true);
+                            setStatusError(describeProbeError(err, `${origin}${statusPath}`));
                         }
                     });
             };
@@ -616,6 +847,9 @@ export function apply(ctx: ClientContext): void {
             };
         }, [origin, reloadTick, statusPath]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3693: the live probe's last network failure (transient — retried
+        // every poll tick until a verdict lands).
+        const liveEmbedError: string | undefined = embed !== undefined && embed.origin === origin ? embed.error : undefined;
         // #3816: remote page + loopback origin ⇒ unreachable by construction —
         // ANY resolved verdict outranks the mismatch (a verdict means THIS
         // browser actually reached the origin).
@@ -637,11 +871,24 @@ export function apply(ctx: ClientContext): void {
         // action row); every hint state keeps its own breathing room.
         const framed = origin !== undefined && liveEmbed === "ok" && sessionId !== null && sessionOurs;
         const hintP = (key: string): unknown => createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t(key));
+        // #3693: kick off a clipboard write of the readout line; the label
+        // flips to "copied" briefly on success.
+        const startCopy = (target: string): void => {
+            void copyText(target).then((ok) => {
+                if (!ok) return;
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            });
+        };
+        const errorBox = (error: string | undefined): unknown =>
+            error === undefined
+                ? null
+                : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
             middle = hintP("degraded");
         } else if (remoteBlocked) {
-            middle = renderRemoteBlock(t, origin);
+            middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
         } else if (liveEmbed === "stale") {
             // Frozen proxy predates the ?embed=1 route: framing is impossible
             // on any page, including the session one.
@@ -667,7 +914,7 @@ export function apply(ctx: ClientContext): void {
             // No session row exists yet: waiting is truthful, framing impossible.
             middle = hintP("ctx_waiting");
         } else if (status === undefined) {
-            middle = hintP(fetchFailed ? "degraded" : "connecting");
+            middle = hintColumn(hintP(fetchFailed ? "degraded" : "connecting"), errorBox(fetchFailed ? statusError : undefined));
         } else if (!status.ok) {
             middle = hintP("ctx_nodata");
         } else {
@@ -675,12 +922,13 @@ export function apply(ctx: ClientContext): void {
             // probe tick) — or a status build that answers without a session id:
             // honest connecting / not-yet hints instead of an empty frame.
             // chain-advisory lands here with liveEmbed "ok" ⇒ ctx_nodata, and
-            // must NEVER read as a stale-build claim.
-            middle = hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting");
+            // must NEVER read as a stale-build claim. #3693: if the embed
+            // probe itself is failing, its raw error rides beneath the hint.
+            middle = hintColumn(hintP(liveEmbed === "ok" ? "ctx_nodata" : "connecting"), errorBox(liveEmbedError));
         }
         return createElement(
             "div",
-            { style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
+            { ref: surfaceRef, style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
             origin !== undefined
                 ? createElement(
                     "div",
@@ -718,6 +966,9 @@ export function apply(ctx: ClientContext): void {
             const v = o !== undefined ? embedVerdicts.get(o) : undefined;
             return o !== undefined && v !== undefined ? { origin: o, verdict: v } : undefined;
         });
+        // #3693: copy feedback for the probe-error readout — declared
+        // unconditionally so hook order stays stable across renders.
+        const [copied, setCopied] = useState(false);
         // #2288: no guard on the snapshot — the live route is authoritative
         // for the whole mount, so a stale boot value is corrected in place.
         // #3100: each resolution also probes the new origin's embed route in
@@ -741,6 +992,9 @@ export function apply(ctx: ClientContext): void {
             if (origin !== undefined) probeEmbedRoute(origin, setEmbed);
         }, [origin]);
         const liveEmbed: EmbedVerdict | undefined = embed !== undefined && embed.origin === origin ? embed.verdict : undefined;
+        // #3693: the live probe's last network failure (transient — retried
+        // every poll tick until a verdict lands).
+        const liveEmbedError: string | undefined = embed !== undefined && embed.origin === origin ? embed.error : undefined;
         // #3816: remote page + loopback origin ⇒ unreachable by construction —
         // explain the fix instead of spinning on "connecting…". ANY resolved
         // verdict outranks the mismatch: a verdict means THIS browser actually
@@ -749,6 +1003,19 @@ export function apply(ctx: ClientContext): void {
         // notice of a reachable-but-frozen proxy.
         const remoteBlocked = remoteMismatch(origin) && liveEmbed === undefined;
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
+        // #3693: kick off a clipboard write of the readout line; the label
+        // flips to "copied" briefly on success.
+        const startCopy = (target: string): void => {
+            void copyText(target).then((ok) => {
+                if (!ok) return;
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+            });
+        };
+        const errorBox = (error: string | undefined): unknown =>
+            error === undefined
+                ? null
+                : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
         if (origin === undefined) {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("degraded"));
@@ -757,8 +1024,9 @@ export function apply(ctx: ClientContext): void {
             // fresh tab. For a purely remote browser that address is still
             // unreachable — the file-edit text above is the primary route;
             // the button serves same-LAN/tunneled access where it lands on
-            // the exact field to set.
-            middle = renderRemoteBlock(t, origin);
+            // the exact field to set. #3693: the raw probe failure proving
+            // the unreachability rides underneath, copyable for reports.
+            middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));
         } else if (liveEmbed === "stale") {
             middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("stale"));
         } else if (liveEmbed === "ok") {
@@ -810,7 +1078,12 @@ export function apply(ctx: ClientContext): void {
                 }),
             );
         } else {
-            middle = createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting"));
+            // #3693: "connecting…" alone hid every failure — when the probe is
+            // actually failing, its raw error rides beneath the hint.
+            middle = hintColumn(
+                createElement("p", { style: { margin: 0, opacity: 0.7, lineHeight: 1.6 } }, t("connecting")),
+                errorBox(liveEmbedError),
+            );
         }
         return createElement(
             "div",
@@ -826,6 +1099,46 @@ export function apply(ctx: ClientContext): void {
                 // 时按钮指向的正是那个够不到的回环地址——死链,一并隐藏。
                 liveEmbed === "ok" || remoteBlocked ? null : openWebButton(origin, t),
             ),
+        );
+    };
+    // #4254 defect ②: frame-level upstream-unavailable pill (shell.overlay slot).
+    // Polls the loopback-gated GET /__bili/upstreams read surface (#4257) and
+    // renders one row per unreachable upstream; returns null while every upstream
+    // is reachable, so the banner auto-dismisses when circuits close + alerts clear.
+    // Purely additive UI — no request path changes. Display identity is the
+    // forwarded host:port (bili is a transparent pipe); provider/model reverse
+    // lookup stays host-side.
+    const upstreamBanner = (): ((props?: Record<string, unknown>) => unknown) => () => {
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        const [rows, setRows] = useState<UpstreamRow[]>([]);
+        useEffect(() => probeOrigin((o) => setOrigin(o)), []);
+        useEffect(() => {
+            if (origin === undefined) return;
+            let cancelled = false;
+            const load = (): void => {
+                void fetch(`${origin}/__bili/upstreams`)
+                    .then((res) => res.json() as Promise<unknown>)
+                    .then((raw) => { if (!cancelled) setRows(parseUpstreamHealth(raw)); })
+                    .catch(() => { if (!cancelled) setRows([]); });
+            };
+            load();
+            const timer: ReturnType<typeof setInterval> = setInterval(load, UPSTREAM_POLL_MS);
+            return () => { cancelled = true; clearInterval(timer); };
+        }, [origin]);
+        if (rows.length === 0) return null;
+        const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
+        return createElement(
+            "div",
+            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(217,63,11,0.5)", background: "rgba(217,63,11,0.1)" } },
+            createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
+            ...rows.map((r) => {
+                const code = r.code !== undefined ? ` ${r.code}` : "";
+                // #6026: 0 means fail-fast already lifted (probe-eligible, and probes are
+                // request-driven — bili never auto-retries), so a countdown would be a lie.
+                const s = r.nextProbeInMs !== undefined && r.nextProbeInMs > 0 ? Math.ceil(r.nextProbeInMs / 1000) : undefined;
+                const eta = s !== undefined ? ` · ${t("upstream_retry_hint").replace("{s}", String(s))}` : "";
+                return createElement("div", { key: r.host, style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 } }, `${r.host} · ${r.kind}${code} ×${r.count}${eta}`);
+            }),
         );
     };
     ctx.slots.inject(
@@ -852,4 +1165,11 @@ export function apply(ctx: ClientContext): void {
             () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
         );
     }
+    // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection
+    // is fail-open on hosts whose build lacks the shell.overlay slot (same
+    // discipline as the session Context tab above).
+    ctx.slots.inject(
+        "shell.overlay",
+        () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner()),
+    );
 }

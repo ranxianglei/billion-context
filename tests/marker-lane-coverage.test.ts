@@ -8,9 +8,10 @@
 // BEFORE the field does.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
+import { logRawStripCounts, stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
 import { MARKER_SPECS, type MarkerId, type MarkerScope, type MarkerSpec, type MarkerStage } from "../src/marker/spec.ts";
 import { MARKER_INTEGRITY_NOTE } from "../src/marker/anchors.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 
 // ── fixtures, one per MarkerId (raw stage) ────────────────────────────────
 const DIGEST = "sha256:" + "ab".repeat(32);
@@ -28,6 +29,7 @@ const STATUS_BODY_MESSAGE =
     "    b1 | m00001–m00003 | 63% saved\n" +
     "  BILLED INPUT 104,100 tok\n" +
     "prose after the report";
+const WRAPPED_STATUS = buildVisibilityMarker("acp_status", "Compressible ranges (1):\n  m00001–m00010 | synthetic stale range").trim();
 const MARKER_LINE_MESSAGE =
     "user prose stays\n📦 [ACP] Compressed m00001–m00110 → b7\n❌ [ACP] compress FAILED: range cannot be anchored\nand so does this";
 // #1357: a FOREIGN literal tag is user data — raw stage keeps it byte-intact
@@ -44,6 +46,8 @@ type Case = { name: string; text: string };
 const userCases: Case[] = [
     { name: "panel", text: PANEL_MESSAGE },
     { name: "status body", text: STATUS_BODY_MESSAGE },
+    { name: "wrapped status body", text: WRAPPED_STATUS },
+    { name: "orphaned status body", text: WRAPPED_STATUS.slice(WRAPPED_STATUS.indexOf("[acp-status]")) },
     { name: "marker lines", text: MARKER_LINE_MESSAGE },
     { name: "render tag", text: RENDER_TAG_PROSE },
     { name: "chain carrier", text: CHAIN_CARRIER },
@@ -58,6 +62,8 @@ function assertStripped(body: unknown, counts: RawStripCounts, label: string): v
     assert.ok(!json.includes("acp_status result:"), `${label}: status body head must be gone`);
     assert.ok(!json.includes("ACTIVE SURFACE"), `${label}: status body sections must be gone`);
     assert.ok(!json.includes("CONTEXT BREAKDOWN"), `${label}: status body sections must be gone (2)`);
+    assert.ok(!json.includes("synthetic stale range"), `${label}: wrapped and orphaned status bodies must be gone`);
+    assert.ok(!json.includes("[acp-status]"), `${label}: status wrappers must be gone`);
     assert.ok(!json.includes("Compressed m00001–m00110"), `${label}: confirmation marker line must be gone`);
     assert.ok(!json.includes("compress FAILED"), `${label}: failure marker line must be gone`);
     assert.ok(!json.includes(DIGEST), `${label}: chain carrier must be gone`);
@@ -169,7 +175,44 @@ test("engine: the declarative spec table and the engine agree on raw-stage class
     // stage must NEVER strip a foreign literal tag from user text.
     assert.ok(!rawIds.includes("render_tag"));
     const counted = ["panels", "statusBodies", "markerLines", "nudges", "carriers"] as const;
-    assert.equal(Object.keys(stripRawStage({ messages: [] }, "anthropic")).length, counted.length + 1, "counts shape unchanged: spec/engine drift check");
+    // statusBodyLines is a sub-count of statusBodies and strippedMs the pass
+    // wall time (#6018) — neither is an artifact class, so neither is a spec
+    // id. Both are enumerated here so a NEW silently-added class still fails
+    // this check.
+    assert.deepEqual(
+        Object.keys(stripRawStage({ messages: [] }, "anthropic")).sort(),
+        [...counted, "statusBodyLines", "strippedMs"].sort(),
+        "counts shape unchanged: spec/engine drift check",
+    );
+});
+
+test("engine: marker-line gate fires only on the literal [ACP] (#6018)", () => {
+    // negative row: near-miss text without the literal cannot match MARKER_LINE
+    // — it must ride byte-intact through the gated pass exactly as before.
+    {
+        const body = { messages: [{ role: "assistant", content: "📦 [AC P] Compressed m00001–m00010 → b5 and 📦[ACP ] x" }] };
+        const counts = stripRawStage(body, "anthropic");
+        assert.equal(counts.markerLines, 0);
+        assert.equal(body.messages[0].content, "📦 [AC P] Compressed m00001–m00010 → b5 and 📦[ACP ] x", "near-miss without literal [ACP] untouched");
+    }
+    // positive row: the literal line is still stripped when present.
+    {
+        const body = { messages: [{ role: "assistant", content: "before\n📦 [ACP] Compressed m00001–m00010 → b5\nafter" }] };
+        const counts = stripRawStage(body, "anthropic");
+        assert.equal(counts.markerLines, 1);
+        assert.ok(!String(body.messages[0].content).includes("[ACP]"), "literal marker line stripped");
+    }
+});
+
+test("engine: strippedMs measures the pass; the slow line logs only above threshold (#6018)", () => {
+    const small = stripRawStage({ messages: [{ role: "user", content: "hi" }] }, "anthropic");
+    assert.ok(Number.isFinite(small.strippedMs) && small.strippedMs >= 0, "strippedMs is a finite non-negative number");
+    const lines: string[] = [];
+    const log = (_level: "info" | "warn", msg: string): void => { lines.push(msg); };
+    logRawStripCounts({ panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 3.2 }, log, "s1");
+    assert.ok(!lines.some((m) => m.includes("raw-strip")), "below threshold: silent");
+    logRawStripCounts({ panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 12.4 }, log, "s1");
+    assert.ok(lines.some((m) => m.includes("raw-strip: 12.4ms")), "above threshold: attributable line");
 });
 
 test("engine: degraded slots become a space, never an empty string (#1542 zombie guard)", () => {
@@ -191,7 +234,7 @@ test("engine: degraded slots become a space, never an empty string (#1542 zombie
 // put marker-shaped text INSIDE every signed slot and assert the walk leaves
 // the containing message byte-identical.
 test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #10)", () => {
-    const poisoned = "model thought\n📦 [ACP] Compressed m00001–m00010 → b5\n\x3cacp tokens=\"9\" type=\"text\"\x3em00001\x3c/acp\x3e tail";
+    const poisoned = WRAPPED_STATUS + "\nmodel thought\n📦 [ACP] Compressed m00001–m00010 → b5\n\x3cacp tokens=\"9\" type=\"text\"\x3em00001\x3c/acp\x3e tail";
 
     // anthropic: {type:"thinking", thinking, signature} block — text field is
     // `.thinking`, and the explicit gate must hold even if a future shape
@@ -206,7 +249,13 @@ test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #
         const before = JSON.stringify(body.messages[0]);
         stripRawStage(body, "anthropic");
         assert.equal(JSON.stringify(body.messages[0]), before, "anthropic thinking block must ride byte-for-byte");
-        assert.equal((body.messages[1] as { content: string }).content, " ", "non-signed user slot still strips");
+        // #5812: messages[1] is the LATEST (and only) user turn, so a marker-shaped
+        // whole slot now fails open to the original bytes instead of blanking.
+        assert.equal(
+            (body.messages[1] as { content: string }).content,
+            "📦 [ACP] Compressed m00001–m00010 → b5",
+            "latest user turn fails open when its whole slot is a marker line (#5812)",
+        );
     }
 
     // google: {text, thought:true} and {text, thoughtSignature} parts
@@ -296,4 +345,83 @@ test("engine: a report pasted into the latest user message survives (paste guard
     const rc = stripRawStage(r, "responses");
     assert.equal(rc.statusBodies, 1, "responses: assistant echo consumed, current-turn paste kept");
     assert.ok(JSON.stringify(r).includes("ACTIVE SURFACE"), "responses: pasted body survives");
+});
+
+
+test("engine: wrapped current-user reports survive on every wire", () => {
+    for (const wire of ["openai", "anthropic", "responses", "google"] as const) {
+        const messages = [
+            { type: "message", role: "assistant", content: WRAPPED_STATUS },
+            { type: "message", role: "user", content: WRAPPED_STATUS },
+        ];
+        const body = wire === "google"
+            ? { contents: messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })) }
+            : wire === "responses" ? { input: messages } : { messages };
+        assert.equal(stripRawStage(body, wire).statusBodies, 1, wire);
+        assert.equal(JSON.stringify(body).split("synthetic stale range").length - 1, 1, `${wire}: only current paste survives`);
+    }
+});
+
+test("engine: wrapped-only assistant content becomes a space without rewriting tool calls", () => {
+    const toolCalls = [{ id: "t1", type: "function", function: { name: "write", arguments: JSON.stringify({ text: WRAPPED_STATUS }) } }];
+    for (const content of [WRAPPED_STATUS, WRAPPED_STATUS.slice(WRAPPED_STATUS.indexOf("[acp-status]"))]) {
+        const body = { messages: [{ role: "assistant", content, tool_calls: toolCalls }] };
+        const before = JSON.stringify(toolCalls);
+        assert.equal(stripRawStage(body, "openai").statusBodies, 1);
+        assert.equal(body.messages[0].content, " ");
+        assert.equal(JSON.stringify(body.messages[0].tool_calls), before);
+    }
+});
+
+// ── #5812: a marker-shaped line the USER typed must not be blanked ──────────
+// The raw layer cannot tell a pasted error line from a forged/bili marker by
+// content alone. The fix protects ONLY the latest user turn (live input —
+// bili's own injected markers never land in the client's latest user message)
+// and fails open to the original bytes when stripping would wipe the whole
+// slot. Older positions and assistant slots keep the degrade-to-space rule.
+const PASTED_MARKER_LINE =
+    "❌ [ACP] stream error: the turn degenerated again after the continuation nudge 这是什么报错？";
+
+test("engine: a marker-shaped LATEST user turn survives intact on every wire (fail-open, #5812)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = { messages: [{ role: "user", content: PASTED_MARKER_LINE }] };
+        const counts = stripRawStage(body, wire);
+        assert.equal((body.messages[0] as { content: string }).content, PASTED_MARKER_LINE, `${wire}: latest user turn preserved`);
+        assert.equal(counts.markerLines, 0, `${wire}: nothing counted as stripped (bytes kept)`);
+    }
+    const g = { contents: [{ role: "user", parts: [{ text: PASTED_MARKER_LINE }] }] };
+    const gc = stripRawStage(g, "google");
+    assert.equal((g.contents[0] as { parts: { text: string }[] }).parts[0]!.text, PASTED_MARKER_LINE, "google: latest user turn preserved");
+    assert.equal(gc.markerLines, 0, "google: nothing counted");
+    const r = { input: [{ type: "message", role: "user", content: PASTED_MARKER_LINE }] };
+    const rc = stripRawStage(r, "responses");
+    assert.equal((r.input[0] as { content: string }).content, PASTED_MARKER_LINE, "responses: latest user turn preserved");
+    assert.equal(rc.markerLines, 0, "responses: nothing counted");
+});
+
+test("engine: an OLDER marker-only user slot and assistant slots still degrade to a space (#5812 boundary)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = {
+            messages: [
+                { role: "user", content: "📦 [ACP] Compressed m00001–m0010 → b5" },
+                { role: "assistant", content: "❌ [ACP] compress FAILED: x", tool_calls: [{ id: "t1", function: { name: "compress", arguments: "{}" } }] },
+                { role: "user", content: PASTED_MARKER_LINE },
+            ],
+        };
+        stripRawStage(body, wire);
+        assert.equal((body.messages[0] as { content: string }).content, " ", `${wire}: older marker-only user slot still blanks`);
+        assert.equal((body.messages[1] as { content: string }).content, " ", `${wire}: assistant marker slot still blanks (tool_calls survive)`);
+        assert.ok(Array.isArray(body.messages[1]!.tool_calls), `${wire}: tool_calls untouched`);
+        assert.equal((body.messages[2] as { content: string }).content, PASTED_MARKER_LINE, `${wire}: latest user turn fails open`);
+    }
+});
+
+test("engine: a marker line WITH prose in the latest user turn strips the marker, keeps the prose (#5812 non-degenerate)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = { messages: [{ role: "user", content: "❌ [ACP] compress FAILED: x\nwhat do I do?" }] };
+        stripRawStage(body, wire);
+        const c = (body.messages[0] as { content: string }).content;
+        assert.ok(!c.includes("[ACP]"), `${wire}: marker line stripped`);
+        assert.ok(c.includes("what do I do?"), `${wire}: user prose survives`);
+    }
 });

@@ -203,3 +203,47 @@ test("acp_status renders the ACTIVE SURFACE line from the session's pack stamp",
     assert.ok(line, "ACTIVE SURFACE line present once stamped");
     assert.ok(line!.startsWith("ACTIVE SURFACE: pack=lean | host=billion-context "), `host identity rendered (got: ${line})`);
 });
+
+test("acp_status marks host-native compaction landings per session (#4458)", () => {
+    const clean = handleAcpStatus({}, makeCtx12()).text;
+    assert.ok(!clean.includes("HOST-NATIVE COMPACTION"), "negative gate: no marker when no native-compaction landing was recorded");
+
+    const pending = makeCtx12();
+    const t0 = Date.now() - 30_000;
+    pending.session.metadata.pluginAgent = "hermes";
+    pending.session.metadata.nativeCompactionBoundary = { at: t0, pendingRebase: true };
+    const outPending = handleAcpStatus({}, pending).text;
+    assert.ok(outPending.includes("HOST-NATIVE COMPACTION"), "marker present when a landing is recorded");
+    assert.ok(outPending.includes("(hermes)"), "names the resolved client/lane");
+    assert.ok(outPending.includes("NOT yet rebased"), "pending-rebase state surfaced");
+
+    const done = makeCtx12();
+    const t1 = Date.now() - 90_000;
+    done.session.metadata.clientHint = "codex";
+    done.session.metadata.nativeCompactionBoundary = { at: t1, pendingRebase: false, rebasedAt: Date.now() - 60_000 };
+    const outDone = handleAcpStatus({}, done).text;
+    assert.ok(outDone.includes("rebased onto it at"), "rebased state surfaced");
+    assert.ok(outDone.includes("(codex)"), "codex lane resolved from clientHint");
+});
+
+test("#3925: acp_status names a skipped fork adoption and stays quiet once blocks exist", () => {
+    const ctx = makeCtx12();
+    assert.ok(!handleAcpStatus({}, ctx).text.includes("FORK ADOPTION SKIPPED"), "no line without the marker (negative gate)");
+
+    ctx.session.metadata.forkAdoptionSkipped = { parentId: "pfa-parent-1", blocks: 7, tokens: 431_500 };
+    const skipped = handleAcpStatus({}, ctx).text;
+    assert.ok(skipped.includes("FORK ADOPTION SKIPPED"), "line appears while zero active blocks");
+    assert.ok(skipped.includes("pfa-parent-1"), "line names the parent session");
+    assert.ok(skipped.includes("7 parent block(s)"), "line names the skipped inventory");
+    assert.ok(skipped.includes("BILI_FORK_ADOPTION=1"), "line carries the recovery knob");
+
+    // Malformed marker must not render (shape validation on the way out).
+    ctx.session.metadata.forkAdoptionSkipped = { parentId: 42 };
+    assert.ok(!handleAcpStatus({}, ctx).text.includes("FORK ADOPTION SKIPPED"), "malformed marker renders nothing");
+
+    // Once any active block exists the gap is closed — line goes away.
+    ctx.session.metadata.forkAdoptionSkipped = { parentId: "pfa-parent-1", blocks: 7, tokens: 431_500 };
+    applyRanges(parseCompressInput(JSON.parse(COMPRESS_ARGS)), ctx);
+    assert.ok(ctx.session.state.blocks.some((b) => b.active), "fixture sanity: an active block now exists");
+    assert.ok(!handleAcpStatus({}, ctx).text.includes("FORK ADOPTION SKIPPED"), "suppressed once blocks exist");
+});

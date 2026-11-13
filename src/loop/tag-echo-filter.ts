@@ -110,15 +110,21 @@ const REF_TOKEN = "m\\d{4,}";
 // shapes the compress machinery prints (single ref, mNNNNN–mMMMMM ranges,
 // comma-separated range lists) that models imitate inside or beside render
 // tags (#2023). A bare run is never prose: prose cites ONE ref among words,
-// never a sequence of them.
-const REFS_RUN = REF_TOKEN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*" + REF_TOKEN + ")*";
+// never a sequence of them. The separator is written UNAMBIGUOUSLY — leading
+// spaces, then optionally ONE joiner plus its trailing spaces — so a given
+// span has exactly one parse. The equivalent two-arm form lets both \s*
+// arms claim the same spaces; when a later alternative fails the engine
+// replays 2^N partitions over an N-ref run (#4178: one push of 28
+// space-joined refs took 11s; 34 refs ~ 1.2h — comma-joined was 2ms).
+const REFS_RUN = REF_TOKEN + "(?:\\s*(?:[\u2013\u2014,\-]\\s*)?" + REF_TOKEN + ")*";
 // Whole string is a refs run (optionally padded): tag content, not prose.
 const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
 // Superset: the run may also END on an incomplete ref prefix (m / m0 / m00…)
 // or a dangling joiner — refs-shaped so far, verdict pending the next delta.
 // The swallow cap defers its release-vs-drop decision while this holds, or
-// the verdict flips with the chunk boundary (chunk-split determinism).
-const PENDING_REF_SPAN = new RegExp("^\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*$");
+// the verdict flips with the chunk boundary (chunk-split determinism). The
+// tail separator keeps the unambiguous one-parse-per-span form (#4178).
+const PENDING_REF_SPAN = new RegExp("^\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*$");
 // Body of a paired render tag: refs-only or empty (#1720/#2023). Anything
 // else is prose wearing tags — PAIRED must not match it.
 const PAIRED_BODY = "\\s*(?:" + REFS_RUN + ")?\\s*";
@@ -185,7 +191,7 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // ref): a dead unit NEVER consumes the whitespace around it (it is content),
 // in either mode, so chunk-split parity needs no cross-push whitespace
 // memory.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
@@ -420,7 +426,30 @@ export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");
 }
 
-export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+// #4106: input-side attestation for the DEAD_REF_CLOSE gate. Evidence produced
+// by channels that run AFTER the gate (a truncated open at EOF, a forged
+// marker line, a bili chain carrier / header block) is computed ONCE on the
+// original text here, before any pass mutates it. The old gate (`out !==
+// text`, evaluated mid-pipeline) only saw what earlier channels had already
+// deleted, so a marker line stripped later in the SAME call never attested —
+// and a second cleanup call shrank the bytes further: the verdict depended on
+// prior cleanup state, not on content. Close-side channels (TRUNC_CLOSE /
+// TRUNC_REF_CLOSE) are deliberately NOT attestation: they are the same
+// close-only family the gate protects (#1760/#644 — a lone truncated close
+// without other echo evidence stays content-preserved, bare ref included).
+const MARKER_LINE_PROBE = new RegExp(MARKER_LINE.source, "mu"); // MARKER_LINE is /gmu — .test() on it is lastIndex-stateful
+function laterChannelAttested(text: string): boolean {
+    return TRUNC_OPEN.test(text)
+        || MARKER_LINE_PROBE.test(text)
+        || nextChainSpan(text) !== null
+        || headBlockCut(text) >= 0;
+}
+
+/** One application of the full channel pipeline over one field. `attested`
+ *  carries the input-side evidence computed once on the ORIGINAL text
+ *  (#4106); `out !== text` adds this pass's own earlier-channel removals as
+ *  evidence. */
+function stripPass(text: string, dropToolCallEmission: boolean, requestText: string | undefined, attested: boolean): string {
     // A whole-field tool-call emission first: the field IS the call, so the
     // span goes whole (see toolCallEmissionSpan). Gated by the caller; the
     // m00885 echo check keeps a span the user asked to be emitted verbatim.
@@ -469,10 +498,14 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
     // passes: their removals ARE the same-text attestation (an unclosed open or
     // a degen pair count too, not just an already-stripped span), and stripping
     // an open also un-glues a ref that sat right after its \x3e so the [\w>]
-    // lookbehind admits it. A close-only shape with no other echo evidence
-    // leaves out === text and stays content-preserved (#1760); such sightings
-    // remain observable via the residue audits.
-    if (out !== text) {
+    // lookbehind admits it. The gate is `attested || out !== text`: this pass's
+    // own earlier-channel removals, plus the input-side evidence computed once
+    // on the original text (#4106 — later channels' shapes count too, so the
+    // verdict rides the CONTENT, not on what an earlier cleanup already did).
+    // A close-only shape with no other echo evidence leaves both terms false
+    // and stays content-preserved (#1760); such sightings remain observable via
+    // the residue audits.
+    if (attested || out !== text) {
         out = out.replace(new RegExp(DEAD_REF_CLOSE.source, "g"), "");
     }
     out = out
@@ -481,6 +514,31 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
         .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
         .replace(MARKER_LINE, "");
     return stripBiliArtifacts(out);
+}
+
+// Cascade cap for the fixed-point walk below: every non-stable pass strictly
+// shortens the text, so the walk terminates anyway; the cap bounds adversarial
+// cascade depth (cross-stage exposures layered more than this deep keep their
+// residue rather than burn CPU on attacker-shaped fields).
+const STRIP_PASS_CAP = 8;
+
+/** Whole-text ACP artifact strip. Returns a FIXED POINT whenever the exposure
+ *  cascade settles within STRIP_PASS_CAP passes (all attested shapes and every
+ *  observed cascade do — one call then does everything repeat calls would,
+ *  #4106, so retry/rebuild paths re-normalizing already-cleaned messages ship
+ *  stable bytes). Beyond the cap — attacker-shaped fields layering more
+ *  cross-stage exposures than this deep — the walk stops and keeps its
+ *  residue; a repeated call may peel further (the CPU bound outranks
+ *  completeness there, see the STRIP_PASS_CAP note above). */
+export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+    const attested = laterChannelAttested(text);
+    let out = text;
+    for (let i = 0; i < STRIP_PASS_CAP; i++) {
+        const next = stripPass(out, dropToolCallEmission, requestText, attested);
+        if (next === out) return out;
+        out = next;
+    }
+    return out;
 }
 
 /** Whole-text echo normalization for parity judges (the invariant judge,
@@ -951,6 +1009,13 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
 
 export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
+    /** Settled prose deferred alongside a NON-definite tag-head tail: it
+     *  carries a dead ref-close unit whose verdict is content-determined
+     *  only at the tail's resolution — a resolved tag records a drop (gate
+     *  opens, unit stripped) while a prose tail leaves the gate closed
+     *  (#1760). Folded back at process() entry so the main loop re-runs
+     *  adjudication once the tail resolves (#4107 family, fifth shape). */
+    let preHeld = "";
     /** Last character actually emitted ("" at stream start). Extends the
      *  [\w>] orphan-unit lookbehind ACROSS chunk boundaries: a refs run
      *  arriving at the buffer head was preceded by whatever was emitted
@@ -1033,6 +1098,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         }
         return out + s.slice(last);
     };
+    const deadUnitIn = (s: string): boolean => {
+        if (!s.includes("\x3c/")) return false;
+        const re = new RegExp(DEAD_REF_CLOSE.source, "g");
+        return re.exec(s) !== null;
+    };
     /** Character immediately before the refs run of an orphan-unit match —
      *  within the buffer, or the last emitted char when the run sits at the
      *  buffer head (chunk boundary). */
@@ -1042,12 +1112,64 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         return pos === 0 ? lastEmitted : s[pos - 1];
     };
     const process = (input: string): string => {
-        let buf = input;
+        // Deferred settled prose re-enters ahead of fresh input so its dead
+        // unit takes the verdict of whatever the pending tail resolves to.
+        let buf = preHeld + input;
+        preHeld = "";
         let out = "";
         for (;;) {
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
+                // #2190/#4107: a completed degenerate unit at the payload
+                // head (single-ref body against any short close) dies
+                // atomically in whole-text (DEGEN_PAIR) whatever else follows
+                // — including a later acplike close, which would otherwise win
+                // the resolution race and release the body as prose with its
+                // dead close still inside (#4107 family, seventh shape).
+                // Consume such units before the loose-close resolution; the
+                // session ends here exactly as on the no-acplike-close path.
+                if (swallowReleases) {
+                    const dspan = degenCloseAfterRef(combined);
+                    if (dspan !== null) {
+                        dropSwallowSpan(combined.slice(0, dspan.end));
+                        swallowed = "";
+                        swallowUntilClose = false;
+                        buf = combined.slice(dspan.end);
+                        continue;
+                    }
+                }
                 const span = looseCloseSpan(combined);
+                // #4163: a NEW opening inside the live bare-open span is the
+                // cross-chunk form of the #1720 nesting evidence ("more tag
+                // structure follows in this same chunk"): the whole-buffer
+                // path would have dropped THIS opening alone and released
+                // whatever sat between it and the inner markup as prose.
+                // Without the check the inner opening accumulates into
+                // `swallowed`, and the close-resolution release branch or the
+                // EOF bare-release (#1881) hands it to the client verbatim —
+                // same logical output, different persisted bytes per chunking
+                // (#3198). Split only when the opening precedes any close
+                // terminator: a close first resolves the pair on the existing
+                // path and the remainder (opening included) loops normally.
+                // Gated to bare-open release sessions: an attrs-bearing tail
+                // is tag content end-to-end (#644 EOF rule), and a wrapped
+                // turn discards its payload wholesale — neither re-adjudicates
+                // its interior.
+                if (swallowBareOpen && swallowReleases) {
+                    const o = LONE_OPEN.exec(combined);
+                    if (o !== null) {
+                        const d = degenCloseAfterRef(combined);
+                        const term = span !== null ? span.start : d !== null ? d.start : -1;
+                        if (term === -1 || o.index < term) {
+                            out += stripDeadRefCloses(combined.slice(0, o.index), true);
+                            dropSwallowSpan(o[0]);
+                            swallowed = "";
+                            swallowUntilClose = false;
+                            buf = combined.slice(o.index);
+                            continue;
+                        }
+                    }
+                }
                 if (span !== null) {
                     // Only a refs-only body is tag content (#1720/#2023): a
                     // prose body between paired tags is released and just the
@@ -1057,29 +1179,32 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     const inner = combined.slice(0, span.start);
                     if (REFS_ONLY.test(inner) || !swallowReleases) {
                         dropSwallowSpan(combined.slice(0, span.end));
+                        buf = combined.slice(span.end);
                     } else {
-                        out += inner;
-                        dropSwallowSpan(combined.slice(span.start, span.end));
+                        // #4169: the body is released as prose, but its own
+                        // tag-shaped echoes take the SAME verdicts as any other
+                        // text — whole-text strips a nested bare open inside an
+                        // attrs payload (LONE_OPEN pass), and streaming must
+                        // agree on the same bytes. Consume only the close and
+                        // splice the body back ahead of the remainder so the
+                        // main loop re-adjudicates it. A nested open left
+                        // TRUNCATED at the body's end is one broken attrs run
+                        // with this close (whole-text wrappedSpan semantics) —
+                        // drop both together instead of holding the head past
+                        // the close for content that arrived before it.
+                        const t = TRUNC_OPEN.exec(inner);
+                        if (t !== null) {
+                            out += stripDeadRefCloses(inner.slice(0, t.index));
+                            dropSwallowSpan(combined.slice(t.index, span.end));
+                            buf = combined.slice(span.end);
+                        } else {
+                            dropSwallowSpan(combined.slice(span.start, span.end));
+                            buf = inner + combined.slice(span.end);
+                        }
                     }
                     swallowed = "";
                     swallowUntilClose = false;
-                    buf = combined.slice(span.end);
                     continue;
-                }
-                if (swallowReleases) {
-                    // #2190: a degenerate close ends the span too. The body is
-                    // ref-shaped by construction (degenCloseAfterRef), so the
-                    // drop-whole rule applies unconditionally — wrapped mode
-                    // never reaches here (its payload may contain arbitrary
-                    // markup and must be discarded whole).
-                    const dspan = degenCloseAfterRef(combined);
-                    if (dspan !== null) {
-                        dropSwallowSpan(combined.slice(0, dspan.end));
-                        swallowed = "";
-                        swallowUntilClose = false;
-                        buf = combined.slice(dspan.end);
-                        continue;
-                    }
                 }
                 if (combined.length > swallowLimit) {
                     if (swallowReleases) {
@@ -1135,9 +1260,20 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // The lookbehind class extends across the chunk boundary: a run at
             // the buffer head preceded by an emitted word char is word-like
             // (xm01233), and one preceded by \x3e is tag-structure residue
-            // (#644) — neither is an orphan.
+            // (#644) — neither is an orphan. Voiding that HEAD match must not
+            // abandon the run: REFS_RUN may start at ANY ref (joiners are not
+            // \w), so a valid MID-RUN start (a ref preceded by a joiner) can sit
+            // inside the voided span. Re-scan from just past the voided head so
+            // that start is found instead of lost — otherwise the drop depends
+            // on where the chunk boundary fell (#4179). Any match at index \x3e 0
+            // already passes the lookbehind gate by construction, so one re-scan
+            // suffices.
             let r = ORPHAN_REF_CLOSE.exec(buf);
-            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) r = null;
+            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) {
+                const rescan = new RegExp(ORPHAN_REF_CLOSE.source, "g");
+                rescan.lastIndex = r.index + 1;
+                r = rescan.exec(buf);
+            }
             // A mangled open (<name=...>) is a complete self-contained tag:
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
@@ -1166,7 +1302,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 swallowSessionCounted = false;
                 recordDrop(broken[0]);
                 // The broken open is attested (recorded above) — clean any
-                // settled dead unit out of the prose before it.
+                // settled dead unit out of the prose before it, and kill any
+                // settle held pending a tail that just completed into it
+                // (#4164).
                 out += stripDeadRefCloses(buf.slice(0, broken.index));
                 buf = buf.slice(broken.index + broken[0].length);
                 swallowUntilClose = true;
@@ -1193,33 +1331,59 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     const cap = definite ? TAG_OPEN_CAP : refsShaped ? IMITATION_SWALLOW_CAP : HOLD_LIMIT;
                     // The settled prefix may already hold a dead unit while
                     // only the trailing head stays held — clean it on release.
-                    const pre = stripDeadRefCloses(buf.slice(0, buf.length - t[0].length));
+                    // A definite tail is guaranteed attestation: it always
+                    // resolves into a recorded drop (complete tag → match
+                    // drop, a second \x3c → broken-attrs drop, EOF →
+                    // TRUNC_OPEN/TRUNC_CLOSE flush drop), so force the gate
+                    // for the prefix ahead of it — otherwise a unit settling
+                    // before the tail survives when the tail's closing \x3e
+                    // lands in a later chunk, while whole-text strips it
+                    // (#4107 family, third shape).
+                    // A NON-definite tail may still resolve either way, so a
+                    // unit settled ahead of it cannot be judged yet: defer
+                    // the whole prefix with the tail (preHeld) and let the
+                    // main loop re-adjudicate at resolution — a resolved
+                    // tag records a drop and opens the gate, a prose tail
+                    // leaves it closed (#1760) (#4107 family, fifth shape).
+                    const rawPre = buf.slice(0, buf.length - t[0].length);
                     if (t[0].length <= cap) {
                         held = t[0];
-                        out += pre;
+                        if (definite) {
+                            preHeld = "";
+                            out += stripDeadRefCloses(rawPre, true);
+                        } else {
+                            preHeld = deadUnitIn(rawPre) ? rawPre : "";
+                            if (preHeld === "") out += rawPre;
+                        }
                     } else if (definite) {
                         drop(t[0]);
                         // The dropped tail IS this response's attestation even
                         // though its drop was only just recorded — force the
                         // gate or a settled unit ahead of it leaks raw.
-                        out += stripDeadRefCloses(buf.slice(0, buf.length - t[0].length), true);
+                        preHeld = "";
+                        out += stripDeadRefCloses(rawPre, true);
                     } else {
                         // Same release-as-prose semantics as the short path:
                         // a settled dead unit dies when an echo is attested.
+                        preHeld = "";
                         out += stripDeadRefCloses(buf);
                     }
                 } else {
                     // #2862: release as prose, minus any dead ref-close unit
-                    // (an echo is already attested in this response).
+                    // (an echo is already attested in this response). A still-
+                    // held settle resolves to prose here too (#4164) and
+                    // precedes this buffer in input order.
                     const rel = stripDeadRefCloses(buf);
-                    if (onResidueWarn && containsEchoResidue(rel)) onResidueWarn(rel);
-                    out += rel;
+                    const resolved = rel;
+                    if (onResidueWarn && containsEchoResidue(resolved)) onResidueWarn(resolved);
+                    out += resolved;
                 }
                 break;
             }
             // The winning match itself attests an echo in this response even
             // though its drop has not been recorded yet — force the gate for
-            // the prose released ahead of it.
+            // the prose released ahead of it, and kill any settle held pending
+            // the tail that just completed into this tag (#4164).
             out += stripDeadRefCloses(buf.slice(0, m.index), true);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
@@ -1236,6 +1400,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // session's first counted span; every other match is self-contained.
             if (m === o) {
                 const bare = !OPEN_WITH_ATTRS.test(m[0]);
+                if (bare) {
+                    // A single-ref body against any short close is a
+                    // degenerate pair: whole-text drops the unit WHOLE
+                    // (DEGEN_PAIR) whatever else shares the chunk — dropping
+                    // only the open here would leave the body's fate to
+                    // whether a later open landed in the same buffer
+                    // (#4107 family). One logical artifact: the open records,
+                    // the body+close counts.
+                    const dspan = degenCloseAfterRef(buf);
+                    if (dspan !== null) {
+                        recordDrop(m[0]);
+                        drop(buf.slice(0, dspan.end));
+                        buf = buf.slice(dspan.end);
+                        continue;
+                    }
+                }
                 if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) {
                     drop(m[0]);
                     continue;
@@ -1293,9 +1473,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return r;
         },
         flush(): string {
+            let preOut = "";
             if (tcHold !== "off") {
                 // The field ended while its head was held: decide the whole
-                // field, then hand any non-emission rest to the normal path.
+                // field, then hand any non-emission rest to the settle below.
+                // No early returns of process() output here: process can leave
+                // a partial tail in held or a live swallow session, and
+                // returning directly dropped both silently at EOF.
                 tcHold = "off";
                 const field = held;
                 held = "";
@@ -1305,29 +1489,30 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     if (span !== null) {
                         if (!emissionEchoesRequest(field.slice(span.start, span.end), requestText)) {
                             drop(field.slice(0, span.end));
-                            const rest = field.slice(span.end);
-                            if (rest.length === 0) return "";
-                            const r = process(rest);
-                            outputChars += r.length;
-                            return r;
+                            preOut += process(field.slice(span.end));
+                        } else {
+                            // The span mirrors the request verbatim (m00885):
+                            // the user asked for this fragment as the whole
+                            // response — it is user intent, so it flows
+                            // through untouched.
+                            preOut += process(field);
                         }
-                        // The span mirrors the request verbatim (m00885): the
-                        // user asked for this fragment as the whole response —
-                        // it is user intent, so it flows through untouched.
                     } else if (isOrphanToolCallTail(field)) {
                         drop(field);
                         return "";
+                    } else {
+                        preOut += process(field);
                     }
+                } else {
+                    preOut += process(field);
                 }
-                const r = process(field);
-                outputChars += r.length;
-                return r;
             }
             // #2862: dead ref-close units die before the truncate branches —
             // TRUNC_CLOSE would otherwise eat the \x3c/name tail at EOF and
             // shadow the unit down to a bare ref (#2348 v4 ordering).
-            const rest = stripDeadRefCloses(swallowed + held);
+            const rest = stripDeadRefCloses(preHeld + swallowed + held);
             const wasSwallowing = swallowUntilClose;
+            preHeld = "";
             swallowed = "";
             held = "";
             swallowUntilClose = false;
@@ -1357,7 +1542,55 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         dropSwallowSpan(rest);
                         result = "";
                     } else {
-                        result = rest;
+                        // Payload accumulated under the session may carry
+                        // COMPLETE structures the main loop never saw (they
+                        // arrived in later pushes while the session held) —
+                        // whole-text strips them, verbatim release leaked
+                        // them raw (#4107 family, sixth shape). Re-run the
+                        // main loop over the payload and drain whatever it
+                        // defers at true EOF with the same verdicts.
+                        let r = "";
+                        let payload = rest;
+                        let prev = "";
+                        for (let guard = 0; ; guard++) {
+                            const emitted = process(payload);
+                            if (emitted.length > 0) lastEmitted = emitted[emitted.length - 1];
+                            r += emitted;
+                            payload = preHeld + swallowed + held;
+                            preHeld = "";
+                            swallowed = "";
+                            held = "";
+                            swallowUntilClose = false;
+                            if (payload === "") break;
+                            const t2 = new RegExp(TRUNC_OPEN.source).exec(payload);
+                            if (t2 !== null) {
+                                dropSwallowSpan(t2[0]);
+                                r += payload.slice(0, t2.index);
+                                break;
+                            }
+                            const tc2 = new RegExp(TRUNC_CLOSE.source).exec(payload);
+                            if (tc2 !== null) {
+                                dropSwallowSpan(tc2[0]);
+                                r += payload.slice(0, tc2.index);
+                                break;
+                            }
+                            // Refs-only drop applies to the WHOLE payload only
+                            // (an imitated marker list, #2023) — once prose
+                            // ahead of a refs tail was emitted, the tail is a
+                            // prose-cited ref and must be released (#1760).
+                            if (r === "" && REFS_ONLY.test(payload)) {
+                                dropSwallowSpan(payload);
+                                break;
+                            }
+                            if (payload === prev || guard >= 64) {
+                                // No progress possible (pure partial tail) or
+                                // pathological nesting — release what remains.
+                                r += payload;
+                                break;
+                            }
+                            prev = payload;
+                        }
+                        result = r;
                     }
                 }
             } else {
@@ -1383,6 +1616,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 drop(result.slice(cut.index));
                 result = result.slice(0, cut.index);
             }
+            // #4164: EOF resolves any still-held settle as prose — no tag ever
+            // completed to attest it, so the units survive (#1760), in input
+            // order ahead of the settled tail. preOut (tcHold path) precedes
+            // both.
+            result = preOut + result;
             if (result.length > 0) lastEmitted = result[result.length - 1];
             if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
@@ -1392,7 +1630,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return droppedAny;
         },
         pending(): boolean {
-            return held.length > 0 || swallowUntilClose;
+            return held.length > 0 || preHeld.length > 0 || swallowUntilClose;
         },
         stats(): TagEchoFilterStats {
             return { inputChars, outputChars, dropped: droppedAny, dropCount };

@@ -486,7 +486,7 @@ test("applyCompression reports error for unknown boundary ref", () => {
   assert.equal(result.result.errors.length, 1);
 });
 
-test("batch compress rejects the whole batch when a summary fails length validation (#3003)", () => {
+test("batch compress passes when one summary is short but the total meets the floor (#5894)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
@@ -526,17 +526,14 @@ test("batch compress rejects the whole batch when a summary fails length validat
     }),
   });
 
-  // #3003: a length-class failure in ANY candidate rejects the WHOLE batch —
-  // the valid sibling no longer lands (that partial commit opened a seam that
-  // the retry then paid twice). All-or-nothing means zero blocks here.
-  assert.equal(result.result.blocksCreated, 0, "no sibling may land while one summary fails length");
-  assert.equal(result.state.blocks.length, 0);
-  assert.equal(result.result.errors.length, 1);
-  assert.match(result.result.errors[0]!, /Batch rejected before folding any range/);
-  assert.match(
-    result.result.errors[0]!,
-    /range m00003\.\.m00004: Summary too short \(22 chars, min 50\)/,
-  );
+  // #5894 flips the old #3003 pin here: the 22-char summary used to reject
+  // the WHOLE batch. The FLOOR now judges the COMBINED total of fold
+  // candidates (60 + 22 = 82 >= 50), so both ranges commit. The all-or-
+  // nothing property itself is unchanged — a TOTAL below the floor still
+  // rejects everything (pinned in issue5894-batch-summary-floor.test.ts).
+  assert.equal(result.result.blocksCreated, 2, "both ranges commit under the batch-total floor");
+  assert.equal(result.state.blocks.length, 2);
+  assert.equal(result.result.errors.length, 0);
 });
 
 test("retrying a consumed range reports already-compressed guidance, not too-small", () => {
@@ -576,18 +573,24 @@ test("retrying a consumed range reports already-compressed guidance, not too-sma
   });
 
   assert.equal(retry.result.blocksCreated, 0);
-  assert.equal(retry.result.errors.length, 1);
-  assert.match(retry.result.errors[0]!, /already compressed/);
+  // #4521: a pure resubmit of an already-consumed range is an idempotent
+  // no-op success — guidance moved from errors[] to warnings[] and the
+  // result is flagged noop so hosts render a success-shaped receipt.
+  assert.equal(retry.result.errors.length, 0);
+  assert.equal(retry.result.noop, true);
+  assert.ok(retry.result.warnings.length > 0);
+  assert.match(retry.result.warnings[0]!, /already compressed/);
   assert.match(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /already summarized in active block\(s\) b1/,
   );
+  assert.match(retry.result.warnings[0]!, /do not resend these ranges/);
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /retry with startId\/endId set to active block IDs/,
   );
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /Total compressible content too small/,
   );
 });
@@ -1426,17 +1429,22 @@ test("gate error names the covering block when anchors stay consumed", () => {
   });
 
   assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.result.errors.length, 1);
+  // #4521: consumed-anchors-only resubmit is the idempotent no-op class —
+  // guidance lives in warnings[], errors[] stays empty, noop is flagged.
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
+  assert.ok(result.result.warnings.length > 0);
   assert.match(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /Requested range\(s\) already compressed \(e\.g\. b2\.\.b110\)/,
   );
   assert.match(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /its content is already summarized in active block\(s\) b110 — use search_context or decompress b110 if you need details from it/,
   );
+  assert.match(result.result.warnings[0]!, /do not resend these ranges/);
   assert.doesNotMatch(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /retry with startId\/endId set to active block IDs/,
   );
 });

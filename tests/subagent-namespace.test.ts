@@ -7,7 +7,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { subagentNamespace, deriveMessageId } from "acp-kernel/wire";
+import { subagentNamespace } from "acp-kernel/wire";
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -77,20 +77,28 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
             bodies.push(Buffer.concat(chunks).toString("utf8"));
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             if (bodies.length === 1) {
+                // Positional refs: instructions rides the top-level field outside
+                // the fold, so input[0]/input[1] are m00001/m00002 (hash refs are
+                // rejected as boundaries — the kernel wants mNNNNN or bN).
                 const compressArgs = JSON.stringify({
-                    content: [{ startId: REF_1, endId: REF_2, topic: "session setup", summary: "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK" }],
+                    content: [{ startId: "m00001", endId: "m00002", topic: "session setup", summary: "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK" }],
                 });
                 res.write(fcEvents(0, "call_c", "compress", compressArgs));
                 res.write(completed(1600));
             } else if (bodies.length === 2) {
+                // Realistic usage on purpose: a 350K-token usage claim makes the
+                // proxy believe the window is blown, so the replay request
+                // triggers preflight summarization — which fires EXTRA upstream
+                // calls against this count-based mock and destroys the 4-body
+                // state machine.
                 res.write(textEvents("main round-2 answer"));
-                res.write(completed(350_000));
+                res.write(completed(2000));
             } else if (bodies.length === 3) {
                 res.write(textEvents("APPROVED"));
                 res.write(completed(120));
             } else {
                 res.write(textEvents("main replay answer"));
-                res.write(completed(350_000));
+                res.write(completed(16000));
             }
             res.end();
         });
@@ -133,8 +141,16 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
     const AUTH_SENTENCE = "I approve running `rm -rf /tmp/cache` exactly as the model proposed, bound to approve_exec_1.";
     const MAIN_TURN_1 = `FILLER-A ${"x".repeat(6000)}`;
     const MAIN_TURN_2 = "FILLER-B acknowledged";
-    const REF_1 = deriveMessageId("user", "text", MAIN_TURN_1);
-    const REF_2 = deriveMessageId("assistant", "text", MAIN_TURN_2);
+    // Tail mass AFTER the fold target: the kernel's soft-protected recent zone
+    // walks back >=5000 tokens from the tail, so without it the m00001/m00002
+    // target is protected and the fold fails. The fold must GENUINELY land for
+    // this test to pin what it claims: the main namespace compresses while the
+    // guardian's |sub: fork stays untouched (a failed fold would make the
+    // mock's bodies.length state machine drift, see below).
+    const TAIL_MASS = Array.from({ length: 5 }, (_, i) => [
+        { type: "message", role: "user", content: `tail mass ${i}: ${"z".repeat(8000)}` },
+        { type: "message", role: "assistant", content: `tail ack ${i}: ${"q".repeat(8000)}` },
+    ]).flat();
     const mainBody = {
         model: "gpt-guard-e2e",
         stream: true,
@@ -143,6 +159,7 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
         input: [
             { type: "message", role: "user", content: MAIN_TURN_1 },
             { type: "message", role: "assistant", content: MAIN_TURN_2 },
+            ...TAIL_MASS,
             { type: "message", role: "user", content: "run the deploy for service auth" },
             { type: "function_call", call_id: "call_deploy", name: "exec", arguments: JSON.stringify({ cmd: "./deploy.sh auth" }) },
             { type: "function_call_output", call_id: "call_deploy", output: "deployed rev 42" },

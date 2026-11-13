@@ -1,25 +1,20 @@
 // Inbound acp_status report-body stripping (#2789, #2811 marker spec class
 // acp_status_body).
 //
-// buildVisibilityMarker (loop/core.ts) emits acp_status results as
-// `\n${icon} [ACP] acp_status result:\n${result.trim()}\n` — a head LINE plus
-// a multi-line report body. MARKER_LINE only consumes the head, so a client
-// that persists and resends assistant text accumulated the orphaned bodies
-// turn over turn (10–40 lines each: ACTIVE SURFACE, CONTEXT BREAKDOWN,
-// COMPRESSED BLOCKS, BILLED INPUT, …; #2789 measured 0.5–1.5K chars/turn).
-//
-// There is no wrapper pair around the body (unlike [acp-cache]…[/acp-cache]),
-// so this consumer anchors on the head and eats the contiguous report body
-// line-by-line. The grammar below is the contract with the renderers:
+// buildVisibilityMarker (loop/core.ts) wraps reports in [acp-status] pairs.
+// Consume complete pairs even if an earlier pass already stripped the head.
+// Legacy reports have no wrapper, so the grammar below remains their contract
+// with the renderers:
 //   - kernel report:  kernel/src/report.ts (renderOverview / renderRanges /
 //     renderMessages / block detail)
 //   - host extras:    src/acp-status.ts (BILLED INPUT, breaker, STORE (CCR),
 //     RETRIEVAL QUALITY, BLOCK SPANS, STORAGE, PRE-COMPACTION ARCHIVE,
-//     CRITICAL ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS)
+//     CRITICAL ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS,
+//     PCK SELF-STAMPING OFF BY DEFAULT)
 //   - conflict view:  src/conflict-watch.ts (COMPRESSION CONFLICTS, Fix (…))
-// A NEW section added to a renderer must be registered here or its body
-// leaks again — tests/marker-render-contract.test.ts renders every section
-// and fails the moment the two sides drift.
+// tests/marker-render-contract.test.ts covers both emitted and legacy shapes.
+
+import { STATUS_REPORT_OPEN, STATUS_REPORT_CLOSE } from "../acp-panel.js";
 
 const STATUS_HEAD = /^\p{So}(?:[ \t])?\[ACP\][^\n]*acp_status[^\n]*\n?/gmu;
 
@@ -51,6 +46,7 @@ const SECTION_HEADS: readonly string[] = [
     "CRITICAL UPDATE AVAILABLE (instance-level): ",
     "UNDECRYPTED TRAFFIC (instance-level): ",
     "UNRECOGNIZED PATHS (instance-level): ",
+    "PCK SELF-STAMPING OFF BY DEFAULT (instance-level, #5079): ",
     "Last failures were attributed to ",
     "The Compressible-ranges list above was re-derived",
     "Nudge: ",
@@ -95,21 +91,31 @@ export interface StatusBodyResult {
 // user's own prose survive. A head with NO recognizable body line after it
 // is left in place — stripAcpTags owns plain marker lines.
 export function consumeAcpStatusBody(text: string): StatusBodyResult {
-    if (!text.includes("[ACP]") || !text.includes("acp_status")) return { text, bodies: 0, lines: 0 };
+    if (!text.includes(STATUS_REPORT_OPEN) && (!text.includes("[ACP]") || !text.includes("acp_status"))) return { text, bodies: 0, lines: 0 };
     const lines = text.split("\n");
     const out: string[] = [];
     let bodies = 0;
     let removed = 0;
     let i = 0;
     while (i < lines.length) {
-        if (!STATUS_HEAD.test(lines[i])) {
+        const hasHead = STATUS_HEAD.test(lines[i]);
+        STATUS_HEAD.lastIndex = 0;
+        const bodyStart = hasHead ? i + 1 : i;
+        if (lines[bodyStart] === STATUS_REPORT_OPEN) {
+            const end = lines.indexOf(STATUS_REPORT_CLOSE, bodyStart + 1);
+            if (end !== -1) {
+                bodies++;
+                removed += end - bodyStart + 1;
+                i = end + 1;
+                continue;
+            }
+            // Without a terminator, keep the text rather than consume trailing prose.
+        }
+        if (!hasHead) {
             out.push(lines[i]);
             i++;
             continue;
         }
-        // STATUS_HEAD is a sticky-incompatible global regex; reset lastIndex
-        // defensively (split lines have no \n, the pattern is ^-anchored).
-        STATUS_HEAD.lastIndex = 0;
         let j = i + 1;
         let bodyLines = 0;
         while (j < lines.length) {

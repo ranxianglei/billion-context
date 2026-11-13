@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { matchSession as matchSessionKernel, parseStoredPlaceholder, renderHandoff as renderHandoffKernel, type MessageContentStore } from "acp-kernel";
+import { indexToRef, matchSession as matchSessionKernel, parseStoredPlaceholder, refForRaw, renderHandoff as renderHandoffKernel, renderMessage, type CompressionBlock, type MessageContentStore, type CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
@@ -30,6 +30,43 @@ interface SessionSummary {
 
 function fmtDate(ms: number | undefined): string {
     return ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "—";
+}
+
+// #5765: per-block ledger metadata — covered message range, original/summary
+// char counts, lifecycle status (active / retired / consumed).
+function blockRefRange(b: CompressionBlock): string {
+    // kernel-assigned raw refs (block-map.ts) — already in "mNNNNN" form.
+    if (typeof b.startRef === "string" && typeof b.endRef === "string" && b.startRef.length > 0 && b.endRef.length > 0) return b.startRef === b.endRef ? b.startRef : `${b.startRef}–${b.endRef}`;
+    return "n/a";
+}
+
+function blockLedgerLine(s: Session, b: CompressionBlock): string {
+    let range = blockRefRange(b);
+    if (range === "n/a") {
+        const nums = b.effectiveMessageIds
+            .map((id) => refForRaw(s.state.messageRefs, id))
+            .filter((r): r is string => r !== null)
+            .map((r) => Number(r.slice(1)))
+            .filter((n) => Number.isInteger(n) && n >= 1);
+        if (nums.length > 0) {
+            if (nums.length === 1) {
+                range = indexToRef(nums[0]);
+            } else {
+                // Loop instead of Math.min(...nums): tier-3 blocks of long
+                // sessions can carry more ids than V8's argument-spread limit.
+                let lo = Infinity;
+                let hi = -Infinity;
+                for (const n of nums) {
+                    if (n < lo) lo = n;
+                    if (n > hi) hi = n;
+                }
+                range = `${indexToRef(lo)}–${indexToRef(hi)}`;
+            }
+        }
+    }
+    const orig = s.blockContents.get(b.blockId)?.full.text.length;
+    const status = !b.active ? "consumed" : b.retired ? "retired" : "active";
+    return `messages ${range} · original ${orig !== undefined ? `${orig} chars` : "not cached"} · summary ${b.summary.length} chars · ${status}`;
 }
 
 export async function listSessions(opts: ExportOptions = {}): Promise<SessionSummary[]> {
@@ -82,12 +119,34 @@ function latestBlockTime(s: Session): number {
     return latest;
 }
 
+/** Ends the reasoning cell inside a single assistant block. `renderMessage`
+ *  emits `_reasoning_: …` with no terminator, so without it the handoff
+ *  renderer folds the answer that follows into the collapsed thinking box.
+ *  An HTML comment keeps the marker invisible in rendered Markdown. */
+export const HANDOFF_THINK_END = "<!-- /reasoning -->";
+
+function handoffCells(messages: CoreMessage[]): CoreMessage[] {
+    return messages.map((m) => m.contentType === "reasoning"
+        ? { ...m, text: (m.text ?? "").split("\n").map((line, index) =>
+            index > 0 && line.trim() === HANDOFF_THINK_END ? line + "\n" + line : line
+        ).join("\n").trimEnd() + "\n" + HANDOFF_THINK_END }
+        : m);
+}
+
 export function renderHandoff(s: Session, full: boolean): string {
+    const response = s.metadata.handoffResponse as { request?: unknown; messages?: unknown } | undefined;
+    const reply = response?.request === s.stats.requests && Array.isArray(response.messages) && response.messages.every((m): m is CoreMessage =>
+        m !== null && typeof m === "object" && typeof m.id === "string" && m.role === "assistant"
+        && ["text", "reasoning", "tool-call"].includes(m.contentType)
+        && [m.text, m.toolName, m.toolCallId].every((value) => value === undefined || typeof value === "string")
+    ) ? response.messages : [];
     const messages = s.lastMessages;
+    // Keep one assistant turn in arrival order, with explicit reasoning boundaries.
+    const latestReply = reply.length ? "\n### assistant\n\n" + handoffCells(reply).map(renderMessage).join("\n") + "\n" : "";
     if (messages && messages.length > 0) {
         const folded = s.lastMessagesFolded === true;
         const base = renderHandoffKernel({
-            coreMessages: messages,
+            coreMessages: handoffCells(messages),
             state: s.state,
             full,
             folded,
@@ -103,7 +162,7 @@ export function renderHandoff(s: Session, full: boolean): string {
                 ],
             },
         });
-        return base + blockSummariesSection(s, full && folded, base);
+        return base + latestReply + blockSummariesSection(s, full && folded, base);
     }
 
     // v2 fallback: no snapshot persisted. Block summaries (+ originals with
@@ -122,13 +181,18 @@ export function renderHandoff(s: Session, full: boolean): string {
     lines.push("");
     const active = s.state.blocks.filter((b) => b.active);
     if (active.length === 0) {
-        lines.push("No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
+        lines.push(reply.length
+            ? "No persisted request snapshot is available. Only the latest assistant response is included below."
+            : "No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
+    // #5765: `active` includes retired blocks (they remain active — only their
+    // view anchor is gone); consumed/inactive blocks stay excluded (#845 contract).
     for (const b of active) {
         lines.push(`## Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
         lines.push("");
         lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
+        lines.push(blockLedgerLine(s, b));
         lines.push("");
         lines.push(b.summary.trim());
         lines.push("");
@@ -146,7 +210,7 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("Paste the block summaries above into a new session to continue without the proxy.");
         lines.push("");
     }
-    return lines.join("\n");
+    return lines.join("\n") + latestReply;
 }
 
 // #845: the kernel handoff never emits state.blocks[].summary, and the persisted
@@ -156,15 +220,18 @@ export function renderHandoff(s: Session, full: boolean): string {
 // appears at least once. Originals attach only for folded snapshots — a
 // non-folded --full export already contains every original message.
 function blockSummariesSection(s: Session, includeOriginals: boolean, priorDoc: string): string {
-    const active = s.state.blocks.filter((b) => b.active);
-    if (active.length === 0) return "";
+    // #5765: retired blocks stay listed (they remain active — only their view
+    // anchor is gone); consumed/inactive blocks stay excluded (#845 contract).
+    const listed = s.state.blocks.filter((b) => b.active);
+    if (listed.length === 0) return "";
     const lines: string[] = [];
     lines.push(`## Compressed block summaries`);
     lines.push("");
-    for (const b of active) {
+    for (const b of listed) {
         lines.push(`### Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
         lines.push("");
         lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
+        lines.push(blockLedgerLine(s, b));
         lines.push("");
         const summary = b.summary.trim();
         if (summary === "") {
@@ -201,7 +268,8 @@ function safeJson(raw: string | null | undefined): unknown {
 
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
  * record per line: a session header, then messages ordered by seq (CCR
- * placeholders dereferenced to their stored originals when `full`), then
+ * placeholders dereferenced to their stored originals when `full`; retired
+ * rows included carrying `retiredAt`, live rows omit it — #4390/#4664), then
  * blocks ordered by ord, then dead refs. Deterministic for a given store
  * state; a generated artifact, never a source of truth. */
 // #3931: consumes the StorageBackend contract (not UnifiedStore) — the
@@ -235,7 +303,9 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
     // store by design (multi-MB rewrite cost, see session.ts contentStore).
     const ccr = new Map((await backend.getCcrEntries(sessionId)).map((e) => [e.key, e.content] as const));
     if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
-    for (const m of await backend.getMessages(sessionId)) {
+    // #4664: historian read — include retired (tombstoned) rows so a rewound
+    // session exports its full history; live rows omit `retiredAt`.
+    for (const m of await backend.getMessages(sessionId, { includeRetired: true })) {
         let message: Record<string, unknown>;
         try {
             message = JSON.parse(m.content) as Record<string, unknown>;
@@ -247,9 +317,13 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             const payload = ph ? ccr.get(ph.ref) : undefined;
             if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
         }
-        lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, message }));
+        lines.push(JSON.stringify({ type: "message", seq: m.seq, rawId: m.msgId, ref: m.ref, refNum: m.refNum ?? undefined, role: m.role, kind: m.kind ?? undefined, ...(m.retiredAt != null ? { retiredAt: m.retiredAt } : {}), message }));
     }
     for (const b of await backend.getBlocks(sessionId)) {
+        // #5765: lifecycle flags ride the verbatim payload blob (the table
+        // projection predates them); parse failure degrades to absent fields.
+        let payload: { retired?: boolean; rewrittenAt?: number } | undefined;
+        try { payload = JSON.parse(b.payloadJson) as { retired?: boolean; rewrittenAt?: number }; } catch { /* legacy row */ }
         lines.push(
             JSON.stringify({
                 type: "block",
@@ -263,6 +337,8 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
                 active: b.active,
                 createdAt: b.createdAt,
                 ...(b.supersedesBlockId ? { supersedesBlockId: b.supersedesBlockId } : {}),
+                ...(payload?.retired ? { retired: true } : {}),
+                ...(payload?.rewrittenAt != null ? { rewrittenAt: payload.rewrittenAt } : {}),
                 summary: safeJson(b.summary),
                 one: safeJson(b.one),
             }),
@@ -308,6 +384,7 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
         lines.push(JSON.stringify({ type: "message", seq: i, rawId: m.id, role: m.role, message: out }));
     }
     for (const [i, b] of s.state.blocks.entries()) {
+        const orig = s.blockContents.get(b.blockId)?.full.text.length;
         lines.push(
             JSON.stringify({
                 type: "block",
@@ -318,6 +395,10 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
                 endRef: b.endRef,
                 active: b.active,
                 createdAt: b.createdAt,
+                ...(b.retired ? { retired: true } : {}),
+                ...(b.rewrittenAt != null ? { rewrittenAt: b.rewrittenAt } : {}),
+                ...(orig !== undefined ? { originalChars: orig } : {}),
+                summaryChars: b.summary.length,
                 summary: { text: b.summary, compressedTokens: b.compressedTokens, tier: b.tier },
             }),
         );
@@ -325,6 +406,81 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
     const dead = s.state.deadRefs ?? [];
     if (dead.length > 0) lines.push(JSON.stringify({ type: "deadRefs", refs: dead }));
     return `${lines.join("\n")}\n`;
+}
+
+async function renderSelectedSessionJsonl(store: SessionStore, session: Session, full: boolean): Promise<string> {
+    // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
+    // exports straight from MySQL; everything else (and every fallback)
+    // stays on the local sqlite index. A mysql failure degrades to the
+    // legacy-tail renderer exactly like a corrupt index does.
+    const backendName = resolveBackendName(process.env, fileStorageBackend());
+    if (backendName === "mysql") {
+        const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
+        if (dsn.length > 0) {
+            try {
+                const backend = await openBackend("mysql", dsn);
+                try {
+                    await backend.init?.();
+                    if (await backend.getSessionRow(session.id)) {
+                        return await renderSessionJsonlFromTables(backend, session.id, full);
+                    }
+                } finally {
+                    await backend.close();
+                }
+            } catch (err) {
+                process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
+`);
+            }
+        }
+    }
+    const index = path.join(store.dir, "index.db");
+    const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
+    if (existsSync(index) && !encrypted) {
+        // #3931: the selection is enforced at open time, mirroring the lane-boot
+        // split — a registered-but-unshipped choice (mysql, step 2) fails here
+        // with its documented backend error before any file access, so a deliberate
+        // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
+        const selected = selectedBackendRaw(process.env, fileStorageBackend());
+        if (selected && selected !== "sqlite") {
+            if (listBackendNames().includes(selected)) {
+                // #3931 step 2: open is async now. The contract from the
+                // #3932 review holds — a deliberate selection never
+                // silently reads sqlite: without a DSN the open rejects
+                // with the documented error (bubbles out of the export);
+                // with a DSN the probe opens + closes cleanly (the real
+                // mysql export above already ran; if it degraded, its
+                // stderr notice announced the sqlite fallback).
+                const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
+                await probe.close();
+            } else {
+                const notice = backendSelectionNotice(selected);
+                if (notice) process.stderr.write(`[export] ${notice}\n`);
+            }
+        }
+        // Guarded open: a corrupt/foreign index.db must degrade to the
+        // legacy-tail renderer, not fail the export (#2690 review notes).
+        // Encryption gates the read for the same reason the ingest side
+        // does — index.db holds cleartext payloads, so an encrypted lane
+        // must never read from it.
+        try {
+            // #3931 step 2: openBackend is async (network backends
+            // open a pool + DDL init); the sqlite path resolves
+            // immediately.
+            const backend = await openBackend("sqlite", index);
+            try {
+                if (await backend.getSessionRow(session.id)) {
+                    const disk = store.loadContentStore(session);
+                    const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
+                    return await renderSessionJsonlFromTables(backend, session.id, full, extra);
+                }
+            } finally {
+                await backend.close();
+            }
+        } catch (err) {
+            process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
+        }
+    }
+    return renderSessionJsonlFromSession(session, full, store.loadContentStore(session));
 }
 
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
@@ -349,87 +505,15 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
         const ids = matches.map((s) => s.id).join(", ");
         throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
     }
-    if (opts.jsonl) {
-        // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
-        // exports straight from MySQL; everything else (and every fallback)
-        // stays on the local sqlite index. A mysql failure degrades to the
-        // legacy-tail renderer exactly like a corrupt index does.
-        const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (backendName === "mysql") {
-            const dsn = resolveMysqlDsn(process.env, fileStorageMysqlDsn());
-            if (dsn.length > 0) {
-                try {
-                    const backend = await openBackend("mysql", dsn);
-                    try {
-                        await backend.init?.();
-                        if (await backend.getSessionRow(matches[0]!.id)) {
-                            return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false);
-                        }
-                    } finally {
-                        await backend.close();
-                    }
-                } catch (err) {
-                    process.stderr.write(`[export] mysql backend unreadable (${String(err)}) — falling back to the local index
-`);
-                }
-            }
-        }
-        const index = path.join(store.dir, "index.db");
-        const encrypted = process.env.BILI_ENCRYPTION_KEY !== undefined && process.env.BILI_ENCRYPTION_KEY !== "";
-        if (existsSync(index) && !encrypted) {
-            // #3931: the selection is enforced at open time, mirroring the lane-boot
-            // split — a registered-but-unshipped choice (mysql, step 2) fails here
-            // with its documented backend error before any file access, so a deliberate
-            // selection never silently reads sqlite; a typo'd name warns once and reads sqlite.
-            const selected = selectedBackendRaw(process.env, fileStorageBackend());
-            if (selected && selected !== "sqlite") {
-                if (listBackendNames().includes(selected)) {
-                    // #3931 step 2: open is async now. The contract from the
-                    // #3932 review holds — a deliberate selection never
-                    // silently reads sqlite: without a DSN the open rejects
-                    // with the documented error (bubbles out of the export);
-                    // with a DSN the probe opens + closes cleanly (the real
-                    // mysql export above already ran; if it degraded, its
-                    // stderr notice announced the sqlite fallback).
-                    const probe = await openBackend(selected, selected === "mysql" ? resolveMysqlDsn(process.env, fileStorageMysqlDsn()) : index);
-                    await probe.close();
-                } else {
-                    const notice = backendSelectionNotice(selected);
-                    if (notice) process.stderr.write(`[export] ${notice}\n`);
-                }
-            }
-            // Guarded open: a corrupt/foreign index.db must degrade to the
-            // legacy-tail renderer, not fail the export (#2690 review notes).
-            // Encryption gates the read for the same reason the ingest side
-            // does — index.db holds cleartext payloads, so an encrypted lane
-            // must never read from it.
-            try {
-                // #3931 step 2: openBackend is async (network backends
-                // open a pool + DDL init); the sqlite path resolves
-                // immediately.
-                const backend = await openBackend("sqlite", index);
-                try {
-                    if (await backend.getSessionRow(matches[0]!.id)) {
-                        const disk = store.loadContentStore(matches[0]!);
-                        const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                        return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false, extra);
-                    }
-                } finally {
-                    await backend.close();
-                }
-            } catch (err) {
-                process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
-            }
-        }
-        return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));
-    }
-    const markdown = renderHandoff(matches[0]!, opts.full ?? false);
+    const content = opts.jsonl
+        ? await renderSelectedSessionJsonl(store, matches[0]!, opts.full ?? false)
+        : renderHandoff(matches[0]!, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
-        writeFileSync(opts.output, markdown, "utf8");
+        writeFileSync(opts.output, content, "utf8");
         return `written to ${opts.output}`;
     }
-    return markdown;
+    return content;
     } finally {
         // The one-shot store holds index.db open in unified modes; close it or
         // Windows callers cannot delete their temp dirs (EPERM).

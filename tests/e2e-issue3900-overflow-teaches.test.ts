@@ -32,6 +32,14 @@ const OVERFLOW_BODY = JSON.stringify({
     },
 });
 
+const LITELLM_OVERFLOW_BODY = JSON.stringify({
+    error: {
+        type: "BadRequestError",
+        code: "400",
+        message: "litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of 30000 tokens. You requested a total of 45000 tokens: 40000 tokens from the input messages and 5000 tokens for the completion.",
+    },
+});
+
 const CJK_TURN = "据".repeat(20_000);
 
 function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
@@ -60,7 +68,7 @@ function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
     } as ProxyOptions;
 }
 
-test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estimator learns from rejections, the arm behaves exactly as before", async () => {
+for (const format of ["openai", "litellm"] as const) test(`e2e #3900 (${format}): overflow counts teach calibration and completion reservation`, async () => {
     let calls = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -69,7 +77,7 @@ test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estima
             chunks.length = 0;
             calls += 1;
             res.writeHead(400, { "content-type": "application/json" });
-            res.end(OVERFLOW_BODY);
+            res.end(format === "litellm" ? LITELLM_OVERFLOW_BODY : OVERFLOW_BODY);
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -85,7 +93,7 @@ test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estima
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
         const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [{ role: "user", content: CJK_TURN }] });
-        const headers = { "content-type": "application/json", "x-acp-session": "t3900-learn-sess" };
+        const headers = { "content-type": "application/json", "x-acp-session": `t3900-learn-${format}` };
 
         // The local estimate (~20k) fits the 30k window, so both turns forward —
         // and both get rejected with the provider's own counts.
@@ -97,7 +105,7 @@ test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estima
         await r2.text();
         assert.ok(calls >= 2, `upstream saw the doomed body at least twice (got ${calls})`);
 
-        const s = listSessions().find((x) => x.id === "t3900-learn-sess");
+        const s = listSessions().find((x) => x.id === `t3900-learn-${format}`);
         assert.ok(s, "session exists");
         const st = s!.stats;
         // THE point of the PR: k̂ published from the rejections themselves.
@@ -113,9 +121,16 @@ test("e2e #3900: two overflow 400s with stated counts publish k̂ — the estima
         // pinned directly in the unit test; here the refold hook's re-prepare
         // legitimately notes a fresh pair afterwards, so lastLocalTextEstimate
         // may hold a new value by the time we look.)
-        // The arm keeps its #1110/#3738/#3450 semantics untouched.
+        // The arm keeps its #1110/#3738/#3450 semantics untouched: the
+        // baseline is still min(stated message tokens, the judging limit).
+        // Only the judging limit moves: this 400 proved the upstream bills a
+        // 5_000-token completion share against the 30_000 wall (#3900), so
+        // handle.ts rewrites effectiveContextLimit to 25_000 and the clamp
+        // lands there - the window the session can actually use. The clamp
+        // RULE is what this assertion pins; the stated ceiling is unchanged
+        // by it (asserted right below).
         assert.equal(st.lastInputTokensSource, "overflow-arm");
-        assert.equal(st.lastInputTokens, 30_000, "armed at min(stated messages 40k, judging limit 30k) — #3738 clamp");
+        assert.equal(st.lastInputTokens, 25_000, "armed at min(stated messages 40k, proven judging limit 25k = 30k - 5k completion share) - #3738 clamp");
         assert.equal(st.overflowArmTokens, 30_000, "guard keeps the stated ceiling");
         assert.equal(st.overflowArmCompletionReserve, 5_000, "the completion share stays reserved (#3450)");
     } finally {

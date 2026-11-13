@@ -8,7 +8,9 @@
 // semantics (#1106/#1148: content is identity): a system change whose
 // history BYTE-EXACTLY CONTINUES the raw key's chain migrates the anchor
 // (same conversation — compression state stays); a history-discontinuous
-// request (auto-review blob) still forks onto `<id>|sub:<fp>`.
+// MAIN-LANE request still forks onto `<id>|sub:<fp>`. (The auto-review
+// blob itself no longer reaches this resolver: since #4438 it rides the
+// stateless side passthrough.)
 //
 // #2989 dual-run: since the #2815 wiring swap the PRODUCTION path is
 // src/session-resolve.ts (order+id claim, fragment guard rails) — the
@@ -228,7 +230,7 @@ async function closeRig(rig: Rig): Promise<void> {
     await once(rig.upstream, "close");
 }
 
-test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); review still forks; switch back migrates again", async () => {
+test("e2e openai lane #2241/#4438: model switch keeps the raw key (anchor migration); review rides stateless passthrough; switch back migrates again", async () => {
     const rig = await startRig();
     const CONV = "dshc-openai";
     try {
@@ -263,7 +265,10 @@ test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); 
         assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length > refsA, "refs keep accumulating on the same session (compression state preserved)");
         assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 13, "remembered snapshot tracks the switched history");
 
-        // A review request under the SAME id still forks (isolation intact).
+        // A review request under the SAME id rides the stateless side
+        // passthrough (#4438 supersedes the #2241-era fork): nothing minted,
+        // main session byte-for-byte untouched.
+        const refsBeforeReview = Object.keys(getSession(CONV).state.messageRefs.byRaw).length;
         const r3 = await fetch(url, {
             method: "POST",
             headers,
@@ -276,12 +281,11 @@ test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); 
                 ],
             }),
         });
+        assert.equal(r3.status, 200, "the review forwarded through the side passthrough");
         await r3.text();
-        const fork = forkKey(CONV, REVIEW_SYSTEM);
-        const forkSession = peekSession(fork);
-        assert.ok(forkSession, "review request still forks onto its own session");
-        assert.equal(forkSession.stats.requests, 1, "forked session served the review");
+        assert.equal(peekSession(forkKey(CONV, REVIEW_SYSTEM)), undefined, "review request minted NO forked session (#4438 stateless passthrough)");
         assert.equal(getSession(CONV).stats.requests, 2, "main session untouched by the review");
+        assert.equal(Object.keys(getSession(CONV).state.messageRefs.byRaw).length, refsBeforeReview, "main refs untouched by the review");
 
         // Switch BACK to model A (history continues) → migrate again, raw key.
         const back = [...switched, { role: "user", content: "back on A-" + "z".repeat(64) }];

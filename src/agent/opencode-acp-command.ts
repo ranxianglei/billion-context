@@ -123,7 +123,7 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                         } catch {
                             version = undefined;
                         }
-                        text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
+                        text = version !== undefined ? armedIdleNotice(version, proxyBase) : noSessionWarning();
                     } else {
                         text = "bili: proxy returned no status panel";
                     }
