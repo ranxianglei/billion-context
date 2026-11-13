@@ -21,6 +21,8 @@ import { randomUUID } from "node:crypto";
 import { afterEach, test } from "node:test";
 import { createCore, defaultConfig, defaultPrompts, type Config, type CoreMessage } from "acp-kernel";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
+import { compressLoopAnthropicJson } from "../src/compress-loop-anthropic.ts";
+import type { RewriteCtx } from "../src/stream.ts";
 import { runReasoningGuard, type SseSink } from "../src/reasoning-guard.ts";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { getSession } from "../src/session.ts";
@@ -86,6 +88,49 @@ test("responses-wire compress loop feeds the 429 governor (#4743)", async () => 
         try { await compressLoopResponsesJson(initial, ctx, body, { url, headers }); } catch { threw400 = true; }
         assert.ok(threw400, "a fail-fast 400 propagates out of the loop");
         assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a settled non-429 verdict lifts the hold");
+    } finally {
+        globalThis.fetch = prevFetch;
+    }
+});
+
+test("non-stream anthropic-wire compress loop feeds the 429 governor (#4743)", async () => {
+    const baseCore = createCore();
+    const core = { ...baseCore, applyCompression: (input: Parameters<typeof baseCore.applyCompression>[0]) => ({ state: input.state, result: { blocksCreated: 0, tokensCompressed: 0, errors: [], warnings: [] } }) };
+    const ctx: RewriteCtx = {
+        core,
+        config: { modelContextLimit: 200000 } as Config,
+        messages: [] as CoreMessage[],
+        session: getSession(`issue4743-anth-${randomUUID()}`),
+        log: () => {},
+    };
+    const url = "https://loop-4743.test/anthropic";
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const initial = {
+        id: "msg_4743",
+        type: "message",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "tu1", name: "compress", input: { content: [{ startId: "m1", endId: "m1", summary: "s" }] } }],
+    };
+    const makeBody = () => ({ model: "claude-sonnet", messages: [{ role: "user", content: "go" }] });
+
+    const prevFetch = globalThis.fetch;
+    try {
+        // Arm: the loop's round-2 resend hits a 429 upstream; fetchWithRetry exhausts
+        // its budget and throws UpstreamHttpError(429), whose observe arms the governor.
+        globalThis.fetch = (async () => new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: { "content-type": "application/json", "retry-after": "1" } })) as typeof fetch;
+        let threw = false;
+        try {
+            await compressLoopAnthropicJson(initial, ctx, { signal: new AbortController().signal }, makeBody(), { url, headers });
+        } catch {
+            threw = true;
+        }
+        assert.ok(threw, "a terminal 429 propagates out of the loop");
+        assert.ok(upstreamThrottlePeekReject(url, headers), "governor armed after the loop's terminal 429");
+
+        // Clear: a settled ok response lifts the hold (same origin key).
+        globalThis.fetch = (async () => new Response(JSON.stringify({ id: "msg_ok", type: "message", role: "assistant", content: [{ type: "text", text: "done" }] }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
+        await compressLoopAnthropicJson(initial, ctx, { signal: new AbortController().signal }, makeBody(), { url, headers });
+        assert.equal(upstreamThrottlePeekReject(url, headers), undefined, "a resolved verdict lifts the hold");
     } finally {
         globalThis.fetch = prevFetch;
     }
