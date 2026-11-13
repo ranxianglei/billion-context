@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { defaultConfig } from "acp-kernel";
+import { createCore, defaultConfig } from "acp-kernel";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { responsesToCore as kernelResponsesToCore, type ResponseInputItem } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, coreToResponsesWithToolImages as coreToResponses } from "../src/responses-tool-output.ts";
 import { imageTokensInParsedBody } from "../src/image-tokens.ts";
@@ -11,6 +14,8 @@ import { createResponsesAdapter } from "../src/loop/adapter-responses.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession, listSessions, _resetSessionsForTest } from "../src/session.ts";
+import { resolveDecompress } from "../src/decompress-shared.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 process.env.NODE_ENV = "test";
@@ -28,9 +33,104 @@ function pngUrl(width: number, height: number, fill = 0): string {
 const imageUrl = pngUrl(2048, 1152);
 const parts = [{ type: "input_text", text: "The screenshot shows a failure." }, { type: "input_image", image_url: imageUrl, detail: "high" }];
 
+function userImageBody(n: number): { input: ResponseInputItem[] } {
+    return { input: [{ type: "message", role: "user", content: Array.from({ length: n }, (_, i) => [
+        { type: "input_text", text: `caption ${i}`, annotations: [`keep-${i}`] },
+        { type: "input_image", image_url: `https://example.test/image-${i}.png`, detail: i % 2 ? "low" : "high" },
+    ]).flat() }] };
+}
+
+test("full encoding binds each multipart image to its source, including partial and duplicate retention", () => {
+    const first = { type: "message", role: "user", content: [
+        { type: "input_text", text: "first source", custom: "keep-text-metadata" },
+        { type: "input_image", image_url: imageUrl, detail: "low" },
+        { type: "input_image", image_url: imageUrl, detail: "high" },
+    ] };
+    const second = { type: "message", role: "user", content: [
+        { type: "input_text", text: "second source" },
+        { type: "input_image", image_url: pngUrl(128, 256), detail: "auto" },
+    ] };
+    const projection = responsesToCore({ input: [first, second] });
+    assert.deepEqual(coreToResponses(projection.msgs), [first, second], "complete carriers round-trip once each");
+    const partial = projection.msgs.filter((_, index) => index !== 1);
+    const rebuilt = coreToResponses(partial);
+    assert.deepEqual(rebuilt[0]!.content, [first.content[0], first.content[2]], "retained duplicate keeps its own detail rather than taking the first image");
+    assert.deepEqual(rebuilt[1], second, "a neighboring source keeps its own image");
+    const summary = { id: "summary-carrier", role: "system" as const, contentType: "text" as const, text: "A new summary between retained image parts." };
+    const split = coreToResponses([projection.msgs[1]!, summary, projection.msgs[4]!]);
+    assert.deepEqual(split[0]!.content, [first.content[1]]);
+    assert.equal(split[1]!.role, "developer", "ordinary system item stays between the image sources");
+    assert.deepEqual(split[2]!.content, [second.content[1]]);
+});
+
 function toolBody(type: string, output: unknown = parts): { input: ResponseInputItem[] } {
     return { input: [{ type, call_id: "screenshot-call", output }] };
 }
+
+test("#4767: full encoding preserves one multi-image carrier instead of repeating it per core", () => {
+    for (const n of [26, 2, 1]) {
+        const body = userImageBody(n);
+        const projection = responsesToCore(body);
+        assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+        for (const textProtocol of [false, true]) {
+            const request = createResponsesAdapter(textProtocol).buildRequest(projection.msgs, "", body);
+            assert.deepEqual((request.input as ResponseInputItem[]).filter((item) => item.role === "user"), body.input);
+        }
+    }
+});
+
+test("#4767: ordinary multipart runs stay intact on both sides of image tool outputs", () => {
+    for (const type of ["function_call_output", "custom_tool_call_output"]) {
+        const before = userImageBody(2).input;
+        const tool = { type, call_id: "image-call", output: parts };
+        const after = userImageBody(3).input;
+        const body = { input: [...before, tool, ...after] };
+        const projection = responsesToCore(body);
+        const edited = projection.msgs.map((m) => m.role === "tool" ? { ...m, text: "changed" } : m);
+        assert.deepEqual(coreToResponses(edited, projection.customToolCallIds), [
+            ...before, { ...tool, output: [{ ...parts[0], text: "changed" }, parts[1]] }, ...after,
+        ]);
+    }
+});
+
+test("#4767: full encoding preserves repeated identical image instances", () => {
+    const body = userImageBody(2);
+    const first = body.input[0];
+    assert.ok(Array.isArray(first.content));
+    first.content[3] = { ...first.content[1] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: batching adjacent source carriers must not lose the later carrier's images", () => {
+    const later = userImageBody(3).input;
+    const body = { input: [...userImageBody(2).input, ...later] };
+    const projection = responsesToCore(body);
+    const rebuilt = coreToResponses(projection.msgs, projection.customToolCallIds);
+    assert.deepEqual(rebuilt, body.input, "each adjacent source keeps its own parts without duplication");
+});
+
+test("#4767: full encoding preserves empty history and surrounding plain history", () => {
+    assert.deepEqual(coreToResponses([]), []);
+    const body = { input: [
+        { type: "message", role: "assistant", content: "plain before" },
+        ...userImageBody(2).input,
+        { type: "message", role: "assistant", content: "plain after" },
+    ] };
+    const projection = responsesToCore(body);
+    assert.deepEqual(coreToResponses(projection.msgs, projection.customToolCallIds), body.input);
+});
+
+test("#4767: summary carriers stay separate from a neighboring multipart source", () => {
+    const body = userImageBody(2);
+    const projection = responsesToCore(body);
+    const summary = { id: "acp_summary_b1", role: "system" as const, contentType: "text" as const, text: "folded history" };
+    const summaryInput = [{ type: "message", role: "user", content: "folded history" }];
+    assert.deepEqual(coreToResponses([summary, ...projection.msgs, summary], projection.customToolCallIds), [
+        ...summaryInput, ...body.input, ...summaryInput,
+    ]);
+});
+
 
 test("Responses tool output images are charged by pixels or bytes, not ignored", () => {
     for (const type of ["function_call_output", "custom_tool_call_output"]) {
@@ -109,7 +209,7 @@ test("ordinary JSON tool outputs retain their existing projection and are not ch
 
 type RequestBody = { stream?: boolean; input?: ResponseInputItem[] };
 
-async function testProxy(window: number, run: (url: string, forwarded: RequestBody[], summaries: RequestBody[]) => Promise<void>): Promise<void> {
+async function testProxy(window: number, run: (url: string, forwarded: RequestBody[], summaries: RequestBody[]) => Promise<void>, store = new SessionStore({ enabled: false })): Promise<void> {
     const forwarded: RequestBody[] = [];
     const summaries: RequestBody[] = [];
     const upstream = http.createServer((req, res) => {
@@ -131,7 +231,7 @@ async function testProxy(window: number, run: (url: string, forwarded: RequestBo
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    _setStoreForTest(store);
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
@@ -155,6 +255,82 @@ async function testProxy(window: number, run: (url: string, forwarded: RequestBo
         }
     }
 }
+
+test("a persisted partial compression block keeps its summary, correct live image and archived original on raw resends", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-partial-block-"));
+    let store = new SessionStore({ enabled: true, dir });
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const a = { type: "input_image", image_url: `data:image/png;base64,${png}`, detail: "low" };
+    const b = { type: "input_image", image_url: `data:image/png;base64,${png}`, detail: "high" };
+    const opaque = { type: "compaction", encrypted_content: "opaque-client-state" };
+    const input: ResponseInputItem[] = [
+        { type: "message", role: "user", content: "Preserve independent opening." },
+        { type: "message", role: "assistant", content: "Ready." },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "Archived A decisions and constraints. ".repeat(200) }, a,
+            { type: "input_text", text: "Current B facts." }, b] },
+        opaque, { type: "message", role: "assistant", content: "Continue." },
+    ];
+    const config = { ...defaultConfig(100_000), preserveRecentMessages: 0, preserveRecentTokens: 0 };
+    const summary = "A established the accepted decisions and constraints. Those findings remain authoritative while continuing from B.";
+    try {
+        await testProxy(100_000, async (url, forwarded) => {
+            const send = async (history: ResponseInputItem[] = input): Promise<void> => {
+                const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ model: "image-test", stream: true, session_id: "persisted-partial-block", input: history }) });
+                assert.equal(response.status, 200, await response.text());
+                await new Promise<void>(resolve => setImmediate(resolve));
+            };
+            await send();
+            const session = listSessions().find(item => item.meta.label === "persisted-partial-block");
+            assert.ok(session);
+            const projection = responsesToCore({ input });
+            const folded = createCore().applyCompression({ messages: projection.msgs, state: session.state, config,
+                ranges: [{ startRef: session.state.messageRefs.byRaw[projection.msgs[2]!.id]!,
+                    endRef: session.state.messageRefs.byRaw[projection.msgs[3]!.id]!, summary }] });
+            assert.equal(folded.result.blocksCreated, 1, JSON.stringify(folded.result));
+            session.state = folded.state;
+            const blockId = session.state.blocks.at(-1)!.blockId;
+            const check = (): void => {
+                const wire = forwarded.at(-1)!.input!;
+                const pictures = wire.flatMap(item => Array.isArray(item.content) ? item.content.filter(part => part.type === "input_image") : []);
+                assert.deepEqual(pictures, [b], "A stays folded; B remains exactly once with its own detail");
+                assert.equal(JSON.stringify(wire).split(summary).length - 1, 1, "one block has one visible summary");
+                assert.deepEqual(wire.find(item => item.type === "compaction"), opaque, "untracked client state survives reconstruction");
+                assert.ok(getSession(session.id).state.blocks.some(block => block.blockId === blockId && block.active));
+            };
+            await send(); check();
+            // A temporary short view must not make the subsequent full echo
+            // resurrect the originals hidden by this same compression block.
+            await send([input[0]!, input[1]!, opaque, input.at(-1)!]);
+            await send(); check();
+            // Conversely, a new identical upload outside the covered span is
+            // current user content, not an echo to suppress by pixel hash.
+            await send([...input, { type: "message", role: "user", content: [a] }]);
+            const withNewImage = forwarded.at(-1)!.input!.flatMap(item => Array.isArray(item.content)
+                ? item.content.filter(part => part.type === "input_image") : []);
+            assert.deepEqual(withNewImage, [b, a], "the genuinely new identical image remains once");
+            await send(); check();
+            await store.writeNow(getSession(session.id));
+            await store.closeQuietlyAsync();
+            _resetSessionsForTest();
+            store = new SessionStore({ enabled: true, dir });
+            _setStoreForTest(store);
+            await send(); check();
+            const restoredSession = getSession(session.id);
+            const imageRef = restoredSession.state.messageRefs.byRaw[projection.msgs[3]!.id];
+            assert.ok(imageRef && imageRef !== "BLOCKED");
+            const restored = resolveDecompress({ imageRef }, { core: createCore(), config, messages: [], session: restoredSession, log: () => {} });
+            assert.equal(restored.outcome, "success", restored.text);
+            const path = restored.text.match(/\n  (.+\.png)/)?.[1];
+            assert.ok(path, restored.text);
+            assert.deepEqual(readFileSync(path), Buffer.from(png, "base64"));
+            await send(); check();
+        }, store);
+    } finally {
+        await store.closeQuietlyAsync();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 function screenshotItems(): ResponseInputItem[] {
     return [

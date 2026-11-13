@@ -149,11 +149,17 @@ test("#199: message-ref range that only re-wraps an active block is rejected, no
     config: cfg,
   });
 
+  // #4521: the re-wrap attempt is now the covered no-op — still zero blocks,
+  // b1 untouched, but delivered as a success-shaped receipt with the
+  // block-id guidance in warnings[] (the old hard error is exactly what the
+  // looping session kept re-sending into 33 times).
   assert.equal(applied.result.blocksCreated, 0, "must not create a block");
-  assert.equal(applied.result.errors.length, 1);
-  assert.match(applied.result.errors[0]!, /no new compressible/i);
-  assert.match(applied.result.errors[0]!, /b1/);
-  assert.match(applied.result.errors[0]!, /b1\.\.b1|block ID/i);
+  assert.equal(applied.result.errors.length, 0);
+  assert.equal(applied.result.noop, true);
+  const w = applied.result.warnings.join(" ");
+  assert.match(w, /already covered by active block\(s\) b1/);
+  assert.match(w, /b1\.\.b1|block ID/i);
+  assert.match(w, /do not resend this range/);
   assert.equal(applied.state.blocks.length, 1, "no wrapper block appended");
   assert.equal(applied.state.blocks[0]!.active, true, "b1 must stay active");
 });

@@ -61,11 +61,11 @@ test("legacy named-route config fails with an actionable migration error", () =>
     }
 });
 
-test("prompt-cache routing accepts the tri-state and defaults invalid values to auto", () => {
+test("prompt-cache routing accepts the tri-state and defaults invalid values to disabled (#5079)", () => {
     assert.equal(parsePromptCacheRouting("enabled"), "enabled");
     assert.equal(parsePromptCacheRouting("disabled"), "disabled");
     assert.equal(parsePromptCacheRouting("auto"), "auto");
-    assert.equal(parsePromptCacheRouting("unknown"), "auto");
+    assert.equal(parsePromptCacheRouting("unknown"), "disabled");
 });
 
 test("lookupContextLimit returns known windows", () => {
@@ -99,6 +99,21 @@ test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basen
     assert.equal(lookupContextLimit("meta-llama/Llama-4-Maverick"), 200_000);
     assert.equal(lookupContextLimit("qwen/qwen3.8-27b"), 200_000);
     assert.equal(lookupContextLimit("unknown-org/unknown-model"), undefined);
+});
+
+test("lookupContextLimit matches custom-gateway 'vendor/prefix:model' ids via the colon tail (#5907)", () => {
+    // The field shape from #5907: magpie-style "vendor/region:model" ids must
+    // reach their family rule instead of falling to the 2e5 env default.
+    assert.equal(lookupContextLimit("liuyue/cn:deepseek-v4.1-flash"), 1_000_000);
+    assert.equal(lookupContextLimit("acme/us:gpt-5-mini"), 400_000);
+    assert.equal(lookupContextLimit("relay/eu:glm-5-air"), 1_000_000);
+    // Colon without slash: the specific rule still wins over the broad one.
+    assert.equal(lookupContextLimit("org:deepseek-r1"), 128_000);
+    // Controls — no-colon shapes and unknown models are untouched.
+    assert.equal(lookupContextLimit("Kimi/glm-5"), 1_000_000);
+    assert.equal(lookupContextLimit("qwen/qwq-32b"), 200_000);
+    assert.equal(lookupContextLimit("deepseek/deepseek-r1"), 128_000);
+    assert.equal(lookupContextLimit("acme/us:totally-unknown-model"), undefined);
 });
 
 test("lookupContextLimit returns undefined for unknown models", () => {
