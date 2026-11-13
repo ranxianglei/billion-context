@@ -66,16 +66,20 @@ async function harness() {
         return { status: r.status, body: await r.json() };
     };
     // dsh-shaped request sender (anthropic wire: system TOP-LEVEL, messages replay raw)
-    const dshSend = async (conversationId: string, msgs: unknown[], agent: string | undefined, system: string, maxTokens = 1024) => {
+    const dshSend = async (conversationId: string, msgs: unknown[], agent: string | undefined, system: string, maxTokens = 1024, tools?: unknown[]) => {
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId };
         if (agent !== undefined) headers["x-bili-plugin-agent"] = agent;
-        const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: maxTokens, stream: false, system, messages: msgs }) });
+        const body: Record<string, unknown> = { model: "claude-test", max_tokens: maxTokens, stream: false, system, messages: msgs };
+        if (tools !== undefined) body.tools = tools;
+        const response = await fetch(`${origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify(body) });
         assert.equal(response.status, 200, await response.text());
     };
     // dsh-shaped request sender (responses wire: instructions is the system carrier)
-    const dshRespSend = async (conversationId: string, input: unknown[], instructions: string, maxTokens = 1024) => {
+    const dshRespSend = async (conversationId: string, input: unknown[], instructions: string, maxTokens = 1024, tools?: unknown[]) => {
         const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": conversationId };
-        const response = await fetch(`${origin}/bili/${upstream.url}/v1/responses`, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_output_tokens: maxTokens, instructions, input }) });
+        const body: Record<string, unknown> = { model: "claude-test", max_output_tokens: maxTokens, instructions, input };
+        if (tools !== undefined) body.tools = tools;
+        const response = await fetch(`${origin}/bili/${upstream.url}/v1/responses`, { method: "POST", headers, body: JSON.stringify(body) });
         assert.equal(response.status, 200, await response.text());
     };
     return { request, forwarded, dshSend, dshRespSend, origin, upstreamUrl: upstream.url, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await new Promise((r2) => setTimeout(r2, 50)); } };
@@ -208,11 +212,20 @@ test("(D) a design dsh persona fork (auto-review) does NOT trip the split canary
         // REVIEW_POLICY system, full-budget model turn (NOT a side request —
         // budget 300, no tools, no side agent) → keyed by design onto
         // `|sub:<fp>` (#1916/#1307/#1314) and rides the main pipeline there.
-        // #2241: the blob is the FLATTENED transcript as a single fresh user
+        // #2241: the blob is the FLATTENED transcript as a fresh user
         // message — it does NOT byte-exactly continue the raw key's chain, so
         // the continuity-aware anchor still forks it (a replay that DID
         // continue the chain is the same conversation evolving, not a persona).
-        await h.dshSend(conv, [{ role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nassistant: ok\nProposed tool call: bash rm -rf /tmp/x. Decide SAFE or UNSAFE." }], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        // #5656: the ONE-MESSAGE review shape now rides the stateless side
+        // lane (isDshSingleShotSidecar — no tools + single-shot body); the
+        // design fork lane is pinned here with a persona that carries its own
+        // round-trip history (an assistant answer between two blobs — not
+        // single-shot, still chain-disjoint, still a designed fork).
+        await h.dshSend(conv, [
+            { role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nProposed tool call: bash rm -rf /tmp/x. Decide SAFE or UNSAFE." },
+            { role: "assistant", content: "UNSAFE" },
+            { role: "user", content: "Conversation transcript (flattened):\nuser: main turn 0\nProposed tool call: npm install left-pad. Decide SAFE or UNSAFE." },
+        ], undefined, "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
         const all = listSessions();
         const kids = all.filter((s) => s.id.startsWith(conv + "|") || s.id.includes(conv + "|sub:"));
         assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
@@ -230,8 +243,12 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
     const h = await harness();
     try {
         const conv = "persona-resp";
-        // main turn anchors the raw key (instructions is the system carrier here)
-        await h.dshRespSend(conv, [mainMsg(0)], "MAIN OPERATING SYSTEM", 256);
+        // main turn anchors the raw key (instructions is the system carrier
+        // here). #5656: the main turn carries a tools surface, as real dsh
+        // main traffic does — a TOOL-LESS single-entry turn would now ride
+        // the side lane (the single-shot sidecar shape) and defer the anchor
+        // claim to the next replay.
+        await h.dshRespSend(conv, [mainMsg(0)], "MAIN OPERATING SYSTEM", 256, [{ type: "function", name: "bash", description: "run a shell command", parameters: { type: "object", properties: {} } }]);
         const main = resolveConversation(conv).session!;
         assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 1, "main refs under the raw key");
         // side shape: tiny budget, no tools, own utility instructions —
@@ -243,8 +260,14 @@ test("(E) side requests never claim the persona anchor on the responses wire (#2
         let kids = all.filter((s) => s.id.startsWith(conv + "|"));
         assert.equal(kids.length, 0, `side request must not mint a persona fork, got ${all.map((s) => s.id).join(", ")}`);
         assert.equal(main.stats.requests, 1, "side request counts nowhere");
-        // full-budget review shape still forks (the #2203 fix itself) and stays canary-clean
-        await h.dshRespSend(conv, [{ role: "user", content: "REVIEW: tool call risk assessment" }], "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
+        // full-budget review persona still forks (the #2203 fix itself) and
+        // stays canary-clean — #5656: the fork leg needs a round-trip history
+        // now (a single-blob review rides the stateless side lane).
+        await h.dshRespSend(conv, [
+            { role: "user", content: "REVIEW: tool call risk assessment" },
+            { role: "assistant", content: "UNSAFE" },
+            { role: "user", content: "REVIEW: second tool call risk assessment" },
+        ], "REVIEW_POLICY: classify the risk of the proposed tool call. Answer SAFE or UNSAFE.", 300);
         all = listSessions();
         kids = all.filter((s) => s.id.startsWith(conv + "|"));
         assert.equal(kids.length, 1, `expected exactly one persona-fork child, got ${all.map((s) => s.id).join(", ")}`);
@@ -277,10 +300,15 @@ test("(E2) empty-persona dsh traffic rides the raw key — no persona machine, n
         assert.equal(all.filter((s) => s.id.startsWith(conv2 + "|")).length, 0,
             `empty-instructions traffic must not mint lanes, got ${all.map((s) => s.id).join(", ")}`);
         // And a NON-empty persona on the same harness still forks (guard does
-        // not over-suppress): reuse (E)'s shapes once.
+        // not over-suppress): reuse (E)'s shapes once — #5656: with a
+        // round-trip history (the single-shot shape now rides the side lane).
         const conv3 = "persona-live";
-        await h.dshSend(conv3, [mainMsg(0)], undefined, "MAIN OPERATING SYSTEM", 256);
-        await h.dshSend(conv3, [{ role: "user", content: "Generate a title." }], undefined, "You generate short titles.", 256);
+        await h.dshSend(conv3, [mainMsg(0)], undefined, "MAIN OPERATING SYSTEM", 256, [{ name: "bash", description: "run a shell command", input_schema: { type: "object", properties: {} } }]);
+        await h.dshSend(conv3, [
+            { role: "user", content: "Aux persona task one." },
+            { role: "assistant", content: "done one" },
+            { role: "user", content: "Aux persona task two." },
+        ], undefined, "You generate short titles.", 256);
         all = listSessions();
         assert.equal(all.filter((s) => s.id.startsWith(conv3 + "|")).length, 1,
             `non-empty persona side traffic still forks, got ${all.map((s) => s.id).join(", ")}`);
@@ -317,12 +345,16 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // and to keep stamped reviews off the |sub: fork path. #5135 adds
 // isClaudeCodeTitleRequest — same category once more: a pure claude-code
 // title-sidecar shape predicate consulted to set sideIntent and to keep the
-// title call out of the #4774 raw-key anchor race.
+// title call out of the #4774 raw-key anchor race. #5656 adds
+// isDshSingleShotSidecar — same category once more: the generic single-shot
+// dsh sidecar shape predicate (no tools + one-shot body, any system text)
+// consulted to set sideIntent and to keep unknown sidecars off the raw-key
+// anchor before the first main turn can claim it.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;

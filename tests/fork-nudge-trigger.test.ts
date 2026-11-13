@@ -30,9 +30,14 @@ import { _resetSessionsForTest } from "../src/session.ts";
 const NUDGE_MARKER = "Context limit reached";
 const WINDOW = 60_000;
 
-function okSse(inputTokens: number): string {
+// #553 incident regime for the ANONYMOUS fork lane: the upstream NEVER
+// reports usage (lastInputTokens stays 0, usage reads 0% forever — see the
+// header comment), so input_tokens is omitted and the local estimate is the
+// only meter. The EXPLICIT-identity control passes a number instead: its zero
+// baseline self-heals via the next measured usage report.
+function okSse(inputTokens: number | null | undefined = null): string {
     return (
-        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: inputTokens } } })}\n\n` +
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", ...(inputTokens != null ? { usage: { input_tokens: inputTokens } } : {}) } })}\n\n` +
         `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n` +
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n` +
         `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
@@ -96,7 +101,8 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
             calls.push({ stream: !!parsed.stream, body: raw });
             if (parsed.stream) {
                 res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse(1000));
+                // explicit control reports; anonymous fork lane never does.
+                res.end(okSse(opts.anonymous ? null : 1000));
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
@@ -154,24 +160,41 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
             stream: true,
             messages: forkConversation(),
         });
-        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
-            method: "POST",
-            headers,
-            body,
-        });
-        await resp.text();
-        return { calls, status: resp.status };
+        // #5865 estimate-hold backstop: the first two estimate-grade rounds
+        // are HELD by design (they cover the aborted-turn / cache-TTL ghost
+        // windows), so replay the same conversation three times — the fork
+        // stays hot and the pressure decision lands on the third consecutive
+        // estimate round. Hold/backstop timing itself is pinned in
+        // kernel/tests/nudge-pressure-estimate-hold-backstop.test.ts.
+        let status = 0;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers,
+                body,
+            });
+            await resp.text();
+            status = resp.status;
+        }
+        if (process.env.FORK_NUDGE_TRACE) {
+            console.log(`TRACE ${opts.anonymous ? "anonymous" : "explicit"}: markers=[${calls.filter((c) => c.stream).map((c) => (c.body.includes(NUDGE_MARKER) ? "N" : "."))}]`);
+        }
+        return { calls, status };
     } finally {
         proxy.close();
         upstream.close();
     }
 }
 
-test("e2e: anonymous zero-baseline fork below the window → nudge injects (no fold, preflight silent)", async () => {
+test("e2e: anonymous zero-baseline fork below the window → nudge injects after the #5865 hold window (no fold, preflight silent)", async () => {
     const { calls, status } = await runCase({ anonymous: true });
     assert.equal(status, 200);
     assert.equal(calls.filter((c) => !c.stream).length, 0, "preflight must stay silent (optimistic estimate under window)");
-    const forward = calls.filter((c) => c.stream).at(-1)!;
+    const fwdCalls = calls.filter((c) => c.stream);
+    for (let i = 0; i < fwdCalls.length - 1; i++) {
+        assert.ok(!fwdCalls[i].body.includes(NUDGE_MARKER), `fork turn ${i + 1} must stay held inside the #5865 estimate-hold window (round ≤ 2 of 2)`);
+    }
+    const forward = fwdCalls.at(-1)!;
     const msgs = msgsOf(forward.body);
     const last = msgs.at(-1)!;
     assert.ok(
@@ -187,8 +210,11 @@ test("e2e: explicit-identity zero-baseline session with the same conversation �
     const { calls, status } = await runCase({ anonymous: false });
     assert.equal(status, 200);
     assert.equal(calls.filter((c) => !c.stream).length, 0);
-    const forward = calls.filter((c) => c.stream).at(-1)!;
-    assert.ok(!forward.body.includes(NUDGE_MARKER), "explicit-identity zero baseline must stay at 0 (self-heals via measured usage)");
+    const fwdCalls = calls.filter((c) => c.stream);
+    for (const f of fwdCalls) {
+        assert.ok(!f.body.includes(NUDGE_MARKER), "explicit-identity zero baseline must stay below every band on all turns (self-heals via measured usage)");
+    }
+    const forward = fwdCalls.at(-1)!;
     const tailMsgs = msgsOf(forward.body);
     const last = tailMsgs.at(-1)!;
     // Strip the outbound ACP anchor tag (proxy-mode wire format, AGENTS.md §2) before comparing.
@@ -236,7 +262,7 @@ async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>>
             calls.push({ stream: !!parsed.stream, body: raw });
             if (parsed.stream) {
                 res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse(1000));
+                res.end(okSse());
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
@@ -286,17 +312,26 @@ async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>>
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-                model: "claude-small",
-                max_tokens: 1024,
-                stream: true,
-                messages: imageForkConversation(),
-            }),
+        const body = JSON.stringify({
+            model: "claude-small",
+            max_tokens: 1024,
+            stream: true,
+            messages: imageForkConversation(),
         });
-        await resp.text();
+        // #5865 estimate-hold backstop: replay three times so the pressure
+        // decision lands past the two-round hold window (same rationale as
+        // runCase above).
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const resp = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body,
+            });
+            await resp.text();
+        }
+        if (process.env.FORK_NUDGE_TRACE) {
+            console.log(`TRACE image-fork: markers=[${calls.filter((c) => c.stream).map((c) => (c.body.includes(NUDGE_MARKER) ? "N" : "."))}]`);
+        }
         return calls;
     } finally {
         proxy.close();
@@ -304,10 +339,14 @@ async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>>
     }
 }
 
-test("e2e: #1137 anonymous image-heavy fork → image term crosses the pressure band, nudge injects", async () => {
+test("e2e: #1137 anonymous image-heavy fork → image term crosses the pressure band, nudge injects after the #5865 hold window", async () => {
     const calls = await runImageCase();
     assert.equal(calls.filter((c) => !c.stream).length, 0, "preflight must stay silent (optimistic estimate under window)");
-    const forward = calls.filter((c) => c.stream).at(-1)!;
+    const fwdCalls = calls.filter((c) => c.stream);
+    for (let i = 0; i < fwdCalls.length - 1; i++) {
+        assert.ok(!fwdCalls[i].body.includes(NUDGE_MARKER), `image-fork turn ${i + 1} must stay held inside the #5865 estimate-hold window (round ≤ 2 of 2)`);
+    }
+    const forward = fwdCalls.at(-1)!;
     const msgs = msgsOf(forward.body);
     const last = msgs.at(-1)!;
     assert.ok(

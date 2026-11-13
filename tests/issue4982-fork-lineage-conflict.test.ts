@@ -46,7 +46,9 @@ for (const populated of [false, true]) {
         const dir = mkdtempSync(join(tmpdir(), "bili-4982-lineage-"));
         const filename = join(dir, "index.db");
         let store = UnifiedStore.open(filename);
-        const raw = openSqliteDatabase(filename, "node:sqlite").db;
+        // Engine unpinned on purpose: the store above used auto-detect, and bun
+        // has no node:sqlite to pin.
+        const raw = openSqliteDatabase(filename).db;
         try {
             for (const id of ["parent", "other", "placeholder"])
                 raw.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, 1, 1)").run(id);
@@ -131,7 +133,7 @@ for (const fail of [false, true]) {
         const dir = mkdtempSync(join(tmpdir(), "bili-4982-atomic-"));
         const filename = join(dir, "index.db");
         const store = UnifiedStore.open(filename);
-        const raw = openSqliteDatabase(filename, "node:sqlite").db;
+        const raw = openSqliteDatabase(filename).db;
         try {
             raw.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES ('parent', 1, 1)").run();
             const bytes = Buffer.from("body");

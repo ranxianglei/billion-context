@@ -114,8 +114,9 @@ export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstre
     };
 }
 
-/** Pure: the TTL tier declared by the snapshot's cache_control breakpoints —
- *  any "1h" wins over "5m"; undefined when the body carries none. */
+/** Pure: the TTL tier declared by the snapshot's cache_control breakpoints.
+ *  Tool inputs and schema examples are data, not directives. Any "1h" wins
+ *  over "5m"; undefined when the body carries no breakpoint. */
 export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
     let found: "5m" | "1h" | undefined;
     const walk = (n: unknown): void => {
@@ -132,9 +133,16 @@ export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
                 found = "1h";
                 return;
             }
-            if (ttl === "5m") found = "5m";
+            // A cache_control breakpoint without an explicit ttl uses Anthropic's
+            // default 5-minute TTL, so it is a 5m-tier breakpoint (#5665); only an
+            // explicit "1h" lifts the tier.
+            found = "5m";
         }
-        for (const v of Object.values(o)) walk(v);
+        for (const [key, value] of Object.entries(o)) {
+            if (key === "input_schema") continue;
+            if (key === "input" && (o.type === "tool_use" || o.type === "server_tool_use")) continue;
+            walk(value);
+        }
     };
     walk(body);
     return found;
@@ -172,8 +180,19 @@ interface KeepaliveEntry {
 
 const registry = new Map<string, KeepaliveEntry>();
 
+/** Real-timer scheduler: every handle is unref'd (#5666) so an armed cadence
+ *  timer never holds the event loop open. Interactive hosts stay alive for
+ *  their own reasons and the pings still fire on schedule; a short-lived
+ *  process (pi -p, a sub-agent) whose only remaining handle is the armed
+ *  keepalive now exits cleanly instead of limping along until maxDurationMs. */
+function realSchedule(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
+    const t = setTimeout(fn, ms);
+    t.unref?.();
+    return t;
+}
+
 let clock: () => number = () => Date.now();
-let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = (fn, ms) => setTimeout(fn, ms);
+let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = realSchedule;
 let cancelFn: (id: ReturnType<typeof setTimeout>) => void = (id) => clearTimeout(id);
 
 export interface KeepaliveArmInput {
@@ -365,6 +384,7 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     entry.pingInFlight = false;
     if (registry.get(entry.sessionId) !== entry) return;
     const text = await resp.text().catch(() => "");
+    if (registry.get(entry.sessionId) !== entry) return;
     if (!resp.ok) {
         if (resp.status === 429) {
             disarm(entry.sessionId, "rate-limited(429)");
@@ -454,7 +474,7 @@ export function _setKeepaliveSchedulerForTest(sched: FakeScheduler | undefined):
         scheduleFn = (fn, ms) => sched.schedule(fn, ms) as ReturnType<typeof setTimeout>;
         cancelFn = (id) => sched.cancel(id as unknown);
     } else {
-        scheduleFn = (fn, ms) => setTimeout(fn, ms);
+        scheduleFn = realSchedule;
         cancelFn = (id) => clearTimeout(id);
     }
 }

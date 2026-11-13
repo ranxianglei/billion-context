@@ -15,6 +15,7 @@ entries:
     site_group: core
     desc_en: "TCP port the proxy listens on (user zone; lane-spawned proxies use BILI_ZONE_PORT instead)."
     desc_zh: "代理监听端口（用户区；车道派生代理使用 BILI_ZONE_PORT，互不干扰）。"
+    desc_ja: "プロキシがリッスンするTCPポート（ユーザーゾーン；レーンスポーンされたプロキシは `BILI_ZONE_PORT` を使用）。"
     site_en: "<code>port</code> — listen port (default 8787)."
     site_zh: "<code>port</code> —— 监听端口（默认 8787）。"
   - key: host
@@ -26,6 +27,7 @@ entries:
     site_group: core
     desc_en: "Bind address. 127.0.0.1 = loopback only; :: = dual-stack; 0.0.0.0 exposes outward (no auth — trusted networks only)."
     desc_zh: "绑定地址。127.0.0.1 仅本机回环；:: 双栈；0.0.0.0 对外暴露（无鉴权，仅限可信网络）。"
+    desc_ja: "バインドアドレス。127.0.0.1 = ループバック専用；:: = デュアルスタック；0.0.0.0 は外部に公開（認証なし — 信頼できるネットワークのみ）。"
     site_en: "<code>host</code> — bind address (default 127.0.0.1; \"::\" is dual-stack, 0.0.0.0 exposes outward)."
     site_zh: "<code>host</code> —— 绑定地址（默认 127.0.0.1；\"::\" 双栈，0.0.0.0 对外暴露）。"
   - key: sessionHeader
@@ -37,6 +39,7 @@ entries:
     site_group: core
     desc_en: "HTTP header carrying the conversation id; same value shares compression state."
     desc_zh: "携带会话 id 的请求头；相同取值的请求共享压缩状态。"
+    desc_ja: "会話IDを保持するHTTPヘッダー；同じ値は圧縮状態を共有する。"
     site_en: "<code>sessionHeader</code> — HTTP header carrying the session id (default x-acp-session)."
     site_zh: "<code>sessionHeader</code> —— 携带会话 id 的请求头（默认 x-acp-session）。"
   - key: log
@@ -48,6 +51,7 @@ entries:
     site_group: core
     desc_en: "Per-request logging master switch."
     desc_zh: "逐请求日志总开关。"
+    desc_ja: "リクエストごとのログ記録マスタースイッチ。"
     site_en: "<code>log</code> — file logging master switch (on by default)."
     site_zh: "<code>log</code> —— 文件日志总开关（默认开）。"
   - key: logFile
@@ -59,6 +63,7 @@ entries:
     site_group: core
     desc_en: "Explicit path for bili.log; auto-rotates at 10 MB."
     desc_zh: "bili.log 的显式路径；10 MB 自动轮转。"
+    desc_ja: "`bili.log` の明示的なパス；10 MB で自動ローテーション。"
     site_en: "<code>logFile</code> — explicit path for bili.log (env ACP_LOG_FILE wins)."
     site_zh: "<code>logFile</code> —— bili.log 显式路径（环境变量 ACP_LOG_FILE 优先）。"
   - key: debug
@@ -70,6 +75,7 @@ entries:
     site_group: core
     desc_en: "Verbose per-request logging."
     desc_zh: "逐请求详细日志。"
+    desc_ja: "詳細なリクエストごとのログ記録。"
     site_en: "<code>debug</code> — verbose per-request logging."
     site_zh: "<code>debug</code> —— 逐请求详细日志。"
   - key: dumpSse
@@ -81,6 +87,7 @@ entries:
     site_group: core
     desc_en: "Directory to dump raw SSE frames for debugging, including loop-originated responses."
     desc_zh: "原始 SSE 帧转储目录（排障用），含循环内发起的上游响应。"
+    desc_ja: "デバッグ用に生SSEフレームをダンプするディレクトリ、ループ起源のレスポンスを含む。"
     site_en: "<code>dumpSse</code> — raw SSE stream dump level for debugging."
     site_zh: "<code>dumpSse</code> —— 原始 SSE 流转储级别（排障用）。"
   - key: passthrough
@@ -92,6 +99,7 @@ entries:
     site_group: core
     desc_en: "Global raw-relay switch: forward every request without compression, tool injection, or nudging."
     desc_zh: "全局裸转发开关：所有请求不做压缩、工具注入或提醒直接转发。"
+    desc_ja: "グローバルな生リレースイッチ：圧縮、ツール注入、ナッジなしですべてのリクエストを転送する。"
     site_en: "<code>passthrough</code> — global raw-relay switch (off by default; ACP_PASSTHROUGH / --passthrough win over the file)."
     site_zh: "<code>passthrough</code> —— 全局裸转发开关（默认关；ACP_PASSTHROUGH / --passthrough 优先于文件）。"
   - key: upstream
@@ -103,6 +111,7 @@ entries:
     site_group: up
     desc_en: "Fallback upstream base URL when a request matches no provider route."
     desc_zh: "请求未命中任何路由时的兜底上游基础地址。"
+    desc_ja: "リクエストがどのプロバイダルートにも一致しない場合のフォールバック用アップストリームベースURL。"
     site_en: "<code>upstream</code> — fallback upstream base URL (ACP_UPSTREAM overrides)."
     site_zh: "<code>upstream</code> —— 兜底上游基础地址（ACP_UPSTREAM 覆盖）。"
   - key: proxy
@@ -114,6 +123,7 @@ entries:
     site_group: up
     desc_en: "Global outbound proxy for the proxy's own egress. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 rejected."
     desc_zh: "代理自身出站的全局代理。解析顺序：按路由 → BILI_UPSTREAM_PROXY → Web UI → 本值 → HTTP(S)_PROXY 环境变量 → Windows 系统代理 → 直连。空字符串 = 显式直连；不支持 SOCKS5。"
+    desc_ja: "プロキシ自身のエグレス（外部送信）用のグローバルアウトバウンドプロキシ。解決順序: ルート別 → BILI_UPSTREAM_PROXY → Web UI → この値 → HTTP(S)_PROXY → Windows システムプロキシ → 直接接続。空文字列は明示的な直接接続を意味し、SOCKS5 は拒否される。"
     site_en: "<code>proxy</code> — global outbound proxy. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY env → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 is rejected."
     site_zh: "<code>proxy</code> —— 全局出站代理。解析顺序：按路由 → BILI_UPSTREAM_PROXY → Web UI → 本值 → HTTP(S)_PROXY 环境变量 → Windows 系统代理 → 直连。空字符串 = 显式直连；不支持 SOCKS5。"
   - key: upstreamProxy
@@ -122,6 +132,7 @@ entries:
     group: upstream
     desc_en: "Web-UI manual proxy tier (written by the dashboard's proxy editor); sits below BILI_UPSTREAM_PROXY in resolution order."
     desc_zh: "Web 面板手动设置的代理层级（由仪表盘代理编辑器写入）；解析顺序中位于 BILI_UPSTREAM_PROXY 之下。"
+    desc_ja: "Web-UI 手動プロキシ階層（ダッシュボードのプロキシエディタによって書き込まれる）。解決順序では BILI_UPSTREAM_PROXY より下位にある。"
   - key: upstreamProxyMode
     type: "\"auto\" | \"manual\" | \"direct\""
     default: "auto (unset behaves as direct)"
@@ -129,6 +140,7 @@ entries:
     group: upstream
     desc_en: "How the global proxy is sourced: auto (env/system discovery), manual (Web-UI value only), direct (never use a proxy)."
     desc_zh: "全局代理来源策略：auto（环境变量/系统发现）、manual（仅 Web 面板值）、direct（从不使用代理）。"
+    desc_ja: "グローバルプロキシの取得方法: auto（環境変数/システム検出）、manual（Web-UI の値のみ）、direct（プロキシを一切使用しない）。"
   - key: providersPath
     type: string
     default: "unset"
@@ -138,6 +150,7 @@ entries:
     site_group: mitm
     desc_en: "Path to an external providers.json (legacy/shared routes file); beats both inline providers and the config-file location."
     desc_zh: "外部 providers.json 路径（遗留/共享路由文件）；优先于内联 providers 与配置文件位置。"
+    desc_ja: "外部 providers.json へのパス（レガシー/共有ルートファイル）。インラインプロバイダおよび設定ファイル内の場所の両方よりも優先される。"
     site_en: "<code>providersPath</code> — external routes file path (env ACP_PROVIDERS beats both it and inline providers)."
     site_zh: "<code>providersPath</code> —— 外部路由文件路径（环境变量 ACP_PROVIDERS 优先于它与内联 providers）。"
   - key: providers
@@ -146,6 +159,18 @@ entries:
     group: upstream
     desc_en: "Route table: URL-prefix keys to per-provider entries (models, compress, compat, …). See the Providers section."
     desc_zh: "路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。"
+    desc_ja: "ルートテーブル: URLプレフィックスキーをプロバイダ別エントリ（モデル、compress、compat など）にマッピングする。Providers セクションを参照。"
+  - key: modelEndpointPatterns
+    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" }"
+    default: "[]"
+    group: upstream
+    id: tt.modelendpoints
+    site_group: up
+    desc_en: "Declarable custom-wire model endpoints: absolute URL prefixes mapped to a wire family. One config source feeds BOTH the proxy protocol classifier and the client-side fetch claim, so the two gates can no longer drift (#1295)."
+    desc_zh: "可声明的自定义 wire 模型端点：绝对 URL 前缀到 wire 族的映射。同一配置源同时喂给代理协议分类器与客户端 fetch 认领，两个门不再漂移（#1295）。"
+    desc_ja: "宣言可能なカスタムワイヤモデルエンドポイント: ワイヤファミリにマッピングされる絶対URLプレフィックス。1つの設定ソースがプロキシのプロトコル分類器とクライアントサイドのフェッチクレームの両方に供給されるため、2つのゲートが乖離しなくなった（#1295）。"
+    site_en: "<code>modelEndpointPatterns</code> — declare model endpoints on non-standard paths (URL prefix → wire family); empty = built-in path tables only."
+    site_zh: "<code>modelEndpointPatterns</code> —— 声明非标准路径上的模型端点（URL 前缀 → wire 族）；空 = 仅内置路径表。"
   - key: modelContextLimit
     type: number
     default: "200000"
@@ -153,10 +178,11 @@ entries:
     group: upstream
     id: tt.mcl2
     site_group: up
-    desc_en: "Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit."
-    desc_zh: "旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。"
-    site_en: "<code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit."
-    site_zh: "<code>modelContextLimit</code> —— 旧版全局窗口上限（默认 200000）；建议改用 compress.modelContextLimit。"
+    desc_en: "Legacy global DEFAULT window (last-resort fallback in the window ladder: consulted only when no tier evidence, plugin/launcher report, per-route declaration, registry lookup, or built-in table resolves a limit for the model; also the usage-ratio denominator wherever it wins); prefer compress.modelContextLimit."
+    desc_zh: "旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。"
+    desc_ja: "レガシーのグローバル DEFAULT ウィンドウ（ウィンドウラダーにおける最終手段のフォールバック: モデルの制限がティア証拠、プラグイン/ランチャーレポート、ルート別宣言、レジストリ検索、組み込みテーブルのいずれからも解決されない場合にのみ参照される。また、勝った場合の使用率の分母としても機能する）。compress.modelContextLimit を優先すること。"
+    site_en: "<code>modelContextLimit</code> — legacy global DEFAULT window (default 200000): last-resort fallback when no other source resolves a limit for the model; does NOT cap a natively-resolved window (#5908); prefer compress.modelContextLimit."
+    site_zh: "<code>modelContextLimit</code> —— 旧版全局默认窗口（默认 200000）：窗口解析的最后一层兜底，其他来源都未解析出该模型上限时才生效；不会封顶已按原生解析出的窗口（#5908）；建议改用 compress.modelContextLimit。"
   - key: imageBilling
     type: "\"auto\" | \"pixels\" | \"bytes\""
     default: "auto (resolves to pixels)"
@@ -166,6 +192,7 @@ entries:
     site_group: up
     desc_en: "Global image-token estimation basis; live-read per request, beats every per-provider setting."
     desc_zh: "全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。"
+    desc_ja: "グローバルなイメージトークン推定基準。リクエストごとにライブ読み取りされ、すべてのプロバイダ別設定を上回る。"
     site_en: "<code>imageBilling</code> — global image-token estimation: \"auto\" (default → pixels), \"pixels\" or \"bytes\" (explicit opt-in for byte relays)."
     site_zh: "<code>imageBilling</code> —— 全局图片 token 估算口径：\"auto\"（默认→pixels）、\"pixels\" 或 \"bytes\"（字节中继需显式指定）。"
   - key: imageTokenCap
@@ -177,6 +204,7 @@ entries:
     site_group: up
     desc_en: "Global per-image token ceiling applied on top of the resolved billing mode; live-read per request."
     desc_zh: "全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。"
+    desc_ja: "解決された課金モードの上に適用されるグローバルな1画像あたりのトークン上限。リクエストごとにライブ読み取りされる。"
     site_en: "<code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live)."
     site_zh: "<code>imageTokenCap</code> —— 全局单图 token 上限；未设置 = 不限（BILI_IMAGE_TOKEN_CAP 优先且实时读取）。"
   - key: imageRescale
@@ -188,8 +216,21 @@ entries:
     site_group: up
     desc_en: "Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request."
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
+    desc_ja: "エグレス画像のダウンスケールマスタースイッチ（#3295/#3400）: 大きなアウトバウンド画像は縮小して送信され、セッションストレージ内のオリジナルは変更されない。リクエストごとにライブ読み取りされる。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: egressTransforms
+    type: array
+    default: "unset (none)"
+    env: []
+    group: upstream
+    id: tt.etf2
+    site_group: up
+    desc_en: "User-registerable egress request-body rewrite pipeline (#6003): ESM plugins that rewrite every outbound model-request body after all session processing and before transport (re-sign / v1Wrap / fetch). Fail-open, hot-reloadable via POST /__bili/config/reload."
+    desc_zh: "用户可注册的出站请求体改写管线（#6003）：ESM 插件在所有会话处理之后、传输（重签 / v1Wrap / fetch）之前改写每个出站模型请求体。fail-open，可经 POST /__bili/config/reload 热重载。"
+    desc_ja: "ユーザー登録可能なエグレスリクエストボディ書き換えパイプライン（#6003）: すべてのセッション処理の後、トランスポート（再署名 / v1Wrap / fetch）の前に、すべてのアウトバウンドモデルリクエストボディを書き換える ESM プラグイン。フェイルオープン、POST /__bili/config/reload によるホットリロード可能。"
+    site_en: "<code>egressTransforms</code> — user-registerable egress body-rewrite pipeline (ESM plugins, fail-open, hot-reloadable)."
+    site_zh: "<code>egressTransforms</code> —— 用户可注册的出站请求体改写管线（ESM 插件，fail-open，可热重载）。"
   - key: billing
     type: object
     default: "{}"
@@ -199,6 +240,7 @@ entries:
     site_group: up
     desc_en: "Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only."
     desc_zh: "按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。"
+    desc_ja: "モデルごとの課金価格（#4899）: billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } は100万トークンあたりの USD 単位。パネルの USD 支出台帳と保存済みドル推定値において、models.dev スナップショットを上書きする。価格未設定のモデルはトークン数のみ表示される。"
     site_en: "<code>billing.prices</code> — per-model USD/Mtok prices feeding the panel's spend + savings views."
     site_zh: "<code>billing.prices</code> —— 按模型美元/百万 token 单价，驱动面板花费与省钱视图。"
   - key: maskHosts
@@ -210,6 +252,7 @@ entries:
     site_group: beh
     desc_en: "Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless."
     desc_zh: "日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。"
+    desc_ja: "ログ内の非公開ターゲットホストを <private-host> としてマスクする。認証情報ヘッダーは常にマスクされる。"
     site_en: "<code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked)."
     site_zh: "<code>maskHosts</code> —— 日志中把非公开主机名遮成 &lt;private-host&gt;（默认开；凭据总是遮盖）。"
   - key: security.adminRelay
@@ -220,6 +263,7 @@ entries:
     site_group: beh
     desc_en: "Let an embedding host (dsh web today) relay the ENTIRE /__bili/ admin surface through its own entry origin so a remote browser can open the panel (#3373). Fail-closed, file-only. The relayed hop reaches the proxy as a local non-browser client (loopback source + loopback Host, no Origin), so the admin gate stays unchanged; enabling it exposes config editing and credential writes to whoever can reach the host web entry — protect that entry (auth / reverse proxy) first."
     desc_zh: "允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。"
+    desc_ja: "エンベディングホスト（現在は dsh web）が、リモートブラウザからパネルを開けるように（#3373）、その自身のエントリーオリジンを通じて /__bili/ 管理サーフェス全体をリレーすることを許可する。フェイルクローズ、ファイルのみ。リレーされたホップはローカル非ブラウザクライアントとしてプロキシに到達する（ループバックソース + ループバック Host、Origin なし）ため、管理ゲートは変更されない。これを有効にすると、ホスト Web エントリーに到達できる者に設定編集と認証情報の書き込みが露出する — まずそのエントリー（認証 / リバースプロキシ）を保護すること。"
     site_en: "<code>security.adminRelay</code> — relay the /__bili/ admin surface through the embedding host's web entry (off by default; fail-closed)."
     site_zh: "<code>security.adminRelay</code> —— 将 /__bili/ 管理面经宿主 web 入口中继（默认关；fail-closed）。"
   - key: subagentSplit
@@ -231,8 +275,21 @@ entries:
     site_group: beh
     desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session. Anthropic-wire only — on the Responses wire this switch is a no-op (see the `subagentSplit` / BOTH-mechanisms scope note)."
     desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。"
+    desc_ja: "Claude Code サブエージェントは、メインセッションのキューに並ぶ代わりに、独自のセッション名前空間（<session>|sub:<agent-id>）を取得します。Anthropic-wire 専用 — Responses wire ではこのスイッチは no-op です（`subagentSplit` / BOTH-mechanisms スコープ注記を参照）。"
     site_en: "<code>subagentSplit</code> — Claude subagents get their own session namespace (on by default)."
     site_zh: "<code>subagentSplit</code> —— Claude 子代理拥有独立会话命名空间（默认开）。"
+  - key: personaSplit
+    type: boolean
+    default: "true"
+    env: BILI_PERSONA_SPLIT
+    group: behavior
+    id: tt.persona
+    site_group: beh
+    desc_en: "Split the Responses-wire lane keyed by the instructions fingerprint (Claude Code over /v1/responses; Codex root threads / older builds) when the instructions text changes AND the incoming history does not continue the tracked chain (default on). Opt out with env BILI_PERSONA_SPLIT=0 or personaSplit: false (env wins)."
+    desc_zh: "当 instructions 文本变化且入站历史不连续时，把按 instructions 指纹分键的 Responses 车道（Claude Code over /v1/responses；Codex 根线程 / 旧版本构建）分叉出去（默认开）。用环境变量 BILI_PERSONA_SPLIT=0 或配置 personaSplit: false 关闭（环境变量优先）。"
+    desc_ja: "指示テキストが変更され、かつ受信履歴が追跡中のチェーンを継続していない場合、指示フィンガープリントでキー付けされた Responses-wire レーンを分割します（Claude Code の /v1/responses 経由; Codex ルートスレッド / 旧ビルド）。デフォルトで有効。環境変数 BILI_PERSONA_SPLIT=0 または personaSplit: false で無効化可能（環境変数が優先）。"
+    site_en: "<code>personaSplit</code> — Responses-wire instructions-fingerprint split (on by default; set false / BILI_PERSONA_SPLIT=0 to opt out)."
+    site_zh: "<code>personaSplit</code> —— Responses 线路 instructions 指纹分叉（默认开；false / BILI_PERSONA_SPLIT=0 关闭）。"
   - key: forkAdoption
     type: boolean
     default: "false"
@@ -242,6 +299,7 @@ entries:
     site_group: beh
     desc_en: "Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request."
     desc_zh: "匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。"
+    desc_ja: "匿名フォークは、フォークされたリクエストにソースコンテンツが完全に存在する親の圧縮ブロックを継承します。"
     site_en: "<code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default)."
     site_zh: "<code>forkAdoption</code> —— 匿名 fork 会话并入父会话（默认关）。"
   - key: autoModeForge.enabled
@@ -253,6 +311,7 @@ entries:
     site_group: beh
     desc_en: "Answer Claude Code auto-mode safety-classifier calls locally with a forged allow verdict instead of forwarding them upstream (#2740): zero egress, zero billing for that lane; every forged verdict is audit-logged and the session carries a notice badge. false / env 0 restores pure passthrough for users who pay for real verdicts."
     desc_zh: "Claude Code auto mode 安全分类器请求由 bili 在本地代答放行判定，不再转发上游（#2740）：该旁路零流出、零计费；每条代答写审计日志，会话带提示徽标。false / env 0 恢复纯透传（愿意付费要真判定的用户）。"
+    desc_ja: "Claude Code の自動モードのセーフティ分類器呼び出しを、上流へ転送する代わりに、偽造された許可判定でローカルに回答します（#2740）：そのレーンでは送信ゼロ、課金ゼロ。すべての偽造判定は監査ログに記録され、セッションには通知バッジが付与されます。false / 環境変数 0 で、実際の判定料金を支払うユーザー向けに純粋なパススルーに戻ります。"
     site_en: "<code>autoModeForge.enabled</code> — answer Claude Code auto-mode classifier calls locally with a forged allow verdict (on by default; <code>BILI_AUTO_MODE_FORGE=0</code> = pure passthrough)."
     site_zh: "<code>autoModeForge.enabled</code> —— Claude Code auto mode 分类器请求本地代答放行判定（默认开；<code>BILI_AUTO_MODE_FORGE=0</code> 纯透传）。"
   - key: affinitySimhash
@@ -264,6 +323,7 @@ entries:
     site_group: beh
     desc_en: "Simhash chain-alignment adoption for anonymous clients (#2265): a client-side pervasive decorative rewrite (e.g. Trae re-stamping model tags on every assistant message) re-attaches the existing session with its compression state instead of minting fresh and re-folding from zero."
     desc_zh: "匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。"
+    desc_ja: "匿名クライアント向けの Simhash チェーン整合性採用（#2265）：クライアント側の普遍的な装飾的書き換え（例：Trae がすべてのアシスタントメッセージにモデルタグを再スタンプする）が発生した場合、ゼロから新規発行して再折りたたむ代わりに、既存のセッションとその圧縮状態を再アタッチします。"
     site_en: "<code>affinitySimhash</code> — simhash chain-alignment re-attaches sessions after pervasive client rewrites (on by default)."
     site_zh: "<code>affinitySimhash</code> —— 大面积客户端改写后按 simhash 链对齐重新挂回会话（默认开）。"
   - key: resumeInheritance
@@ -275,6 +335,7 @@ entries:
     site_group: beh
     desc_en: "Identified clients resuming under a new session id inherit the parent's ref assignments and fully-present compression blocks."
     desc_zh: "以新会话 id 恢复的已识别客户端继承父会话的引用编号与完整存在的压缩块。"
+    desc_ja: "新しいセッション ID で再開する識別済みクライアントは、親の ref 割り当てと完全に存在する圧縮ブロックを継承します。"
     site_en: "<code>resumeInheritance</code> — inherited refs/blocks on resume (cc --resume) (on by default)."
     site_zh: "<code>resumeInheritance</code> —— resume（cc --resume）继承引用与区块（默认开）。"
   - key: chainContentDetection
@@ -286,6 +347,7 @@ entries:
     site_group: beh
     desc_en: "Body-content detection of bili→bili chains (off: body scanning can false-positive on CCR/model-echoed text); by default only x-bili-hop drives chain recognition."
     desc_zh: "按请求体内容识别 bili→bili 链（默认关：正文扫描会对 CCR/模型回声文本误报）；默认仅 x-bili-hop 驱动链识别。"
+    desc_ja: "bili→bili チェーンのボディコンテンツ検出（オフ：ボディスキャンは CCR/モデルエコーテキストで誤検出する可能性がある）；デフォルトでは x-bili-hop のみでチェーン認識を駆動します。"
     site_en: "<code>chainContentDetection</code> — recognize bili-owned traffic by body content (off; false-positive risk)."
     site_zh: "<code>chainContentDetection</code> —— 按请求体内容识别 bili 自有流量（默认关；有误报风险）。"
   - key: chainEgressStamp
@@ -297,6 +359,7 @@ entries:
     site_group: beh
     desc_en: "Emit the model-visible <bili-chain/> checkpoint carrier on egress (off: models treat it as phantom input and burn tokens)."
     desc_zh: "在出口消息上打模型可见的 <bili-chain/> 链完整性标记（默认关：模型会把它当幽灵输入而消耗 token）。"
+    desc_ja: "送信時にモデル可視の <bili-chain/> チェックポイントキャリアを発行します（オフ：モデルはこれを幻覚入力として扱い、トークンを消費します）。"
     site_en: "<code>chainEgressStamp</code> — model-visible stamp on egress messages (off; burns tokens)."
     site_zh: "<code>chainEgressStamp</code> —— 在出口消息上打模型可见的标记（默认关；消耗 token）。"
   - key: stableSystemAnchor
@@ -308,6 +371,7 @@ entries:
     site_group: beh
     desc_en: "Best-effort wire-layer prefix-cache anchor: re-sends the first-seen head system bytes even when the client changes them (plain-proxy lanes only)."
     desc_zh: "线路层尽力而为的前缀缓存锚点：客户端改动头部 system 时仍重发首次见到的字节（仅纯代理通道）。"
+    desc_ja: "ベストエフォートのワイヤーレイヤープレフィックスキャッシュアンカー：クライアントが変更した場合でも、最初に確認されたヘッドシステムバイトを再送信します（プレーンプロキシレーンのみ）。"
     site_en: "<code>stableSystemAnchor</code> — best-effort wire-layer prefix-cache anchor (off; plain-proxy lanes)."
     site_zh: "<code>stableSystemAnchor</code> —— 线路层尽力而为的前缀缓存锚点（默认关；纯代理通道）。"
   - key: compat
@@ -318,6 +382,7 @@ entries:
     site_group: beh
     desc_en: "Global wire-compat block: role remaps, strict-schema field drops, stream error shape, cache-control handling."
     desc_zh: "全局线上兼容块：角色映射、严格 schema 字段剔除、流式错误形态、缓存控制处理。"
+    desc_ja: "グローバルワイヤー互換性ブロック：ロールリマップ、厳格スキーマフィールドの削除、ストリームエラー形状、cache-control 処理。"
     site_en: "<code>compat</code> — wire-compatibility block: role remaps, stream error shape, strict-schema field drops, cache-control handling."
     site_zh: "<code>compat</code> —— 线上兼容块：角色映射、流式错误形态、严格 schema 字段剔除、缓存控制处理。"
   - key: compat.roles
@@ -326,12 +391,14 @@ entries:
     group: behavior
     desc_en: "Map message roles to the names your upstream accepts (e.g. developer→system); exact-match roles only, per-provider entries win per key."
     desc_zh: "把消息角色映射为上游接受的名字（如 developer→system）；仅精确匹配角色，逐 provider 条目按键级胜出。"
+    desc_ja: "メッセージロールを上流が受け入れる名前にマッピングします（例：developer→system）；完全一致ロールのみ、プロバイダーごとのエントリがキーごとに優先されます。"
   - key: compat.dropFields
     type: "string[] (dot paths)"
     default: "[]"
     group: behavior
     desc_en: "Dot-path fields stripped from every forwarded body for strict-schema gateways that 400 on unknown fields; global + per-provider lists union additively."
     desc_zh: "从每个转发请求体中剔除的点路径字段，面向对未知字段返回 400 的严格 schema 网关；全局与逐 provider 列表加法并集。"
+    desc_ja: "未知のフィールドで 400 を返す厳格スキーマゲートウェイ向けに、転送されるすべてのボディからドットパスフィールドを削除します；グローバル + プロバイダーごとのリストは加算的に統合されます。"
   - key: compat.streamErrorShape
     type: "\"protocol\" | \"completion\""
     default: "protocol"
@@ -339,6 +406,7 @@ entries:
     group: behavior
     desc_en: "How upstream stream failures are presented after the 200 is committed: protocol-native error frames (default) or the legacy synthesized-completion shape."
     desc_zh: "200 已提交后上游流失败的呈现方式：协议原生错误帧（默认）或旧版合成完成形态。"
+    desc_ja: "200 がコミットされた後、上流ストリーム失敗がどのように提示されるか：プロトコルネイティブのエラーフレーム（デフォルト）またはレガシーの合成完了形状。"
   - key: compat.noCacheControl
     type: boolean
     default: "false"
@@ -346,6 +414,7 @@ entries:
     group: behavior
     desc_en: "Stop stamping Anthropic-lane cache_control breakpoints entirely (escape hatch for upstreams/relays with their own breakpoint policy)."
     desc_zh: "完全停止 Anthropic 通道的 cache_control 断点打标（面向拒收该字段或有自有断点策略的上游/中继的逃生门）。"
+    desc_ja: "Anthropic レーンの cache_control ブレークポイントを完全にスタンプしないようにします（独自のブレークポイントポリシーを持つ上流/リレー用のエスケープハッチ）。"
   - key: compat.keepResponseId
     type: boolean
     default: "false"
@@ -353,6 +422,7 @@ entries:
     group: behavior
     desc_en: "Preserve previous_response_id on kernel-rebuilt Responses requests (default strips it so rebuilt bodies never reference ids the upstream never issued)."
     desc_zh: "在内核重建的 Responses 请求上保留 previous_response_id（默认剔除，使重建请求体永不引用上游从未签发过的响应 id）。"
+    desc_ja: "カーネル再構築された Responses リクエストで previous_response_id を保持します（デフォルトでは削除するため、再構築されたボディは上流が発行したことのない ID を参照しません）。"
   - key: dsh
     type: object
     default: "{}"
@@ -360,6 +430,7 @@ entries:
     group: behavior
     desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel — are documented in the following entries."
     desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。"
+    desc_ja: "セクションは認識されるが、従来のエスケープハッチは削除された（#3666、#2028 を代替）：`allowDshCompaction` キーおよび `BILI_ALLOW_DSH_COMPACTION` 環境変数はもはや存在しない — dsh ネイティブコンパクションは、すべてのレーンにおいてワイヤガードによって無条件に拒否される。残存する `dsh.allowDshCompaction` の値は、一度限りの非推奨警告とともに無視される；代わりにホスト側の抑制を適用すること（#3354/#2474）。ライブキー — `dsh.authoredCompaction`、`dsh.contextTab`、`dsh.contextTabLabel` — は以下のエントリに文書化されている。"
   - key: dsh.authoredCompaction
     type: boolean
     default: "true (on, #3901 flip)"
@@ -367,6 +438,7 @@ entries:
     group: behavior
     desc_en: "bili answers dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3723/#3733). ON by default since the 0.1.203 dogfood window held; false (or env BILI_DSH_AUTHORED_COMPACTION=0) restores the #1729 refusal path."
     desc_zh: "bili 用折叠快照本地应答 dsh 压缩摘要请求而非拒绝（#3723/#3733）。0.1.203 狗粮窗口守住后默认开启；false（或环境变量 BILI_DSH_AUTHORED_COMPACTION=0）恢复 #1729 拒绝路径。"
+    desc_ja: "bili は dsh コンパクションの summarize 呼び出しを、拒否する代わりに折り畳みスナップショットでローカルに回答する（#3723/#3733）。0.1.203 のドッグフッド期間が維持されたため、デフォルトで ON。`false`（または環境変数 `BILI_DSH_AUTHORED_COMPACTION=0`）を設定すると、#1729 の拒否パスが復元される。"
   - key: dsh.contextTab
     type: boolean
     default: "true"
@@ -374,12 +446,14 @@ entries:
     group: behavior
     desc_en: "Registers the DSH top-bar 「上下文」/「Context」 conversation tab at all (#3862/#4237): false removes ONLY that tab — compression, the settings section and every other surface keep working. Hiding never disables compression; the ledger stays reachable via the settings section (会话 subpage), the plugin bundle config face, the Web UI and the /acp command. Takes effect on the next page load / dsh restart (slot registration happens at page load); default true = today's behavior unchanged."
     desc_zh: "是否注册 DSH 顶栏「上下文」会话标签页（#3862/#4237）：false 只移除该标签页——压缩、设置页一节及其余所有入口不受影响。隐藏绝不关闭压缩；账本仍可从设置页（会话子页）、插件 bundle 配置面、Web UI 与 /acp 命令查看。下次页面加载 / dsh 重启生效（槽位注册发生在页面加载时）；默认 true = 现状不变。"
+    desc_ja: "DSH トップバーの「上下文」/「Context」会話タブを登録する（#3862/#4237）：`false` にすると、そのタブのみが削除される — コンプレッション、設定セクション、その他のすべてのサーフェスは引き続き動作する。非表示にしてもコンプレッションは無効にならない；台帳は設定セクション（会话 サブページ）、プラグインバンドル設定フェイス、Web UI、および `/acp` コマンド経由で引き続きアクセス可能。次のページ読み込み / dsh リスタート時に有効になる（スロット登録はページ読み込み時に発生）；デフォルト `true` = 現在の動作は変更なし。"
   - key: dsh.contextTabLabel
     type: string
     default: "unset (built-in 「上下文」/「Context」)"
     group: behavior
     desc_en: "Custom display name for the DSH top-bar Context tab (#4237), e.g. \"压缩账本\" when another plugin (dsh-context) owns the name 「上下文」. Trimmed non-empty string wins over the built-in label; blank or absent falls back to the built-in. File-only tier (display preference, no env knob per #2030). Default unset = built-in label unchanged."
     desc_zh: "DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为\"压缩账本\"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。"
+    desc_ja: "DSH トップバーの Context タブのカスタム表示名（#4237）、例：別のプラグイン（dsh-context）が「上下文」の名前を所有している場合の \"压缩账本\"。トリムされた空でない文字列が組み込みラベルに優先される；空白または未設定の場合は組み込みにフォールバック。ファイル専用ティア（表示設定、#2030 に従い環境変数なし）。デフォルト未設定 = 組み込みラベルは変更なし。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"
@@ -387,6 +461,7 @@ entries:
     group: behavior
     desc_en: "Re-sign arm keyed by Authorization scheme: signed model requests tunnel with every egress body re-signed; unresignable requests are refused locally 403 unless passthrough opts that scheme into verbatim forwarding."
     desc_zh: "按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。"
+    desc_ja: "Authorization スキームでキーイングされた再署名アーム：署名済みモデルリクエストは、すべてのエグレスボディが再署名されてトンネリングされる；署名解除できないリクエストは、パススルーがそのスキームを逐語転送にオプトインしていない限り、ローカルで 403 として拒否される。"
   - key: promptCache.routing
     type: "\"auto\" | \"enabled\" | \"disabled\""
     default: "disabled"
@@ -394,6 +469,7 @@ entries:
     group: behavior
     desc_en: "Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim."
     desc_zh: "bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。"
+    desc_ja: "bili 自身の `prompt_cache_key` 出力の姿勢（両方のワイヤ）；クライアントが供給したキーは常に逐語的に転送される。"
   - key: cacheKeepalive.enabled
     type: boolean
     default: "false"
@@ -401,6 +477,7 @@ entries:
     group: behavior
     desc_en: "Master switch for idle prompt-cache keepalive on the Anthropic wire (#3376): while a session goes idle, bili replays the last forwarded body with max_tokens=1 on a TTL-derived cadence so the upstream prefix cache stays warm; hits are verified via usage.cache_read_input_tokens; stops on miss/429/error-streak/duration cap. Also settable per provider route and per model."
     desc_zh: "Anthropic 线路空闲期提示缓存保活总开关（#3376）：会话空闲时按 TTL 推导的节奏以 max_tokens=1 重放最后一次转发的请求体，维持上游前缀缓存温热；以 usage.cache_read_input_tokens 验证命中，miss/429/连续错误/时长上限即停；支持逐 provider 路由与逐模型覆盖。"
+    desc_ja: "Anthropic ワイヤにおけるアイドル時のプロンプトキャッシュキープアライブのマスタースイッチ（#3376）：セッションがアイドルになると、bili は TTL 由来の周期で `max_tokens=1` を伴う最後の転送ボディを再生し、アップストリームのプレフィックスキャッシュをウォームに保つ；ヒットは `usage.cache_read_input_tokens` 経由で検証される；ミス/429/エラー連続/期間上限で停止。プロバイダルートごとおよびモデルごとにも設定可能。"
   - key: cacheKeepalive.ttlFactor
     type: number
     default: "0.9"
@@ -408,6 +485,7 @@ entries:
     group: behavior
     desc_en: "Cadence factor applied to the detected/assumed cache TTL tier (ping interval = tier x factor; 0.9 gives roughly one ping per 4.5 min on the 5-min tier and per 54 min on the 1-hour tier). Must be in (0, 1]."
     desc_zh: "作用于检测/假定缓存 TTL 档位的节奏因子（ping 间隔 = 档位 x 因子；0.9 → 5 分钟档约每 4.5 分钟、1 小时档约每 54 分钟一次）。取值须在 (0, 1]。"
+    desc_ja: "検出/推定されたキャッシュ TTL ティアに適用される周期係数（ピン間隔 = ティア x 係数；0.9 は 5 分ティアで約 4.5 分ごとに 1 ピン、1 時間ティアで 54 分ごとに 1 ピン）。(0, 1] の範囲でなければならない。"
   - key: cacheKeepalive.maxDurationMs
     type: number
     default: "86400000"
@@ -415,6 +493,7 @@ entries:
     group: behavior
     desc_en: "Per-session keepalive lifetime cap, measured from the session's last real request (default 24 h); past it, keepalive disarms even while still hitting."
     desc_zh: "单会话保活时长上限，自其最后一次真实请求起算（默认 24 小时）；超过后即使仍在命中也会解除武装。"
+    desc_ja: "セッションごとのキープアライブ生存期間上限、セッションの最後の実際のリクエストから測定（デフォルト 24 h）；これを過ぎると、ヒットが続いていてもキープアライブは解除される。"
   - key: cacheKeepalive.maxConcurrentPings
     type: number
     default: "4"
@@ -422,6 +501,7 @@ entries:
     group: behavior
     desc_en: "Cap on simultaneously armed sessions; when exceeded, the longest-idle armed session is evicted first."
     desc_zh: "同时武装的会话数上限；超限时先驱逐空闲最久的已武装会话。"
+    desc_ja: "同時にアームされたセッションの上限；超過した場合、最も長くアイドル状態のアーム済みセッションが最初に追い出される。"
   - key: cacheKeepalive.assumeTtl
     type: "\"5m\" | \"1h\""
     default: "null (detect from body breakpoints)"
@@ -429,6 +509,7 @@ entries:
     group: behavior
     desc_en: "Skip body breakpoint detection and derive the cadence from this tier directly - for relays that inject or rewrite cache_control TTL downstream of bili, leaving the forwarded body breakpoint-less or mis-tiered."
     desc_zh: "跳过 body 断点检测，直接按该档位推导节奏——面向会在 bili 下游注入或改写 cache_control TTL、导致转发 body 无断点（或档位不对）的中继/代理。"
+    desc_ja: "ボディブレークポイント検出をスキップし、このティアから直接周期を導出 - bili の下流で `cache_control` TTL を注入または書き換えるリレー向け、転送ボディにブレークポイントがないか、ティアが誤っている場合。"
   - key: cacheKeepalive.armWithoutBreakpoints
     type: boolean
     default: "false"
@@ -436,6 +517,7 @@ entries:
     group: behavior
     desc_en: "Arm keepalive even when the forwarded body carries no cache_control breakpoint at all (off by default - without breakpoints there is no explicit break-pointed content to refresh; pair with assumeTtl/intervalMs when your relay manages breakpoints itself)."
     desc_zh: "转发 body 无任何 cache_control 断点时也武装保活（默认关——没有断点就没有显式打断点的内容可刷新；断点由你的中继自管时配合 assumeTtl/intervalMs 使用）。"
+    desc_ja: "転送ボディに `cache_control` ブレークポイントが全くない場合でもキープアライブをアーム（デフォルトオフ - ブレークポイントがない場合、リフレッシュすべき明示的なブレークポイント付きコンテンツがない；リレーがブレークポイントを自分で管理している場合は `assumeTtl`/`intervalMs` と組み合わせること）。"
   - key: cacheKeepalive.intervalMs
     type: number
     default: "null (derive from TTL tier)"
@@ -443,6 +525,7 @@ entries:
     group: behavior
     desc_en: "Absolute ping interval in milliseconds; wins over ttlFactor, assumeTtl and the detected tier. For fixed cadences that do not follow the upstream TTL policy."
     desc_zh: "绝对 ping 间隔（毫秒）；优先于 ttlFactor、assumeTtl 与检测档位。用于不随上游 TTL 策略变化的固定节奏。"
+    desc_ja: "ミリ秒単位の絶対ピン間隔；`ttlFactor`、`assumeTtl`、および検出されたティアに優先。アップストリームの TTL ポリシーに従わない固定周期向け。"
   - key: native.attachExternal
     type: boolean
     default: "false"
@@ -452,6 +535,7 @@ entries:
     site_group: adv
     desc_en: "Let launcher-less native plugins attach to an external (lane'd, unarmed) daemon instead of spawning their own."
     desc_zh: "允许无启动器的原生插件挂到外部（车道化、未武装看门狗）守护进程，而不是自行派生。"
+    desc_ja: "ランチャーなしのネイティブプラグインが、自分自身のデーモンを生成する代わりに、外部（レーン付き、未アーム）のデーモンにアタッチできるようにする。"
     site_en: "<code>native.attachExternal</code> — let launcher-less native plugins attach to an external daemon (off by default)."
     site_zh: "<code>native.attachExternal</code> —— 允许无启动器的原生插件挂到外部守护进程（默认关）。"
   - key: native.attachLanePriority
@@ -461,6 +545,7 @@ entries:
     group: behavior
     desc_en: "Ordered list of FOREIGN lane names a lane may ride when no own-lane instance exists (#2905). Own lane always wins first; the user zone (manual bili start, the 8787 global) is ALWAYS last; unlisted lanes stay non-attachable. File-only, no env var."
     desc_zh: "本 lane 没有自己的实例时可搭车的外部 lane 名字有序列表（#2905）。本 lane 永远第一；用户区（手动 bili start、8787 全局）永远最后；未列出的 lane 仍不可挂。仅配置文件，无 env。"
+    desc_ja: "自レーンインスタンスが存在しない場合、レーンがライド可能な FOREIGN レーン名の順序付きリスト（#2905）。自レーンは常に最初に優先される；ユーザーゾーン（手動 `bili start`、8787 グローバル）は常に最後；リストにないレーンはアタッチ不可のまま。ファイル専用、環境変数なし。"
   - key: native.attachPolicy
     type: "\"own-lane\" | \"global-fallback\""
     default: "own-lane"
@@ -468,6 +553,7 @@ entries:
     group: behavior
     desc_en: "Lane affinity for native-hook attach, and the gate on whether any cross-lane riding happens (#2877). own-lane (default): a LANEd hook rides ONLY a same-lane daemon and, with none available, spawns its own instead of falling back onto a lane-less / manually-started bili start daemon or another lane's daemon (that convergence pinned every agent to one daemon's version and double-wrote sessions); an armed lane-less daemon (a managed shared proxy, #1225) stays shareable under either policy. global-fallback restores the pre-#2877 behavior: same-lane first, then a compatible lane-less/user-zone daemon, and (with attachLanePriority) the listed foreign lanes."
     desc_zh: "native hook 附着的 lane 亲和，也是是否发生跨 lane 搭车的总闸（#2877）。own-lane（默认）：lane 型 hook 只搭同 lane 的守护；没有时自行派生，而不是回落到无 lane / 手动启动的 bili start 守护或其他 lane 的守护（那种汇聚会把所有 agent 钉死在一台守护的版本上并双写会话）；已武装的无 lane 守护（受管共享代理，#1225）在两种策略下都可被搭车。global-fallback 恢复 #2877 之前的行为：先同 lane，再兼容的无 lane/用户区守护，以及（配 attachLanePriority）列出的外部 lane。"
+    desc_ja: "ネイティブフックのアタッチにおけるレーンアフィニティ、およびクロスレーンライドが発生するかどうかのゲート（#2877）。own-lane（デフォルト）: LANEd フックは同じレーンのデーモンにのみライドし、利用可能なものがなければフォールバックとしてレーンなし/手動起動された bili start デーモンや他のレーンのデーモンを使用するのではなく、自前でスポンします（この収束により、すべてのエージェントが1つのデーモンのバージョンに固定され、セッションの二重書き込みが発生していた問題が解決されました）。アームされたレーンなしデーモン（管理共有プロキシ、#1225）は、どちらのポリシー下でも共有可能のままです。global-fallback は #2877 以前の動作を復元します：まず同じレーン、次に互換性のあるレーンなし/ユーザーゾーンデーモン、そして（attachLanePriority が設定されている場合）リストされた外部レーン。"
   - key: native.attachUrl
     type: string
     default: "unset (discover per lane)"
@@ -475,6 +561,7 @@ entries:
     group: behavior
     desc_en: "Explicit target origin for native-hook attach (any URL). When set, a hook attaches ONLY to that exact origin instead of auto-discovering, and spawns its own if it is not live; it must still be code-compatible and pass the lifecycle gate. The BILI_MCP_PROXY env var (also set by CLI --origin) takes precedence over this file value; empty/whitespace means unset."
     desc_zh: "native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。"
+    desc_ja: "ネイティブフックのアタッチにおける明示的なターゲットオリジン（任意の URL）。設定されると、フックは自動検出の代わりに、その正確なオリジンにのみアタッチし、ライブでない場合は自前でスポンします。それでもなおコード互換性があり、ライフサイクルゲートを通過する必要があります。BILI_MCP_PROXY 環境変数（CLI の --origin によっても設定される）は、このファイルの値よりも優先されます。空または空白は未設定を意味します。"
   - key: claude.nativePort
     type: number
     default: "unset (lane sticky zone port)"
@@ -482,20 +569,31 @@ entries:
     group: behavior
     desc_en: "Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly)."
     desc_zh: "claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。"
+    desc_ja: "claude ネイティブレーンのフックスポンによるプロキシの正確なポートピン（strict-port: 占有者は明確に拒否されます）。"
   - key: pi.subagents
     type: "object | boolean"
     default: "{} (acp_delegate enabled with package defaults)"
     env: [PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT]
     group: behavior
-    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md."
-    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。"
+    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in configuration.md."
+    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 configuration.md 的 pi 段。"
+    desc_ja: "組み込み pi レーンサブエージェント（acp_delegate）サーフェス、#2230 config-home。billion-context.json の pi.subagents セクションがデリゲート設定を所有します。4 つの acp.json キー（delegate/delegatePrompt/displayUsage/debug）は、セクションが存在しない場合のみ読み取られる非推奨のフォールバックです。prompt は delegatePrompt を置き換えます。debug はサブエージェントサブシステムにスコープされます。ブール値の省略形 subagents: false はサーフェス全体を無効にします。完全なフィールドテーブル：configuration.md の pi セクション。"
   - key: pi.inline
     type: boolean
-    default: "false"
+    default: "true (unset env+file runs inline)"
     env: BILI_PI_INLINE
     group: behavior
-    desc_en: "Pi inline lane (#3278; OPT-IN — #4687 reverts the #4571 default flip, default stays the spawned proxy): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Set true (or BILI_PI_INLINE=1/on/yes/TRUE) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly as before (attach/spawn). `bili pi-inline` presets the env for the one-command lane."
-    desc_zh: "pi 内联压缩通道（#3278；需手动开启——#4687 收回 #4571 的默认翻转，默认仍是派生代理）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。设 true（或 BILI_PI_INLINE=1/on/yes/TRUE）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili pi-inline` 一键车道会预置该变量。"
+    desc_en: "Pi inline lane (#3278; DEFAULT-ON since #5428, superseding the #4687 opt-in rule): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Unset env+file now runs INLINE; an ANNOUNCED attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, so `bili pi` keeps its launcher proxy. Opt OUT with BILI_PI_INLINE=0/false/no/off or this key set false — restores the old attach/spawn posture. Resolved env > file > default; an explicit inline choice always beats an announced attach target. Human surface: `bili -i/--inline pi` (≡ the one-command lane) and `bili -s/--server pi` (pin the proxy posture, beats an inherited inline env)."
+    desc_zh: "pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。"
+    desc_ja: "Pi インラインレーン（#3278; #5428 以降デフォルトで有効、#4687 のオプトインルールを置き換え）: pi 拡張機能の圧縮はインプロセスで実行されます — スポンされたプロキシなし、エフェメラルポートなし；モデルトラフィックと /__bili//__acp ツールサーフェスは擬似オリジンを通じてインプロセスエンジンによって提供され、codex Responses WebSocket レーンはループバック専用 WS ブリッジによって、Web UI はエンジンと同時に起動されるループバック専用 Web リスナーによって提供されます。現在、env+file が未設定の場合にはインラインで実行されます；ANNOUNCED アタッチターゲット（ランチャー設定の BILLION_CONTEXT_PROXY/ATTACH）はデフォルトよりも優先されるため、`bili pi` はランチャープロキシを維持します。BILI_PI_INLINE=0/false/no/off またはこのキーを false に設定することでオプトアウトできます — 従来のアタッチ/スポン姿勢を復元します。解決順序は env > file > default；明示的なインライン選択は常に ANNOUNCED アタッチターゲットよりも優先されます。人間向けサーフェス：`bili -i/--inline pi`（≡ ワンコマンドレーン）と `bili -s/--server pi`（プロキシ姿勢をピン留め、継承されたインライン env よりも優先）。"
+  - key: pi.commands
+    type: "string[] | boolean"
+    default: "[\"acp\", \"acp-cache\"]"
+    env: ""
+    group: behavior
+    desc_en: "Which bili pi-plugin slash commands register: \"acp\", \"acp-cache\", \"acp-rule\", \"acp-fleet\". The default keeps the status (/acp) and cache-reconciliation (/acp-cache) entry points while leaving the rarer /acp-rule and /acp-fleet off the slash-completion list; true registers all four, [] or false registers none. Unknown names warn once and are ignored. Read at session start, so a config edit applies to the next session (no proxy restart needed). Pure UI surface: disabling a command never removes the underlying tool (acp_cache / acp_rule stay available to the model) or affects the proxy."
+    desc_zh: "bili pi 插件注册哪些斜杠命令：\"acp\"、\"acp-cache\"、\"acp-rule\"、\"acp-fleet\"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。"
+    desc_ja: "登録される bili pi-plugin スラッシュコマンド：\"acp\", \"acp-cache\", \"acp-rule\", \"acp-fleet\"。デフォルトでは、ステータス（/acp）とキャッシュ調整（/acp-cache）のエントリポイントを維持しつつ、より稀に使用される /acp-rule と /acp-fleet をスラッシュ補完リストから除外します；true は 4 つすべてを登録し、[] または false は何も登録しません。不明な名前は一度警告が表示され、無視されます。セッション開始時に読み取られるため、設定の編集は次のセッションに適用されます（プロキシの再起動は不要）。純粋な UI サーフェス：コマンドの無効化は、基盤となるツール（acp_cache / acp_rule はモデルに対して利用可能のまま）を削除したり、プロキシに影響を与えたりしません。"
   - key: opencode.inline
     type: boolean
     default: "false"
@@ -503,6 +601,7 @@ entries:
     group: behavior
     desc_en: "OpenCode inline lane (#3278 port; OPT-IN — the default stays the spawned proxy, per owner decision on #4687): the opencode plugin's compression runs IN-PROCESS — no spawned proxy, no ephemeral port, no MITM certs; model traffic and the /__bili/ tool surface are served by an in-process engine through a pseudo-origin (verified on the Bun host). Set true (or BILI_OPENCODE_INLINE=1) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target, an absent choice falls back to attach/spawn as before. `bili opencode-inline` is the one-command lane."
     desc_zh: "opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。"
+    desc_ja: "OpenCode インラインレーン（#3278 ポート；オプトイン — #4687 におけるオーナーの決定に従い、デフォルトはスポンされたプロキシのまま）: opencode プラグインの圧縮はインプロセスで実行されます — スポンされたプロキシなし、エフェメラルポートなし、MITM 証明書なし；モデルトラフィックと /__bili/ ツールサーフェスは擬似オリジンを通じてインプロセスエンジンによって提供されます（Bun ホストで検証済み）。有効にするには true（または BILI_OPENCODE_INLINE=1）を設定します。解決順序は env > file；明示的なインライン選択は常に ANNOUNCED アタッチターゲットよりも優先され、選択が欠如している場合は従来どおりアタッチ/スポンにフォールバックします。`bili opencode-inline` はワンコマンドレーンです。"
   - key: mitm.enabled
     type: boolean
     default: "true"
@@ -512,6 +611,7 @@ entries:
     site_group: mitm
     desc_en: "HTTPS interception switch for login clients that hard-code their upstream; domains are whitelisted on first sight."
     desc_zh: "面向写死 HTTPS 上游的登录客户端的拦截开关；域名首次发现即加入白名单。"
+    desc_ja: "アップストリームをハードコードしているログインクライアント向けの HTTPS 傍受スイッチ；ドメインは初回検出時にホワイトリストに登録されます。"
     site_en: "<code>mitm.enabled</code> / <code>mitm.domains</code> — HTTPS interception switch and whitelist domains for login clients."
     site_zh: "<code>mitm.enabled</code> / <code>mitm.domains</code> —— 登录客户端 HTTPS 拦截开关与白名单域名。"
   - key: mitm.domains
@@ -521,6 +621,7 @@ entries:
     group: mitm
     desc_en: "Explicit MITM whitelist domains (unioned with first-sight auto-whitelisting)."
     desc_zh: "显式 MITM 白名单域名（与首次发现的自动白名单取并集）。"
+    desc_ja: "明示的な MITM ホワイトリストドメイン（初回検出時の自動ホワイトリスト化と合算）。"
   - key: mitm.handshakeTimeoutMs
     type: number
     default: "10000"
@@ -530,5 +631,6 @@ entries:
     site_group: mitm
     desc_en: "TLS handshake timeout for intercepted connections."
     desc_zh: "被拦截连接的 TLS 握手超时。"
+    desc_ja: "傍受された接続の TLS ハンドシェイクタイムアウト。"
     site_en: "<code>mitm.handshakeTimeoutMs</code> — TLS handshake timeout (default 10000)."
     site_zh: "<code>mitm.handshakeTimeoutMs</code> —— TLS 握手超时（默认 10000）。"

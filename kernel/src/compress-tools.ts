@@ -21,6 +21,14 @@ export const DECOMPRESS_TOOL_NAME = "decompress";
 export const SEARCH_CONTEXT_TOOL_NAME = "search_context";
 export const ACP_STATUS_TOOL_NAME = "acp_status";
 export const ACP_CACHE_TOOL_NAME = "acp_cache";
+/** #5765 block ops: retire/restore move a block's summary out of (back into)
+ *  the resident view; rewrite replaces its stored summary with supplied text.
+ *  OPT-IN (config.blockOps.enabled, default off): hosts advertise, inject and
+ *  prompt for these only when enabled — the tool definitions below stay exported
+ *  unconditionally (same pattern as the absorb tools). */
+export const ACP_RETIRE_TOOL_NAME = "acp_retire";
+export const ACP_RESTORE_TOOL_NAME = "acp_restore";
+export const ACP_REWRITE_TOOL_NAME = "acp_rewrite";
 export const ABSORB_TOOL_NAME = "absorb";
 
 /** Text-protocol trigger tags. The model emits these in its text output to
@@ -364,6 +372,25 @@ export function buildCompressHybridSystemPrompt(
   ].join("\n\n");
 }
 
+/** #5765: system-prompt section for the opt-in block-lifecycle tools
+ *  (acp_retire / acp_restore / acp_rewrite). Hosts append it ONLY when they
+ *  also inject the tools (config.blockOps.enabled), so the prompt never
+ *  advertises a tool the request's tools array lacks. "function" = the
+ *  function-tool lanes (anthropic/chat/google + responses function mode);
+ *  "hybrid" = the Responses text-protocol lane, where compress stays a text
+ *  marker and the block ops ride as real function tools. */
+export function buildBlockOpsSystemPrompt(lane: "function" | "hybrid"): string {
+  if (lane === "hybrid") {
+    return `You also have these block-management function tools:
+- acp_retire / acp_restore — move blocks out of (back into) the resident view without losing them. Arguments: {"blockId":"b5"} or {"ids":["b3","b7"]}.
+- acp_rewrite — replace a block's stored summary with shorter supplied text (no re-compression; originals untouched). Arguments: {"blockId":"b5","summary":"..."} or {"items":[{"blockId":"b5","summary":"..."}]}.`;
+  }
+  return `BLOCK-LIFECYCLE MANAGEMENT (acp_retire / acp_restore / acp_rewrite)
+
+- acp_retire / acp_restore — Move compressed blocks out of (back into) the resident view without losing them: acp_retire({ blockId }) or acp_retire({ ids: ["b3","b7"] }) stops injecting those blocks' summaries every turn (decompress/search_context still work; acp_status lists them under RETIRED BLOCKS); acp_restore({ blockId }) puts them back. Use for old material that no longer needs to be resident.
+- acp_rewrite — Replace a block's stored summary with shorter text you write: acp_rewrite({ blockId: "b5", summary: "..." }) or batch via items:[{blockId,summary}]. No re-compression; the previous summary stays available one step deep for rollback and the originals are untouched.`;
+}
+
 export const DECOMPRESS_TOOL_OPENAI = {
   type: "function" as const,
   function: {
@@ -476,6 +503,86 @@ export const ACP_CACHE_TOOL_OPENAI = {
   },
 };
 
+// #5765 block ops — shared parameter schemas. Open objects, no top-level
+// required: retire/restore accept blockId OR ids (the executor enforces
+// "at least one"), rewrite accepts a single pair OR an items batch.
+const BLOCK_IDS_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    blockId: {
+      type: "string",
+      description: "One block id (e.g. b5)",
+    },
+    ids: {
+      type: "array",
+      items: { type: "string" },
+      description: "Several block ids in one call (e.g. [\"b3\", \"b7\"])",
+    },
+  },
+};
+
+const ACP_RETIRE_DESCRIPTION =
+  "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.";
+
+const ACP_RESTORE_DESCRIPTION =
+  "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.";
+
+const ACP_REWRITE_DESCRIPTION =
+  "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.";
+
+const ACP_REWRITE_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    blockId: {
+      type: "string",
+      description: "Block id to rewrite (e.g. b5) — single-block form",
+    },
+    summary: {
+      type: "string",
+      description: "The replacement summary text — single-block form",
+    },
+    items: {
+      type: "array",
+      description: "Batch form: several rewrites in one call",
+      items: {
+        type: "object",
+        properties: {
+          blockId: { type: "string", description: "Block id (e.g. b5)" },
+          summary: { type: "string", description: "Replacement summary text" },
+        },
+        required: ["blockId", "summary"],
+      },
+    },
+  },
+};
+
+export const ACP_RETIRE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_RETIRE_TOOL_NAME,
+    description: ACP_RETIRE_DESCRIPTION,
+    parameters: BLOCK_IDS_PARAMETERS,
+  },
+};
+
+export const ACP_RESTORE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_RESTORE_TOOL_NAME,
+    description: ACP_RESTORE_DESCRIPTION,
+    parameters: BLOCK_IDS_PARAMETERS,
+  },
+};
+
+export const ACP_REWRITE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_REWRITE_TOOL_NAME,
+    description: ACP_REWRITE_DESCRIPTION,
+    parameters: ACP_REWRITE_PARAMETERS,
+  },
+};
+
 export const ACP_TOOLS_OPENAI = [
   COMPRESS_TOOL_OPENAI,
   DECOMPRESS_TOOL_OPENAI,
@@ -511,6 +618,24 @@ export const ACP_CACHE_TOOL = {
   name: ACP_CACHE_TOOL_NAME,
   description: ACP_CACHE_TOOL_DESCRIPTION,
   input_schema: ACP_CACHE_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_RETIRE_TOOL = {
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  input_schema: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL = {
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  input_schema: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL = {
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  input_schema: ACP_REWRITE_PARAMETERS,
 };
 
 export const ACP_TOOLS_ANTHROPIC = [
@@ -557,6 +682,27 @@ export const ACP_CACHE_TOOL_RESPONSES = {
   parameters: ACP_CACHE_TOOL_OPENAI.function.parameters,
 };
 
+export const ACP_RETIRE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  parameters: ACP_REWRITE_PARAMETERS,
+};
+
 /** All ACP tools in Responses API flat format, matching ACP_TOOL_NAMES. */
 export const ACP_TOOLS_RESPONSES = [
   COMPRESS_TOOL_RESPONSES,
@@ -580,8 +726,9 @@ export const ACP_READONLY_TOOLS_RESPONSES = [
 ] as const;
 
 /** All ACP tool names (dynamic membership — Set, not a static record). Does
- *  NOT include absorb or acp_retrieve: both are opt-in (config.absorb.enabled
- *  / config.ccr.enabled) and hosts only register/inject them when on. */
+ *  NOT include absorb, acp_retrieve or the #5765 block ops: all opt-in
+ *  (config.absorb.enabled / config.ccr.enabled / config.blockOps.enabled) and
+ *  hosts only register/inject them when on. */
 export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
   DECOMPRESS_TOOL_NAME,
@@ -590,11 +737,27 @@ export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   ACP_CACHE_TOOL_NAME,
 ]);
 
-/** compress/decompress: mutate history → must drive the compress loop (their
- *  result is folded into the request before the model continues). */
+/** #5765: the opt-in block-lifecycle tool names. Like absorb/acp_retrieve they
+ *  stay OUT of ACP_TOOL_NAMES (config.blockOps.enabled gates the surface), but
+ *  every "is this a bili-owned tool" check (absorb candidacy, ccr placeholder
+ *  skip, side-request demotion) must still recognize them — when enabled their
+ *  receipts behave like any other ACP tool receipt. */
+export const BLOCK_OP_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ACP_RETIRE_TOOL_NAME,
+  ACP_RESTORE_TOOL_NAME,
+  ACP_REWRITE_TOOL_NAME,
+]);
+
+/** compress/decompress/acp_retire/acp_restore/acp_rewrite: mutate session
+ *  state → must drive the compress loop (their result is folded into the
+ *  request before the model continues — for the block ops that is what makes
+ *  the shrink/restore land within the same turn). */
 export const ACP_MUTATING_TOOLS: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
   DECOMPRESS_TOOL_NAME,
+  ACP_RETIRE_TOOL_NAME,
+  ACP_RESTORE_TOOL_NAME,
+  ACP_REWRITE_TOOL_NAME,
 ]);
 
 /** acp_status/search_context/acp_cache: read-only → must NOT loop. Looping them
@@ -679,6 +842,24 @@ export const ACP_CACHE_TOOL_GOOGLE = {
   name: ACP_CACHE_TOOL_NAME,
   description: ACP_CACHE_TOOL_DESCRIPTION,
   parameters: ACP_CACHE_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_RETIRE_TOOL_GOOGLE = {
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL_GOOGLE = {
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL_GOOGLE = {
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  parameters: ACP_REWRITE_PARAMETERS,
 };
 
 /** All ACP tools in Gemini flat format, matching ACP_TOOL_NAMES. */

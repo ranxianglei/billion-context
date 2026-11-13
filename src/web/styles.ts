@@ -22,6 +22,32 @@ export const WEB_STYLES = String.raw`
     --amber: #9a6700;
     --amber-soft: rgba(154, 103, 0, 0.1);
     --purple: #8250df;
+    /* handoff code tokens (highlight.js github palette) + role-card accents */
+    --hl-key: #0550ae;
+    --hl-str: #0a3069;
+    --hl-bool: #953800;
+    --hl-k: #cf222e;
+    --hl-c: #6e7781;
+    --hl-add: #1a7f37;
+    --hl-del: #cf222e;
+    --hl-hunk: #6639ba;
+    --hc-user: #1a7f37;
+    --hc-user-bg: rgba(26, 127, 55, 0.045);
+    --hc-user-badge: rgba(26, 127, 55, 0.14);
+    --hc-assistant: #2185d0;
+    --hc-assistant-bg: rgba(33, 133, 208, 0.045);
+    --hc-assistant-badge: rgba(33, 133, 208, 0.14);
+    --hc-tool: #9a6700;
+    --hc-tool-bg: rgba(154, 103, 0, 0.05);
+    --hc-tool-badge: rgba(154, 103, 0, 0.14);
+    /* #5417: treemap per-tier node fills. Light values are the pre-existing
+       hardcoded hues verbatim (zero light-mode drift); the dark counterparts
+       below give each tier a legible low-luminance ground in dark mode. */
+    --tm-base-fill: #ffffff;
+    --tm-t1-fill: #f2f7ff;
+    --tm-t2-fill: #f6f3ff;
+    --tm-t3-fill: #fffaf0;
+    --tm-tn-fill: #f7f8fa;
     --shadow: 0 1px 3px rgba(31, 35, 40, 0.06), 0 1px 2px rgba(31, 35, 40, 0.04);
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -51,7 +77,30 @@ export const WEB_STYLES = String.raw`
         --amber: #d29922;
         --amber-soft: rgba(210, 153, 34, 0.14);
         --purple: #a371f7;
+        --tm-base-fill: #161b22;
+        --tm-t1-fill: #182338;
+        --tm-t2-fill: #241a38;
+        --tm-t3-fill: #2c2416;
+        --tm-tn-fill: #1c2129;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    /* keep in sync: the two dark palettes must stay verbatim-equal (#2559) */
+    --hl-key: #79c0ff;
+    --hl-str: #a5d6ff;
+    --hl-bool: #ffa657;
+    --hl-k: #ff7b72;
+    --hl-c: #8b949e;
+    --hl-add: #3fb950;
+    --hl-del: #ff7b72;
+    --hl-hunk: #d2a8ff;
+    --hc-user: #3fb950;
+    --hc-user-bg: rgba(63, 185, 80, 0.08);
+    --hc-user-badge: rgba(63, 185, 80, 0.16);
+    --hc-assistant: #4493f8;
+    --hc-assistant-bg: rgba(68, 147, 248, 0.08);
+    --hc-assistant-badge: rgba(68, 147, 248, 0.16);
+    --hc-tool: #d29922;
+    --hc-tool-bg: rgba(210, 153, 34, 0.08);
+    --hc-tool-badge: rgba(210, 153, 34, 0.16);
     }
 }
 :root[data-theme="dark"] {
@@ -73,7 +122,30 @@ export const WEB_STYLES = String.raw`
     --amber: #d29922;
     --amber-soft: rgba(210, 153, 34, 0.14);
     --purple: #a371f7;
+    --tm-base-fill: #161b22;
+    --tm-t1-fill: #182338;
+    --tm-t2-fill: #241a38;
+    --tm-t3-fill: #2c2416;
+    --tm-tn-fill: #1c2129;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    /* keep in sync: the two dark palettes must stay verbatim-equal (#2559) */
+    --hl-key: #79c0ff;
+    --hl-str: #a5d6ff;
+    --hl-bool: #ffa657;
+    --hl-k: #ff7b72;
+    --hl-c: #8b949e;
+    --hl-add: #3fb950;
+    --hl-del: #ff7b72;
+    --hl-hunk: #d2a8ff;
+    --hc-user: #3fb950;
+    --hc-user-bg: rgba(63, 185, 80, 0.08);
+    --hc-user-badge: rgba(63, 185, 80, 0.16);
+    --hc-assistant: #4493f8;
+    --hc-assistant-bg: rgba(68, 147, 248, 0.08);
+    --hc-assistant-badge: rgba(68, 147, 248, 0.16);
+    --hc-tool: #d29922;
+    --hc-tool-bg: rgba(210, 153, 34, 0.08);
+    --hc-tool-badge: rgba(210, 153, 34, 0.16);
 }
 :root[data-theme="light"] {
     color-scheme: light;
@@ -298,11 +370,11 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tm-inner { position: relative; margin: 0 auto; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
-.g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
-.g-node.tier-1 rect { stroke: var(--accent); fill: #f2f7ff; }
-.g-node.tier-2 rect { stroke: #7a5af8; fill: #f6f3ff; }
-.g-node.tier-3 rect { stroke: #bf8700; fill: #fffaf0; }
-.g-node.tier-n rect { stroke: #8a8f99; fill: #f7f8fa; }
+.g-node rect { fill: var(--tm-base-fill); stroke: var(--border-soft); stroke-width: 1.4; }
+.g-node.tier-1 rect { stroke: var(--accent); fill: var(--tm-t1-fill); }
+.g-node.tier-2 rect { stroke: #7a5af8; fill: var(--tm-t2-fill); }
+.g-node.tier-3 rect { stroke: #bf8700; fill: var(--tm-t3-fill); }
+.g-node.tier-n rect { stroke: #8a8f99; fill: var(--tm-tn-fill); }
 .g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
 .g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }
@@ -340,6 +412,15 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tchip rect { fill: var(--bg-muted); stroke: var(--border-soft); }
 .tchip:hover rect { stroke: var(--accent); }
 .tchip text { font-size: 10px; font-weight: 700; fill: var(--text-muted); text-anchor: middle; }
+/* Stable hover card for the collapsible tree — the native SVG <title> tooltip
+   dies the instant any repaint (expand/collapse, Esc, the #4173 live tick)
+   swaps the drawing under a stationary cursor, so the tree draws its own
+   card (pointer-events: none so it never steals the pointer it tracks). */
+#tree-graph { position: relative; }
+.g-tip { position: absolute; z-index: 30; max-width: 340px; pointer-events: none; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 7px 10px; line-height: 1.45; font-size: 11.5px; }
+.g-tip .gt-id { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); }
+.g-tip .gt-topic { color: var(--text); }
+.g-tip .gt-meta { color: var(--text-muted); font-size: 10.5px; margin-top: 3px; }
 .fd-side { min-width: 0; }
 .bd-card { border: 1px solid var(--border-soft); border-radius: 10px; position: sticky; top: 12px; max-height: calc(100vh - 240px); overflow-y: auto; }
 .bd-panel { padding-bottom: 14px; }
@@ -358,6 +439,7 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .handoff pre code { background: none; padding: 0; }
 .handoff ul, .handoff ol { margin: 8px 0; padding-left: 22px; }
 .handoff li { margin: 3px 0; }
+.handoff li input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: 1px; }
 .handoff blockquote { margin: 8px 0; padding: 6px 12px; border-left: 3px solid var(--border); color: var(--text-muted); background: var(--bg-muted); border-radius: 0 8px 8px 0; }
 .handoff hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 /* #1426: message-role dividers in the handoff doc (### user / assistant / tool) */
@@ -449,19 +531,69 @@ pre.small-pre { max-height: 220px; overflow: auto; }
 .row-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pt-row { display: flex; align-items: center; gap: 10px; }
 
-/* #1426 handoff structured rendering */
-.msg-think { margin: 8px 0; }
-.msg-think summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); font-weight: 600; }
-.think-box { margin-top: 6px; padding: 8px 12px; border-left: 3px solid rgba(130, 80, 223, 0.45); background: var(--bg-elev); border-radius: 0 8px 8px 0; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); word-break: break-word; white-space: normal; }
-.msg-out { margin: 8px 0; font-size: 13px; line-height: 1.55; word-break: break-word; }
-.msg-tool, .msg-result { margin: 8px 0; padding: 8px 10px; background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; }
+/* Handoff document rendering — eWork-style role cards, Markdown bodies, and
+   hand-highlighted tool input/output. renderHandoffMd (client) emits the
+   hc-*/hdoc-* classes; the server handoffHtml fallback + blog articles share
+   the token colors below (scoped to their own containers). */
+.hdoc-meta { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px 14px; margin: 4px 0 14px; }
+.hdoc-title { font-weight: 700; font-size: 14.5px; margin-bottom: 6px; }
+.hdoc-meta-row { font-size: 12px; color: var(--text-muted); line-height: 1.7; word-break: break-word; }
+.hdoc-meta-k { color: var(--text-faint); margin-right: 6px; font-family: var(--mono); font-size: 11px; }
+.hdoc-sub { font-size: 12.5px; font-weight: 600; color: var(--text-muted); margin: 14px 0 6px; }
+.handoff .hblock { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; margin: 0 0 8px; overflow: hidden; }
+.handoff .hblock-head { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; background: var(--bg-muted); border-bottom: 1px solid var(--border-soft); }
+.handoff .hblock-id { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+.handoff .hblock-topic { font-size: 11.5px; color: var(--text-muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.handoff .hblock-tier { padding: 5px 12px 0; font-size: 10.5px; color: var(--text-faint); font-family: var(--mono); }
+.handoff .hblock-body { padding: 8px 12px 10px; font-size: 13px; }
+.handoff .hblock-body > :first-child { margin-top: 0; }
+.handoff .hblock-body > :last-child { margin-bottom: 0; }
+.handoff .hc-section-pro { margin: 0 0 8px; color: var(--text-muted); }
+.hcard { border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--accent-soft); margin: 10px 0; overflow: hidden; }
+.hcard.hc-user { border-left-color: var(--hc-user); background: var(--hc-user-bg); }
+.hcard.hc-assistant { border-left-color: var(--hc-assistant); background: var(--hc-assistant-bg); }
+.hcard.hc-tool { border-left-color: var(--hc-tool); background: var(--hc-tool-bg); }
+.hc-head { padding: 8px 12px 0; }
+.hc-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: .3px; padding: 2px 10px; border-radius: 999px; }
+.hc-badge-user { background: var(--hc-user-badge); color: var(--hc-user); }
+.hc-badge-assistant { background: var(--hc-assistant-badge); color: var(--hc-assistant); }
+.hc-badge-tool { background: var(--hc-tool-badge); color: var(--hc-tool); }
+.hc-body { padding: 4px 12px 10px; }
+.hc-out { word-break: break-word; }
+.hc-out > :first-child { margin-top: 4px; }
+.hc-out > :last-child { margin-bottom: 2px; }
+/* thinking cells — collapsed by default, reasoning would otherwise swamp the doc */
+.hc-think { margin: 8px 0; border: 1px solid var(--border-soft); border-left: 3px solid rgba(130, 80, 223, 0.55); border-radius: 0 8px 8px 0; background: var(--bg-elev); }
+.hc-think summary { cursor: pointer; padding: 6px 12px; font-size: 12.5px; color: var(--text-muted); font-weight: 600; }
+.hc-think-body { padding: 2px 12px 10px; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); word-break: break-word; }
+/* tool input/output cards */
+.hc-tool { margin: 8px 0; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--bg-elev); overflow: hidden; }
+.hc-tool-sum { cursor: pointer; display: flex; align-items: center; flex-wrap: wrap; gap: 2px; padding: 7px 10px; font-size: 12px; }
+.hc-tool-sum:hover { background: var(--bg-muted); }
+.hc-res { color: var(--text-faint); margin-left: 6px; }
+.hc-tool-body { border-top: 1px solid var(--border-soft); padding: 8px 10px 10px; }
+.hc-io-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.hc-io-label { font-size: 11px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase; color: var(--text-faint); font-family: var(--mono); }
+.hc-copy { flex: none; }
+pre.hc-io { margin: 0; padding: 8px 10px; background: var(--bg-muted); border-radius: 6px; font-size: 11.5px; line-height: 1.5; max-height: 320px; overflow: auto; }
+pre.hc-io code { white-space: pre; word-break: normal; }
+/* syntax-highlight tokens — web/mdrender.ts's hand-rolled scanners emit
+   these classes; colors track the highlight.js github / github-dark palette. */
+.handoff .hl-key, .handoff .hl-num, .post-body .hl-key, .post-body .hl-num { color: var(--hl-key); }
+.handoff .hl-str, .post-body .hl-str { color: var(--hl-str); }
+.handoff .hl-bool, .post-body .hl-bool { color: var(--hl-bool); }
+.handoff .hl-k, .post-body .hl-k { color: var(--hl-k); font-weight: 600; }
+.handoff .hl-c, .post-body .hl-c { color: var(--hl-c); font-style: italic; }
+.handoff .hl-add, .post-body .hl-add { color: var(--hl-add); }
+.handoff .hl-del, .post-body .hl-del { color: var(--hl-del); }
+.handoff .hl-hunk, .post-body .hl-hunk { color: var(--hl-hunk); font-weight: 600; }
+/* tool name chips (kept from #1426 — reused by the new tool cards) */
 .tool-chip { display: inline-flex; align-items: center; padding: 1px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; background: var(--bg-muted); color: var(--text-muted); margin-right: 8px; font-family: var(--mono); }
 .tool-chip.t-shell { background: #1f2328; color: #ffffff; }
 .tool-chip.t-file { background: #ddf4ff; color: #0969da; }
 .tool-chip.t-seek { background: #dafbe1; color: #1a7f37; }
 .tool-chip.t-fold { background: #fbefff; color: #8250df; }
 .tool-cid { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
-pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--bg-muted); border-radius: 6px; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
 .fold-scroll { max-height: 400px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; padding: 2px 8px 8px; }
 .seam-ev { border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--bg-elev); box-shadow: var(--shadow); overflow: hidden; }
 .seam-ev summary { list-style: none; cursor: pointer; padding: 12px 16px; font-size: 13.5px; font-weight: 650; display: flex; align-items: baseline; gap: 8px; }
@@ -482,6 +614,11 @@ table.data.fold-table th, table.data.fold-table td { display: table-cell; }
 .twrap { overflow-x: auto; }
 .tproc table.data { min-width: 520px; }
 .twide table.data { min-width: 940px; table-layout: fixed; }
+.twide th { position: relative; }
+.col-resize { position: absolute; top: 0; right: 0; width: 8px; height: 100%; padding: 0; border: 0; border-right: 1px solid var(--border); background: transparent; cursor: col-resize; touch-action: none; }
+.col-resize:hover, .col-resize:focus-visible { background: var(--accent-soft); border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: -2px; }
+.twide .columns-resized .w-title, .twide .columns-resized .row-id, .twide .columns-resized .w-up { max-width: 100%; }
+.twide .columns-resized th, .twide .columns-resized td { overflow: hidden; text-overflow: ellipsis; }
 .hitc { font-size: 11px; letter-spacing: -0.2px; }
 .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .client-cell { min-width: 0; }
