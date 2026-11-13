@@ -80,7 +80,7 @@ jobs:
           warned=0
 
           collect() {
-            gh api --paginate --jq '.workflow_runs[] | [.id, .status, .created_at, .event, (.head_branch // "")] | @tsv' \
+            gh api --paginate --jq '.workflow_runs[] | [.id, .status, .created_at, .event, (.head_branch // "-"), (.head_repository.full_name // "-")] | @tsv' \
               "repos/$REPO/actions/runs?status=$1&per_page=100"
           }
           { collect queued; collect in_progress; } | sort -u > /tmp/janitor-runs.tsv
@@ -111,7 +111,7 @@ jobs:
           # Actions job, so EVERY rule below (zombie reap, age limits, master
           # warnings) was dead code from day one (2026-10-30). Feed the collected
           # list explicitly.
-          while IFS=$'\t' read -r id status created event branch; do
+          while IFS=$'\t' read -r id status created event branch head_repo; do
             if [ "$id" = "$SELF_ID" ]; then continue; fi
             age_min=$(( (now - $(date -d "$created" +%s)) / 60 ))
 
@@ -122,9 +122,12 @@ jobs:
             fi
 
             reason=""
-            if [ "$event" = "pull_request" ] && [ -n "$branch" ]; then
-              if ! gh api "repos/$REPO/branches/$branch" >/dev/null 2>&1; then
-                reason="head branch '$branch' deleted"
+            if [ "$event" = "pull_request" ] && [ "$branch" != "-" ] && [ "$head_repo" != "-" ]; then
+              branch_ref=$(jq -rn --arg ref "$branch" '$ref | @uri')
+              branch_response=$(gh api --include "repos/$head_repo/branches/$branch_ref" 2>/dev/null) || true
+              branch_status=$(printf '%s\n' "$branch_response" | awk 'NR == 1 { print $2 }')
+              if [ "$branch_status" = "404" ] && gh api "repos/$head_repo" >/dev/null 2>&1; then
+                reason="head branch '$head_repo:$branch' deleted"
               fi
             fi
             if [ -z "$reason" ] && [ "$status" = "queued" ] && [ "$starve_mode" = "1" ] && [ "$STARVED_QUEUE_MAX" -gt 0 ]; then
