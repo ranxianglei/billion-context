@@ -8,7 +8,11 @@ import { runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./strea
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export async function rewriteGoogleJsonResponseAsync(body: unknown, ctx: RewriteCtx, signal?: AbortSignal): Promise<unknown> {
-    return runJsonRewriteAsync(rewriteGoogleJsonSteps(body, ctx), async (call) => (await executeProxyToolAsync(call.name, call.args as Record<string, unknown>, ctx, call.id, undefined, signal)).text);
+    return runJsonRewriteAsync(rewriteGoogleJsonSteps(body, ctx), async (call) => {
+        const r = await executeProxyToolAsync(call.name, call.args as Record<string, unknown>, ctx, call.id, undefined, signal);
+        await ctx.pendingSnapshotFlush; // #5874: the awaited-flush discipline (fold commits land before the response continues)
+        return r.text;
+    });
 }
 
 function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCall, unknown, string> {

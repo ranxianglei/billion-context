@@ -370,6 +370,17 @@ async function main() {
             [G.sglangUrl]: { models: { [G.sglangModel]: { context: window, output: window === G.bigWindow ? 32768 : 4096 } } },
             ...(relayOk ? { [G.relayUrl]: { models: { [G.relayModel]: { context: 32768, output: 8192 } } } } : {}),
           },
+          // #5874: the gate runs the snapshot-table compression foundation at
+          // 100% (master + lane on) so a release never ships a broken
+          // foundation. The cohort stays ["pi"]: the gate's driver is the dsh
+          // CLI, which sends NO per-element msgid envelope (no biliMsgIds /
+          // x-bili-msg-ids) and is therefore NOT a foundation host — its turns
+          // take the unchanged legacy path, which is exactly what "100%-on does
+          // not break the real client" has to prove. The foundation's behavior
+          // itself is pinned by the hermetic A/B byte-parity tests (the pi
+          // plugin lane with a synthetic envelope).
+          rollout: { features: { snapshotFoundation: true, snapshotLane: true } },
+          snapshot: { enabled: true, cohortHosts: ["pi"], tripwireRate: 0.05, ckptEveryNTurns: 16 },
           // Lane U reads `latest` from here (a dsh-managed proxy must NOT self-update in place).
           ...(verdaccioOk ? { update: { registry: G.verdaccio } } : {}),
         },

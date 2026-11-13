@@ -307,6 +307,16 @@ billion-context/
 │   ├── runaway-guard.ts          # Intrinsic stream terminator for runaway tag/codepoint enumeration (#2346)
 │   ├── served-markers.ts         # Per-session writer markers: split-brain visibility (#3923)
 │   ├── session-self-heal.ts      # Degrades zombie plugin sessions back to proxy mode (#2155)
+│   ├── snapshot-plane.ts         # Snapshot-table foundation: world/lane/reconcile/egress decision layer + red-gate latches (#5874)
+│   ├── snapshot/                 # Snapshot-table compression foundation (#5874): pure decision modules
+│   │   ├── checksums.ts          #   Deterministic sha256 + canonical JSON + S4 aggregate
+│   │   ├── egress.ts             #   mapEgress: active rows (envelope order) ++ tail cores
+│   │   ├── hydrate.ts            #   Green/red plane hydration + checkpoint S4/state verify
+│   │   ├── identity.ts           #   World matching: echo/probe/scatter/issue/diverge/resync
+│   │   ├── index.ts              #   Public barrel for the snapshot decision layer
+│   │   ├── lane.ts               #   Lane + red-gate (R1–R4) decision tokens
+│   │   ├── reconcile.ts          #   Table mutation events: cast/append/update/delete/compact
+│   │   └── types.ts              #   Shared types (events, world, plane, reconcile I/O)
 │   ├── startup-failure-page.ts   # Port-holding failure page when a launcher-spawned proxy dies (#5096)
 │   ├── state-gc.ts               # Opt-in retention GC for dump directories (size/age bounds) (#2412)
 │   ├── state-hydration.ts        # Single mergeState truth; persisted field list derived mechanically (#4242)

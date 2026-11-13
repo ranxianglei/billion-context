@@ -227,6 +227,9 @@ export interface LoopCtx {
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
     session: Session;
+    /** #5874: set by the applyRanges snapshot-fold hook when a fold commits on
+     *  a foundation-lane session — await it before continuing (flush discipline). */
+    pendingSnapshotFlush?: Promise<void>;
     reply?: HandoffReply;
     log: (msg: string) => void;
     proxyUrl?: string;
@@ -1417,6 +1420,10 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
+                    // #5874: the awaited-flush discipline (proxy compress
+                    // loop carrier) — a fold committed above must land in
+                    // the snapshot tables before this request continues.
+                    await ctx.pendingSnapshotFlush;
                     proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;

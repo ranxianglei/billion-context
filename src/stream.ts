@@ -20,6 +20,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { foundationFoldHook } from "./snapshot-plane.js";
 import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
@@ -42,6 +43,11 @@ export type RewriteCtx = {
      *  lanes pin their round's own processTurn offer (#4227); a lane without
      *  one falls back to the live recompute below. */
     lastNudge?: NudgeDecision;
+    /** #5874: the snapshot-table fold commit queued for this session by the
+     *  applyRanges hook below (fire-and-forget at the fold point, ordered per
+     *  session). Callers that must not respond before the fold lands (the
+     *  plugin tool endpoint, the compress loop) await it. */
+    pendingSnapshotFlush?: Promise<void>;
 };
 
 // Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
@@ -1349,6 +1355,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // #5874 stage 3 (fold path): commit the fold to the snapshot tables
+        // right after the kernel state commit — this is the single fold
+        // point of BOTH carriers (plugin endpoint first scene + proxy
+        // compress loop). Queued per session; the caller awaits
+        // ctx.pendingSnapshotFlush before responding so the next model
+        // request always sees the folded rows (the awaited-flush discipline).
+        foundationFoldHook(ctx, res.state.blocks.filter((b) => b.active && !beforeIds.has(b.blockId)).map((b) => b.blockId));
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs

@@ -97,6 +97,7 @@ import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
 import { requestModelFromBody } from "../upstream-throttle.js";
 import { tryAnswerEarlyHold } from "./relay.js";
+import { FoundationRejectError } from "../snapshot-plane.js";
 
 // #5795: the credential subset of the inbound headers — exactly the names
 // credentialFingerprint reads (CREDENTIAL_HEADER_NAMES), or the fast path's
@@ -3361,7 +3362,25 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            let pendingForward;
+            try {
+                pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            } catch (err) {
+                if (err instanceof FoundationRejectError) {
+                    // #5874 R3: the snapshot-foundation envelope fault — a
+                    // hard 400 answered BEFORE any forward and with zero
+                    // kernel side effects (prepare threw before processTurn).
+                    // The plane latches to legacy after repeated faults
+                    // (in-memory breaker), so a misbehaving host degrades
+                    // instead of bricking the session.
+                    forwarded = true;
+                    log("error", `[snapshot] ${session.id}: ${err.code} — ${err.message}`);
+                    res.writeHead(err.status, { "content-type": "application/json", "x-bili-snapshot": err.code });
+                    res.end(JSON.stringify({ error: { code: err.code, message: err.message } }));
+                    return;
+                }
+                throw err;
+            }
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an

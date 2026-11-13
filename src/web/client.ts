@@ -4281,6 +4281,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             wmSel.value = wmv;
             updateWmNote();
+            const sf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.snapshotFoundation : undefined;
+            let smv = "default";
+            if (sf === true) smv = "on"; else if (sf === false) smv = "off";
+            while (snapSel.options.length > 0) snapSel.removeChild(snapSel.lastChild);
+            SNAP_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                snapSel.appendChild(o);
+            });
+            if (sf !== undefined && !SNAP_VALUES.includes(smv)) {
+                const o = document.createElement("option");
+                o.value = String(sf);
+                o.textContent = String(sf) + " *";
+                snapSel.appendChild(o);
+                smv = String(sf);
+            }
+            snapSel.value = smv;
+            updateSnapNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -4895,6 +4914,43 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
             else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
             else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
+        }));
+        // #5874: snapshot-table compression foundation grey-rollout switch —
+        // maps 1:1 onto rollout.features.snapshotFoundation (the master; the
+        // lane is base-nested at 100% and needs no separate switch). Cohort
+        // roster and cadence live under the snapshot config section (raw
+        // JSON editor). default follows the baked percent.
+        const SNAP_VALUES = ["default", "on", "off"];
+        const snapSel = document.createElement("select");
+        snapSel.className = "field-input mono";
+        qCtrls.push(snapSel);
+        const sw = document.createElement("div");
+        sw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const slab = document.createElement("label");
+        slab.htmlFor = "quick-snapshot";
+        slab.style.cssText = "flex:0 1 auto;max-width:520px";
+        slab.textContent = t("cfg.q_snap");
+        snapSel.id = "quick-snapshot";
+        sw.appendChild(slab);
+        sw.appendChild(snapSel);
+        box.appendChild(sw);
+        const snapNote = document.createElement("div");
+        snapNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateSnapNote() {
+            if (snapSel.value === "on") snapNote.textContent = t("cfg.q_snap_on_desc");
+            else if (snapSel.value === "off") snapNote.textContent = t("cfg.q_snap_off_desc");
+            else if (snapSel.value !== "default") snapNote.textContent = t("cfg.q_snap_custom");
+            else snapNote.textContent = t("cfg.q_snap_default_desc");
+        }
+        box.appendChild(snapNote);
+        snapSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (snapSel.value === "on") feats.snapshotFoundation = true;
+            else if (snapSel.value === "off") feats.snapshotFoundation = false;
+            else delete feats.snapshotFoundation;
             if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
             if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
         }));
