@@ -308,3 +308,33 @@ test("#6522 P2: silence persists across further folds of the uncovered history i
     assert.ok(out3.includes(NO_RANGES_REMAIN_TEXT), "plain stop signal expected:\n" + out3);
     assert.equal(ctx.session.uncoveredReceiptNoted, true, "latch is a session field");
 });
+
+test("#6522 P3: an actual nudge injection re-opens the latch — the note fires once more in the new cycle, then goes quiet again", () => {
+    const { ctx, fold1, mid, tailBit } = dualHoleSession();
+    const out1 = runApply(ctx, foldArgs(fold1));
+    assert.ok(out1.includes(UNCOVERED_HEADER), "first note expected:\n" + out1);
+    assert.equal(ctx.session.uncoveredReceiptNoted, true, "latch set after first note");
+    // Next fold in the same cycle: silent.
+    setOffer(ctx, [offerRange(mid.startRef, mid.endRef, 45)]);
+    const out2 = runApply(ctx, foldArgs([mid]));
+    assert.ok(out2.startsWith("[Compressed"), `fold 2: ${out2.slice(0, 160)}`);
+    assert.ok(!out2.includes(UNCOVERED_HEADER), "same cycle: quiet:\n" + out2);
+    // A NEW nudge was actually injected this round (the proxy stamps this exactly
+    // when prepared.nudgeOutcome === "injected" — src/server/handle.ts, right
+    // after storeUnpromptedGate). Fresh injection = fresh compress-while-you-are
+    // -at-it moment, so the note may fire once more.
+    ctx.session.uncoveredReceiptNoted = false;
+    setOffer(ctx, [offerRange(tailBit.startRef, tailBit.endRef, 45)]);
+    const out3 = runApply(ctx, foldArgs([tailBit]));
+    assert.ok(out3.startsWith("[Compressed"), `fold 3: ${out3.slice(0, 160)}`);
+    assert.ok(out3.includes(UNCOVERED_HEADER), "re-opened latch: note fires again:\n" + out3);
+    assert.equal(ctx.session.uncoveredReceiptNoted, true, "latch re-set after the fresh note");
+    // And the cycle closes again: the next fold without a new injection is quiet.
+    const runs = uncoveredHistoryRuns({ core: ctx.core, messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 100000 });
+    const next = runs.find((r) => r.tokens >= 1000);
+    assert.ok(next, "a residual run remains");
+    setOffer(ctx, [offerRange(next.startRef, next.endRef, next.count)]);
+    const out4 = runApply(ctx, foldArgs([next]));
+    assert.ok(out4.startsWith("[Compressed"), `fold 4: ${out4.slice(0, 160)}`);
+    assert.ok(!out4.includes(UNCOVERED_HEADER), "no new injection: quiet again:\n" + out4);
+});

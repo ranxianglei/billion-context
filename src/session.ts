@@ -714,11 +714,14 @@ export type Session = {
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
     /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
-     *  receipt note has already fired in this session. Once per session, never
-     *  re-nagged: repeating the note after every successful fold drove models
-     *  into an infinite compress→note loop. The same detail stays available on
-     *  demand via acp_status(scope:"uncompressed"). Lost on restart (at most
-     *  one extra note). */
+     *  receipt note has already fired in the current nudge-injection cycle.
+     *  The note fires once per cycle — repeating it after every successful
+     *  fold drove models into an infinite compress→note loop (#6522). Each
+     *  ACTUAL nudge injection (nudgeOutcome === "injected", stamped in
+     *  src/server/handle.ts) re-opens the latch: a fresh nudge is a new
+     *  "big enough, compress while you are at it" moment. The same detail
+     *  stays available on demand via acp_status(scope:"uncompressed").
+     *  Lost on restart (at most one extra note). */
     uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its

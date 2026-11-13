@@ -703,14 +703,18 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
-                // #6522 anti-nag latch: notify at most ONCE per session. Re-emitting
+                // #6522 anti-nag latch: notify at most ONCE per nudge-injection cycle. Re-emitting
                 // the note after every subsequent successful fold drove models into
                 // an infinite compress→note→compress loop — as the session grows the
                 // newly offered ranges sit INSIDE the big uncovered tail run, so each
                 // fold split/shrunk a run and a span-level "changed set" check still
-                // re-fired. The note is advisory and the same detail stays available
+                // re-fired. The latch is set on the first qualifying receipt.
+                // The note is advisory and the same detail stays available
                 // on demand via acp_status(scope:"uncompressed") (read-only, no gate),
-                // so one notice per session is enough. Restart resets the latch
+                // so one notice per cycle is enough. Each ACTUAL nudge injection
+                // (src/server/handle.ts, nudgeOutcome === "injected") re-opens the
+                // latch: a fresh nudge means the context grew big enough again, a
+                // new compress-while-you-are-at-it moment. Restart resets the latch
                 // (in-memory field) — at most one extra note.
                 if (!ctx.session.uncoveredReceiptNoted) {
                     ctx.session.uncoveredReceiptNoted = true;
