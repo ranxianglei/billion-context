@@ -3978,7 +3978,6 @@ export async function pipePluginChatWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
-<<<<<<< HEAD
             // #5293: the partial output of an aborted turn never reports usage — record the pre-abort anchor so the first nudge decision after resume can absorb that debt.
             if (session) noteAbortedTurn(session);
             // A terminal already arrived before the client left: the reply is
@@ -5018,7 +5017,6 @@ export async function pipePluginResponsesWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
-<<<<<<< HEAD
             // #5293: same as the chat lane — record the pre-abort anchor for the post-resume re-anchor.
             if (session) noteAbortedTurn(session);
             // Completed turn, dead socket: keep the reply for the handoff render.
