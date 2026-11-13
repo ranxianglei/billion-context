@@ -369,6 +369,7 @@
 | `compat` | { roles?, dropFields? } | {} | — | 逐路由线上兼容覆盖；provider 条目按键级覆盖全局；dropFields 加法并集。 |
 | `direct` | boolean | false | — | 客户端侧豁免：该上游流量完全不指向 bili。 |
 | `passthrough` | boolean | false | — | 路由级逐字节透传、无会话状态——面向反作弊上游。 |
+| `renderNone` | boolean | unset (follows diagnostics.renderNone) | — | 路由级渲染标记：true 时本路由历史不渲染 ACP 标签，false 强制开启（#2483）。 |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (→ pixels) | — | 本路由图片 token 计费口径；bytes 为字节中继的显式指定。 |
 | `imageTokenCap` | number | unset (uncapped) | — | 本路由单张图片 token 成本上限。 |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | 按路由覆盖全局 resign 映射（第 2 级，最深层胜出）。 |

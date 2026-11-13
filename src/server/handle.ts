@@ -65,7 +65,7 @@ import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, withRouteRenderNone, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -1065,6 +1065,9 @@ async function handleRequest(
     // requests whose upstream URL matches a provider route with
     // `passthrough: true` (upstreams that fingerprint the request body).
     const routePassthrough = !opts.passthrough && findRoute(opts.routes, providerDestUrl)?.passthrough === true;
+    // #2483: route-scoped render tags (`providers[<url>].renderNone`), applied
+    // around every prepare of this request (incl. compress-loop rebuilds).
+    const routeRenderNone = findRoute(opts.routes, providerDestUrl)?.renderNone;
     if (routePassthrough && hopMarker === undefined && protocol && parsed) {
         log("info", `[route-passthrough] ${maskUrlsInText(providerDestUrl)} matches a passthrough route — forwarding verbatim, kernel bypassed`);
     }
@@ -3054,7 +3057,7 @@ async function handleRequest(
                 // #1295: stamp the envelope meta onto every Prepared for this
                 // request (initial AND preflight re-prepares both flow through).
                 const runPrepare = async (): Promise<Prepared> => {
-                    const p = await runPrepareInner();
+                    const p = await withRouteRenderNone(routeRenderNone, runPrepareInner);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     return p;
                 };

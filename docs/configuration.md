@@ -369,6 +369,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compat` | { roles?, dropFields? } | {} | — | Per-route wire-compat overrides; provider entries beat the global block per key; dropFields union additively. |
 | `direct` | boolean | false | — | Client-side exemption: traffic for this upstream is never pointed at bili at all. |
 | `passthrough` | boolean | false | — | Route-scoped byte-for-byte relay with no session state — for anti-fraud upstreams. |
+| `renderNone` | boolean | unset (follows diagnostics.renderNone) | — | Route-scoped render tags: true renders no ACP tags into this route's history, false forces them on (#2483). |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (→ pixels) | — | Image-token counting basis for this route; bytes is an explicit opt-in for byte relays. |
 | `imageTokenCap` | number | unset (uncapped) | — | Per-image token cost cap for this route. |
 | `resign` | scheme → { enabled?, passthrough?, credentialRef? } | {} (global map applies) | — | Per-route overrides of the global resign map (level 2, deepest wins). |

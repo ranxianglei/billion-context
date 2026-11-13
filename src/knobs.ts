@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 // #2030: canonical home for runtime knobs. Every knob resolves
 // env var > config file > default:
 //  - the ENV tier is byte-exact with the historical parsing (deployments and
@@ -863,10 +864,26 @@ export function dumpGcMaxAgeMs(): number | null {
     return null;
 }
 
-/** ACP_RENDER_NONE > diagnostics.renderNone > false (any non-empty env value enables). */
+/** #2483: request-scoped render override from the matched provider route
+ *  (`providers[<url>].renderNone`). Set by the request handler around the
+ *  prepare pipeline so every render-strategy reader (prepare-*, inject,
+ *  count_tokens, the compress-loop rebuild) agrees for that request. */
+const routeRender = new AsyncLocalStorage<{ renderNone: boolean }>();
+
+/** Run `fn` with the route's renderNone in scope; undefined = no route override. */
+export function withRouteRenderNone<T>(value: boolean | undefined, fn: () => T): T {
+    return value === undefined ? fn() : routeRender.run({ renderNone: value }, fn);
+}
+
+/** ACP_RENDER_NONE > providers[<url>].renderNone > diagnostics.renderNone > false
+ *  (any non-empty env value enables). The route value wins over the global
+ *  file flag in either direction, so one lane can opt in (a stateful
+ *  claude-code relay such as magpie) or out while the rest keep the default. */
 export function renderNone(): boolean {
     const envRaw = process.env.ACP_RENDER_NONE;
     if (envRaw !== undefined) return envRaw.length > 0;
+    const route = routeRender.getStore();
+    if (route !== undefined) return route.renderNone;
     return fileDiag().renderNone === true;
 }
 
