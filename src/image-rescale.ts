@@ -150,7 +150,7 @@ async function rescaleImage(mediaType: string, b64: string, maxDim: number): Pro
     const dims = decodeImageDims(b64);
     const gated = (dims !== undefined && Math.max(dims.w, dims.h) > maxDim) || origBytes > RESCALE_TRIGGER_BYTES;
     if (!gated) return null;
-    const hash = createHash("sha256").update(b64, "utf8").digest("hex");
+    const hash = createHash("sha256").update(`${mime}:${maxDim}:${b64}`, "utf8").digest("hex");
     let pending = encodeCache.get(hash);
     const cacheHit = pending !== undefined;
     if (!pending) {
