@@ -30,6 +30,7 @@ import {
     markSnapPlaneDead,
     readSnapView,
     snapGcCoveredRows,
+    snapL1EnvelopeRead,
     snapL1Record,
     snapR3LatchedRead,
     snapR3LatchWrite,
@@ -39,6 +40,7 @@ import {
     type SnapEvent,
     type SnapView,
 } from "./snap.js";
+import { parseEnvelope } from "../snapshot/identity.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
@@ -1639,6 +1641,38 @@ export class UnifiedStore {
         // plane's tagged forms).
         const view = input.planeMessages;
         const tagged = Array.isArray(view) && view.length > 0;
+        // #6181 B4 (stack on the #5901 head with #6326 durability-before-render):
+        // an UNTAGGED save against a sid that already holds active plane rows
+        // can only update the plane when its ledger-id view EXTENDS the
+        // stage-0 world: stage0Decide writes the l1 envelope and declares the
+        // new positions, but the ROWS for those positions land at the NEXT
+        // save — and for a pinned cohort that next save is often an untagged
+        // one (#6326's ingestRowsNow persists before render). So:
+        //   • view ids ⊇ envelope ids (prefix-identical) → ALLOW: the legacy
+        //     diff materializes the declared rows (ids agree, idempotent);
+        //   • anything else is STALE w.r.t. the pinned world — re-derived
+        //     kernel ids (h_…), a pre-turn transcript, a compaction — and the
+        //     legacy diff could only delete/re-home the pinned rows (the R2
+        //     doctrine: the tagged plane is addressable from tagged views
+        //     only) → SKIP the plane; the disk record still lands (the
+        //     #6326 durability win survives) and the plane is updated by the
+        //     next TAGGED save or a stage-0 resync (one-round convergence).
+        // MUST run before the transaction — after it the destructive legacy
+        // diff is already committed.
+        if (!tagged && (input.planeMessages ?? []).length === 0) {
+            const anyRow = (snapRowsAll(this.db, sid) ?? []).some((r) => r.active === 1);
+            if (anyRow) {
+                const env = snapL1EnvelopeRead(this.db, sessRaw);
+                const envIds =
+                    env && env.envelopeJson !== null
+                        ? parseEnvelope(env.envelopeJson).envelope.map((e) => e.id)
+                        : [];
+                const viewIds = input.messages.map((m) => m.msgId);
+                const extendsEnvelope =
+                    viewIds.length >= envIds.length && envIds.every((id, i) => viewIds[i] === id);
+                if (!extendsEnvelope) return;
+            }
+        }
         try {
             const out = this.db.transaction(() => {
                 const l1 = snapL1Record(this.db, sessRaw, sid, witness, now);
