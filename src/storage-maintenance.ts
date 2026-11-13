@@ -140,7 +140,12 @@ async function runRm(store: SessionStore, target: string | undefined, json: bool
         }
     }
     const dbAfter = indexDbSize(store.dir);
-    const dbRowsReleased = stats ? Object.values(stats.rows).reduce((a, b) => a + b, 0) : null;
+    let dbRowsReleased: number | null = null;
+    if (stats) {
+        // pinnedCheckpoints is a subset of checkpoints, and those rows survive.
+        const { pinnedCheckpoints, ...rowCounts } = stats.rows;
+        dbRowsReleased = Object.values(rowCounts).reduce((a, b) => a + b, 0) - pinnedCheckpoints + stats.casExclusiveBlobs;
+    }
     const dbBytesReleased = stats ? stats.inlineBytes + stats.casExclusiveBytes : null;
     const data = { id: target, filesRemoved: files, dbRowsReleased, dbBytesReleased, indexDbBefore: dbBefore, indexDbAfter: dbAfter, vacuumed, vacuumNote };
     if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };

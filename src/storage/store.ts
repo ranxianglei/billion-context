@@ -286,12 +286,13 @@ export interface CheckpointRow {
 }
 
 /** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
- *  CAS bytes are split by ownership so the number is honest: only refcount-1
- *  blobs die with this session (they are attributed to it); shared blobs are
- *  counted but never double-attributed, because they outlive any single
- *  session's deletion. */
+ *  CAS ownership follows the references deleteSession releases: several
+ *  references within one session can own one blob, while a pinned checkpoint
+ *  retains its reference even after that session is removed. */
 export interface SessionStorageStats {
     rows: {
+        sessions: number;
+        conversations: number;
         messages: number;
         media: number;
         blocks: number;
@@ -306,11 +307,11 @@ export interface SessionStorageStats {
      *  record + blocks payload_json + session_ext value_json) — everything
      *  except the content-addressed blobs. */
     inlineBytes: number;
-    /** CAS blob bytes this session references at refcount = 1 (freed when it
-     *  is deleted). */
+    /** CAS payload bytes whose last references are released by deletion. */
     casExclusiveBytes: number;
-    /** CAS blobs this session references that other sessions also hold
-     *  (refcount > 1) — they survive the deletion. */
+    /** Number of the distinct CAS rows represented by casExclusiveBytes. */
+    casExclusiveBlobs: number;
+    /** Referenced CAS blobs retained by other sessions or pinned checkpoints. */
     casSharedBlobs: number;
 }
 
@@ -1908,12 +1909,14 @@ export class UnifiedStore {
 
     /** #3928: per-session storage footprint for `bili sessions ls`. Counts
      *  never cascade into each other: inline bytes cover only JSON columns,
-     *  CAS bytes only content-addressed blobs; the CAS split by refcount
-     *  mirrors exactly what deleteSession frees. */
+     *  CAS bytes only content-addressed blobs; the CAS split compares the
+     *  global refcount with this deletion's per-hash release count. */
     sessionStorageStats(sessionId: string): SessionStorageStats {
         const counts = this.db
             .prepare(
                 "SELECT " +
+                    "(SELECT COUNT(*) FROM sessions WHERE session_id = ?) AS sessions, " +
+                    "(SELECT COUNT(*) FROM conversations WHERE session_id = ?) AS conversations, " +
                     "(SELECT COUNT(*) FROM messages WHERE session_id = ?) AS messages, " +
                     "(SELECT COUNT(*) FROM message_media WHERE session_id = ?) AS media, " +
                     "(SELECT COUNT(*) FROM blocks WHERE session_id = ?) AS blocks, " +
@@ -1924,40 +1927,47 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            sessions: number; conversations: number;
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
         };
         const inlineBytes =
             ((this.db
                 .prepare(
-                    "SELECT COALESCE(SUM(LENGTH(meta_json)), 0) + COALESCE(SUM(LENGTH(stats_json)), 0) " +
-                        "+ COALESCE(SUM(LENGTH(metadata_json)), 0) + COALESCE(SUM(LENGTH(kstate_json)), 0) " +
-                        "+ COALESCE(SUM(LENGTH(tail_json)), 0) + COALESCE(LENGTH(ccr_json), 0) AS b " +
+                    "SELECT COALESCE(SUM(LENGTH(CAST(meta_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(stats_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(metadata_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(kstate_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(tail_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(ccr_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(orphans_json AS BLOB))), 0) AS b " +
                         "FROM sessions WHERE session_id = ?",
                 )
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
-                .prepare("SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS b FROM blocks WHERE session_id = ?")
+                .prepare("SELECT COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0) AS b FROM blocks WHERE session_id = ?")
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
-                .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .prepare("SELECT COALESCE(SUM(LENGTH(CAST(value_json AS BLOB))), 0) AS b FROM session_ext WHERE session_id = ?")
                 .get(sessionId) as { b: number }).b ?? 0);
         const cas = this.db
             .prepare(
-                "SELECT COALESCE(SUM(CASE WHEN refcount = 1 THEN byte_len ELSE 0 END), 0) AS exclusiveBytes, " +
-                    "COALESCE(SUM(CASE WHEN refcount > 1 THEN 1 ELSE 0 END), 0) AS sharedBlobs " +
-                    "FROM content WHERE hash IN (" +
-                    "SELECT content_hash FROM messages WHERE session_id = ? " +
-                    "UNION SELECT media_hash FROM message_media WHERE session_id = ? " +
-                    "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
-                    "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
-                    "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
-                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+                `WITH owned_refs(hash, released) AS (
+                    SELECT content_hash, 1 FROM messages WHERE session_id = ?
+                    UNION ALL SELECT media_hash, 1 FROM message_media WHERE session_id = ?
+                    UNION ALL SELECT summary_hash, 1 FROM blocks WHERE session_id = ?
+                    UNION ALL SELECT one_hash, 1 FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL
+                    UNION ALL SELECT content_hash, 1 FROM ccr_entries WHERE session_id = ?
+                    UNION ALL SELECT state_hash, CASE WHEN pinned = 0 THEN 1 ELSE 0 END FROM checkpoints WHERE session_id = ?
+                 ), releases AS (SELECT hash, SUM(released) AS n FROM owned_refs GROUP BY hash)
+                 SELECT COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN c.byte_len ELSE 0 END), 0) AS exclusiveBytes,
+                        COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN 1 ELSE 0 END), 0) AS exclusiveBlobs,
+                        COALESCE(SUM(CASE WHEN c.refcount > r.n THEN 1 ELSE 0 END), 0) AS sharedBlobs
+                   FROM releases r JOIN content c ON c.hash = r.hash`,
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
         return {
             rows: {
+                sessions: counts.sessions,
+                conversations: counts.conversations,
                 messages: counts.messages,
                 media: counts.media,
                 blocks: counts.blocks,
@@ -1970,6 +1980,7 @@ export class UnifiedStore {
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,
+            casExclusiveBlobs: cas.exclusiveBlobs,
             casSharedBlobs: cas.sharedBlobs,
         };
     }
