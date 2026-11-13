@@ -658,7 +658,8 @@ export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key",
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
         if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
@@ -677,12 +678,18 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
                 // per request. The STABLE credential on that line is the
                 // Access key id — fingerprint only that.
                 const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 

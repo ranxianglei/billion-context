@@ -175,6 +175,41 @@ class UpstreamRecorder {
         }
     }
 
+    /** The fake's token bill must sit on the SAME scale as a real tokenizer
+     *  (the text the model reads + tool schemas, ÷4) — NOT on whole-body bytes:
+     *  the wire envelope/JSON structure is ~2x the core text here, so bytes/4
+     *  billing taught the per-route calibration factor (#1933) a false k̂≈1.9,
+     *  and the post-#4933 zero-fold fit verdict (calibrated scale) put the pi
+     *  lane's post-restart baseline ~120 tokens OVER its 12288 wall — a false
+     *  413 on a payload a consistently-billing upstream would accept.
+     *  Scale-matched billing keeps k̂≈1, so the calibrated and raw meters agree,
+     *  as on real routes. The bill is the WHOLE prompt; the anthropic branch
+     *  must then emit it as a DISJOINT partition (input_tokens = uncached
+     *  remainder, cache_read = cached prefix) because promptInputTotal sums
+     *  the two — reporting the full bill in BOTH fields double-counts the
+     *  cached prefix (the pre-fix failure mode above). OpenAI's prompt_tokens
+     *  is inclusive of cached_tokens, so that branch reports the full bill. */
+    static billedTokens(body: string): number {
+        try {
+            const j = JSON.parse(body) as Record<string, unknown>;
+            const text: unknown[] = [];
+            if (j.system !== undefined) text.push(j.system);
+            if (j.instructions !== undefined) text.push(j.instructions);
+            if (Array.isArray(j.messages)) text.push(j.messages);
+            let chars = 0;
+            const walk = (c: unknown): void => {
+                if (typeof c === "string") { chars += c.length; }
+                else if (Array.isArray(c)) { for (const x of c) walk(x); }
+                else if (c && typeof c === "object") { for (const v of Object.values(c)) walk(v); }
+            };
+            for (const t of text) walk(t);
+            chars += JSON.stringify(j.tools ?? []).length;
+            return Math.max(1, Math.ceil(chars / 4));
+        } catch {
+            return Math.max(1, Math.ceil(Buffer.byteLength(body, "utf8") / 4));
+        }
+    }
+
     get recPort(): number {
         return this.port;
     }
@@ -232,7 +267,7 @@ class UpstreamRecorder {
             this.hits.push({ url: key, bytes, prompt, lcpPromptBytes, ack });
             const modelMatch = body.match(/"model"\s*:\s*"([^"]+)"/);
             const model = modelMatch?.[1] ?? "unknown";
-            const promptTokens = Math.ceil(bytes / 4);
+            const promptTokens = UpstreamRecorder.billedTokens(body);
             const cachedTokens = Math.floor(lcpPromptBytes / 4);
             const json = key.includes("/messages")
                 ? JSON.stringify({
@@ -243,7 +278,7 @@ class UpstreamRecorder {
                     content: [{ type: "text", text: ack }],
                     stop_reason: "end_turn",
                     stop_sequence: null,
-                    usage: { input_tokens: promptTokens, output_tokens: 4, cache_read_input_tokens: cachedTokens },
+                    usage: { input_tokens: Math.max(0, promptTokens - cachedTokens), output_tokens: 4, cache_read_input_tokens: cachedTokens },
                 })
                 : JSON.stringify({
                     id: `chatcmpl_${seq}`,
