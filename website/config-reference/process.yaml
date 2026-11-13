@@ -482,7 +482,8 @@ entries:
     group: process
     desc_en: "Protocol cohorts allowed to cut the egress source over (#5874 P2); a subset of openai/anthropic/google/responses. Sessions whose protocol is absent keep legacy bytes unconditionally (the plane still shadow-writes for them). An empty/absent array means all four."
     desc_zh: "允许切出站源的协议 cohort（#5874 P2），取 openai/anthropic/google/responses 的子集。协议不在名单内的会话无条件保留旧字节（平面照常影子写）。空/缺省 = 四个全开。"
-    desc_ja: "egress ソースの切替を許可するプロトコル cohort (#5874 P2); openai/anthropic/google/responses の部分集合。プロトコルがリストにないセッションは無条件で legacy バイトを保持する (プレーンはシャドウライト継続)。空/欠如の配列は 4 つすべてを意味する。"  - key: sessions
+    desc_ja: "egress ソースの切替を許可するプロトコル cohort (#5874 P2); openai/anthropic/google/responses の部分集合。プロトコルがリストにないセッションは無条件で legacy バイトを保持する (プレーンはシャドウライト継続)。空/欠如の配列は 4 つすべてを意味する。"
+  - key: sessions
     type: object
     default: "{} (all defaults)"
     group: process
