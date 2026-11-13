@@ -2201,6 +2201,7 @@ export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     }
     sessions.clear();
     evictedWeights.clear();
+    evictedWeightAt.clear();
 }
 
 export function _sessionsSizeForTest(): number {
