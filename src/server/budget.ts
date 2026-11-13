@@ -218,7 +218,7 @@ function responsesSysDevItemText(item: Record<string, unknown>): string {
     return "";
 }
 
-// #6293: the overhead-exclusive system slice of a Responses body is EXACTLY
+// #6291: the overhead-exclusive system slice of a Responses body is EXACTLY
 // the set the kernel projection hoists OUT of the core view: top-level
 // instructions plus the LEADING run of role=system/developer items. Mid-
 // history sys/dev items land in projection.msgs instead (#4166) and are
@@ -273,7 +273,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
         }
     }
     // responses: instructions ride the projection's systemParts — counted once
-    // by responsesOverheadSystemText below, never here (#6293).
+    // by responsesOverheadSystemText below, never here (#6291).
     const sysRaw = protocol === "google"
         ? googleSystemText(parsed as GoogleRequestBody)
         : protocol === "responses"
@@ -290,7 +290,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     // openai chat: the kernel hoists leading system/developer messages out of
     // the array into the rebuilt body's system field — but raw clients that
     // never went through a rebuild keep them in messages; count both shapes.
-    // #6293: project instead of walking — only the LEADING contiguous prefix
+    // #6291: project instead of walking — only the LEADING contiguous prefix
     // leaves the core view; mid-history system messages are core messages
     // already billed by estimateCoreMessages, so the old all-messages walk
     // double-billed them. Projection failure → legacy walk (fail-closed).
@@ -312,7 +312,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
     // rebuild moves them back into input[] as a developer message while
     // stripping instructions — so the whole system prompt is invisible to
     // estimateCoreMessages AND to the instructions-only read above (#829).
-    // #6293: count exactly that hoisted set via the shared codec — mid-
+    // #6291: count exactly that hoisted set via the shared codec — mid-
     // history sys/dev items are core messages (#4166), not overhead.
     if (protocol === "responses") {
         sysText = responsesOverheadSystemText(parsed);

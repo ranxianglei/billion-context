@@ -16,7 +16,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
-// #6293: estimateWireOverhead walked EVERY role=system/developer item in the
+// #6291: estimateWireOverhead walked EVERY role=system/developer item in the
 // Responses input[] (and every system message in the OpenAI messages[]), but
 // the kernel projections hoist only the LEADING run out of the counted core
 // view — mid-history sys/dev items land in projection.msgs (#4166) and are
@@ -36,12 +36,12 @@ import { rmrf } from "./tmp-rm.ts";
 // cold-start request must forward in ONE upstream call with its history
 // untouched.
 process.env.NODE_ENV = "test";
-const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-r6293-"));
+const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-r6291-"));
 test.after(() => rmrf(testRoot));
 
 const NO_TOOLS = defaultCountTokens(JSON.stringify([])); // "[]" — the zero-tools term
 
-test("#6293: responses mid-history sys/dev stays out of overhead; head + instructions stay in", () => {
+test("#6291: responses mid-history sys/dev stays out of overhead; head + instructions stay in", () => {
     const H = "head developer prompt ".repeat(500);      // leading run → systemParts
     const M = "mid-history developer notice ".repeat(2000); // mid-history → core (#4166)
     const U = "user question ".repeat(400);
@@ -64,7 +64,7 @@ test("#6293: responses mid-history sys/dev stays out of overhead; head + instruc
     assert.ok(core >= defaultCountTokens(M), `mid-history sys/dev must be billed by the core side (core=${core}, M=${defaultCountTokens(M)})`);
 });
 
-test("#6293: responses instructions + leading developer together, mid excluded (#829 kept)", () => {
+test("#6291: responses instructions + leading developer together, mid excluded (#829 kept)", () => {
     const I = "top-level instructions ".repeat(500);
     const H = "leading developer block ".repeat(500);
     const M = "positioned reminder ".repeat(1500);
@@ -81,13 +81,13 @@ test("#6293: responses instructions + leading developer together, mid excluded (
     assert.equal(oh, defaultCountTokens(`${I}\n${H}`) + NO_TOOLS, `instructions + head dev counted once each (got ${oh})`);
 });
 
-test("#6293: responses string input + instructions unchanged", () => {
+test("#6291: responses string input + instructions unchanged", () => {
     const I = "instructions payload ".repeat(300);
     const oh = estimateWireOverhead("responses", JSON.stringify({ instructions: I, input: "just a string" }));
     assert.equal(oh, defaultCountTokens(I) + NO_TOOLS, `string-input shortcut keeps counting instructions (got ${oh})`);
 });
 
-test("#6293: responses projection failure → legacy all-sys/dev walk (fail-closed, no crash)", () => {
+test("#6291: responses projection failure → legacy all-sys/dev walk (fail-closed, no crash)", () => {
     const M = "fallback reminder ".repeat(800);
     // A null item makes responsesToCore throw (normalizeEasyInputItem reads
     // item.type); the legacy walk must still bill the developer item. Pre-fix
@@ -97,7 +97,7 @@ test("#6293: responses projection failure → legacy all-sys/dev walk (fail-clos
     assert.equal(oh, defaultCountTokens(M) + NO_TOOLS, `fallback walk bills the sys/dev item (got ${oh})`);
 });
 
-test("#6293: openai mid-history system stays out of overhead; leading prefix stays in", () => {
+test("#6291: openai mid-history system stays out of overhead; leading prefix stays in", () => {
     const S = "leading system prompt ".repeat(500);
     const M = "mid-history system note ".repeat(2000);
     const body = JSON.stringify({
@@ -113,7 +113,7 @@ test("#6293: openai mid-history system stays out of overhead; leading prefix sta
     assert.equal(oh, defaultCountTokens(S) + NO_TOOLS, `only the leading contiguous prefix is overhead (got ${oh})`);
 });
 
-test("#6293: openai top-level system field AND leading message both counted", () => {
+test("#6291: openai top-level system field AND leading message both counted", () => {
     const T = "top-level system field ".repeat(300);
     const S = "leading system message ".repeat(300);
     const body = JSON.stringify({ system: T, messages: [{ role: "system", content: S }, { role: "user", content: "u" }] });
@@ -121,7 +121,7 @@ test("#6293: openai top-level system field AND leading message both counted", ()
     assert.equal(oh, defaultCountTokens(`${T}\n${S}`) + NO_TOOLS, `both shapes summed (got ${oh})`);
 });
 
-test("#6293: openai structured-content leading system now counted (was silently dropped)", () => {
+test("#6291: openai structured-content leading system now counted (was silently dropped)", () => {
     const P = "structured system part ".repeat(400);
     const body = JSON.stringify({
         messages: [
@@ -281,7 +281,7 @@ async function coldStartConv(h: Harness, conv: string): Promise<number> {
     return limit;
 }
 
-test("#6293: fitting cold-start request forwards once — no spurious preflight compression", async () => {
+test("#6291: fitting cold-start request forwards once — no spurious preflight compression", async () => {
     const root = fs.mkdtempSync(path.join(testRoot, "e2e-"));
     try {
         for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
@@ -290,7 +290,7 @@ test("#6293: fitting cold-start request forwards once — no spurious preflight 
         _setStoreForTest(new SessionStore({ enabled: false }));
 
         const h = await startHarness();
-        const conv = "conv-6293-e2e";
+        const conv = "conv-6291-e2e";
         try {
             const L = await coldStartConv(h, conv);
 
@@ -348,7 +348,7 @@ test("#6293: fitting cold-start request forwards once — no spurious preflight 
 // a genuinely over-window cold-start request DOES fold (extra upstream calls
 // for the summary rounds) before forwarding. Without this, the single-call
 // assertion above could pass vacuously if some gate skipped preflight outright.
-test("#6293 control: an over-window cold-start request still triggers preflight compression", async () => {
+test("#6291 control: an over-window cold-start request still triggers preflight compression", async () => {
     const root = fs.mkdtempSync(path.join(testRoot, "control-"));
     try {
         for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = root;
@@ -357,7 +357,7 @@ test("#6293 control: an over-window cold-start request still triggers preflight 
         _setStoreForTest(new SessionStore({ enabled: false }));
 
         const h = await startHarness();
-        const conv = "conv-6293-control";
+        const conv = "conv-6291-control";
         try {
             const L = await coldStartConv(h, conv);
             // Six foldable user/assistant pairs at ~15% of the limit each —
