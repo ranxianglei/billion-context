@@ -1448,7 +1448,9 @@ export async function* runCompressLoop(
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result.text);                        }
+                            yield adapter.emitMarker(call.name, result.text);
+                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
+                        }
                     }
                 } else {
                     realToolCalls.push(call);

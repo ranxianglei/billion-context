@@ -34,7 +34,10 @@ test("precomputed wire metadata matches raw-buffer snapshot evidence across wire
         { wire: { messages: null, input: "fallback" }, comparable: true },
         { wire: { messages: [{ content: [{ type: "image", source: {} }] }], input: "ignored" }, comparable: false },
         { wire: { messages: [{ content: [{ type: "tool_use", input: { type: "image" } }] }] }, comparable: true },
-        { wire: { messages: [{ content: [{ type: "thinking", thinking: "signed" }] }] }, comparable: false },
+        // #4266 (landed after this PR's base): a payload-bearing thinking block projects to a
+        // named reasoning message whose text carries the wire bytes — comparable by view.
+        // Only payload-less thinking stays non-comparable (fail-closed).
+        { wire: { messages: [{ content: [{ type: "thinking", thinking: "signed" }] }] }, comparable: true },
         { wire: { messages: [{ content: "text", audio: {} }] }, comparable: false },
         { wire: null, comparable: false },
         { wire: 42, comparable: false },

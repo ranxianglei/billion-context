@@ -83,6 +83,7 @@ for (const scenario of ["success", "refold", "declined", "throwing", "rejected"]
                 },
                 undefined,
                 undefined,
+                undefined,
                 () => { releaseCount++; trace.push("release"); released.resolve(); },
             ).then(() => { forwardCompleted = true; completed.resolve(); }, error => { res.destroy(); completed.reject(error); });
         });
