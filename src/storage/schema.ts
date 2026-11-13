@@ -63,7 +63,27 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-const STORAGE_SCHEMA_VERSION = 8;
+//      - v10: immutable per-message local time-of-occurrence (#4313) —
+//        messages gains nullable `ts` (epoch ms, stamped once at ingest,
+//        never updated). No backfill: pre-feature rows stay NULL and keep
+//        rendering without the tag's time attribute. Same both-directions
+//        compatibility as v5 (older build ignores, newer build ALTERs).
+//      - v11: FK child indexes on content.hash (#5539) — every column that
+//        REFERENCES content(hash) gains its own index: messages(content_hash),
+//        blocks(one_hash), blocks(summary_hash), ccr_entries(content_hash),
+//        message_media(media_hash), checkpoints(state_hash). With
+//        foreign_keys=ON, deleting a parent content row must prove no child
+//        row still references it; without an index on the child column
+//        SQLite full-scans the whole child table once PER deleted parent row.
+//        releaseContent() removes one parent per released hash (~3K/turn on a
+//        busy session), so every turn paid ~3K × 6 full scans — field report
+//        #5539: 20–35 s/turn at ~18K messages, 4–5 s after adding the five
+//        child indexes he listed (checkpoints.state_hash is this fix's sixth,
+//        same mechanism, missed by the field audit). Same idempotent-CREATE
+//        discipline as v9 (#4796); building them once costs about what
+//        open-time quick_check pays on EVERY open (#4175). Additive-only: an
+//        older build opening a v11 file ignores the extra indexes.
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -82,16 +102,22 @@ export const WAL_JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024;
  *  short-lived openers (export fast path) and tests apply. */
 export function storagePragmas(walJournalSizeLimitBytes: number): string[] {
     return [
+        // #3901/#3463: with auto_vacuum=INCREMENTAL, freed pages can be handed
+        // back to the filesystem by `PRAGMA incremental_vacuum`
+        // (gc({vacuum:"incremental"})) without the offline full rewrite.
+        // MUST stay FIRST: SQLite only honours auto_vacuum while the database
+        // file is still empty, and switching to WAL already writes page 1 —
+        // set after journal_mode, a brand-new index.db silently stays at
+        // auto_vacuum=0 and incremental_vacuum reclaims nothing. On an
+        // existing file the pragma only arms the mode for this connection's
+        // next full VACUUM: a database created with auto_vacuum=0 keeps that
+        // layout until a one-time gc({vacuum:"full"}) / ?vacuum=full.
+        "PRAGMA auto_vacuum = INCREMENTAL",
         "PRAGMA journal_mode = WAL",
         "PRAGMA synchronous = NORMAL",
         "PRAGMA busy_timeout = 5000",
         "PRAGMA foreign_keys = ON",
         `PRAGMA journal_size_limit = ${walJournalSizeLimitBytes}`,
-        // #3901/#3463: freed pages return to the pool incrementally so an
-        // archive/GC sweep actually shrinks the file going forward. Databases
-        // created before this pragma keep their original layout until a
-        // one-time full VACUUM (gc({vacuum:"full"}) / ?vacuum=full).
-        "PRAGMA auto_vacuum = INCREMENTAL",
     ];
 }
 
@@ -144,6 +170,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash    TEXT NOT NULL REFERENCES content(hash),
     identity        TEXT NOT NULL DEFAULT '',
     retired_at      INTEGER,
+    ts              INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -271,6 +298,17 @@ CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_dead_refs_session ON dead_refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_refs_session ON refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, created_at);
+-- FK child indexes (#5539): with foreign_keys=ON, every DELETE from the
+-- content parent proves no child row still references it by scanning each
+-- child table UNLESS the child's ref column is indexed. releaseContent()
+-- removes one parent per released hash (~3K/turn), so unindexed = ~3K × 6
+-- full scans per turn (field: 20–35 s/turn at ~18K messages).
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
+CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
+CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -369,6 +407,41 @@ export function migrateSchema(db: {
             // migration and re-OMM'd: permanently unopenable stores (#4677).
             needV8Backfill = true;
         }
+        if (from < 9) {
+            // v9 zero-ref collection index (#4796): gc()'s sweep and the
+            // dry-run count address content BY refcount — without this index
+            // every run full-scans the CAS table. Field report: 766K rows /
+            // ~20 GB, one uncommitted `DELETE ... WHERE refcount <= 0` ran
+            // 8 hours with zero committed rows, its WAL frames could never
+            // checkpoint, and the held write lock starved live proxies. The
+            // index makes candidate selection an index range scan; building
+            // it once on an already-bloated db costs about what open-time
+            // quick_check pays on EVERY open (#4175). Idempotent CREATE so a
+            // dev-window lib that already carried it re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
+        }
+        if (from < 10) {
+            // v10 (#4313): immutable message wall-clock stamp. Nullable, no
+            // backfill — pre-feature rows read NULL and render without the
+            // time attribute (legacy bytes unchanged). Probe-first like v8.
+            const tsCols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!tsCols.includes("ts")) {
+                db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
+            }
+        }
+        if (from < 11) {
+            // v11 (#5539): FK child indexes on content.hash — see the header
+            // note and the DDL comment above for the mechanism and field
+            // evidence. Idempotent CREATEs, same discipline as v9; a
+            // dev-window lib that already carried them re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
+        }
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
@@ -415,7 +488,7 @@ function migrateV8Identities(db: {
             "WHERE m.session_id = ? AND m.identity = '' AND m.seq > ? ORDER BY m.seq LIMIT ?",
     );
     const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
-    const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ?");
+    const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0");
     const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
     const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
     const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
@@ -456,7 +529,9 @@ function migrateV8Identities(db: {
             // One transaction per session: keepers get their identity, the later
             // duplicates hand their media mappings + message rows + CAS refs back
             // (delete referencing rows FIRST — the #4242 discipline; refcount may
-            // reach 0, the next gc run collects those content rows).
+            // reach 0, the next gc run collects those content rows). The > 0
+            // floor on decRef mirrors the releaseContent guards so an
+            // already-corrupt ledger cannot go negative during migration.
             db.transaction(() => {
                 for (const u of updates) upd.run(u.identity, s.session_id, u.seq);
                 for (const d of drops) {

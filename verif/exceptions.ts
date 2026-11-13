@@ -33,6 +33,12 @@ export const EXCLUDED_FUNCTIONS: readonly ExcludedFunction[] = [
     reason:
       "Optional BPE tokenizer probe: node require + returned closures. Never on a verified path — CompressionCore takes countTokens as an injectable port and the verified entry points use defaultCountTokens (pure arithmetic).",
   },
+  {
+    file: "kernel/src/render-refs.ts",
+    fn: "formatTagTime",
+    reason:
+      "#4313: displays a PERSISTED epoch-ms value as a fixed-width local wall-clock string for the <acp> tag's time attribute. Pure formatting of an already-stored number (no read of now); its byte output depends on the process TZ, which the solver cannot model. Same treatment class as createdAt above: the timestamp itself stays an unconstrained symbolic integer, so every cache/coverage invariant holds independently of the displayed digits. Rendering properties are pinned by kernel/tests/issue4313-message-timestamps.test.ts.",
+  },
 ];
 
 export const EXCEPTIONS: readonly SubsetException[] = [
@@ -48,6 +54,14 @@ export const EXCEPTIONS: readonly SubsetException[] = [
     fn: "applySingleRange",
     reason:
       "createdAt: Date.now() — wall-clock stamp on new blocks; orthogonal to every verified invariant, modeled as an unconstrained symbolic integer.",
+  },
+  {
+    file: "kernel/src/compress.ts",
+    code: "ENV_ACCESS",
+    fn: "run",
+    detail: "Date.now",
+    reason:
+      "#4313: first-sight message ts minted once per id (state.tsStamps, never overwritten). Wall-clock input only — the same stored value renders byte-identically forever, so no verified cache/coverage invariant reads this call's result. Same treatment class as createdAt above.",
   },
   {
     file: "kernel/src/compress.ts",
