@@ -351,7 +351,12 @@ async function forwardCaptured(
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     const hostOwnsTruncationRecovery = req.headers[BILI_HOST_RECOVERY_OWNER_HEADER] === BILI_HOST_RECOVERY_OWNER_OMP;
-    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;    // E2: a codex native-compaction request intercepted in prepare() carries a
+    // #4861: persistence answers "did the upstream turn finish?", not "is the
+// client socket still open?" — a client that hangs up on the terminal frame
+// (pi's shape) must not lose the finished reply. Partial turns (no terminal)
+// are still never captured.
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
+    // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
         onWireBody?.();        releaseRequestInput?.();        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);

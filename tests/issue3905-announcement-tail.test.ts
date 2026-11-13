@@ -200,8 +200,12 @@ test("#3905 chat: an announcement RETRY degenerates into the in-band error (#870
     const refetch = () => Promise.resolve(streamOf(announceTurn()));
     await pipePluginChatWithStrip(streamOf(announceTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
     const text = out.join("");
+    // #5958 (771d5d908, landed after this PR's base): the double-degenerate
+    // terminal is shaped by compat.streamErrorShape, default "protocol" → a
+    // native error frame ("stream_error") instead of the legacy in-band
+    // "[ACP] stream error" completion shape. The client is told either way.
     assert.ok(
-        text.includes("[ACP] stream error"),
+        text.includes("stream_error") && text.includes("degenerated again"),
         "the client is told, rather than left with a second silent announcement",
     );
 });
