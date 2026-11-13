@@ -329,9 +329,12 @@ test("#6291: fitting cold-start request forwards once — no spurious preflight 
             assert.equal((sent as Item[])[3]?.role, "developer", "mid-history developer item preserved at position");
             // The proxy stamps re-sent history with an ACP tag line (KDD #2) —
             // strip that single prefix line, then the item text must be M verbatim.
+            // The time="..." attribute exists only when messageTimestamps is on
+            // (#4313): the suite pins it OFF (tests/preload-test-env.mjs) while a
+            // standalone run gets the production default ON — tolerate both.
             const sent3 = (sent as Item[])[3]?.content as string;
             const stripped = sent3.replace(
-                /^\x3cacp tokens="[^"]*" type="[^"]*" time="[^"]*"\x3em\d+\x3c\/acp\x3e\n/,
+                /^\x3cacp tokens="[^"]*" type="[^"]*"( time="[^"]*")?\x3em\d+\x3c\/acp\x3e\n/,
                 "",
             );
             assert.equal(stripped, M, "mid-history developer item text byte-intact (minus the ACP tag line)");
