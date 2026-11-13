@@ -77,7 +77,7 @@ if (JSON.stringify(ledgerSlugs) !== JSON.stringify(zhSlugs)) fail('hub ledger mi
 
 const pageDir = join(hubDir, 'architecture');
 const pageFiles = existsSync(pageDir) ? readdirSync(pageDir).filter((f) => f.endsWith('.md')) : [];
-const pageSlugs = new Set(pageFiles.map((f) => f.replace(/\.zh-CN\.md$/, '').replace(/\.md$/, '')));
+const pageSlugs = new Set(pageFiles.map((f) => f.replace(/\.zh-CN\.md$/, '').replace(/\.ja\.md$/, '').replace(/\.md$/, '')));
 for (const slug of activeSlugs) {
   for (const f of [`architecture/${slug}.md`, `architecture/${slug}.zh-CN.md`]) {
     if (!existsSync(join(hubDir, f))) fail(`ledger says ${slug} is active but docs/${f} is missing`);
@@ -85,6 +85,24 @@ for (const slug of activeSlugs) {
 }
 for (const slug of pageSlugs) {
   if (!ledgerSlugs.includes(slug)) fail(`orphan module page (not in hub ledger): docs/architecture/${slug}.md`);
+}
+// ja pages are optional until the hub exists; once docs/architecture.ja.md is in the tree the ja set
+// must be complete and locked to the EN ledger (ja mirrors EN, reuses the EN diagrams).
+const hubJaPath = join(hubDir, 'architecture.ja.md');
+if (existsSync(hubJaPath)) {
+  const hubJa = readFileSync(hubJaPath, 'utf8');
+  const jaSlugs = [...hubJa.matchAll(/^\|\s*`([a-z-]+)`\s*\|/gm)].map((m) => m[1]);
+  if (JSON.stringify(ledgerSlugs) !== JSON.stringify(jaSlugs)) fail('hub ledger mismatch between architecture.md and architecture.ja.md');
+  for (const ext of ['svg', 'png']) {
+    const link = `./architecture/assets/architecture-current.en.${ext}`; // ja hub reuses the EN diagram
+    if (!hubJa.includes(`](${link})`)) fail(`docs/architecture.ja.md does not link ${link}`);
+  }
+  for (const slug of activeSlugs) {
+    if (!existsSync(join(pageDir, `${slug}.ja.md`))) fail(`ledger says ${slug} is active but docs/architecture/${slug}.ja.md is missing (ja hub exists, ja set must be complete)`);
+  }
+  for (const slug of pageSlugs) {
+    if (existsSync(join(pageDir, `${slug}.ja.md`)) && !ledgerSlugs.includes(slug)) fail(`orphan ja module page (not in hub ledger): docs/architecture/${slug}.ja.md`);
+  }
 }
 if (!process.exitCode) ok(`ledger: ${ledgerSlugs.length} modules, ${activeSlugs.length} active, page set matches`);
 
@@ -109,6 +127,15 @@ for (const slug of activeSlugs) {
       if (open !== close + self) fail(`unbalanced <${tag}> in docs/${svg} (open=${open} close=${close} selfclose=${self})`);
     }
     if (!existsSync(join(pageDir, png.slice(2)))) fail(`missing bitmap fallback: docs/${png}`);
+  }
+  // ja module pages reuse the EN diagram (svg + png), same as the ja hub
+  const pageJa = join(pageDir, `${slug}.ja.md`);
+  if (existsSync(pageJa)) {
+    const jaPage = readFileSync(pageJa, 'utf8');
+    const svgJa = `./assets/${slug}.en.svg`;
+    const pngJa = svgJa.replace(/\.svg$/, '.png');
+    if (!jaPage.includes(`](${svgJa})`)) fail(`docs/architecture/${slug}.ja.md does not link ${svgJa}`);
+    if (!jaPage.includes(`](${pngJa})`)) fail(`docs/architecture/${slug}.ja.md does not link the ${pngJa} fallback`);
   }
 }
 if (!process.exitCode) ok('diagram references + SVG well-formedness pass');
