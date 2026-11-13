@@ -1320,15 +1320,14 @@ async function handleRequest(
                 }
             }
         }
-        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
-        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
-        // it can reach the real upstream, then pin behind the rollout gate.
-        // So a non-body source (header / harvest) stamps the parsed body on
-        // BOTH wires now — nothing extra is ever forwarded either way;
-        // response-ish protocols keep feeding the resolve rung below via this
-        // local alone.
-        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
-            (protocol === "openai" || protocol === "anthropic")) {
+        // The pin-consumers are prepare-openai, prepare-anthropic AND
+        // prepare-google/prepare-responses (#6525): all four read + strip
+        // MSG_IDS_BODY_FIELD unconditionally before it can reach the real
+        // upstream, then pin behind the rollout gate. So a non-body source
+        // (header / harvest) stamps the parsed body on EVERY wire now —
+        // nothing extra is ever forwarded either way, and a length/shape
+        // mismatch is rejected (bail) at the pin, never leaked or mis-pinned.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined) {
             (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
         // #5719: the RECORDED side of the msgid identity rung lives in the
