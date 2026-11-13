@@ -296,7 +296,7 @@
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 1つの生成サマリーに対する文字数のハード上限。これを超える返信は全体として拒否される（切り詰めもリトライもされない）。外部サマライザーにはこの正確な上限が事前に通知される（#3635）。0 = 無制限。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成サマリーの文字数下限：単一範囲はこれに単独で達する必要がある。複数範囲のバッチは、その結合サマリーがこれに達した場合に合格する（#5894）。0 = 無効。外部サマライザーはサマリーごとの下限に引き続き従う（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | クライアントがターン間で履歴を巻き戻しまたは書き換えた場合、フォールド状態を調整する。 |
-| `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
+| `compress.promptPack` | string (builtin: "default", "lean", "chat") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → 同梱（chat）→ ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
 | `compress.tiers` | boolean | true | — | T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
