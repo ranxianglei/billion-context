@@ -18,6 +18,7 @@ import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { getStore } from "../persist.js";
+import { carriesClaudeNativeCompactionSummary } from "./claude-compaction-guard.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
@@ -30,7 +31,7 @@ import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
-import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
+import { conflictClientOf, dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
@@ -327,21 +328,39 @@ export async function prepareAnthropic(
         // intact history has no gap; a gap without framing falls through to
         // detectUnannouncedHistoryRewrite below). Title-gen side requests are
         // skipped like on the openai lane (same tiny-budget heuristic).
-        let dshRebased = false;
+        // #5767: Claude Code's auto-compact (CLAUDE_CODE_AUTO_COMPACT_WINDOW)
+        // lands the SAME shape — [continuation summary, retained tail…]
+        // against the same session id — but its framing is the CC continuation
+        // sentence, which the dsh detector does not know, so the landing fell
+        // through to detectUnannouncedHistoryRewrite below and lit the alarm
+        // banner for the client's own auto-compact. Same marker+rebase
+        // treatment as the dsh lane; the framing check is lane-scoped (a dsh
+        // session never matches the claude sentence and vice versa).
+        let nativeRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
-        if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
-            const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
-            const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && (carriesDshLocalCompactionSummary(msgs) || carriesBiliSnapshotCheckpoint(msgs))) {
-                const missing = dshGap.expected - dshGap.matched;
-                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+        const dshLane = laneDecisions.profile.compactsClientSide;
+        const claudeLane = laneDecisions.profile.identity === "claude-responses" || conflictClientOf(session) === "claude";
+        if (!anthropicTitleGen && (dshLane || claudeLane) && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeNativeCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
+            const nativeGap = foldCoverage(coveredBeforeNativeCompact, msgs.map((m) => m.id));
+            // #2621 novelty gate enforced here (knownRefsBefore = pre-turn ref map).
+            const dshFramed = dshLane && (carriesDshLocalCompactionSummary(msgs) || carriesBiliSnapshotCheckpoint(msgs));
+            const claudeFramed = claudeLane && carriesClaudeNativeCompactionSummary(msgs, knownRefsBefore);
+            if (nativeGap && (dshFramed || claudeFramed)) {
+                const missing = nativeGap.expected - nativeGap.matched;
+                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= nativeGap.expected) {
                     // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
-                    const authored = carriesBiliSnapshotCheckpoint(msgs);
+                    const authored = dshFramed && carriesBiliSnapshotCheckpoint(msgs);
                     if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
+                    if (claudeFramed) {
+                        recordConflict(session, "native-compaction", `claude native compaction: ${missing}/${nativeGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#5767)`);
+                        log("warn", `[${sessionId}] claude native compaction detected (${nativeGap.matched}/${nativeGap.expected} covered id(s) retained, continuation framing in resent history) — rebasing ACP state onto the compacted history (#5767)`);
+                    } else {
+                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${nativeGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${nativeGap.matched}/${nativeGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
+                    }
                     markNativeCompactionBoundary(session);
-                    dshRebased = reconcileNativeCompactionBoundary(session);
+                    nativeRebased = reconcileNativeCompactionBoundary(session);
                 }
             }
         }
@@ -440,11 +459,12 @@ export async function prepareAnthropic(
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
-        // the rewrite was just classified as dsh native compaction above
-        // (#2432/#2658): it is already recorded as "native-compaction" and
-        // rebased — a second "unannounced-rewrite" entry beside it would present
-        // the substrate destruction as "another compressor fighting you".
-        if (!dshRebased) {
+        // the rewrite was just classified as a marker-detected native
+        // compaction above (#2432/#2658 dsh, #5767 claude): it is already
+        // recorded as "native-compaction" and rebased — a second
+        // "unannounced-rewrite" entry beside it would present the substrate
+        // destruction as "another compressor fighting you".
+        if (!nativeRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
             if (rewrite.churnExplained) {
                 // #4131: cross-build id re-mint (#3642) — fold-reconcile found every
