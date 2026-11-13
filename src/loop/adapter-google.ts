@@ -548,6 +548,28 @@ export function createGoogleAdapter(
                 const usageMetadata = parsed.usageMetadata as Record<string, unknown> | undefined;
                 if (usageMetadata) lastUsage = readUsageMetadata(usageMetadata);
 
+                const streamError = parsed.error;
+                if (streamError !== undefined && streamError !== null) {
+                    yield* flushFilter();
+                    if (lastUsage && !usageEmitted) {
+                        usageEmitted = true;
+                        yield usageEvent();
+                    }
+                    let message: string;
+                    if (typeof streamError === "object") {
+                        const error = streamError as Record<string, unknown>;
+                        const detail = typeof error.message === "string" ? error.message : JSON.stringify(streamError);
+                        const status = typeof error.status === "string" ? error.status : undefined;
+                        const code = typeof error.code === "number" || typeof error.code === "string" ? String(error.code) : undefined;
+                        const prefix = [status, code ? `(${code})` : undefined].filter(Boolean).join(" ");
+                        message = prefix ? `${prefix}: ${detail}` : detail;
+                    } else {
+                        message = String(streamError);
+                    }
+                    yield { kind: "error", message } as ParsedStreamEvent;
+                    return;
+                }
+
                 // A prompt the safety filter refused up front carries no
                 // candidate at all; the client needs the reason as a terminal.
                 if (blockReason && !candidate && !sawDone) {
