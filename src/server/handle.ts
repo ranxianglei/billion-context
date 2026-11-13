@@ -9,7 +9,7 @@ import { defaultPrompts, type CompressionCore, type Config, type PackSurface, ty
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveContextLimit, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
@@ -67,7 +67,7 @@ import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError }
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
-import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
+import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, truncateV1ContentsForBudget, unwrapV1Internal, wrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
@@ -699,8 +699,51 @@ async function handleRequest(
         v1Model = unwrapped.model ?? undefined;
         v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
-            log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+            // #6457: size-gate the verbatim passthrough. A requestType=checkpoint
+            // packs the FULL uncompressed local history into inner.contents; once
+            // that exceeds the upstream window the forward is a guaranteed 400
+            // ("input token count exceeds the maximum number of tokens") that
+            // Antigravity treats as fatal — it terminates the whole agent loop.
+            // No session is bound at this point, so resolve a lightweight window
+            // (providers table → built-in table → global modelContextLimit) and
+            // guard it with the #554 sideRequestGuard.
+            const window = resolveContextLimit(opts.routes, upstreamOrigin, v1Model) ?? config.modelContextLimit;
+            const guard = sideRequestGuard(unwrapped.inner, "google", window);
+            const requestTypeLabel = typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro";
+            if (!guard.blocked) {
+                log("info", `v1internal background utility call (requestType=${requestTypeLabel}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
+                await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+                return;
+            }
+            // Over window: shrink inner.contents to fit (first user instruction
+            // anchor + most recent contiguous tail), re-wrap the envelope, and
+            // re-guard the truncated body before forwarding.
+            const overhead = estimateRawBodyTokens({ ...unwrapped.inner, contents: [] });
+            const budget = guard.limit - overhead;
+            const truncated = truncateV1ContentsForBudget(unwrapped.inner.contents, budget);
+            const truncatedInner = { ...unwrapped.inner, contents: truncated.contents };
+            const reGuard = sideRequestGuard(truncatedInner, "google", window);
+            if (!reGuard.blocked) {
+                const rewrapped = wrapV1Internal(truncatedInner, unwrapped.meta);
+                const newBuffer = Buffer.from(JSON.stringify(rewrapped), "utf8");
+                log("warn", `v1internal background utility call (requestType=${requestTypeLabel}) ~${guard.estimate} tokens over window ${guard.limit} — truncated to ${truncated.contents.length} contents to fit (#6457)`);
+                await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, newBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+                return;
+            }
+            // Still over after shrinking (pathological single giant message):
+            // block locally instead of forwarding a guaranteed 400 (#554 pattern).
+            log("warn", `v1internal background utility call (requestType=${requestTypeLabel}) ~${guard.estimate} tokens cannot be shrunk under window ${guard.limit} (model=${v1Model ?? "unknown"}) — NOT forwarded: guaranteed upstream 400 (#6457)`);
+            if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                res.writeHead(413, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    error: {
+                        type: "server_error",
+                        code: "v1internal_side_request_payload_too_large",
+                        message: `v1internal side request payload (~${guard.estimate} tokens) reaches the effective context window ${guard.limit} (model=${v1Model ?? "unknown"}) and cannot be shrunk; NOT forwarded — the payload is too large (#6457). Shrink the conversation or raise the model's context window.`,
+                        retryable: false,
+                    },
+                }));
+            }
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
