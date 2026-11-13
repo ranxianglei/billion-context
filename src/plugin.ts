@@ -2757,10 +2757,11 @@ export async function pipePluginChatWithStrip(
     // write through the request logger landed in the SAME tee file, doubling
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -3972,9 +3973,11 @@ export async function pipePluginJsonlWithStrip(
     // delta as a whole line, so the filters' held tails are only resolved at
     // the terminal frame / EOF / read failure — never per line (a per-line
     // flush destroys the cross-delta tag/marker state this filter exists for).
-    const onStrip = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onStrip = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode plugin mode)";
+        const head = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] ${head}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
     const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
@@ -4272,8 +4275,9 @@ export async function pipePluginResponsesWithStrip(
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {

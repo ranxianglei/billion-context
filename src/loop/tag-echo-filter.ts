@@ -1007,7 +1007,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boolean) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
     /** Settled prose deferred alongside a NON-definite tag-head tail: it
      *  carries a dead ref-close unit whose verdict is content-determined
@@ -1055,17 +1055,29 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     // the cap drops repeatedly until its close. swallowSessionCounted keeps
     // any one swallow session at exactly one count.
     let swallowSessionCounted = false;
-    const recordDrop = (snippet: string) => {
+    // #5192: a drain drop is a different event from an ordinary strip — the
+    // stream ended while the filter still held bytes, so the one-shot notice
+    // below (spent by the response's FIRST drop) left it with no line at all.
+    // It gets its own one-shot budget so a held head at EOF is always audible.
+    let drainNoticed = false;
+    const recordDrop = (snippet: string, duringDrain = false) => {
         droppedAny = true;
+        if (duringDrain) {
+            if (onDrop && !drainNoticed) {
+                drainNoticed = true;
+                onDrop(snippet, true);
+            }
+            return;
+        }
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string) => {
+    const drop = (snippet: string, duringDrain = false) => {
         dropCount += 1;
-        recordDrop(snippet);
+        recordDrop(snippet, duringDrain);
     };
     /** Any drop inside a live swallow session — the session counts once. */
     const dropSwallowSpan = (snippet: string) => {
@@ -1596,12 +1608,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             } else {
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    drop(t[0]);
+                    drop(t[0], true);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        drop(tc[0]);
+                        drop(tc[0], true);
                         result = rest.slice(0, tc.index);
                     } else {
                         result = rest;
