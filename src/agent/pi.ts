@@ -21,7 +21,7 @@ import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from 
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
-import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, requestPreCompactFold, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
@@ -1016,9 +1016,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         if (agent === "pi" || agent === "omp") {
             if (agent === "pi") {
                 pi.on("session_before_compact", async (event, ctx) => {
-                    const ev = event as unknown as { reason?: unknown; branchEntries?: unknown };
+                    const ev = event as unknown as { reason?: unknown; branchEntries?: unknown; signal?: unknown };
                     if (ev.reason !== "threshold" && ev.reason !== "overflow") return undefined;
                     if (!(await ownsCompaction(ctx, ev.branchEntries))) return undefined;
+                    // #6199: pi's own compaction is cancelled below, and the proxy
+                    // folds only on the next request — ask it to fold now, while
+                    // pi shows its compaction indicator (Escape aborts via signal).
+                    const proxyBase = proxyBaseForCtx(ctx, ev.branchEntries);
+                    const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
+                    if (proxyBase !== undefined && sid !== undefined && sid.length > 0) {
+                        try {
+                            const answer = await requestPreCompactFold(proxyBase, sid, ev.signal instanceof AbortSignal ? ev.signal : undefined);
+                            logHostEvent("info", "[native-client]", `bili-plugin(pi): ${ev.reason} compaction cancelled; proxy fold ${answer === undefined ? "not answered ok" : answer.skipped !== undefined ? `skipped (${answer.skipped})` : answer.folded === true ? "folded" : "had nothing to fold"}`);
+                        } catch (err) {
+                            logHostEvent("warn", "[native-client]", `bili-plugin(pi): ${ev.reason} compaction cancelled; proxy fold failed (${err instanceof Error ? err.message : String(err)})`);
+                        }
+                    }
                     return { cancel: true };
                 });
             } else {
