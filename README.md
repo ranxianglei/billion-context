@@ -439,7 +439,7 @@ trip the nudge self-heal suppression and delay soft compression until the
 preflight hard backstop fires (#4897/#4903). This is a known limitation, not data
 loss. Workaround today: set `"recap": { "enabled": false }` in omp's config (or
 lower `recap.idleSeconds`) to remove the trigger source; the root fix — host-side
-marking so these route to their own sub-session — is tracked in #4903.
+marking so these route to their own sub-session — is scoped in the decision request #4903.
 
 **Is bili transparent? How do I turn it off?** Unrecognized endpoints forward
 unchanged ([docs/clients.md](docs/clients.md)), and every mode reverses cleanly:
