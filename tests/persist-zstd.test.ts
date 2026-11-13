@@ -48,16 +48,21 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
 interface Harness {
     dir: string;
     logs: LogLine[];
+    stores: SessionStore[];
 }
 
 async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Promise<void> {
     await test(name, async () => {
         const dir = mkdtempSync(join(tmpdir(), "bili-zstd-"));
         const logs: LogLine[] = [];
-        const h = { dir, logs };
+        const h: Harness = { dir, logs, stores: [] };
         try {
             await fn(h);
         } finally {
+            // #6547: full mode opens index.db (+shm/wal) in dir; Windows
+            // refuses to delete open files, so close every store this
+            // harness created before rmrf.
+            for (const s of h.stores) s.closeQuietly();
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
@@ -67,12 +72,14 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
 }
 
 function newStore(h: Harness, debounceMs = 0): SessionStore {
-    return new SessionStore({
+    const store = new SessionStore({
         dir: h.dir,
         debounceMs,
         enabled: true,
         log: (level, msg) => h.logs.push({ level, msg }),
     });
+    h.stores.push(store);
+    return store;
 }
 
 function filePath(dir: string, id: string): string {
