@@ -5339,6 +5339,7 @@ export function _resetPluginStateForTest(): void {
     pluginRuntimeTable.clear();
     pluginRuntimeByConversation.clear();
     warnedNoModelRequests.clear();
+    warnedStaleBindings.clear();
 }
 
 export function _rememberedForTest(): ReadonlyMap<string, NonNullable<NonNullable<Session["transient"]>["pluginMessages"]>> {
