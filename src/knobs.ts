@@ -715,9 +715,9 @@ type PluginBypassOverride = "auto" | "on" | "off";
  *    unset / "auto"    → current behavior: the inbound header decides per request
  *    "1"/"on"/"true"   → force bypass: every inbound request is forwarded verbatim
  *    "0"/"off"/"false" → never bypass: ignore any inbound x-bili-plugin-bypass header
- *  Env-only on owner sign-off in #6222 ("env-only, 不扩张 config schema"): the
- *  header is a wire contract stamped by hosts; the override is a per-process
- *  operator posture, not a per-route config field. */
+ *  Env-only per the owner-approved design in #6220: the header is a wire
+ *  contract stamped by hosts; the override is a per-process operator
+ *  posture, not a per-route config field. */
 export function pluginBypassOverride(): PluginBypassOverride {
     const raw = process.env.BILI_PLUGIN_BYPASS?.trim().toLowerCase();
     if (raw === "1" || raw === "on" || raw === "true") return "on";
