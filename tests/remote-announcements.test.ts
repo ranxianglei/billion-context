@@ -309,13 +309,17 @@ test("remote lane end-to-end: gated entry absent until the scan reports the plug
     }
 });
 
-test("shipped remote.json validates end-to-end (incl. the gated entry)", () => {
+test("shipped remote.json validates end-to-end", () => {
     const fed = JSON.parse(fs.readFileSync(path.join(process.cwd(), "announcements", "remote.json"), "utf8"));
     const r = parseRemoteDoc(fed);
     assert.equal(r.error, undefined);
-    const gate = r.entries.find((e) => e.id === "dsh-live-compact-conflict");
-    assert.ok(gate, "gated entry present on master feed");
-    assert.deepEqual(gate!.requiresScan, { client: "dsh", knownId: "dsh-live-compact" });
+    // The dsh-live-compact-conflict entry was retracted from the feed (#6508):
+    // until instances upgrade to a build that understands requiresScan, a gated
+    // entry still shows unconditionally on old versions — so the broadcast stays
+    // empty and the conflict scan (dsh lane → knownId "dsh-live-compact") remains
+    // the live surfacing mechanism. Re-adding the entry is safe once the gated
+    // build is deployed (or sooner, accepting the transient over-broadcast).
+    assert.ok(!r.entries.some((e) => e.id === "dsh-live-compact-conflict"), "retracted entry must stay out of the feed");
 });
 
 test("dismiss routing follows the remote record's declared mode", async () => {
