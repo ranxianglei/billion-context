@@ -715,7 +715,6 @@ async function handleRequest(
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
-    bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -3345,7 +3344,11 @@ async function handleRequest(
                     // Refolding is finished before streaming starts. Drop the
                     // input-only bindings even if forward's wrapper retains the
                     // callback; accepted outbound bodies still support retries.
+                    // bodyText stays alive until here: the prepare lane (and any
+                    // overflow refold re-prepare) scans the raw body text for the
+                    // #5403/#5418 watermark fastpath before this boundary.
                     bodyBuffer = Buffer.alloc(0);
+                    bodyText = undefined;
                     parsed = null;
                     affinityMessagesCache = null;
                     runPreparedPipeline = undefined;
