@@ -24,6 +24,7 @@ import {
   coveredMessageIds,
   countMessageTokens,
   defaultCountTokens,
+  orderedRefPair,
   refForRaw,
   type CompressionCore,
   type CompressionState,
@@ -185,7 +186,14 @@ export function shortTokenCount(n: number): string {
 }
 
 export function describeUncoveredRuns(runs: UncoveredRun[], maxListed = 5): string {
-  const listed = runs.slice(0, maxListed).map((r) => `${r.startRef}–${r.endRef} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok)`);
+  // #5680: runs are grouped by array adjacency, so a run straddling a
+  // generation boundary can store numerically descending endpoint labels.
+  // This text reaches the model in compress receipts and acp_status, so it
+  // renders ascending like every other span surface.
+  const listed = runs.slice(0, maxListed).map((r) => {
+    const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+    return `${lo}–${hi} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok)`;
+  });
   const rest = runs.length - listed.length;
   return rest > 0 ? `${listed.join(", ")}, +${rest} more run(s)` : listed.join(", ");
 }
