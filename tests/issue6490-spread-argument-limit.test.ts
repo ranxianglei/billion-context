@@ -20,9 +20,11 @@ const SPREAD_LIMIT = 150_000;
 
 test("#6490: canonical-pointer upkeep survives a pointer list beyond the argument limit", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-6490-"));
-    const store = new SessionStore({ dir, enabled: true });
-    _setStoreForTest(store);
+    const previousMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     try {
+        const store = new SessionStore({ dir, enabled: true });
+        _setStoreForTest(store);
         const ptrs = Array.from({ length: SPREAD_LIMIT }, (_, i) => i);
         store.setSessionExt("conv-6490", "inc:canonical-ptrs", ptrs);
         const msgs: BiliMessage[] = Array.from({ length: SPREAD_LIMIT }, (_, i) => ({
@@ -52,7 +54,9 @@ test("#6490: canonical-pointer upkeep survives a pointer list beyond the argumen
         assert.equal((after as number[]).length, SPREAD_LIMIT);
         assert.equal((after as number[])[SPREAD_LIMIT - 1], SPREAD_LIMIT - 1);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
         _resetStoreForTest();
+        if (previousMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = previousMode;
+        rmSync(dir, { recursive: true, force: true });
     }
 });
