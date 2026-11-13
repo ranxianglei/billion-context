@@ -12,6 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
     perfTelemetryInit, perfRecordRequest, perfRecordMemSample,
     perfStopAll, perfRecentRows, perfActiveMode, perfTelemetryResetForTests,
+    perfBoundDir, perfTelemetryReleaseIfBound,
     PERF_DB_FILE, PERF_EVENTS_DDL,
 } from "../src/perf-telemetry.js";
 
@@ -229,6 +230,42 @@ test("#5460 P1: legacy (pure-JSON) storage mode leaves ZERO telemetry footprint 
         if (savedKey === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = savedKey;
         perfTelemetryResetForTests();
     }
+});
+
+test("#5460 P1: releaseIfBound releases only the bound store's handle; released telemetry never reopens", () => {
+    resetModule();
+    const dir = sandbox();
+    const other = sandbox();
+    try {
+        perfTelemetryInit("sqlite", { dir });
+        perfRecordRequest({ sessionId: "s" });
+        assert.equal(perfBoundDir(), dir, "init binds the store's dir");
+        assert.equal(perfTelemetryReleaseIfBound(other), false, "foreign dir → no-op");
+        assert.equal(perfTelemetryReleaseIfBound(dir), true, "bound dir → released");
+        assert.equal(perfTelemetryReleaseIfBound(dir), false, "already released → false");
+        assert.equal(perfBoundDir(), null, "binding cleared");
+        rmSync(path.join(dir, PERF_DB_FILE), { force: true });
+        perfRecordRequest({ sessionId: "s2" });
+        assert.equal(existsSync(path.join(dir, PERF_DB_FILE)), false, "released handle must not be reopened");
+    } finally { perfStopAll(); }
+});
+
+test("#5460 P1: SessionStore.closeQuietly releases the perf.sqlite handle it armed (Windows EBUSY)", async () => {
+    // Windows refuses to unlink a file whose SQLite handle is still open:
+    // a short-lived store must release the telemetry handle it armed, or
+    // the caller's rmrf of the store's dir dies with EBUSY (win22 shards —
+    // issue3769/issue4241/issue4732 tests).
+    const { SessionStore } = await import("../src/persist.js");
+    resetModule();
+    const dir = sandbox();
+    try {
+        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        perfRecordRequest({ sessionId: "s" });
+        assert.equal(perfBoundDir(), dir, "store construction arms telemetry on its own dir");
+        store.closeQuietly();
+        assert.equal(perfBoundDir(), null, "closeQuietly released the binding");
+        assert.equal(perfTelemetryReleaseIfBound(dir), false, "no double release");
+    } finally { perfStopAll(); }
 });
 
 after(() => { for (const d of SANDBOXES.splice(0)) rmSync(d, { recursive: true, force: true }); });

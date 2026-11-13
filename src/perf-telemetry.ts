@@ -199,6 +199,24 @@ export function perfRecordMemSample(w?: (level: "warn" | "error" | "info", msg: 
     insertRow(db, row, w ?? loggerLog);
 }
 
+/** The directory this process's telemetry is bound to (null = unbound).
+ *  Store close paths use it to release the handle they armed. */
+export function perfBoundDir(): string | null { return state.dir; }
+
+/** Release the handle if this process's telemetry is bound to `dir` —
+ *  the store that armed it is closing. Windows cannot delete a directory
+ *  while perf.sqlite is open, so a store's close path must release the
+ *  handle it caused to be opened (same contract as index.db — see
+ *  SessionStore.closeQuietly). The armed mode is kept: the singleton is
+ *  one-per-process by design; a later store in the same process finds no
+ *  binding and records nothing (no degrade, no retry). */
+export function perfTelemetryReleaseIfBound(dir: string): boolean {
+    if (state.dir !== dir) return false;
+    if (state.db) { try { state.db.close(); } catch { /* best effort */ } state.db = null; }
+    state.dir = null;
+    return true;
+}
+
 /** Close everything (process shutdown / tests). Idempotent. */
 export function perfStopAll(): void {
     if (state.memTimer) { clearInterval(state.memTimer); state.memTimer = null; }
