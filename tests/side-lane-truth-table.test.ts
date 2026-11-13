@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { demoteGate, DSH_TITLE_SYSTEM_PREFIX, isDshTitleRequest, isSideRequest, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
+import { demoteGate, DSH_TITLE_SYSTEM_PREFIX, isDshTitleRequest, isSideRequest, isStructuredOutputCall, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 
 // #2170 measure 1: exhaustive truth-table pin for the two extracted lane
 // decision functions. These tables ARE the regression net: any future edit to
@@ -171,5 +171,42 @@ test("isSideRequest: the <=200 budget heuristic still catches rc.2 titles and mi
 test("isDshTitleRequest: non-object bodies stay closed", () => {
     assert.equal(isDshTitleRequest(null), false);
     assert.equal(isDshTitleRequest("nope"), false);
+});
+
+// #5073: a toolless request demanding STRUCTURED output (OpenAI chat
+// response_format, Responses text.format — json_object/json_schema only) is a
+// one-shot utility call riding the #388 verbatim side passthrough: bili's proxy
+// must not inject its ACP tools next to response_format (strict backends 400 on
+// that pair). The row table pins every matched carrier and every veto; the
+// lane-guard job (#2170) ties this table to the gate edit in
+// src/server/side-request.ts.
+const STRUCTURED_OUTPUT_ROWS: [string, Record<string, unknown>, boolean][] = [
+    ["openai: response_format json_object, toolless", { response_format: { type: "json_object" }, messages: [{ role: "user", content: "hi" }] }, true],
+    ["openai: response_format json_schema, toolless", { response_format: { type: "json_schema", json_schema: { name: "facts" } } }, true],
+    ["responses: text.format json_object, toolless", { text: { format: { type: "json_object" } }, input: [{ role: "user", content: "hi" }] }, true],
+    ["responses: text.format json_schema, toolless", { text: { format: { type: "json_schema", schema: {} } } }, true],
+    ["empty tools array is still toolless", { tools: [], response_format: { type: "json_object" } }, true],
+    ["a client tool vetoes (#546 owns it)", { tools: [{ type: "function", function: { name: "get_weather" } }], response_format: { type: "json_object" } }, false],
+    ["legacy bare-string response_format never matches", { response_format: "json_object" }, false],
+    ["non-structured type (text) does not match", { response_format: { type: "text" } }, false],
+    ["null response_format does not match", { response_format: null }, false],
+    ["response_format object without a string type does not match", { response_format: {} }, false],
+    ["Gemini generationConfig.responseMimeType never matches", { generationConfig: { responseMimeType: "application/json" }, contents: [{ role: "user", parts: [{ text: "hi" }] }] }, false],
+    ["responses text.format as a bare string does not match", { text: { format: "json_object" } }, false],
+    ["a large-budget plain completion has no structured carrier", { max_tokens: 64_000, messages: [{ role: "user", content: "hi" }] }, false],
+];
+
+test("isStructuredOutputCall: both documented carriers match, every veto closes (#5073)", () => {
+    for (const [name, body, want] of STRUCTURED_OUTPUT_ROWS) {
+        assert.equal(isStructuredOutputCall(body), want, name);
+    }
+});
+
+test("isSideRequest: the structured shape rides the side lane; #546 and explicit intent still outrank it (#5073)", () => {
+    const body = { messages: [{ role: "user", content: "hi" }], response_format: { type: "json_object" } };
+    assert.equal(isSideRequest(body), true, "a toolless structured-output request is a side request despite its budget");
+    assert.equal(isSideRequest({ ...body, tools: [{ name: "compress" }] }), false, "#546 veto: a tool-carrying structured request stays a main turn");
+    assert.equal(isSideRequest(body, "main"), false, "explicit main intent vetoes the structure");
+    assert.equal(isSideRequest(body, "title"), true, "declared side agent stays side");
 });
 

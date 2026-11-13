@@ -72,6 +72,55 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
     return false;
 }
 
+// #5073: a toolless request that demands STRUCTURED output is a one-shot utility
+// call (extraction / classification / formatting), not an agent turn — an agent
+// turn always carries its action surface (the #546 rule below). On a strict
+// backend (PolyStrata et al.) the pair `tools` + `response_format` is rejected
+// outright (HTTP 400), and bili's proxy-mode injection puts the six ACP tools
+// next to response_format on EVERY main-lane request — so any child process that
+// inherits the host's proxy env (Hermes' Hindsight memory daemon, other memory
+// plugins, evaluators, terminal scripts) 400s on every call. Routed through the
+// #388 verbatim side passthrough instead: nothing injected, the backend sees the
+// clean toolless body it sent — the same treatment title-gen / WebSearch-utility
+// calls already get.
+//
+// The no-tools veto is load-bearing (mirrors isDshTitleRequest /
+// isDshAutoReviewRequest): any action surface marks an agent turn, and the #546
+// rule already vetoes those in isSideRequest. Only the two documented
+// structured-output carriers are matched — OpenAI chat-completions
+// `response_format` and the Responses-wire `text.format`, each with type
+// json_object/json_schema. Deliberately NOT matched: the legacy bare-string
+// response_format, Gemini's generationConfig.responseMimeType, or any other type
+// — no strict backend rejects tools+that pair, so matching them would demote real
+// turns with no defending bug (evidence-per-client discipline).
+const STRUCTURED_OUTPUT_TYPES: ReadonlySet<string> = new Set(["json_object", "json_schema"]);
+
+function structuredFormatType(v: unknown): string | undefined {
+    if (v === null || typeof v !== "object") return undefined;
+    const t = (v as Record<string, unknown>).type;
+    return typeof t === "string" ? t : undefined;
+}
+
+/** #5073: structural identification of a toolless structured-output utility call
+ *  (see the block comment above). Read-only; safe to call from any decision point. */
+export function isStructuredOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn, not a one-shot structured-output utility call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // OpenAI chat-completions carrier: top-level response_format { type }.
+    const rf = structuredFormatType(p.response_format);
+    if (rf !== undefined && STRUCTURED_OUTPUT_TYPES.has(rf)) return true;
+    // Responses-wire carrier: text.format { type }.
+    const text = p.text;
+    if (text !== null && typeof text === "object") {
+        const tf = structuredFormatType((text as Record<string, unknown>).format);
+        if (tf !== undefined && STRUCTURED_OUTPUT_TYPES.has(tf)) return true;
+    }
+    return false;
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
@@ -84,6 +133,13 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // gets injected into it. Explicit host intent above still outranks this.
     if (isServerToolUtilityCall(p)) return true;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // #5073: a toolless structured-output request (response_format json_object/
+    // json_schema, or Responses text.format) is a one-shot utility call, not an
+    // agent turn — forward it verbatim via the #388 side passthrough so bili's
+    // proxy-mode tool injection never lands next to response_format on a strict
+    // backend (HTTP 400). The #546 veto above keeps every tool-carrying request
+    // a main turn; explicit host intent above still outranks this.
+    if (isStructuredOutputCall(p)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
