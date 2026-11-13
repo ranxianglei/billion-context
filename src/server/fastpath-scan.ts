@@ -88,6 +88,7 @@ export function scanMessagesSpans(
                 if (s.charCodeAt(i) === close) { i++; depth--; return; }
                 for (;;) {
                     if (c === 91) {
+                        skipWs();
                         walkValue();
                     } else {
                         skipWs();
@@ -112,7 +113,7 @@ export function scanMessagesSpans(
             const startTok = i;
             while (i < n) {
                 const t = s.charCodeAt(i);
-                if (t === 45 || t === 46 || (t >= 48 && t <= 57) || t === 101 || t === 69
+                if (t === 43 || t === 45 || t === 46 || (t >= 48 && t <= 57) || t === 101 || t === 69
                     || t === 102 || t === 116 || t === 114 || t === 117 || t === 97 || t === 108 || t === 115 || t === 110) {
                     i++;
                     continue;
@@ -132,7 +133,6 @@ export function scanMessagesSpans(
             skipWs();
             if (i >= n) throw new Error("e");
             const c0 = s.charCodeAt(i);
-            if (c0 === 125) { i++; break; }
             if (c0 !== 34) throw new Error("e");
             const keyStart = i;
             readString();
