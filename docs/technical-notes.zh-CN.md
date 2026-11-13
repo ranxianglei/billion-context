@@ -174,6 +174,23 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 
 声明的信任边界(§7.4——必须人工评审,禁止自动合并):**保元素数不变的前缀字节改写不可检测**——锚点除外:v2 在锚点比对 carried prevId 与存锚,id 重铸 = 一次 UNcredited miss + 下一轮自愈。这就是跳过逐条字节复核的全部代价;该代价已过 §7.4 人工评审,故以**实验性灰度**出厂——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量,web 面板对全部安装显示一次性公告直到关闭、快速配置提供三态开关),A/B 黄金测试钉死出站字节逐字一致,并提供 per-install 开/关(`rollout.features.pluginFullResendWatermark: true|false` / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`)。破坏性改写(通告 compaction、截断、重排)都会改变 count,在任何陈旧 core 喂给内核之前就被判掉——在 v4 下这道拦截从客户端回显移到宽度算式本身:前缀收缩要求一个非正宽度,任何 id 列表都不可能满足,credited `ahead` / `seed-stale` 判决与 pre-v4 完全一致地触发。
 
+**v6 标准账本统一(owner 裁定 2026-11-03,契约 R1–R8):** 命中判决现在派生自标准(transcript)对齐而非快路径自己的并行字节门。机制上,对齐的 id 快速路径恰好就是 shim tail-ids 所编码的东西——宿主 msgid 永世唯一,所以「对会话累计宿主 id 账本(`pf:state.lg`,FIFO 上限 2048 真实 id;`?` 槽永不记录)纯追加的列表」等价于「锚在 transcript 上的向后 id 链成功」。若命中路径直接消费 snapshot-render 的完整走查,就会付上本快路径专为避免的 O(N) 解析(指导项 2),因此集合差作为同一语义契约的首要廉价门前置,而 snapshot-render 担任免费时的确认层:水位 MISS 回合全量解析本已付出,此时一个只读身份行的轻量探针(`probeTranscriptAlignment`,仅身份行、无内容字节)将账本视图与 unified transcript 交叉核对并每会话记一条日志(除非 `snapshotRender` rollout 同时开启,否则休眠)。旧栈保留的部分及理由:宽度算术保留为 SHIM 协议形状有效性(服务端定位窗口起点 K);起点钉(`tail-ids-prev`)保留,因为容隙对齐会骑在客户端已不再声明的重铸起点槽上;头部 SYSTEM 文本门两种模式下都保留生效(prompt 没有 msgid——flagged 偏差:宁可省一次解析也不能服务陈旧 prompt);模型切换保留物理投影分区(R6:每 (model × wire format) 一份派生投影、共享一份逻辑账本——某新模型的首个请求付一次全量 legacy pass 建立该投影,后续回合纯增量追加;`m` 字段从世界分区降格为投影缓存键)。v6 新增:(a) 已验证范围内出现中历史未知真实 id——形状存活于宽度+起点门之后的结构性改写(客户端压缩/插入)——付一次保守的计名 legacy pass,下一轮起按新消息透出(`watermarkCompactionPassthrough` 旋钮,默认开;关 = 这些回合恢复 pre-v6 骑存+诊断):摘要块带新 id,集合差自然追加,无抑制逻辑(R4/O3);(b) 不可辨识增量(正文变大但增量完全不带宿主 id)正常命中但记结构化诊断、不向账本追加——永不做猜测式重建(R5);(c) 客户端会话头摘要切换(cs 门,R7)现在同时扣住账本——换入会话的 id 绝不折入本会话累计账本。纯计数回合在所有分支上与 pre-v6 逐字节相同。
+
 诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
 
 实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
+
+## 原生身份观测层(#5571 M1)
+
+每条经过 bili 的模型 API 请求都自带其客户端的**原生身份面**——session id、逐条消息宿主 id、压缩标记——以普通头/正文字段形式,在 relay 任何改写之前就可读。观测层把这份静态取证(issue #5571 采集表)变成按会话的实测数据,让 M2 绑定表与 M3 re-baseline 建立在测量事实而非二进制字符串之上。
+
+**单采集点,单张模式表。** `observeNativeIdentity()` 每请求恰好调用一次,位于 `src/server/handle.ts` 会话 id 绑定(`enterSessionContext`)之后。客户端家族钉在 `src/server/native-identity-profiles.ts`(WorkBuddy / codex / Claude Code / opencode / Gemini 五行:session/msg/request 头、双通道 body 路径、压缩前缀、形状断言)。压缩文案是客户端版本面——上游漂移时改这张表+测试,禁止在别处硬编码字面量。
+
+**不变量(红线):**
+- 零转发字节改动——本模块只读;M2/M3 决定之前,下游任何逻辑不得基于这些数据做 gate。
+- 隐私:session ext 键 `nidv:obs` 只存 id 值的 sha1-8 **摘要**;原始值只在请求内存里活几微秒;日志打摘要/截断。
+- unknown 客户端**不写任何东西**(隐私红线:不把陌生流量的指纹存进存储)。
+- 默认关:`rollout.features.nativeIdentityObservation`,percent 0(env `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1|0`;配置 `true/false`)。关 = 零 ext 写入、管线字节一致——由既有 golden 套件的无感中性(对现有队列特性缺席)加 `tests/issue5571-native-identity-obs.test.ts` 显式 off 用例共同钉住。
+- 结构性 fail-open:全部采集在函数内一个 try/catch 里;任何坏行降级为「无观测」,绝不会失败或拖慢请求(常数成本查找 + 有界正文扫描——`USER_TEXT_SCAN_CAP=3`、`TOOL_ANCHOR_CAP=4096`)。
+
+**状态形状**(`nidv:obs`,JSON ≤4KB 硬上限,事件 FIFO 裁剪):`{v:1, client, firstSeen, lastSeen, reqs, sessH?, sessStable, msgN?, msgLastH?, events:[{t,k,e≤64}]}`。事件类型:`compaction`(三级信号——显式头 > 专用 `/responses/compact` 端点 > 摘要轮前缀[锚定在文本开头,中段嵌入不得命中])、`id_change`、`profile_flip`、`dual_mismatch`(cc 头 vs metadata 通道不一致)、`shape_assert_fail`(opencode wire 形状漂移)。连续相同事件去重,最多保 32 条。
