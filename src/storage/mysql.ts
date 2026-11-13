@@ -1866,7 +1866,6 @@ export class MysqlBackend implements StorageBackend {
                 if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) {
                     if (lineNo === -1) lineNo = i;
                     matchCount += 1;
-                    lineNo = i;
                 }
             }
         } catch {
