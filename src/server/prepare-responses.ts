@@ -287,19 +287,29 @@ export async function prepareResponses(
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
-            const covered = coveredRealHistoryIds(session.state.blocks);
-            const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
-            // A checkpoint may predate this process's first observation (for
-            // example after an upgrade). Keep folds whose entire source still
-            // exists; only missing coverage or an empty substrate needs rebasing.
-            const rebase = covered.size === 0 || gap !== null;
-            if (rebase) {
-                markNativeCompactionBoundary(session);
-                reconcileNativeCompactionBoundary(session);
+            if (codexCheckpointBoundary) {
+                // The codex checkpoint channels above (header / replayed items)
+                // already closed this exact epoch on this request; rebasing
+                // again there would open a second, empty generation for one
+                // compaction. Only advance the opaque-key bookmark.
+                session.metadata.codexNativeCompactionKey = checkpoint;
+                markDirty(session);
+                log("info", `[${sessionId}] native opaque Responses checkpoint observed; already rebased by the codex checkpoint channel`);
+            } else {
+                const covered = coveredRealHistoryIds(session.state.blocks);
+                const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
+                // A checkpoint may predate this process's first observation (for
+                // example after an upgrade). Keep folds whose entire source still
+                // exists; only missing coverage or an empty substrate needs rebasing.
+                const rebase = covered.size === 0 || gap !== null;
+                if (rebase) {
+                    markNativeCompactionBoundary(session);
+                    reconcileNativeCompactionBoundary(session);
+                }
+                session.metadata.codexNativeCompactionKey = checkpoint;
+                markDirty(session);
+                log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
             }
-            session.metadata.codexNativeCompactionKey = checkpoint;
-            markDirty(session);
-            log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
         }
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
