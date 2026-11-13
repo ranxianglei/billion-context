@@ -165,7 +165,7 @@ describe("#4661 proxy: stale-binding diagnosis in handlePluginTool", () => {
     it("status route exposes the additive staleBinding field (direct + fallback rows)", async () => {
         const { s, f } = makePair();
         const out = mockRes();
-        handlePluginStatus(s.id, out.res, deps);
+        await handlePluginStatus(s.id, out.res, deps);
         assert.equal(out.status(), 200);
         const direct = JSON.parse(out.body()) as Record<string, unknown>;
         const sb = direct.staleBinding as Record<string, unknown>;
@@ -174,7 +174,7 @@ describe("#4661 proxy: stale-binding diagnosis in handlePluginTool", () => {
 
         s.lastModelRequestAt = Date.now() - 60 * 1000; // live — not stale
         const outF = mockRes();
-        handlePluginStatus(s.id, outF.res, deps);
+        await handlePluginStatus(s.id, outF.res, deps);
         assert.equal(JSON.parse(outF.body()).staleBinding, undefined, "fresh bound session is never flagged");
 
         // fallback=latest resolving to the stale session must NOT be flagged —
@@ -182,7 +182,7 @@ describe("#4661 proxy: stale-binding diagnosis in handlePluginTool", () => {
         s.lastModelRequestAt = Date.now() - 20 * 60 * 1000;
         s.lastSeen = Date.now(); // strictly newest → fallback picks s
         const out3 = mockRes();
-        handlePluginStatus("never-seen-4661", out3.res, deps, true);
+        await handlePluginStatus("never-seen-4661", out3.res, deps, true);
         const fb = JSON.parse(out3.body()) as Record<string, unknown>;
         assert.equal(fb.fallback, true);
         assert.equal(fb.staleBinding, undefined, "viaFallback adoption is never flagged stale");
