@@ -64,7 +64,8 @@ interface UncoveredRun {
   tokens: number;
   /** #5780: set when the apply-side judgment says this exact span cannot fold
    *  RIGHT NOW for structural reasons (turn split at the protected boundary /
-   *  entirely inside the zone). Transient refusals leave it unset. */
+   *  entirely inside the zone / content protected or filtered). Transient
+   *  refusals leave it unset. */
   note?: string;
 }
 
@@ -81,12 +82,15 @@ const FOLDABILITY_PROBE_SUMMARY =
 // within the protected zone") AND its #5253-family soft no-ops (kernel/src/
 // compress.ts: "folded nothing — it lies entirely inside the protected
 // zone … do not resend this range", "all of its content is protected or
-// filtered"). A no-op is the same structural class as the zone fatal:
-// resending the span cannot fold anything until the zone moves. Transient
-// refusals ("too small", already covered, unknown refs) intentionally fall
-// through to unmarked — they self-teach via their own text.
+// filtered"). Both no-ops are the same structural class as the zone fatal —
+// resending the span folds nothing: the zone no-op until the zone moves, the
+// filtered no-op because the content is protected/filtered, not zone-bound.
+// Transient refusals ("too small", already covered, unknown refs)
+// intentionally fall through to unmarked — they self-teach via their own
+// text.
 const SPLIT_NOTE = "\u26a0 not foldable: would split a turn at the protected boundary";
 const ZONE_NOTE = "\u26a0 not foldable: entirely inside the protected zone";
+const FILTERED_NOTE = "\u26a0 not foldable: content is protected or filtered";
 
 /**
  * #5780: run the run's exact span through the apply-side judgment on a state
@@ -116,7 +120,8 @@ function foldabilityNote(
       if (/entirely within the protected zone/.test(err)) return ZONE_NOTE;
     }
     for (const warning of result.warnings) {
-      if (/lies entirely inside the protected zone|all of its content is protected/.test(warning)) return ZONE_NOTE;
+      if (/lies entirely inside the protected zone/.test(warning)) return ZONE_NOTE;
+      if (/all of its content is protected/.test(warning)) return FILTERED_NOTE;
     }
     return undefined;
   } catch {
