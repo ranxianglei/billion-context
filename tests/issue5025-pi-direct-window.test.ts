@@ -18,6 +18,7 @@ import path from "node:path";
 import { after, beforeEach, test } from "node:test";
 import { createBiliPlugin, piDeclaredWindowForDirect, _resetPiDeclaredWindowForTest } from "../src/agent/pi.ts";
 import { _declaredWindowHookForTest } from "../src/agent/pi-native.ts";
+import { _resetNativeOriginWaiterForTest } from "../src/agent/native-bootstrap.ts";
 
 const STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5025-state-"));
 const PREV_ENV: Record<string, string | undefined> = {};
@@ -89,6 +90,7 @@ function chatBody(textChars: number): string {
 
 beforeEach(() => {
     _resetPiDeclaredWindowForTest();
+    _resetNativeOriginWaiterForTest();
     delete process.env.BILLION_CONTEXT_PROXY;
 });
 

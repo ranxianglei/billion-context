@@ -185,3 +185,10 @@ export function setNativeOriginWaiter(waiter: NativeOriginWaiter): void {
 export async function awaitNativeProxyOrigin(): Promise<string | undefined> {
     return originWaiter === undefined ? undefined : originWaiter.wait();
 }
+
+/** Test hook: clear the registered origin waiter so suites that import a
+ *  native entry (which arms at module load) do not leak its INLINE_ORIGIN
+ *  waiter into the shared factory's awaitNativeProxyOrigin(). */
+export function _resetNativeOriginWaiterForTest(): void {
+    originWaiter = undefined;
+}
