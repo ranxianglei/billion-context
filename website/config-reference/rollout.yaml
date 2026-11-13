@@ -10,6 +10,7 @@ entries:
     site_group: beh
     desc_en: "Feature rollout (canary) block: per-feature overrides of the version's baked-in rollout plan; features roll out by percent of installs, bucketed on a stable per-machine id."
     desc_zh: "灰度发布配置块:按特性覆盖版本内置的灰度计划;特性按安装占比放量,分桶基于每台机器稳定的 id。"
+    desc_ja: "機能ロールアウト（カナリア）ブロック：バージョンに組み込まれたロールアウト計画の機能ごとのオーバーライド；機能はインストール数のパーセンテージでロールアウトされ、安定したマシンごとの ID でバケット化されます。"
     site_en: "<code>rollout</code> — canary gating: features enable for a percent of installs, bucketed on a stable per-machine UUID; nested <span class='mech'>base</span> rolls B out only inside A's cohort."
     site_zh: "<code>rollout</code> —— 灰度门控:特性按安装百分比启用,以每台机器稳定的 UUID 分桶;嵌套 <span class='mech'>base</span> 使 B 只在 A 的入组人群内放量。"
   - key: rollout.installId
@@ -18,12 +19,14 @@ entries:
     group: behavior
     desc_en: "Pins the bucketing identity instead of the auto-generated state-dir UUID (support/testing: pick or compute an id whose bucket lands inside a cohort)."
     desc_zh: "钉住分桶身份,替代 state 目录自动生成的 UUID(支持/测试用:选取或计算一个桶值落在目标人群内的 id)。"
+    desc_ja: "自動生成された state-dir UUID の代わりにバケット化アイデンティティをピン留め（サポート/テスト：コホート内にバケットが収まる ID を選択または計算）。"
   - key: rollout.features
     type: "record feature name → { enabled?, percent?, salt?, base? } | boolean | number"
     default: "{}"
     group: behavior
     desc_en: "Per-feature overrides, keyed by the feature names the running version has under rollout. enabled (boolean) overrides any percentage; percent (0–100) re-scales the cohort; salt re-randomizes it; base re-scopes the nesting. Shorthands: \"x\": true/false forces on/off, \"x\": 20 sets percent. Wrong-typed fields (e.g. enabled as a string) are ignored and named by the startup warning — never silently widening a cohort."
     desc_zh: "按特性覆盖,键为当前版本处于灰度中的特性名。enabled(布尔)覆盖任何百分比;percent(0–100)重设比例;salt 重新洗牌;base 重设嵌套父特性。缩写:\"x\": true/false 强制开/关,\"x\": 20 等价 percent 20。类型写错的字段(如 enabled 写成字符串)会被忽略并在启动警告中点名,绝不静默放宽圈层。"
+    desc_ja: "実行中バージョンが rollout 下で持つ機能名をキーとする機能ごとのオーバーライド。enabled (boolean) はパーセンテージを無視して上書き；percent (0–100) はコホートを再スケーリング；salt は再ランダム化；base はネストのスコープを再定義。ショートハンド：\"x\": true/false でオン/オフを強制、\"x\": 20 で percent を設定。型が誤ったフィールド（例：enabled が文字列）は無視され、起動時の警告で名前が示されます — コホートのサイレントな拡大は決して行われません。"
   - key: rollout.features.enabled
     type: boolean
     default: "unset (bucket math decides)"
@@ -31,24 +34,28 @@ entries:
     group: behavior
     desc_en: "Force a gated feature on/off regardless of percentage. Env tier BILI_ROLLOUT_<FEATURE> (UPPER_SNAKE feature name; 0/false = off, any other value = on) wins over everything, including this field."
     desc_zh: "无视百分比强制开关某个灰度特性。环境变量 BILI_ROLLOUT_<特性名>(大写下划线;0/false=关,其余值=开)优先于一切,包括本字段。"
+    desc_ja: "パーセンテージに関係なく、ゲート付き機能を強制的にオン/オフにする。環境変数 `BILI_ROLLOUT_<FEATURE>`（大文字スネークケースの機能名; 0/false = オフ、それ以外の値 = オン）が、このフィールドを含むすべての設定を上書きする。"
   - key: rollout.features.percent
     type: number
     default: "the version's baked-in plan"
     group: behavior
     desc_en: "Percent of installs (0–100, fractional allowed) that see the feature. Monotonic: raising the percent never drops an already-enabled install; the bucket is prefix-stable per install."
     desc_zh: "看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。"
+    desc_ja: "機能を確認できるインストールの割合（0–100、小数可）。単調増加性を持つ：パーセンテージを上げても、すでに有効化されたインストールが失効することはない。バケットはインストールごとにプレフィックス安定である。"
   - key: rollout.features.salt
     type: string
     default: "the feature name"
     group: behavior
     desc_en: "Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles)."
     desc_zh: "分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。"
+    desc_ja: "バケット分割用のハッシュソルト。変更するとコホート全体が再ランダム化される（シャッフルする唯一の方法；パーセンテージを上げるだけではシャッフルされない）。"
   - key: rollout.features.base
     type: string
     default: "unset (roll out over everyone)"
     group: behavior
     desc_en: "Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed)."
     desc_zh: "嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。"
+    desc_ja: "ネストされたロールアウト：指定された機能の有効化コホート内でのみこの機能を評価し、パーセンテージがその母集団に対する相対値となる（Aのユーザーに対してBをロールアウト；チェーンは許可、サイクルはクローズドに失敗する）。"
   - key: rollout.features.identityChannelHarvest
     type: "boolean | number"
     default: "0 (off)"
@@ -57,6 +64,7 @@ entries:
     group: behavior
     desc_en: "Identity-channel harvest cohort gate (#5825): allows the loopback-only transcript/sqlite harvest (src/identity-harvest.ts: claude-code / codebuddy / mcode / goose / qwen lanes) without any per-install env switch, when neither the per-install switch (BILI_IDENTITY_HARVEST) nor this key is set nothing ever reads client storage. Owner ruling 2026-11-07: this cohort key is deliberately separate from rollout.features.pluginLaneServerHistory (which governs row PINNING of admitted ids) — either enabler may activate harvesting. Default 0%; raise after small-cohort observation of the degrade warn-once rate. See identity-channels.md."
     desc_zh: "身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。"
+    desc_ja: "IDチャネル収穫コホートゲート (#5825)：インストールごとの環境スイッチなしで、ループバック専用のトランスクリプト/sqlite収穫（`src/identity-harvest.ts`: claude-code / codebuddy / mcode / goose / qwen レーン）を許可する。インストールごとのスイッチ（`BILI_IDENTITY_HARVEST`）もこのキーも設定されていない場合、クライアントストレージは一切読み取られない。オーナー裁定 2026-11-07：このコホートキーは `rollout.features.pluginLaneServerHistory`（承認済みIDの行固定を管理）とは意図的に分離されている — いずれかのイネーブラーが収穫を有効化できる。デフォルト 0%；小規模コホートでの degrade warn-once レートの観察後に引き上げる。`identity-channels.md` を参照。"
   - key: rollout.features.pluginLaneServerHistory
     type: "boolean | number"
     default: "0 (off)"
@@ -65,6 +73,7 @@ entries:
     group: behavior
     desc_en: "Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out."
     desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"
+    desc_ja: "プラグインレーンのサーバー所有履歴 (#4491)：有効化されたインストールにおいて、(a) プラグインレーンのリクエストは `messages` と並行して内部 `biliMsgIds` 配列を持ち、メッセージIDをクライアント提供のIDに固定できる（上流転送前に常に除去；不正な配列は警告付きで無視、ID汚染形状は増分レーンでハードフェイル）；(b) ループバック専用の `POST /__bili/plugin/render` エンドポイントは、統合トランスクリプトからレンダリングされた送信プレフィックスを提供する（折り畳み領域はサマリアンカーに縮小；デシンクは非2xxにデグレードし、シムはローカル履歴にフォールバック）；(c) 増分レーンのプローブは `serverHistory` をアドバタイズする。デフォルト 0% — ロールアウトされるまで挙動は変わらない。"
   - key: rollout.features.nativeIdentityObservation
     type: "boolean | number"
     default: "false (off)"
@@ -73,6 +82,7 @@ entries:
     group: behavior
     desc_en: "Native identity observation (#5571 M1, observational layer): on every model-API request bili recognizes which client family it came from (WorkBuddy / codex / Claude Code / opencode / Gemini) and records that client's NATIVE identity surface — session ids, per-message host ids, explicit compaction headers or summary-turn prefixes — into session ext key `nidv:obs` as sha1-8 DIGESTS only (raw id values never leave request memory; unknown clients write nothing). Pure collection at the single relay choke point: zero forwarded-byte changes, zero decisions, fail-open by construction. It exists to turn the #5571 client-collection table from static forensics into live measured data ahead of the M2 binding table and M3 re-baseline work. Default OFF (0%) — enable with `true` or `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1`. See technical-notes.md \"Native identity observation layer\"."
     desc_zh: "原生身份观测层(#5571 M1):每条模型 API 请求到达时,bili 识别它来自哪个客户端家族(WorkBuddy / codex / Claude Code / opencode / Gemini),并把该客户端的原生身份面——session id、逐条消息宿主 id、显式压缩头或摘要轮前缀——以 sha1-8 摘要形式记入 session ext 键 `nidv:obs`(原始 id 值不落盘、不出请求内存;unknown 客户端不写任何值)。纯采集,位于 relay 单点咽喉:零转发字节改动、零决策、结构性 fail-open。目的是在 M2 绑定表与 M3 re-baseline 开工前,把 #5571 客户端采集表从静态取证变成实测数据。默认关(0%),`true` 或 `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1` 开启。见 technical-notes.zh-CN.md「原生身份观测层」。"
+    desc_ja: "ネイティブID観測（#5571 M1、観測レイヤー）：モデルAPIリクエストごとに、bili はリクエストがどのクライアントファミリー（WorkBuddy / codex / Claude Code / opencode / Gemini）から来たかを識別し、そのクライアントのネイティブID面（セッションID、メッセージごとのホストID、明示的なコンパクションヘッダー、またはサマリーターンプレフィックス）を sha1-8 ダイジェストの形でセッション ext キー `nidv:obs` に記録する（生のID値はリクエストメモリの外に出ない；不明なクライアントは何も書かない）。単一のリレーチョークポイントでの純粋な収集：転送バイトの変更ゼロ、判定ゼロ、構造上 fail-open。#5571 クライアント収集表を静的フォレンジックからライブ測定データに変え、M2 バインディング表と M3 リベースライン作業に備えるのが目的。デフォルト OFF（0%）— `true` または `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1` で有効化。`technical-notes.md` の「Native identity observation layer」を参照。"
   - key: rollout.features.pluginFullResendWatermark
     type: "boolean | number"
     default: "5 (experimental grey)"
@@ -81,6 +91,7 @@ entries:
     group: behavior
     desc_en: "Full-resend watermark fastpath (#5403/#5418): plugin-lane chat-completions turns whose previous response carried an x-bili-pf-seq stamp assert the resent prefix via the echoed count (structural scan, no full parse); on a hit the pipeline consumes stashed canonical prefix cores plus only the new tail window (byte-identical outbound provenance; ANY doubt falls back to the untouched full-parse path per turn and re-stamps, five credited misses hold the lane for one hour). Requires the client to echo the stamp back as x-bili-pf-count (dsh/pi/opencode/omp do; unadapted lanes never hit). EXPERIMENTAL grey rollout — ON by default for roughly 5% of installs (owner ruling 2026-11-02: small cohort before GA; one-time intro notice in the web UI for every install, tri-state switch in quick config). Force it with `true`, turn off with `false` (or a percent) / env = 0. See technical-notes.md “Full-resend watermark fastpath”."
     desc_zh: "全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。"
+    desc_ja: "フルリセンドウォーターマークファストパス (#5403/#5418)：前回のレスポンスに `x-bili-pf-seq` ス tamp を持っていたプラグインレーンのチャットコンプリートターンでは、エコーされたカウントにより再送信プレフィックスをアサートする（構造スキャン、フルパースなし）；ヒット時にパイプラインはスタッシュされた正規プレフィックスコアと新しいテールウィンドウのみを消費する（バイト同一の送信プロベナンス；疑義がある場合はターンごとに未変更のフルパースパスにフォールバックし再スタンプ、5回のクレジットミスでレーンを1時間保持）。クライアントがスタンプを `x-bili-pf-count` としてエコーバックすることを要求（dsh/pi/opencode/omp は対応；未適応レーンはヒットしない）。実験的グレースケールロールアウト — インストールの約5%でデフォルトON（オーナー裁定 2026-11-02：GA前に小規模コホート；Web UIで全インストールに一度限りの導入通知、クイック設定に3状態スイッチ）。`true` で強制、`false`（またはパーセンテージ）/ 環境変数 = 0 でオフ。`technical-notes.md` の「Full-resend watermark fastpath」を参照。"
   - key: rollout.features.watermarkCompactionPassthrough
     type: "boolean | number"
     default: "100 (on, nested under pluginFullResendWatermark)"
@@ -89,3 +100,4 @@ entries:
     group: behavior
     desc_en: "Watermark v6 canonical-ledger unification (#5403/#5418 v6): when the plugin-lane watermark turn carries a shape-valid host-id list AND a mid-history unknown id sits before a still-known one — a client structural rewrite (compaction/insertion) that changed what the stashed prefix cores describe — this knob decides the verdict: ON (default) pays ONE conservative legacy pass for that turn (credited miss, self-healing re-stamp) so the increment rides through as new messages from the next turn with its fresh ids appended to the session's cumulative host-id ledger (pf:state.lg, FIFO-capped) — no suppression logic, never speculative rebuilds; OFF restores the pre-v6 behavior for those turns (the rewrite rides the stashed prefix under the identity-only ruling, byte-compare demoted to diagnostic). Only matters for id-list turns inside an already-enabled watermark cohort; count-only turns are byte-identical either way. Force off with false / env = 0. See technical-notes.md \"Full-resend watermark fastpath\"."
     desc_zh: "水位 v6 标准账本统一(#5403/#5418 v6):当插件车道水位回合携带形状合格的宿主 id 列表,且已验证范围内出现「已知 id 之前还有未知真实 id」——客户端结构性改写(压缩/插入)已经改变了钉存前缀核所描述的内容——本旋钮决定判决:开(默认)为该回合付一次保守的 legacy 全量解析(计名 miss,自愈重盖戳),增量从下一轮起以新消息形态透出、其新 id 追加进会话累计宿主 id 账本(pf:state.lg,FIFO 上限)——无抑制逻辑、永不做猜测式重建;关 = 这些回合回退 pre-v6 行为(改写在身份-only 裁定下骑钉存前缀,字节比对降为诊断)。仅影响 id 列表回合且限已启用水位队列内;纯计数回合两种取值逐字节相同。false / env = 0 强制关。见 technical-notes.zh-CN.md「全量重发水位快路径」。"
+    desc_ja: "ウォーターマーク v6 正規台帳の統一（#5403/#5418 v6）：プラグインレーンのウォーターマークターンが形状妥当なホストIDリストを持ち、かつ履歴途中の未知IDがまだ既知のIDより前にある場合（＝釘留めプレフィックスコアが記述する内容を変えたクライアントの構造的書き換え（コンパクション/挿入））— このノブが判定を決める：ON（デフォルト）はそのターンに一度だけ保守的な legacy パス（クレジットミス、自己修復による再スタンプ）を支払うため、増分は次のターンから新メッセージとして通り抜け、その新しいIDはセッションの累積ホストID台帳（`pf:state.lg`、FIFO 上限）に追記される — 抑制ロジックなし、投機的な再構築はしない；OFF はそれらのターンで pre-v6 挙動を復元する（書き換えは ID のみ裁定の下で釘留めプレフィックスに乗る、バイト比較は診断に格下げ）。既に有効なウォーターマークコホート内のIDリストターンにのみ影響；カウントのみのターンはどちらの値でもバイト同一。`false` / 環境変数 = 0 で強制オフ。`technical-notes.md` の「Full-resend watermark fastpath」を参照。"
