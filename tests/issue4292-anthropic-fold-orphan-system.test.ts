@@ -9,17 +9,19 @@ import {
 } from "acp-kernel/wire";
 import type { BiliMessage } from "acp-kernel/wire";
 
-// #4292 → #4457: a compression fold can cover the assistant messages that
-// legitimized a client mid-conversation system. coreToAnthropic ends with a
-// POSITION-based backstop: any non-directive system whose first non-system
-// follower is neither an assistant nor the array end is healed — re-voiced
-// to user with tool_addition/tool_removal blocks stripped (WC-022) and
-// dropped when nothing remains. The fold layer keeps these sidecar systems
-// out of folds (kernel protected.ts never-fold carve — their tool deltas
-// are functional), so folds still orphan them; the backstop also heals
-// sessions folded by older builds and positionally-illegal client input.
-// Legal layouts
-// (assistant next, array end, directive-only anywhere) stay byte-exact.
+// #4292 → #4457 → #4818: a compression fold can cover the messages that
+// legitimized a client mid-conversation system on either side. coreToAnthropic
+// ends with a POSITION-based backstop: plain systems in an illegal position
+// are re-voiced to user and dropped when nothing remains; systems carrying
+// functional tool deltas (tool_addition/tool_removal) are RELOCATED to the
+// next legal slot instead (#4818) — stripping their WC-022 blocks splits
+// paired chains (orphaned tool_removal → hard 400 tool_reference_unresolved;
+// addition-only carriers → silent permanent tool loss). The fold layer keeps
+// these sidecar systems out of folds (kernel protected.ts never-fold carve —
+// their tool deltas are functional), so folds still orphan them; the
+// backstop also heals sessions folded by older builds and positionally-illegal
+// client input. Legal layouts (assistant next, array end, directive-only
+// anywhere) stay byte-exact.
 
 /** Indices of system entries violating the Anthropic position rule. */
 function orphanSystems(messages: AnthropicWireMessage[]): number[] {
@@ -96,16 +98,16 @@ test("without the anchor adjacent, the orphaned system heals anyway (#4457 backs
   const cores = postFoldCore().filter((m) => m.id !== "anchor");
   const rebuilt = coreToAnthropic(cores as never);
   assert.deepEqual(orphanSystems(rebuilt), []);
-  assert.equal(rebuilt[1]!.role, "user");
-  assert.deepEqual(rebuilt[1]!.content, [
-    {
-      type: "text",
-      text: 'Updated system prompt section "tools":\n<tools>…</tools>',
-    },
+  // #4818: the tool-delta carrier relocates to the next legal slot (array
+  // end) with its block intact instead of being demoted and stripped.
+  assert.deepEqual(rebuilt, [
+    { role: "user", content: [{ type: "text", text: "enable subagents" }] },
+    { role: "user", content: [{ type: "text", text: "next question" }] },
+    CLIENT_SYSTEM,
   ]);
 });
 
-test("post-fold: the backstop re-voices the orphan, tool blocks stripped (#4457)", () => {
+test("post-fold: the backstop relocates the tool-delta orphan with its block intact (#4818)", () => {
   const cores = postFoldCore();
   const rebuilt = coreToAnthropic(cores as never);
   assert.deepEqual(
@@ -113,23 +115,18 @@ test("post-fold: the backstop re-voices the orphan, tool blocks stripped (#4457)
     [],
     "no illegal-position system remains after the fold guard",
   );
-  // The orphaned system became a user message: text blocks byte-identical,
-  // tool_addition stripped (WC-022 forbids it outside role:system).
-  assert.equal(rebuilt[1]!.role, "user");
-  assert.deepEqual(rebuilt[1]!.content, [
-    {
-      type: "text",
-      text: 'Updated system prompt section "tools":\n<tools>…</tools>',
-    },
-  ]);
   // Anchor + tail keep their user mapping with verbatim text.
-  assert.deepEqual(rebuilt[2], {
+  assert.deepEqual(rebuilt[1], {
     role: "user",
     content: [
       { type: "text", text: ANCHOR_TEXT },
       { type: "text", text: "next question" },
     ],
   });
+  // #4818: the orphaned tool-delta carrier moved to the next legal slot
+  // (array end) VERBATIM — demote-strip would have split its delta chain.
+  assert.equal(rebuilt[2]!.role, "system");
+  assert.deepEqual(rebuilt[2]!.content, CLIENT_SYSTEM.content);
   // The session-stored sidecar object was not mutated by the re-voicing.
   assert.equal(
     (cores[1]!.rawAnthropicMessage as AnthropicSystemMessage).role,
