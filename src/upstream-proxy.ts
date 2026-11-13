@@ -486,15 +486,20 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
     return new Promise((resolve, reject) => {
         const socket = openProxySocket(proxy);
         let settled = false;
+        const closedBeforeHeaders = () => finishError(new Error(`upstream proxy CONNECT ${host}:${port} closed before response headers`));
         const finishError = (error: Error) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            socket.removeListener("end", closedBeforeHeaders);
+            socket.removeListener("close", closedBeforeHeaders);
             socket.destroy();
             reject(error);
         };
         const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), CONNECT_TIMEOUT_MS);
         socket.once("error", finishError);
+        socket.once("end", closedBeforeHeaders);
+        socket.once("close", closedBeforeHeaders);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
             const authority = `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
@@ -525,6 +530,8 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
                 settled = true;
                 clearTimeout(timer);
                 socket.removeListener("error", finishError);
+                socket.removeListener("end", closedBeforeHeaders);
+                socket.removeListener("close", closedBeforeHeaders);
                 const rest = buffer.subarray(end + 4);
                 if (rest.length > 0) socket.unshift(rest);
                 resolve(socket);
