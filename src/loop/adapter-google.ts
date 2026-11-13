@@ -5,7 +5,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData } from "../sse-util.js";
 
 import type {
     CompressLoopAdapter,
@@ -133,10 +133,7 @@ function filterRealCallChunk(
 }
 
 function dataLine(frame: string): string | null {
-    for (const line of frame.split("\n")) {
-        if (line.startsWith("data:")) return line.slice(5).trim();
-    }
-    return null;
+    return sseEventData(frame)?.trim() ?? null;
 }
 
 interface GoogleChunk {
@@ -219,7 +216,7 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                         const json = buf.slice(elementStart, cursor + 1);
                         started = false;
                         elementStart = -1;
-                        yield { frame: `data: ${json}`, json };
+                        yield { frame: `data: ${json.replace(/\r\n|\r|\n/g, "\ndata: ")}`, json };
                     }
                 }
             }
@@ -456,7 +453,7 @@ export function createGoogleAdapter(
                 for (const { json, parsed, callIndexes } of rawCallChunks) {
                     const filtered = filterRealCallChunk(parsed, realIndexes, callIndexes);
                     if (filtered === "keep") {
-                        yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: Buffer.from(`data: ${json.replace(/\r\n|\r|\n/g, "\ndata: ")}\n\n`, "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
                         yield { kind: "meta", chunk: sseFrame(filtered) } as ParsedStreamEvent;
                     } else {

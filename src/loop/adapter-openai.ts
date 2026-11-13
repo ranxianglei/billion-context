@@ -5,7 +5,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData, replaceSseEventData } from "../sse-util.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 
 import type {
@@ -147,13 +147,14 @@ function rewriteDeltaFields(parsed: Record<string, unknown>, fields: Record<stri
 // emitted once, at the end, by emitCompletion. Leaking an early finish makes every
 // later token "content after the finish reason" to the client.
 function stripFinishReasonChunk(buf: Buffer): Buffer {
-    const m = /^data: (.*)\n\n$/s.exec(buf.toString("utf8"));
-    if (!m) return buf;
+    const frame = buf.toString("utf8");
+    const data = sseEventData(frame);
+    if (data === null) return buf;
     try {
-        const parsed = JSON.parse(m[1]) as { choices?: Array<Record<string, unknown>> };
+        const parsed = JSON.parse(data) as { choices?: Array<Record<string, unknown>> };
         if (!Array.isArray(parsed.choices)) return buf;
         parsed.choices = parsed.choices.map((c) => ({ ...c, finish_reason: null }));
-        return Buffer.from(`data: ${JSON.stringify(parsed)}\n\n`, "utf8");
+        return Buffer.from(replaceSseEventData(frame, JSON.stringify(parsed)), "utf8");
     } catch {
         return buf;
     }
@@ -435,7 +436,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 for (const { json, parsed } of rawToolChunks) {
                     const filtered = filterRealToolFragments(parsed, realIndexes);
                     if (filtered === "keep") {
-                        yield { kind: "meta", chunk: Buffer.from("data: " + json + "\n\n", "utf8") } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: Buffer.from("data: " + json.replace(/\n/g, "\ndata: ") + "\n\n", "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
                         yield { kind: "meta", chunk: Buffer.from("data: " + JSON.stringify(filtered) + "\n\n", "utf8") } as ParsedStreamEvent;
                     } else {
@@ -458,9 +459,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 pending.clear();
             };
             for await (const eventStr of iterSseChunks(upstream)) {
-                const dataLine = eventStr.split("\n").find((l) => l.startsWith("data:"));
-                if (!dataLine) continue;
-                const jsonStr = dataLine.slice(5).trim();
+                const data = sseEventData(eventStr);
+                if (data === null) continue;
+                const jsonStr = data.trim();
                 if (jsonStr === "[DONE]") {
                     yield* flushFilter();
                     if (sawRealToolCall) {
