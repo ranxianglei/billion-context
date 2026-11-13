@@ -43,7 +43,10 @@ type CoverageShape = "full" | "tail-gap" | "head-gap" | "holes" | "none";
 /** Where the missing covered ids sit, in the block's own coverage order.
  *
  *  - `tail-gap`  survivors are a prefix, everything missing is the newest end:
- *                a rewind removed the span's tail -> the summary is stale.
+ *                EITHER a rewind (the tail was withdrawn -> the summary is
+ *                stale) OR id churn (a re-stamp re-minted the tail in place ->
+ *                still live). The shape alone cannot tell them apart; the
+ *                liveness check (tailGapIsChurn) does.
  *  - `head-gap`  survivors are a suffix, everything missing is the oldest end:
  *                the host dropped old history; the summary is the ONLY record
  *                of it, so dropping it too would be the actual loss.
@@ -63,6 +66,41 @@ function coverageShape(
   if (present.slice(0, lastPresent + 1).every(Boolean)) return "tail-gap";
   if (present.slice(firstPresent).every(Boolean)) return "head-gap";
   return "holes";
+}
+
+/** #5166: a tail gap is id churn (a model re-stamp / re-serialization re-minted
+ * the newest covered ids in place), not a rewind, when the current history
+ * carries at least as many messages BEYOND the surviving covered prefix as
+ * there are missing covered ids — the re-minted tail occupies the same slots,
+ * so the span is still live and the summary still describes content on the
+ * wire. A true rewind leaves fewer messages beyond the prefix than the
+ * withdrawn tail (those slots are empty), so the summary is stale. Works
+ * without ledgerSeq stamps: the re-stamp e2e (#2265) is unstamped, so the
+ * positional witness cannot carry this case.
+ */
+function tailGapIsChurn(
+  block: { effectiveMessageIds: string[] },
+  presentBases: Set<string>,
+  messages: CoreMessage[],
+): boolean {
+  const effIds = block.effectiveMessageIds;
+  let lastPresent = -1;
+  for (let i = 0; i < effIds.length; i++) {
+    if (presentBases.has(baseIdOf(effIds[i]!))) lastPresent = i;
+  }
+  const missing = effIds.length - lastPresent - 1;
+  if (missing <= 0) return true;
+  const anchorBase = baseIdOf(effIds[lastPresent]!);
+  let anchorIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const id = messages[i]!.id;
+    if (typeof id === "string" && baseIdOf(id) === anchorBase) {
+      anchorIdx = i;
+      break;
+    }
+  }
+  if (anchorIdx < 0) return true; // defensive: anchor absent -> keep
+  return messages.length - anchorIdx - 1 >= missing;
 }
 
 export interface SyncResult {
@@ -216,7 +254,13 @@ export function syncBlocks(
     // span; `every` answered "is all of it there" but treated id churn like a
     // deletion. The shape of the gap decides:
     //
-    //   tail gap  -> rewind (the host withdrew the newest end)  -> stale, drop
+    //   tail gap  -> either a rewind (the host withdrew the newest end ->
+    //                stale, drop) OR id churn (a re-stamp re-minted the newest
+    //                covered ids in place -> still live, keep). The two share
+    //                one shape, so the gap alone cannot decide: tailGapIsChurn
+    //                asks whether the history still carries the missing tail
+    //                (enough messages beyond the surviving prefix) before
+    //                treating the gap as a withdrawal.
     //   head gap  -> the host dropped OLD history; the summary is the only
     //                record of it, so keep it (dropping it would lose content)
     //   holes     -> id churn (interior gaps are never the rewind shape):
@@ -226,7 +270,8 @@ export function syncBlocks(
     //                merged-pair shape rather than a deletion
     //
     // Everything except the tail gap keeps today's keep-alive behaviour, so the
-    // only behaviour that changes is the one shape that can be named.
+    // only behaviour that changes is the one shape that can be named — and even
+    // there only the confirmed-withdrawal half of it.
     const shape = coverageShape(block, presentBases);
     let stillPresent: boolean;
     if (presentIds.has(summaryMessageId(block.blockId))) {
@@ -240,7 +285,7 @@ export function syncBlocks(
           stillPresent = true;
           break;
         case "tail-gap":
-          stillPresent = false;
+          stillPresent = tailGapIsChurn(block, presentBases, messages);
           break;
         case "none":
           stillPresent = blockSeqPresent(block, messages);

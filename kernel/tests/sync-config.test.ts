@@ -53,6 +53,49 @@ test("syncBlocks deactivates a block whose span was partially truncated (rewind)
   assert.equal(result.state.blocks[0]!.active, false);
 });
 
+// #5166: the mirror of the rewind above. A model re-stamp re-mints the newest
+// covered ids in place (same slots, fresh content-hash ids), leaving the SAME
+// tail-gap shape as a rewind — but the span is still live, so the summary must
+// survive. The discriminator works without ledgerSeq stamps: the history
+// carries as many messages beyond the surviving prefix as there are missing
+// covered ids, so the gap is churn, not a withdrawal. (The #2265 re-stamp e2e
+// is unstamped, so the positional witness cannot carry this case.)
+test("syncBlocks keeps a tail-gap block whose missing tail was re-minted in place (re-stamp churn)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["u1", "a1", "u2"] }),
+  );
+  // u1 survives; a1 and u2 were re-stamped (fresh ids a1-re, u2-re); the
+  // history continues with newer messages.
+  const visible: CoreMessage[] = [
+    msg("u1"),
+    { id: "a1-re", role: "assistant", contentType: "text", text: "[via model:x] a1" },
+    { id: "u2-re", role: "user", contentType: "text", text: "<system-reminder>u2" },
+    msg("a2"),
+    msg("u3"),
+    msg("a3"),
+    msg("u4"),
+  ];
+  const result = syncBlocks(visible, state);
+  assert.deepEqual(result.deactivated, []);
+  assert.equal(result.state.blocks[0]!.active, true);
+});
+
+// #5166: the boundary the churn rule must NOT cross. A rewind that withdraws
+// the tail and appends FEWER new messages than it withdrew leaves a tail gap
+// with too few messages beyond the surviving prefix to account for the missing
+// ids -> the tail was genuinely cut -> stale, drop.
+test("syncBlocks deactivates a tail-gap block whose withdrawn tail outnumbers the appended messages (rewind + short append)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["m1", "m2", "m3"] }),
+  );
+  // m1 survives; m2, m3 were withdrawn; only ONE new message (n1) appended.
+  const result = syncBlocks([msg("m1"), msg("n1")], state);
+  assert.deepEqual(result.deactivated, ["b1"]);
+  assert.equal(result.state.blocks[0]!.active, false);
+});
+
 // #4592: the mirror shape of a rewind. The host dropped OLD history from the
 // head; the summary is the only record of it, so dropping the summary too is the
 // actual loss. This is what makes sliding-window / head-truncating hosts safe.
