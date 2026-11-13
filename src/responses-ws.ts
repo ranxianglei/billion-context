@@ -82,6 +82,25 @@ function isPrewarmProbe(body: JsonObject): boolean {
         object(item) && (item.type === undefined || item.type === "message") && (item.role === "developer" || item.role === "system" || item.role === "user"));
 }
 
+// x.ai's Responses WebSocket rejects a stale previous_response_id with an
+// HTTP-style envelope and no top-level type:
+//   {"error":{"message":"gRPC error: Response with id=<id> not found","type":"api_error"}}
+// OpenAI uses {type:"error", error:{code:"previous_response_not_found"}}.
+// Closing the socket on the x.ai frame hides the miss and arms emergency shrink.
+const XAI_RESPONSE_MISSING = /Response with id=\S+ not found/;
+
+function continuationRejected(error: JsonObject, status: unknown): boolean {
+    if (error.code === "previous_response_not_found") return true;
+    if (status === 400 && (error.code === undefined || error.code === "invalid_request_error")) return true;
+    const message = error.message;
+    return error.type === "api_error" && typeof message === "string" && XAI_RESPONSE_MISSING.test(message);
+}
+
+function untypedErrorEnvelope(frame: unknown): { frame: JsonObject; error: JsonObject } | undefined {
+    if (!object(frame) || typeof frame.type === "string" || !object(frame.error)) return undefined;
+    return { frame, error: frame.error };
+}
+
 function describeEventType(frame: unknown): string {
     if (frame === null) return "null";
     if (!object(frame)) return Array.isArray(frame) ? "array" : String(typeof frame);
@@ -224,32 +243,33 @@ export class ResponsesWsHistory {
         if (!Array.isArray(request.input)) throw new Error("response.create requires an input array");
         if (previous !== undefined && previous !== null) {
             if (previous !== this.checkpoint?.id) throw new Error("previous_response_not_found");
-            // Walk the checkpoint chain oldest→newest. The base level always
+            // Replay the checkpoint chain oldest→newest. The base level always
             // carries a complete reconstruction in request.input; every later
             // level contributes only its own tail + output (its augmented body
             // would double-count the echoed previous output otherwise).
             const levels: Checkpoint[] = [];
             let cursor: Checkpoint | undefined = this.checkpoint;
             while (cursor) {
-                levels.unshift(cursor);
+                levels.push(cursor);
                 cursor = cursor.base;
             }
-            const base = levels[0];
+            const base = levels[levels.length - 1];
             if (!base || !Array.isArray(base.request.input)) throw new Error("previous_response_not_found");
             // Per-level contribution in conversation order: the base's complete
             // input, then each later level's own tail followed by its output.
-            let input: unknown[] = [];
-            for (let i = 0; i < levels.length; i++) {
+            const input: unknown[] = [];
+            for (let i = levels.length - 1; i >= 0; i--) {
                 const level = levels[i];
-                if (i === 0 && Array.isArray(level.request.input)) input = [...input, ...level.request.input];
-                else if (Array.isArray(level.tail)) input = [...input, ...level.tail];
-                input = [...input, ...level.output];
+                const added = i === levels.length - 1 ? level.request.input : level.tail;
+                if (Array.isArray(added)) for (const item of added) input.push(item);
+                for (const item of level.output) input.push(item);
             }
+            for (const item of request.input) input.push(item);
             // #2966: generate is a per-request action control, not conversation
             // state — a prewarm's generate:false must not leak into a continuation
             // that omits the field (the upstream would then refuse to generate).
-            const { generate: _priorGenerate, ...topRequest } = levels[levels.length - 1].request;
-            return { ...topRequest, ...request, input: [...input, ...request.input] };
+            const { generate: _priorGenerate, ...topRequest } = levels[0].request;
+            return { ...topRequest, ...request, input };
         }
         return request;
     }
@@ -501,6 +521,22 @@ export class ResponsesWsUpstream {
                 try {
                     if (typeof event.data !== "string" || Buffer.byteLength(event.data) > this.requestBytes) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
+                    const bare = untypedErrorEnvelope(frame);
+                    if (bare && !settled) {
+                        if (retryFull && continuationRejected(bare.error, bare.frame.status)) {
+                            retryFull = false;
+                            this.resetHistory("continuation-rejected");
+                            this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
+                            sendCreate(body);
+                            return;
+                        }
+                        clean();
+                        this.resetHistory("upstream-error");
+                        const status = typeof bare.frame.status === "number" && bare.frame.status >= 400 && bare.frame.status <= 599 ? bare.frame.status : 400;
+                        this.log("warn", `upstream rejected phase=await-first-event status=${status}`);
+                        resolve(new Response(JSON.stringify(bare.frame), { status, headers: { "content-type": "application/json" } }));
+                        return;
+                    }
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
                     receivedEvents++;
                     const completed = output.observe(frame);
@@ -513,7 +549,7 @@ export class ResponsesWsUpstream {
                             resolve(this.fetch(url, options, false));
                             return;
                         }
-                        if (retryFull && (error.code === "previous_response_not_found" || frame.status === 400 && (error.code === undefined || error.code === "invalid_request_error"))) {
+                        if (retryFull && continuationRejected(error, frame.status)) {
                             retryFull = false;
                             this.resetHistory("continuation-rejected");
                             this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
@@ -598,6 +634,16 @@ class ResponsesWsResponse extends http.ServerResponse {
         Object.defineProperty(this, "socket", { get: () => req.socket });
     }
 
+    // Socket-death semantics, as in InlineRes.destroy(): OutgoingMessage.destroy()
+    // emits 'close' only through its own socket slot (not the `socket` getter
+    // above), and the relay aborts the upstream only on 'close' while !writableEnded.
+    override destroy(error?: Error): this {
+        if (this.destroyed) return this;
+        super.destroy(error);
+        if (!this.ended) this.emit("close");
+        return this;
+    }
+
     override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding: BufferEncoding, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
@@ -649,13 +695,26 @@ class ResponsesWsResponse extends http.ServerResponse {
         if (!this.terminal && this.peer.readyState === WebSocket.OPEN) {
             let details: unknown;
             try { details = JSON.parse(this.buffer); } catch { details = undefined; }
-            this.peer.send(object(details)
-                ? JSON.stringify({ ...details, type: "error", status: this.statusCode >= 400 ? this.statusCode : 502 })
-                : errorFrame("incomplete_response", "Responses exchange ended without a terminal event", 502));
+            const status = this.statusCode >= 400 ? this.statusCode : 502;
+            if (!object(details)) {
+                this.peer.send(errorFrame("incomplete_response", "Responses exchange ended without a terminal event", status));
+            } else {
+                // #4601: the WS-lane error contract is { type, status, error: { code?, message?, headers? } }
+                // (codex parse_wrapped_websocket_error_event) — a string `error` fails that deserialization and
+                // codex waits out its idle timeout instead of failing fast. Normalize at this one conversion
+                // point; the HTTP lanes keep their own string-error contract untouched.
+                const rawError = details.error;
+                const detailText = typeof details.detail === "string" ? details.detail : "";
+                const error: Record<string, unknown> = object(rawError) ? rawError
+                    : typeof rawError === "string"
+                        ? { code: "proxy_failure", message: detailText !== "" && detailText !== rawError ? `${rawError}: ${detailText}` : rawError }
+                        : { code: "incomplete_response", message: "Responses exchange ended without a terminal event" };
+                this.peer.send(JSON.stringify({ ...details, error, type: "error", status }));
+            }
         }
         this.ended = true;
         this.emit("finish");
-        this.emit("close");
+        if (!this.destroyed) this.emit("close");
         const cb = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : callback;
         if (typeof cb === "function") cb();
         return this;
