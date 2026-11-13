@@ -1,5 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import fs from "node:fs";
@@ -15,17 +16,25 @@ for (const name of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"]) {
 const { getInlineEngine, INLINE_ORIGIN, _resetInlineEngineForTest } = await import("../src/inline-engine.ts");
 const engine = await getInlineEngine();
 let hits = 0;
+const streamResponses: http.ServerResponse[] = [];
 const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", chunk => chunks.push(Buffer.from(chunk)));
     req.on("end", () => {
         hits++;
+        if (req.url === "/signal-stream") {
+            streamResponses.push(res);
+            res.writeHead(200, { "content-type": "text/plain" });
+            res.write("first");
+            return;
+        }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ method: req.method, headers: req.headers, body: Buffer.concat(chunks).toString() }));
     });
 });
 await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
 const target = `${INLINE_ORIGIN}/bili/http://127.0.0.1:${(upstream.address() as AddressInfo).port}/echo`;
+const streamTarget = target.replace(/\/echo$/, "/signal-stream");
 after(async () => {
     upstream.closeAllConnections();
     await new Promise<void>(resolve => upstream.close(() => resolve()));
@@ -151,3 +160,115 @@ test("GET body validation rejects before reaching the upstream", async () => {
     await assert.rejects(dispatch(target, { method: "GET", body: "invalid" }), TypeError);
     assert.equal(hits, before);
 });
+
+async function openStream(input: string | URL | Request, init?: RequestInit) {
+    const response = await engine.dispatch(input, init, globalThis.fetch);
+    const reader = response.body!.getReader();
+    assert.equal(Buffer.from((await reader.read()).value!).toString(), "first");
+    return { reader, source: streamResponses.at(-1)! };
+}
+
+async function finishStream(stream: Awaited<ReturnType<typeof openStream>>): Promise<void> {
+    stream.source.end("last");
+    let tail = "";
+    for (;;) {
+        const chunk = await stream.reader.read();
+        if (chunk.done) break;
+        tail += Buffer.from(chunk.value).toString();
+    }
+    assert.equal(tail, "last");
+}
+
+async function closeStream(stream: Awaited<ReturnType<typeof openStream>>): Promise<void> {
+    if (!stream.source.writableEnded) stream.source.end();
+    await stream.reader.cancel().catch(() => {});
+}
+
+for (const kind of ["string", "URL"] as const) {
+    test(`normalizing a ${kind} input leaves cancellation with the dispatcher`, async () => {
+        const controller = new AbortController();
+        const ownListener = (): void => {};
+        controller.signal.addEventListener("abort", ownListener);
+        const stream = await openStream(kind === "string" ? streamTarget : new URL(streamTarget), { signal: controller.signal });
+        try {
+            assert.equal(getEventListeners(controller.signal, "abort").length, 2, "only the caller and dispatcher own listeners");
+            await finishStream(stream);
+            assert.deepEqual(getEventListeners(controller.signal, "abort"), [ownListener]);
+        } finally {
+            controller.abort();
+            await closeStream(stream);
+        }
+    });
+}
+
+test("normalizing a Request does not retain a dependency on its signal", async () => {
+    const controller = new AbortController();
+    const input = new Request(streamTarget, { signal: controller.signal });
+    const before = getEventListeners(input.signal, "abort");
+    const stream = await openStream(input);
+    try {
+        // Request-only dispatch signal inheritance is a separate transport
+        // concern; the temporary body/header normalizer must not own it.
+        await finishStream(stream);
+        assert.deepEqual(getEventListeners(input.signal, "abort"), before);
+    } finally {
+        controller.abort();
+        await closeStream(stream);
+    }
+});
+
+test("an explicit init signal owns cancellation instead of the Request signal", async () => {
+    const original = new AbortController();
+    const replacement = new AbortController();
+    const input = new Request(streamTarget, { signal: original.signal });
+    const stream = await openStream(input, { signal: replacement.signal });
+    try {
+        assert.equal(getEventListeners(input.signal, "abort").length, 0);
+        assert.equal(getEventListeners(replacement.signal, "abort").length, 1);
+        original.abort(new Error("original request cancelled"));
+        assert.equal(replacement.signal.aborted, false);
+        replacement.abort(new Error("effective signal cancelled"));
+        await assert.rejects(stream.reader.read(), /client aborted/);
+        assert.equal(getEventListeners(replacement.signal, "abort").length, 0);
+    } finally {
+        original.abort();
+        replacement.abort();
+        await closeStream(stream);
+    }
+});
+
+test("an explicit null signal keeps an aborted Request override independent", async () => {
+    const original = new AbortController();
+    const input = new Request(streamTarget, { signal: original.signal });
+    original.abort(new Error("overridden request cancellation"));
+    const stream = await openStream(input, { signal: null });
+    try {
+        await finishStream(stream);
+        assert.equal(getEventListeners(input.signal, "abort").length, 0);
+    } finally { await closeStream(stream); }
+});
+
+test("a body read failure does not retain the init signal before dispatch starts", async () => {
+    const controller = new AbortController();
+    const failure = new Error("normalization body failed");
+    const body = new ReadableStream<Uint8Array>({ start(stream) { stream.error(failure); } });
+    const before = hits;
+    try {
+        await assert.rejects(dispatch(target, { method: "POST", body, duplex: "half", signal: controller.signal } as RequestInit), error => error === failure);
+        assert.equal(hits, before);
+        assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+    } finally { controller.abort(); }
+});
+
+for (const kind of ["inherited", "non-enumerable"] as const) {
+    test(`RequestInit keeps ${kind} body, method, and header members`, async () => {
+        const fields: RequestInit = { method: "POST", body: "dictionary body", headers: { "x-dictionary": kind } };
+        const init: RequestInit = kind === "inherited"
+            ? Object.create(fields) as RequestInit
+            : Object.create(null, Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, { value }]))) as RequestInit;
+        const result = await dispatch(target, init);
+        assert.equal(result.method, "POST");
+        assert.equal(result.body, "dictionary body");
+        assert.equal(result.headers["x-dictionary"], kind);
+    });
+}

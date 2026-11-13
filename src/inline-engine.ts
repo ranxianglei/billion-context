@@ -207,7 +207,11 @@ class InlineRes extends EventEmitter {
 }
 
 async function toInlineReq(input: FetchInput, init?: RequestInit): Promise<InlineReq> {
-    const request = new Request(input, init);
+    // Only normalize body/header semantics here; the dispatcher owns and
+    // detaches the caller's cancellation listener. A dependent Request signal
+    // would leave a second listener behind. Inherit dictionary members so
+    // prototype and non-enumerable RequestInit fields retain Fetch semantics.
+    const request = new Request(input, Object.create(init ?? null, { signal: { value: null } }) as RequestInit);
     const headerMap: Record<string, string | string[] | undefined> = {};
     request.headers.forEach((value, key) => {
         const existing = headerMap[key];
