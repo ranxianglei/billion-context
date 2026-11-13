@@ -70,7 +70,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1610,6 +1610,19 @@ async function handleRequest(
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
+                // #6548: a single-shot server-tool-only Responses call (the
+                // pi-web-access xAI web search: string input, web_search /
+                // x_search tools, no history) is not a conversation turn — it
+                // carries no history to fingerprint and creates no session
+                // state, so the #286 refusal's rationale does not apply to
+                // it, and the client cannot carry an identity here. Forward
+                // it verbatim (same raw relay as the #1117 passthrough) so
+                // the search backend keeps working instead of hard-400ing.
+                if (protocol === "responses" && isResponsesServerToolSingleShot(parsed)) {
+                    log("info", `single-shot server-tool Responses call — no conversation identity possible; forwarding verbatim (#6548): ${maskUrlForLog(req.url ?? "")}`);
+                    await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+                    return;
+                }
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify(protocol === "anthropic"
