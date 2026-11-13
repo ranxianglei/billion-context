@@ -29,8 +29,12 @@ export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
 // session's proxy lane serially — the step keeps waiting seconds to tens of
 // seconds after its first byte. Own id so its dismissal is independent.
 export const IOT_INCOMPAT_NOTICE_ID = "iot-incompat";
+// This release's storage-default flip to pure sqlite: JSON envelope writing is
+// OFF by default (the SQLite index becomes the sole persistent copy). Own id
+// so dismissal stays independent of the others.
+export const SQLITE_DEFAULT_NOTICE_ID = "storage-sqlite-default";
 
-const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, IOT_INCOMPAT_NOTICE_ID]);
+const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, IOT_INCOMPAT_NOTICE_ID, SQLITE_DEFAULT_NOTICE_ID]);
 // #5548 P2: local announcements dismiss as `<id>@<content-hash16>` so edited
 // content re-nags exactly once; the hash shape is the only dynamic form the
 // store accepts (raw local ids never enter it — those use instance/always).
