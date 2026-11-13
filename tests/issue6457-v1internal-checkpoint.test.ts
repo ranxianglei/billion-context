@@ -185,6 +185,21 @@ test("truncateV1ContentsForBudget: a single giant anchor that cannot fit is retu
     assert.equal(result[0].parts[0].text, contents[0].parts[0].text, "the anchor itself is returned (caller blocks)");
 });
 
+test("truncateV1ContentsForBudget: tail head collides with the anchor role → drop the tail head, keep the anchor", () => {
+    // 4 entries, each ~502 tokens: [user(0), model(1), user(2), model(3)].
+    // The budget keeps the two most recent entries (2, 3) but not entry 1, so
+    // the tail head (user, entry 2) collides with the anchor's role (user,
+    // entry 0). The join fix must drop the tail head (entry 2), NOT the anchor
+    // (entry 0), so the first user instruction survives.
+    const contents = giantContents(4, 2000);
+    const result = truncateV1ContentsForBudget(contents, 1750) as Content[];
+    assert.equal(result.length, 2, "anchor + one tail entry after the collision drop");
+    assert.equal(result[0].parts[0].text, contents[0].parts[0].text, "the anchor (first user instruction) is kept, not dropped");
+    assert.equal(result[1].parts[0].text, contents[3].parts[0].text, "the most recent entry is kept");
+    assert.notEqual(result[1].role, result[0].role, "the join alternates");
+    assert.ok(estimateRawBodyTokens({ contents: result }) <= 1750, "the result fits the budget");
+});
+
 // --- Integration tests: the size-gated v1internal bypass ---------------------
 
 test("#6457 A: a checkpoint that FITS the window is forwarded verbatim (unchanged)", async () => {

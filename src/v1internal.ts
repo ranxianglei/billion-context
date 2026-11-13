@@ -146,11 +146,12 @@ export function truncateV1ContentsForBudget(contents: unknown, budget: number): 
         result = [anchor, ...tail];
     }
 
-    // Preserve Gemini's strict role alternation at the join: drop leading tail
-    // contents whose role matches the anchor until they alternate (the original
-    // is alternating, so at most one drop is needed; loop for safety).
-    while (result.length > 1 && result[0].role === result[1].role) {
-        result = result.slice(1);
+    // Preserve Gemini's strict role alternation at the join: if the tail head's
+    // role matches the anchor's, drop the tail head (NOT the anchor) so the
+    // first user instruction survives and the join alternates. The original is
+    // alternating, so at most one drop is needed.
+    if (result.length > 1 && result[1].role === result[0].role) {
+        result.splice(1, 1);
     }
     // Gemini requires the first content to be user role.
     while (result.length > 0 && result[0].role !== "user") {
