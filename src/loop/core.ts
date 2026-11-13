@@ -1045,6 +1045,11 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // Parsing may stop on an in-band error before HTTP EOF. Release
+                // this attempt before a retry replaces currentUpstream. A dump
+                // tee can still own its sibling, so do not await cancellation.
+                void currentUpstream.cancel().catch(() => {});
+
                 // #2701: threads acceptance. This round's response started ⇔
                 // the tail advanced past the id the sent body continued from ⇔
                 // that body (with its in-flight delta slice) was consumed
@@ -1886,6 +1891,9 @@ export async function* runCompressLoop(
             roundBody = newBody;
         }
     } finally {
+        // Consumer return or a parser throw can bypass the per-attempt cleanup.
+        // Adapters have released their readers; cancelling a closed body is a no-op.
+        void currentUpstream.cancel().catch(() => {});
         // #2701: anthropic Threads — persist every response id observed this
         // turn (round 1's message_start id first, then one per internal
         // round) so an inbound continue targeting an id the PROXY itself
