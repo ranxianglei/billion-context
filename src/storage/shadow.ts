@@ -26,6 +26,7 @@
 
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
@@ -34,7 +35,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
@@ -63,6 +64,11 @@ interface ResidentFields {
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
+
+/** #5744: wall-clock threshold for the slow-ingest warn (ms). The old
+ *  request-level warn keyed on message count, which cannot separate a fast
+ *  big session from a slow small one. */
+const SLOW_INGEST_WARN_MS = 500;
 
 /** #4323: consecutive sampled drifts required before escalating. A one-off
  *  drift is transient external churn (the watermark clear below heals it);
@@ -103,6 +109,32 @@ export function sqliteOpenFailureHint(err: string): string {
         return " (win32: 'attempt to write a readonly database' on an EXISTING index.db = the file opened read-only and the first write was refused by the OS — most often Windows integrity control (a process running at Low integrity cannot write Medium-labeled files, and a DSH-spawned node.exe can itself carry a Low label, e.g. after a stray 'icacls /setintegritylevel Low' — #5154), less often antivirus/Defender or another bili/dsh process holding the files; check the PROCESS side first — run icacls on your node.exe and if it reports a Low label restore it with 'icacls <path-to-node.exe> /setintegritylevel Medium' — do NOT relabel the sessions dir Low to match (that cements the mislabel and drags every file down with it); do NOT delete the file — in unified-full mode it may hold the only copy of recent session state)";
     }
     return "";
+}
+
+/** #5627: single-line forensic form of a record() failure — the error, the
+ *  failing PHASE, the session id, and the top stack frames. String(err)
+ *  alone is worthless for engine-level failures (a RangeError says "Maximum
+ *  call stack size exceeded" without saying WHERE); pre-fix both the warn
+ *  line and stats.lastError (the panel/status carrier) discarded everything
+ *  but the bare message, leaving such failures undiagnosable (#5627). Frames
+ *  are trimmed so the line stays grep-able; shortenError() on the status
+ *  side truncates the rest. */
+export function formatShadowFailure(err: unknown, phase: string, sessionId: string | undefined): string {
+    const detail = `${String(err)} | phase=${phase} | session=${sessionId ?? "-"}`;
+    const stack = err instanceof Error ? err.stack : undefined;
+    if (typeof stack !== "string") return cap(detail);
+    const frames = stack
+        .split("\n")
+        .slice(1, 7)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0)
+        .map((f) => (f.length > 96 ? `${f.slice(0, 96)}…` : f))
+        .join(" <- ");
+    return frames.length > 0 ? cap(`${detail} | ${frames}`) : cap(detail);
+}
+
+function cap(s: string): string {
+    return s.length > 700 ? `${s.slice(0, 697)}...` : s;
 }
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
@@ -193,6 +225,11 @@ export class UnifiedShadow {
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
+    /** Warn-dedup key of the last logged failure — the error message itself
+     *  (#5140: one warn per distinct message, no per-turn spam). #5627 makes
+     *  the message victim-specific where possible, so distinct victims still
+     *  each warn once. */
+    private lastWarnKey: string | null = null;
 
     private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend, dbPath?: string) {
         this.mode = mode;
@@ -203,17 +240,29 @@ export class UnifiedShadow {
     }
 
     /** #5103 / 2026-10-30 owner policy (never abandon index writes): record
-     *  every ingest failure with the file named — but a streak of the SAME
-     *  error message warns once (a permanently broken index must not add a log
-     *  line to every turn), while any NEW message warns immediately. Nothing is
-     *  ever disabled; the next save retries the write unconditionally. */
-    private noteIngestFailure(err: unknown): void {
-        const prev = this.stats.lastError ?? "";
-        const errStr = String(err);
+     *  every ingest failure with the file named — but the SAME error message
+     *  warns once (a permanently broken index must not add a log line to
+     *  every turn), while any NEW message warns immediately.
+     *  Nothing is ever disabled; the next save retries the write
+     *  unconditionally.
+     *  #5627: the recorded detail names the failing PHASE + SESSION + top
+     *  stack frames (formatShadowFailure) — an engine verdict like
+     *  "RangeError: Maximum call stack size exceeded" names nothing on its
+     *  own. The dedup key stays the MESSAGE (the #5140 pin: one warn per
+     *  distinct message), and the enrichment makes that key honest: the
+     *  serializer re-throw names the offending row (#5627), so distinct
+     *  victims carry distinct messages and each still gets its ONE warning,
+     *  while shared-root-cause failures (one SQLITE_BUSY across many
+     *  sessions) stay a single line. stats.lastError always carries the
+     *  LATEST failure's full detail regardless of dedup. */
+    private noteIngestFailure(err: unknown, phase: string, sessionId?: string): void {
+        const detail = formatShadowFailure(err, phase, sessionId);
         this.consecutiveFailures += 1;
-        this.stats.lastError = errStr;
-        if (errStr !== prev) {
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${errStr})${sqliteOpenFailureHint(errStr)} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
+        this.stats.lastError = detail;
+        const key = String(err);
+        if (key !== this.lastWarnKey) {
+            this.lastWarnKey = key;
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${detail})${sqliteOpenFailureHint(String(err))} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
     }
 
@@ -404,9 +453,14 @@ export class UnifiedShadow {
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
             return;
         }
+        // #5627: which stage is running — the failure forensics must name
+        // the operation that died, not just the engine's one-line verdict.
+        let phase = "legacy-load";
+        let sessionId: string | undefined;
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
+            sessionId = loaded.id;
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
             // journals the orphan contents into sessions.orphans_json and
@@ -434,8 +488,32 @@ export class UnifiedShadow {
             // full path below; the delta itself re-verifies the boundary
             // inside the ingest transaction, so a racing writer degrades to
             // a full ingest, never a corrupt one.
-            if (!this.ingestDelta(legacy, hasRawTail)) {
+            // #5744: wall-clock guard on the ingest itself — message count is
+            // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
+            // SAME ~3k msgs). Names the path so a spike is attributable
+            // (delta fast path vs full fallback) without a profiler.
+            const tIngestStart = performance.now();
+            let ingestPath = "delta";
+            phase = "ingest-delta";
+            // #5677: while drift-latched the sampled digest has PROVEN the
+            // stored view diverges from the live one — vouching for a trusted
+            // prefix is exactly the trust that sample just voided. A host that
+            // re-writes history slots below the watermark on every save (the
+            // #4614 producer class) makes the delta path re-diverge within ≤
+            // VERIFY_EVERY_INGESTS saves of each heal, so the samples drift in
+            // a row, the streak escalates and the envelope freezes — the
+            // chronic ESCALATED→FROZEN loop reported in #5677. Forcing the
+            // exact full path for every latched save keeps both legs
+            // same-generation at sample time: the next sample passes, the
+            // latch releases, the delta resumes. Bounded cost (full ingest per
+            // save) paid only by sessions whose views are already proven
+            // divergent; healthy sessions never see it.
+            const deltaApplied = !this.driftedSessions.has(legacy.id) && this.ingestDelta(legacy, hasRawTail);
+            if (!deltaApplied) {
+                ingestPath = "full";
+                phase = "plan-ingest";
                 const plan = planIngest(legacy);
+                phase = "ingest-session";
                 // #3285: only a raw-tail plan is the complete log — that is
                 // what lets the full path sweep foreign rows as stale.
                 // #5408: while drift-latched the ENVELOPE is what loadSync
@@ -450,11 +528,20 @@ export class UnifiedShadow {
                 this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
+            const ingestMs = Math.round(performance.now() - tIngestStart);
+            if (ingestMs > SLOW_INGEST_WARN_MS) {
+                // #5744: attach WAL forensics so a stall spike can be attributed
+                // to a checkpoint burst (multi-second tick inside the window)
+                // instead of per-row statement cost — read-only, warn path only.
+                const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+            }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
             // parity oracle, so it runs on the first ingest of a session and
             // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
             // stats.verifyDrift on the sampled saves).
+            phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
             if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
@@ -554,7 +641,7 @@ export class UnifiedShadow {
             }
             this.consecutiveFailures = 0;
         } catch (err) {
-            this.noteIngestFailure(err);
+            this.noteIngestFailure(err, phase, sessionId);
         }
     }
 
@@ -934,6 +1021,13 @@ export class UnifiedShadow {
         return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
+    /** #6029: per-msg_id stored bodies — the restamp-proof twin of
+     *  messageContentByRefNums (sync store only, like its sibling). */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (this.sync === null || msgIds.length === 0) return [];
+        return this.sync.messageContentByMsgIds(sessionId, msgIds);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         return this.sync.sessionSummaries();
@@ -1077,10 +1171,14 @@ export class UnifiedShadow {
      *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         void this.enqueue(async () => {
+            // #5627: same failing-stage forensics as the sync record() above.
+            let phase = "legacy-load";
+            let sessionId: string | undefined;
             try {
                 const backend = this.backend!;
                 const loaded0 = this.legacyLoad(record);
                 if (!loaded0) return;
+                sessionId = loaded0.id;
                 let legacy = loaded0;
                 let hasRawTail = false;
                 if (rawTail && rawTail.lastMessages.length > 0) {
@@ -1092,21 +1190,28 @@ export class UnifiedShadow {
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
+                phase = "ingest-delta";
                 let applied = false;
-                try {
-                    const mark = await backend.ingestWatermark(legacy.id);
-                    if (mark) {
-                        const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
-                        if (boundary) {
-                            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
-                            if (plan) {
-                                applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
-                                if (applied) this.stats.deltaIngests++;
+                // #5677: same latch gate as the sync path above — a drift-
+                // latched session's stored prefix is proven untrustworthy by
+                // definition; the exact full path keeps both legs same-
+                // generation so the next sample can re-admit and release it.
+                if (!this.driftedSessions.has(legacy.id)) {
+                    try {
+                        const mark = await backend.ingestWatermark(legacy.id);
+                        if (mark) {
+                            const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
+                            if (boundary) {
+                                const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
+                                if (plan) {
+                                    applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
+                                    if (applied) this.stats.deltaIngests++;
+                                }
                             }
                         }
+                    } catch {
+                        applied = false;
                     }
-                } catch {
-                    applied = false;
                 }
                 // #5412: mirror the sync path's latched-sweep promotion (#5408
                 // B1 / #4323). While the sampler has latched this session as
@@ -1117,8 +1222,14 @@ export class UnifiedShadow {
                 // incomplete view, the next sample drifts again, and the
                 // frozen session never self-heals.
                 const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
-                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog });
+                if (!applied) {
+                    phase = "plan-ingest";
+                    const plan = planIngest(legacy);
+                    phase = "ingest-session";
+                    await backend.ingestSession(plan, undefined, { completeLog });
+                }
                 this.stats.ingests++;
+                phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
                 if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
@@ -1149,7 +1260,7 @@ export class UnifiedShadow {
                 }
                 this.consecutiveFailures = 0;
             } catch (err) {
-                this.noteIngestFailure(err);
+                this.noteIngestFailure(err, phase, sessionId);
             }
         });
     }
@@ -1418,7 +1529,7 @@ interface DriftDiagnostics {
      *  converges the tables it owns; the sub-key names the actual residue. */
     stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
-    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
+    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint; /** #5677: top-level field names whose values disagree (names only). */ fields?: string[] };
 }
 
 /** Compare the replay by component, retaining only message fingerprints across batches. */
@@ -1427,7 +1538,10 @@ class BatchedViewVerification {
     private readonly tail: { tailSeqs: number[] | null; pluginSnapshotSeqs: number[] | null };
     private readonly remainingContents: LegacySessionLike["blockContents"];
     private readonly orphans: LegacySessionLike["blockContents"];
-    private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
+    // #5677: the parsed row rides along with its signature so the FIRST
+    // divergent slot can be field-diffed without re-reading the store; the
+    // verifier is per-sample and short-lived, so the extra retention is bounded.
+    private readonly messages = new Map<number, { sig: ReturnType<typeof messageSignature>; raw: unknown }>();
     private readonly keys = new Set<string>();
     private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
@@ -1478,7 +1592,10 @@ class BatchedViewVerification {
     }
 
     addMessages(rows: MessageRow[]): void {
-        for (const row of rows) this.messages.set(row.seq, messageSignature(JSON.parse(row.content)));
+        for (const row of rows) {
+            const raw = JSON.parse(row.content);
+            this.messages.set(row.seq, { sig: messageSignature(raw), raw });
+        }
     }
 
     private changed(key: string): void {
@@ -1492,26 +1609,61 @@ class BatchedViewVerification {
     }
 
     private compareMessages(key: "lastMessages" | "pluginSnapshot", seqs: number[] | null): void {
+        // The two legs intentionally hold different SLICES of the same log. The rows are
+        // the raw tail interned at save time (`tailSeqs`, oldest-first, the whole resident
+        // window); the envelope carries only `boundedFoldedSnapshot`, which prunes from the
+        // FRONT and keeps the NEWEST messages under `persist.tailTokens` (#2960 (5), caveat
+        // 2a). Measured on live sessions the envelope is an exact SUFFIX of the row tail —
+        // tail=1095/envelope=10 and tail=752/envelope=22, element-wise aligned at the end,
+        // zero id and zero content mismatches inside the overlap.
+        //
+        // Comparing positionally from index 0 therefore compared the oldest row against the
+        // oldest RETAINED message, i.e. off by `tail.length - messages.length`, so `want` was
+        // undefined for every slot outside the envelope window: `changed()` for every
+        // tailSeq, the streak latched, and each save paid a multi-second FULL ingest
+        // (measured: 44 full ingests, avg 4522 ms, max 9363 ms, 170.8 s of stalled event
+        // loop in one episode). Align the envelope to its suffix position instead and
+        // compare only the overlap — a genuine content divergence inside that window still
+        // reports, and a leg that is not a suffix produces mismatches rather than silence.
+        //
+        // Absence of a leg is handled by the header digest, which distinguishes `undefined`
+        // from `[]` (`withoutBulk`), so it must not be re-litigated here. Row PRESENCE is
+        // still checked (tailGaps, #4390) for every seq.
         const expected = this.legacy[key];
+        const tailLen = seqs?.length ?? 0;
+        const offset = expected === undefined ? 0 : Math.max(0, tailLen - expected.length);
         let index = 0;
         for (const seq of seqs ?? []) {
-            const got = this.messages.get(seq);
-            if (!got) {
+            const rec = this.messages.get(seq);
+            if (!rec) {
+                // A recorded tail pointer with no row: the table leg is shorter than the tail
+                // it claims, so this is a real divergence (#4390), not an alignment artifact.
                 this.tailGaps++;
+                this.changed(key);
+                if (key === "lastMessages" && !this.tailSlot) {
+                    this.tailSlot = { index, expect: missingSlot(), got: missingSlot() };
+                }
+                index++;
                 continue;
             }
-            const want = expected && index < expected.length ? messageSignature(expected[index]) : undefined;
-            if (!want || want.digest !== got.digest) {
+            const wantIndex = index - offset;
+            const want = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length ? messageSignature(expected[wantIndex]) : undefined;
+            if (want !== undefined && want.digest !== rec.sig.digest) {
                 this.changed(key);
                 if (key === "lastMessages" && expected && !this.tailSlot) {
-                    this.tailSlot = { index, expect: want?.slot ?? missingSlot(), got: got.slot };
+                    const fields = diffFieldNames(expected[wantIndex], rec.raw);
+                    this.tailSlot = fields === undefined
+                        ? { index, expect: want.slot, got: rec.sig.slot }
+                        : { index, expect: want.slot, got: rec.sig.slot, fields };
                 }
             }
             index++;
         }
-        if (seqs && expected && index < expected.length) {
+        // The envelope claims MORE messages than the row tail holds: the table leg lost rows
+        // the envelope still carries. That is a real divergence in either direction.
+        if (seqs && expected && expected.length > tailLen) {
             this.changed(key);
-            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index, expect: messageSignature(expected[index]).slot, got: missingSlot() };
+            if (key === "lastMessages" && !this.tailSlot) this.tailSlot = { index: tailLen, expect: messageSignature(expected[tailLen]).slot, got: missingSlot() };
         }
     }
 
@@ -1532,19 +1684,57 @@ function missingSlot(): DriftSlotFingerprint {
     return { id: "-", role: "-", length: 0, sha8: "-" };
 }
 
+/** #6351: the two legs hold the same message in DIFFERENT media representations.
+ *
+ *  Rows are written media-SPLIT (`planIngest` -> `splitMediaContent`: an
+ *  `imageBase64` payload and every >=2 KiB data URL become `{"$media":hash}`
+ *  CAS references), but `UnifiedStore.getMessages()` returns them media-
+ *  HYDRATED (`hydrateMedia` inlines the payload again) — the verifier reads the
+ *  tail through exactly that accessor, so its leg is hydrated while the
+ *  envelope's `lastMessages` keeps the split form.
+ *
+ *  Hashing the canonical JSON as-is therefore compares a ~2 KB placeholder
+ *  against a ~200 KB inlined payload for the SAME message and marks drift: a
+ *  measured 1,991 vs 201,293 bytes on one tool result, and ten 390-byte user
+ *  rows that hydrate to 112-672 KB. That is a digest-shape mismatch (#4392
+ *  family), so the latch it triggers re-ingests the whole tail forever (#5677).
+ *
+ *  Normalize BOTH legs to the split form before hashing: it is idempotent on
+ *  already-split input, so the envelope leg passes through unchanged, and
+ *  `splitMediaContent(hydrate(x)) === x` was verified byte-identical on every
+ *  media-bearing row sampled, so a real content edit still changes the digest.
+ */
 function messageSignature(value: unknown): { digest: string; slot: DriftSlotFingerprint } {
     const json = JSON.stringify(canonicalize(value)) ?? "null";
-    const digest = sha256(json);
+    const normalized = splitMediaContent(json).content;
+    const digest = sha256(normalized);
     const message = value as { id?: unknown; role?: unknown } | null;
     return {
         digest,
         slot: !message || typeof message !== "object" ? missingSlot() : {
             id: typeof message.id === "string" ? message.id : "-",
             role: typeof message.role === "string" ? message.role : "-",
-            length: json.length,
+            length: normalized.length,
             sha8: digest.slice(0, 8),
         },
     };
+}
+
+/** #5677: top-level field names whose canonicalized values disagree between
+ *  two slot copies. NAMES ONLY — values never leave this function (the log
+ *  line goes to disk and mirrors publicly). undefined when either side is not
+ *  a plain object; for two plain objects a digest mismatch always names ≥1
+ *  field, so an empty result is impossible there. */
+function diffFieldNames(a: unknown, b: unknown): string[] | undefined {
+    if (!a || typeof a !== "object" || Array.isArray(a) || !b || typeof b !== "object" || Array.isArray(b)) return undefined;
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
+    const out: string[] = [];
+    for (const k of [...new Set([...Object.keys(ao), ...Object.keys(bo)])].sort()) {
+        if (ser(ao[k]) !== ser(bo[k])) out.push(k);
+    }
+    return out.length > 0 ? out : undefined;
 }
 
 // #3919: which dimensions disagree when the sampled verify detects drift —
@@ -1596,7 +1786,12 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
                 const s2 = ser(m) ?? "";
                 return { id: typeof s.id === "string" ? s.id : "-", role: typeof s.role === "string" ? s.role : "-", length: s2.length, sha8: sha256(s2).slice(0, 8) };
             };
-            diagnostics.tailSlot = { index, expect: fp(index < et.length ? et[index] : null), got: fp(index < gt.length ? gt[index] : null) };
+            const ea = index < et.length ? et[index] : null;
+            const ga = index < gt.length ? gt[index] : null;
+            const fields = diffFieldNames(ea, ga);
+            diagnostics.tailSlot = fields === undefined
+                ? { index, expect: fp(ea), got: fp(ga) }
+                : { index, expect: fp(ea), got: fp(ga), fields };
         }
     }
     return diagnostics;
@@ -1607,8 +1802,8 @@ export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
     if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
-        const { index, expect: ex, got: go } = d.tailSlot;
-        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);
+        const { index, expect: ex, got: go, fields } = d.tailSlot;
+        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}${fields ? `; fields: ${fields.join(",")}` : ""}`);
     }
     return " [" + parts.join("; ") + "]";
 }

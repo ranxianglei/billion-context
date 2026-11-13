@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { vertexEnabled } from "./vertex.js";
+import { nonNegativeTomlInteger } from "./toml-integer.js";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
@@ -720,7 +721,7 @@ export function parseCodexToml(text: string): CodexConfig {
             continue;
         }
         const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(line);
         if (strMatch) {
             const key = strMatch[1];
             const val = strMatch[2] !== undefined ? strMatch[2] : strMatch[3];
@@ -733,9 +734,11 @@ export function parseCodexToml(text: string): CodexConfig {
                 result.providers[curProvider].baseUrl = val;
             }
         } else if (numMatch && table === "") {
-            if (numMatch[1] === "model_context_window") codexContextWindow = Number(numMatch[2]);
-            else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = Number(numMatch[2]);
-            else if (numMatch[1] === "model_max_output_tokens") codexMaxOutput = Number(numMatch[2]);
+            const numVal = nonNegativeTomlInteger(numMatch[2]);
+            if (numVal === undefined) continue;
+            if (numMatch[1] === "model_context_window") codexContextWindow = numVal;
+            else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = numVal;
+            else if (numMatch[1] === "model_max_output_tokens") codexMaxOutput = numVal;
         }
     }
     if (codexModel) result.model = codexModel;
@@ -1079,11 +1082,11 @@ export function parseKimiToml(text: string): KimiConfig {
             continue;
         }
         const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(line);
         if (!strMatch && !numMatch) continue;
         const key = (strMatch ?? numMatch)![1];
         const strVal = strMatch ? (strMatch[2] !== undefined ? strMatch[2] : strMatch[3]) : undefined;
-        const numVal = numMatch ? Number(numMatch[2]) : undefined;
+        const numVal = numMatch ? nonNegativeTomlInteger(numMatch[2]) : undefined;
         if (parts.length === 0) {
             if (key === "default_model" && strVal !== undefined) result.defaultModel = strVal;
         } else if (parts[0] === "providers") {
@@ -1559,10 +1562,12 @@ export function readOmpConfig(ompHome: string): OmpConfig {
 }
 
 /** Minimal line-based YAML reader for hermes config.yaml: collects provider
- *  entries from the v12 `providers:` dict (provider key -> `api:` url) and the
- *  legacy `custom_providers:` list (- name: ... / base_url: ...). Anything
- *  else in the file is ignored — only name -> endpoint URL pairs matter for
- *  launcher route discovery. */
+ *  entries from the v12 `providers:` dict (provider key -> `api:` url), the
+ *  legacy `custom_providers:` list (- name: ... / base_url: ...), and the stock
+ *  top-level `base_url`/`url`/`api` next to `provider:` (#6022 — the active
+ *  provider's endpoint when no providers entry covers it). Anything else in the
+ *  file is ignored — only name -> endpoint URL pairs matter for launcher route
+ *  discovery. */
 export function parseHermesYaml(text: string): HermesConfig {
     const result: HermesConfig = { providers: {} };
     const candidates = new Map<string, string>();
@@ -1572,6 +1577,22 @@ export function parseHermesYaml(text: string): HermesConfig {
     let entryIndent = -1;
     let current: string | null = null;
     let anonCount = 0;
+    // YAML scalars may be quoted; the launcher feeds endpoint values straight into
+    // new URL(), which rejects surrounding quotes (Invalid URL) and the entry
+    // would be silently skipped. Strip them where captured.
+    const unquote = (v: string): string => v.replace(/^["']|["']$/g, "");
+    // Top-level endpoint keys (#6022): first occurrence per key wins, resolved
+    // base_url > url > api like per-provider entries.
+    const topLevel: Partial<Record<"base_url" | "url" | "api", string>> = {};
+    let activeProvider = "";
+    const captureTopLevel = (line: string): void => {
+        if (!activeProvider) {
+            const pm = /^provider:\s*["']?([A-Za-z0-9_.-]+)/.exec(line);
+            if (pm) activeProvider = pm[1];
+        }
+        const um = /^(base_url|url|api):\s*(\S+)/.exec(line);
+        if (um && !(um[1] in topLevel)) topLevel[um[1] as "base_url" | "url" | "api"] = unquote(um[2]);
+    };
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -1587,9 +1608,12 @@ export function parseHermesYaml(text: string): HermesConfig {
                 sectionIndent = indent;
                 entryIndent = -1;
                 current = null;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
+
         if (indent <= sectionIndent) {
             // Left the section — re-evaluate this line for a new section start.
             mode = "none";
@@ -1602,6 +1626,8 @@ export function parseHermesYaml(text: string): HermesConfig {
             } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
                 mode = "list";
                 sectionIndent = indent;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
@@ -1615,7 +1641,7 @@ export function parseHermesYaml(text: string): HermesConfig {
                 // hermes accepts base_url / url / api (priority order) — collect
                 // all and resolve after the scan.
                 const apiMatch = /^(base_url|url|api):\s*(\S+)/.exec(trimmed);
-                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, apiMatch[2]);
+                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, unquote(apiMatch[2]));
             }
         } else {
             // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
@@ -1626,16 +1652,30 @@ export function parseHermesYaml(text: string): HermesConfig {
                 current = nameMatch ? nameMatch[1] : `custom-${++anonCount}`;
                 if (!result.providers[current]) result.providers[current] = {};
                 const inlineUrl = /^(?:base_url|api|url):\s*(\S+)/.exec(dashMatch[1]);
-                if (inlineUrl) result.providers[current].api = inlineUrl[1];
+                if (inlineUrl) result.providers[current].api = unquote(inlineUrl[1]);
             } else if (current) {
                 const urlMatch = /^(?:base_url|api|url):\s*(\S+)/.exec(trimmed);
-                if (urlMatch) result.providers[current].api = urlMatch[1];
+                if (urlMatch) result.providers[current].api = unquote(urlMatch[1]);
             }
         }
     }
     for (const name of Object.keys(result.providers)) {
         const pick = candidates.get(`${name}\u0000base_url`) ?? candidates.get(`${name}\u0000url`) ?? candidates.get(`${name}\u0000api`);
         if (pick !== undefined) result.providers[name].api = pick;
+    }
+    // Stock shape (#6022): a top-level base_url/url/api next to provider: is the
+    // active provider's endpoint when its own entry is absent. Both shapes may
+    // coexist in one file — keep both hosts routable rather than guessing which
+    // wins (a missing whitelist entry means blind-tunneled, uncompressed traffic).
+    const topLevelUrl = topLevel.base_url ?? topLevel.url ?? topLevel.api;
+    if (topLevelUrl !== undefined) {
+        const covered = Object.values(result.providers).some((p) => p.api === topLevelUrl);
+        if (!covered) {
+            const taken = new Set(Object.keys(result.providers));
+            let name = activeProvider && !taken.has(activeProvider) ? activeProvider : "top-level";
+            while (taken.has(name)) name += "-x";
+            result.providers[name] = { api: topLevelUrl };
+        }
     }
     return result;
 }
@@ -2102,7 +2142,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed" | "kiro";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

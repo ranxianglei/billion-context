@@ -17,6 +17,7 @@ import {
     type SearchDoc,
     type SearchResult,
 } from "acp-kernel";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
@@ -216,7 +217,7 @@ export function resolveDecompress(
         return resolveDecompressRange(args, ctx, block);
     }
 
-    const full = args.full === true;
+    const full = args.full === true || args.full === "true";
     const cached = ctx.session.blockContents.get(blockId);
     let body: string;
     let count: number;
@@ -247,11 +248,11 @@ export function resolveDecompress(
     const toFileOut = toFilePointer(args, ctx, header, body);
     if (toFileOut !== null) return toFileOut;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-    const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
+    const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${randomUUID()}.txt`) : null;
     if (outPath) {
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
             return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
@@ -451,13 +452,13 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         injText = toFileOut.text;
     } else if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        // [#1207 review F4] Span in the filename (two spans of one block in the
-        // same millisecond must not clobber each other) and 0600 (folded
-        // conversation content is not world-readable on multi-user hosts).
-        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${Date.now()}.txt`);
+        // [#1207 review F4] Span in the filename; each spill owns its path even when sessions
+        // reuse block and span ids in the same millisecond (#6191). 0600: folded conversation
+        // content is not world-readable on multi-user hosts.
+        const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${randomUUID()}.txt`);
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
             injText = `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
@@ -589,7 +590,7 @@ function resolveDerivedDecompress(
         if (hasRangeArgs(args)) {
             return toolFail(`[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`);
         }
-        const full = args.full === true;
+        const full = args.full === true || args.full === "true";
         const cached = anc.blockContents.get(blockId);
         const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
         const body = view?.text || block.summary;
@@ -829,7 +830,8 @@ export function executeSearchContext(
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
-    const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
+    const rawLimit = typeof args.limit === "number" ? args.limit : typeof args.limit === "string" && /^\d+$/.test(args.limit.trim()) ? Number(args.limit.trim()) : NaN;
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 5;
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     // #4154: the pool is EVERY block (active + inactive/consumed), ranked by
     // the kernel's public search surface (blockDocs + searchBlocks) instead
