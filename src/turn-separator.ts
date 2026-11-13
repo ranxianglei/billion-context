@@ -5,7 +5,7 @@
 // session.ts re-exports these for its existing consumers.
 
 /** #2627: bili-synthesized Responses turn separators (repairResponsesAssistantOrdering,
- *  src/server.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
+ *  src/server/responses-ordering.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
  *  ever contains them, so they can never anchor or be covered. When a
  *  separator-bearing view reached applyCompression (the plugin lane handed its
  *  processed view straight in), their ids were registered into new blocks'
@@ -18,6 +18,15 @@ export const RESPONSES_TURN_SEPARATOR_ID_PREFIX = "acp_turn_sep_";
 
 export function isResponsesTurnSeparatorId(id: string): boolean {
     return id.startsWith(RESPONSES_TURN_SEPARATOR_ID_PREFIX);
+}
+
+/** #5139: the markers exist ONLY in the send view — the apply view has none of
+ *  these ids, so any analysis pass screened against the apply view must run on
+ *  the send view minus them, or range endpoints landing on a marker ref vanish
+ *  at projection (BoundaryNotFoundError → silent demotion). No-op when absent. */
+export function withoutTurnSeparators<T extends { id?: string }>(messages: T[]): T[] {
+    const isSep = (m: T): boolean => typeof m.id === "string" && isResponsesTurnSeparatorId(m.id);
+    return messages.some(isSep) ? messages.filter((m) => !isSep(m)) : messages;
 }
 
 /** #2627: strip turn-separator ids from block coverage IN PLACE (load-time heal

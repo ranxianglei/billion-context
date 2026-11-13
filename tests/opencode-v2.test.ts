@@ -108,7 +108,8 @@ function makeFakeCtx() {
     let signal: AbortSignal | undefined;
     const addedTools: FakeAddedTool[] = [];
     const addedCommands: FakeAddedCommand[] = [];
-    const syntheticCalls: Array<{ sessionID: string; text: string; description?: string; resume?: boolean }> = [];
+    const syntheticCalls: Array<{ id?: string; sessionID: string; text: string; description?: string; resume?: boolean }> = [];
+    const contextHooks = new Map<string, (e: Record<string, unknown>) => void | Promise<void>>();
     let modelRequestCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     let wsHandshakeCb: ((e: Record<string, unknown>) => void | Promise<void>) | undefined;
     const disposed: number[] = [];
@@ -118,10 +119,11 @@ function makeFakeCtx() {
             hook: async (name: string, cb: (e: Record<string, unknown>) => void | Promise<void>) => {
                 if (name === "http.request") modelRequestCb = cb;
                 else if (name === "experimental.ws.handshake") wsHandshakeCb = cb;
+                else if (["context", "compaction", "title", "generate"].includes(name)) contextHooks.set(name, cb);
                 else assert.fail(`unexpected hook ${name}`);
                 return { dispose: () => { disposed.push(1); } };
             },
-            synthetic: async (input: { sessionID: string; text: string; description?: string; resume?: boolean }) => {
+            synthetic: async (input: { id?: string; sessionID: string; text: string; description?: string; resume?: boolean }) => {
                 syntheticCalls.push(input);
                 return {};
             },
@@ -165,6 +167,7 @@ function makeFakeCtx() {
 
     return {
         ctx,
+        contextHooks,
         fireModelRequest: async (opts: { sessionID?: unknown; baseURL?: unknown; model?: unknown; headers?: Record<string, string> }) => {
             const store: Record<string, string> = {};
             await modelRequestCb!({
@@ -211,6 +214,55 @@ function withEnv(vars: Record<string, string | undefined>, fn: () => void | Prom
         }
     });
 }
+
+test("v2 reports: outgoing hooks exclude only generated report IDs, including after restart", async () => {
+    const fake = makeFakeCtx();
+    const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+    let report: (typeof fake.syntheticCalls)[number];
+    try {
+        await fake.addedCommands.find((c) => c.name === "acp")!.execute({ sessionID: "ses_report" });
+        report = fake.syntheticCalls[0];
+        assert.match(report.id!, /^msg_bili_report_[0-9a-f]{32}$/);
+    } finally {
+        cleanup();
+    }
+    const restarted = makeFakeCtx();
+    const stop = await biliOpencodePlugin.setup(restarted.ctx as never);
+    try {
+        for (const name of ["context", "compaction", "title", "generate"]) {
+            const retained = [
+                { id: "msg_user", role: "user", content: [{ type: "text", text: report.text }] },
+                { role: "user", content: [{ type: "text", text: report.text }] },
+                { id: report.id, role: "assistant", content: [] },
+                { id: "msg_bili_report_invalid", role: "user", content: [] },
+            ];
+            const history = [{ id: report.id, role: "user", content: [{ type: "text", text: report.text }] }, ...retained];
+            const event = { sessionID: "ses_report", messages: [...history] };
+            await restarted.contextHooks.get(name)!(event);
+            assert.deepEqual(event.messages, retained, name);
+            assert.equal(history.length, 5, "persisted history is unchanged");
+        }
+    } finally {
+        stop();
+    }
+});
+
+test("v2 reports: unsupported context hooks retain the inert body", async () => {
+    const fake = makeFakeCtx();
+    const hook = fake.ctx.session.hook;
+    fake.ctx.session.hook = async (name, cb) => {
+        if (name === "context") throw new Error("unsupported hook");
+        return hook(name, cb);
+    };
+    const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+    try {
+        await fake.addedCommands.find((c) => c.name === "acp")!.execute({ sessionID: "ses_old" });
+        assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+        assert.equal(fake.syntheticCalls[0].id, undefined);
+    } finally {
+        cleanup();
+    }
+});
 
 test("object export: .id/.setup for V2 and .server for V1 >= 1.18.29", () => {
     assert.equal(typeof biliOpencodePlugin, "object");
@@ -396,8 +448,8 @@ test("v2 setup: /acp command registered and renders proxy status panel via synth
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.equal(fake.syntheticCalls[0].sessionID, "ses_acp_1");
                 assert.match(fake.syntheticCalls[0].description!, /ACP-PANEL-OK/);
-                assert.match(fake.syntheticCalls[0].text, /displayed in your terminal/);
-                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.equal(fake.syntheticCalls[0].text, "```text\nACP-PANEL-OK\n```");
+                assert.match(fake.syntheticCalls[0].id!, /^msg_bili_report_[0-9a-f]{32}$/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
             } finally {
                 cleanup();
@@ -417,7 +469,7 @@ test("v2 setup: /acp reports no proxy detected via synthetic when no proxy", asy
             await acp.execute({ sessionID: "s_nopx" });
             await until(() => fake.syntheticCalls.length === 1);
             assert.match(fake.syntheticCalls[0].description!, /no proxy detected/);
-            assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            assert.match(fake.syntheticCalls[0].text, /no proxy detected/);
             assert.equal(fake.syntheticCalls[0].resume, false);
         } finally {
             cleanup();
@@ -436,7 +488,7 @@ test("v2 setup: first /acp before any model request shows the idle notice (proxy
                 await acp.execute({ sessionID: "ses_acp_idle" });
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.match(fake.syntheticCalls[0].description!, /billion-context@9\.9\.9-test \u2014 proxy connected via http:\/\/127\.0\.0\.1:\d+, no ACP session yet/);
-                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.match(fake.syntheticCalls[0].text, /no ACP session yet/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
             } finally {
                 cleanup();
@@ -472,7 +524,7 @@ test("v2 setup: /acp long panels lead with the Web UI link and keep whole leadin
                 const m = desc.match(/\[panel truncated\] (\d+) more lines?$/);
                 assert.ok(m, "marker carries the dropped count");
                 assert.equal(Number(m![1]), lines.length - (keptLines.length - 1), "dropped count is exact");
-                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.ok(fake.syntheticCalls[0].text.length > desc.length);
             } finally {
                 cleanup();
             }
@@ -579,7 +631,7 @@ test("v2 setup: /acp-cache registered and renders the cache report via synthetic
                 await until(() => fake.syntheticCalls.length === 1);
                 assert.equal(fake.syntheticCalls[0].sessionID, "ses_cache_1");
                 assert.match(fake.syntheticCalls[0].description!, /CACHE-REPORT-OK/);
-                assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+                assert.match(fake.syntheticCalls[0].text, /CACHE-REPORT-OK/);
                 assert.equal(fake.syntheticCalls[0].resume, false);
                 // #2072: host-native callers stamp their machine-minted id — the wire body carries the flag.
                 assert.deepEqual(proxy.toolCalls, [{ conversationId: "ses_cache_1", tool: "acp_cache", args: {}, nativeCaller: true }]);

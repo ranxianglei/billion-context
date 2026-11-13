@@ -10,6 +10,7 @@ entries:
     render: compress-row
     desc_en: "Effective context window (tokens or N%): denominator of the usage ratio and a hard preflight wall; highest-priority window source."
     desc_zh: "有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。"
+    desc_ja: "有効コンテキストウィンドウ（トークン数または N%）：使用率の分母であり、事前チェックのハードウォール。最優先のウィンドウソース。"
     site_en: "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default."
     site_zh: "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。窗口来源中优先级最高——覆盖路由/模型声明与顶层默认值。"
   - key: compress.maxContextLimit
@@ -20,6 +21,7 @@ entries:
     render: compress-row
     desc_en: "Forced-compression nudge threshold: once history passes this share of the window the nudge fires immediately, bypassing growth gates. Not a hard cap."
     desc_zh: "强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。"
+    desc_ja: "強制圧縮のナッジ閾値：履歴がこのウィンドウの割合を超えると、ナッジが即座に発火し、成長ゲートをバイパスする。ハードキャップではない。"
     site_en: "Forced-compression nudge threshold (default \"75%\"): once history passes this share of the window the nudge fires immediately, bypassing the growth gates. Not a hard cap."
     site_zh: "强制压缩提醒阈值（默认 \"75%\"）：历史超过窗口的该占比时提醒立即触发，绕过增长门槛。不是硬上限。"
   - key: compress.emergencyThresholdPercent
@@ -30,6 +32,7 @@ entries:
     render: compress-row
     desc_en: "Emergency truncation of oversized tool outputs when history passes this share of the window (must be >= maxContextLimit)."
     desc_zh: "历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。"
+    desc_ja: "履歴がこのウィンドウの割合を超えた場合の、過大ツール出力の緊急切り詰め（maxContextLimit 以上である必要がある）。"
     site_en: "Default \"95%\": emergency truncation of oversized tool outputs when history passes this share of the window (must be ≥ maxContextLimit)."
     site_zh: "默认 \"95%\"：历史超过窗口该占比时，对超大工具输出做紧急截断（必须 ≥ maxContextLimit）。"
   - key: compress.outputHeadroomMaxPct
@@ -40,6 +43,7 @@ entries:
     render: compress-row
     desc_en: "Cap on the share of the window reserved for output via max_tokens."
     desc_zh: "max_tokens 输出预留占窗口的最大比例。"
+    desc_ja: "max_tokens 経由で出力に確保されるウィンドウの割合の上限。"
     site_en: "Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens."
     site_zh: "max_tokens 输出预留占窗口的最大比例（0–1，默认 0.25）。"
   - key: compress.nudgeGrowthTokens
@@ -50,6 +54,7 @@ entries:
     render: compress-row
     desc_en: "Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size)."
     desc_zh: "增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。"
+    desc_ja: "成長ゲート：折りたたみ可能な範囲がベースライン成長をこのトークン数だけ上回った場合のみ、ナッジが発火する（設計上フラットであり、ウィンドウサイズに依存しない）。"
     site_en: "Growth gate (default 50000): nudges fire only when a foldable range exceeds baseline growth by this many tokens."
     site_zh: "增长门槛（默认 50000）：可折叠片段超出基线增长达到该 token 数才发提醒。"
   - key: compress.tierNudgeTokens
@@ -60,6 +65,7 @@ entries:
     render: compress-row
     desc_en: "Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376)."
     desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
+    desc_ja: "ティアごとのトークン質量トリガー閾値。未設定のティアは導出デフォルトにフォールバックするため、欠落/空 = レガシー統合動作 (#2376)。"
     site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
     site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
   - key: compress.minPressureBenefitTokens
@@ -70,8 +76,33 @@ entries:
     render: compress-row
     desc_en: "Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending."
     desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
+    desc_ja: "圧力バンドのナッジが発火するために必要な最小の回収可能トークン数。インフレ計器ルートでは、高頻度の小規模な churn の代わりに、大きなイベントに折りたたみをバッチ処理するようにこれを引き上げる (#3211)。明示的な 0 = レガシーの任意の保留中。"
     site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
     site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
+  - key: compress.requireUsageSampleForPressure
+    type: boolean
+    default: "true"
+    group: compress
+    id: cw.rusfp
+    render: compress-row
+    desc_en: "Phantom-pressure guard: when this round's meter is a local estimate (no billing sample — aborted turn, TTL expiry), the pressure band waits up to compress.maxEstimateHoldRounds rounds (default 2) for the real sample instead of firing EMERGENCY off an inflated reading, then falls back to the legacy estimate-driven decision so never-reporting upstreams cannot starve it forever. false = always legacy."
+    desc_zh: "幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后至多 compress.maxEstimateHoldRounds 轮（默认 2）等真样本，再回落到老的估算驱动决定，防止永不回传计费的线路被无限挂起。false＝始终老行为。"
+    desc_ja: "ファントム圧力ガード：このラウンドの計器がローカル推定値（請求サンプルなし — 中断されたターン、TTL 期限切れ）の場合、圧力バンドはインフレした読み取り値に基づいて EMERGENCY を発火させるのではなく、実際のサンプルを最大 compress.maxEstimateHoldRounds ラウンド（デフォルト 2）まで待機し、その後レガシーの推定駆動決定にフォールバックすることで、レポートしないアップストリームが永遠に飢餓状態にしないようにする。false = 常にレガシー。"
+    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred for at most compress.maxEstimateHoldRounds rounds (default 2) until either a usage-grade reading decides or the bound runs out and the estimate decides (legacy); billed readings keep byte-identical behavior while within the hold. Set false to restore immediate estimate-driven pressure injection."
+    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后至多 compress.maxEstimateHoldRounds 轮（默认 2），等实际 usage 级读数决定；到期仍未等到则按老行为用估算判，永不回传计费的会话因此不会被无限挂起。设 false 恢复旧的立即估算驱动行为。"
+  - key: compress.maxEstimateHoldRounds
+    type: number
+    default: "2"
+    group: compress
+    id: cw.mehr
+    render: compress-row
+    desc_en: "Backstop for the phantom-pressure guard (#5865 ruling): how many CONSECUTIVE estimate-grade rounds the pressure band may wait before firing on the estimate anyway. Capped so an upstream that never reports usage (anonymous zero-baseline forks, silent backends — where the local estimate is the only pressure signal) still gets automatic compression. 0 = no waiting at all. Only consulted while requireUsageSampleForPressure is on."
+    desc_zh: "幻影压力守卫的兜底（#5865 裁定）：压力带最多连等多少轮估算读数就必须照估算动手。兜底保证从不回传计费的会话（匿名零基线 fork、静默后端——本地估算是它们唯一的压力信号）也能拿到自动压缩。0＝完全不等待。仅在 requireUsageSampleForPressure 开启时生效。"
+    desc_ja: "ファントム圧力ガードのバックストップ (#5865 裁定)：圧力バンドが推定値に基づいて発火する前に、推定グレードのラウンドを何ラウンド連続で待機できるか。使用量をレポートしないアップストリーム（匿名ゼロベースラインフォーク、サイレントバックエンド — ローカル推定値が唯一の圧力シグナルとなる場所）でも、自動圧縮が実行されるように上限が設定されている。0 = 待機なし。requireUsageSampleForPressure がオンである間のみ参照される。"
+    site_en: "Caps how many consecutive no-billing-sample rounds the pressure band may wait before deciding on the local estimate anyway (default 2), so a backend that never reports usage still gets automatic compression instead of being held forever; 0 waits not at all."
+    site_zh: "限制压力带最多连等多少轮无计费样本的估算读数就必须照估算判（默认 2），保证从不回传计费的后端也能自动压缩、不会永远等待；设 0 表示不等待。"
+    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred one round until a usage-grade reading decides; billed readings keep byte-identical behavior. Set false to restore estimate-driven pressure injection."
+    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后一轮等实际 usage 级读数再决定；计费级读数行为逐字节不变。设 false 恢复旧的估算驱动行为。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
@@ -80,6 +111,7 @@ entries:
     render: compress-row
     desc_en: "Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON \"yes\" injects an explicit directive with a program-finalized span; \"no\", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled."
     desc_zh: "模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 \"yes\" 会注入带程序最终确定范围的明确压缩指令；\"no\"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。"
+    desc_ja: "モデル決定によるナッジタイミング (#2228)：アームされたティア 1 のナッジは、まずセッションのキャッシュ済みプレフィックス経由の短いサイドコールで、モデルに「今すぐ圧縮することが現在のタスクに有益か」を尋ねる。厳密な JSON の \"yes\" は、プログラムで最終化されたスパンを持つ明示的なディレクティブを注入する。\"no\"、不正な回答、またはタイムアウトの場合、このラウンドでは何も注入しない。EMERGENCY アームとティア 2 以上の蒸留は常にレガシーの助言を維持する。明示的に有効化されない限りオフ。"
     site_en: "Model-decided nudge timing (off by default): an armed tier-1 nudge first asks the model, over the session's cached prefix, whether compressing now helps the current task; a strict-JSON yes injects a directive with a program-finalized span, anything else injects nothing this round."
     site_zh: "模型自决的压缩时机（默认关闭）：tier-1 提醒触发时，先通过会话缓存前缀上的短 side call 问模型现在压缩是否划算；严格 JSON 的 yes 注入带程序最终确定范围的指令，其余情况本轮不注入。"
   - key: compress.nudgeDecisionMaxTokens
@@ -90,8 +122,31 @@ entries:
     render: compress-row
     desc_en: "Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0."
     desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。"
+    desc_ja: "nudgeModelDecided が使用するモデル決定サイドコールの出力予算（トークン数）。0 より大きい必要がある。"
     site_en: "Output budget (tokens) of the model-decision side call (default 200). Must be > 0."
     site_zh: "模型决策 side call 的输出预算（token，默认 200）。必须 > 0。"
+  - key: compress.requireNudge
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rnug
+    render: compress-row
+    desc_en: "Forbid UNPROMPTED model-initiated compression (#5683/#5943): a compress call is refused unless a NUDGE CREDIT is live — a window of 20 MODEL rounds minted by the last compression nudge that actually reached the model (advisory, decide-directive and emergency injections all mint; \"gated\"/\"vetoed\"/\"skipped\" never do), refreshed by each new injection and decayed one per un-nudged model round (non-model request shapes hold it open). Successful folds do NOT consume the credit, so finishing a nudge's recommended cleanup over several rounds stays legal. Refusal sends the model an error receipt instead of folding; bili's own overflow backstop folds are exempt. For models that fold on their own (e.g. qwen 27b); can be scoped per provider/model. Off unless explicitly enabled."
+    desc_zh: "禁止未提示的模型主动压缩（#5683/#5943）：只有 nudge 信用存活时才允许 compress——即距最近一次真正送达模型的压缩提醒不超过 20 个 MODEL 轮的窗口（advisory、模型自决指令、紧急提醒都算铸券；\"gated\"/\"vetoed\"/\"skipped\" 不算）；每次新注入刷新窗口，每个未提示的模型轮衰减 1（非模型请求形态既不刷新也不衰减）。成功折叠**不消耗**信用，分几轮压完 nudge 推荐的剩余范围仍然合法。否则拒绝并回错误回执；bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。"
+    desc_ja: "無促のモデル主導圧縮の禁止 (#5683/#5943)：NUDGE CREDIT がライブでない限り、compress 呼び出しは拒否される — 最後にモデルに実際に到達した圧縮ナッジ（助言、決定ディレクティブ、緊急注入はすべて発行；\"gated\"/\"vetoed\"/\"skipped\" は発行しない）によって発行された 20 モデルラウンドのウィンドウ。各新しい注入で更新され、ナッジされないモデルラウンドごとに 1 ずつ減衰する（非モデルリクエスト形状はそれをオープンに保つ）。成功した折りたたみはクレジットを消費しないため、ナッジの推奨クリーンアップを複数ラウンドにわたって完了することは依然として合法である。拒否は、折りたたむ代わりにモデルにエラーレシートを送る。bili 自身のオーバーフローバックストップ折りたたみは免除される。自分で折りたたむモデル（例: qwen 27b）向け；プロバイダー/モデルごとにスコープを限定できる。明示的に有効化されない限りオフ。"
+    site_en: "Forbid unprompted compression (off by default): a model compress call is refused unless a nudge credit is live — a delivered nudge opens a 20-model-round window, refreshed by each new nudge; the refusal returns an error receipt instead of folding."
+    site_zh: "禁止未提示压缩（默认关闭）：只有 nudge 信用存活（送达的提醒开启 20 个模型轮窗口，新提醒刷新窗口）才允许模型调用 compress，否则拒绝并回错误回执。"
+  - key: compress.requireRecommendation
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rrec
+    render: compress-row
+    desc_en: "Forbid OUT-OF-BOUNDS model-initiated compression (#5683): every submitted range must stay within what bili currently recommends folding — the same live compressible set the nudge text and acp_status show (this request's prepare-time offer when present, else a live recompute). Judgment is by COVERAGE: subdividing a recommended span passes, and messages already folded into active blocks (refolds updating an existing summary) are exempt. A range carrying any other live message is refused whole with an error receipt naming the offending span(s). Off unless explicitly enabled."
+    desc_zh: "禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。"
+    desc_ja: "範囲外のモデル主導圧縮の禁止 (#5683)：提出されたすべての範囲は、bili が現在折りたたみを推奨している範囲内に留まらなければならない — ナッジテキストと acp_status が示すのと同じライブ折りたたみ可能セット（存在する場合、このリクエストの準備時オファー、それ以外の場合はライブ再計算）。判定はカバレッジによる：推奨スパンの細分化は合格し、アクティブなブロックにすでに折りたたまれたメッセージ（既存のサマリーを更新する再折りたたみ）は免除される。他のライブメッセージを含む範囲は、問題のあるスパンを特定するエラーレシートとともに全体として拒否される。明示的に有効化されない限りオフ。"
+    site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
+    site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
@@ -100,6 +155,7 @@ entries:
     render: compress-row
     desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip."
     desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。"
+    desc_ja: "事前チェックの要約を、最初の試行からストリーミング（SSE）コールとして実行することを強制する。エラー駆動の自己学習は、ストリーミングを強制するアップストリームを独自に処理する（非ストリーミング要約での 400 はワンショット SSE プローブをトリガーする、#2494）が、ゲートウェイタイムアウト（例: Cloudflare HTTP 524）では決してアームしない：bili とオリジンの間にそのようなゲートウェイがある場合にこれを設定するか、単に 1 回のプローブ往復をスキップするために設定する。"
     site_en: "Force streaming (SSE) summarization from the first attempt — stream-mandating upstreams now self-heal via a one-shot SSE probe on any non-streaming 400 (#2494); kept as the escape hatch for gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the self-learn cannot detect, or to skip the one probe round-trip."
     site_zh: "强制摘要从首次起走流式（SSE）——要求流式的上游现在通过任何非流式 400 上的一次性 SSE 探测自愈（#2494）；保留作为会掐断长非流式调用的网关（如 Cloudflare 524）的逃生通道（自学习无法感知该场景），也可用于省去一次探测往返。"
   - key: compress.preserveRecentMessages
@@ -110,6 +166,7 @@ entries:
     render: compress-row
     desc_en: "The most recent messages stay soft-protected from folds."
     desc_zh: "最近的消息软保护、免于折叠。"
+    desc_ja: "最新のメッセージは、折りたたみからソフト保護される。"
     site_en: "Kernel default 3 (tuned 5 → 3, #3058): the most recent messages stay soft-protected from folds."
     site_zh: "内核默认 3（5 → 3，#3058）：最近消息软保护、免于折叠。"
   - key: compress.preserveRecentTokens
@@ -120,6 +177,7 @@ entries:
     render: compress-row
     desc_en: "The most recent tokens stay soft-protected from folds."
     desc_zh: "最近的 token 软保护、免于折叠。"
+    desc_ja: "最新のトークンはフォールドからソフト保護される。"
     site_en: "Kernel default ≈5000: the most recent tokens stay soft-protected from folds."
     site_zh: "内核默认约 5000：最近的 token 软保护、免于折叠。"
   - key: compress.minCompressRangeChars
@@ -130,6 +188,7 @@ entries:
     render: compress-row
     desc_en: "Smallest foldable range, in characters; shorter ranges never fold."
     desc_zh: "可折叠片段的最小字符数；更短的永不折叠。"
+    desc_ja: "フォールド可能な最小範囲（文字数）。これより短い範囲はフォールドされない。"
     site_en: "Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold."
     site_zh: "可折叠片段的最小字符数（内核默认约 5000），更短的永不折叠。"
   - key: compress.maxSummaryLength
@@ -140,6 +199,7 @@ entries:
     render: compress-row
     desc_en: "Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded."
     desc_zh: "单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。"
+    desc_ja: "1つの生成サマリーに対する文字数のハード上限。これを超える返信は全体として拒否される（切り詰めもリトライもされない）。外部サマライザーにはこの正確な上限が事前に通知される（#3635）。0 = 無制限。"
     site_en: "Hard cap, in characters, on one generated summary (kernel default 20000): longer replies are rejected whole by the kernel check or the external-summary executor. External summarizers receive this exact cap in their instructions (#3635); 0 disables the cap."
     site_zh: "单条生成摘要的硬上限，单位为字符（内核默认 20000）：超长的回复由内核检查或外部摘要执行器整段拒绝。外部摘要模型的指令中会写明这个确切上限（#3635）；0 禁用上限。"
   - key: compress.minSummaryLength
@@ -148,10 +208,11 @@ entries:
     group: compress
     id: cw.mnl
     render: compress-row
-    desc_en: "Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635)."
-    desc_zh: "生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。"
-    site_en: "Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635)."
-    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：过短的回复被整段拒绝；0 禁下限。外部摘要模型受同一下限约束（#3635）。"
+    desc_en: "Character floor for generated summaries: a single range must meet it alone; a multi-range batch passes when its combined summaries reach it (#5894). 0 = disabled. External summarizers remain held to the per-summary floor (#3635)."
+    desc_zh: "生成摘要的字符下限：单段压缩按自身判定；批量压缩按合计判定——一段偷懒不再拖垮整批（#5894）。0 = 禁用。外部摘要模型仍受逐段下限约束（#3635）。"
+    desc_ja: "生成サマリーの文字数下限：単一範囲はこれに単独で達する必要がある。複数範囲のバッチは、その結合サマリーがこれに達した場合に合格する（#5894）。0 = 無効。外部サマライザーはサマリーごとの下限に引き続き従う（#3635）。"
+    site_en: "Floor, in characters, for generated summaries (kernel default 50): a single range must meet it on its own; a multi-range batch passes when its COMBINED summaries reach it — one lazy paragraph no longer sinks the whole batch (#5894). 0 disables the floor. External summarizers remain held to the per-summary floor (#3635)."
+    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：单段压缩按自身判定；批量压缩按各段合计判定——一段偷懒不再拖垮整批（#5894）。0 禁用下限。外部摘要模型仍受逐段下限约束（#3635）。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""
@@ -161,6 +222,7 @@ entries:
     render: compress-row
     desc_en: "Reconcile folded state when the client rewinds or rewrites history between turns."
     desc_zh: "客户端在轮次之间回退或改写历史时校准已折叠状态。"
+    desc_ja: "クライアントがターン間で履歴を巻き戻しまたは書き換えた場合、フォールド状態を調整する。"
     site_en: "\"off\" | \"warn\" | \"repair\" (default repair): reconcile folded state when the client rewinds or rewrites history between turns."
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
   - key: compress.promptPack
@@ -171,6 +233,7 @@ entries:
     render: compress-row
     desc_en: "Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk."
     desc_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。"
+    desc_ja: "圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。"
     site_en: "Compression prompt pack, resolved project pack → user pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions). Not gated by acknowledgePromptsRisk."
     site_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）。不受 acknowledgePromptsRisk 门控。"
   - key: compress.tiers
@@ -181,6 +244,7 @@ entries:
     render: compress-row
     desc_en: "Tiered T1→T3 distillation spreads folding cost across generations."
     desc_zh: "T1→T3 分级蒸馏把折叠成本摊到多代。"
+    desc_ja: "T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。"
     site_en: "On by default: tiered T1→T3 distillation spreads folding cost across generations."
     site_zh: "默认开：T1→T3 分级蒸馏，把折叠成本摊到多代。"
   - key: compress.protectedTools
@@ -191,6 +255,7 @@ entries:
     render: compress-row
     desc_en: "Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947)."
     desc_zh: "全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。"
+    desc_ja: "全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。"
     site_en: "Hard exclusion across all history: results of listed tools never fold (use with care)."
     site_zh: "全历史硬排除：列出工具的结果永不折叠（慎用）。"
   - key: compress.protectedLatestTools
@@ -201,6 +266,7 @@ entries:
     render: compress-row
     desc_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947)."
     desc_zh: "只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。"
+    desc_ja: "最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。"
     site_en: "Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists)."
     site_zh: "只保护累积快照类工具的「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。"
   - key: compress.neverPreserveRecentTools
@@ -211,6 +277,7 @@ entries:
     render: compress-row
     desc_en: "Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection)."
     desc_zh: "从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。"
+    desc_ja: "最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。"
     site_en: "Excluded from the recent protection zone (immediately compressible); default [\"decompress\", \"search_context\", \"read\", \"bash\"]. An empty array is valid — it excludes nothing (maximum protection)."
     site_zh: "从近期保护区排除（立即可压）；默认 [\"decompress\", \"search_context\", \"read\", \"bash\"]。空数组合法＝不排除任何工具（最大保护）。"
   - key: compress.preserveRecentTools
@@ -221,6 +288,7 @@ entries:
     render: compress-row
     desc_en: "Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo."
     desc_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
+    desc_ja: "減算形式：最近ゾーンツールからこのリストを引いたものが完全保護される。ここでの空の配列は誤記として拒否される。"
     site_en: "Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo."
     site_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
   - key: compress.visibilityMarkers
@@ -231,8 +299,21 @@ entries:
     render: compress-row
     desc_en: "Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration."
     desc_zh: "在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。"
+    desc_ja: "`compress`/`decompress`/`search_context`/`acp_status` の結果後に可視性マーカーを追加。オフにすると模倣ナレーションが停止する。"
     site_en: "Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration)."
     site_zh: "在 compress/decompress/search_context/acp_status 结果后追加 📦/❌ 可见性标记（默认开；关闭可抑制模型模仿叙述）。"
+  - key: compress.messageTimestamps
+    type: boolean
+    default: "true"
+    env: BILI_MESSAGE_TIMESTAMPS
+    group: compress
+    id: ct.mt
+    render: compress-row
+    desc_en: "Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly."
+    desc_zh: "为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time=\"…\" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。"
+    desc_ja: "圧縮メッセージレコードに不変の壁時計タイムスタンプを付与：ワイヤー上の ACP タグに `time=`、`compress` 受領証に `[start – end]` カバレッジスパン、サマリーに `Occurred` 行。デフォルトで ON：各メッセージに1つの不変な初回表示スタンプが決定論的にレンダリングされるため、再レンダリングされた履歴はバイト安定性を保つ（有効化時の再起動によるプレフィックス書き換えを超えるプロンプトキャッシュコストなし）。`false` に設定すると、#4313 以前のバイトを正確に再現する。"
+    site_en: "Message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; ON by default. Set `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS=0 to keep every byte identical to pre-feature master. Env wins when defined (0 forces off, any other value forces on); resolved once per instance — changing the flag needs a restart, and the first restart with the flag on pays one frozen-prefix cache rewrite per active session."
+    site_zh: "消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认开启。设 `compress.messageTimestamps: false` 或 env BILI_MESSAGE_TIMESTAMPS=0 可让线上字节与特性前逐字节一致。env 有定义时优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启，开关生效后的首个重启每个活跃会话付一次冻结前缀缓存重写。"
   - key: compress.rules
     type: boolean
     default: "false"
@@ -241,6 +322,7 @@ entries:
     render: compress-row
     desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
     desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
+    desc_ja: "注入された `acp_rule` ツールを通じて配信される永続モデルリマインダー。フォールドからハード保護される。`pi/omp` は `/acp-rule` コマンドを公開する。プロキシモード専用 — プラグインモードでは無効であり、ホストがツールサーフェスを所有する。"
     site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
     site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
   - key: compress.injectTool
@@ -252,6 +334,7 @@ entries:
     render: compress-row
     desc_en: "Register the acp_compress tool for clients (global level only)."
     desc_zh: "向客户端注册 acp_compress 工具（仅全局层级生效）。"
+    desc_ja: "クライアント向けに `acp_compress` ツールを登録（グローバルレベルのみ）。"
     site_en: "Register the acp_compress tool for clients (on by default; global level only)."
     site_zh: "向客户端注册 acp_compress 工具（默认开；仅全局层级生效）。"
   - key: compress.injectNudge
@@ -263,6 +346,7 @@ entries:
     render: compress-row
     desc_en: "Send growth nudges as the window fills (global level only)."
     desc_zh: "窗口填满过程中发送增长提醒（仅全局层级生效）。"
+    desc_ja: "ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。"
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
   - key: compress.reasoning
@@ -273,6 +357,7 @@ entries:
     render: compress-row
     desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+    desc_ja: "2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。"
     site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
   - key: compress.absorb
@@ -283,8 +368,20 @@ entries:
     render: obj-item
     desc_en: "Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify."
     desc_zh: "可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。"
+    desc_ja: "ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。"
     site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
     site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
+  - key: compress.blockOps
+    type: object
+    default: "off"
+    group: compress
+    id: co.blockops
+    render: obj-item
+    desc_en: "Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765."
+    desc_zh: "可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。"
+    desc_ja: "圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。"
+    site_en: "<code>blockOps</code> — opt-in compressed-block lifecycle tools (acp_retire / acp_restore / acp_rewrite); off by default so the wire surface stays byte-identical to pre-#5765 (<span class='mech'>enabled</span>)."
+    site_zh: "<code>blockOps</code> —— 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，线上表面与 #5765 之前逐字节一致（<span class='mech'>enabled</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -293,6 +390,7 @@ entries:
     render: obj-item
     desc_en: "Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction."
     desc_zh: "内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。"
+    desc_ja: "コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。"
     site_en: "<code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>)."
     site_zh: "<code>ccr</code> —— 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 <code>acp_retrieve</code> 取回原文；无上限、永不清除；自 v2 起代理模式默认开（<span class='mech'>enabled, minToolTokens(~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>）。"
   - key: compress.search
@@ -303,6 +401,7 @@ entries:
     render: obj-item
     desc_en: "Search-behavior settings for search_context; currently holds planAware re-ranking."
     desc_zh: "search_context 的检索行为设置；当前含 planAware 重排。"
+    desc_ja: "search_context の検索動作設定；現在、planAware リランキングを保持している。"
     site_en: "<code>search</code> — search-behavior settings for search_context; currently holds <code>planAware</code>."
     site_zh: "<code>search</code> —— search_context 的检索行为设置；当前含 <code>planAware</code>。"
   - key: compress.search.planAware
@@ -313,6 +412,7 @@ entries:
     render: obj-item
     desc_en: "When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results."
     desc_zh: "开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。"
+    desc_ja: "オンにすると、search_context の候補が現在のプラン状態に対してリランキングされる；オフにすると、バイト単位で同一の語彙結果が維持される。"
     site_en: "<code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results."
     site_zh: "<code>search.planAware</code> —— 默认关：开启后 search_context 候选按当前计划状态重排（todo 最新优先 + 上一轮用户消息）；关闭时结果逐字节不变。"
   - key: compress.prompts
@@ -323,6 +423,7 @@ entries:
     render: obj-item
     desc_en: "Override the kernel doctrine texts; load-bearing for quality — gated behind acknowledgePromptsRisk."
     desc_zh: "覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。"
+    desc_ja: "カーネル教義テキストを上書きする；品質に重要であるため、acknowledgePromptsRisk によってゲートされている。"
     site_en: "<code>prompts</code> — override the kernel doctrine texts (<span class='mech'>compressPhilosophy, howToCompressRules, tier2DistillRules, tier3CondenseRules</span>); load-bearing for quality — gated behind acknowledgePromptsRisk."
     site_zh: "<code>prompts</code> —— 覆盖内核教条文本（<span class='mech'>compressPhilosophy, howToCompressRules, tier2DistillRules, tier3CondenseRules</span>）；对压缩质量承重要——受 acknowledgePromptsRisk 门控。"
   - key: compress.reasoningGuard
@@ -333,6 +434,7 @@ entries:
     render: obj-item
     desc_en: "Auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (up to 3 continue-nudge rounds)."
     desc_zh: "gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。"
+    desc_ja: "gpt-5.x/6.x における推論格子の切り詰めに対する自動修復（最大3ラウンドの継続通知）。"
     site_en: "<code>reasoningGuard</code> — auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (≤3 continue-nudge rounds, marker \"Continue thinking...\") (<span class='mech'>enabled, maxContinue, maxTierN, markerText, base, offset, debugLog</span>)."
     site_zh: "<code>reasoningGuard</code> —— gpt-5.x/6.x 推理格截断自动修复（≤3 轮继续提示，标记 \"Continue thinking...\"）（<span class='mech'>enabled, maxContinue, maxTierN, markerText, base, offset, debugLog</span>）。"
   - key: compress.outputSteering
@@ -343,6 +445,7 @@ entries:
     render: obj-item
     desc_en: "Appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests."
     desc_zh: "向系统提示词尾部附加简洁度指令；只收紧机械延续请求。"
+    desc_ja: "システムプロンプトの末尾に簡潔性の指示を追加する；機械的な継続要求をクランプする。"
     site_en: "<code>outputSteering</code> — <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>: appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests."
     site_zh: "<code>outputSteering</code> —— <span class='mech'>{ enabled? false, verbosityLevel? 2 (0–4), effortRouting? }</span>：向系统提示词尾部附加简洁度指令；只收紧机械延续请求。"
   - key: compress.priceProfile
@@ -353,6 +456,7 @@ entries:
     render: obj-item
     desc_en: "w/r/q ratios normalized to the input price (write/cache-read/output); report-only — never affects triggers or the wire."
     desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。"
+    desc_ja: "w/r/q 比率を入力価格（書き込み/キャッシュ読み取り/出力）に対して正規化する；レポート専用であり、トリガーやワイヤーには影響を与えない。"
     site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
     site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
   - key: compress.externalSummary
@@ -363,6 +467,7 @@ entries:
     render: obj-item
     desc_en: "Sends compression summaries to separately configured models referenced from the providers table; whole-chain replace semantics at all three compress levels."
     desc_zh: "把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。"
+    desc_ja: "プロバイダテーブルから参照される個別設定モデルに圧縮サマリーを送信する；3つの圧縮レベルすべてでチェーン全体の置換セマンティクスを持つ。"
     site_en: "<code>externalSummary</code> — optional chain of external summary models, each target a \"provider/model\" reference into the <code>providers</code> table; disabled unless <code>enabled</code> is true, targets tried in order with fall-through (<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>). Whole-chain replace semantics at all three compress levels."
     site_zh: "<code>externalSummary</code> —— 可选的外部摘要模型链，每个目标为指向 <code>providers</code> 表的 \"provider/model\" 引用；<code>enabled</code> 为 true 才启用，目标按顺序尝试、失败落到下一个（<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>）。三级 compress 均为整链替换语义。"
   - key: compress.acknowledgePromptsRisk
@@ -373,6 +478,7 @@ entries:
     render: obj-item
     desc_en: "Must be true before custom prompts take effect."
     desc_zh: "必须先置 true，自定义 prompts 才会生效。"
+    desc_ja: "カスタムプロンプトが有効になる前に true である必要がある。"
     site_en: "<code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect."
     site_zh: "<code>acknowledgePromptsRisk</code> —— 必须先置 true，自定义 prompts 才会生效。"
   - key: compress.absorb.enabled
@@ -381,180 +487,217 @@ entries:
     group: compress
     desc_en: "Enable the absorb distillation block."
     desc_zh: "启用 absorb 蒸馏块。"
+    desc_ja: "吸収蒸留ブロックを有効にする。"
   - key: compress.absorb.minToolTokens
     type: number
     default: "1000"
     group: compress
     desc_en: "Minimum estimated token size of a tool result eligible for absorption."
     desc_zh: "可被吸收的工具结果的最小估算 token 大小。"
+    desc_ja: "吸収の対象となるツール結果の最小推定トークンサイズ。"
   - key: compress.absorb.contextThresholdPct
     type: "number | %"
     default: "unset"
     group: compress
     desc_en: "Only absorb when context usage passes this share of the window."
     desc_zh: "仅当上下文使用率超过窗口该占比时才吸收。"
+    desc_ja: "コンテキスト使用量がウィンドウのこの割合を超えた場合のみ吸収する。"
   - key: compress.absorb.excludeTools
     type: "string[]"
     default: "[]"
     group: compress
     desc_en: "Tool names excluded from absorption."
     desc_zh: "排除出吸收范围的工具名。"
+    desc_ja: "吸収から除外されるツール名。"
   - key: compress.absorb.toolName
     type: string
     default: "\"absorb\""
     group: compress
     desc_en: "Registered name of the absorb tool."
     desc_zh: "absorb 工具的注册名。"
+    desc_ja: "吸収ツールの登録名。"
   - key: compress.absorb.mediaOnly
     type: boolean
     default: "true"
     group: compress
     desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
     desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
+    desc_ja: "メディア（画像）を伴うツール結果に吸収を制限する。画像バイトはテキストにカウントされないため、minToolTokens の対象外となる。false に設定すると、従来の大規模結果の全文吸収が有効になる。"
+  - key: compress.blockOps.enabled
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost."
+    desc_zh: "启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。"
+    desc_ja: "3 つのブロックライフサイクルツール（インジェクション + プロンプト + マニフェスト）を有効にする。Off = ツールなし、プロンプトセクションなし、リクエストごとのコストゼロ。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"
     group: compress
     desc_en: "Enable the content-cache-and-retrieve block."
     desc_zh: "启用内容缓存与回取块。"
+    desc_ja: "コンテンツキャッシュおよび取得ブロックを有効にする。"
   - key: compress.ccr.minToolTokens
     type: number
     default: "≈4000"
     group: compress
     desc_en: "Minimum estimated token size of a tool result eligible for CCR storage."
     desc_zh: "可进入 CCR 存储的工具结果的最小估算 token 大小。"
+    desc_ja: "CCR ストレージの対象となるツール結果の最小推定トークンサイズ。"
   - key: compress.ccr.excludeTools
     type: "string[]"
     default: "[]"
     group: compress
     desc_en: "Tool names excluded from CCR storage."
     desc_zh: "排除出 CCR 存储的工具名。"
+    desc_ja: "CCR ストレージから除外されるツール名。"
   - key: compress.ccr.toolName
     type: string
     default: "\"acp_retrieve\""
     group: compress
     desc_en: "Registered name of the retrieval tool."
     desc_zh: "回取工具的注册名。"
+    desc_ja: "取得ツールの登録名。"
   - key: compress.ccr.maxHeadChars
     type: number
     default: "96"
     group: compress
     desc_en: "Maximum head-excerpt length left inline at the storage pointer."
     desc_zh: "存储指针处内联首段摘录的最大长度。"
+    desc_ja: "ストレージポインタにインラインで残される最大ヘッド抜粋の長さ。"
   - key: compress.prompts.compressPhilosophy
     type: string
     default: "unset (kernel text)"
     group: compress
     desc_en: "Override of the compression philosophy doctrine paragraph."
     desc_zh: "覆盖压缩哲学教条文段。"
+    desc_ja: "圧縮哲学教義パラグラフの上書き。"
   - key: compress.prompts.howToCompressRules
     type: string
     default: "unset (kernel text)"
     group: compress
     desc_en: "Override of the compression how-to rules."
     desc_zh: "覆盖压缩操作规则。"
+    desc_ja: "圧縮手順ルールの上書き。"
   - key: compress.prompts.tier2DistillRules
     type: string
     default: "unset (kernel text)"
     group: compress
     desc_en: "Override of the tier-2 distillation rules."
     desc_zh: "覆盖二级蒸馏规则。"
+    desc_ja: "ティア 2 蒸留ルールの上書き。"
   - key: compress.prompts.tier3CondenseRules
     type: string
     default: "unset (kernel text)"
     group: compress
     desc_en: "Override of the tier-3 condensation rules."
     desc_zh: "覆盖三级浓缩规则。"
+    desc_ja: "ティア 3 凝縮ルールの上書き。"
   - key: compress.reasoningGuard.enabled
     type: boolean
     default: "false"
     group: compress
     desc_en: "Enable reasoning-lattice auto-repair."
     desc_zh: "启用推理格自动修复。"
+    desc_ja: "推論格子の自動修復を有効にする。"
   - key: compress.reasoningGuard.maxContinue
     type: number
     default: "3"
     group: compress
     desc_en: "Maximum continue-nudge rounds per truncation."
     desc_zh: "单次截断的最多继续提示轮数。"
+    desc_ja: "切り詰めごとの最大 continue-nudge ラウンド数。"
   - key: compress.reasoningGuard.maxTierN
     type: number
     default: "(built-in)"
     group: compress
     desc_en: "Upper bound on the repaired lattice tier index."
     desc_zh: "修复后格层索引的上限。"
+    desc_ja: "修復済みラティス階層インデックスの上限。"
   - key: compress.reasoningGuard.markerText
     type: string
     default: "\"Continue thinking...\""
     group: compress
     desc_en: "Marker text that signals a truncated reasoning lattice."
     desc_zh: "标识被截断推理格的标记文本。"
+    desc_ja: "切り詰められた推論ラティスを示すマーカーテキスト。"
   - key: compress.reasoningGuard.base
     type: number
     default: "(built-in)"
     group: compress
     desc_en: "Base offset parameter of the repair lattice."
     desc_zh: "修复格的基础偏移参数。"
+    desc_ja: "修復ラティスのベースオフセットパラメータ。"
   - key: compress.reasoningGuard.offset
     type: number
     default: "(built-in)"
     group: compress
     desc_en: "Offset step parameter of the repair lattice."
     desc_zh: "修复格的偏移步长参数。"
+    desc_ja: "修復ラティスのオフセットステップパラメータ。"
   - key: compress.reasoningGuard.debugLog
     type: boolean
     default: "false"
     group: compress
     desc_en: "Verbose logging for the repair loop."
     desc_zh: "修复环的详细日志。"
+    desc_ja: "修復ループの詳細ログ出力。"
   - key: compress.outputSteering.enabled
     type: boolean
     default: "false"
     group: compress
     desc_en: "Enable the conciseness directive appended to the system-prompt tail."
     desc_zh: "启用附加在系统提示词尾部的简洁度指令。"
+    desc_ja: "システムプロンプト末尾に追加される簡潔性ディレクティブを有効にする。"
   - key: compress.outputSteering.verbosityLevel
     type: "number (0–4)"
     default: "2"
     group: compress
     desc_en: "Target verbosity level for the directive."
     desc_zh: "指令的目标详细程度级别。"
+    desc_ja: "ディレクティブの目標冗長度レベル。"
   - key: compress.outputSteering.effortRouting
     type: boolean
     default: "(built-in)"
     group: compress
     desc_en: "Route effort hints alongside the directive."
     desc_zh: "随指令一起路由 effort 提示。"
+    desc_ja: "ディレクティブとともに努力ヒントをルーティングする。"
   - key: compress.priceProfile.w
     type: number
     default: "unset (registry)"
     group: compress
     desc_en: "Write-price ratio relative to the input price."
     desc_zh: "写入价相对输入价的比率。"
+    desc_ja: "入力価格に対する書き込み価格比。"
   - key: compress.priceProfile.r
     type: number
     default: "unset (registry)"
     group: compress
     desc_en: "Cache-read price ratio relative to the input price."
     desc_zh: "缓存读价相对输入价的比率。"
+    desc_ja: "入力価格に対するキャッシュ読み取り価格比。"
   - key: compress.priceProfile.q
     type: number
     default: "unset (registry)"
     group: compress
     desc_en: "Output price ratio relative to the input price."
     desc_zh: "输出价相对输入价的比率。"
+    desc_ja: "入力価格に対する出力価格比。"
   - key: compress.reasoning.drop
     type: boolean
     default: "true"
     group: compress
     desc_en: "Drop finished-round reasoning runs longer than the threshold."
     desc_zh: "丢弃超过阈值的已结束轮次推理块。"
+    desc_ja: "閾値を超える長さの完了ラウンド推論実行を破棄する。"
   - key: compress.reasoning.threshold
     type: number
     default: "2048"
     group: compress
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
+    desc_ja: "完了推論実行を破棄する文字数閾値。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"
@@ -562,3 +705,4 @@ entries:
     deprecated: true
     desc_en: "Deprecated alias of minCompressRangeChars (accepted, mapped onto it)."
     desc_zh: "minCompressRangeChars 的弃用别名（接受，映射到后者）。"
+    desc_ja: "minCompressRangeChars の非推奨エイリアス（受け入れられ、それにマッピングされる）。"

@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+// #4830: deterministic favicon generator. Draws the panel brand mark (∞ on an
+// accent-blue rounded square, 4x4 supersampled), encodes 16px + 32px PNGs into
+// one .ico container, and writes src/web/favicon.ts — the base64 const served
+// at GET /favicon.ico (admin.ts) and declared by the panel head (page.ts).
+// Re-run after changing the drawing below; output is deterministic (no
+// timestamps, zlib level fixed). Node builtins only — no dependencies.
+import { deflateSync } from "node:zlib";
+import { writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ACCENT = [0x21, 0x85, 0xd0]; // styles.ts --accent (light theme, #2185d0)
+const GLYPH = [0xff, 0xff, 0xff];
+const RING_R = 0.155; // loop radius, unit space
+const RING_HW = 0.052; // ring half-stroke width
+const RING_CX = [0.36, 0.64]; // loop centers (y is 0.5)
+const CORNER_R = 0.17; // badge corner radius
+const SS = 4; // supersamples per side
+
+function roundedRectInside(u, v) {
+    const qx = Math.abs(u - 0.5) - (0.5 - CORNER_R);
+    const qy = Math.abs(v - 0.5) - (0.5 - CORNER_R);
+    const ox = Math.max(qx, 0);
+    const oy = Math.max(qy, 0);
+    return Math.hypot(ox, oy) + Math.min(Math.max(qx, qy), 0) - CORNER_R <= 0;
+}
+
+function sampleColor(u, v) {
+    if (!roundedRectInside(u, v)) return [0, 0, 0, 0];
+    let onGlyph = false;
+    for (const cx of RING_CX) {
+        if (Math.abs(Math.hypot(u - cx, v - 0.5) - RING_R) <= RING_HW) { onGlyph = true; break; }
+    }
+    const c = onGlyph ? GLYPH : ACCENT;
+    return [c[0], c[1], c[2], 255];
+}
+
+function render(size) {
+    const px = Buffer.alloc(size * size * 4);
+    const step = 1 / size;
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            let r = 0, g = 0, b = 0, a = 0;
+            for (let sy = 0; sy < SS; sy++) {
+                for (let sx = 0; sx < SS; sx++) {
+                    const u = (x + (sx + 0.5) / SS) * step;
+                    const v = (y + (sy + 0.5) / SS) * step;
+                    const s = sampleColor(u, v);
+                    r += s[0]; g += s[1]; b += s[2]; a += s[3];
+                }
+            }
+            const n = SS * SS;
+            const i = (y * size + x) * 4;
+            px[i] = Math.round(r / n);
+            px[i + 1] = Math.round(g / n);
+            px[i + 2] = Math.round(b / n);
+            px[i + 3] = Math.round(a / n);
+        }
+    }
+    return px;
+}
+
+const CRC_TABLE = new Uint32Array(256).map((_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+});
+
+function crc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function pngChunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length, 0);
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body), 0);
+    return Buffer.concat([len, body, crc]);
+}
+
+function encodePng(size, rgba) {
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(size, 0);
+    ihdr.writeUInt32BE(size, 4);
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 6; // color type RGBA
+    const rowBytes = size * 4;
+    const raw = Buffer.alloc(size * (rowBytes + 1));
+    for (let y = 0; y < size; y++) {
+        raw[y * (rowBytes + 1)] = 0; // filter type none
+        rgba.copy(raw, y * (rowBytes + 1) + 1, y * rowBytes, (y + 1) * rowBytes);
+    }
+    return Buffer.concat([PNG_SIG, pngChunk("IHDR", ihdr), pngChunk("IDAT", deflateSync(raw, { level: 9 })), pngChunk("IEND", Buffer.alloc(0))]);
+}
+
+function encodeIco(entries) {
+    const header = Buffer.alloc(6);
+    header.writeUInt16LE(0, 0); // reserved
+    header.writeUInt16LE(1, 2); // type: icon
+    header.writeUInt16LE(entries.length, 4);
+    const dataStart = 6 + entries.length * 16;
+    let offset = dataStart;
+    const dirs = [];
+    const payloads = [];
+    for (const e of entries) {
+        const d = Buffer.alloc(16);
+        d[0] = e.size >= 256 ? 0 : e.size;
+        d[1] = e.size >= 256 ? 0 : e.size;
+        d.writeUInt16LE(1, 4); // planes
+        d.writeUInt16LE(32, 6); // bit count
+        d.writeUInt32LE(e.png.length, 8);
+        d.writeUInt32LE(offset, 12);
+        offset += e.png.length;
+        dirs.push(d);
+        payloads.push(e.png);
+    }
+    return Buffer.concat([header, ...dirs, ...payloads]);
+}
+
+const sizes = [16, 32];
+const entries = sizes.map((size) => ({ size, png: encodePng(size, render(size)) }));
+const ico = encodeIco(entries);
+const base64 = ico.toString("base64");
+
+const out = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "web", "favicon.ts");
+writeFileSync(out, `// #4830: generated by scripts/gen-favicon.mjs — re-run that script after
+// changing its drawing code, do not edit this constant by hand. Served at
+// GET /favicon.ico (src/server/admin.ts) and declared by the panel head
+// (src/web/page.ts).
+export const FAVICON_ICO_BASE64 = "${base64}";
+`);
+console.log(`wrote ${out}: ico=${ico.length}B base64=${base64.length} chars (${entries.map((e) => `${e.size}px/${e.png.length}B`).join(", ")})`);

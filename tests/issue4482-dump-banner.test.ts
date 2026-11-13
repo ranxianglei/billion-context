@@ -187,14 +187,14 @@ function pairShape(p: { category: string; attribution: string | null; outgoingAp
     };
 }
 
-test("#4482: runDiff classifies bannered dumps identically to pre-banner ones (old dumps stay readable)", () => {
+test("#4482: runDiff classifies bannered dumps identically to pre-banner ones (old dumps stay readable)", async () => {
     const oldDir = tmpdir("bili-4482-oldfmt-");
     const newDir = tmpdir("bili-4482-newfmt-");
     try {
         writeSession(oldDir, "ses_old", false);
         writeSession(newDir, "ses_new", true);
-        const rOld = runDiff(oldDir, { noLog: true });
-        const rNew = runDiff(newDir, { noLog: true });
+        const rOld = await runDiff(oldDir, { noLog: true });
+        const rNew = await runDiff(newDir, { noLog: true });
         assert.equal(rOld.totalPairs, 1);
         assert.equal(rNew.totalPairs, 1);
         const shapeOld = pairShape(rOld.sessions[0]!.pairs[0]!);
@@ -206,12 +206,12 @@ test("#4482: runDiff classifies bannered dumps identically to pre-banner ones (o
     } finally { rmrf(oldDir); rmrf(newDir); }
 });
 
-test("#4482: runDiff handles a mixed dir (pre-banner + bannered dumps side by side)", () => {
+test("#4482: runDiff handles a mixed dir (pre-banner + bannered dumps side by side)", async () => {
     const dir = tmpdir("bili-4482-mixed-");
     try {
         writeSession(dir, "ses_old", false);
         writeSession(dir, "ses_new", true);
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         assert.equal(report.totalPairs, 2);
         for (const s of report.sessions) {
             for (const p of s.pairs) {
