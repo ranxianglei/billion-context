@@ -159,3 +159,36 @@ test("missing and retired tail rows remain visible as drift", (t) => {
         assert.equal(store.ingestWatermark(view.id), null);
     }
 });
+
+test("folded tail suffix alignment: bounded envelope does not drift against the full table tail (#6353)", (t) => {
+    const { store, shadow, dbPath, view } = fixture(t);
+    const fullTail = Array.from({ length: 100 }, (_, i) => message(i));
+    const fullView: LegacySessionLike = { ...view, lastMessages: fullTail, pluginSnapshot: undefined };
+    store.ingestSession(planIngest(fullView));
+    changeBeforeRead(t, store, dbPath, (db) => {
+        const row = db.prepare("SELECT tail_json FROM sessions WHERE session_id = ?").get(view.id) as { tail_json: string };
+        const tail = JSON.parse(row.tail_json);
+        tail.tailFolded = true;
+        db.prepare("UPDATE sessions SET tail_json = ? WHERE session_id = ?").run(JSON.stringify(tail), view.id);
+    });
+    t.mock.method(store, "ingestSession", () => true);
+    const foldedView: LegacySessionLike = { ...view, lastMessages: fullTail.slice(90), lastMessagesFolded: true, pluginSnapshot: undefined };
+    shadow.record(foldedView);
+    assert.equal(shadow.stats.verifyDrift, 0, shadow.stats.lastError ?? "folded tail must not drift (suffix alignment)");
+    assert.equal(shadow.stats.verifyOk, 1);
+});
+
+test("folded tail suffix alignment: corruption in the overlap is still detected (#6353)", (t) => {
+    const { store, shadow, dbPath, view } = fixture(t);
+    const fullTail = Array.from({ length: 100 }, (_, i) => message(i));
+    const fullView: LegacySessionLike = { ...view, lastMessages: fullTail, pluginSnapshot: undefined };
+    store.ingestSession(planIngest(fullView));
+    t.mock.method(store, "ingestSession", () => true);
+    changeBeforeRead(t, store, dbPath, (db) => {
+        const row = db.prepare("SELECT content_hash FROM messages WHERE session_id = ? AND msg_id = ?").get(view.id, "raw-95") as { content_hash: string };
+        db.prepare("UPDATE content SET bytes = ? WHERE hash = ?").run(Buffer.from(JSON.stringify({ ...message(95), text: "corrupted" })), row.content_hash);
+    });
+    const foldedView: LegacySessionLike = { ...view, lastMessages: fullTail.slice(90), lastMessagesFolded: true, pluginSnapshot: undefined };
+    shadow.record(foldedView);
+    assert.equal(shadow.stats.verifyDrift, 1, shadow.stats.lastError ?? "corruption in the overlap must drift");
+});
