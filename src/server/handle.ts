@@ -2929,18 +2929,14 @@ async function handleRequest(
             // #5683: this round's merged three-level compress settings, captured
             // so the post-prepare gate stamp below can read the policy knobs.
             let preparedCs: CompressSettings | undefined;
-            let runPreparedPipeline = async (
-                respondFailFast: boolean,
-                overflowWindow?: number,
-            ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                const runPrepareInner = async (): Promise<Prepared> => {
-=======
+            // #4753: `let` + `| undefined` so releaseRequestInput below can drop
+            // the closure (and with it its captured input-only state) once the
+            // upstream response boundary is reached.
             let runPreparedPipeline: ((
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
-                const runPrepare = async (): Promise<Prepared> => {
->>>>>>> 9c8c72c78 (fix: release input-only request data before streaming (#4753))
+                const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -3391,9 +3387,26 @@ async function handleRequest(
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
-                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
-                });                // Remember for ALL modes (not just plugin): wire clients (dsh,
+                const releaseRequestInput = () => {
+                    // #4753: refolding is finished before streaming starts. Drop
+                    // the input-only bindings even if forward's wrapper retains
+                    // the callback; accepted outbound bodies still support
+                    // retries.
+                    bodyBuffer = Buffer.alloc(0);
+                    parsed = null;
+                    affinityMessagesCache = null;
+                    runPreparedPipeline = undefined;
+                };
+                try {
+                    await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
+                    }, releaseRequestInput);
+                } finally {
+                    // Transport failures and locally forged replies can return
+                    // before the upstream response boundary.
+                    releaseRequestInput();
+                }
+                // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
                 // plugin tool call sees a consistent window.
