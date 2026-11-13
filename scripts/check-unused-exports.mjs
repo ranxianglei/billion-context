@@ -26,6 +26,7 @@ const ENTRY_FILES = new Set([
     "src/mcp.ts",
     "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
+    "src/claude-subagent-hook.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
     "src/agent/omp.ts",
@@ -87,11 +88,21 @@ const WAIVERS = new Map([
     // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
     // export so the wire shape stays named at its definition site.
     ["src/update.ts", new Set(["LastInstallRecord"])],
+    // #5146 /__bili/upstreams read contract: the two report payload interfaces
+    // are referenced only inside src/upstream-alerts.ts (admin.ts consumes
+    // getUpstreamHealthReport() structurally via JSON.stringify); keep the
+    // exports so the wire shape stays named at its definition site.
+    ["src/upstream-alerts.ts", new Set(["UpstreamHealthEntry", "UpstreamHealthReport"])],
     // #3962 gate telemetry: the coverage record crosses the gate/dsh-native
     // BUNDLE boundary on the globalThis channel — consumers use it
     // structurally through dshCompactionGateTelemetry()'s return type; keep
     // the export so the channel payload stays named at its definition site.
     ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
+    // #6003 egress-transform plugin contract: the four match/ctx/result/module
+    // type shapes are referenced only inside src/egress-transforms.ts (callers
+    // consume them through applyEgressTransforms' parameter types); keep the
+    // exports so the user-plugin contract stays named at its definition site.
+    ["src/egress-transforms.ts", new Set(["EgressTransformMatch", "EgressTransformCtx", "EgressTransformResult", "EgressTransformModule"])],
 ]);
 
 const findings = [];

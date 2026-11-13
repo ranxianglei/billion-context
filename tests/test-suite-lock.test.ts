@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { homedir, tmpdir } from "node:os";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { rmrf } from "./tmp-rm.ts";
 import * as lck from "../scripts/test-suite-lock.mjs";
 
@@ -17,7 +18,8 @@ import * as lck from "../scripts/test-suite-lock.mjs";
 // banner, force bypass, and release-on-exit — both the imported primitives and
 // the real CLI entry point.
 
-const SCRIPT = resolve(import.meta.dirname, "..", "scripts", "test-suite-lock.mjs");
+const ROOT = resolve(import.meta.dirname, "..");
+const SCRIPT = resolve(ROOT, "scripts", "test-suite-lock.mjs");
 const NODE = process.execPath;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -309,5 +311,246 @@ test("CLI run: holds the lock while the suite runs, second run fails fast <2s, r
     } finally {
         try { runProc.kill("SIGKILL"); } catch { /* gone */ }
         rmrf(dir);
+    }
+});
+
+// ---- #5107: production-sessions leak guard + hermetic preload wiring ----
+
+test("resolveProductionSessionsDir mirrors paths.ts sessionsDir() (explicit > XDG > ~/.local/share)", () => {
+    const explicit = join(tmpdir(), "x", "sessions-explicit");
+    assert.equal(
+        lck.resolveProductionSessionsDir({ BILI_SESSIONS_DIR: explicit } as NodeJS.ProcessEnv),
+        resolve(explicit),
+    );
+    const xdg = join(tmpdir(), "x", "data-home");
+    assert.equal(
+        lck.resolveProductionSessionsDir({ BILI_SESSIONS_DIR: "", XDG_DATA_HOME: xdg } as NodeJS.ProcessEnv),
+        join(resolve(xdg), "billion-context", "sessions"),
+    );
+    assert.ok(
+        lck.resolveProductionSessionsDir({} as NodeJS.ProcessEnv).startsWith(join(homedir(), ".local", "share")),
+    );
+});
+
+test("leakGuardEnabled defaults ON; 0/false/no/off disable (BILI_TEST_LEAK_GUARD)", () => {
+    assert.equal(lck.leakGuardEnabled({}), true);
+    assert.equal(lck.leakGuardEnabled({ BILI_TEST_LEAK_GUARD: "" }), true);
+    assert.equal(lck.leakGuardEnabled({ BILI_TEST_LEAK_GUARD: "1" }), true);
+    for (const v of ["0", "false", "no", "off"]) {
+        assert.equal(lck.leakGuardEnabled({ BILI_TEST_LEAK_GUARD: v }), false, `v=${v}`);
+    }
+});
+
+test("snapshotSessionsTree: absent dir → null; files → relpath→[mtimeMs,size]; symlinks skipped", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-leak-snap-"));
+    try {
+        assert.equal(lck.snapshotSessionsTree(join(dir, "absent")), null);
+        mkdirSync(join(dir, "anthropic"), { recursive: true });
+        writeFileSync(join(dir, "index.db"), "x".repeat(4));
+        writeFileSync(join(dir, "anthropic", "s.json"), "{}");
+        const snap = lck.snapshotSessionsTree(dir)!;
+        assert.ok(snap instanceof Map);
+        assert.deepEqual([...snap.keys()].sort(), ["anthropic/s.json", "index.db"]);
+        const [mt, size] = snap.get("index.db")!;
+        assert.equal(size, 4);
+        assert.ok(typeof mt === "number" && mt > 0);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("diffSnapshots: NEW files fail, mtime/size drift warns, untouched passes, absent→present fails everything", () => {
+    const before = new Map<string, [number, number]>([["a.json", [100, 1]], ["b.json", [200, 2]]]);
+    const afterClean = new Map<string, [number, number]>([["a.json", [100, 1]], ["b.json", [200, 2]]]);
+    assert.deepEqual(lck.diffSnapshots(before, afterClean), { created: [], changed: [] });
+
+    const afterNew = new Map<string, [number, number]>([...afterClean, ["c.json", [300, 3]]]);
+    assert.deepEqual(lck.diffSnapshots(before, afterNew), { created: ["c.json"], changed: [] });
+
+    const afterChanged = new Map<string, [number, number]>([
+        ["a.json", [999, 1]], // mtime drift
+        ["b.json", [200, 5]], // size drift
+    ]);
+    assert.deepEqual(lck.diffSnapshots(before, afterChanged), { created: [], changed: ["a.json", "b.json"] });
+
+    assert.deepEqual(lck.diffSnapshots(null, afterClean), { created: ["a.json", "b.json"], changed: [] });
+    assert.deepEqual(lck.diffSnapshots(before, null), { created: [], changed: [] });
+});
+
+test("leak messages name the tree, list files (capped), and point at the escape hatch", () => {
+    const fail = lck.leakFailureMessage("/prod/sessions", ["a.json", "b.json", ...Array.from({ length: 20 }, (_, i) => `c${i}.json`)]);
+    assert.match(fail, /NEW file\(s\)/);
+    assert.ok(fail.includes("/prod/sessions"));
+    assert.ok(fail.includes("a.json") && fail.includes("c0.json"));
+    assert.match(fail, /…and 12 more/);
+    assert.match(fail, /BILI_TEST_LEAK_GUARD=0 npm test/);
+    const warn = lck.leakWarningMessage(["z.json"]);
+    assert.match(warn, /modified during the run/);
+    assert.ok(warn.includes("z.json"));
+    assert.doesNotMatch(warn, /BILI_TEST_LEAK_GUARD=0/, "warn-only line must not advertise a bypass for itself");
+});
+
+test("realSuiteArgs wires BOTH preloads before tsx (#5107 + #2815)", () => {
+    const args = lck.realSuiteArgs();
+    const iBase = args.indexOf("./tests/preload-storage-baseline.mjs");
+    const iEnv = args.indexOf("./tests/preload-test-env.mjs");
+    const iTsx = args.indexOf("tsx");
+    assert.ok(iBase >= 0, `storage-baseline preload missing: ${JSON.stringify(args.slice(0, 6))}`);
+    assert.ok(iEnv >= 0, `hermetic data-root preload missing: ${JSON.stringify(args.slice(0, 6))}`);
+    assert.ok(iTsx > iEnv && iTsx > iBase, "preloads must load before tsx");
+    assert.ok(args.includes("--test") && args[args.length - 1].endsWith(".test.ts"));
+});
+
+test("preload-test-env.mjs isolates src/paths.ts defaults before any user code runs (#5107)", () => {
+    // Pure-JS probe (tsx does not transform -e strings): the preload must have
+    // already rewritten the ambient env before this user code resolves paths.
+    const probe = `
+import { sessionsDir, dataDir, stateDir, configFile } from ${JSON.stringify(pathToFileURL(resolve(ROOT, "src", "paths.ts")).href)};
+const env = process.env;
+const s = sessionsDir();
+const d = dataDir();
+const st = stateDir();
+const cf = configFile();
+if (s !== env.BILI_SESSIONS_DIR) { console.error("sessionsDir escaped isolation:", s); process.exit(9); }
+if (!env.XDG_DATA_HOME || !d.startsWith(env.XDG_DATA_HOME)) { console.error("dataDir escaped isolation:", d); process.exit(9); }
+if (!env.XDG_STATE_HOME || !st.startsWith(env.XDG_STATE_HOME)) { console.error("stateDir escaped isolation:", st); process.exit(9); }
+if (!env.XDG_CONFIG_HOME || !cf.startsWith(env.XDG_CONFIG_HOME)) { console.error("configFile escaped isolation:", cf); process.exit(9); }
+console.log(JSON.stringify({ s, d, st }));
+`;
+    // Scrub the ambient path vars so the ONLY thing isolating this child is the
+    // explicit --import below: the suite's own parent process already runs under
+    // the preload (wrapper wiring), and an inheriting child would pass even with
+    // a broken/renamed preload file — the gate must actually gate (#3617).
+    const scrubbed = { ...process.env } as NodeJS.ProcessEnv;
+    for (const k of ["BILI_SESSIONS_DIR", "BILI_CONFIG_FILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) {
+        delete scrubbed[k];
+    }
+    const r = spawnSync(NODE, ["--import", "tsx", "--input-type=module", "--import", "./tests/preload-test-env.mjs", "-e", probe], {
+        cwd: ROOT,
+        encoding: "utf8",
+        env: scrubbed,
+    });
+    assert.equal(r.status, 0, `probe failed: ${r.stderr ?? r.stdout}`);
+    const parsed = JSON.parse(r.stdout.trim().split("\n").pop()!) as { s: string; d: string; st: string };
+    for (const v of [parsed.s, parsed.d, parsed.st]) {
+        assert.ok(v.startsWith(tmpdir()), `isolated root must live under the system tmp: ${v}`);
+    }
+});
+
+// CLI end-to-end for the guard: the stub "suite" writes into the wrapper's
+// BILI_SESSIONS_DIR (its resolved production dir), mirroring a leaking test.
+function runCliWithStub(cacheDir: string, prodDir: string, stubScript: string, extraEnv: Record<string, string> = {}) {
+    return spawn(NODE, [SCRIPT, "run"], {
+        env: {
+            ...cleanEnv(cacheDir),
+            BILI_SESSIONS_DIR: prodDir,
+            BILI_TEST_SUITE_CMD: JSON.stringify([NODE, "-e", stubScript]),
+            ...extraEnv,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+}
+
+test("CLI run: suite that creates a file in the production sessions dir FAILS the guard (#5107)", async () => {
+    const cache = freshCacheDir();
+    const prod = freshCacheDir();
+    try {
+        const p = runCliWithStub(cache, prod, `
+            require("fs").mkdirSync(require("path").join(process.env.BILI_SESSIONS_DIR, "anthropic"), { recursive: true });
+            require("fs").writeFileSync(require("path").join(process.env.BILI_SESSIONS_DIR, "anthropic", "leak.json"), "{}");
+            process.exit(0);
+        `);
+        let err = "";
+        p.stderr!.on("data", (d) => { err += d; });
+        const code = await once(p, "close").then(([c]) => c as number);
+        assert.equal(code, 1, "guard must turn a green leaking suite red");
+        assert.match(err, /NEW file\(s\)/);
+        assert.ok(err.includes("anthropic/leak.json"), `banner must name the leaked file:\n${err}`);
+        assert.match(err, /BILI_TEST_LEAK_GUARD=0 npm test/);
+    } finally {
+        rmrf(cache);
+        rmrf(prod);
+    }
+});
+
+test("CLI run: clean suite leaves the production dir untouched → guard silent, exit 0 (negative direction)", async () => {
+    const cache = freshCacheDir();
+    const prod = freshCacheDir();
+    writeFileSync(join(prod, "index.db"), "pre-existing");
+    try {
+        const p = runCliWithStub(cache, prod, `process.exit(0);`);
+        let err = "";
+        p.stderr!.on("data", (d) => { err += d; });
+        const code = await once(p, "close").then(([c]) => c as number);
+        assert.equal(code, 0);
+        assert.doesNotMatch(err, /leak guard/i, `no guard output expected:\n${err}`);
+    } finally {
+        rmrf(cache);
+        rmrf(prod);
+    }
+});
+
+test("CLI run: modifying a PRE-EXISTING session file warns but does not fail (live-instance tolerance)", async () => {
+    const cache = freshCacheDir();
+    const prod = freshCacheDir();
+    const pre = join(prod, "openai", "pre.json");
+    mkdirSync(dirname(pre), { recursive: true });
+    writeFileSync(pre, "old");
+    try {
+        const p = runCliWithStub(cache, prod, `
+            require("fs").writeFileSync(require("path").join(process.env.BILI_SESSIONS_DIR, "openai", "pre.json"), "rewritten-by-live-instance");
+            process.exit(0);
+        `);
+        let err = "";
+        p.stderr!.on("data", (d) => { err += d; });
+        const code = await once(p, "close").then(([c]) => c as number);
+        assert.equal(code, 0, "mtime drift on pre-existing files is warn-only");
+        assert.match(err, /modified during the run/);
+        assert.ok(err.includes("openai/pre.json"));
+        assert.doesNotMatch(err, /NEW file\(s\)/);
+    } finally {
+        rmrf(cache);
+        rmrf(prod);
+    }
+});
+
+test("CLI run: BILI_TEST_LEAK_GUARD=0 disables the guard even when the suite leaks (escape hatch)", async () => {
+    const cache = freshCacheDir();
+    const prod = freshCacheDir();
+    try {
+        const p = runCliWithStub(cache, prod, `
+            require("fs").mkdirSync(process.env.BILI_SESSIONS_DIR, { recursive: true });
+            require("fs").writeFileSync(require("path").join(process.env.BILI_SESSIONS_DIR, "leak.json"), "{}");
+            process.exit(0);
+        `, { BILI_TEST_LEAK_GUARD: "0" });
+        let err = "";
+        p.stderr!.on("data", (d) => { err += d; });
+        const code = await once(p, "close").then(([c]) => c as number);
+        assert.equal(code, 0, "disabled guard must not fail the run");
+        assert.doesNotMatch(err, /NEW file\(s\)/);
+    } finally {
+        rmrf(cache);
+        rmrf(prod);
+    }
+});
+
+test("CLI run: absent production dir that the suite MATERIALIZES counts as a leak", async () => {
+    const cache = freshCacheDir();
+    const prod = join(freshCacheDir(), "never-created");
+    assert.equal(existsSync(prod), false);
+    try {
+        const p = runCliWithStub(cache, prod, `
+            require("fs").mkdirSync(require("path").join(process.env.BILI_SESSIONS_DIR, "_unknown"), { recursive: true });
+            require("fs").writeFileSync(require("path").join(process.env.BILI_SESSIONS_DIR, "_unknown", "new.json"), "{}");
+            process.exit(0);
+        `);
+        let err = "";
+        p.stderr!.on("data", (d) => { err += d; });
+        const code = await once(p, "close").then(([c]) => c as number);
+        assert.equal(code, 1, "materializing the production tree is already a violation");
+        assert.ok(err.includes("_unknown/new.json"));
+    } finally {
+        rmrf(dirname(prod));
+        rmrf(cache);
     }
 });

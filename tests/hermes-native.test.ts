@@ -309,7 +309,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"version": "test-1", "tools": {"anthropic": [
                 {"name": "compress", "description": "compress a range", "input_schema": {"type": "object"}},
                 {"name": "decompress", "description": "decompress a block", "input_schema": {"type": "object"}},
-                {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]}})
+                {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]},
+                # A proxy that supports the compression-channel override names its header here; an
+                # older proxy omits the map entry (empty string), and the plugin must stay legacy.
+                "headers": {"agent": "x-bili-plugin", "conversation": "x-bili-plugin-conversation",
+                            "compression": os.environ.get("BC_MANIFEST_COMPRESSION") or ""}})
         elif self.path.startswith("/__bili/plugin/status"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
@@ -564,6 +568,9 @@ elif SCENARIO == "slow-boot-fail":
 elif SCENARIO == "slow-boot-unload":
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # #5991 negative direction: the host's own proxy must survive an unload that lands BEFORE
+    # routing ever happened — the _shutdown env gate must stay a no-op, not wipe pre-existing keys.
+    os.environ["HTTPS_PROXY"] = "http://user-proxy.example:9999"
     mod.REGISTER_WAIT_S = 0.2
     mod.BOOTSTRAP_BUDGET_S = 5.0
     SLOW["enabled"] = True
@@ -752,6 +759,28 @@ elif SCENARIO.startswith("attach"):
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
         })
+elif SCENARIO == "defer-fallback":
+    # Hermes registers the ACP tools natively but its tool_search layer DEFERS the toolset, so the
+    # outgoing snapshot carries none of them — the session would otherwise ride anonymous proxy mode
+    # (pfa-* fork ids, default window, /acp dead). The proxy advertises the compression-channel
+    # override: identity + budget stay plugin-stamped, compression moves server-side.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    os.environ["BC_MANIFEST_COMPRESSION"] = "x-bili-plugin-compression"
+    mod.register(ctx)
+    mw = ctx.middlewares["llm_request"]
+    deferred = mw(request=mw_request("test-model", with_tools=False), session_id="sess-defer",
+                  model="test-model", provider="p", api_mode="chat")
+    partial = mw(request=mw_request("test-model", names=("compress",)), session_id="sess-defer",
+                 model="test-model", provider="p", api_mode="chat")
+    visible = mw(request=mw_request("test-model"), session_id="sess-defer",
+                 model="test-model", provider="p", api_mode="chat")
+    out.update({
+        "defer_none": deferred is None,
+        "defer_headers": deferred["request"]["extra_headers"] if isinstance(deferred, dict) else None,
+        "partial_headers": partial["request"]["extra_headers"] if isinstance(partial, dict) else None,
+        "visible_headers": visible["request"]["extra_headers"] if isinstance(visible, dict) else None,
+    })
 elif SCENARIO.startswith("cmd-acp"):
     # no-proxy leg: no sidecar installed -> register() stays inert, origin unset
     if SCENARIO != "cmd-acp-no-proxy":
@@ -793,7 +822,7 @@ elif SCENARIO.startswith("mitm-"):
     os.makedirs(libdir, exist_ok=True)
     with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
         f.write(MINI_YAML_PARSER)
-    if kind in ("pyyaml", "parse"):
+    if kind in ("pyyaml", "parse", "top-level"):
         with open(os.path.join(libdir, "yaml.py"), "w") as f:
             f.write(YAML_STUB_SRC)
     if kind == "ruamel":
@@ -808,17 +837,47 @@ elif SCENARIO.startswith("mitm-"):
     if kind == "none":
         sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
     sys.path.insert(0, libdir)
-    cfg_text = (
-        "providers:\n"
-        "  openrouter:\n"
-        "    base_url: https://openrouter.ai/api/v1\n"
-        "  legacy:\n"
-        "    url: https://legacy.example.com/v1\n"
-    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
-    with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
-        f.write(cfg_text)
+    if kind == "top-level":
+        # #6022: documented stock shape — top-level base_url next to provider:, no providers map.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: nous\n"
+                "base_url: https://inference-api.example.com/v1\n"
+            )
+        out["tl_domains"] = mod.mitm_domains_from_config()
+        out["tl_pbu"] = {
+            "active": mod._provider_base_url("nous"),
+            "unnamed": mod._provider_base_url(None),
+            "other": mod._provider_base_url("other"),
+        }
+        # Mixed shape: per-provider entries win for their own name; top-level answers active/unnamed only.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: alpha\n"
+                "providers:\n"
+                "  beta:\n"
+                "    base_url: https://beta.example.com/v1\n"
+                "base_url: https://alpha.example.com/v1\n"
+            )
+        out["mix_domains"] = mod.mitm_domains_from_config()
+        out["mix_pbu"] = {
+            "active": mod._provider_base_url("alpha"),
+            "named": mod._provider_base_url("beta"),
+            "missing": mod._provider_base_url("missing"),
+            "unnamed": mod._provider_base_url(None),
+        }
+    else:
+        cfg_text = (
+            "providers:\n"
+            "  openrouter:\n"
+            "    base_url: https://openrouter.ai/api/v1\n"
+            "  legacy:\n"
+            "    url: https://legacy.example.com/v1\n"
+        ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(cfg_text)
+        out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_kind"] = kind
-    out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_warnings"] = list(WARNINGS)
 elif SCENARIO == "retry-recover":
     # #4644: attempt 1 hits a still-booting proxy; the backoff retry lands when it comes up.
@@ -1031,6 +1090,24 @@ elif SCENARIO == "registry-find":
           "zzz-own": {"origin": ORIGIN, "pid": 4242, "instanceId": "zzz-own", "startedAt": 999}})
     out["rf_dup_pid"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
     out["rf_none"] = mod._find_spawned_in_registry(None)
+elif SCENARIO == "ready-unload":
+    # #5991: env is routed to the live origin while ready, then the host unloads mid-session —
+    # the process-global routing must be restored (or dropped), not left pointing at a port the
+    # plugin no longer serves; a leftover HTTPS_PROXY breaks every LLM call in the process.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    user_proxy = "http://user-proxy.example:9999"   # pre-existing host routing — must survive unload
+    os.environ["HTTPS_PROXY"] = user_proxy
+    os.environ["https_proxy"] = user_proxy
+    mod.register(ctx)
+    out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
+    ctx.run_unload()
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1095,6 +1172,10 @@ interface DriverOut {
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
+    tl_domains?: string[];
+    tl_pbu?: Record<string, string | null>;
+    mix_domains?: string[];
+    mix_pbu?: Record<string, string | null>;
     commands?: Record<string, string>;
     tools_after_reenable?: string[];
     state_after_reenable?: string;
@@ -1108,6 +1189,10 @@ interface DriverOut {
     stale_headers?: Record<string, string> | null;
     no_tools_none?: boolean;
     partial_tools_none?: boolean;
+    defer_none?: boolean;
+    defer_headers?: Record<string, string> | null;
+    partial_headers?: Record<string, string> | null;
+    visible_headers?: Record<string, string> | null;
     anthropic_headers?: Record<string, string> | null;
     register_elapsed?: number;
     state_after_register?: string;
@@ -1136,6 +1221,7 @@ interface DriverOut {
     env_after_unload?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
+    env_routed?: boolean;
     register_calls?: number;
     retry_state?: string;
     retry_attempt?: number;
@@ -1250,6 +1336,25 @@ describe("python plugin runtime (subprocess)", () => {
         // #1199: an attaching session registers its host pid so the shared proxy
         // outlives the first (spawning) owner's exit.
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+    });
+
+    // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
+    // though the plugin registered it. Once the proxy advertises the compression-channel override,
+    // the request keeps its plugin identity + budget and the proxy owns compression — the pure
+    // plugin lane (no override header) stays untouched.
+    test("deferred toolset: identity/budget stay plugin-stamped, compression falls back to the proxy", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("defer-fallback");
+        assert.ok(out, err);
+        assert.equal(out!.defer_none, false, "a deferred toolset must not drop the request into anonymous proxy mode");
+        assert.equal(out!.defer_headers!["x-bili-plugin"], "hermes");
+        assert.equal(out!.defer_headers!["x-bili-plugin-conversation"], "sess-defer");
+        assert.equal(out!.defer_headers!["x-bili-plugin-compression"], "proxy", "proxy owns compression for this request");
+        assert.equal(out!.partial_headers!["x-bili-plugin-compression"], "proxy", "a partial snapshot also runs proxy-side");
+        assert.equal(out!.visible_headers!["x-bili-plugin-compression"], undefined, "a visible toolset keeps the pure plugin lane");
     });
 
     // #3261: the host knows the model's window (HERMES_HOME/context_length_cache.yaml) but the
@@ -1673,7 +1778,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_after_unload, [], "no register_tool after unload — the host would drop it anyway");
         assert.equal(out!.unload_thread_alive, false, "the bootstrap thread exits on the stop event");
         assert.equal(out!.state_after_unload, "stopped");
-        assert.equal(out!.env_after_unload, null);
+        assert.equal(out!.env_after_unload, "http://user-proxy.example:9999",
+            "the host's own proxy survives an unload that never routed (#5991)");
         assert.equal(out!.mw_after_unload_none, true);
         assert.match(out!.acp_after_unload!, /plugin unloaded/);
     });
@@ -1687,6 +1793,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.state_after_reenable, "ready");
         assert.equal(out!.env_after_reenable, out!.origin, "traffic is routed again");
         assert.equal(out!.origin_after_reenable, out!.origin);
+    });
+
+    test("unload with routed env: the process-global proxy is restored to the host's own values (#5991)", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("ready-unload");
+        assert.ok(out, err);
+        assert.equal(out!.env_routed, true, "register() routed traffic through the origin first");
+        assert.equal(out!.env_https_proxy, "http://user-proxy.example:9999",
+            "the host's own proxy is restored verbatim, not left at the plugin's origin port");
+        assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
+        assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
+        assert.equal(out!.env_ssl_cert_file, null);
     });
 });
 
@@ -1820,5 +1938,30 @@ describe("MITM-domain discovery (#2838)", () => {
         assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
         assert.match(out!.mitm_warnings![0], /could not parse/);
         assert.match(out!.mitm_warnings![0], /blind-tunnel/);
+    });
+
+    // #6022: the documented stock shape is a top-level base_url next to provider: (no providers map) —
+    // it must be discovered, and _provider_base_url must answer it for the active/unnamed provider only.
+    test("top-level base_url: whitelisted AND scoped to the active provider", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-top-level");
+        assert.ok(out, err);
+        assert.deepEqual(out!.tl_domains, ["inference-api.example.com"]);
+        assert.deepEqual(out!.tl_pbu, {
+            active: "https://inference-api.example.com/v1",
+            unnamed: "https://inference-api.example.com/v1",
+            other: null,
+        });
+        assert.deepEqual(out!.mix_domains, ["beta.example.com", "alpha.example.com"]);
+        assert.deepEqual(out!.mix_pbu, {
+            active: "https://alpha.example.com/v1",
+            named: "https://beta.example.com/v1",
+            missing: null,
+            unnamed: "https://alpha.example.com/v1",
+        });
+        assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
     });
 });

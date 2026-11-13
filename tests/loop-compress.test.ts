@@ -112,8 +112,9 @@ function reFetchProbe(): { calls: () => number; bodies: () => string[]; restore:
 
 test("loop #3: proxy-tool round → re-request fires (model continues with result), marker shown", async () => {
     // acp_status drives the re-request deterministically: a bare-session
-    // compress fails kernel validation and ends the turn under the failed-only
-    // breaker (#156/#4186), which would un-test this path.
+    // compress fails kernel validation and enters the #5220 recovery-receipt
+    // path (receipt re-request with stripped frames), which would muddy this
+    // plain re-request assertion.
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_s", "acp_status", "{}"),
@@ -608,12 +609,14 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
     }
 });
 
-// Scope guard: a FAILED compress changes no state — no refresh. Under the
-// failed-only breaker (#156/#4186) such a round ends the turn before any
-// re-request: the ephemeral failure frame never reaches upstream (it would
-// vanish from the next client request — an unsanctioned mid-history seam),
-// and the ❌ receipt streamed to the client carries the reason forward.
-test("loop #422b: failed compress → no fold refresh, no re-request (turn ends, receipt surfaced)", async () => {
+// Scope guard: a FAILED compress changes no state — no refresh (#422b scope
+// unchanged). #5220 contract: such a round no longer ends the turn — the retry
+// body carries ONE plain assistant recovery receipt whose bytes equal the ❌
+// marker already streamed to the client; this round's ephemeral tool frames
+// are stripped first so they never reach upstream (#1548/#4186 seam). The
+// fixture resubmits the identical failing call on round 2 → the #156
+// signature breaker stops exactly one re-request.
+test("loop #422b/#5220: failed compress → no fold refresh; recovery-receipt re-request; identical resubmit breaks", async () => {
     const ctx = withRefs(
         makeCtx([
             textMsg("m00001", "user", "hello"),
@@ -628,8 +631,10 @@ test("loop #422b: failed compress → no fold refresh, no re-request (turn ends,
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
+    let refreshCalls = 0;
     try {
         ctx.refreshFolded = () => {
+            refreshCalls++;
             throw new Error("refreshFolded must NOT be called for a failed compress");
         };
         const out = await drain(
@@ -638,7 +643,12 @@ test("loop #422b: failed compress → no fold refresh, no re-request (turn ends,
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(probe.calls(), 0, "failed-only round breaks before any re-request — the failure frame never reaches upstream (#4186)");
+        assert.equal(refreshCalls, 0, "no fold refresh for a failed compress");
+        assert.equal(probe.calls(), 1, "recovery-receipt re-request fired once; the identical round-2 resubmit hits the #156 signature breaker");
+        const body = probe.bodies()[0]!;
+        assert.ok(body.includes("❌") && body.includes("FAILED"), "retry body carries the recovery receipt as assistant text");
+        assert.ok(!body.includes("function_call") && !body.includes("call_id"), "ephemeral failed frames stay off the wire (#1548/#4186) — receipt only");
+        assert.ok(!body.includes(compressArgs), "the failing arguments did NOT ride upstream inside an ephemeral frame (receipt carries marker text only)");
         assert.ok(out.includes("Compression FAILED"), "failure receipt surfaced to the client so the reason survives the turn");
         assert.ok(/event: response\.completed/.test(out), "graceful completion (not degenerate empty)");
     } finally {

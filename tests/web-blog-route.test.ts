@@ -34,9 +34,19 @@ const mkHarnessEl = (): HarnessEl => ({
     querySelectorAll: () => [], querySelector: () => null,
 });
 
-const FEED = { items: [{ id: "demo", kind: "post", date: "2026-10-08", title: "Demo post", titleZh: "演示", excerpt: "ex", html: "<p>hi</p>", htmlZh: "<p>你好</p>" }] };
+const FEED = { items: [{ id: "demo", kind: "post", date: "2026-10-08", title: "Demo post", titleZh: "演示", excerpt: "ex", html: "<p>hi</p>", htmlZh: "<p>你好</p>", discussion: 123 }] };
 
-async function runClient(hash: string): Promise<{ els: Map<string, HarnessEl>; blogHits: number; unhandled: unknown[] }> {
+// #4957: blog slugs keep whatever the filename carried after the date prefix
+// (blogfeed.ts strips only `YYYY-MM-DD_`), so ids can contain dots, spaces and
+// CJK text — and the list href is percent-encoded, so it also contains `%`.
+const NONASCII_FEED = {
+    items: [
+        { id: "v0.1.208·压缩上线", kind: "post", date: "2026-10-20", title: "Dot and middot id", titleZh: "", excerpt: "ex", html: "<p>dot</p>", htmlZh: "" },
+        { id: "深入浅出上下文压缩", kind: "post", date: "2026-10-21", title: "CJK id", titleZh: "", excerpt: "ex", html: "<p>cjk</p>", htmlZh: "" },
+    ],
+};
+
+async function runClient(hash: string, feed: unknown = FEED): Promise<{ els: Map<string, HarnessEl>; blogHits: number; unhandled: unknown[] }> {
     const unhandled: unknown[] = [];
     const onRej = (r: unknown) => unhandled.push(r);
     process.on("unhandledRejection", onRej);
@@ -62,7 +72,7 @@ async function runClient(hash: string): Promise<{ els: Map<string, HarnessEl>; b
             fetch: async (url: string | URL | Request) => {
                 if (String(url).endsWith("/blog")) {
                     blogHits += 1;
-                    return { ok: true, status: 200, json: async () => FEED };
+                    return { ok: true, status: 200, json: async () => feed };
                 }
                 return { ok: true, status: 200, json: async () => ({}) };
             },
@@ -103,6 +113,19 @@ test("#/blog/<slug> renders that single article with a back link", async () => {
     const list = r.els.get("bl-list")!;
     assert.ok(list.innerHTML.includes("post-body") && (list.innerHTML.includes("<p>hi</p>") || list.innerHTML.includes("\u4f60\u597d</p>")), "article body rendered (locale-twin aware)");
     assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link to the index present");
+    // #5396 final form: exact discussion link built from the manifest-recorded number
+    // (item.discussion) — no search guesswork; plus the in-page EN|中文 language pins.
+    assert.ok(list.innerHTML.includes('href="https://github.com/ranxianglei/billion-context/discussions/123" target="_blank" rel="noopener"'), "exact discussion-thread link from the recorded number");
+    assert.ok(list.innerHTML.includes("?lang=en#/blog/demo") && list.innerHTML.includes("?lang=zh#/blog/" + encodeURIComponent("demo")), "in-page language pins present");
+    assert.ok(list.innerHTML.includes("\u4e2d\u6587</a>"), "Chinese toggle label rendered");
+});
+
+test("#/blog/<slug> without a recorded discussion number shows no thread button", async () => {
+    const feed = { items: [{ id: "plain", kind: "post", date: "2026-10-08", title: "Plain", excerpt: "ex", html: "<p>p</p>" }] };
+    const r = await runClient("#/blog/plain", feed);
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes("post-body"), "article still renders without a recorded thread");
+    assert.ok(!list.innerHTML.includes("billion-context/discussions"), "no discussion link when the manifest recorded none");
 });
 
 test("unknown slug degrades to a back link without a crash", async () => {
@@ -110,6 +133,31 @@ test("unknown slug degrades to a back link without a crash", async () => {
     assert.equal(r.unhandled.length, 0, `client raised unhandled rejection: ${r.unhandled.join("; ")}`);
     const list = r.els.get("bl-list")!;
     assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link present for unknown slug");
+    assert.ok(!list.innerHTML.includes("post-body"), "no article body for an unknown slug");
+});
+
+test("blog ids containing non-ASCII or dots route to the article detail, not overview (#4957)", async () => {
+    // The hash is exactly what the index row href produces (encodeURIComponent of
+    // the id): dots survive literal, CJK becomes %XX sequences. The old route
+    // regex only admitted [A-Za-z0-9_-] so both fell back to overview.
+    for (const item of NONASCII_FEED.items) {
+        const hash = "#/blog/" + encodeURIComponent(item.id);
+        const r = await runClient(hash, NONASCII_FEED);
+        assert.equal(r.unhandled.length, 0, `${hash} raised unhandled rejection: ${r.unhandled.join("; ")}`);
+        assert.equal(r.blogHits, 1, `${hash} fetches the feed once`);
+        assert.ok(r.els.get("page-blog") && !r.els.get("page-blog")!.hidden, `${hash} shows the blog section`);
+        assert.ok(r.els.get("page-overview")!.hidden, `${hash} must NOT fall back to the overview page`);
+        const list = r.els.get("bl-list")!;
+        assert.ok(list.innerHTML.includes("post-body"), `${hash} renders the article body`);
+    }
+});
+
+test("unknown non-ASCII blog slug degrades to the back-link card without a crash", async () => {
+    const hash = "#/blog/" + encodeURIComponent("不存在的文章.md");
+    const r = await runClient(hash, NONASCII_FEED);
+    assert.equal(r.unhandled.length, 0, `client raised unhandled rejection: ${r.unhandled.join("; ")}`);
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link present for an unknown non-ASCII slug");
     assert.ok(!list.innerHTML.includes("post-body"), "no article body for an unknown slug");
 });
 

@@ -11,6 +11,8 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { yieldToEventLoop } from "./yield-loop.js";
+import { bufferedSseEvents } from "./sse-util.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -27,6 +29,7 @@ import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
 // #3635: the failure description moved to the leaf module next to its data
@@ -133,6 +136,16 @@ const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+
+// #5408: when the #4288 fit-forward exit judges on ESTIMATE ONLY (no usage
+// baseline backing it) and the payload estimate reaches this fraction of the
+// HARD window limit, warn: the local estimate excludes the system prompt +
+// tool definitions and provider-side counting, so "fits by our scale" can
+// still overflow upstream (the incident forwarded ~542K actual against a
+// 500K window with zero bili warnings). Observability only — the forward
+// still happens (blocking would defeat #4288); the overflow-arm rescue folds
+// next turn if upstream rejects (#1195).
+const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // #2383: entry overshoot (entryTokens / window) above which the LLM fold path
 // is PROVABLY unable to converge in this invocation — it exceeds the raised
 // budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
@@ -264,6 +277,8 @@ export interface PreflightDeps {
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
+    /** #5974: tokens by which this pass's blind view (processTurn on the client re-send) understates the ACTUAL outbound body, measured by the caller against a fresh full-pipeline rebuild (#4543-① — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about). When > 0, every fit judgment in this pass runs on the corrected scale (exit bar, futility deficit, relax triggers, tier-distillation funnel, final fitsWindow), so the walk keeps folding until the reconstruction is predicted to fit too. Absent/0 → byte-identical legacy behavior; only the bounded corrective second pass sets it. */
+    viewDeltaCorrection?: number;
 }
 
 type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -374,39 +389,138 @@ function refNum(ref: string): number {
 // clamp, the image-cost textSide) carries billed-caliber mass. Without it the
 // k̂ sample divides a bill that includes thinking by an estimate that
 // excludes it, and thinking-heavy routes learn an inflated factor.
+// #5116: the estimator runs on EVERY outbound turn over the RESENT full
+// history, so the CJK-aware scan is O(total conversation bytes) per request
+// and O(turns × bytes) per session — the single largest per-turn CPU item on
+// big-context lanes. A message's estimate is a pure function of its identity
+// (text + thinkingTokens), and kernel-minted ids are content digests, so an
+// id-keyed memo makes every call after the first a Map lookup: steady state
+// pays O(new messages) instead of O(full history) and repeated calls within
+// one turn (preflight arming, window gates, output clamp, relay) all hit.
+// Only `h_` digest ids are cached — test fixtures and reserved ids
+// (`acp_summary_*`) may reuse an id across differing texts and bypass it.
+// Kernel ids are *logical* identity, not a digest of the counted text, so two
+// same-id messages can still differ in counted text: (a) converters seed
+// tool-call ids with canonicalToolArgs(args) (whitespace/key-order only — the
+// character multiset, and therefore the CJK-aware count, is unchanged) while
+// CoreMessage.text keeps the verbatim args; (b) view renders (renderTags,
+// snapshot render) rewrite text in place and keep ids. The key therefore also
+// carries text length: every length-changing rewrite misses (a safe recount),
+// and the canonicalization deltas from (a) are count-invariant by construction.
+const messageTokenMemo = new Map<string, number>();
+const MESSAGE_TOKEN_MEMO_CAP = 200_000;
+const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
+
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += countMessageTokens(m, defaultCountTokens);
+    for (const m of messages) {
+        const id = m.id;
+        if (KERNEL_MINTED_ID.test(id)) {
+            const textLength = m.text === undefined ? -1 : m.text.length;
+            const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
+            const cached = messageTokenMemo.get(key);
+            if (cached !== undefined) {
+                tokens += cached;
+                continue;
+            }
+            const counted = countMessageTokens(m, defaultCountTokens);
+            if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
+            messageTokenMemo.set(key, counted);
+            tokens += counted;
+        } else {
+            tokens += countMessageTokens(m, defaultCountTokens);
+        }
+    }
     return tokens;
+}
+
+export function clearEstimateCoreMessagesMemoForTests(): void {
+    messageTokenMemo.clear();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
 // so their fit decision must be made on the RAW client body — the kernel view
 // is empty on that path (processedMessages: []). Walks every string leaf of
-// the parsed body through the same CJK-aware defaultCountTokens; binary-
-// carrying fields (base64 image data, data-URLs) are excluded because
+// the parsed body (iterative explicit stack — client bodies may nest beyond
+// recursion depth, #6038) through the same CJK-aware defaultCountTokens;
+// binary-carrying fields (base64 image data, data-URLs) are excluded because
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
 // fails closed.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data"]);
+// #5932: `image_url` is the responses-lane/OpenAI data-URL shape (the blob sits
+// DIRECTLY under that key) — counting it as text once made a 40 MB screenshot
+// body "measure" ~10M tokens and doom-gates 413'd image turns that belong in
+// the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
+// `source.data` and Gemini `inline_data.data` were already excluded.
+const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const walk = (value: unknown, key?: string): void => {
+    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    while (pending.length > 0) {
+        const [value, key] = pending.pop()!;
         if (typeof value === "string") {
             if (!key || !NON_TEXT_BODY_KEYS.has(key)) tokens += defaultCountTokens(value);
-            return;
+            continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) walk(item, key);
-            return;
+            for (const item of value) pending.push([item, key]);
+            continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k]);
         }
-    };
-    walk(parsed);
+    }
     return tokens;
+}
+
+/** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
+ *  must say whether it is messages[] (a giant paste / tool result), tools[]
+ *  (84 schemas in #5000), the system prompt, or structural other — "trim the
+ *  oversized content" is actively misleading for a 55.2 MiB body whose
+ *  messages[] is only 1.44 MiB. Same walk + same exclusions as
+ *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
+ *  equals estimateRawBodyTokens(parsed) exactly. */
+export interface RawBodyBreakdown {
+    total: number;
+    messages: number;
+    tools: number;
+    system: number;
+    other: number;
+}
+
+export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+    const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
+    const pending: [unknown, string | undefined, number][] = [];
+    if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            pending.push([v, k, bucket]);
+        }
+    } else {
+        pending.push([parsed, undefined, 3]);
+    }
+    while (pending.length > 0) {
+        const [value, key, bucket] = pending.pop()!;
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            continue;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) pending.push([item, key, bucket]);
+            continue;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+        }
+    }
+    return {
+        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
+        messages: buckets[0],
+        tools: buckets[1],
+        system: buckets[2],
+        other: buckets[3],
+    };
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts
@@ -837,18 +951,8 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
     let completed = false;
     let invalid = false;
     let badFrame = false;
-    let eventType = "";
-    for (const line of text.split("\n")) {
-        if (line.trim() === "") {
-            eventType = "";
-            continue;
-        }
-        if (line.startsWith("event:")) {
-            eventType = line.slice(6).trim();
-            continue;
-        }
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
+    for (const { event: eventType, data } of bufferedSseEvents(text)) {
+        const payload = data.trim();
         if (!payload || payload === "[DONE]") continue;
         let obj: unknown;
         try {
@@ -1233,7 +1337,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // minimum-summary gate rejects such output anyway), so omit it.
     // #2952: systemOverride carries a tier-distillation TASK (T2/T3 rules) in
     // place of the default tier-1 TASK; absent → byte-identical default below.
-    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
         summaryLengthBudgetClause(lengthBudget, MIN_SUMMARY_CHARS);
     if (deps.externalSummary) {
@@ -1346,12 +1450,23 @@ class SummaryTransportError extends Error {
 }
 
 async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boolean): Promise<string> {
+    // #5904: log the upstream's origin+path (never the query — it can carry
+    // signed credentials) so progress lines stay greppable per-endpoint.
+    const safeUpstreamLabel = (raw: string): string => {
+        try { const u = new URL(raw); return u.origin + u.pathname; } catch { return "upstream"; }
+    };
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         deps.signal?.throwIfAborted();
         let clearTimer: (() => void) | undefined;
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
+        const sentAt = Date.now();
+        // #5904: a summary attempt could previously wedge between "sent" and
+        // "answered" with NO log line at all — a 5-minute silent hang was
+        // indistinguishable from a slow prefill. Emit send/receive progress so
+        // log timelines show exactly which attempt is in flight and for how long.
+        deps.log("info", `[preflight] summary attempt ${attempt}/${maxAttempts} sent (${body.length}b, stream=${stream}) → ${safeUpstreamLabel(deps.url)}`);
         try {
             // #3226: build the header set first so a signed lane can re-sign over
             // the summary's OWN bytes — forwarding the inbound signature verbatim
@@ -1367,6 +1482,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             }, undefined, deps.signal);
             clearTimer = result.clearTimer;
             stage = "response body";
+            deps.log("info", `[preflight] summary attempt ${attempt} headers received (${result.response.status}) after ${Date.now() - sentAt}ms`);
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
@@ -1399,6 +1515,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
                 if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
                 }
+                deps.log("error", `[preflight] summary failed permanently after ${attempt} attempt${attempt === 1 ? "" : "s"} (${Date.now() - sentAt}ms): ${failure.message}`);
                 throw failure;
             }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
@@ -1656,8 +1773,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // for k̂=1 / absent / mismatched-origin (applyEstimateCalibration → raw), so
     // the uncalibrated #1841 path stays byte-identical.
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
-    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
+    // #5974: measured view-vs-reconstruction divergence (see PreflightDeps.viewDeltaCorrection).
+    // Every fit judgment in this pass runs on the corrected scale; 0 keeps legacy behavior.
+    const viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve - viewDeltaCorrection);
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    // #4288: set when the round-top fit exit fired — the walk ended in a
+    // forward decision, and no later verdict may override it (see the final
+    // failure stamp below).
+    let fitExitForward = false;
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
@@ -1892,7 +2016,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // the old blanket "every compression tier is exhausted" conflated.
         let exhaustedWhy: string | undefined;
         let est = measureEst();
-        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
+        // #5974: judge recovery on the corrected scale too — a blind-view est under the window can still leave the true body over.
+        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est + viewDeltaCorrection >= limit && !deps.signal?.aborted) {
             const active = deps.session.state.blocks.filter((b) => b.active);
             const t1 = active.filter((b) => b.tier === 1);
             const t2 = active.filter((b) => b.tier === 2);
@@ -1951,7 +2076,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             const { sourceTier, first, last, lo, hi } = chosen;
             const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
-            const system = buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections)
+            const system = buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections))
                 + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
             const content = spanContent(lo, hi);
             const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
@@ -2012,13 +2137,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             netSaved += gained;
             est = after;
-            if (est < limit) { stopReason = "fit"; break; }
+            // #5974: corrected scale — the fit must hold for the predicted OUTBOUND body, not just the blind view.
+            if (est + viewDeltaCorrection < limit) { stopReason = "fit"; break; }
             deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged b-range ${first.blockId}..${last.blockId} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
         }
-        if (stopReason === "fit" && est >= limit) stopReason = "cap";
-        const recovered = est < limit;
+        if (stopReason === "fit" && est + viewDeltaCorrection >= limit) stopReason = "cap";
+        const recovered = est + viewDeltaCorrection < limit;
         if (recovered) currentTokens = Math.min(currentTokens, est);
-        const overBy = Math.max(0, est - limit);
+        const overBy = Math.max(0, est + viewDeltaCorrection - limit);
         // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
         // only when there was genuinely nothing left to distill; a call-cap hit or an
         // unavailable summary is not tier exhaustion. #3646: when the search really
@@ -2039,6 +2165,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             break;
         }
         if (poolQueueDrop) break;
+        // #4528: each round re-runs the full O(messages) kernel pass over the
+        // resent history; yield between rounds so UI/API requests on the same
+        // listener are served instead of queueing behind the whole compression
+        // run.
+        await yieldToEventLoop();
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -2131,8 +2262,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // roundText path.
         const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
         if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+            // #4288: the walk ends in a fit-forward — the caller's gate judges
+            // on the same floorless payloadEstimate and forwards. The final
+            // verdict below must not stamp an exhausted/failure verdict over
+            // this exit just because the STALE-floored currentTokens still
+            // reads over-limit.
+            fitExitForward = true;
             if (baselineFloor >= textTarget && !armedBaseline) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            if (!armedBaseline && baselineFloor < textTarget && result.payloadEstimate >= FIT_FORWARD_ESTIMATE_ONLY_MARGIN * limit) {
+                deps.log("warn", `[preflight] fit-forward on estimate only: ~${Math.round(result.payloadEstimate)} tok vs window ${limit} with no usage measurement backing the fit (baseline ~${Math.round(baselineFloor)}) — the local estimate excludes the system prompt + tool definitions, so upstream may still reject with context overflow; if it does, the overflow-arm rescue folds next turn (#5408/#4288)`);
             }
             break;
         }
@@ -2204,7 +2344,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 return si !== undefined && ei !== undefined && si <= ei ? sum + r.tokens : sum;
             }, 0);
             let potential = resolvableMass(ranges);
-            const deficit = result.payloadEstimate - limit;
+            // #5974: corrected scale — the blind view understates the outbound body by viewDeltaCorrection.
+            const deficit = result.payloadEstimate + viewDeltaCorrection - limit;
             if (potential > 0 && deficit > 0 && calibrateFoldMass(potential) * FUTILITY_SLACK < deficit) {
                 if (!relaxed) {
                     // The soft-protected recent zone is not in `ranges` yet; #330
@@ -2226,7 +2367,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (calibrateFoldMass(relaxedPotential) * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
                         relaxed = true;
-                        textTarget = Math.max(0, limit - imageReserve);
+                        // #5974: keep the correction through the relax reset, or it silently drops out mid-pass.
+                        textTarget = Math.max(0, limit - imageReserve - viewDeltaCorrection);
                         summaryCalls = 0;
                         budgetHit = false;
                         transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
@@ -2264,10 +2406,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && result.payloadEstimate >= limit) {
+            // #5974: corrected scale — otherwise a blind-view fit skips relaxing the recent zone while the true body still overflows.
+            if (!relaxed && result.payloadEstimate + viewDeltaCorrection >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
-                textTarget = Math.max(0, limit - imageReserve);
+                // #5974: keep the correction through the relax reset, or it silently drops out mid-pass.
+                textTarget = Math.max(0, limit - imageReserve - viewDeltaCorrection);
                 // #575-merge: the summarization budget counts per protection
                 // regime — reset it on relax, else bad summaries burned under
                 // normal protection can starve the relaxed walk entirely and
@@ -2551,7 +2695,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const maxSummary = activeConfig.compress.maxSummaryLength;
                     const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
                     const instructions =
-                        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+                        buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
                         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
                         summaryLengthBudgetClause(perChunkBudget, MIN_SUMMARY_CHARS);
                     nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
@@ -2641,7 +2785,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const ei = refToIdx.get(rj.endRef);
                     if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
                 }
-                const deficit = result.payloadEstimate - limit;
+                // #5974: corrected scale — keep parity with the pre-walk gate above (the blind view understates the outbound body by viewDeltaCorrection).
+                const deficit = result.payloadEstimate + viewDeltaCorrection - limit;
                 if (remaining > 0 && deficit > 0 && calibrateFoldMass(remaining) * FUTILITY_SLACK < deficit) {
                     futileBail = true;
                     bailRemaining = calibrateFoldMass(remaining);
@@ -2746,9 +2891,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     // regime-independent — coverage-based, they hold under the #330 relax flip
                     // too, so the span is skipped for the rest of this invocation and
                     // remembered across invocations. Zone/min-gate/length verdicts can clear
-                    // mid-invocation (relax, newer messages) and stay retryable. Raw errors,
-                    // not the truncated verdict: the named-block list must survive intact.
-                    const named = parseStructuralEmptyVerdict(preview.result.errors.join("\n"));
+                    // mid-invocation (relax, newer messages) and stay retryable. #4521 moved
+                    // the structural-empty verdicts from FAILED errors to success warnings
+                    // ("folded nothing — ..."); raw errors AND warnings, not a truncated
+                    // rendering: the named-block list must survive intact.
+                    const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
                     if (named !== null) {
                         skipSet.add(skipKey);
                         recordDeadRange(deps.session, startRef, endRef, named);
@@ -3009,7 +3156,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #330 relax path below is still available (!relaxed AND the payload
             // overflows the window) — in that case fall through to it; the next
             // round re-judges on the relaxed view.
-            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate < limit)) {
+            // #5974: corrected scale — the "payload already fits" escape must not trigger on the blind view when the true body still overflows.
+            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate + viewDeltaCorrection < limit)) {
                 const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
                 // #1372 contract: per-range skip notes are the diagnosis of WHY
                 // candidates died — carry them into the bail verdict too.
@@ -3028,7 +3176,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
-            if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
+            // #5974: corrected scale (mirror of the gate above).
+            if (!failure && !budgetHit && !relaxed && result.payloadEstimate + viewDeltaCorrection >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 summaryCalls = 0;
@@ -3091,10 +3240,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (deps.signal?.aborted) failure = ABORTED_FAILURE;
-    if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
+    // #4288: a fit-forward exit outranks the stale-floored currentTokens —
+    // the payload fits by its own estimate and the caller forwards it; an
+    // exhausted verdict here would report a marathon that did not happen.
+    if ((currentTokens >= limit && !fitExitForward) || failure?.kind === "aborted") result.failure = failure;
     // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
     // char-count upper bound was the trigger arm, never the reject-forward gate.
-    result.fitsWindow = result.payloadEstimate < limit;
+    // #5974: corrected scale — fitsWindow must reflect the predicted OUTBOUND size, not just the blind view.
+    result.fitsWindow = result.payloadEstimate + viewDeltaCorrection < limit;
     if (deps.externalSummary !== undefined) {
         result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
     }
