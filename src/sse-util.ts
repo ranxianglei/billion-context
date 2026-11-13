@@ -30,3 +30,24 @@ export function finalizeSseLineEndings(buf: string): string {
     if (buf.indexOf("\r") === -1) return buf;
     return buf.replace(/\r\n|\r/g, "\n");
 }
+
+/** Read buffered SSE event payloads. Multiple data fields belong to ONE
+ *  event and are joined with LF before a consumer parses JSON. Keep the final
+ *  residual available: callers retain their own framing/terminal validity
+ *  checks (Responses may trust a completed terminal without a blank line). */
+export function* bufferedSseEvents(text: string): Generator<{ event: string; data: string }> {
+    let event = "";
+    let data: string[] = [];
+    for (const line of finalizeSseLineEndings(text).split("\n")) {
+        if (line.trim() === "") {
+            if (data.length) yield { event, data: data.join("\n") };
+            event = "";
+            data = [];
+        } else if (line.startsWith("event:")) {
+            event = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+            data.push(line.slice(5).replace(/^ /, ""));
+        }
+    }
+    if (data.length) yield { event, data: data.join("\n") };
+}

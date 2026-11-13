@@ -1,6 +1,6 @@
 # billion-context 配置参考
 
-[English](configuration.md) | [中文](configuration.zh-CN.md)
+[中文](configuration.zh-CN.md) | [English](configuration.md) | [日本語](configuration.ja.md)
 
 `billion-context` 是一个 HTTP 代理，用于将 [ACP](https://github.com/ranxianglei/acp-kernel)（Active Context Pruning，主动上下文剪枝）的上下文压缩注入到 LLM API 流中。下文所有选项都位于同一个 JSON 配置文件中（也可通过等价的环境变量 / CLI 参数设置）。
 
@@ -450,6 +450,7 @@
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
+| `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：未设置（或 auto）= 现状——由入站头逐请求决定（legacy opencode-acp 会话绕过，其余走完整管线）；1/on/true = 强制 bypass——所有入站请求原样透传（不注入工具、不注入 nudge、不绑定会话）；0/off/false = 永不 bypass——忽略任何入站 x-bili-plugin-bypass 头，即使 legacy opencode-acp 会话也走完整管线。无法识别的取值按 auto 处理（= 现状）。按 #6220 owner 拍板仅环境变量（该头是宿主盖戳的线路契约，覆盖是逐进程运维姿态，而非逐路由配置项）。 |
 
 <!-- /bili:gen -->
 
@@ -1629,7 +1630,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **说明：** 可选的**压缩块生命周期管理**。启用后，三个工具与 ACP 工具一并注入（代理通道）/ 上报（插件通道），各有独立 system-prompt 段；同时为每个会话存一份生效开关，保证插件工具 API 解析到与线上相同的值：
   - `acp_retire` — 把 active 压缩块移出常驻视图（其摘要不再随每个请求发送；仍可按 id 用 `acp_restore` / `decompress` / `search_context` 取回）。
   - `acp_restore` — 把已退场块放回常驻视图。
-  - `acp_rewrite` — 原地替换块摘要（保留一步回滚位 `previousSummary`；相同/空白摘要拒收）。
+  - `acp_rewrite` — 原地替换块摘要（保留一步回滚位 `previousSummary`；相同/空白摘要拒收；`compress` 对该块会拒收的摘要同样拒收：长度超出 `compress.minSummaryLength` / `compress.maxSummaryLength`，或不比该块折叠的内容小）。
   内核状态变更幂等、可批量（`blockId` 单块或 `ids` 数组）。**为何默认关：** 三个工具 schema 在启用期间是常驻面——每个会话每个请求约 +0.7k 估算 token——所以不显式开启时，线上表面（工具数组、prompt、manifest）与 #5765 之前逐字节一致。关闭时的误调会得到面向模型的「not enabled on this bili proxy (compress.blockOps.enabled is not true)」回执而非报错，且绝不改动状态。退场/改写状态跨重启持久化在会话状态中，导出台账（markdown handoff + JSONL）报告 `retired` 状态、消息 ref 区间与原文/摘要字符数。
 
 #### `ccr`
@@ -2138,6 +2139,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CA_FILE` | 指向一个 PEM 文件的路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 TLS。做 HTTPS/加密连接扫描的安全软件（卡巴斯基、企业 DLP）或企业 MITM 代理会用自家 CA 重签上游：浏览器通过系统证书库信任它，但 Node 的 fetch 只读内置根证书加 `NODE_EXTRA_CA_CERTS`——于是 bili 报 `SELF_SIGNED_CERT_IN_CHAIN`，而机器上其他一切连接正常。把扫描软件/厂商根证书导出为 PEM 后设置此项（或 `NODE_EXTRA_CA_CERTS`）；或在安全软件的 HTTPS 检查中排除 node.exe。该文件与 Node 内置根证书及 `NODE_EXTRA_CA_CERTS` 条目合并——从不替换。未设置 = 当前默认信任，逐字节不变。配置键：`network.caFile`。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | dsh/opencode attach 校验中，attach 目标已挂但本进程模型通道**钉死**在其上（观察到指向它的 `/bili/…` 路由流量）时的健康等待上限（毫秒）：bili 等待目标恢复而不是 spawn 第二实例——spawn 会把会话劈成两半（模型流量保持钉死，bili 工具在另一实例上 404）。超时后大声报错，并在每次模型请求时持续重查直到目标恢复（默认 `15000`）。见 #1365。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | dsh/opencode attach 校验探测到目标已挂时，等待路由通道证据出现的宽限窗口（毫秒），超时才回退到旧的 spawn 路径（覆盖「判定早于首个请求」的竞态：t≈0 时探测失败、t≈1s 时首个模型请求才落地）（默认 `5000`）。见 #1365。 |
+| `BILI_PLUGIN_BYPASS` | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：**未设置**/auto = 现状（由入站头逐请求决定）；**1/on/true** = 强制 bypass（所有请求原样透传——不注入工具、不注入 nudge、不绑定会话）；**0/off/false** = 永不 bypass（忽略任何入站 x-bili-plugin-bypass 头）；无法识别的取值按 auto 处理。按 #6220 owner 拍板仅环境变量（无配置文件键）。 |
 | `BILI_PERSIST` | 设 `0` 关闭会话持久化（仅内存，重启即丢）。 |
 | `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |
 | `BILI_PERSIST_MAX_DELAY_MS` | 变更不断到来时一次待落盘写入最多可等待的上限（毫秒）——去抖窗口每次变更都会重置，这个预算才保证持续流量下文件一定会落盘（默认 `5000`；此前在 session-order / prefix-affinity 写入器中硬编码，#6058）。 |
