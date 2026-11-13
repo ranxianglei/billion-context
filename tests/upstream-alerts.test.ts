@@ -9,11 +9,20 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { MESSAGES } from "../src/web/i18n.ts";
 import {
+    ALERT_KINDS,
     recordUpstreamAlert,
     clearUpstreamAlertsForHost,
     getUpstreamAlerts,
+    getUpstreamHealthReport,
+    recordUpstreamCircuitFailure,
+    recordUpstreamCircuitSuccess,
+    upstreamCircuitBlockReason,
+    getOpenUpstreamCircuits,
     _resetUpstreamAlertsForTest,
+    _resetUpstreamCircuitsForTest,
+    _setCircuitCooldownForTest,
     type UpstreamAlert,
 } from "../src/upstream-alerts.ts";
 import { assertPortDead } from "./port-race.ts";
@@ -85,12 +94,26 @@ test("alert table: every v1 kind enters, keyed by (kind, host)", () => {
         recordUpstreamAlert("http://h4.example.com/", netError("ECONNRESET"), false);
         recordUpstreamAlert("http://h5.example.com/", netError("ENOTFOUND"), false);
         recordUpstreamAlert("https://h6.example.com:8443/", netError("EPROTO"), false);
+        // #2465/#5663: ICMP no-route family enters like every other cannot-reach kind
+        recordUpstreamAlert("http://h7.example.com/", netError("EHOSTUNREACH"), false);
         const kinds = getUpstreamAlerts().map((a) => a.kind).sort();
-        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset"]);
+        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset", "upstream-unreachable"]);
         const tls = getUpstreamAlerts().find((a) => a.kind === "tls");
         assert.equal(tls?.host, "h6.example.com:8443");
     } finally {
         _resetUpstreamAlertsForTest();
+    }
+});
+
+// #2465 P2: nothing used to check the ALERT_KINDS ↔ i18n catalog coupling —
+// a kind could enter the banner path with only the generic "unknown" fallback
+// copy (a copy that can never render its own meaning). Every alertable kind
+// must have a dedicated hint key in BOTH locales.
+test("#2465/#5663: every alertable kind has a dedicated i18n hint key in both locales", () => {
+    for (const kind of ALERT_KINDS) {
+        const key = `alert.hint.${kind.replace(/-/g, "_")}`;
+        assert.ok(MESSAGES["zh-CN"][key], `zh catalog missing ${key}`);
+        assert.ok(MESSAGES.en[key], `en catalog missing ${key}`);
     }
 });
 
@@ -118,6 +141,133 @@ test("alert table: success clears every alert for that host only", () => {
         assert.equal(a.host, "b.example.com");
     } finally {
         _resetUpstreamAlertsForTest();
+    }
+});
+
+test("alert table: a one-shot failure against a dead host expires after the staleness window (#5572)", () => {
+    _resetUpstreamAlertsForTest();
+    try {
+        withClock((advance) => {
+            // One ECONNREFUSED — the shape of a stray request hitting a loopback shim port that
+            // rebound to a fresh ephemeral port after a plugin reload. No further failures arrive.
+            recordUpstreamAlert("http://127.0.0.1:56402/v1/chat/completions", netError("ECONNREFUSED"), false);
+            assert.equal(getUpstreamAlerts().length, 1, "present immediately");
+            for (let i = 0; i < 301; i++) advance(); // 301_000ms > 5-min window ⇒ row must be gone
+            assert.deepEqual(getUpstreamAlerts(), [], "stale row expires without any success or restart");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+    }
+});
+
+test("alert table: a host still failing does NOT age out (#5572)", () => {
+    _resetUpstreamAlertsForTest();
+    try {
+        withClock((advance) => {
+            const url = "http://127.0.0.1:56402/v1/chat/completions";
+            recordUpstreamAlert(url, netError("ECONNREFUSED"), false);
+            for (let i = 0; i < 9; i++) {
+                for (let j = 0; j < 100; j++) advance(); // 100_000ms between failures
+                recordUpstreamAlert(url, netError("ECONNREFUSED"), false);
+            }
+            // First failure was 900_000ms ago (> window), but the LAST one just happened.
+            const list = getUpstreamAlerts();
+            assert.equal(list.length, 1, "live outage never ages out");
+            assert.equal(list[0].count, 10, "staleness keys off lastSeen, not firstSeen");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+    }
+});
+
+test("health report: /__bili/upstreams projection also drops stale rows (#5572 DSH banner source)", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        withClock((advance) => {
+            recordUpstreamAlert("http://127.0.0.1:56402/v1/chat/completions", netError("ECONNREFUSED"), false);
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 1);
+            for (let i = 0; i < 301; i++) advance();
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "banner source no longer reports the dead port");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
+    }
+});
+
+// #6026: same defect class as #5572, on the circuits side — an OPEN circuit had
+// no expiry at all: its only removal path was a resolved response, so a host that
+// stopped being requested (an on-demand local model) pinned the DSH banner
+// forever with a fake "约 1s 后重试" countdown. Idle open circuits must age out of
+// the report projections after the same ALERT_STALE_MS window; live outages must not.
+test("health report: an idle OPEN circuit ages out of the banner source (#6026)", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        _setCircuitCooldownForTest(2_000);
+        withClock((advance) => {
+            const url = "http://desktop-dp:18200/v1/chat/completions";
+            for (let i = 0; i < 3; i++) recordUpstreamCircuitFailure(url, netError("UND_ERR_CONNECT_TIMEOUT"), false);
+            let row = getUpstreamHealthReport(Date.now()).upstreams[0];
+            assert.equal(row.circuit?.state, "open", "fail-fast active: row present");
+            assert.equal(row.circuit?.nextProbeInMs, 2_000, "real countdown while blocked");
+            for (let i = 0; i < 3; i++) advance(); // +3s: past nextProbeAt, still inside the window
+            row = getUpstreamHealthReport(Date.now()).upstreams[0];
+            assert.equal(row.circuit?.nextProbeInMs, 0, "probe-eligible: still reported, countdown clamps to 0");
+            for (let i = 0; i < 301; i++) advance(); // last scheduled probe now > 5min in the past
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "stale idle circuit drops out like the alert rows");
+            assert.deepEqual(getOpenUpstreamCircuits(), [], "acp_status surface agrees");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
+    }
+});
+
+test("health report: a circuit kept failing probes does NOT age out (#6026)", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        _setCircuitCooldownForTest(2_000);
+        withClock((advance) => {
+            const url = "http://desktop-dp:18200/v1/chat/completions";
+            for (let i = 0; i < 3; i++) recordUpstreamCircuitFailure(url, netError("UND_ERR_CONNECT_TIMEOUT"), false);
+            for (let round = 0; round < 11; round++) {
+                for (let j = 0; j < 30; j++) advance(); // 30s per failed probe round — 330s total > window
+                recordUpstreamCircuitFailure(url, netError("UND_ERR_CONNECT_TIMEOUT"), false);
+            }
+            const [row] = getUpstreamHealthReport(Date.now()).upstreams;
+            assert.ok(row, "live outage never ages out");
+            assert.equal(row.circuit?.nextProbeInMs, 2_000, "re-armed countdown tracks the latest probe failure");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
+    }
+});
+
+test("#6026: stale filtering is report-only — fail-fast / half-open probe / close are untouched", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        _setCircuitCooldownForTest(2_000);
+        withClock((advance) => {
+            const url = "http://desktop-dp:18200/v1/chat/completions";
+            for (let i = 0; i < 3; i++) recordUpstreamCircuitFailure(url, netError("UND_ERR_CONNECT_TIMEOUT"), false);
+            for (let i = 0; i < 304; i++) advance(); // deep into the stale window
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "unreported…");
+            assert.equal(upstreamCircuitBlockReason(url), undefined, "…but still probe-eligible AS the half-open probe");
+            recordUpstreamCircuitFailure(url, netError("UND_ERR_CONNECT_TIMEOUT"), false);
+            const [row] = getUpstreamHealthReport(Date.now()).upstreams;
+            assert.equal(row.circuit?.nextProbeInMs, 2_000, "a fresh probe failure puts the host straight back into the report");
+            recordUpstreamCircuitSuccess(url);
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "success still closes it (existing semantics)");
+            assert.deepEqual(getOpenUpstreamCircuits(), []);
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
     }
 });
 
