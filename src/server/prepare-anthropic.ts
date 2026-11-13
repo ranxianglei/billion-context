@@ -36,7 +36,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore } from "../persist.js";
+import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
@@ -641,7 +641,18 @@ export async function prepareAnthropic(
     // SysPrompt row — the kernel breakdown classifies messages only, and on
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
-    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // #3397 durability-before-render: make this turn's ledger rows durable NOW
+    // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
+    // about to see are on disk BEFORE the response is sent. Without this, a
+    // crash before the debounced save (#5155) leaves rendered refs unbacked —
+    // the #3397 orphaned-generation gap that makes a later turn cite refs the
+    // gate rejects as "above the highest allocated ref". The in-request
+    // snapshot flush above (#5874 P2-final) already covered the revision it
+    // captured; this pass catches the mutations that landed after it (stats
+    // probes, retrieval notes) and is an idempotent re-ingest when nothing
+    // new landed. The JSON envelope stays debounced — only the small row
+    // ingest moves ahead.
+    getStore().ingestRowsNow(session);    // #5874 P2-final: the in-request snapshot flush above already persisted
     // this revision; re-arm the debounce only if the session mutated since
     // (stats probes land at the next flush) or the flush never landed.
     if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);

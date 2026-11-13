@@ -882,7 +882,12 @@ async function withProxyT(
     }
 }
 
-const PLUGIN_HEADERS = { "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": "e2e-sess" } as Record<string, string>;
+// ONE SESSION PER TEST: the in-process session registry, the plane-dead set,
+// the R3 breaker and the egress side-channel are all keyed by session id —
+// reusing one sid across the e2e tests lets an earlier test's transcript
+// bleed into a later one (the unified store's digest-drift re-ingest then
+// presents the foreign tail to snapViewEvents: R2 red, plane dead, B4 red).
+const pluginHeaders = (sid: string): Record<string, string> => ({ "content-type": "application/json", "x-bili-plugin": "e2e-agent", "x-acp-session": sid });
 
 test("B1: a declared host that fails to collect msgids (count mismatch) → 400 + x-bili-snapshot: identity, no upstream forward", async () => {
     await withProxyT(
@@ -890,7 +895,7 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
         async (url, bodies) => {
             const res = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-b1"),
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
@@ -917,7 +922,7 @@ test("B3: a plugin chained round with EMPTY input is a pure continuation — the
         () => ({ status: 200, payload: sseDone() }),
         async (url, bodies) => {
             const reqBody = { model: "gpt-e2e", stream: true, previous_response_id: "resp_b3", input: [] };
-            const res = await fetch(url, { method: "POST", headers: PLUGIN_HEADERS, body: JSON.stringify(reqBody) });
+            const res = await fetch(url, { method: "POST", headers: pluginHeaders("e2e-b3"), body: JSON.stringify(reqBody) });
             assert.equal(res.status, 200);
             await res.text();
             assert.equal(bodies.length, 1);
@@ -937,7 +942,7 @@ test("B4: the delta frontier commits only when the upstream ACCEPTS — a 400 tu
             // Turn 1: seed (no chain ref yet).
             const r1 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-b4"),
                 body: JSON.stringify({ model: "gpt-e2e", stream: true, input: [{ type: "message", role: "user", content: "one" }], biliMsgIds: ["b4m1"], biliLedgerSeqs: [1] }),
             });
             assert.equal(r1.status, 200);
@@ -948,7 +953,7 @@ test("B4: the delta frontier commits only when the upstream ACCEPTS — a 400 tu
             // upstream REFUSES it. The selected frontier must NOT commit.
             const r2 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-b4"),
                 body: JSON.stringify({ model: "gpt-e2e", stream: true, previous_response_id: "resp_t1", input: [{ type: "message", role: "user", content: "two" }], biliMsgIds: ["b4m2"], biliLedgerSeqs: [2] }),
             });
             assert.equal(r2.status, 400, "the upstream refusal passes through");
@@ -960,7 +965,7 @@ test("B4: the delta frontier commits only when the upstream ACCEPTS — a 400 tu
             // advanced the frontier, this round would send a 1-element delta.
             const r3 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-b4"),
                 body: JSON.stringify({ model: "gpt-e2e", stream: true, previous_response_id: "resp_t2", input: [{ type: "message", role: "user", content: "three" }], biliMsgIds: ["b4m3"], biliLedgerSeqs: [3] }),
             });
             assert.equal(r3.status, 200);
@@ -1039,7 +1044,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             // starts here; no selection fires (no id in) → no frontier.
             const r1 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-r12"),
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
@@ -1058,7 +1063,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             // trusted only for an id THIS proxy minted (Residual 2 hardening).
             const r2 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-r12"),
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
@@ -1084,7 +1089,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             // response path). The plane must stay intact.
             const r3 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-r12"),
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
@@ -1109,7 +1114,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             // loss). A 1-element delta here would be the loss edge.
             const r4 = await fetch(url, {
                 method: "POST",
-                headers: PLUGIN_HEADERS,
+                headers: pluginHeaders("e2e-r12"),
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,

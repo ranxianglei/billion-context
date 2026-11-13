@@ -614,3 +614,12 @@ entries:
     desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
     desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"
     desc_ja: "エグレス画像のダウンスケールパスのトリガー閾値（px）（#3400）; 数値でない場合または 128 未満の場合は無視される（デフォルトが適用される）。設計上、環境変数のみ。"
+  - key: BILI_PLUGIN_BYPASS
+    type: string
+    default: "auto (unset = the inbound header decides)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Operator override of the `x-bili-plugin-bypass` passthrough decision (#6220), read per-request (no restart). Three-state: unset (or `auto`) = current behavior — the inbound header decides per request (legacy opencode-acp sessions bypass, everything else gets the full pipeline); `1`/`on`/`true` = force bypass — every inbound request is forwarded verbatim (no tool injection, no nudge, no session binding); `0`/`off`/`false` = never bypass — any inbound `x-bili-plugin-bypass` header is ignored, so even legacy opencode-acp sessions get the full pipeline. Unrecognized values are treated as `auto` (current behavior). Env-only per the owner-approved design in #6220 (the header is a wire contract stamped by hosts; the override is a per-process operator posture, not a per-route config field)."
+    desc_zh: "x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：未设置（或 auto）= 现状——由入站头逐请求决定（legacy opencode-acp 会话绕过，其余走完整管线）；1/on/true = 强制 bypass——所有入站请求原样透传（不注入工具、不注入 nudge、不绑定会话）；0/off/false = 永不 bypass——忽略任何入站 x-bili-plugin-bypass 头，即使 legacy opencode-acp 会话也走完整管线。无法识别的取值按 auto 处理（= 现状）。按 #6220 owner 拍板仅环境变量（该头是宿主盖戳的线路契约，覆盖是逐进程运维姿态，而非逐路由配置项）。"
+    desc_ja: "x-bili-plugin-bypass パススルー判定のオペレーターオーバーライド（#6220）、リクエストごとに読み取り（再起動不要）。3 状態：未設定（または auto）= 現状 — 受信ヘッダーがリクエストごとに判定（legacy opencode-acp セッションはバイパス、その他はフルパイプライン）；1/on/true = 強制バイパス — すべての受信リクエストをそのまま転送（ツール注入なし、nudge なし、セッションバインドなし）；0/off/false = 常にバイパスしない — 受信 x-bili-plugin-bypass ヘッダーをすべて無視し、legacy opencode-acp セッションもフルパイプラインを通過。識別できない値は auto（= 現状）として扱われます。#6220 の owner 承認デザインにより環境変数のみ（ヘッダーはホストがスタンプするワイヤー契約であり、オーバーライドはプロセス単位のオペレーター姿勢であり、ルート単位の設定フィールドではない）。"

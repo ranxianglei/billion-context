@@ -1604,6 +1604,21 @@ export class UnifiedStore {
                       ? `sync,fold(n=${out.nEvents})`
                       : `sync(n=${out.nEvents})`;
             loggerLog("info", `[snaplane] sid=${sid} l1=${out.l1} ${kind} tail=${out.commit.tailSeq}`);
+            // #6181 B4 (stack on the #5901 head with #6326 durability-before-render):
+            // an UNTAGGED save against a sid that already holds active plane rows
+            // is destructive and can never be an update: the tagged plane is only
+            // addressable from tagged views (the R2 doctrine — re-derived kernel ids
+            // are unaddressable), so the legacy diff can only delete/re-home the
+            // pinned rows. #6326's ingestRowsNow persist is such an untagged save:
+            // it runs before render, when the in-memory transcript holds the pre-turn
+            // world (the previous response was never ingested), and its diff then
+            // deleted the just-flushed rows. The disk record above still lands (the
+            // durability win survives); the plane is updated by the NEXT tagged save
+            // (the next turn's flush carries the authoritative view).
+            if (!tagged && (input.planeMessages ?? []).length === 0) {
+                const anyRow = (snapRowsAll(this.db, sid) ?? []).some((r) => r.active === 1);
+                if (anyRow) return;
+            }
         } catch (err) {
             if (!(err instanceof Error) || err.name !== "SnapPlaneDeadError") markSnapPlaneDead(sid);
             // R2/R3 degrade: the round stays on the legacy path. Log the

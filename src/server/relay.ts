@@ -2786,14 +2786,21 @@ async function forwardCaptured(
                 while (cut !== -1) {
                     const event = mintSseTail.slice(0, cut);
                     mintSseTail = mintSseTail.slice(cut + 2);
-                    const dataLine = event.split("\n").find((l) => l.startsWith("data: "));
-                    if (dataLine !== undefined && (dataLine.includes("response.completed") || dataLine.includes("response.created"))) {
+                    // The event type rides in the data JSON for real upstreams
+                    // ({"type":"response.completed",...}); some clients/tests
+                    // emit it on the `event:` line instead — accept both.
+                    if (!event.includes("response.completed") && !event.includes("response.created")) continue;
+                    const lines = event.split("\n");
+                    const dataLine = lines.find((l) => l.startsWith("data: "));
+                    const eventLine = lines.find((l) => l.startsWith("event: "));
+                    if (dataLine !== undefined) {
                         try {
                             const evt = JSON.parse(dataLine.slice(6)) as { type?: string; response?: { id?: unknown } };
                             const id = evt.response?.id;
                             if (typeof id === "string" && id.length > 0) {
-                                if (evt.type === "response.completed") mintCompletedId = id;
-                                else mintCreatedId = id;
+                                const type = evt.type ?? (eventLine !== undefined ? eventLine.slice(7).trim() : "");
+                                if (type === "response.completed") mintCompletedId = id;
+                                else if (type === "response.created") mintCreatedId = id;
                             }
                         } catch {
                             /* partial/corrupt event — ignore */
