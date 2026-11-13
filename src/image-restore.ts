@@ -17,7 +17,7 @@
 // sends no such bytes to the proxy, so those belong to the agent's in-process
 // recovery (cf. billion-context-pi#594), not here.
 
-import { existsSync, mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -155,20 +155,13 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             }
             const fr = part.functionResponse;
             if (isObj(fr) && Array.isArray(fr.parts)) {
-                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (from the
-                // removed kernel strip-images.ts; kept for parity) — when
-                // `response` points at a part via
-                // {"$ref": displayName} the bytes are not inline,
-                // so there is nothing to restore: skip indexing (harmless waste,
-                // not corruption).
-                const refGuarded = JSON.stringify(fr.response ?? null).includes('"$ref"');
-                if (!refGuarded) {
-                    for (const np of fr.parts) {
-                        if (!isObj(np)) continue;
-                        const ni = np.inlineData;
-                        if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
-                            out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
-                        }
+                // Gemini's $ref names an inlineData part in this same response:
+                // https://ai.google.dev/api/generate-content#FunctionResponse
+                for (const np of fr.parts) {
+                    if (!isObj(np)) continue;
+                    const ni = np.inlineData;
+                    if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
+                        out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
                     }
                 }
             }
@@ -438,7 +431,8 @@ export function writeRestoredImage(ref: string, idx: number, img: RestorableImag
     const digest = createHash("sha256").update(body).digest("hex").slice(0, 8);
     const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}-${digest}.${extFor(img.mediaType)}`);
     try {
-        if (existsSync(path)) return path;
+        const existing = statSync(path, { throwIfNoEntry: false });
+        if (existing?.isFile() && existing.size === body.length) return path;
         mkdirSync(dir, { recursive: true });
         writeFileSync(path, body, { mode: 0o600 });
         return path;
