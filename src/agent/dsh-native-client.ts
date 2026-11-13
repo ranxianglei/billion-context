@@ -57,7 +57,7 @@ import { createElement, useEffect, useLayoutEffect, useRef, useState } from "rea
 type Dict = Record<string, string>;
 
 type SlotOptions =
-    | { name: string; id: string; order: number; label: () => string; locale: string }
+    | { name: string; id: string; order: number; label: () => string; locale: string; inject?: (sessionId: string) => Record<string, unknown> }
     | { name: string; key: string; locale: string };
 
 type ClientContext = {
@@ -205,7 +205,11 @@ function parseCtxStatus(raw: unknown): CtxStatus | undefined {
         panelPresent: o.panel !== undefined,
         sessionId: typeof o.sessionId === "string" && o.sessionId.length > 0 ? o.sessionId : null,
         conversationId: typeof o.conversationId === "string" && o.conversationId.length > 0 ? o.conversationId : null,
-        viaFallback: o.viaFallback === true,
+        // #6534: the server emits `fallback` (plugin.ts handlePluginStatus),
+        // not `viaFallback` — read the real field, keep the legacy name as a
+        // defensive alias so an older/foreign build answering the URL still
+        // degrades correctly instead of silently passing the ownership gate.
+        viaFallback: o.fallback === true || o.viaFallback === true,
     };
 }
 
@@ -776,13 +780,20 @@ export function apply(ctx: ClientContext): void {
             };
         }, []);
         // The host names this conversation to every conversation.view entry
-        // (props.sessionId — the same id the dsh lane stamps on
-        // x-bili-plugin-conversation), so the poll targets OUR session. Old
-        // hosts pass nothing ⇒ the legacy literal path (unchanged).
+        // via the slot inject callback (props.hostSessionId — the same id the
+        // dsh lane stamps on x-bili-plugin-conversation), so the poll targets
+        // OUR session. #6534: newer DSH builds no longer put the id in the
+        // standard kit, so props.sessionId is undefined there — inject is the
+        // documented, version-stable carrier (the official trajectory plugin
+        // uses it too). Older hosts that still expose it in the standard kit
+        // are covered by the props.sessionId fallback; hosts that pass
+        // nothing ⇒ the legacy literal path (unchanged).
         const hostSessionId =
-            props !== undefined && typeof props.sessionId === "string" && props.sessionId.length > 0
-                ? props.sessionId
-                : undefined;
+            props !== undefined && typeof props.hostSessionId === "string" && props.hostSessionId.length > 0
+                ? props.hostSessionId
+                : props !== undefined && typeof props.sessionId === "string" && props.sessionId.length > 0
+                    ? props.sessionId
+                    : undefined;
         const statusPath = ctxStatusPathFor(hostSessionId);
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         // #2559: pin the frame palette to the host ground, same discipline as
@@ -857,15 +868,18 @@ export function apply(ctx: ClientContext): void {
         const lang = t("nav") === zhDict.nav ? "zh" : "en";
         // Ownership gate: a fallback-resolved row describes whatever ran LAST
         // globally — possibly a sibling conversation or a delegate sub-agent.
-        // With a known host identity such a row is not ours ⇒ fall through to
+        // With a KNOWN host identity such a row is not ours ⇒ fall through to
         // the not-yet hint instead of framing someone else's session page.
-        // Exact hits are trusted unconditionally; legacy responses (field
-        // absent) behave exactly as before.
+        // #6534: an UNKNOWN host identity likewise refuses — the old
+        // `hostSessionId === undefined` clause short-circuited the whole gate
+        // to true, so a host that passed no identity framed whatever the
+        // fallback=latest pool resolved (the reported "always the recent
+        // session" bug). Unknown id ⇒ hint, never a guess. Exact hits (our
+        // conversation id, not a fallback) are the only rows we frame; legacy
+        // responses (field absent) keep the historical render.
         const sessionOurs =
-            hostSessionId === undefined ||
-            status === undefined ||
-            status.viaFallback !== true ||
-            status.conversationId === hostSessionId;
+            hostSessionId !== undefined &&
+            (status === undefined || (status.conversationId === hostSessionId && status.viaFallback !== true));
         // #4281: framed ⇒ fill the whole conversation view (full-height
         // column, no outer padding, borderless frame on flex:1, slim top
         // action row); every hint state keeps its own breathing room.
@@ -1162,7 +1176,25 @@ export function apply(ctx: ClientContext): void {
     if (!ctxGate.hidden) {
         ctx.slots.inject(
             "conversation.view",
-            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+            () => ctx.slots.register(
+                {
+                    name: "conversation.view",
+                    id: "bili-context",
+                    order: 30,
+                    label: () => ctxGate.label ?? t("tab_ctx"),
+                    locale: NS,
+                    // #6534: the host hands us the CURRENT conversation id
+                    // (api-contracts v3 §8 — the same id the lane stamps on
+                    // x-bili-plugin-conversation) as the inject callback's
+                    // first arg. A TOP-LEVEL key (not under `hooks`, which the
+                    // renderer converts into a use<Name>() hook) so it lands
+                    // on props.hostSessionId. This is the version-stable
+                    // carrier: newer DSH builds stopped putting the id in the
+                    // standard kit, so props.sessionId is no longer reliable.
+                    inject: (sessionId: string) => ({ hostSessionId: sessionId }),
+                },
+                contextPanel(),
+            ),
         );
     }
     // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection
