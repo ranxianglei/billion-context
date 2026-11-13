@@ -3,7 +3,15 @@ import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, rele
 import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
-import { appendTrailingUserText } from "./wire-body.js";
+import { appendEchoedToolExchange, appendTrailingUserText } from "./wire-body.js";
+
+/** #5440: the verbatim exchange the proxy appends when continuing after an
+ *  echoed tool-call name — the assistant turn (carrying the echoed call) plus
+ *  the canned tool result. The caller builds these per wire protocol. */
+export interface EchoedToolContinuation {
+    assistantMessages: Record<string, unknown>[];
+    toolResultMessages: Record<string, unknown>[];
+}
 
 const MAX_THROTTLE_ERROR_BODY_BYTES = 16 * 1024;
 // Keep callback latency separate from the bounded body read used for scope refinement.
@@ -109,28 +117,31 @@ async function readSmallThrottleErrorBody(response: Response): Promise<Uint8Arra
  *  when the retry cannot be issued (unbuildable body, upstream error, client
  *  already gone) — the caller then passes the original empty turn through
  *  unchanged. */
-export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Promise<ReadableStream<Uint8Array> | null> {
-    return async () => {
+export function makeContinuationRefetch(opts: ContinuationRetryOpts): (cont?: EchoedToolContinuation) => Promise<ReadableStream<Uint8Array> | null> {
+    return async (cont?: EchoedToolContinuation) => {
         if (opts.signal.aborted) return null;
+        const kind = cont ? "echoed-tool continuation" : "degenerate-terminal retry";
         // A body whose final input item is a compaction trigger must never be
-        // re-issued: appending the nudge after it breaks the wire shape (#283:
-        // the trigger stays the last input item), and the trigger's terminal is
-        // decided by the compaction flow, not by an empty-turn retry. Parsed
-        // here, at retry time, so healthy turns pay nothing.
+        // re-issued: appending the nudge/exchange after it breaks the wire shape
+        // (#283: the trigger stays the last input item), and the trigger's
+        // terminal is decided by the compaction flow, not by a terminal retry.
+        // Parsed here, at retry time, so healthy turns pay nothing.
         if (opts.protocol === "responses") {
             try {
                 const parsed = JSON.parse(typeof opts.body === "string" ? opts.body : opts.body.toString("utf8")) as Record<string, unknown>;
                 if (hasCompactionTrigger(parsed["input"])) {
-                    opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request ends on a compaction trigger`);
+                    opts.log("warn", `[${opts.label}] [plugin] ${kind} skipped: request ends on a compaction trigger`);
                     return null;
                 }
             } catch {
-                /* unparseable body: injectContinuationNudge below reports and skips */
+                /* unparseable body: the body builders below report and skip */
             }
         }
-        const retryBody = injectContinuationNudge(opts.protocol, opts.body, opts.model);
+        const retryBody = cont
+            ? appendEchoedToolExchange(opts.protocol, opts.body, cont.assistantMessages, cont.toolResultMessages)
+            : injectContinuationNudge(opts.protocol, opts.body, opts.model);
         if (retryBody === null) {
-            opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
+            opts.log("warn", `[${opts.label}] [plugin] ${kind} skipped: request body carries no turn array`);
             return null;
         }
         const wireRetryBody = opts.wrapBody ? opts.wrapBody(retryBody) : retryBody;
@@ -141,7 +152,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
         try {
             classificationReservation = reserveUpstreamThrottleClassification(opts.upstreamUrl, opts.reqHeaders);
             if (classificationReservation === undefined) {
-                opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry skipped: throttle classification capacity is full`);
+                opts.log("info", `[${opts.label}] [plugin] ${kind} skipped: throttle classification capacity is full`);
                 return null;
             }
             opts.resign?.(opts.reqHeaders, wireRetryBody);
@@ -159,7 +170,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             if (throttleReject !== undefined) {
                 classificationReservation.release();
                 classificationReservation = undefined;
-                opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the empty turn through`);
+                opts.log("info", `[${opts.label}] [plugin] ${kind} answered locally by the 429 hold (#4204) — passing the original turn through`);
                 return null;
             }
             const r = await fetchWithTimeout(
@@ -217,7 +228,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     classificationReservation = undefined;
                     r.clearTimer();
                 }
-                opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
+                opts.log("warn", `[${opts.label}] [plugin] ${kind} rejected (HTTP ${r.response.status}); passing the original turn through`);
                 return null;
             }
             noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status, Date.now(), requestModel, probeToken);
@@ -234,7 +245,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             settleProvisional?.();
             classificationReservation?.release();
             releaseUpstreamThrottleProbe(probeToken);
-            opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
+            opts.log("warn", `[${opts.label}] [plugin] ${kind} failed (${e instanceof Error ? e.message : String(e)}); passing the original turn through`);
             return null;
         }
     };
