@@ -20,6 +20,7 @@ import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-loo
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -36,7 +37,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, nativeCompactionKey, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
@@ -77,6 +78,12 @@ export async function prepareResponses(
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
+
+    // Unlike the legacy text-template heuristic, an opaque native checkpoint
+    // explicitly announces a replacement history even after old blocks were
+    // reaped. Persist its identity so replay/restart cannot reset newer folds.
+    const checkpoint = isCodexHost(req.headers) && !hasCompactionTrigger(parsed.input)
+        ? nativeCompactionKey(parsed.input) : undefined;
 
     // A codex client echoes our forged compaction item back in the next
     // request; replace it with a plain summary-carrying user message so the
@@ -207,6 +214,21 @@ export async function prepareResponses(
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
+        if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
+            const covered = coveredRealHistoryIds(session.state.blocks);
+            const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
+            // A checkpoint may predate this process's first observation (for
+            // example after an upgrade). Keep folds whose entire source still
+            // exists; only missing coverage or an empty substrate needs rebasing.
+            const rebase = covered.size === 0 || gap !== null;
+            if (rebase) {
+                markNativeCompactionBoundary(session);
+                reconcileNativeCompactionBoundary(session);
+            }
+            session.metadata.codexNativeCompactionKey = checkpoint;
+            markDirty(session);
+            log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
+        }
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
         // below can replace systemParts — fingerprinting the post-anchor value
@@ -714,6 +736,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
+    getStore().ingestRowsNow(session);
     markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims
