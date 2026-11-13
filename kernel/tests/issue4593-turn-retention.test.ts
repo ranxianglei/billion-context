@@ -189,7 +189,7 @@ test("#4593: a range crossing the turn boundary truncates there with an auditabl
   assert.match(warning, /last-turns retention/);
 });
 
-test("#4593: a range entirely inside the retained turns is rejected naming the turn zone", () => {
+test("#4593: a range entirely inside the retained turns is a no-op (#4521) naming the protected zone", () => {
   const core = createCore();
   const messages = [...FIVE_TURNS];
   const state = seededState(messages);
@@ -202,10 +202,14 @@ test("#4593: a range entirely inside the retained turns is rejected naming the t
     config: cfg,
   });
 
+  // #4521 (landed on master after this PR branched): a range entirely inside
+  // the protected zone is a legal no-op, not a rejection — retry-loop fix.
+  // Nothing folds; the receipt warns "do not resend". The turn-zone
+  // attribution itself is still pinned by the crossing-range carve test above.
   assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.result.errors.length, 1);
-  assert.match(result.result.errors[0]!, /entirely.*protected.*zone/i);
-  assert.match(result.result.errors[0]!, /last 2 turns/);
+  assert.equal(result.result.errors.length, 0, JSON.stringify(result.result.errors));
+  const warning = result.result.warnings.join("\n");
+  assert.match(warning, /entirely inside the protected zone/i);
 });
 
 test("#4593: protectUserMessages hard-excludes user messages (BLOCKED refs + auditable carve)", () => {
@@ -242,7 +246,7 @@ test("#4593: protectUserMessages hard-excludes user messages (BLOCKED refs + aud
   assert.match(warning, /user message/);
 });
 
-test("#4593: a range containing only protected user messages is rejected", () => {
+test("#4593: a range containing only protected user messages is a no-op (#4521)", () => {
   const core = createCore();
   const messages = [
     msg("u1", "instruction one"),
@@ -259,9 +263,14 @@ test("#4593: a range containing only protected user messages is rejected", () =>
     config: cfg,
   });
 
+  // #4521 (landed on master after this PR branched): a range of only protected
+  // user messages is a legal no-op, not a rejection — the carve receipt names
+  // the protectUserMessages cause, then nothing folds ("do not resend").
   assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.result.errors.length, 1);
-  assert.match(result.result.errors[0]!, /no compressible messages/);
+  assert.equal(result.result.errors.length, 0, JSON.stringify(result.result.errors));
+  const warning = result.result.warnings.join("\n");
+  assert.match(warning, /Excluded 2 user message\(s\).*protectUserMessages/s);
+  assert.match(warning, /folded nothing/i);
 });
 
 test("#4593: preserveRecentTurns unions with preserveRecentMessages (one soft set)", () => {

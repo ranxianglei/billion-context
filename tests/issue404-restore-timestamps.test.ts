@@ -119,7 +119,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         assert.notEqual(active.restored, true, "a session created by a live request is not restored");
         const statusDeps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
         const res1 = mockRes();
-        handlePluginStatus("never-seen", res1.res, statusDeps, true);
+        await handlePluginStatus("never-seen", res1.res, statusDeps, true);
         const body1 = JSON.parse(res1.body) as { ok: boolean; fallback?: boolean; label: string | null };
         assert.equal(res1.status, 200);
         assert.equal(body1.ok, true);
@@ -129,7 +129,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         // All sessions restored (no activity since boot): refuse to guess.
         _resetSessionsForTest();
         const res2 = mockRes();
-        handlePluginStatus("never-seen", res2.res, statusDeps, true);
+        await handlePluginStatus("never-seen", res2.res, statusDeps, true);
         assert.equal(res2.status, 404);
         assert.ok(res2.body.includes("since boot"), "explicit no-post-boot-activity error instead of a readdir-order guess");
     } finally {

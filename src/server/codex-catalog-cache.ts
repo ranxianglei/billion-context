@@ -5,7 +5,7 @@ import { cacheDir } from "../paths.js";
 import type { FetchOptions, fetchWithTimeout } from "../fetch-util.js";
 
 type FetchResult = Awaited<ReturnType<typeof fetchWithTimeout>>;
-type Entry = { key: string; savedAt: number; body: string };
+type Entry = { key: string; savedAt: number; body: string; etag?: string; lastModified?: string };
 type Log = (level: "info" | "warn", message: string) => void;
 const MAX_BYTES = 1024 * 1024;
 const MAX_ENTRIES = 16;
@@ -66,6 +66,29 @@ function transient(error: unknown): boolean {
     return false;
 }
 
+function sameEntityTag(left: string, right: unknown): boolean {
+    if (typeof right !== "string") return false;
+    const tag = /^(?:W\/)?("[^"]*")$/;
+    const a = tag.exec(left.trim());
+    const b = tag.exec(right.trim());
+    return a !== null && b !== null && a[1] === b[1];
+}
+
+function revalidates(entry: Entry, request: Headers, response: Headers): boolean {
+    const returnedTag = response.get("etag");
+    if (returnedTag !== null) return sameEntityTag(returnedTag, entry.etag);
+    const requestedTag = request.get("if-none-match");
+    // A list or wildcard can match a different representation. Without the
+    // response's own ETag, only one matching tag proves this body unchanged.
+    if (requestedTag !== null) return sameEntityTag(requestedTag, entry.etag);
+    const modified = request.get("if-modified-since");
+    if (modified === null || typeof entry.lastModified !== "string") return false;
+    const storedTime = Date.parse(entry.lastModified);
+    if (!Number.isFinite(storedTime) || Date.parse(modified) !== storedTime) return false;
+    const returnedTime = response.get("last-modified");
+    return returnedTime === null || Date.parse(returnedTime) === storedTime;
+}
+
 export function isCodexCatalogRequest(url: string, init: FetchOptions): boolean {
     try {
         const parsed = new URL(url);
@@ -90,6 +113,7 @@ export function createCodexCatalogFetch(
 ) {
     const memory = new Map<string, Entry>();
     const invalidated = new Set<string>();
+    const offSpec304Noted = new Set<string>();
     const clock = options.now ?? Date.now;
     const maxAge = options.maxAgeMs ?? 6 * 60 * 60 * 1000;
     const fresh = (entry: unknown): entry is Entry =>
@@ -213,6 +237,30 @@ export function createCodexCatalogFetch(
             if ([500, 502, 503, 504].includes(status)) return fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
             if (status === 304) {
                 if (!entry) return result;
+                // A 304 only means "not modified" when THIS request was
+                // conditional — the wrapper itself never sends a validator,
+                // but the end client may have added if-none-match /
+                // if-modified-since. The validator must also identify the
+                // stored representation before it can replay a cached 200.
+                // An UNCONDITIONAL 304 is off-spec
+                // (some transparent middleboxes answer it anyway): treat it
+                // like any other unexpected status — drop the cache, pass
+                // the oddity through — instead of extending freshness on a
+                // phantom hit whose real headers we would also discard.
+                if (!headers.has("if-none-match") && !headers.has("if-modified-since")) {
+                    // A gateway looping on this off-spec answer would otherwise
+                    // stay invisible; one warn per credential makes it traceable.
+                    if (!offSpec304Noted.has(key)) {
+                        offSpec304Noted.add(key);
+                        log("warn", `[model-catalog] upstream answered 304 to an unconditional GET; dropping cached catalog and passing the response through; age=${Math.floor((clock() - entry.savedAt) / 1000)}s`);
+                    }
+                    await invalidate();
+                    return result;
+                }
+                if (!revalidates(entry, headers, result.response.headers)) {
+                    await invalidate();
+                    return result;
+                }
                 await remember({ ...entry, savedAt: clock() });
                 discard(result);
                 return replay(entry, false);
@@ -243,7 +291,12 @@ export function createCodexCatalogFetch(
             }
             const text = complete ? Buffer.concat(chunks).toString("utf8") : "";
             if (validCatalog(text)) {
-                await remember({ key, savedAt: clock(), body: text });
+                const etag = result.response.headers.get("etag");
+                const lastModified = result.response.headers.get("last-modified");
+                await remember({ key, savedAt: clock(), body: text,
+                    ...(etag !== null ? { etag } : {}),
+                    ...(lastModified !== null ? { lastModified } : {}),
+                });
                 log("info", "[model-catalog] complete catalog refreshed; offline protection ready");
             } else {
                 await invalidate();
