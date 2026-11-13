@@ -19,6 +19,33 @@ const R_COMPLETED = (text?: string): string =>
 const A_DELTA = (text: string): string => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`;
 const O_DELTA = (content: string): string => `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content } }] })}\n\n`;
 
+for (const [protocol, body] of [
+    ["responses", R_DELTA("complete summary") + R_COMPLETED()],
+    ["anthropic", A_DELTA("complete summary")],
+    ["openai", O_DELTA("complete summary") + "data: [DONE]\n\n"],
+    ["google", `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "complete summary" }] }, finishReason: "STOP" }] })}\n\n`],
+] as const) {
+    test(`summary extraction joins multiline ${protocol} SSE data before parsing JSON`, () => {
+        const multiline = body.replace(/^data: (.+)$/gm, (line, data: string) => data === "[DONE]" ? line :
+            JSON.stringify(JSON.parse(data), null, 2).split("\n").map((part) => `data: ${part}`).join("\n: keepalive\n"));
+        assert.equal(extractSummaryFromSse(protocol, multiline), "complete summary");
+        assert.equal(extractSummaryFromSse(protocol, multiline.replace(/\n/g, "\r\n")), "complete summary");
+    });
+}
+
+test("multiline SSE keeps frame-level event types and failure terminals", () => {
+    const delta = 'event: response.output_text.delta\ndata: {\ndata: "delta":"retained"\ndata: }\n\n';
+    const complete = 'event: response.completed\ndata: {\ndata: "response":{"status":"completed","output":[]}\ndata: }\n\n';
+    assert.equal(extractSummaryFromSse("responses", delta + complete), "retained");
+    const failed = 'event: response.failed\ndata: {\ndata: "response":{"status":"failed"}\ndata: }\n\n';
+    assert.equal(extractSummaryFromSse("responses", delta + failed), "");
+});
+
+test("joining SSE data does not accept malformed JSON or merge adjacent events", () => {
+    assert.equal(extractSummaryFromSse("openai", O_DELTA("partial") + 'data: {\ndata: invalid json\ndata: }\n\n'), "");
+    assert.equal(extractSummaryFromSse("openai", 'data: {"choices":\n\ndata: []}\n\n'), "");
+});
+
 test("#780 responses: complete stream, completed full text is authoritative", () => {
     assert.equal(extractSummaryFromSse("responses", R_DELTA("Hello ") + R_DELTA("world.") + R_COMPLETED("Hello world.")), "Hello world.");
 });
