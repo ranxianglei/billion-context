@@ -7,8 +7,10 @@ import { appendEchoedToolExchange, appendTrailingUserText } from "./wire-body.js
 
 /** #5440: the verbatim exchange the proxy appends when continuing after an
  *  echoed tool-call name — the assistant turn (carrying the echoed call) plus
- *  the canned tool result. The caller builds these per wire protocol. */
-export interface EchoedToolContinuation {
+ *  the canned tool result. The caller builds these per wire protocol.
+ *  Module-local: the `cont` param contract of makeContinuationRefetch, no
+ *  cross-file import (unused-exports INTERNAL_ONLY). */
+interface EchoedToolContinuation {
     assistantMessages: Record<string, unknown>[];
     toolResultMessages: Record<string, unknown>[];
 }
