@@ -1138,9 +1138,12 @@ export class MysqlBackend implements StorageBackend {
             await this.releaseContent(c, r.from);
         }
         // #4390 rewind-redo: reactivate in place (no duplicate row).
-        for (const seq of retiredSeqs) {
-            if (messages.some((m) => m.seq === seq)) {
-                await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+        if (retiredSeqs.length > 0) {
+            const presentedSeqs = new Set(messages.map((m) => m.seq));
+            for (const seq of retiredSeqs) {
+                if (presentedSeqs.has(seq)) {
+                    await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+                }
             }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
