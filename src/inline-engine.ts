@@ -155,6 +155,9 @@ class InlineRes extends EventEmitter {
         super();
         this.bodyStream = new ReadableStream<Uint8Array>({
             start: (c) => { this.controller = c; },
+            // Cancelling a response body is a client disconnect even when
+            // the caller did not supply or abort an AbortSignal.
+            cancel: () => { this.destroy(); },
         });
     }
 
