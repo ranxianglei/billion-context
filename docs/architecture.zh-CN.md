@@ -2,6 +2,7 @@
 
 > 系统架构的唯一枢纽。本页放**整体架构图**与**模块总表**；每个模块在本目录下有独立页面（中英各一份），每页配自己的图。
 > English: [architecture.md](./architecture.md)
+> 日本語: [architecture.ja.md](./architecture.ja.md)
 >
 > **实时维护文档（owner 裁定 2026-11-08）**：任何改动模块边界 / 数据流 / 表 / 车道 / 线上路径的 PR，必须**同一 PR** 更新对应页面 + 图 + 本总表。机械部分由 CI 强制（`tools/check-architecture-docs.mjs`）；规则条文见 [AGENTS.md](../AGENTS.md)「Documentation Layout」。
 

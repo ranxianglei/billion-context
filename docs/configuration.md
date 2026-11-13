@@ -1,6 +1,6 @@
 # billion-context Configuration Reference
 
-[English](configuration.md) | [中文](configuration.zh-CN.md)
+[English](configuration.md) | [中文](configuration.zh-CN.md) | [日本語](configuration.ja.md)
 
 `billion-context` is an HTTP proxy that injects [ACP](https://github.com/ranxianglei/acp-kernel) (Active Context Pruning) context compression into LLM API streams. Every option below lives in a single JSON config file (or an equivalent environment variable / CLI flag).
 

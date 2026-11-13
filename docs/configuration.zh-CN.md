@@ -1,6 +1,6 @@
 # billion-context 配置参考
 
-[English](configuration.md) | [中文](configuration.zh-CN.md)
+[中文](configuration.zh-CN.md) | [English](configuration.md) | [日本語](configuration.ja.md)
 
 `billion-context` 是一个 HTTP 代理，用于将 [ACP](https://github.com/ranxianglei/acp-kernel)（Active Context Pruning，主动上下文剪枝）的上下文压缩注入到 LLM API 流中。下文所有选项都位于同一个 JSON 配置文件中（也可通过等价的环境变量 / CLI 参数设置）。
 
