@@ -2260,3 +2260,33 @@ test("#4406: the Context tab marks the conversation scroll container and hides t
     m.runCleanups();
     assert.equal(scrollAttrs.has("data-bili-surface"), false, "leaving the tab drops the marker");
 });
+
+test("#6587: both dark palettes bind color-scheme so native controls follow the theme", () => {
+    // `color-scheme` is what the UA paints native control chrome from: a
+    // <select>'s option popup, checkbox/radio glyphs, scrollbars. The base
+    // :root carries `light dark` (#2473, canvas/ground coupling), but the
+    // BASE value resolves to `light` whenever the OS asks for neither scheme,
+    // so each dark palette rebinds it to dark — otherwise the compress
+    // prompt-pack <select> (#/config -> compress.promptPack) pops a white
+    // option list over the dark settings face while the page itself is dark.
+    // Scope the read: the base :root also declares `color-scheme: light dark`,
+    // so a bare includes() passes even with both dark blocks stripped.
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+    const decls = (open: string): string[] => {
+        const i = styles.indexOf(open);
+        assert.ok(i >= 0, `${open} present`);
+        return styles
+            .slice(i + open.length, styles.indexOf("}", i))
+            .split("\n")
+            .map((l) => l.trim().replace(/;\s*$/, ""))
+            .filter((l) => l !== "");
+    };
+    assert.ok(
+        decls(':root[data-theme="dark"] {').includes("color-scheme: dark"),
+        "the pinned dark palette binds color-scheme: dark",
+    );
+    assert.ok(
+        decls(":root:not([data-theme]) {").includes("color-scheme: dark"),
+        "the OS-driven dark palette binds color-scheme: dark for native controls",
+    );
+});
