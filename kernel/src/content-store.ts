@@ -121,6 +121,52 @@ export function hasStoredRef(store: MessageContentStore, ref: string): boolean {
   return store.byRef[ref] !== undefined;
 }
 
+/** #4733: re-key a CCR content store onto the post-restamp ref map.
+ * restampRefsToLedger renumbers messageRefs (ref = seq+1) but the store's
+ * byRef keys stay frozen at store-time refs — after the stamp the two views
+ * disagree: a stored entry sits under a number the ref map now vends to a
+ * DIFFERENT message (silent misattribution on retrieveByRef), and host
+ * consistency gates that check byRaw[entry.rawId] === ref reject the whole
+ * session. Re-key every entry whose rawId holds a live numeric ref in the
+ * new map; entries for unmapped raw ids (dead/pruned) keep their old key
+ * (the store's byRef index remains their retrieval path, per the frozen-alias
+ * invariant); entries for BLOCKED raw ids keep theirs too (no numeric ref).
+ * Collisions merge — one entry per rawId under its current ref, first
+ * content wins (append-only/first-write-wins preserved). */
+export function restampContentStore(
+  store: MessageContentStore,
+  byRaw: Record<string, string>,
+): MessageContentStore {
+  const next: Record<string, StoredEntry> = {};
+  // Live mappings claim their keys first; a dead raw id's frozen alias may
+  // never shadow a live mapping that now owns that number.
+  for (const entry of Object.values(store.byRef)) {
+    const live = byRaw[entry.rawId];
+    if (live === undefined || live === "BLOCKED") continue;
+    if (next[live] === undefined) next[live] = entry;
+  }
+  let changed = Object.keys(next).length !== Object.keys(store.byRef).length;
+  for (const [ref, entry] of Object.entries(store.byRef)) {
+    const live = byRaw[entry.rawId];
+    if (live !== undefined && live !== "BLOCKED") continue;
+    if (next[ref] === undefined) {
+      next[ref] = entry;
+    } else {
+      changed = true; // frozen alias shadowed by a live mapping — dropped
+    }
+  }
+  if (!changed) {
+    for (const [ref, entry] of Object.entries(store.byRef)) {
+      if (next[ref] !== entry) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (!changed) return store;
+  return { ...store, byRef: next };
+}
+
 export interface ContentStoreStats {
   /** Number of stored refs. */
   entries: number;

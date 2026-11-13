@@ -53,6 +53,19 @@ export function storedMessagesFor(session: Session, sessionId: string, msgs: rea
     return resolveStoredDecompositions(session, sessionId, wireIds);
 }
 
+/** #5142: raw-row source for the expected-rebase backfill — fold-reconcile
+ *  needs the ORIGINAL bytes of missing covered ids (carrier classification,
+ *  inline-image evidence), not a pre-filtered decomposition, so it gets the
+ *  uninterpreted StoredRow stream back. Same null/[] contract as
+ *  DecompositionSource.rows. Callback shape keeps fold-reconcile storage-free
+ *  for unit fakes; tests inject their own source. */
+export function storedRowLookupFor(
+    sessionId: string,
+    source: DecompositionSource = defaultSource(),
+): (msgIds: readonly string[]) => StoredRow[] | null {
+    return (msgIds) => source.rows(sessionId, msgIds);
+}
+
 export function resolveStoredDecompositions(
     session: Session,
     sessionId: string,

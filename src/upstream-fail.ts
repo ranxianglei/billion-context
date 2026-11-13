@@ -12,6 +12,16 @@
  *  neither imports the other just for this (they already form an import
  *  edge upstream-proxy → fetch-util; adding the reverse would be a cycle). */
 
+// #5807/#5917: the code fetchWithTimeout stamps on an error when its PHASE-1
+// (pre-first-byte) watchdog fires because the operator TIGHTENED the first-byte
+// budget below the idle budget. Carrying it as a string `code` (not a new
+// exception type) keeps the existing chainOf() walk working unchanged: the
+// classifier reads it off the error and returns "upstream-headers-timeout",
+// which isFailFastUpstreamKind() then replays. Unset knob ⇒ the marker is never
+// stamped ⇒ a first-byte timeout still classifies as "upstream-timeout" and
+// stays non-retried, byte-identical to the pre-#5807 default.
+export const UPSTREAM_FIRST_BYTE_TIMEOUT_CODE = "UPSTREAM_FIRST_BYTE_TIMEOUT";
+
 export type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
@@ -20,11 +30,29 @@ export type UpstreamFailureKind =
      *  OS/undici reported a headers/body timeout. NOT retried — the budget
      *  already waited and the request may have reached the upstream. */
     | "upstream-timeout"
+    /** Phase-1 FIRST-BYTE timeout: the operator tightened the first-byte budget
+     *  (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS below the idle
+     *  budget) and the upstream still sent NO response byte within it. Zero
+     *  bytes were received, so a replay cannot double-deliver anything and each
+     *  attempt costs at most the (explicitly tightened) first-byte budget — it
+     *  replays within the retry budget (#5807/#5831). Distinct from
+     *  upstream-timeout: a mid-stream (body) idle expiry stays non-retried. */
+    | "upstream-headers-timeout"
     /** Connect-phase timeout (undici UND_ERR_CONNECT_TIMEOUT): the TCP
      *  handshake never completed, so nothing reached the upstream and each
      *  attempt costs at most one connect timeout — replayed within the retry
      *  budget (#1453). */
     | "connect-timeout"
+    /** Connect-phase ICMP "no route" rejection (EHOSTUNREACH / ENETUNREACH /
+     *  EHOSTDOWN): the kernel refused the connection IMMEDIATELY — same
+     *  pre-response status as connect-refused (nothing reached the upstream,
+     *  per-attempt cost is milliseconds) so it replays within the budget
+     *  (#2465/#5663). Deliberately distinct from connect-timeout: immediate
+     *  rejection vs deadline expiry point at different remedies (route/ACL
+     *  check vs timeout-budget/upstream-health), keeping the #1263 goal of
+     *  distinguishable remedies. macOS Local Network privacy denials surface
+     *  as exactly this errno family (#5663). */
+    | "upstream-unreachable"
     /** Connect-phase reset THROUGH a proxy: socket died before the response
      *  started, and a proxy sits in the path — prime suspect is the proxy
      *  recycling the tunnel (idle recycle, payload cap, node churn). */
@@ -68,6 +96,11 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
     for (const entry of chain) {
         const code = typeof entry.code === "string" ? entry.code : undefined;
         const name = typeof entry.name === "string" ? entry.name : undefined;
+        // #5807: a TIGHTENED first-byte watchdog stamps this code before
+        // aborting — nothing reached the wire (zero response bytes), so it is a
+        // distinct, replayable kind. Checked first: it is the only code whose
+        // meaning is defined by bili itself, not by the OS/undici.
+        if (code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) return "upstream-headers-timeout";
         if (code === undefined) {
             if (name === "AbortError") return "upstream-timeout";
             continue;
@@ -76,6 +109,10 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
         if (code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "upstream-timeout";
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
+        // #2465/#5663: ICMP no-route family — before this it fell through to
+        // "unknown", which is neither fail-fast (no replay) nor alertable
+        // (no banner), so field EHOSTUNREACH storms died on attempt 1.
+        if (code === "EHOSTUNREACH" || code === "ENETUNREACH" || code === "EHOSTDOWN") return "upstream-unreachable";
         if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
         // #1987: OpenSSL/undici certificate-TRUST codes (corporate interception /
         // MITM) are TLS failures too — before this they classified as "unknown",
@@ -215,11 +252,14 @@ export function buildProxyFailureResponse(msg: string, err: unknown): { status: 
 
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a
  *  replay cannot double-deliver anything. Per-attempt cost stays bounded —
- *  milliseconds for resets/refusals/DNS, at most one connect timeout for
- *  connect-timeout — so retrying never stacks the 12-min idle budget across
- *  attempts the way a headers/body timeout would (#1263, #1453). */
+ *  milliseconds for resets/refusals/DNS/no-route rejections, at most one
+ *  connect timeout for connect-timeout — so retrying never stacks the 12-min
+ *  idle budget across attempts the way a headers/body timeout would; a
+ *  first-byte timeout is bounded by the explicitly-tightened first-byte budget
+ *  (strictly under the idle budget by construction), so it is fail-fast too
+ *  (#5807/#5831, #1263, #1453, #2465/#5663). */
 export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
-    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns";
+    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns" || kind === "upstream-unreachable" || kind === "upstream-headers-timeout";
 }
 
 /** One-line remediation hint per kind — used by logs and the docs so the
@@ -227,13 +267,17 @@ export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
 export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "client-abort": "downstream client disconnected — no bili-side action",
     "upstream-timeout": "idle budget expired (headers/body) — check upstream health; not retried by design",
+    "upstream-headers-timeout": "no first response byte within the explicitly-tightened first-byte budget (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS) — zero bytes were received, so a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX); the mid-stream (body) idle budget is unchanged",
     "connect-timeout": "TCP handshake never completed — upstream/proxy unreachable or blackholed; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
+    "upstream-unreachable": "ICMP no-route rejection (EHOSTUNREACH/ENETUNREACH/EHOSTDOWN) — nothing reached the upstream; check routing/firewall/ACL (on macOS also the Local Network privacy grant for the app that owns the bili process, #5663); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "proxy-reset": "proxy dropped the connection before the response — check proxy idle-recycle/payload limits (BILI_PROXY_KEEPALIVE_MAX_MS can shorten our reuse window); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-reset": "upstream/network reset before the response — check upstream and local network; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "connect-refused": "TCP refused (proxy when configured, else upstream) — endpoint down or wrong port",
     dns: "name resolution failed — DNS server or hostname typo; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     tls: "TLS/certificate failure at CONNECT or upstream handshake — CA/proxy MITM config",
-    unknown: "unclassified transport failure — report with full error chain",
+    // #2465/#5663: state the fact instead of demanding a report — describeUpstreamFailure
+    // already puts the full masked error chain on the same log line.
+    unknown: "unclassified transport failure — full masked error chain is on this log line",
 };
 
 /** Mask proxy credentials for display surfaces (log lines, 502 detail, the
