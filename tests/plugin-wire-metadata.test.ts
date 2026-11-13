@@ -34,7 +34,7 @@ test("precomputed wire metadata matches raw-buffer snapshot evidence across wire
         { wire: { messages: null, input: "fallback" }, comparable: true },
         { wire: { messages: [{ content: [{ type: "image", source: {} }] }], input: "ignored" }, comparable: false },
         { wire: { messages: [{ content: [{ type: "tool_use", input: { type: "image" } }] }] }, comparable: true },
-        { wire: { messages: [{ content: [{ type: "thinking", thinking: "signed" }] }] }, comparable: false },
+        { wire: { messages: [{ content: [{ type: "thinking", thinking: "signed" }] }] }, comparable: true },
         { wire: { messages: [{ content: "text", audio: {} }] }, comparable: false },
         { wire: null, comparable: false },
         { wire: 42, comparable: false },

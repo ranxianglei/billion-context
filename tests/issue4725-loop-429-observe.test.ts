@@ -3,7 +3,11 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../src/upstream-throttle.ts";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleGate } from "../src/upstream-throttle.ts";
+
+function throttleReject(url: string, headers: Record<string, string>) {
+    return upstreamThrottleGate(url, headers).reject;
+}
 
 // N3 (PR #4725 round-3 review): the 429 governor's observe pair was wired only
 // on the relay lane; the loop lane's own sends (compression re-requests,
@@ -24,13 +28,13 @@ test("429 governor contract: consecutive 429 verdicts arm the local gate; a reso
     const headers: Record<string, string> = {};
     // resolved verdict first: no hold exists — stays clean
     noteUpstreamThrottleResolved(url, headers, 200);
-    assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "no hold before any 429");
+    assert.equal(throttleReject(url, headers), undefined, "no hold before any 429");
     // arm the hold with loop-shaped 429 verdicts (streak 2 → backoff armed)
     noteUpstreamThrottle429(url, headers, null);
     noteUpstreamThrottle429(url, headers, null);
-    const reject = upstreamThrottleLocalReject(url, headers);
+    const reject = throttleReject(url, headers);
     assert.ok(reject, "hold armed after consecutive 429 verdicts");
     // a settled success (exactly what the loop notes on 2xx) lifts the hold
     noteUpstreamThrottleResolved(url, headers, 200);
-    assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "resolved verdict lifts the hold");
+    assert.equal(throttleReject(url, headers), undefined, "resolved verdict lifts the hold");
 });

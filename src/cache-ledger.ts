@@ -442,6 +442,11 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #564/#2627: exit-core indexes of THIS body that bili proved are its own
+     *  ordering separators, as the invariant judge returned them at send. The
+     *  next loop round's continuity verdict reads them as entry-side ownership.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    ownedSeparatorCores?: ReadonlySet<number>;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -642,16 +647,22 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+// #5795: single source of truth for the credential header names — the 429
+// governor's hold key (upstream-throttle.ts) and the pre-ingest fast path
+// (server/handle.ts) must read exactly these headers or holds go unmatched.
+export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
+
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
  *  key is ever persisted in (raw secrets never reach the ledger, logs or the
  *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
@@ -667,19 +678,27 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
                 // per request. The STABLE credential on that line is the
                 // Access key id — fingerprint only that.
                 const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
 // field reordering (a host that emits the same knobs in a different order must
-// NOT flip the cache-partition identity between requests).
-function canonicalJson(v: unknown): string {
+// NOT flip the cache-partition identity between requests). Exported: the
+// persist-side metadata fold gate (#5506) fingerprints with the same
+// canonicalization so live-vs-disk comparisons are like-for-like.
+export function canonicalJson(v: unknown): string {
     if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     const obj = v as Record<string, unknown>;
@@ -751,6 +770,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        ownedSeparatorCores: samePayload ? prior.ownedSeparatorCores : undefined,
     };
     if ("round" in transient && transient.round > 1) {
         delete transient.imageFacts;

@@ -115,6 +115,56 @@ export interface IntegrityWithdrawals {
   splitPairCount: number;
 }
 
+/** Precomputed per-MESSAGE inputs of {@link computeIntegrityWithdrawals} (#5337
+ *  option A): everything that depends only on `messages`, not on `foldedIds`,
+ *  is an O(n) pass repeated for every screened unit — hoisting it to one
+ *  build-per-turn cuts the dominant term of the O(n²) recommend screening.
+ *  Build via {@link buildIntegrityPre}; omit the parameter to compute inline
+ *  (single-call paths keep the legacy behavior). */
+export interface IntegrityPre {
+  reasoningIds: Set<string>;
+  callIds: Set<string>;
+  /** The tool-call messages themselves (id present) — the fixed-point pair
+   *  loop iterates these instead of re-scanning ALL messages per pass. */
+  callMessages: CoreMessage[];
+  callIdByMessageId: Map<string, string>;
+  resultIdByCallId: Map<string, string>;
+  groups: string[][];
+}
+
+/** One-pass build of {@link IntegrityPre} for a message array. */
+export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
+  const reasoningIds = new Set<string>();
+  const callIds = new Set<string>();
+  const callMessages: CoreMessage[] = [];
+  const callIdByMessageId = new Map<string, string>();
+  const resultIdByCallId = new Map<string, string>();
+  for (const m of messages) {
+    if (!m.id) continue;
+    if (m.contentType === "reasoning") reasoningIds.add(m.id);
+    if (m.role === "assistant" && m.contentType === "tool-call") {
+      callIds.add(m.id);
+      callMessages.push(m);
+      if (typeof m.toolCallId === "string") {
+        callIdByMessageId.set(m.id, m.toolCallId);
+      }
+    }
+    if (m.contentType === "tool-result" && typeof m.toolCallId === "string") {
+      if (!resultIdByCallId.has(m.toolCallId)) {
+        resultIdByCallId.set(m.toolCallId, m.id);
+      }
+    }
+  }
+  return {
+    reasoningIds,
+    callIds,
+    callMessages,
+    callIdByMessageId,
+    resultIdByCallId,
+    groups: computeTurnGroups(messages),
+  };
+}
+
 /**
  * Fold-integrity gate (#684): given the ids a fold removes from the visible
  * stream, return the ids that must stay visible instead.
@@ -134,37 +184,34 @@ export interface IntegrityWithdrawals {
  *
  * The reverse direction stays allowed (#564): reasoning and text may stay
  * visible while the call and its result fold, since that leaves a valid stream.
+ *
+ * Coverage is not "kept". An id in `invisibleIds` is already hidden by an
+ * active block: it neither counts as folding nor as kept-visible. A covered
+ * tool-call therefore cannot strand its turn's reasoning — without this, a
+ * #564 reverse split (call+result inside an existing block, reasoning+text
+ * visible) withdraws the stranded pair wholesale FOREVER: they leave no gap a
+ * range can span, so every later fold reclaims only everything else and the
+ * residue grows monotonically until nothing left is big enough to fold
+ * (billion-context#5531). Omit the parameter for the legacy model where
+ * everything not folded reads as visible.
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
   foldedIds: ReadonlySet<string>,
+  pre?: IntegrityPre,
+  invisibleIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
   const handledTurns = new Set<number>();
   const handledPairs = new Set<string>();
 
-  const reasoningIds = new Set<string>();
-  const callIds = new Set<string>();
-  const callIdByMessageId = new Map<string, string>();
-  const resultIdByCallId = new Map<string, string>();
-  for (const m of messages) {
-    if (!m.id) continue;
-    if (m.contentType === "reasoning") reasoningIds.add(m.id);
-    if (m.role === "assistant" && m.contentType === "tool-call") {
-      callIds.add(m.id);
-      if (typeof m.toolCallId === "string") {
-        callIdByMessageId.set(m.id, m.toolCallId);
-      }
-    }
-    if (m.contentType === "tool-result" && typeof m.toolCallId === "string") {
-      if (!resultIdByCallId.has(m.toolCallId)) {
-        resultIdByCallId.set(m.toolCallId, m.id);
-      }
-    }
-  }
-
-  const groups = computeTurnGroups(messages);
+  const built = pre ?? buildIntegrityPre(messages);
+  const reasoningIds = built.reasoningIds;
+  const callIds = built.callIds;
+  const callIdByMessageId = built.callIdByMessageId;
+  const resultIdByCallId = built.resultIdByCallId;
+  const groups = built.groups;
   let changed = true;
   while (changed) {
     changed = false;
@@ -177,7 +224,10 @@ export function computeIntegrityWithdrawals(
       );
       if (!foldHasReasoning) continue;
       const keptHasCall = group.some(
-        (id) => !remaining.has(id) && callIds.has(id),
+        (id) =>
+          !remaining.has(id) &&
+          callIds.has(id) &&
+          !invisibleIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);
@@ -188,8 +238,7 @@ export function computeIntegrityWithdrawals(
       changed = true;
     }
 
-    for (const m of messages) {
-      if (!m.id || !callIds.has(m.id)) continue;
+    for (const m of built.callMessages) {
       const callId = callIdByMessageId.get(m.id);
       if (callId === undefined || handledPairs.has(callId)) continue;
       const resultId = resultIdByCallId.get(callId);
