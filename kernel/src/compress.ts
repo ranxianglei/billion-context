@@ -49,7 +49,6 @@ import {
   buildCompressibleRanges,
   mergeRangesToThreshold,
   screenRecommendedUnits,
-  warnScreenDrop,
 } from "./recommend.js";
 import {
   runPipeline,
@@ -1502,23 +1501,6 @@ const recommendNode: PipelineNode = {
       ctx.config,
       computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
     );
-    // Production 2026-11-09 mega-turn incident: the funnel can zero out BELOW
-    // the "nothing compressible" level — segments exist and hold messages, but
-    // every island dies at the merge gate or the screen, and the host only
-    // sees recommendedRanges=[] while its own message-level diagnostic still
-    // counts collectible material ("collectible>0 yet ranges=0" was
-    // undiagnosable from the host side for a full night). Warn (budgeted)
-    // with the stage-by-stage numbers so the killing stage is named directly.
-    if (contextRanges.compressible.length > 0 && recommendedRanges.length === 0) {
-      const segMsgs = contextRanges.compressible.reduce((s, r) => s + r.count, 0);
-      const minChars = ctx.config.compress.minCompressRange;
-      const subGate = contextRanges.compressible.filter(
-        (r) => (r.chars ?? r.tokens * 4) < minChars,
-      ).length;
-      warnScreenDrop(
-        `funnel zeroed with material present: segments=${contextRanges.compressible.length} (${segMsgs} msgs, ${subGate} below ${minChars}-char merge gate) → all died at merge/screen; host sees no-ranges`,
-      );
-    }
     const recommendation: Recommendation = {
       contextRanges,
       recommendedRanges,

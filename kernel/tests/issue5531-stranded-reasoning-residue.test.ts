@@ -195,15 +195,9 @@ describe("#5531 recommend: stranded reasoning+text are advertised again", () => 
     });
     assert.deepEqual(res.result.errors, [], JSON.stringify(res.result.errors));
     assert.ok(res.result.blocksCreated >= 1, "a recovery block must be created");
-    // The recovery block is the one covering the stranded reasoning. The seed
-    // block (call+result only) may stay active alongside it: ranges ENDING at
-    // a mid-group block cut are clamped at the coverage boundary instead of
-    // dragging the seed in as consumed (unit-projection clampAdjustmentAtCoverage),
-    // so "distinct from the seed" is no longer the reliable discriminator here.
-    const block = res.state.blocks.find(
-      (b) => b.active && b.effectiveMessageIds.includes("r"),
-    );
-    assert.ok(block, "a recovery block covering the stranded reasoning must exist");
+    const block = res.state.blocks.find((b) => b.active && b !== state.blocks[0]);
+    assert.ok(block, "new block distinct from the seed block");
+    assert.ok(block.effectiveMessageIds.includes("r"));
     assert.ok(block.effectiveMessageIds.includes("t"));
   });
 });
