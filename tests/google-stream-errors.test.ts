@@ -164,4 +164,3 @@ test("#6629: the plugin-owned Google path still forwards the provider error verb
     await pipePluginChatWithStrip(new Response(frame).body!, response as unknown as http.ServerResponse, "google");
     assert.equal(Buffer.concat(chunks).toString("utf8"), frame);
 });
-
