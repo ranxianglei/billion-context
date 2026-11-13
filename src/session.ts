@@ -718,6 +718,18 @@ export type Session = {
      *  whole world again). Transient within a turn? No — persisted with the
      *  session, like responsesDelta. */
     responsesChainBroken?: boolean;
+    /** #6181 round 2, Residual 2 hardening: the latest response id THIS
+     *  proxy emitted for this session (responses lane), paired with the
+     *  plane frontier the provider chain provably held after that response
+     *  (committed only on an ACCEPTED forward — a refused round mints
+     *  nothing the client chains from). The chain id itself is opaque:
+     *  the first-chained-round frontier seed AND every persisted frontier
+     *  are trusted only when previous_response_id equals this id (the host
+     *  continues from our latest response — a fork/rewind to an older id,
+     *  or an id another proxy minted, can carry a world that chain never
+     *  held, so it re-seeds instead). Persisted with the session, like
+     *  responsesDelta. */
+    lastMintedResponse?: { id: string; frontierPos: number } | null;
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient

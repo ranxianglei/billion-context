@@ -3108,6 +3108,17 @@ async function handleRequest(
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    // #6181 B3: the compact-passthrough base hard-codes
+                    // resetAfterSuccess — which schedules a native-compaction
+                    // REBASE for the next Responses turn (reconcileNative-
+                    // CompactionBoundary → resetSessionCompression). A pure
+                    // chain-continuation round compacts nothing: honoring the
+                    // marker would wipe this session's compression state on
+                    // the next turn with no compaction ever having happened.
+                    // Drop it for the B3 route (the next turn's stage-0
+                    // resync already converges the plane when the host
+                    // resends a genuinely-compact world).
+                    if (pureChainContinuation) preparedOut.resetAfterSuccess = false;
                     return preparedOut;
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this
