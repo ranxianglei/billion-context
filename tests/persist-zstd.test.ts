@@ -11,6 +11,13 @@ import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
+// This suite is the legacy ENVELOPE format matrix (plain JSON / BILIZSTD1 /
+// encryption, boot file hygiene). The storage default flipped to pure-sqlite
+// (index-only, no envelope) — pin explicit dual-write so the envelope files
+// these assertions read keep being written.
+process.env.BILI_STORAGE_UNIFIED = "full";
+process.env.BILI_STORAGE_JSON_WRITER = "1";
+
 const KEY = randomBytes(32).toString("hex");
 
 // Static zstd frame produced by node:zlib zstdCompressSync; decoding it with
