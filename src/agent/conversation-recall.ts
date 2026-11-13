@@ -97,16 +97,24 @@ function sweep(now: number): void {
 }
 
 /**
- * Lane key: endpoint origin + pathname only. Query strings can carry
- * per-request noise, the model field changes on exactly the #3918 switch-
- * model retry this must catch, and auth tokens rotate (bearer refresh / key
- * swap — an auth-keyed lane would be orphaned on the very retry the bridge
- * exists for). The lane is only the SEARCH NAMESPACE; the identity evidence
- * is the boundary fingerprint plus its uniqueness across the lane.
+ * Lane key: hostname only. Query strings carry per-request noise, auth
+ * tokens rotate (bearer refresh / key swap — an auth-keyed lane would be
+ * orphaned on the very retry the bridge exists for), and the model field
+ * changes on exactly the #3918 switch-model retry this must catch.
+ *
+ * #6511: origin+pathname was too fine — the same logical session can ride
+ * two different endpoints (attributed traffic via the proxy to
+ * `http://host:9452/v1/…` while an unattributed connector dials
+ * `https://host/v2/…` directly), so the learn lane and the claim lane never
+ * intersected and the recall net was dead on arrival for that shape.
+ * Hostname is the coarsest key that still separates distinct providers;
+ * the boundary fingerprint (plus its uniqueness across the lane) remains
+ * the identity evidence, so a wider namespace only adds candidates the
+ * fingerprint filters out.
  */
 export function recallLaneKey(url: string): string {
     const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
+    return u.hostname;
 }
 
 /** Cheap probe for gate-side short-circuiting: no learned session on this
