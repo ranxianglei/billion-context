@@ -322,7 +322,10 @@ async function startCtx(transport: string, mockPort: number): Promise<Ctx> {
     );
     // Loosen the kernel's recent-content protection so the scripted fold can
     // target the planted bulk (same seam the opencode WS suite uses).
-    fs.writeFileSync(path.join(biliCfgDir, "billion-context.json"), JSON.stringify({ compress: { preserveRecentTokens: 0 } }));
+    // #6480 made pure-SQLite the default (jsonWriter off), so the JSON session
+    // envelopes this lane's sessionFiles() traversal asserts on are no longer
+    // written — same test-only dual-write pin as the pi/dsh native lanes.
+    fs.writeFileSync(path.join(biliCfgDir, "billion-context.json"), JSON.stringify({ compress: { preserveRecentTokens: 0 }, storage: { unified: "full", jsonWriter: "on" } }));
     return ctx;
 }
 
