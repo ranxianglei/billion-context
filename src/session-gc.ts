@@ -113,16 +113,24 @@ export function viewFromParsed(parsed: unknown): FileView | null {
     const savedAt = num(top.savedAt ?? rec.savedAt);
     if (savedAt === null || savedAt <= 0) return null;
     const state = asRecord(rec.state);
+    if (rec.state !== undefined && state === null) return null;
+    if (state?.blocks !== undefined && !Array.isArray(state.blocks)) return null;
     const blocks = Array.isArray(state?.blocks) ? (state!.blocks as unknown[]) : [];
     // Any block — active OR inactive — or any stored fold content means the
     // session was compressed at some point: its summaries cannot be rebuilt
     // losslessly from a client re-send, so the file is never GC-eligible.
     const blockContents = asRecord(rec.blockContents);
+    if (rec.blockContents !== undefined && blockContents === null) return null;
     const everCompressed = blocks.length > 0 || (blockContents !== null && Object.keys(blockContents).length > 0);
     const stats = asRecord(rec.stats);
-    const contextTokens = num(stats?.contextTokens ?? rec.contextTokens) ?? 0;
+    if (rec.stats !== undefined && stats === null) return null;
     const metadata = asRecord(rec.metadata);
-    const rawInputTokens = num(metadata?.rawInputTokens);
+    const contextValue = stats?.contextTokens ?? rec.contextTokens;
+    const rawValue = metadata?.rawInputTokens;
+    if ([contextValue, rawValue].some((value) => value !== undefined && value !== null
+        && (typeof value !== "number" || !Number.isFinite(value) || value < 0))) return null;
+    const contextTokens = num(contextValue) ?? 0;
+    const rawInputTokens = num(rawValue);
     const id = typeof top.id === "string" ? top.id
         : typeof rec.id === "string" ? rec.id
             : null;
@@ -143,7 +151,8 @@ export function contentStoreTokens(parsed: unknown): number | null {
     if (!byHash || !byRef) return null;
     let tokens = 0;
     for (const text of Object.values(byHash)) {
-        if (typeof text === "string") tokens += defaultCountTokens(text);
+        if (typeof text !== "string") return null;
+        tokens += defaultCountTokens(text);
     }
     return tokens;
 }
