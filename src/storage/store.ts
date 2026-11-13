@@ -2487,6 +2487,18 @@ export class UnifiedStore {
         return { rows, coverMax };
     }
 
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos for
+     *  this sid (-1 when the plane has no active row) — the frontier a
+     *  full-world round leaves the provider chain holding. */
+    snapPlaneMaxPos(sid: string): number {
+        const all = snapRowsAll(this.db, sid);
+        let max = -1;
+        for (const r of all) {
+            if (r.active === 1 && r.pos > max) max = r.pos;
+        }
+        return max;
+    }
+
     /** The stage-0 resync (brief red gate R4 / the resync ruling): reset the
      *  session's plane (rows + log + ckpt + the l1 element envelope + the
      *  sticky R1 latch) in one txn. This turn then runs the legacy full path

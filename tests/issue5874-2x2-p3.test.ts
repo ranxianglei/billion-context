@@ -797,10 +797,10 @@ function closeT(server: http.Server): Promise<void> {
 function sseT(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
-function sseDone(): string {
+function sseDone(id = "resp_done"): string {
     return [
         sseT("response.output_item.done", { item: { type: "message", id: "msg_1", role: "assistant", content: [{ type: "output_text", text: "ok" }] }, output_index: 0 }),
-        sseT("response.completed", { response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } } }),
+        sseT("response.completed", { response: { id, status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } } }),
     ].join("");
 }
 
@@ -1032,7 +1032,7 @@ test("Residual 2 (unit): storedFrontierPos is set only for a strict extension �
 
 test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain serves the new elements ONLY, and a same-body RETRY of it is a no-op (id kept, empty input, no dev)", async () => {
     await withProxyT(
-        () => ({ status: 200, payload: sseDone() }),
+        (n) => ({ status: 200, payload: sseDone(`resp_done_${n}`) }),
         async (url, bodies) => {
             const msg = (role: string, content: string) => ({ type: "message", role, content });
             // Round 1: the full world, NO chain ref. The provider's chain
@@ -1053,14 +1053,16 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             // Round 2: CHAINED (KEEP=1 forwards the id) + one new element.
             // WITHOUT Residual 2 this would re-seed the full 4-element view;
             // WITH it the outbound is exactly the new element, id kept, no
-            // developer re-injection.
+            // developer re-injection. The chain id must be the one round 1's
+            // response actually carried (resp_done_1) — the frontier seed is
+            // trusted only for an id THIS proxy minted (Residual 2 hardening).
             const r2 = await fetch(url, {
                 method: "POST",
                 headers: PLUGIN_HEADERS,
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
-                    previous_response_id: "resp_r1",
+                    previous_response_id: "resp_done_1",
                     input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two"), msg("assistant", "ack two")],
                     biliMsgIds: ["r2m1", "r2m2", "r2m3", "r2m4"],
                 }),
@@ -1068,7 +1070,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             assert.equal(r2.status, 200);
             await r2.text();
             const fwd2 = JSON.parse(bodies[1]!) as Record<string, unknown>;
-            assert.equal(fwd2.previous_response_id, "resp_r1", "the chain id is kept on the delta round");
+            assert.equal(fwd2.previous_response_id, "resp_done_1", "the chain id is kept on the delta round");
             const texts2 = ((fwd2.input as unknown as { content?: unknown }[])).flatMap((x) => (Array.isArray(x.content) ? x.content.map((p) => (p as { text?: string }).text ?? "") : [String(x.content ?? "")]));
             assert.ok(texts2.some((t) => t.includes("ack two")), "the new element is sent");
             assert.ok(!texts2.some((t) => t.includes("one")), "the stored world is NOT re-sent (the provider chain holds it)");
@@ -1086,7 +1088,7 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
                 body: JSON.stringify({
                     model: "gpt-e2e",
                     stream: true,
-                    previous_response_id: "resp_r2",
+                    previous_response_id: "resp_done_2",
                     input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two"), msg("assistant", "ack two")],
                     biliMsgIds: ["r2m1", "r2m2", "r2m3", "r2m4"],
                 }),
@@ -1094,9 +1096,37 @@ test("Residual 1a+2 (e2e): the first CHAINED round of a keepResponseId chain ser
             assert.equal(r3.status, 200);
             await r3.text();
             const fwd3 = JSON.parse(bodies[2]!) as Record<string, unknown>;
-            assert.equal(fwd3.previous_response_id, "resp_r2", "the no-op round KEEPS the chain id (stripping it orphans the provider's context)");
+            assert.equal(fwd3.previous_response_id, "resp_done_2", "the no-op round KEEPS the chain id (stripping it orphans the provider's context)");
             assert.deepEqual(fwd3.input, [], "the no-op round sends an EMPTY input (pure chain continuation)");
             assert.ok(!JSON.stringify(fwd3).includes("You are bili"), "no developer message on the no-op round (it would make a blind response)");
+
+            // Round 4: FORK — the host rewinds to round 1's response id while
+            // keeping the full current world plus one new element. The strict-
+            // extension proof would still pass (the plane is a strict prefix),
+            // but the chain from resp_done_1 may not hold the round-2/3 world
+            // if it was ever re-seeded — so the id mismatch drops the
+            // frontier and the round re-seeds the FULL view (id kept, never a
+            // loss). A 1-element delta here would be the loss edge.
+            const r4 = await fetch(url, {
+                method: "POST",
+                headers: PLUGIN_HEADERS,
+                body: JSON.stringify({
+                    model: "gpt-e2e",
+                    stream: true,
+                    previous_response_id: "resp_done_1",
+                    input: [msg("user", "one"), msg("assistant", "ack one"), msg("user", "two"), msg("assistant", "ack two"), msg("assistant", "ack three")],
+                    biliMsgIds: ["r2m1", "r2m2", "r2m3", "r2m4", "r2m5"],
+                }),
+            });
+            assert.equal(r4.status, 200);
+            await r4.text();
+            const fwd4 = JSON.parse(bodies[3]!) as Record<string, unknown>;
+            assert.equal(fwd4.previous_response_id, "resp_done_1", "the forked id is forwarded (kept, not stripped)");
+            const texts4 = ((fwd4.input as unknown as { content?: unknown }[])).flatMap((x) => (Array.isArray(x.content) ? x.content.map((p) => (p as { text?: string }).text ?? "") : [String(x.content ?? "")]));
+            assert.ok(texts4.some((t) => t.includes("one")), "the fork round RE-SEEDS the full view (the old chain is not provably holding the stored world)");
+            assert.ok(texts4.some((t) => t.includes("ack three")), "the new element is in the re-seed view");
+            const worldItems4 = (fwd4.input as { role?: string }[]).filter((x) => x.role !== "developer");
+            assert.equal(worldItems4.length, 5, "all 5 world elements on the wire (a delta would have sent 1)");
         },
         { storeDir: path.join(hermetic, "r2-store"), env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1", ACP_KEEP_RESPONSE_ID: "1" } },
     );

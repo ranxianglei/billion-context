@@ -47,7 +47,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore } from "../persist.js";
+import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -149,6 +149,14 @@ export async function prepareResponses(
     // the plane write for this turn's flush and the plane egress — see the
     // flag set site below the processTurn block.
     let planeBypass = false;
+    // #6181 round 2, Residual 2 hardening: the plane max pos the provider
+    // chain will hold once THIS forward is accepted — the relay pairs it
+    // with the response id it observes on the outbound stream (see
+    // relay.ts). Set after the in-request flush: the plane then holds
+    // exactly this round's world (or, for a planeBypass round, the
+    // previous world — which is precisely the boundary the chain already
+    // holds, since the bypass skips the flush).
+    let mintFrontierPos: number | undefined;
     let sysNotes: string[] = [];
     // #3713: billed tokens of the #1638-masked mid-history sys/dev items — they
     // ride the rebuilt input verbatim yet enter neither projection.msgs nor
@@ -462,6 +470,17 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // write (flag consumed) or ran it — either way the one-shot flag is
         // done for this turn.
         session.skipPlaneFlush = false;
+        // #6181 round 2, Residual 2 hardening: record the frontier this
+        // ACCEPTED round leaves the provider chain holding (post-flush
+        // plane max pos — see the declaration). Best-effort: a store error
+        // just leaves the mint unset (no verifiable chain → re-seeds, the
+        // status quo, never a loss).
+        try {
+            const s = getStore();
+            if (s !== null && s !== undefined) mintFrontierPos = s.snapPlaneMaxPos(session.id);
+        } catch {
+            /* no mint record for this round */
+        }
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -564,6 +583,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             deltaState === null && chains
             && !session.responsesChainBroken
             && s0.kernelInput !== undefined && s0.storedFrontierPos !== null
+            && session.lastMintedResponse !== null && session.lastMintedResponse !== undefined
+            && session.lastMintedResponse.id === parsed.previous_response_id
+            && session.lastMintedResponse.frontierPos === s0.storedFrontierPos
         ) {
             deltaState = { frontierPos: s0.storedFrontierPos, servedAnchors: [] };
             log("info", `[${sessionId}] [snaplane] frontier seeded at the stored-world boundary (pos ${s0.storedFrontierPos}) — the provider chain from this proxy's own prior round holds the stored world; serving the new elements only instead of re-seeding (Residual 2)`);
@@ -575,6 +597,32 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // first frontier the native #1954 KEEP=1 contract holds (id forwarded
         // intact, whatever the outbound is).
         hadFrontier = deltaState !== undefined && deltaState !== null;
+        // #6181 round 2, Residual 2 hardening: a persisted frontier is a
+        // claim about the PROVIDER's chain, not just the plane — and
+        // previous_response_id is OPAQUE. A host can fork/rewind to an older
+        // response id (or carry an id another proxy minted); the strict-
+        // extension proof bounds only the plane, so a delta built from a
+        // frontier the chain never provably holds loses the gap. Trust the
+        // frontier ONLY when the host continues from an id THIS proxy minted
+        // last for this session; any other chained round drops it (the egress
+        // then does a plain re-seed: full view, id kept — the status quo,
+        // at-least-once, never a loss) and the persisted state is cleared so
+        // the next round re-establishes verifiability from a fresh seed.
+        // (planeBypass rounds never reach the delta machinery — the egress
+        // serves the legacy bytes — so this is inert there.)
+        if (
+            deltaState !== undefined && deltaState !== null
+            && !(session.lastMintedResponse !== null && session.lastMintedResponse !== undefined
+                && session.lastMintedResponse.id === parsed.previous_response_id)
+        ) {
+            log("info", `[${sessionId}] [snaplane] chained round carries a previous_response_id this proxy did not mint last (${session.lastMintedResponse === null || session.lastMintedResponse === undefined ? "no mint record" : "id mismatch / fork / rewind"}) — dropping the persisted frontier and re-seeding the full view (Residual 2 hardening)`);
+            deltaState = null;
+            session.responsesDelta = null;
+            // The re-seed is a "no frontier" round for the strip/dev gates
+            // too: id kept (native #1954), developer message injected (the
+            // full view is self-contained) — exactly the pre-seed status quo.
+            hadFrontier = false;
+        }
         // #6181 B0 (decided at the flush site, above): a CHAINED turn that was
         // NOT assembled from the plane (non-cohort — no msgids — or a cohort
         // turn whose stage 0 did not run) cannot be addressed against the
@@ -973,6 +1021,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // #6181 B4: commit the selected frontier only after the upstream
         // accepts the request (relay.ts); a failed forward drops it.
         ...(deltaState !== undefined && selectionFired ? { pendingResponsesDelta: pendingDelta } : {}),
+        // #6181 round 2, Residual 2 hardening: the relay pairs this with
+        // the response id observed on the outbound stream (accepted forwards
+        // only) and records session.lastMintedResponse.
+        ...(mintFrontierPos !== undefined ? { mintFrontierPos } : {}),
         systemNotes: sysNotes,
         protocol: "responses",
         stream,
