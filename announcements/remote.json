@@ -19,6 +19,7 @@
       },
       "ctaLabel": "See #5984",
       "ctaUrl": "https://github.com/ranxianglei/billion-context/issues/5984",
+      "requiresScan": { "client": "dsh", "knownId": "dsh-live-compact" },
       "dismiss": "persistent",
       "priority": 70,
       "publishedAt": "2026-11-11T10:40:00Z"
