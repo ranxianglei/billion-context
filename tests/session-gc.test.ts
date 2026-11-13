@@ -203,6 +203,46 @@ test("viewFromParsed: envelope v3, legacy flat, corrupt input", () => {
     assert.equal(viewFromParsed({ savedAt: -5 }), null);
 });
 
+test("viewFromParsed: malformed compression state and token counts are never treated as empty", () => {
+    for (const extra of [
+        { state: "unreadable state" },
+        { state: { blocks: { b1: { summary: "irreplaceable" } } } },
+        { blockContents: ["irreplaceable"] },
+        { stats: { contextTokens: "large" } },
+        { stats: { contextTokens: -1 } },
+        { metadata: { rawInputTokens: -1 } },
+        { metadata: { rawInputTokens: "large" } },
+    ]) {
+        assert.equal(viewFromParsed(envelope("malformed", 1234, extra)), null, JSON.stringify(extra));
+    }
+});
+
+test("contentStoreTokens: malformed content entries are not silently counted as zero", () => {
+    for (const value of [null, 1, {}, ["preserved bytes"]]) {
+        assert.equal(contentStoreTokens({ version: 1, byHash: { h1: value }, byRef: {} }), null);
+    }
+});
+
+test("gcSessionFiles: keep valid JSON with malformed state or malformed companion content", async () => {
+    const dir = tmpDir("bili-gc-malformed-shapes-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const old = Date.now() - 10 * DAY;
+        const malformed = writeFile(dir, "anthropic/malformed.json", JSON.stringify(envelope("gc-malformed", old, {
+            state: { blocks: { b1: { summary: "preserve this" } } },
+        })), 10);
+        const session = writeFile(dir, "anthropic/companion.json", JSON.stringify(envelope("gc-malformed-companion", old)), 10);
+        const companion = writeFile(dir, "anthropic/companion.content-store.json", JSON.stringify({
+            version: 1, byHash: { h1: { text: "preserve unknown representation" } }, byRef: {},
+        }), 10);
+        const result = await gcSessionFiles({ dir, store, now: Date.now() });
+        assert.equal(result.removed, 0);
+        assert.equal(result.companionsRemoved, 0);
+        assert.equal(result.unreadable, 1);
+        for (const file of [malformed, session, companion]) assert.ok(existsSync(file), file);
+    });
+});
+
 test("gcConfigFromEnv: disabled by default, opt-in only", async () => {
     await withEnv(
         { BILI_SESSION_GC: undefined, BILI_SESSION_GC_MAX_AGE_DAYS: undefined, BILI_SESSION_GC_MAX_TOKENS: undefined, BILI_SESSION_GC_INTERVAL_MS: undefined },

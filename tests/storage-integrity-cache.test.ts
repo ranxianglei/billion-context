@@ -6,7 +6,8 @@
  *      open must NOT recheck (counter stays put).
  *   2. any stat change (mtime bump) invalidates the cache → recheck.
  *   3. cached failure → open throws StorageIntegrityError (the #4175
- *      quarantine-and-reopen-fresh path) without rescanning.
+ *      loud-degrade trigger: files stay where they are, next open fails fast)
+ *      without rescanning.
  *   4. large store (threshold overridden to 1 byte): open returns without
  *      blocking; a worker-thread check completes in the background, writes
  *      the cache, and the counter reaches 1.
@@ -19,6 +20,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
+import { setLogCapture } from "../src/logger.ts";
 import {
     integrityCachePath,
     readIntegrityCache,
@@ -81,7 +83,7 @@ test("touching the db file invalidates the cache and forces a recheck", () => {
     }
 });
 
-test("a cached failure fails open with the typed error (the #4175 quarantine trigger) without rescanning", () => {
+test("a STALE cached FAIL (older-version leftover) no longer blocks boots — fresh rescan decides (#4609/#5123)", () => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();
@@ -91,10 +93,23 @@ test("a cached failure fails open with the typed error (the #4175 quarantine tri
         store.close(); // cache now holds ok for the closed file set
         const cache = readIntegrityCache(dbPath);
         assert.ok(cache !== null);
-        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ ...cache, ok: false, detail: "simulated background failure" }));
+        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ ...cache, ok: false, detail: "simulated older-version failure" }));
+        // Owner policy 2026-10-30: runtime/background findings are alarms, never
+        // boot-blockers. A FAIL verdict left by an OLDER build is treated as a
+        // plain cache miss: loud warn, then a FRESH scan decides.
         const before = integrityCheckRunsForTests();
-        assert.throws(() => UnifiedStore.open(dbPath), (err: unknown) => err instanceof StorageIntegrityError && /simulated background failure/.test(err.detail));
-        assert.equal(integrityCheckRunsForTests(), before, "cached fail threw without running a scan");
+        let warned = "";
+        setLogCapture((_level, m) => { if (m.includes("stale verdicts no longer block boots")) warned = m; });
+        try {
+            const again = UnifiedStore.open(dbPath);
+            again.close();
+        } finally {
+            setLogCapture(null);
+        }
+        assert.ok(warned.length > 0, "the stale FAIL must be called out loudly in the log");
+        assert.equal(integrityCheckRunsForTests(), before + 1, "a fresh scan ran instead of trusting the old verdict");
+        const after = readIntegrityCache(dbPath);
+        assert.equal(after?.ok, true, "the healthy file set re-cached a PASS verdict (fast path restored)");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
@@ -149,6 +164,63 @@ test("a corrupt small store still fails open synchronously and writes no ok-cach
         assert.throws(() => UnifiedStore.open(dbPath), /quick_check|integrity|not a database|SQLite/i);
         const cache = readIntegrityCache(dbPath);
         assert.ok(cache === null || cache.ok === false, "no ok verdict cached for a corrupt store");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("malformed verdict records are cache misses", () => {
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath);
+        store.close();
+        const valid = readIntegrityCache(dbPath);
+        assert.ok(valid !== null);
+        const malformed: unknown[] = [
+            null,
+            [],
+            { v: 1, ok: true },
+            { ...valid, db: null },
+            { ...valid, db: [] },
+            { ...valid, db: { ...valid.db, s: -1 } },
+            { ...valid, db: { ...valid.db, s: "0" } },
+            { ...valid, db: { ...valid.db, m: null } },
+            { ...valid, wal: {} },
+            { ...valid, wal: { s: 1, m: "today" } },
+            { ...valid, schema: "11" },
+            { ...valid, at: null },
+            { ...valid, detail: {} },
+        ];
+        for (const value of malformed) {
+            writeFileSync(integrityCachePath(dbPath), JSON.stringify(value));
+            assert.equal(readIntegrityCache(dbPath), null, JSON.stringify(value));
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a damaged verdict cache cannot prevent a healthy store from reopening", () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath);
+        store.setKv("test", "kept", { message: "still here" });
+        store.close();
+        const before = integrityCheckRunsForTests();
+        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ v: 1, ok: true, db: null }));
+
+        const again = UnifiedStore.open(dbPath);
+        try {
+            assert.deepEqual(again.getKv("test", "kept"), { message: "still here" });
+            assert.equal(integrityCheckRunsForTests(), before + 1);
+        } finally {
+            again.close();
+        }
+        assert.equal(readIntegrityCache(dbPath)?.ok, true);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

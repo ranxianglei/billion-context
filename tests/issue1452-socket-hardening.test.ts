@@ -548,7 +548,7 @@ test("clientError backstop: knob off restores hold-until-peer-FIN status quo (#1
 });
 
 test("clientError backstop: knob parse — negative / non-numeric fall back to the 30s default (#1529)", async () => {
-    // Pins the documented contract (CONFIGURATION.md + PR body): only a valid
+    // Pins the documented contract (docs/configuration.md + PR body): only a valid
     // non-negative integer is honored (0 disables); a negative or non-numeric
     // value falls back to the 30s default rather than silently disabling the
     // backstop. The value is read at startServer, so each case boots its own
