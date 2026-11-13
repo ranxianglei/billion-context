@@ -38,7 +38,7 @@ const MEDIA_URL_MARKER_RE = new RegExp(
 );
 
 export function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
-    let media: { hash: string; bytes: string }[] = [];
+    const media: { hash: string; bytes: string }[] = [];
     let split = content;
     if (content.includes("\"imageBase64\"")) {
         let parsed: { imageBase64?: unknown };
@@ -68,7 +68,7 @@ export function splitMediaContent(content: string): { content: string; hash: str
             const mediaHash = sha256Hex(payload);
             if (!byHash.has(mediaHash)) {
                 byHash.set(mediaHash, payload);
-                media = [...media, { hash: mediaHash, bytes: payload }];
+                media.push({ hash: mediaHash, bytes: payload });
             }
             return `data:${mime};base64,{$media:${mediaHash}}`;
         });
