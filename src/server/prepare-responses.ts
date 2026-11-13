@@ -5,6 +5,8 @@ import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputIt
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { featureEnabled } from "../rollout.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
@@ -72,6 +74,12 @@ export async function prepareResponses(
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    // #6525: the client may stamp the envelope (`biliMsgIds`) on plugin-wire
+    // full-resend turns. Read + strip it before anything can reach the real
+    // upstream, then pin behind the rollout gate (same contract as the openai/
+    // anthropic twins). Nothing extra is ever forwarded either way.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
@@ -242,8 +250,27 @@ export async function prepareResponses(
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
         }
-        const { msgs } = projection;
+        const { msgs: msgsIn } = projection;
+        let msgs = msgsIn;
         originalMessages = msgs;
+        // #6525/#4491 parity: pin identity to client-supplied ids (plugin lanes
+        // only), the SAME gated contract as the openai/anthropic twins. The
+        // store path (core.processTurn below) reads `projection.msgs` directly,
+        // so keep it in sync with the pinned array.
+        if (pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    projection.msgs = msgs;
+                    originalMessages = msgs;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] responses-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#6525)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] responses-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#6525)`);
+            }
+        }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
