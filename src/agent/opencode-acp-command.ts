@@ -34,8 +34,10 @@ export interface OpencodeClient {
             body: { noReply: boolean; parts: OpencodePromptPart[] };
         }) => Promise<unknown>;
         // #1362: SDK session.get — child sessions declare their parent via
-        // data.parentID (opencode mints a fresh id per persona/subagent).
-        get?: (args: { path: { id: string } }) => Promise<{ data?: { id?: unknown; parentID?: unknown } } | undefined>;
+        // data.parentID (opencode mints a fresh id per persona/subagent); UI
+        // user forks instead carry data.fork = {sessionID, boundary} because
+        // their rows store parent_id NULL (#5509) — callers prefer fork.sessionID.
+        get?: (args: { path: { id: string } }) => Promise<{ data?: { id?: unknown; parentID?: unknown; fork?: { sessionID?: unknown; boundary?: unknown } } } | undefined>;
     };
 }
 
