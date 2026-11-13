@@ -701,7 +701,7 @@ async function handleRequest(
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
             const requestType = typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro";
             const v1ModelId = v1Model ?? googleModel ?? vertexModel;
-            // #6457: size-gate the verbatim passthrough. A background side request
+            // #6457: size-gate the verbatim passthrough. A background v1internal request
             // (requestType=checkpoint) packs the FULL uncompressed local history
             // into inner.contents; when that payload exceeds the upstream window,
             // the verbatim forward is a guaranteed 400 that kills the client's
