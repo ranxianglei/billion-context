@@ -256,6 +256,96 @@ test("instance registry: #394 warning is lane-aware — cross-lane silent, same-
     }
 });
 
+test("instance registry: #394 warning judges by sessions directory when both report one (#5046)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    const infos: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        registerInstanceAndWarn(
+            { instanceId: "a", pid: process.pid, port: 1, origin: "http://127.0.0.1:1", startedAt: 1, lane: "dsh", sessionsDir: "/sessions/a" },
+            (msg) => warnings.push(msg),
+            (msg) => infos.push(msg),
+        );
+        assert.equal(warnings.length, 0);
+        assert.equal(infos.length, 0);
+        // Same-lane peer with a DIFFERENT sessions dir (BILI_SESSIONS_DIR isolation):
+        // shares no state → informational only, never the "stop one" advice.
+        registerInstanceAndWarn(
+            { instanceId: "b", pid: process.pid, port: 2, origin: "http://127.0.0.1:2", startedAt: 2, lane: "dsh", sessionsDir: "/sessions/b" },
+            (msg) => warnings.push(msg),
+            (msg) => infos.push(msg),
+        );
+        assert.equal(warnings.length, 0, "isolated dirs are not a shared-state hazard");
+        assert.equal(infos.length, 1, "proven-apart peer reported informationally");
+        assert.match(infos[0], /different sessions directories/);
+        assert.match(infos[0], /ours: \/sessions\/b/);
+        assert.match(infos[0], /theirs: \/sessions\/a/);
+        const regDir = path.join(st.dir, "billion-context", "instances");
+        const bMarker = JSON.parse(fs.readFileSync(path.join(regDir, "b.json"), "utf8")) as { sessionsDir?: string };
+        assert.equal(bMarker.sessionsDir, "/sessions/b", "sessionsDir round-trips through the marker file");
+        // Same-lane peer with the SAME dir as "a": still the full warning.
+        registerInstanceAndWarn(
+            { instanceId: "c", pid: process.pid, port: 3, origin: "http://127.0.0.1:3", startedAt: 3, lane: "dsh", sessionsDir: "/sessions/a" },
+            (msg) => warnings.push(msg),
+            (msg) => infos.push(msg),
+        );
+        assert.equal(warnings.length, 1, "shared dir still warns");
+        assert.match(warnings[0], /both processes will write the same sessions directory/);
+        assert.match(warnings[0], /lane "dsh"/);
+        assert.equal(infos.length, 2, "c vs b is proven apart → info");
+        // Peer without a recorded dir (pre-#5046 marker): isolation unprovable → conservative warn for every peer.
+        registerInstanceAndWarn(
+            { instanceId: "d", pid: process.pid, port: 4, origin: "http://127.0.0.1:4", startedAt: 4, lane: "dsh" },
+            (msg) => warnings.push(msg),
+            (msg) => infos.push(msg),
+        );
+        assert.equal(warnings.length, 4, "unknown own dir stays conservative against all three peers");
+        assert.equal(infos.length, 2, "unknown dir can never be judged apart");
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
+test("instance registry: peer rescan judges by sessions directory like startup does (#2401/#5046)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    const infos: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        registerInstanceAndWarn(
+            { instanceId: "a", pid: process.pid, port: 1, origin: "http://127.0.0.1:1", startedAt: 1, lane: "pi", sessionsDir: "/s/a" },
+            () => {},
+            () => {},
+        );
+        registerInstanceAndWarn(
+            { instanceId: "b", pid: process.pid, port: 2, origin: "http://127.0.0.1:2", startedAt: 2, lane: "pi", sessionsDir: "/s/b" },
+            () => {},
+            () => {},
+        );
+        const fresh = warnOnNewPeers({ instanceId: "a", lane: "pi", sessionsDir: "/s/a" }, new Set<string>(), (m) => warnings.push(m), (m) => infos.push(m));
+        assert.deepEqual(fresh, ["b"], "newly-seen live peer reported");
+        assert.equal(warnings.length, 0, "proven-apart late peer is informational");
+        assert.equal(infos.length, 1);
+        assert.match(infos[0], /appeared while this process was already running/);
+        assert.match(infos[0], /different sessions directories/);
+        registerInstanceAndWarn(
+            { instanceId: "c", pid: process.pid, port: 3, origin: "http://127.0.0.1:3", startedAt: 3, lane: "pi", sessionsDir: "/s/a" },
+            () => {},
+            () => {},
+        );
+        const seen = new Set<string>(["b"]);
+        const fresh2 = warnOnNewPeers({ instanceId: "a", lane: "pi", sessionsDir: "/s/a" }, seen, (m) => warnings.push(m), (m) => infos.push(m));
+        assert.deepEqual(fresh2, ["c"], "shared-dir late peer warned");
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /both processes write the same sessions directory/);
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
 test("instance registry: resident warns once per newly-appearing live peer, remembers them (#2401)", () => {
     const st = tmpStateDir();
     const warnings: string[] = [];
