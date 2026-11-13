@@ -565,11 +565,13 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
         assert.equal(json.error?.code, "preflight_compress_failed");
         const msg = json.error?.message ?? "";
         assert.ok(msg.includes("NOT forwarded"), `payload withheld (got: ${msg})`);
-        // Proves the headroom path was exercised: the reported window is the
-        // 7500 after the #896-capped headroom reservation (min(max_tokens,
+        // Proves the headroom path was exercised: the cited wall is the 7500
+        // after the #896-capped headroom reservation (min(max_tokens,
         // outputHeadroomMaxPct·window) = min(4000, 2500) = 2500 off 10000), not
-        // the declared 10000.
-        assert.ok(msg.includes("model window 7500"), `effective window reflects headroom reservation (got: ${msg})`);
+        // the declared 10000. #3663 relabels that wall "the effective input
+        // budget" (naming the native window + the reservation) instead of
+        // "the model window".
+        assert.ok(msg.includes("effective input budget 7500"), `effective window reflects headroom reservation (got: ${msg})`);
         // Regression guard: the reduction here came from output-headroom, NOT an
         // operator setting — the shrink note must stay silent.
         assert.ok(!msg.includes("full window"), `no shrink note for a headroom-shrunk window (got: ${msg})`);
