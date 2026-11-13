@@ -19,3 +19,10 @@ tests/golden/web-hitrate/*.svg text eol=lf
 # "every fixture artifact matches its recorded digest and size" failed every
 # windows-latest leg (run 38982246862).
 tests/fixtures/vertex-anthropic/* text eol=lf
+
+# #1305 class again, new path: the trae wire fixture is compared byte-for-byte
+# against the pipe's output (`assert.equal(out, REAL_TURN)` in
+# tests/trae-plugin-pipe.test.ts). Git-for-Windows' autocrlf=true checked it out
+# CRLF, the pipe normalizes terminators to LF (src/sse-util.ts), and the
+# byte-equal assertion failed on windows-latest shard 4 only (run 43029697326).
+tests/fixtures/trae-*.sse.txt text eol=lf

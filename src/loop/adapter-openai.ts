@@ -163,7 +163,7 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
 // standard field is prompt_tokens_details.cached_tokens, while DeepSeek reports
 // KV-cache hits as top-level prompt_cache_hit_tokens (#779). Both mean "input
 // tokens served from cache", so normalize to one number.
-function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
+export function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
     const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
     if (typeof pd?.cached_tokens === "number") return pd.cached_tokens;
     if (typeof u.prompt_cache_hit_tokens === "number") return u.prompt_cache_hit_tokens;

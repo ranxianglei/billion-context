@@ -70,6 +70,7 @@ billion-context/
 │   ├── egress-transforms.ts      # User-registerable egress request-body rewrite pipeline (#6003)
 │   ├── wire-drop-warn.ts         # Warn when a wire codec drops non-text parts (#1205)
 │   ├── commandcode-wire.ts       # commandcode CLI envelope codec: nested openai-completions request unwrap + bare JSONL response handling (#1295)
+│   ├── trae-wire.ts              # TRAE SOLO wire codec: `event:`/`data:` SSE envelope unwrap + rewrap, image parts kept, cache directives round-tripped (#1295)
 │   ├── text-safe.ts              # Surrogate-safe string prefix helper
 │   ├── sse-util.ts               # SSE parsing / line-ending normalization
 │   ├── stream.ts                 # SSE stream utilities + tag patching
@@ -196,6 +197,7 @@ billion-context/
 │   │   ├── core.ts               #   Protocol-neutral event model + tool adjudication
 │   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter
 │   │   ├── adapter-commandcode.ts #   commandcode wire adapter: envelope unwrap/re-wrap over the OpenAI-family loop (#1295)
+│   │   ├── adapter-trae.ts       #   trae SOLO wire adapter: SSE dialect over the OpenAI-family loop, envelope restored at the wire boundary (#1295)
 │   │   ├── adapter-openai.ts     #   OpenAI chat adapter
 │   │   ├── adapter-responses.ts  #   Responses API adapter (+ over-long id healing)
 │   │   ├── adapter-google.ts     #   Google wire adapter

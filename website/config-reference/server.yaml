@@ -161,7 +161,7 @@ entries:
     desc_zh: "路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。"
     desc_ja: "ルートテーブル: URLプレフィックスキーをプロバイダ別エントリ（モデル、compress、compat など）にマッピングする。Providers セクションを参照。"
   - key: modelEndpointPatterns
-    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" }"
+    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" | \"trae\" }"
     default: "[]"
     group: upstream
     id: tt.modelendpoints

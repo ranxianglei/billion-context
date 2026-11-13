@@ -61,3 +61,50 @@ JSONL event stream (one JSON object per line, NOT SSE).
 - Errors: `{"type":"error","error":<code>,"message"}` — the client throws an
   `LlmError`; retry policy belongs to the CLI's HTTP layer, so bili's
   preflight/stream error frames carry code+message only.
+
+## TRAE SOLO wire (`wire: "trae"`)
+
+Motivating case: Trae IDE's in-house SOLO agent lane —
+`POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`; request = an
+openai-completions conversation inside a Trae envelope (`function: "solo_agent"`,
+model id echoed in `config_name`, Max mode expressed purely in the body through
+`mode_type` / `context_window_size` / `prompt_max_tokens`); response = an SSE
+dialect whose frame names are its own.
+
+| ID | Constraint | Consequence in bili |
+|----|------------|---------------------|
+| WC-12a | The conversation is openai-completions, but message content is ALWAYS an array of parts — tool results included, and the part vocabulary is OpenAI's (`text`, `image_url`). | Unwrap joins all-text parts into a plain string and keeps the part array when an `image_url` is present (pictures ride through untouched); a part type outside that vocabulary (audio/file) rejects the whole body → verbatim relay (#1284). Rewrap turns a string back into one text part and restores image parts in order. |
+| WC-12b | Tool calls keep OpenAI's envelope (`id`, `type: "function"`) but rename the payload key to `function_call`; an assistant turn carrying tool calls sets `content: null`. | Unwrap renames to `function`; rewrap renames back and restores `content: null` for tool turns (`arguments` survives byte-semantically, #1039). |
+| WC-12c | The stream is `event:<name>` / `data:<json>` with NO space after the colon and NO `[DONE]` sentinel; the `done` frame terminates it. Frames: `metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`. | The adapter parses that dialect; `emitCompletion` writes `token_usage` + `done`. A truncation synthesizes an `error` frame only when the cut happened before `done`. Plugin mode needs its OWN passthrough pipe (`pipePluginTraeWithStrip`): the shared chat pipe treats only a quoted `finish_reason` chunk or the `[DONE]` sentinel as terminal, neither of which this wire emits, so a CLEAN trae turn reached EOF with no terminal seen and was reported as truncated (144 hits on the live seat before the fix). |
+| WC-12d | Rewrap must never drop content mid-forward. | Roles this wire has no slot for (e.g. a compat-roles rewrite target) degrade to `user` text instead of being discarded. |
+| WC-12e | Upstream may emit frames bili does not understand (future revision risk). | Unrecognized frame names and undecodable `data:` payloads are forwarded byte-exact — first round only, before bili's own injections could be confused with upstream content. |
+| WC-12f | `token_usage` carries the real counters in the per-request fields; every `*_total` field is always 0. Captured frames never fill a cached-prompt counter (`cache_read_input_tokens` is always 0, no `prompt_tokens_details`) — the channel does not report prefix-cache hits today (#5713). | Usage maps from `prompt_tokens` / `completion_tokens`; cached tokens read `prompt_tokens_details.cached_tokens` → `prompt_cache_hit_tokens` → `cache_read_input_tokens` (openai-vocabulary fields first so the lane tracks any future channel revision that starts filling them, wire-native counter last — #5713). The `*_total` fields are never read. The plugin lane's usage sample keeps the identical ladder. |
+| WC-12g | The wire has no dedicated channel for visibility markers. | Injected markers ride as prose inside an `output` frame's `response`; how they render is host-side policy. |
+| WC-12h | `output.reasoning_content` streams through the same frame type as `response` (no separate reasoning event), and `extra_info` re-delivers reasoning that already streamed. | Reasoning maps to the reasoning channel; `extra_info` is forwarded verbatim (first round) and never re-injected into the rebuilt conversation. |
+| WC-12i | Parallel tool calls in one turn. Captured 2026-11-04 (Trae Max, two `run_code` calls in one turn): the opening frame of each call carries the full envelope (`index`, `id: call_00_…` / `call_01_…`, `type: "function"`, `function_call.name`) with empty `arguments`; every argument increment carries an EMPTY `id`/`type`/`name` and only `function_call.arguments`; the frame that opens call #1 also closes call #0's arguments (two entries in one frame); every frame after that carries TWO entries of the SAME `index: 1`, i.e. the argument stream is chunked twice per frame. The turn still terminates with `extra_info` → `token_usage` → `done`, and both calls share that single terminator. | Grouping is by `index`, and `index` increases per call (0, 1) — the captured wire never reuses an index with a fresh id and never puts two calls on index 0. Outbound, `emitToolCall` numbers calls by first appearance (0, 1, …) exactly as `adapter-openai` does. Inbound, every entry of a frame is appended in order (one frame may close a call and open the next); a frame reusing an occupied `index` with a DIFFERENT non-empty `id` opens a new call instead of merging — defensive only, not something this capture shows. Pinned by `tests/fixtures/trae-2026-11-04-two-tool-calls.sse.txt`. |
+| WC-12j | Cache directives are flat body keys the envelope does not define: `prompt_cache_key` (client-sent or bili-stamped relay affinity, #2218/#2645) and `stream_options` (forced `{include_usage:true}` on streaming for usage accounting). The envelope base carries whatever the client sent — replaying it blindly would defeat the pipeline's drop decisions and lose stamped keys. | Unwrap carries both into the flat body so the pck keep/drop/stamp decision sees the client key exactly like every other openai lane; rewrap writes them back when the decided flat body has them and REMOVES them otherwise — present→write-back, absent→delete, mirroring the existing `tools` / `tool_choice` handling. A blanket envelope spread was rejected: it would silently forward any future pipeline addition without a nameable rule (#1284 strict-fidelity discipline). |
+
+### Envelope mapping (unwrap / rewrap)
+
+- `messages`: text parts → strings (and back, one part per message).
+- `tools`: plain OpenAI shape, passed through unchanged.
+- Envelope keys the flat body cannot carry (`function`, `config_name`,
+  `mode_type`, `context_window_size`, `prompt_max_tokens`,
+  `model_selection_strategy`, `model_auto_selection`, …) are captured verbatim
+  at unwrap and replayed at the final forward boundary (and on every
+  compress-loop re-send).
+- Verification boundary: the request/response shapes above come from a real
+  capture (#1295). The bili-side round trip is covered by unit tests, and both
+  the single-call framing and the parallel-call framing (WC-12i, captured
+  2026-11-04 with two `run_code` calls in one turn) are replayed from verbatim
+  frame dumps under `tests/fixtures/`. The plugin lane has its own passthrough
+  pipe (`pipePluginTraeWithStrip`), pinned by the same real dump in
+  `tests/trae-plugin-pipe.test.ts`: byte-verbatim on a clean turn, an in-band
+  `error` frame only on a genuine cut, render-tag echo stripped from the prose
+  field alone, and `token_usage` feeding `lastInputTokens`. The proxy lane has
+  since run on a live seat (compressed turns were forwarded to the real Trae
+  host, and a fold took the reported context from 24% to 8%). What has NOT run
+  is a full end-to-end replay through a real Trae client (compressed
+  conversation echoed back by the IDE) — that needs a live seat, and it remains
+  the only open check.
+
