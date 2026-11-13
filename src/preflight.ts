@@ -3233,7 +3233,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // blowing every span past TIER_DISTILL_SOURCE_CHAR_BUDGET) is deterministic →
                 // 413 not-forwarded; cap/unavailable/no-shrink are relay/budget-dependent and MUST
                 // stay 502-retryable (server.ts fail-fast contract).
-                failure = { kind: "exhausted", deterministic: rec.stopReason === "exhausted", detail: rec.honestDetail };
+                // #6451: an overflow-armed baseline is a relay-billing artifact, not a structural
+                // doom — the upstream proved a smaller window, so the client may still recover by
+                // switching models or the upstream recovering; keep it 502-retryable.
+                const overflowArmed = deps.session.stats.lastInputTokensSource === "overflow-arm";
+                failure = { kind: "exhausted", deterministic: rec.stopReason === "exhausted" && !overflowArmed, detail: rec.honestDetail };
             }
         }
         if (currentTokens >= limit && !failure) {
