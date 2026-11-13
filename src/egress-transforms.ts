@@ -42,10 +42,10 @@ export type EgressTransformEntry = {
     order: number;
 };
 
-/** Context handed to each plugin's `transform`. `headers` is a LIVE reference to
- *  the outgoing header map — a successful plugin may mutate it directly, or
- *  return `headers` to merge. `body` is the current stage's outbound copy
- *  (string JSON text or Buffer). */
+/** Context handed to each plugin's `transform`. `headers` is a writable draft:
+ *  successful direct mutations commit to the outgoing map before returned
+ *  headers merge; failed or timed-out drafts are discarded. `body` is the
+ *  current stage's outbound copy (string JSON text or Buffer). */
 export type EgressTransformCtx = {
     sessionId: string | undefined;
     upstreamUrl: string;
@@ -190,6 +190,11 @@ function deleteHeaderInsensitive(headers: Record<string, string>, name: string):
     for (const key of Object.keys(headers)) if (key.toLowerCase() === target) delete headers[key];
 }
 
+function commitHeaders(target: Record<string, string>, draft: Record<string, string>): void {
+    for (const key of Object.keys(target)) delete target[key];
+    Object.assign(target, draft);
+}
+
 function matchUpstream(match: EgressTransformMatch | undefined, upstreamUrl: string): boolean {
     if (!match) return true;
     if (match.urlPrefix !== undefined && !upstreamUrl.startsWith(match.urlPrefix)) return false;
@@ -255,7 +260,8 @@ export async function applyEgressTransforms(
     let current = body;
     for (const t of resolved) {
         if (!matchUpstream(t.match, base.upstreamUrl)) continue;
-        const ctx: EgressTransformCtx = { ...base, body: current };
+        const headers = { ...base.headers };
+        const ctx: EgressTransformCtx = { ...base, headers, body: current };
         const inBytes = byteLen(current);
         let result: EgressTransformResult;
         try {
@@ -265,6 +271,7 @@ export async function applyEgressTransforms(
             continue;
         }
         if (result === undefined || result === null) {
+            commitHeaders(base.headers, headers);
             log("debug", `[${base.sessionId ?? "-"}] [egress:${t.id}] stage=${base.stage} in=${inBytes}B out=${inBytes}B (unchanged)`);
             continue;
         }
@@ -272,6 +279,7 @@ export async function applyEgressTransforms(
             log("error", `[egress:${t.id}] stage=${base.stage} returned an illegal body type (fail-open, keeping previous body)`);
             continue;
         }
+        commitHeaders(base.headers, headers);
         if (result.body !== undefined) current = result.body;
         if (result.headers !== undefined) {
             for (const [k, v] of Object.entries(result.headers)) {
