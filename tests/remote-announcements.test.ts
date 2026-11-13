@@ -222,6 +222,106 @@ test("merging: local shadows remote on equal id; both shadow builtins; priority 
     })();
 });
 
+// #5984: requiresScan live-scan gate — a broadcast record is visible only
+// while the flagged client's plugin registry actually reports the plugin.
+// Hermetic: DSH_HOME points at a fixture (never the machine's real ~/.dsh);
+// the rest of env keeps the temp XDG roots set at file top so the
+// persistent-dismissal store stays inside the sandbox. The scan cache is
+// keyed by client+cwd (NOT env), so each case clears it first.
+const { validateRecord, noticePassesGates } = await import("../src/announcements.ts");
+const { clearScanCache } = await import("../src/thirdparty-scan.ts");
+
+const SCAN_ENV: NodeJS.ProcessEnv = { ...process.env, DSH_HOME: path.join(root, "dsh-scan") };
+const SCAN_PROFILE = path.join(SCAN_ENV.DSH_HOME!, "profiles", "work");
+fs.mkdirSync(SCAN_PROFILE, { recursive: true });
+
+function gatedRecord(id = "dsh-live-compact-conflict") {
+    const rec = validateRecord(REC({
+        id,
+        kind: "warning",
+        requiresScan: { client: "dsh", knownId: "dsh-live-compact" },
+    }));
+    if (!rec || !rec.requiresScan) throw new Error("fixture record must validate");
+    return rec;
+}
+
+test("requiresScan gate: hidden unless the scan reports the plugin (#5984)", () => {
+    const now = new Date("2026-11-13T00:00:00Z");
+    const rec = gatedRecord();
+
+    clearScanCache();
+    assert.equal(noticePassesGates(rec, now, SCAN_ENV), false, "plugin not installed → hidden");
+
+    fs.writeFileSync(path.join(SCAN_PROFILE, "package.json"),
+        JSON.stringify({ name: "work", dependencies: { "dsh-live-compact": "*" } }));
+    clearScanCache();
+    assert.equal(noticePassesGates(rec, now, SCAN_ENV), true, "plugin detected → shown");
+
+    clearScanCache();
+    const other = validateRecord(REC({
+        id: "dsh-other-conflict", kind: "warning",
+        requiresScan: { client: "dsh", knownId: "some-other-plugin" },
+    }));
+    assert.ok(other);
+    assert.equal(noticePassesGates(other, now, SCAN_ENV), false, "different knownId → still hidden");
+
+    clearScanCache();
+    const anyDsh = validateRecord(REC({ id: "dsh-any-finding", kind: "suggestion", requiresScan: { client: "dsh" } }));
+    assert.ok(anyDsh);
+    assert.equal(noticePassesGates(anyDsh, now, SCAN_ENV), true, "no knownId → any dsh finding shows it");
+
+    clearScanCache();
+});
+
+test("requiresScan: validation matrix (bad shapes rejected, per-entry isolation kept)", () => {
+    assert.ok(validateRecord(REC({ requiresScan: { client: "dsh" } })), "client alone is valid (any-finding)");
+    assert.equal(validateRecord(REC({ requiresScan: { client: "nope" } })), null, "unknown client rejected");
+    assert.equal(validateRecord(REC({ requiresScan: { knownId: "x" } })), null, "missing client rejected");
+    assert.equal(validateRecord(REC({ requiresScan: { client: 7 } })), null, "non-string client rejected");
+    assert.equal(validateRecord(REC({ requiresScan: { client: "dsh", knownId: "" } })), null, "empty knownId rejected");
+    assert.equal(validateRecord(REC({ requiresScan: { client: "dsh", knownId: 7 } })), null, "non-string knownId rejected");
+    assert.equal(validateRecord(REC({ requiresScan: "dsh" })), null, "non-object rejected");
+    const r = parseRemoteDoc(JSON.parse(doc([REC({ requiresScan: { client: "nope" } }), REC({ id: "second-entry" })])));
+    assert.deepEqual(r.entries.map((e) => e.id), ["second-entry"], "one bad entry never blanks its siblings");
+});
+
+test("remote lane end-to-end: gated entry absent until the scan reports the plugin", async () => {
+    _resetRemoteNoticesForTest();
+    fs.rmSync(snapshotFile, { force: true });
+    clearScanCache();
+    fs.rmSync(path.join(SCAN_PROFILE, "package.json"), { force: true });
+    const fed = [gatedRecord()];
+    const s = await serve((res) => { res.setHeader("content-type", "application/json"); res.end(doc(fed)); });
+    try {
+        await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
+        assert.equal(visibleRemoteRecords(new Date("2026-11-13T00:00:00Z"), SCAN_ENV).length, 0,
+            "feed delivered but plugin absent → no banner");
+
+        fs.writeFileSync(path.join(SCAN_PROFILE, "package.json"),
+            JSON.stringify({ name: "work", dependencies: { "dsh-live-compact": "*" } }));
+        clearScanCache();
+        const vis = visibleRemoteRecords(new Date("2026-11-13T00:00:00Z"), SCAN_ENV);
+        assert.deepEqual(vis.map((r) => r.id), ["dsh-live-compact-conflict"], "plugin installed → banner appears");
+        assert.equal(remoteAnnouncementPayloads(new Date("2026-11-13T00:00:00Z"), SCAN_ENV)[0]?.source, "remote");
+    } finally {
+        await s.close();
+        clearScanCache();
+    }
+});
+
+test("shipped remote.json validates end-to-end", () => {
+    const fed = JSON.parse(fs.readFileSync(path.join(process.cwd(), "announcements", "remote.json"), "utf8"));
+    const r = parseRemoteDoc(fed);
+    assert.equal(r.error, undefined);
+    // The dsh-live-compact-conflict entry was retracted from the feed (#6508):
+    // until instances upgrade to a build that understands requiresScan, a gated
+    // entry still shows unconditionally on old versions — so the broadcast stays
+    // empty and the conflict scan (dsh lane → knownId "dsh-live-compact") remains
+    // the live surfacing mechanism. Re-adding the entry is safe once the gated
+    // build is deployed (or sooner, accepting the transient over-broadcast).
+    assert.ok(!r.entries.some((e) => e.id === "dsh-live-compact-conflict"), "retracted entry must stay out of the feed");
+});
+
 test("dismiss routing follows the remote record's declared mode", async () => {
     _resetRemoteNoticesForTest();
     fs.rmSync(snapshotFile, { force: true });
