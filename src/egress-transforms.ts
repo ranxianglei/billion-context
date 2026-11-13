@@ -275,8 +275,8 @@ export async function applyEgressTransforms(
         if (result.body !== undefined) current = result.body;
         if (result.headers !== undefined) {
             for (const [k, v] of Object.entries(result.headers)) {
-                if (v === undefined) deleteHeaderInsensitive(base.headers, k);
-                else base.headers[k] = String(v);
+                deleteHeaderInsensitive(base.headers, k);
+                if (v !== undefined) base.headers[k] = String(v);
             }
         }
         const outBytes = byteLen(current);
