@@ -93,10 +93,10 @@ test("CODEX_HOME isolates live metadata; explicit client reports outrank it and 
     writeModels(home, [{ slug: model, context_window: 800_000 }]);
     writeModels(other, [{ slug: model, context_window: 100_000 }]);
     process.env.CODEX_HOME = home;
-    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex), { limit: 800_000, clamped: true });
-    assert.deepEqual(codexAlignedWindow(200_000, model, codex), { limit: 200_000, clamped: false });
-    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex, 900_000), { limit: 900_000, clamped: true });
-    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex, 80_000), { limit: 80_000, clamped: true });
+    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex), { limit: 800_000, clamped: true, source: "codex-models-cache" });
+    assert.deepEqual(codexAlignedWindow(200_000, model, codex), { limit: 200_000, clamped: false, source: "codex-models-cache" });
+    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex, 900_000), { limit: 900_000, clamped: true, source: "client-metadata" });
+    assert.deepEqual(codexAlignedWindow(1_050_000, model, codex, 80_000), { limit: 80_000, clamped: true, source: "client-metadata" });
     for (const invalid of [0, -1, NaN, Infinity]) assert.equal(codexAlignedWindow(1_050_000, model, codex, invalid).limit, 800_000);
     process.env.CODEX_HOME = other;
     assert.equal(codexAlignedWindow(1_050_000, model, codex).limit, 100_000);

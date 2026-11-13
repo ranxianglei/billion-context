@@ -11,6 +11,7 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { main } from "./cli.js";
+import { startupFailureHints, warnIfLowIntegrityRuntime } from "./integrity-label.ts";
 
 function invokedAsScript(): boolean {
     const argv1 = process.argv[1];
@@ -30,8 +31,13 @@ function invokedAsScript(): boolean {
 }
 
 if (invokedAsScript()) {
+    // #5154: probe the runtime's NTFS integrity label once, before any
+    // startup write can die on it — fire-and-forget, never gates startup.
+    warnIfLowIntegrityRuntime();
     main().catch((err) => {
         console.error("bili: failed to start:", err);
+        const hints = startupFailureHints(err);
+        if (hints !== undefined) console.error(hints);
         process.exit(1);
     });
 }

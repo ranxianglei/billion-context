@@ -78,8 +78,13 @@ const drifted = [];
 for (const t of targets) {
     const data = readJson(t.rel);
     if (!data) {
-        console.log(`[sync-codex-plugin-version] 跳过（不存在）：${t.rel}`);
-        continue;
+        // 缺文件不是可跳过状态：四个 manifest 是固定契约，少一个说明仓库
+        // 树被破坏或 targets 列表过期。写入模式跳过会静默产出一个缺文件
+        // 的“已同步”；--check 模式跳过等于把发版守卫钻了个洞（缺失照样绿）。
+        // 例外：预 #4449 的老 lane（release-bugfix.yml 的存在性守卫）本来
+        // 就没有这个脚本，不会走到这里。
+        console.error(`[sync-codex-plugin-version] 缺少 manifest：${t.rel} — 不允许跳过，请修复仓库树或更新 targets 列表`);
+        process.exit(1);
     }
     const before = JSON.stringify(data);
     t.apply(data);
