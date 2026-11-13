@@ -5849,6 +5849,54 @@ test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)
     }
 });
 
+test("runLaunch claude: the injected --mcp-config does not swallow a positional prompt", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-prompt-"));
+    const prevHome = process.env.HOME;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
+    process.env.HOME = home;
+    delete process.env.BILI_LAUNCHER_PLUGIN;
+    const fakeClaude = path.join(home, process.platform === "win32" ? "fake-claude.exe" : "fake-claude");
+    fs.writeFileSync(fakeClaude, "");
+    process.env.BILI_CLIENT_BIN = fakeClaude;
+    const clientArgs: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeClaude) {
+            clientArgs.push([...(args ?? [])]);
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "claude", clientArgs: ["say hi", "-p"], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgs.length, 1);
+        const args = clientArgs[0]!;
+        // Claude Code's --mcp-config is variadic: a bare flag takes every following word as a config file.
+        assert.equal(args.includes("--mcp-config"), false, `bare --mcp-config would eat the prompt: ${JSON.stringify(args)}`);
+        assert.ok(args.some((a) => a.startsWith("--mcp-config=")), "bili's MCP config is still passed");
+        assert.ok(args.includes("say hi"));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevPlugin !== undefined) process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
+        rmrf(home);
+    }
+});
+
 test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table window)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-budget-"));
     const prevHome = process.env.HOME;

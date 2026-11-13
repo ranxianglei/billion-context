@@ -7685,7 +7685,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             const mcpFile = path.join(os.tmpdir(), `bili-mcp-${Date.now()}.json`);
             fs.writeFileSync(mcpFile, JSON.stringify(buildMcpConfig(origin)));
             tmpFiles.push(mcpFile);
-            clientArgs = ["--mcp-config", mcpFile, ...clientArgs];
+            clientArgs = [`--mcp-config=${mcpFile}`, ...clientArgs];
         }
     }
 
