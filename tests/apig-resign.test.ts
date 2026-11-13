@@ -116,6 +116,8 @@ test("#1884 signer: deterministic golden shape and independent verification", ()
 
 // Huawei SDK fea8a3150325831fd3a1e277e6c89b20f699bd05
 // https://github.com/huaweicloud/huaweicloud-sdk-python-v3/blob/fea8a3150325831fd3a1e277e6c89b20f699bd05/huaweicloud-sdk-core/huaweicloudsdkcore/signer/signer.py
+// The AgentCenter GET pair also matches dsh-providers-hub's signer at
+// https://github.com/iJetLi/dsh-providers-hub/blob/99b09c59d52b92076b7a249310e219bf0bb21b16/src/sign.ts
 const SDK_QUERY_VECTORS = [
     {
         "url": "https://api.example.com/v1/chat/completions",
@@ -148,16 +150,37 @@ const SDK_QUERY_VECTORS = [
     {
         "url": "https://api.example.com/v1/chat/completions?q=%E4%B8%AD%E6%96%87&a=1",
         "signature": "65c8639b8d0b5795d34ceb998e0a6a29fb6fa6fafad0c68996ef871b8ff804be"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?%F0%9F%98%80=astral&%EF%BC%A1=bmp",
+        "signature": "f57e5c06726bcefa5ea0bc1acdb845e2fc9031e0eb9114d6d745f7987022d17f"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?tag=%F0%9F%98%80&tag=%EF%BC%A1",
+        "signature": "c49b892c255ee47d04128e9b6190147af49abf4c2386497d23c80b9d102d48b0"
+    },
+    {
+        "url": "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?offset=0&limit=100",
+        "method": "GET",
+        "body": "",
+        "signature": "c9dd0d0b4d2d082fda4ca1d31690049fc44a5d4eedb864fbb73bcedee2b96477"
+    },
+    {
+        "url": "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?limit=100&offset=0",
+        "method": "GET",
+        "body": "",
+        "signature": "c9dd0d0b4d2d082fda4ca1d31690049fc44a5d4eedb864fbb73bcedee2b96477"
     }
 ];
 
 for (const vector of SDK_QUERY_VECTORS) {
     test(`APIG query signature matches the official SDK: ${new URL(vector.url).search || "no query"}`, () => {
         const headers: Record<string, string> = {};
-        const body = Buffer.from('{"model":"example"}');
-        signApigHeaders(headers, CRED, "POST", vector.url, body, { now: NOW });
+        const method = vector.method ?? "POST";
+        const body = Buffer.from(vector.body ?? '{"model":"example"}');
+        signApigHeaders(headers, CRED, method, vector.url, body, { now: NOW });
         assert.equal(headers["authorization"].split("Signature=")[1], vector.signature);
-        assert.equal(verifySdkHmac({ method: "POST", url: vector.url, headers, body, sk: CRED.sk }).ok, true);
+        assert.equal(verifySdkHmac({ method, url: vector.url, headers, body, sk: CRED.sk }).ok, true);
     });
 }
 

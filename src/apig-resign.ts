@@ -240,7 +240,9 @@ interface ApigSignOptions {
 function canonicalApigQuery(url: URL): string {
     const encode = (value: string): string => encodeURIComponent(value)
         .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
-    const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+    // UTF-8 byte order matches the SDK's Unicode scalar order, including
+    // non-BMP characters that JavaScript's UTF-16 string order misorders.
+    const compare = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
     return [...url.searchParams]
         .sort(([ak, av], [bk, bv]) => compare(ak, bk) || compare(av, bv))
         .map(([key, value]) => `${encode(key)}=${encode(value)}`)
