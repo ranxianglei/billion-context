@@ -10,15 +10,17 @@
 // Logs go through the shared bili.log tee because claude does not surface this
 // child's stderr.
 
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveProxyOrigin, runMcpStdio } from "./mcp.js";
+import { resolveProxyOrigin, runMcpStdio, setClaudeSessionResolver } from "./mcp.js";
 import { configureLogger, log as teeLog } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
 import { logRetentionPolicy } from "./knobs.js";
 import { defaultLogFile } from "./paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, healthUrl } from "./launcher.js";
-import { chooseWatchdogParentPid, planClaudeNativeBootstrap } from "./claude-native-bootstrap.js";
+import { chooseWatchdogParentPid, planClaudeNativeBootstrap, resolveClaudeHostPid } from "./claude-native-bootstrap.js";
 import { repinClaudeManagedBaseUrl, readClaudeManagedBaseUrl } from "./plugin-install.js";
 
 const WATCHDOG_INTERVAL_MS = 30000;
@@ -29,6 +31,76 @@ const WATCHDOG_FAILURE_LIMIT = 3;
  *  default script would re-invoke THIS script as the proxy. */
 function proxyScriptPath(): string {
     return path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
+}
+
+// #6361: the host's CURRENT session id. claude /clear (or /new) starts a new
+// session id but keeps this stdio child running, so the spawn-time
+// CLAUDE_CODE_SESSION_ID env (mcp.ts's CONVERSATION_FROM_ENV) goes stale. The
+// live id is rewritten by claude into <CLAUDE_CONFIG_DIR|~/.claude>/sessions/
+// <host-pid>.json on every /clear; the host pid is stable for this child's
+// lifetime. mcp.ts's tools/call path re-reads this on each call and re-binds on
+// change. Defensive about the file shape (sessionId/session_id/id; any read,
+// parse, or shape failure → undefined, which means "no re-bind", never a crash).
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{3,255}$/;
+
+function claudeConfigDir(): string {
+    const fromEnv = process.env.CLAUDE_CONFIG_DIR?.trim();
+    if (fromEnv && fromEnv.length > 0) return fromEnv;
+    return path.join(os.homedir(), ".claude");
+}
+
+/** Read + validate the session id from one claude sessions file. Exported for
+ *  tests (pure: a config dir + pid in, an id or undefined out). */
+export function readClaudeSessionFile(configDir: string, pid: number): string | undefined {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(path.join(configDir, "sessions", `${pid}.json`), "utf8");
+    } catch {
+        return undefined;
+    }
+    let data: unknown;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        return undefined;
+    }
+    if (typeof data !== "object" || data === null) return undefined;
+    const obj = data as Record<string, unknown>;
+    const sid = obj.sessionId ?? obj.session_id ?? obj.id;
+    if (typeof sid !== "string") return undefined;
+    const trimmed = sid.trim();
+    return SESSION_ID_RE.test(trimmed) ? trimmed : undefined;
+}
+
+let cachedHostPid: number | undefined;
+let hostPidResolved = false;
+
+function hostPid(): number | undefined {
+    if (!hostPidResolved) {
+        hostPidResolved = true;
+        cachedHostPid = resolveClaudeHostPid();
+    }
+    return cachedHostPid;
+}
+
+/** The full resolver injected into mcp.ts: resolve the claude host pid (cached
+ *  — it is stable for this child's lifetime) and read its current session id. */
+export function readClaudeSessionId(): string | undefined {
+    const pid = hostPid();
+    if (pid === undefined) return undefined;
+    return readClaudeSessionFile(claudeConfigDir(), pid);
+}
+
+// Test seams: the host pid is resolved once and cached; reset or pin it between
+// cases (pinning bypasses the real process-tree walk).
+export function _resetClaudeHostPidForTest(): void {
+    hostPidResolved = false;
+    cachedHostPid = undefined;
+}
+
+export function _setClaudeHostPidForTest(pid: number | undefined): void {
+    hostPidResolved = true;
+    cachedHostPid = pid;
 }
 
 async function probeProxyHealth(origin: string): Promise<boolean> {
@@ -130,6 +202,10 @@ export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}):
     configureLogRetention(logRetentionPolicy());
     configureLogger(defaultLogFile());
     const log = (msg: string) => teeLog("info", `[bili-claude-mcp] ${msg}`);
+    // #6361: arm the /clear session re-bind in every posture (attach/passthrough
+    // included — the tool calls still need to follow the host's current session).
+    // mcp.ts ignores it unless the shim is identity-bound (CLAUDE_CODE_SESSION_ID).
+    setClaudeSessionResolver(readClaudeSessionId);
     const plan = planClaudeNativeBootstrap(process.env);
     if (plan.action !== "start") {
         // attach (BILLION_CONTEXT_PROXY / BILI_PROVIDER_REWRITES) or passthrough
