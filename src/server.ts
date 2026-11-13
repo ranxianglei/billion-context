@@ -3924,6 +3924,22 @@ export async function preflightCompressIfNeeded(
         log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
         baselineFloor = 0;
     }
+    // #6430: the baseline's MODEL provenance — a usage-grade baseline measured
+    // under a different model (same route) is not authoritative for this
+    // request's billing scale: tokenizers bill differently across models, so a
+    // cross-model baseline can sit far above (or below) the current model's true
+    // size (the incident: a 282K opus reading drove preflight on a fable payload
+    // that billed ~55K). The k̂ read gate (currentCalibrationFactor) already
+    // demotes on model mismatch; the baseline floor must match it, or a stale
+    // cross-model baseline keeps arming preflight on the same route. Mirrors the
+    // #1933 F2 origin demotion above. Absent model (legacy files / unprovenanced)
+    // keeps the legacy behavior — never invalidated by missing info.
+    const baselineModel = typeof session.stats.lastInputTokensModel === "string" && session.stats.lastInputTokensModel !== "" ? session.stats.lastInputTokensModel : undefined;
+    const currentModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+    if (baselineFloor > 0 && baselineModel !== undefined && currentModel !== undefined && baselineModel !== currentModel) {
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured under model ${baselineModel}, request now runs ${currentModel} — demoting to untrusted, judging by this payload's own estimate (#6430)`);
+        baselineFloor = 0;
+    }
     // #1933 F1: scale the local text estimate by the per-route calibration
     // factor k̂ learned from this session's own usage reports (local estimate ÷
     // what upstream actually billed; clamped 0.25–4, two-way since #2366 — see
@@ -3933,7 +3949,23 @@ export async function preflightCompressIfNeeded(
     // with a cross-model billing scale (currentCalibrationFactor).
     const kFactor = currentCalibrationFactor(session.stats, session.metadata?.lastModel);
     const kOrigin = session.stats.calibratedEstimateOrigin;
-    const calibratedText = applyEstimateCalibration(textEstimate + overheadEstimate, kFactor, kOrigin, currentOrigin);
+    // #6430: a fresh same-route+same-model usage baseline (not demoted above) is
+    // the most recent MEASURED reading of this lane's real billed size. When the
+    // current payload's RAW estimate is not bigger than that reading, the payload
+    // has not genuinely grown past the last measurement — any excess of the k̂-
+    // scaled estimate over the baseline is calibration over-correction (a stale
+    // k̂>1 inflating a payload the provider just billed below the target), not
+    // real growth. Cap the calibrated text at the measured baseline so a stale k̂
+    // cannot fire preflight below a fresh measurement: the measurement wins over
+    // the inflated estimate. Genuine growth (raw > baseline) leaves the
+    // calibrated estimate untouched, so a payload that really has crossed the
+    // target still folds; a missed fold here self-heals via the overflow arm on
+    // the next 400. The cap only applies while the baseline is trusted (same
+    // route+model); a demoted baseline floors at 0 and the estimate decides.
+    const rawTextEstimate = textEstimate + overheadEstimate;
+    const calibratedText = rawTextEstimate <= baselineFloor
+        ? Math.min(applyEstimateCalibration(rawTextEstimate, kFactor, kOrigin, currentOrigin), baselineFloor)
+        : applyEstimateCalibration(rawTextEstimate, kFactor, kOrigin, currentOrigin);
     const calibratedPayload = calibratedText + imageTokens;
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens

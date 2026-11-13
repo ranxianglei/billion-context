@@ -1908,6 +1908,13 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // #6430: record which MODEL measured this baseline — the preflight gate
+        // uses it to demote the baseline when the current request runs on a
+        // different model (tokenizers bill differently across models),
+        // mirroring the origin demotion above and the k̂ read gate's model
+        // dimension. Same source as the k̂ settle model (ingestCalibrationPair).
+        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        if (settleModel !== undefined) session.stats.lastInputTokensModel = settleModel;
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
