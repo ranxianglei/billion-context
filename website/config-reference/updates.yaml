@@ -11,6 +11,7 @@ entries:
     site_group: diag
     desc_en: "Automatic npm version checks (every ~3 min); disable via ACP_AUTO_UPDATE=0 or --no-auto-update."
     desc_zh: "自动 npm 版本检查（约每 3 分钟）；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭。"
+    desc_ja: "自動 npm バージョンチェック（約 3 分ごと）；ACP_AUTO_UPDATE=0 または --no-auto-update で無効化。"
     site_en: "<code>autoUpdate</code> — automatic version checks (on by default; disable via ACP_AUTO_UPDATE=0 or --no-auto-update)."
     site_zh: "<code>autoUpdate</code> —— 自动版本检查（默认开；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭）。"
   - key: autoRestartOnUpdate
@@ -22,6 +23,7 @@ entries:
     site_group: diag
     desc_en: "Restart the daemon automatically once a newer version has been installed."
     desc_zh: "新版本装好后自动重启守护进程。"
+    desc_ja: "新しいバージョンがインストールされた後、デーモンを自動的に再起動する。"
     site_en: "<code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (opt-in)."
     site_zh: "<code>autoRestartOnUpdate</code> —— 新版本装好后自动重启守护进程（可选开启）。"
   - key: updateTag
@@ -33,6 +35,7 @@ entries:
     site_group: diag
     desc_en: "npm dist-tag channel for self-updates: latest (default), dev, or pr."
     desc_zh: "自更新的 npm dist-tag 通道：latest（默认）、dev 或 pr。"
+    desc_ja: "セルフアップデート用の npm dist-tag チャンネル：latest（デフォルト）、dev、または pr。"
     site_en: "<code>updateTag</code> — npm dist-tag channel: latest (default), dev, or pr."
     site_zh: "<code>updateTag</code> —— npm dist-tag 通道：latest（默认）、dev 或 pr。"
   - key: update
@@ -43,6 +46,7 @@ entries:
     site_group: proc
     desc_en: "Self-update channel settings."
     desc_zh: "自更新通道设置。"
+    desc_ja: "セルフアップデートのチャンネル設定。"
     site_en: "<code>update</code> — self-update channel: <span class='mech'>registry \"npmjs\" · checkIntervalMs 180000</span>."
     site_zh: "<code>update</code> —— 自更新通道：<span class='mech'>registry \"npmjs\" · checkIntervalMs 180000</span>。"
   - key: update.registry
@@ -52,6 +56,7 @@ entries:
     group: updates
     desc_en: "Custom npm registry base URL for self-updates (private mirrors)."
     desc_zh: "自更新用的自定义 npm registry 基础地址（私有镜像）。"
+    desc_ja: "セルフアップデート用のカスタム npm レジストリベース URL（プライベートミラー）。"
   - key: update.checkIntervalMs
     type: number
     default: "180000"
@@ -59,6 +64,7 @@ entries:
     group: updates
     desc_en: "Interval between npm registry version checks."
     desc_zh: "npm registry 版本检查间隔。"
+    desc_ja: "npm レジストリのバージョンチェックの間隔。"
   - key: update.staggerMinDelayMs
     type: "number | string"
     default: "900000 (built-in 15 min)"
@@ -66,6 +72,7 @@ entries:
     group: updates
     desc_en: "#3619 staggered rollout: lower bound of this machine's base upgrade-delay window; ms number or duration string (15m / 2d / 1d12h); 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top."
     desc_zh: "#3619 错峰升级：本机基础升级延迟窗口下限；毫秒数字或时长字符串（15m / 2d / 1d12h）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。"
+    desc_ja: "#3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの下限; ms 数値または期間文字列 (15m / 2d / 1d12h); 0 で遅延を無効化 (従来の即時実行)。リモートポリシーのデフォルトウィンドウとバージョン別の上書きがこれに重ねて適用される。"
   - key: update.staggerMaxDelayMs
     type: "number | string"
     default: "172800000 (built-in 48 h)"
@@ -73,6 +80,7 @@ entries:
     group: updates
     desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades."
     desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。"
+    desc_ja: "#3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの上限; ms 数値または期間文字列 (48h / 2d); min とともに 0 に設定すると従来の即時アップグレードに戻る。"
   - key: update.policyUrl
     type: string
     default: "official repo raw URL"
@@ -80,6 +88,7 @@ entries:
     group: updates
     desc_en: "Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo)."
     desc_zh: "远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。"
+    desc_ja: "リモート自動更新ポリシーファイルの URL 上書き (テスト用シーム — 本番環境では公式リポジトリに固定される)。"
   - key: advisoryCheck
     type: boolean
     default: "true"
@@ -89,6 +98,7 @@ entries:
     site_group: diag
     desc_en: "Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected."
     desc_zh: "关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。"
+    desc_ja: "重大な欠陥に関するアドバイザリーウォッチャー; 実行中のバージョンが影響を受ける場合、推奨される修正を強制インストールする。"
     site_en: "<code>advisoryCheck</code> / <code>advisoryUrl</code> — critical-defect advisory watcher (on by default; force-installs the recommended fix when your version is affected)."
     site_zh: "<code>advisoryCheck</code> / <code>advisoryUrl</code> —— 关键缺陷公告监视器（默认开；本机版本命中受影响范围时装填推荐修复版本）。"
   - key: advisoryUrl
@@ -98,6 +108,7 @@ entries:
     group: updates
     desc_en: "Override URL for the advisory feed."
     desc_zh: "公告源覆盖地址。"
+    desc_ja: "アドバイザリーフィードの URL 上書き。"
   - key: remoteAnnouncementsUrl
     type: string
     default: "unset (official feed: GitHub master announcements/remote.json)"
@@ -105,6 +116,7 @@ entries:
     group: updates
     desc_en: "Override URL for the remote announcement feed (#5548): JSON document {v: 1, entries: [...]} — same record schema as local announcement files, fetched every ~3 min like the other watchers, cached snapshot survives restarts/outages. Firewall installs point this at a relay mirror; bad pushes are rejected and the last good copy keeps showing. Local files in <config dir>/announcements/*.json always shadow same-id remote/builtin notices."
     desc_zh: "远程公告源覆盖地址（#5548）：JSON 文档 {v: 1, entries: [...]}，记录格式与本地公告文件一致；与其他监视器一样约每 3 分钟拉取一次，缓存快照可跨重启/断网存活。无法直连的安装把它指向中继镜像；坏推送会被拒绝并继续显示上一份有效公告。配置目录 announcements/*.json 的本地文件按同 id 覆盖远程/内置公告。"
+    desc_ja: "リモートアナウンスメントフィードの URL 上書き (#5548): JSON ドキュメント {v: 1, entries: [...]} — ローカルアナウンスメントファイルと同じレコードスキーマ。他のウォッチャーと同様に約 3 分ごとに取得され、キャッシュされたスナップショットは再起動や障害後も維持される。ファイアウォールインストールではこれをリレーミラーに向ける。不正なプッシュは拒否され、最後に正常だったコピーが表示され続ける。`<config dir>/announcements/*.json` 内のローカルファイルは、同じ ID のリモート/組み込み通知を常にシャドウする。"
   - key: releaseNotesCheck
     type: boolean
     default: "true"
@@ -114,6 +126,7 @@ entries:
     site_group: diag
     desc_en: "Release-notes feed for the web panel (fetch + cache only; never installs anything)."
     desc_zh: "Web 面板里的发布说明源（只抓取缓存、从不安装任何东西）。"
+    desc_ja: "Web パネル用のリリースノートフィード (取得とキャッシュのみ; 何もインストールしない)。"
     site_en: "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> — release-notes feed for the panel (on by default; fetch + cache only, never installs)."
     site_zh: "<code>releaseNotesCheck</code> / <code>releaseNotesUrl</code> —— 面板里的发布说明源（默认开；只抓取缓存、从不安装）。"
   - key: releaseNotesUrl
@@ -123,3 +136,4 @@ entries:
     group: updates
     desc_en: "Override URL for the release-notes feed."
     desc_zh: "发布说明源覆盖地址。"
+    desc_ja: "リリースノートフィードの URL 上書き。"

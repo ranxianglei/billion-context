@@ -86,9 +86,11 @@ Execute a tool against the conversation's compression state.
 {
   "conversationId": "the same value you send as x-bili-plugin-conversation",
   "tool": "compress",
-  "args": { "content": [{ "startId": "m00001", "endId": "m00042", "summary": "...", "topic": "..." }] }
+  "args": { "content": "m00001–m00042 optional topic\nsummary markdown..." }
 }
 ```
+
+`content` is ONE string holding every range (batch multiple `mNNNNN–mNNNNN` blocks in one call); a JSON-encoded array of `{startId, endId, summary, topic?}` objects as that same string is also accepted. A raw JSON array argument is no longer the advertised shape — do not emit one.
 
 Response:
 
