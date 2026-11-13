@@ -260,3 +260,29 @@ test("#6325: clearLastWrittenColumns re-arms a full write of every column", (t) 
     assert.equal(f!.metadataChanged, 1, "re-armed save writes metadata_json");
     assert.equal(f!.ccrChanged, 1, "re-armed save writes ccr_json");
 });
+
+test("#6325: restoreArchived clears the last-written entry (restore writes the columns directly)", (t) => {
+    const dir = tmpdir("bili-6325-restore-");
+    t.after(() => rmBestEffort(dir));
+    const { shadow, store } = openPair(dir);
+    t.after(() => shadow.close());
+    t.after(() => store.close());
+    const syncStore = (shadow as unknown as { sync: UnifiedStore }).sync;
+    const m = instrumentFlags(syncStore);
+    t.after(() => m.dispose());
+
+    shadow.record(mkLegacy(SID, 100, { marker: "v1" }));
+    const map = (syncStore as unknown as { lastWrittenColumns: Map<string, unknown> }).lastWrittenColumns;
+    assert.ok(map.has(SID), "last-written entry present after the first save");
+
+    // Archive captures the current state; restore re-writes the four large
+    // columns DIRECTLY (bypassing ingestSession's change-detection). Without
+    // clearing the entry, a later ingest of the pre-restore state would be seen
+    // as "unchanged" and skipped, stranding the restored (archived) bytes.
+    const arch = syncStore.archiveSession(SID, { archiveDir: dir });
+    assert.ok(arch.ok, `archive succeeds (reason: ${arch.reason ?? "n/a"})`);
+    const res = syncStore.restoreArchived(SID, { archiveDir: dir });
+    assert.ok(res.ok, `restore succeeds (reason: ${res.reason ?? "n/a"})`);
+
+    assert.ok(!map.has(SID), "restoreArchived clears the last-written entry (next save full-writes)");
+});

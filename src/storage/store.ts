@@ -1961,6 +1961,10 @@ export class UnifiedStore {
             // released hashes (see collectZeroRefIn) — never the whole table.
             this.collectZeroRefIn(refs);
         });
+        // #6325: the session row is gone — its last-written entry is dead. Drop
+        // it so the in-memory map stays bounded to live sessions (a re-created
+        // session id re-ingests through the INSERT leg, which full-writes anyway).
+        this.clearLastWrittenColumns(sessionId);
     }
 
     /** #3928: per-session storage footprint for `bili sessions ls`. Counts
@@ -2301,6 +2305,13 @@ export class UnifiedStore {
                     sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
                 );
         });
+        // #6325: this restore writes the four large columns directly (bypassing
+        // ingestSession's per-column change-detection), so the stored bytes no
+        // longer match the last-written map — a later ingest of the pre-restore
+        // live state would be seen as "unchanged" and skipped, leaving the
+        // restored (archived) bytes in place. Clear the entry so the next save
+        // conservatively full-writes every column, same as the drift-heal path.
+        this.clearLastWrittenColumns(sessionId);
         // Drop the restored session's line(s) from the JSONL (a same-session
         // archive can theoretically appear more than once across reinstalls;
         // rewrite removes them all). Other sessions' lines are untouched.
