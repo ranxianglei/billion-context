@@ -78,6 +78,13 @@ export type ResponsesProjection = {
   customToolCallIds: Set<string>;
   layout: ResponseLayoutSlot[];
   stringInput?: { original: string; coreId: string };
+  /** Role of the client's leading system/developer message when it was hoisted
+   *  into `systemParts`. Hosts re-inject that block as one head message; they
+   *  must reuse the client's role instead of hardcoding `developer`, or a model
+   *  that declares `compat.supportsDeveloperRole: false` rejects the request
+   *  (DeepSeek answers HTTP 422 unknown variant `developer`). Undefined means
+   *  the body carried no head message — keep the historical `developer`. */
+  headRole?: "system" | "developer";
   /** Reasoning items dropped because ACP_REASONING_KEEP=none. 0 by default —
    *  reasoning is normally routed through the compression pipeline so it is
    *  hidden automatically once its turn is summarized. */
@@ -247,6 +254,7 @@ export function responsesToCore(
     };
   }
   let sysDevHead = true;
+  let headRole: "system" | "developer" | undefined;
   for (const [wireIndex, raw] of body.input.entries()) {
     const item = normalizeEasyInputItem(raw);
     let coreId: string | undefined;
@@ -287,6 +295,7 @@ export function responsesToCore(
         const text = messageContent(message.content);
         if (message.role === "system" || message.role === "developer") {
           if (sysDevHead) {
+            headRole ??= message.role;
             systemParts.push(text);
             idx++;
             continue;
@@ -645,6 +654,7 @@ export function responsesToCore(
     customToolCallIds,
     layout,
     droppedReasoning,
+    ...(headRole ? { headRole } : {}),
   };
 }
 
@@ -1005,6 +1015,7 @@ export function coreToResponses(
 export function injectResponsesDeveloperMessage(
   input: string | ResponseInputItem[],
   content: string,
+  role: "system" | "developer" = "developer",
 ): ResponseInputItem[] {
   const items: ResponseInputItem[] =
     typeof input === "string"
@@ -1012,7 +1023,7 @@ export function injectResponsesDeveloperMessage(
       : [...input];
   let index = 0;
   while (items[index]?.type === "additional_tools") index++;
-  items.splice(index, 0, { type: "message", role: "developer", content });
+  items.splice(index, 0, { type: "message", role, content });
   return items;
 }
 

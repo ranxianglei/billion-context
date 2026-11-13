@@ -7,10 +7,15 @@ import {
   ACP_TOOLS_OPENAI,
   ACP_TOOLS_ANTHROPIC,
   ACP_TOOLS_RESPONSES,
+  ACP_TOOLS_GOOGLE,
   ACP_READONLY_TOOLS_RESPONSES,
   ACP_TOOL_NAMES,
   ACP_MUTATING_TOOLS,
   ACP_READONLY_TOOLS,
+  BLOCK_OP_TOOL_NAMES,
+  ACP_RETIRE_TOOL_NAME,
+  ACP_RESTORE_TOOL_NAME,
+  ACP_REWRITE_TOOL_NAME,
   ACP_TEXT_OPEN,
   ACP_TEXT_CLOSE,
   ACP_STATUS_OPEN,
@@ -22,10 +27,14 @@ import {
   buildCompressSystemPrompt,
   buildCompressTextSystemPrompt,
   buildCompressHybridSystemPrompt,
+  buildBlockOpsSystemPrompt,
   parseCompressInput,
 } from "../src/compress-tools.js";
 
 test("ACP tool sets classify every ACP tool by mutation semantics", () => {
+  // #5765 block ops are opt-in (config.blockOps.enabled, default off) — like
+  // absorb/acp_retrieve they stay OUT of the always-on name set so the default
+  // manifest/surface never advertises them.
   assert.deepEqual([...ACP_TOOL_NAMES].sort(), [
     "acp_cache",
     "acp_status",
@@ -33,12 +42,47 @@ test("ACP tool sets classify every ACP tool by mutation semantics", () => {
     "decompress",
     "search_context",
   ]);
-  assert.deepEqual([...ACP_MUTATING_TOOLS].sort(), ["compress", "decompress"]);
+  // …but they are mutating session-state tools (same tier as compress/
+  // decompress): when enabled their calls must drive the compress loop.
+  assert.deepEqual([...ACP_MUTATING_TOOLS].sort(), [
+    "acp_restore",
+    "acp_retire",
+    "acp_rewrite",
+    "compress",
+    "decompress",
+  ]);
+  assert.deepEqual([...BLOCK_OP_TOOL_NAMES].sort(), [
+    "acp_restore",
+    "acp_retire",
+    "acp_rewrite",
+  ]);
   assert.deepEqual([...ACP_READONLY_TOOLS].sort(), [
     "acp_cache",
     "acp_status",
     "search_context",
   ]);
+});
+
+test("#5765: block ops stay out of the default tool arrays and prompts (opt-in)", () => {
+  const names = (arr: Array<{ name?: string; function?: { name?: string } }>) =>
+    arr.map((t) => t.name ?? t.function?.name);
+  for (const arr of [ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_TOOLS_GOOGLE, ACP_READONLY_TOOLS_RESPONSES]) {
+    for (const n of BLOCK_OP_TOOL_NAMES) assert.ok(!names(arr).includes(n), `default array must not expose ${n}`);
+  }
+  for (const n of BLOCK_OP_TOOL_NAMES) assert.ok(!ACP_TOOL_NAMES.has(n));
+  // default prompts never advertise a tool the default tools array lacks
+  assert.ok(!buildCompressSystemPrompt().includes("acp_retire"));
+  assert.ok(buildCompressSystemPrompt().includes("You have four context-management tools"));
+  assert.ok(!buildCompressHybridSystemPrompt().includes("acp_retire"));
+  // the opt-in section advertises exactly the three names on both lanes
+  for (const lane of ["function", "hybrid"] as const) {
+    const section = buildBlockOpsSystemPrompt(lane);
+    for (const n of [ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME]) {
+      assert.ok(section.includes(n), `${lane} section must mention ${n}`);
+    }
+  }
+  assert.ok(buildBlockOpsSystemPrompt("function").includes("BLOCK-LIFECYCLE MANAGEMENT"));
+  assert.ok(buildBlockOpsSystemPrompt("hybrid").includes("block-management function tools"));
 });
 
 test("tool arrays expose compress in every wire format", () => {
@@ -50,11 +94,13 @@ test("tool arrays expose compress in every wire format", () => {
   assert.equal(names(ACP_READONLY_TOOLS_RESPONSES).includes("compress"), false);
   assert.equal(COMPRESS_TOOL.name, "compress");
   assert.equal(COMPRESS_TOOL_OPENAI.function?.name, "compress");
-  assert.deepEqual(
-    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.anyOf.map(
-      (entry) => entry.type,
-    ),
-    ["array", "string"],
+  assert.equal(
+    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.type,
+    "string",
+  );
+  assert.equal(
+    COMPRESS_TOOL_OPENAI.function.parameters.properties.content.anyOf,
+    undefined,
   );
 });
 
