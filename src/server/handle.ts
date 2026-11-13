@@ -14,7 +14,7 @@ import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
 import { recordClientUa } from "../client-ua-registry.js";
-import { codexAlignedWindow } from "../codex-models.js";
+import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
@@ -65,7 +65,7 @@ import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -113,6 +113,16 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
+
+// #6220: BILI_PLUGIN_BYPASS forces the bypass decision for EVERY request, and
+// both forced states carry an approved risk that must not be silent (decision
+// thread #6220): force-on with the in-process compressor absent sends all
+// traffic out uncompressed; force-off sends legacy in-process sessions through
+// the full bili pipeline, and their acp-store history degrades to a read-only
+// archive. Warn once per process per state — a line per request would be noise
+// on a stream that re-sends the same posture every turn.
+let bypassOverrideOnWarned = false;
+let bypassOverrideOffWarned = false;
 
 // #5608 v3: weakest VERIFIED common-prefix ratio (verifiedPrefix / chainDepth)
 // at which a byte-exact MISS may still weakly adopt the closest tracked chain.
@@ -637,8 +647,24 @@ async function handleRequest(
     // plugin stamps this header per request for sessions with acp state on
     // disk; acp owns their context in-process, so binding/injecting/compressing
     // here would double-manage it. Raw forward, zero state touched.
-    if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
-        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
+    // #6220: BILI_PLUGIN_BYPASS overrides this decision per request —
+    //   "on"  → force bypass (every request forwarded verbatim)
+    //   "off" → never bypass (ignore the header)
+    //   unset → current behavior (the header decides)
+    const bypassOverride = pluginBypassOverride();
+    const headerBypass = headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1";
+    if (bypassOverride === "on" && !bypassOverrideOnWarned) {
+        bypassOverrideOnWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=on — every inbound request is forwarded verbatim (no tool injection, no nudge, no session binding); if the in-process compressor is not loaded, traffic goes out with NO compression (#6220)");
+    }
+    if (bypassOverride === "off" && headerBypass && !bypassOverrideOffWarned) {
+        bypassOverrideOffWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=off — inbound x-bili-plugin-bypass header ignored; legacy in-process compression sessions now run the full bili pipeline (their acp-store history degrades to a read-only archive) (#6220)");
+    }
+    const bypass = bypassOverride === "on" || (bypassOverride === "auto" && headerBypass);
+    if (bypass) {
+        const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
+        log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
@@ -831,6 +857,10 @@ async function handleRequest(
     // operator that their own setting, not the upstream, is the wall they hit.
     let resolvedNativeWindow: number | undefined;
     let windowShrinkReason: "operator" | "codex" | undefined;
+    // The window was clamped to a codex live-table value that already reserves
+    // codex's own output headroom (effective_context_window_percent) — see
+    // codexWindowNetsOutputHeadroom. Gates the default output reservation below.
+    let codexWindowNetsOutput = false;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -1006,6 +1036,7 @@ async function handleRequest(
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
+                codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
@@ -2386,7 +2417,8 @@ async function handleRequest(
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
-        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
+        const resolvedHeadroomCompress = resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress);
+        const headroomCap = resolveOutputHeadroomCap(resolvedHeadroomCompress.outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
         // is refused BEFORE any pipeline work: not forwarded, kernel state
@@ -2695,7 +2727,21 @@ async function handleRequest(
             headroomOrigin,
             (parsed as { model?: string }).model,
         );
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
+        // A codex live-table window already nets out codex's own output
+        // headroom; reserving bili's default share on top double-counts it and
+        // walls the session below codex's own auto-compact point. An explicit
+        // operator outputHeadroomMaxPct and a proven completion share still apply.
+        const operatorHeadroomCap = resolvedHeadroomCompress.outputHeadroomMaxPct !== undefined;
+        const skipForCodexWindow = codexWindowNetsOutput && !operatorHeadroomCap;
+        const reserveByProtocol = shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) && !skipForCodexWindow;
+        if (skipForCodexWindow && provenReserve === 0) {
+            const skipModel = String(requestModel ?? "?");
+            if (!headroomFallbackLogged.has(`${skipModel}|codex-netted`)) {
+                headroomFallbackLogged.add(`${skipModel}|codex-netted`);
+                log("info", `[headroom] model=${skipModel}: no output reservation — the codex-aligned window ${reqConfig.modelContextLimit} already nets out codex's own output headroom (effective_context_window_percent); set compress.outputHeadroomMaxPct to reserve anyway`);
+            }
+        }
+        if (reserveByProtocol || provenReserve > 0) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2769,7 +2815,7 @@ async function handleRequest(
                     }
                 }
             }
-            if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+            if (provenReserve > 0 && !reserveByProtocol) {
                 // Proven share outranks the client-side fallbacks: it is what
                 // the upstream already counted into a rejection on this exact
                 // origin+model, so window − proven share is the input it accepts.
@@ -2777,7 +2823,7 @@ async function handleRequest(
                 const proofModel = (parsed as { model?: string }).model ?? "?";
                 if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
                     headroomFallbackLogged.add(`${proofModel}|proven-completion`);
-                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
+                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although ${skipForCodexWindow ? "the codex-aligned window already nets out codex's own output headroom" : `protocol ${protocol ?? "unknown"} is exempt`} (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
                 }
             }
             // #2283 sub-defect 1: emit [window-change] when the per-session resolution
