@@ -389,8 +389,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
     const preExistingCoverage = collectCoverage(state);
 
-    // Classify every requested range ONCE. The result feeds overlap
-    // skipSpecs, the minCompressRange pre-check, and the per-range loop —
+    // Classify every requested range ONCE. The result feeds the overlap
+    // gate, the minCompressRange pre-check, and the per-range loop —
     // previously each re-resolved and silently swallowed failures, so
     // consumed/unknown ranges produced misleading "too small" errors.
     const classifications = new Map<
@@ -525,27 +525,53 @@ export function createCore(ports: Ports = {}): CompressionCore {
       });
     }
     const sortedRanges = [...rangeSpans].sort((a, b) => a.start - b.start);
-    // Overlapping ranges warn+skip (earliest wins) rather than aborting the
-    // whole batch — see ISSUE-42 / dog/billion-context-pi#21.
-    const skipSpecs = new Set<(typeof input.ranges)[number]>();
+    // Overlapping ranges REJECT THE WHOLE BATCH atomically (#5541): a partial
+    // fold silently discarded the model's summary for the skipped range(s) and
+    // left cross-references inside the surviving block's summary dangling. The
+    // all-or-nothing contract #3003/#3939 established for every other failure
+    // class applies here too; the earlier ISSUE-42 warn+skip (earliest wins)
+    // predates that contract and is retired. Nesting counts as overlap.
+    type RangeSpec = (typeof input.ranges)[number];
+    const overlapConflicts: { spec: RangeSpec; against: RangeSpec }[] = [];
     let acceptedMaxIndex = -1;
+    let acceptedAtMax: RangeSpec | null = null;
     for (const entry of sortedRanges) {
-      if (entry.start <= acceptedMaxIndex) {
-        skipSpecs.add(entry.spec);
-        warnings.push(
-          `Skipped range (${entry.spec.startRef}..${entry.spec.endRef}) — overlaps an earlier range in the batch; the earlier range takes precedence. Keep ranges disjoint.`,
-        );
+      if (entry.start <= acceptedMaxIndex && acceptedAtMax !== null) {
+        overlapConflicts.push({ spec: entry.spec, against: acceptedAtMax });
         continue;
       }
-      if (entry.end > acceptedMaxIndex) acceptedMaxIndex = entry.end;
+      if (entry.end > acceptedMaxIndex) {
+        acceptedMaxIndex = entry.end;
+        acceptedAtMax = entry.spec;
+      }
+    }
+    if (overlapConflicts.length > 0) {
+      const detail = overlapConflicts
+        .map(
+          (c) =>
+            `(${c.spec.startRef}..${c.spec.endRef}) overlaps (${c.against.startRef}..${c.against.endRef})`,
+        )
+        .join("; ");
+      return {
+        state,
+        result: {
+          blocksCreated: 0,
+          tokensCompressed: 0,
+          errors: [
+            `Batch rejected before folding any range — ${overlapConflicts.length} of ${input.ranges.length} requested range(s) overlap another range in the same batch: ${detail}. Nothing was folded, so no prefix was rewritten. Re-issue the batch with disjoint ranges (no message may belong to two ranges; nesting counts as overlap).`,
+            ...classificationErrors,
+          ],
+          warnings: [],
+        },
+      };
     }
 
     if (input.config.compress.minCompressRange > 0 && input.ranges.length > 0) {
       let totalRangeChars = 0;
       let hasBlockBoundaryRange = false;
       let countedRanges = 0;
-      for (const [spec, resolution] of classifications) {
-        if (resolution.status !== "ok" || skipSpecs.has(spec)) continue;
+      for (const [, resolution] of classifications) {
+        if (resolution.status !== "ok") continue;
         if (resolution.resolved.boundaryKind === "block") {
           hasBlockBoundaryRange = true;
           continue;
@@ -596,7 +622,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
         const okBlockedReasons = [
           ...new Set(
             [...classifications.entries()].flatMap(([spec, resolution]) => {
-              if (skipSpecs.has(spec) || resolution.status !== "ok") return [];
+              if (resolution.status !== "ok") return [];
               const decision = refoldDecisions.get(spec);
               return decision?.kind === "blocked" ? decision.reasons : [];
             }),
@@ -644,8 +670,8 @@ export function createCore(ports: Ports = {}): CompressionCore {
           };
         }
         const reversalNotes: string[] = [];
-        for (const [spec, resolution] of classifications) {
-          if (resolution.status === "ok" && !skipSpecs.has(spec)) {
+        for (const [, resolution] of classifications) {
+          if (resolution.status === "ok") {
             const note = resolution.resolved.reversedNote;
             if (note) reversalNotes.push(note);
           }
@@ -717,7 +743,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
     {
       const foldCandidates: ApplyCompressionInput["ranges"][number][] = [];
       for (const spec of input.ranges) {
-        if (skipSpecs.has(spec)) continue;
         const resolution = classifications.get(spec);
         if (resolution === undefined) continue;
         const foldsFresh = resolution.status === "ok";
@@ -805,7 +830,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 
     for (const spec of input.ranges) {
-      if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
       if (resolution.status === "consumed") {

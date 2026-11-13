@@ -105,7 +105,11 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
+    // #5541: when the whole batch was rejected atomically (overlapping ranges),
+    // surface the kernel's named conflict instead of the generic protection text.
+    const overlapError = preview.result.errors.find((error) => /overlap another range/i.test(error));
     if (work.length === 0) {
+        if (overlapError) return compressResult(`[Compression FAILED: ${overlapError} Nothing compressed.]`, "refused", 0);
         // #5558: an unchanged preview can be an already-covered/protected no-op
         // or a kernel refusal; the normal path supplies that truthful receipt.
         // If a probe changed state but yielded no content, never fold a hint
