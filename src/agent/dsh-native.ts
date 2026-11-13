@@ -69,6 +69,8 @@ import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
+import { anthropicToCore, detectWireFormat, openaiToCore } from "acp-kernel/wire";
+import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire } from "./pi-msgids.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
@@ -1188,6 +1190,11 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    // #6525: the raw host message list (pi-ai shape: {id, role, content,
+    // toolCallId}) — the full-resend envelope stamps biliMsgIds from these
+    // by lockstep fingerprint walk, not from the id array alone (pairing
+    // must be PROVEN, never assumed positional — pi-msgids.ts discipline).
+    messages: unknown;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
@@ -1245,6 +1252,74 @@ function pfSlotIdsOf(messages: unknown): string[] | undefined {
 function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
     return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
 }
+
+/** #6525: resolve the envelope (carrier ①) id array for a full-resend model
+ *  body — CORE-aligned (== the post-hoist core count the server validates
+ *  against, prepare-openai/anthropic) or undefined (degrade to
+ *  content-derived ids, never guess). Pure — unit-testable without a plugin
+ *  ctx. Never re-implements the host's wire transforms: the pi-ai lockstep
+ *  walkers (the SAME functions the pi/omp lanes pin with) prove
+ *  wire-element ⇔ host-message pairing by order-preserving fingerprints and
+ *  bail all-or-nothing; the kernel's own converters then prove the pin is
+ *  core-alignable via the #3642 wireIndex back-pointer — every non-leading
+ *  wire element must own exactly ONE core (parallel tool calls /
+ *  reasoning+text / text+image parts split one host message into N cores,
+ *  and N cores cannot share one host id: validateMsgIds rejects duplicates).
+ */
+function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: unknown): string[] | undefined {
+    const fmt = detectWireFormat(parsed);
+    if (fmt !== "openai" && fmt !== "anthropic") return undefined; // google/responses stay content-derived (#6525 v1)
+    const wire = parsed.messages;
+    if (!Array.isArray(wire)) return undefined;
+    if (!Array.isArray(hostMessages) || hostMessages.length === 0) return undefined;
+    // pi-shaped entries: dsh's flat host messages share the pi-ai message
+    // shape ({role, content blocks} + toolCallId on results) and entry.id IS
+    // the host's stable message id (#4491) — the walkers consume them through
+    // the same makeEntryTake contract as pi's branch entries. System-role
+    // entries are EXCLUDED: they ride the hoisted/folded leading system (the
+    // bili-ps-N slots on the openai wire; the separate `system` field on
+    // anthropic), which never aligns 1:1 to a non-leading wire element.
+    const entries: Array<Record<string, unknown>> = [];
+    for (const m of hostMessages) {
+        if (m === null || typeof m !== "object") return;
+        const mm = m as Record<string, unknown>;
+        if (mm.role === "system" || mm.role === "developer") continue;
+        entries.push({ type: "message", id: mm.id, message: { role: mm.role, content: mm.content, toolCallId: mm.toolCallId } });
+    }
+    const wireAligned = fmt === "anthropic" ? laneMsgIdsForWire(wire, entries) : laneMsgIdsForOpenAiWire(wire, entries);
+    if (wireAligned === undefined) return undefined; // pairing not provable — degrade
+    // OpenAI wire only: the leading system/developer run becomes synthetic
+    // bili-ps-N slots (== the kernel's hoisted prefix) — drop them; the
+    // envelope must be CORE-aligned (server validates against the post-hoist
+    // core count). Anthropic has no hoist (system is a separate field), so
+    // lead stays 0 there.
+    let lead = 0;
+    while (lead < wireAligned.length && (wireAligned[lead] as string).startsWith("bili-ps-")) lead += 1;
+    for (let i = lead; i < wireAligned.length; i++) {
+        if ((wireAligned[i] as string).startsWith("bili-ps-")) return undefined; // placeholders legal only as the hoisted leading run
+    }
+    const coreAligned = wireAligned.slice(lead);
+    if (coreAligned.length === 0) return undefined;
+    const flat = fmt === "anthropic" ? anthropicToCore(parsed as Parameters<typeof anthropicToCore>[0]) : openaiToCore(parsed as Parameters<typeof openaiToCore>[0]);
+    const perEl = new Map<number, number>();
+    for (const c of flat.msgs) {
+        const w = c.wireIndex;
+        if (w === undefined) continue;
+        perEl.set(w, (perEl.get(w) ?? 0) + 1);
+    }
+    for (let i = lead; i < wire.length; i++) {
+        if ((perEl.get(i) ?? 0) !== 1) return undefined; // element split into N cores (or vanished) — no 1:1 host pin exists
+    }
+    // Client-side reject-class parity with hostMsgIdsOf (#4491): duplicates
+    // would be rejected server-side anyway (validateMsgIds) — refusing here
+    // avoids the one-time "pin rejected" warn path for provably-bad stamps.
+    if (new Set(coreAligned).size !== coreAligned.length) return undefined;
+    return coreAligned;
+}
+
+/** Test-only accessor (#6525 review): pins the resolver against the kernel.
+ *  The bail matrix lives in tests/issue6525-dsh-envelope.test.ts. */
+export const _envelopeMsgIdsForTest = resolveEnvelopeMsgIds;
 
 /** Test-only accessors (#5826 review): pins tests/msgid-rule-parity.test.ts
  *  drives these collectors directly against the shared reject-class set. */
@@ -2050,7 +2125,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), messages: options?.messages };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2614,6 +2689,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        await maybeStampEnvelopeMsgIds(ctx, url, init);
         emitHostParseDiagnostic(init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
@@ -2738,6 +2814,48 @@ export async function apply(ctx: PluginContext): Promise<void> {
             logHostEvent("warn", "[native-client]", `bili-native-dsh: incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
         }
     };
+
+    // #6525 envelope wiring (carrier ①'s last mile): full-resend requests
+    // stamp the model body's own parallel id array — `biliMsgIds`, the
+    // SERVER-side field name, duplicated here for the same reason
+    // hostMsgIdsOf duplicates the reject class (host code must not import
+    // server modules; keep in sync with src/msgid-pin.ts MSG_IDS_BODY_FIELD).
+    // A pinned prefix then exists on EVERY turn, not only on the lane's
+    // anthropic-wire turns. Resolution never re-implements the host's wire
+    // transforms: the pi-ai lockstep walkers (laneMsgIdsForWire /
+    // laneMsgIdsForOpenAiWire, the SAME functions the pi/omp lanes pin with)
+    // prove wire-element ⇔ host-message pairing by order-preserving
+    // fingerprints and bail all-or-nothing; the kernel's own converters then
+    // prove the pin is core-alignable — every non-leading wire element must
+    // own exactly ONE core via the #3642 wireIndex back-pointer (parallel
+    // tool calls / reasoning+text / text+image parts split one host message
+    // into N cores, and N cores cannot share one host id: validateMsgIds
+    // rejects duplicates). Any bail leaves the body byte-identical →
+    // content-derived ids, exactly today's behavior. maybeIncrementalNative
+    // runs FIRST and swaps the body — the delta payload pins msgIds itself,
+    // so once it fired the envelope must not touch the body. The server
+    // strips the field before forwarding and gates the pin on pluginMode +
+    // the pluginLaneServerHistory rollout (prepare-openai/anthropic).
+    const ENVELOPE_MSG_IDS_FIELD = "biliMsgIds"; // == MSG_IDS_BODY_FIELD (src/msgid-pin.ts)
+    let envelopeStampedFor: string | undefined; // one log line per session
+    async function maybeStampEnvelopeMsgIds(ctx: PluginContext, _url: string, init: RequestInit | undefined): Promise<void> {
+        if (!register.toolsReady || init === undefined) return;
+        const attr = attributionOf(ctx);
+        if (attr.state !== "ok") return; // non-plugin traffic carries no msgid channel
+        const body = init.body;
+        if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride content-derived
+        const parsed = (await parsedBodyOnce(init)) as Record<string, unknown> | undefined;
+        if (parsed === undefined) return;
+        const coreAligned = resolveEnvelopeMsgIds(parsed, dispatchScope.getStore()?.messages);
+        if (coreAligned === undefined) return;
+        const fmt = detectWireFormat(parsed) as string; // log detail only — the resolver already gated the wire
+        const stamped = { ...parsed, [ENVELOPE_MSG_IDS_FIELD]: coreAligned };
+        init.body = JSON.stringify(stamped);
+        if (envelopeStampedFor !== attr.sid) {
+            envelopeStampedFor = attr.sid;
+            persistClientEvent(`bili-native-dsh: msgid envelope stamped on full-resend for ${attr.sid} (${coreAligned.length} ids, ${fmt} wire) — pinned prefix live from turn one (#6525)`);
+        }
+    }
 
     // #1268: arm the interceptor's toolsReady gate — the first model request
     // holds until this resolves, so it stamps into plugin mode instead of
