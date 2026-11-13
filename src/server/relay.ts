@@ -2780,7 +2780,7 @@ async function forwardCaptured(
             const mintScan = (text: string): void => {
                 if (prepared.protocol !== "responses" || prepared.mintFrontierPos === undefined) return;
                 mintSseTail += text;
-                if (mintSseTail.length > 65536) mintSseTail = mintSseTail.slice(-32768);
+                if (mintSseTail.length > 65536) mintSseTail = safeSuffix(mintSseTail, 32768);
                 if (!mintSseTail.includes("response.completed") && !mintSseTail.includes("response.created")) return;
                 let cut = mintSseTail.indexOf("\n\n");
                 while (cut !== -1) {
