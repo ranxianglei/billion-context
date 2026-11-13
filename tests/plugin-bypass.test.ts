@@ -184,6 +184,19 @@ describe("BILI_PLUGIN_BYPASS override (#6220)", () => {
         assert.ok(names.includes("compress"), `expected compress in ${JSON.stringify(names)}`);
     });
 
+    it("explicit \"auto\" → auto (header present → bypassed verbatim)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "auto";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "explicit auto" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-bypass": "1" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[] };
+        assert.equal(seen.tools, undefined);
+    });
+
     it("unrecognized value → auto (header present → bypassed verbatim)", { timeout: 60_000 }, async () => {
         process.env.BILI_PLUGIN_BYPASS = "banana";
         const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "fallback to auto" }] };
