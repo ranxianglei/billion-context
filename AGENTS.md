@@ -173,12 +173,22 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 | **Branch naming** | `YYYY-MM-DD_short-title`; releases: `*_release-v*` (bili) / `*_release-kernel-v*` (kernel, §5) |
 | **NEVER modify `version` off release branches** | `"version"` touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. See Version Bumps below. |
 | **NEVER cut a release without owner approval** | Release branches and release PRs are opened ONLY after the owner explicitly approves the release in-thread (「发版 vX」/「批准发布」). An Agent may **propose** a release but never pushes the branch or opens the PR itself. If asked, reply: "Releases need your go — approve in-thread and I'll cut the PR." (Owner rule 2026-10-12, #2910) |
+| **NEVER ship a broadcast-to-all announcement** | An announcement record visible to every machine unconditionally is strictly forbidden — owner confirmation + explicit blast radius + audience restriction required (§ Remote Announcements). (Owner rule 2026-11-13, #6508/#6509) |
 
 **Opening a PR** (no `gh` CLI): `git push origin HEAD` → token from `git credential fill` (shell var only, never print) → POST `/repos/ranxianglei/billion-context/pulls` with base `master`. Full token/curl recipe: [reference/git-pr.md](reference/git-pr.md). Merging stays human-only.
 
 **External contributors' PRs — fix directly, don't replace.** Fixes go out as **additive commits to the contributor's PR branch**, whoever authored it (owner rule 小问题直接修, 2026-10-01). What stays off-limits is REPLACING the contribution: no rebase-and-replace with an Agent-owned PR, no closing a still-mergeable contribution in favor of a new one (#1765) — the contributor's commits, diff and authorship stay in the merged history. A deleted head branch does NOT kill an open PR (GitHub freezes `refs/pull/N/head`; check `mergeable`/`mergeStateStatus` first), and `BEHIND` is not a blocker. Mechanics: [reference/git-pr.md](reference/git-pr.md).
 
 **Post-merge supplements** → a small follow-up PR whose body references the original PR number; never append to / rebase the merged PR. Verify a supplement is actually needed first (replaying the same commit on newer master is verification, not content).
+
+### Remote Announcements (公告) — owner-gated, no broadcast-to-all (MANDATORY)
+
+The remote announcement feed ([`announcements/remote.json`](announcements/remote.json), #5548) reaches **every running instance within ~3 minutes of a master merge** — it is a safety surface in the same class as merge/release, not a docs file. Rules (owner ruling 2026-11-13, #6508/#6509 — the dsh-live-compact entry shipped as an ungated broadcast, hit every machine, and had to be retracted):
+
+1. **No broadcast-to-all（严格禁止对所有用户公告）.** A record visible to every machine unconditionally is strictly forbidden. Every record must be restricted to a defined audience — `versions` / `requiresScan` / time window, as applicable. If you cannot state a narrow audience, do not ship the record.
+2. **Explicit owner confirmation for ANY announcement.** Adding, changing, or retracting any announcement record requires the owner's explicit confirmation in-thread BEFORE the PR is opened — same class as releases (§ Version Bumps). An Agent may **propose** announcement content and scope but never opens or pushes the announcement PR itself.
+3. **The announcement PR must state the blast radius.** The body must spell out: (a) the audience (which client / version / install-state sees it); (b) version coverage — explicitly which OLDER versions ignore new gate fields (e.g. `requiresScan`) and therefore see the record unconditionally; (c) the display duration — when and by whom the record comes out of the feed (retraction PR vs. `until` window).
+4. **Plugin-targeted announcements are disallowed in principle（原则上不允许针对某个插件的公告）.** Surfacing plugin conflicts belongs to the read-only conflict scan (#1206), which is inherently per-machine. Any plugin-targeted notice must be **trigger-based, not announcement-based**: a scan surface (CLI WARNING / session conflict ledger / `/__bili/stats` / interception-failure web banner), or — only when a persistent web notice is genuinely needed — a feed record carrying a `requiresScan` gate so delivery matches the stated audience. Precedent: the #5984 dsh-live-compact record, broadcast ungated, retracted 2026-11-13 (#6508/#6509).
 
 ### Issue & Problem Tracking (MANDATORY)
 

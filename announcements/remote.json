@@ -1,27 +1,4 @@
 {
   "v": 1,
-  "entries": [
-    {
-      "id": "dsh-live-compact-conflict",
-      "kind": "warning",
-      "tone": "warn",
-      "title": {
-        "en": "DSH: dsh-live-compact conflicts with bili compression",
-        "zh-CN": "DSH：dsh-live-compact 与 bili 压缩冲突"
-      },
-      "desc": {
-        "en": "If your dsh profile has the third-party plugin dsh-live-compact installed, it acts as a competing compaction engine that bili's compaction-disabling overlay cannot see — its checkpoints can land outside bili's knowledge and destroy the compression substrate (#5984). The conflict scan now flags it as a known conflict. If bili should own compression, remove the plugin and restart the profile: dsh plugin remove dsh-live-compact",
-        "zh-CN": "如果你的 dsh profile 安装了第三方插件 dsh-live-compact，它是一个 bili 压缩禁用 overlay 看不见的竞争压缩引擎——它的压缩 checkpoint 可能落在 bili 知识之外、摧毁压缩基底（#5984）。冲突扫描现在会把它标记为已知冲突。若要让 bili 持有压缩，请卸载插件并重启 profile：dsh plugin remove dsh-live-compact"
-      },
-      "hint": {
-        "en": "Source-level analysis in issue #5984: the plugin takes over dsh's stock compaction engine, and its row name never matches bili's overlay.",
-        "zh-CN": "源码级分析见 issue #5984：该插件顶替 dsh 的 stock 压缩引擎，其行名永远对不上 bili 的 overlay。"
-      },
-      "ctaLabel": "See #5984",
-      "ctaUrl": "https://github.com/ranxianglei/billion-context/issues/5984",
-      "dismiss": "persistent",
-      "priority": 70,
-      "publishedAt": "2026-11-11T10:40:00Z"
-    }
-  ]
+  "entries": []
 }
