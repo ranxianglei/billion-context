@@ -241,7 +241,7 @@
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | リモート自動更新ポリシーファイルの URL 上書き (テスト用シーム — 本番環境では公式リポジトリに固定される)。 |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 重大な欠陥に関するアドバイザリーウォッチャー; 実行中のバージョンが影響を受ける場合、推奨される修正を強制インストールする。 |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | アドバイザリーフィードの URL 上書き。 |
-| `remoteAnnouncementsUrl` | string | unset (official feed: GitHub master announcements/remote.json) | BILI_ANNOUNCEMENTS_URL | リモートアナウンスメントフィードの URL 上書き (#5548): JSON ドキュメント {v: 1, entries: [...]} — ローカルアナウンスメントファイルと同じレコードスキーマ。他のウォッチャーと同様に約 3 分ごとに取得され、キャッシュされたスナップショットは再起動や障害後も維持される。ファイアウォールインストールではこれをリレーミラーに向ける。不正なプッシュは拒否され、最後に正常だったコピーが表示され続ける。`<config dir>/announcements/*.json` 内のローカルファイルは、同じ ID のリモート/組み込み通知を常にシャドウする。 |
+| `remoteAnnouncementsUrl` | string | unset (official feed: GitHub master announcements/remote.json) | BILI_ANNOUNCEMENTS_URL | リモートアナウンスメントフィードの URL 上書き (#5548): JSON ドキュメント {v: 1, entries: [...]} — ローカルアナウンスメントファイルと同じレコードスキーマ。他のウォッチャーと同様に約 3 分ごとに取得され、キャッシュされたスナップショットは再起動や障害後も維持される。ファイアウォールインストールではこれをリレーミラーに向ける。不正なプッシュは拒否され、最後に正常だったコピーが表示され続ける。`<config dir>/announcements/*.json` 内のローカルファイルは、同じ ID のリモート/組み込み通知を常にシャドウする。エントリは任意の `requiresScan: { "client", "knownId"? }` フィールドを持てます — ライブ競合スキャンゲートで、そのクライアントの読み取り専用プラグインレジストリスキャンが実際に該当プラグインを報告した場合（いずれかの所見、または `knownId` 一致）以外ではバナーは非表示のままです。そのためマシン固有の競合のブロードキャストは、競合が存在するマシンで正確に表示されます (#5984)。 |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Web パネル用のリリースノートフィード (取得とキャッシュのみ; 何もインストールしない)。 |
 | `releaseNotesUrl` | string | unset (built-in feed) | BILI_RELEASE_NOTES_URL | リリースノートフィードの URL 上書き。 |
 
