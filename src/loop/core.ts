@@ -9,7 +9,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport, toolsArrayFps } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import type { SeparatorSlot } from "../server/responses-ordering.js";
@@ -633,7 +633,7 @@ export async function* runCompressLoop(
         // noteForwardedBody is a string-only forensics sink; an opaque egress
         // envelope (Buffer) is lossy-converted — advisory pairing only, and the
         // provenance judge below already skips when the body was rewritten.
-        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj), toolsArrayFps(wireObj));
         // #564/#2627: provenance is resolved against the array that belongs to
         // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
         // `wireArr` no longer describes it; rather than map stale indexes (which
