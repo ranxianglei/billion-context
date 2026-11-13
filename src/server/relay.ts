@@ -326,6 +326,51 @@ export function tryAnswerEarlyHold(o: {
     return true;
 }
 
+// #6181 round 2, Residual 2 hardening: scans the OUTBOUND SSE for the response
+// id the client actually chains from (response.created / response.completed).
+// The event type rides in the data JSON for real upstreams
+// ({"type":"response.completed",...}); some clients/tests emit it on the
+// `event:` line instead — accept both. Feeds are cheap (bounded tail, string
+// ops only) so the scan can ride a tee'd twin of any streaming branch.
+class MintIdTap {
+    private tail = "";
+    created?: string;
+    completed?: string;
+    feed(text: string): void {
+        this.tail += text;
+        if (this.tail.length > 65536) this.tail = safeSuffix(this.tail, 32768);
+        if (!this.tail.includes("response.completed") && !this.tail.includes("response.created")) return;
+        let cut = this.tail.indexOf("\n\n");
+        while (cut !== -1) {
+            const event = this.tail.slice(0, cut);
+            this.tail = this.tail.slice(cut + 2);
+            // The recompute must run on EVERY pass — the marker check below
+            // `continue`s, and skipping the recompute there pins `cut` on a
+            // shrinking tail: a non-marker event preceding a marker event
+            // (e.g. response.output_item.done before response.completed)
+            // spins the loop forever on an empty tail.
+            cut = this.tail.indexOf("\n\n");
+            if (!event.includes("response.completed") && !event.includes("response.created")) continue;
+            const lines = event.split("\n");
+            const dataLine = lines.find((l) => l.startsWith("data: "));
+            const eventLine = lines.find((l) => l.startsWith("event: "));
+            if (dataLine !== undefined) {
+                try {
+                    const evt = JSON.parse(dataLine.slice(6)) as { type?: string; response?: { id?: unknown } };
+                    const id = evt.response?.id;
+                    if (typeof id === "string" && id.length > 0) {
+                        const type = evt.type ?? (eventLine !== undefined ? eventLine.slice(7).trim() : "");
+                        if (type === "response.completed") this.completed = id;
+                        else if (type === "response.created") this.created = id;
+                    }
+                } catch {
+                    /* partial/corrupt event — ignore */
+                }
+            }
+        }
+    }
+}
+
 export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
     return withCacheCapture(args[4]?.session, () => forwardCaptured(...args));
 }
@@ -2291,6 +2336,27 @@ async function forwardCaptured(
                 pluginBody = a;
                 dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
             }
+            // #6181 round 2, Residual 2: the mint scan (the record that lets
+            // the NEXT chained round prove the provider chain holds the
+            // stored world) must ride this branch — plugin turns return
+            // before the proxy-lane taps. The client-facing bytes here ARE
+            // the upstream bytes (the strip pipes are byte-identical for
+            // tag-free streams; a response id is never a render tag), so a
+            // raw tap sees exactly what the client chains from.
+            let mintTap: MintIdTap | undefined;
+            let mintDone: Promise<void> | undefined;
+            if (prepared.stream && prepared.protocol === "responses" && prepared.mintFrontierPos !== undefined && upstreamResult.response.status < 400) {
+                const [mMain, mTwin] = pluginBody.tee();
+                pluginBody = mMain;
+                mintTap = new MintIdTap();
+                mintDone = (async () => {
+                    try {
+                        for await (const c of mTwin) mintTap?.feed(Buffer.from(c).toString("utf8"));
+                    } catch {
+                        /* upstream cut — the client-facing branch decides */
+                    }
+                })();
+            }
             if (prepared.stream) {
                 // #2328: what the pipes know about the upstream HTTP response —
                 // first attempt's status/content-type (a resolveFakeCompletion
@@ -2375,6 +2441,15 @@ async function forwardCaptured(
                 }
             } else {
                 await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, absorbInstructed, wireBodyText, reply);
+            }
+            if (mintTap !== undefined && mintDone !== undefined && upstreamResult.response.status < 400 && prepared.mintFrontierPos !== undefined) {
+                // Drain BEFORE the finally's session persist rides markDirty,
+                // so lastMintedResponse is recorded in the same save.
+                await mintDone;
+                const seen = mintTap.completed ?? mintTap.created;
+                if (seen !== undefined) {
+                    prepared.session.lastMintedResponse = { id: seen, frontierPos: prepared.mintFrontierPos };
+                }
             }
         } finally {
             clearUpstreamTimer();
@@ -2473,6 +2548,30 @@ async function forwardCaptured(
         prepared !== null &&
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
+    // #6181 round 2, Residual 2 hardening: the mint scan above lives in the
+    // compress-loop (injected) branch — but a non-injected responses turn
+    // (small context, classifier bypass, ACP_NO_INJECT_TOOL) never enters it,
+    // so session.lastMintedResponse was never recorded and the first chained
+    // round re-seeded the whole world. Tee a twin of the raw stream for those
+    // turns: here the client-facing bytes ARE the upstream bytes (the strip
+    // pipes are byte-identical for tag-free streams, and a response id is
+    // never a render tag), so the raw tap sees exactly what the client sees.
+    let plainMintTap: MintIdTap | undefined;
+    let plainMintDone: Promise<void> | undefined;
+    let plainMintFrontier: number | undefined;
+    if (
+        !useRewriter && prepared !== null && prepared.stream
+        && prepared.protocol === "responses" && prepared.mintFrontierPos !== undefined
+        && upstreamResult.response.status < 400
+    ) {
+        plainMintFrontier = prepared.mintFrontierPos;
+        const [mintMain, mintTap] = responseBody.tee();
+        responseBody = mintMain;
+        plainMintTap = new MintIdTap();
+        plainMintDone = (async () => {
+            for await (const c of mintTap) plainMintTap?.feed(Buffer.from(c).toString("utf8"));
+        })();
+    }
     if (!useRewriter || prepared === null) {
         // #2328: pipes cite the first upstream response's HTTP identity.
         const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
@@ -2604,6 +2703,15 @@ async function forwardCaptured(
         }
         // #2347: the raw-SSE dump is finished in the safety-net finally below —
         // an inline await here would be skipped when a pipe rejects.
+        // #6181: drain the mint twin BEFORE the finally's markDirty persists
+        // the session, so lastMintedResponse rides the same save.
+        if (plainMintTap !== undefined && plainMintDone !== undefined && prepared !== null && plainMintFrontier !== undefined) {
+            await plainMintDone;
+            const seen = plainMintTap.completed ?? plainMintTap.created;
+            if (seen !== undefined) {
+                prepared.session.lastMintedResponse = { id: seen, frontierPos: plainMintFrontier };
+            }
+        }
         return;
     }
     const ctx: RewriteCtx = {
@@ -2774,40 +2882,10 @@ async function forwardCaptured(
             // proxy's minted one otherwise, inline-minted included: the scan
             // runs on the exact bytes written to the client). The relay pairs
             // it with prepared.mintFrontierPos into session.lastMintedResponse.
-            let mintCreatedId: string | undefined;
-            let mintCompletedId: string | undefined;
-            let mintSseTail = "";
+            const mintTap = new MintIdTap();
             const mintScan = (text: string): void => {
                 if (prepared.protocol !== "responses" || prepared.mintFrontierPos === undefined) return;
-                mintSseTail += text;
-                if (mintSseTail.length > 65536) mintSseTail = safeSuffix(mintSseTail, 32768);
-                if (!mintSseTail.includes("response.completed") && !mintSseTail.includes("response.created")) return;
-                let cut = mintSseTail.indexOf("\n\n");
-                while (cut !== -1) {
-                    const event = mintSseTail.slice(0, cut);
-                    mintSseTail = mintSseTail.slice(cut + 2);
-                    // The event type rides in the data JSON for real upstreams
-                    // ({"type":"response.completed",...}); some clients/tests
-                    // emit it on the `event:` line instead — accept both.
-                    if (!event.includes("response.completed") && !event.includes("response.created")) continue;
-                    const lines = event.split("\n");
-                    const dataLine = lines.find((l) => l.startsWith("data: "));
-                    const eventLine = lines.find((l) => l.startsWith("event: "));
-                    if (dataLine !== undefined) {
-                        try {
-                            const evt = JSON.parse(dataLine.slice(6)) as { type?: string; response?: { id?: unknown } };
-                            const id = evt.response?.id;
-                            if (typeof id === "string" && id.length > 0) {
-                                const type = evt.type ?? (eventLine !== undefined ? eventLine.slice(7).trim() : "");
-                                if (type === "response.completed") mintCompletedId = id;
-                                else if (type === "response.created") mintCreatedId = id;
-                            }
-                        } catch {
-                            /* partial/corrupt event — ignore */
-                        }
-                    }
-                    cut = mintSseTail.indexOf("\n\n");
-                }
+                mintTap.feed(text);
             };
             for await (const chunk of loop) {
                 if (res.destroyed || res.writableEnded) break;
@@ -2835,7 +2913,7 @@ async function forwardCaptured(
             // full world (mintFrontierPos set). The markDirty in the finally
             // below persists it with the rest of the turn's state.
             if (prepared.protocol === "responses" && upstreamResult.response.status < 400 && prepared.mintFrontierPos !== undefined) {
-                const seen = mintCompletedId ?? mintCreatedId;
+                const seen = mintTap.completed ?? mintTap.created;
                 if (seen !== undefined) {
                     prepared.session.lastMintedResponse = { id: seen, frontierPos: prepared.mintFrontierPos };
                 }
