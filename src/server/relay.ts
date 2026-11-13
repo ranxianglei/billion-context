@@ -2768,6 +2768,40 @@ async function forwardCaptured(
                 clientAbort.signal,
             );
             let protocolFragmentWarned = false;
+            // #6181 round 2, Residual 2 hardening: capture the response id
+            // the CLIENT actually sees (response.created / response.completed
+            // in the outbound SSE — the upstream's id when present, the
+            // proxy's minted one otherwise, inline-minted included: the scan
+            // runs on the exact bytes written to the client). The relay pairs
+            // it with prepared.mintFrontierPos into session.lastMintedResponse.
+            let mintCreatedId: string | undefined;
+            let mintCompletedId: string | undefined;
+            let mintSseTail = "";
+            const mintScan = (text: string): void => {
+                if (prepared.protocol !== "responses" || prepared.mintFrontierPos === undefined) return;
+                mintSseTail += text;
+                if (mintSseTail.length > 65536) mintSseTail = mintSseTail.slice(-32768);
+                if (!mintSseTail.includes("response.completed") && !mintSseTail.includes("response.created")) return;
+                let cut = mintSseTail.indexOf("\n\n");
+                while (cut !== -1) {
+                    const event = mintSseTail.slice(0, cut);
+                    mintSseTail = mintSseTail.slice(cut + 2);
+                    const dataLine = event.split("\n").find((l) => l.startsWith("data: "));
+                    if (dataLine !== undefined && (dataLine.includes("response.completed") || dataLine.includes("response.created"))) {
+                        try {
+                            const evt = JSON.parse(dataLine.slice(6)) as { type?: string; response?: { id?: unknown } };
+                            const id = evt.response?.id;
+                            if (typeof id === "string" && id.length > 0) {
+                                if (evt.type === "response.completed") mintCompletedId = id;
+                                else mintCreatedId = id;
+                            }
+                        } catch {
+                            /* partial/corrupt event — ignore */
+                        }
+                    }
+                    cut = mintSseTail.indexOf("\n\n");
+                }
+            };
             for await (const chunk of loop) {
                 if (res.destroyed || res.writableEnded) break;
                 {
@@ -2780,12 +2814,25 @@ async function forwardCaptured(
                     }
                 }
                 res.write(chunk);
+                mintScan(chunk.toString("utf8"));
                 if (res.writableNeedDrain) {
                     await awaitDrain(res);
                 }
                 if (res.destroyed || res.writableEnded) break;
             }
             res.end();
+            // #6181 round 2, Residual 2 hardening: pair the observed id with
+            // the frontier the lane recorded — accepted forwards only (a
+            // refused round mints nothing the client chains from) and only
+            // when the lane proved this round leaves the provider holding the
+            // full world (mintFrontierPos set). The markDirty in the finally
+            // below persists it with the rest of the turn's state.
+            if (prepared.protocol === "responses" && upstreamResult.response.status < 400 && prepared.mintFrontierPos !== undefined) {
+                const seen = mintCompletedId ?? mintCreatedId;
+                if (seen !== undefined) {
+                    prepared.session.lastMintedResponse = { id: seen, frontierPos: prepared.mintFrontierPos };
+                }
+            }
         } catch (e) {
             emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
@@ -2895,6 +2942,14 @@ async function forwardCaptured(
                     await withSessionLock(prepared.session, () => rewriteJsonResponseAsync(json, ctx, clientAbort.signal));
                 }
                 captureHandoffJson(reply, prepared.protocol, json);
+                // #6181 round 2, Residual 2 hardening: non-streaming twin of
+                // the streaming mint capture — json.id here is the final
+                // client-visible id (post rewriteResponsesJsonResponseAsync).
+                if (prepared.protocol === "responses" && upstreamResult.response.status < 400 && prepared.mintFrontierPos !== undefined) {
+                    if (typeof json.id === "string" && json.id.length > 0) {
+                        prepared.session.lastMintedResponse = { id: json.id, frontierPos: prepared.mintFrontierPos };
+                    }
+                }
                 reply?.save();
                 res.end(JSON.stringify(json));
             } catch {

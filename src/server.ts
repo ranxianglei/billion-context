@@ -2024,6 +2024,14 @@ export type Prepared = {
      *  safe, under-serving is the context loss). Absent (undefined) = no
      *  delta was selected this turn. */
     pendingResponsesDelta?: { state: { frontierPos: number; servedAnchors: string[] }; kind: "full" | "noop" | "partial" } | null;
+    /** #6181 round 2, Residual 2 hardening: the plane max pos (post
+     *  in-request flush) the provider chain will hold once THIS forward is
+     *  accepted — the relay pairs it with the response id it observes on
+     *  the outbound stream and records session.lastMintedResponse (accepted
+     *  forwards only; a refused round mints nothing). Set by the responses
+     *  lane on every round whose accepted forward leaves the provider
+     *  holding the full world. */
+    mintFrontierPos?: number;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND
      *  anthropic system (pre-anchor). Preflight summary calls must carry it —

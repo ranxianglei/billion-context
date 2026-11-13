@@ -2460,6 +2460,13 @@ export class SessionStore {
         return this.liveShadow().snapStage0Cores(sessionId);
     }
 
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
+     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
+    snapPlaneMaxPos(sessionId: string): number {
+        if (!this.replicasAvailable()) return -1;
+        return this.liveShadow().snapPlaneMaxPos(sessionId);
+    }
+
     /** The stage-0 resync (R4 / table behind): reset the session plane so
      *  the next turn re-issues from the client's current array. */
     snapStage0Reset(sessionId: string): void {
