@@ -550,7 +550,7 @@ jobs:
           node-version: 22
       - run: node tools/gen-config-docs.mjs generate
       - name: Fail on artifact drift
-        run: git diff --exit-code -- docs/configuration.md docs/configuration.zh-CN.md website/main.js website/docs/index.html
+        run: git diff --exit-code -- docs/configuration.md docs/configuration.zh-CN.md docs/configuration.ja.md website/main.js website/docs/index.html
 
   # #2107 drift guard B: every BILI_*/ACP_* env var read in src/ and every
   # FileConfig top-level key must have a seed entry — an undocumented param

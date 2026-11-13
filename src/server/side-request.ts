@@ -3,7 +3,7 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
-import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
@@ -348,6 +348,10 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
 // guaranteed bili-owned, and any host tool vetoes the demotion.
 export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...ACP_TOOL_NAMES,
+    // #5765: block ops are opt-in but kernel-fixed (no rename surface) —
+    // bili-owned names, so they count toward the "entire array is bili's set"
+    // structural signal like the other kernel-fixed ACP names.
+    ...BLOCK_OP_TOOL_NAMES,
     ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
