@@ -124,6 +124,12 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
     return raw * k;
 }
 
+/** #5952: the provenance stamp a published k̂ carries when every sample in
+ *  its ring came from a text-only final wire estimate (per-request capture
+ *  pair, #4430 discipline). Only this value ever decides: a factor whose
+ *  evidence may include image-billed usage must not scale a text estimate. */
+export const CALIBRATION_PROVENANCE_TEXT_ONLY = "text-only-v1";
+
 /** #2117: read-side gate for the learned estimator scale — the model dimension
  *  of k̂ provenance. A factor published against model X must not decide on
  *  model Y: tokenizers bill differently, and a stale cross-model factor can be
@@ -133,10 +139,19 @@ export function applyEstimateCalibration(raw: number, k: number | undefined, kOr
  *  string → factor kept as-is, so factors published before this field existed
  *  (or requests without a model stamp) are never invalidated by missing
  *  information — they retire through the normal ring rollover when new samples
- *  land. Invalid factors degrade to absent. */
-export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string }, lastModel?: unknown): number | undefined {
+ *  land. Invalid factors degrade to absent.
+ *  #5952: the provenance dimension is STRICT where the model dimension is
+ *  lenient — a factor with no text-only stamp is absent, however well it
+ *  matches on route+model. The incident proved a legacy multiplier can be
+ *  image-contaminated (the shared prepare slot records text + image reserve
+ *  under a "TextEstimate" name), and no amount of route/model matching can
+ *  vouch for its evidence. Sessions re-train within two fresh text-only
+ *  settles; a ring that still holds a legacy sample stays inert until the
+ *  window flushes it out. */
+export function currentCalibrationFactor(stats: { calibratedEstimate?: number; calibratedEstimateModel?: string; calibratedEstimateProvenance?: string }, lastModel?: unknown): number | undefined {
     const k = stats.calibratedEstimate;
     if (k === undefined || !Number.isFinite(k) || k <= 0) return undefined;
+    if (stats.calibratedEstimateProvenance !== CALIBRATION_PROVENANCE_TEXT_ONLY) return undefined;
     if (stats.calibratedEstimateModel !== undefined && typeof lastModel === "string" && lastModel !== "" && stats.calibratedEstimateModel !== lastModel) return undefined;
     return k;
 }
