@@ -15,10 +15,12 @@
 // cut off mid-work. The session lane of the same case (floor 164287) was
 // lighter but still clamped (62797 instead of the raw formula's 83498).
 //
-// Fix A1 (budget.ts): when the floor IS the planning basis (strictly above
-// the folded estimate) it is a high-water BYTES proxy, not a low-biased
-// local estimate — the #5278 safe pass would double-count it, so skip it
-// and judge raw. Est-driven calls pass the flag off: byte-identical.
+// Fix A1 (budget.ts): when the floor IS the planning basis (the #3384 gate
+// fired AND it is strictly above the folded estimate) it is a high-water
+// BYTES proxy, not a low-biased local estimate — the #5278 safe pass would
+// double-count it, so skip it and judge raw. Gate OFF, the floor never
+// plans: the est-driven path keeps the safe pass byte-identical (a sticky
+// floor above the est must not strip #5278's under-estimator protection).
 //
 // Fix A2 (handle.ts): an AUTHORED checkpoint landing resets dsh's raw
 // ledger (#3723), so the refused-replay high-water no longer bounds any
@@ -127,6 +129,24 @@ test("A1: boundary — est equal to the floor still takes the safe pass (#3071 p
     clampOutgoingOutput(rebuilt, "max_tokens", ctxOf({ lastInputTokens: 216_690, ledgerFloorTokens: 216_690 }), "s-5596-e", clampLog(lines));
     // Safe: est 242693 → cap 1172 → floored at 4096.
     assert.equal(rebuilt.max_tokens, 4_096, "equality boundary keeps the legacy safe path");
+});
+
+test("A1: gate off + sticky floor above the est — the est-driven path keeps the #5278 safe pass", () => {
+    const lines: string[] = [];
+    const rebuilt: Record<string, unknown> = { max_tokens: 20_000 };
+    // est 70K < headroom 75K (viewAtEnforcedTarget off) and raw 20K < 25K
+    // (giant off): the #3384 gate is OFF, so the sticky floor 82.5K must not
+    // plan this turn — and must not strip the #5278 safe pass from the
+    // est-driven clamp either. The pre-review flag (bare floor > est) took
+    // the raw path here: cap 100000-70000.4-3501=26498 >= 20000 → no clamp
+    // at all, re-exposing the #5278 under-estimator hole in the firing band.
+    clampOutgoingOutput(rebuilt, "max_tokens", ctxOf({ lastInputTokens: 70_000, nativeWindow: 100_000, headroomWindow: 75_000, ledgerFloorTokens: 82_500 }), "s-5596-g", clampLog(lines));
+    // Safe: est 70000 + a ~0.4-token local residue (the estimator's
+    // fractional delta, cf. test s-5596-c) → ceil(*1.12) = 78401,
+    // margin 3921 → cap 100000 - 78401 - 3921 = 17678. The raw no-
+    // inflation path would give cap 26498 >= 20000 → NO clamp at all —
+    // the difference IS the #5278 inflation, which must survive here.
+    assert.equal(rebuilt.max_tokens, 17_678, "#5278 safe pass intact on the est-driven path even with a sticky floor above the est");
 });
 
 test("A1: the doomed-probe surrender survives on the flag path (cap below the floor → no clamp)", () => {

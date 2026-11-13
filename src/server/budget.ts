@@ -544,11 +544,14 @@ export function clampOutgoingOutput(
     const viewAtEnforcedTarget = typeof ctx.headroomWindow === "number" && Number.isFinite(ctx.headroomWindow) && ctx.headroomWindow > 0 && inputEstimate >= ctx.headroomWindow;
     const giantRequestedBudget = ctx.nativeWindow > 0 && raw >= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT * ctx.nativeWindow;
     const planningInput = viewAtEnforcedTarget || giantRequestedBudget ? Math.max(inputEstimate, ledgerFloor) : inputEstimate;
-    // #5596: when the ledger floor IS the planning basis (strictly above the
-    // folded estimate), it is a bytes/4 high-water proxy that already
-    // over-counts the host's own tokenizer — skip the #5278 ×1.12 safe pass
-    // there. Every est-driven call passes false → #5278 byte-identical.
-    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling, ledgerFloor > inputEstimate);
+    // #5596: when the ledger floor IS the planning basis (the #3384 gate fired
+    // AND it is strictly above the folded estimate), it is a bytes/4 high-water
+    // proxy that already over-counts the host's own tokenizer — skip the #5278
+    // ×1.12 safe pass there. Gate OFF the floor never plans, so the est-driven
+    // path keeps the safe pass byte-identical — a sticky floor above the est
+    // must not strip #5278's under-estimator protection from the folded view.
+    const floorDrivesPlanning = (viewAtEnforcedTarget || giantRequestedBudget) && ledgerFloor > inputEstimate;
+    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling, floorDrivesPlanning);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
         // #2096: in the band (headroom target, native window) the clamp can only
@@ -556,7 +559,7 @@ export function clampOutgoingOutput(
         // the input back under the enforced target. Say so instead of advertising
         // rescue right before the turn dies.
         const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
-        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${floorDrivesPlanning ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
         onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
     }
 }
