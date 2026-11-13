@@ -7,9 +7,9 @@
 // instead: same durable record, zero terminal traffic. Boot-time banners that
 // fire before the TUI takes over may still use console.* deliberately.
 //
-// Line grammar mirrors src/logger.ts (`<iso-ts> [level] [v=<build>] <msg>`),
-// so a shared log written by mixed-version hosts self-identifies every
-// physical line; `origin` marks which lane wrote it ([native-client],
+// Line grammar mirrors src/logger.ts (`<ts> [level] [v=<build>] <msg>` — ts is
+// local wall clock, no zone suffix, #4535), so a shared log written by
+// mixed-version hosts self-identifies every physical line; `origin` marks which lane wrote it ([native-client],
 // [dsh-client], …). An EMPTY origin is allowed when the message already
 // carries its own prefix (launcher attach diagnostics, #3200) — the separator
 // is dropped so the line stays byte-identical to the legacy teeLog format.
@@ -19,6 +19,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { maskIpsInText, maskUrlsForDiagnostics, redactSecretsInText } from "../log-mask.js";
+import { logTimestamp } from "../logger.js";
 import { defaultLogFile } from "../paths.js";
 import { VERSION } from "../version.js";
 
@@ -33,7 +34,7 @@ export function logHostEvent(level: "info" | "warn" | "error", origin: string, m
         // leaked provider domains through [dsh-client] lines while every
         // proxy-side line masked them.
         const safe = maskUrlsForDiagnostics(maskIpsInText(redactSecretsInText(msg)));
-        appendFileSync(file, `${new Date().toISOString()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${safe}\n`);
+        appendFileSync(file, `${logTimestamp()} [${level}] [v=${VERSION}] ${origin ? `${origin} ` : ""}${safe}\n`);
     } catch {
         // best-effort: logging must never break the host
     }

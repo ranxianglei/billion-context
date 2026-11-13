@@ -199,28 +199,152 @@ The workflow then:
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`, and creates
    the GitHub Release with notes generated from `git log` since the last tag.
 
+**Emergency bypass (`skip_ci_gate`, owner decision 2026-11-01):** ticking the checkbox
+skips the full-CI dispatch AND wait on BOTH paths (direct push and fallback PR) — the
+run finishes right after the fast pre-flight instead of waiting up to 60 minutes for
+every lane at the publish sha. A loud `::warning::` line in the job log is the permanent
+audit record, and on the fallback path the auto-PR body is stamped with an EMERGENCY
+BYPASS banner so whoever merges knows the sha shipped without lane verification.
+Leave it UNTICKED for normal releases: an unticked run publishes exactly as before,
+a green release branch included.
+
+**Nuclear option (`raw_publish`):** ticking this checkbox puts nothing between you and
+npm but a one-time dependency download (`npm install --no-audit --no-fund`, a plain
+lockfile fetch that executes no project code) and `npm run build` — no typecheck,
+no tests, no CI lanes, no push to master, no release PR. The run still enforces the drift guard
+and the release-notes check, then publishes to npm, pushes the git tag, creates the
+GitHub Release (body carries a RAW EMERGENCY PUBLISH banner), and opens a version-sync
+PR so master converges. Until that sync PR merges, the NEXT one-click release aborts
+on the drift guard (master sits exactly one patch behind npm) — that is deliberate:
+it forces a visible convergence instead of silently re-bumping. A loud warning line in
+the job log is the permanent audit record. Use it when even the fast path is too slow
+and you accept shipping an unverified tree.
+
+**Local zero-install variant:** on your own machine (where `node_modules` already
+exists) run `NPM_TOKEN=*** GITHUB_TOKEN=*** node scripts/emergency-publish.mjs` for the
+literal `npm run build && npm publish`: no dependency install step at all, then tag
+push + GitHub Release when the token is present. Add `--dry-run` to preview with zero
+side effects.
+
 A successful one-click run does NOT double-trigger `release.yml`: its check only
 matches release-branch merges / date-prefixed commits, never a plain `release v{VERSION}`
 commit. The standard branch/PR flow above remains the canonical path for anything
 non-trivial (updater changes, cross-repo bumps, or whenever a human wants the review
 gate).
 
-## Bugfix carve-out channel (release-bugfix.yml)
+## Bugfix patch-lane channel (release-bugfix.yml — gate-branch model)
 
-Emergency hotfix path (#2011, first used for v0.1.182), **PR-gated since #2851**:
-publish a version cut from a **non-master ref** — typically a released tag plus a
-single fix commit — STRICTLY excluding the unreleased work that has since
-accumulated on master. It goes through a PR exactly like a normal release (human
-reviews and merges; CI publishes); the ONLY difference is the published tree: the
-PRE-MERGE PR-head tree (last tag + the fix + the version bump), never the
-post-merge master.
+Emergency hotfix path (#2011, first used for v0.1.182), PR-gated since #2851,
+and since 2026-10-25 hard-gated on human review as the **protected
+gate-branch model (v3)**: publish a version cut from a **non-master ref** — a
+released tag plus the fixes that landed on its lane — STRICTLY excluding the
+unreleased work that
+has since accumulated on master.
+
+**The governing rules (v3, 2026-10-25 — supersedes the v2 "any merge into the
+lane publishes" trigger AND the `backport-ship` label path):**
+
+Three branches, one role each:
+
+- **`bugfix` — THE GATE.** A standalone PROTECTED branch with the same status
+  as master (PR-only, required checks green, force-push/delete disabled,
+  admins included). It never accumulates development; it only receives a
+  finished tag lane. The v3 workflow file sits ON this branch from birth
+  (`pull_request_target` executes the base-side copy), so there is NO
+  "arming" window: the first ship PR works immediately.
+- **`bugfix-vX.Y.Z` — the TAG LANES.** Each cycle's lane is cut from the
+  released `vX.Y.Z` tag with package.json pre-bumped to the next version, and
+  protected exactly like master. All fixes enter through reviewed carry PRs
+  (opened automatically from the `backport` label); **merging carries into a
+  lane NEVER publishes**.
+- **master** — the mainline; re-aligned after every publish (below).
+
+**THE FIRE IS ONE EXACT PR SHAPE AND NOTHING ELSE:** a same-repo PR, MERGED,
+base = `bugfix`, head = `bugfix-vX.Y.Z`. Only that merge publishes:
+`release-bugfix.yml`'s `pull_request_target` closed trigger (executing the
+`bugfix`-side copy) resolves the POST-MERGE lane head (= the ship PR's
+`merge_commit_sha`, cross-checked against the live lane ref with a drift
+warning), runs the full guard chain below, tags + publishes + creates the
+GitHub Release, leaves an audit comment on the merged ship PR, then AUTO-OPENS
+the alignment PR (**head = `bugfix`**, base = master). Every other close — any
+PR into a lane, any non-tag-branch into `bugfix`, a non-merged close, a fork —
+is a millisecond no-op.
+
+**Why v3 has no arming step (2026-10-25 incident — never re-arm lanes):** the
+v2 design carried a separate "arming" commit to each new lane (the lane-side
+copy of this workflow). The window proved fatal once: when arming PR #4654
+merged into `bugfix-v0.1.206`, GitHub resolved the `pull_request_target` event
+against the base ref *after* the merge commit had landed — so the arm's own
+trigger matched its own merge and immediately published v0.1.207
+(tag `7e69b49f`, GH Release 08:09:37Z) with none of the review the channel is
+supposed to provide. No double-ship followed: every later close against that
+frozen lane hits the monotonic npm guard (`0.1.207` already live) and dies red
+without publishing. The lesson, codified in the model: **an arming commit
+whose trigger matches its own target fires itself.** Hence the gate branch is
+born carrying the workflow (no arming step exists in v3) and merges into tag
+lanes can never fire anything.
+
+**Epoch-1 transition (2026-10-25 — the first v3 lane is special; do it in order):**
+tag `v0.1.207`'s published tree still carries the **v2** workflow file (it IS the
+self-fired arm's tree), and `pull_request_target` executes the **base-side** copy —
+so the first v3 lane must be cut from **aligned master**, NOT from that tag: a lane
+inheriting the v2 wide trigger would self-fire its FIRST carry merge straight into a
+publish — the same incident, delivered by `backport.yml`, which AUTO-CUTS a missing
+lane from the latest tag the moment any PR gets the `backport` label. Procedure:
+1. merge this PR (#4660) into master;
+2. merge the open alignment PR #4659 ("align master with v0.1.207 …") — it currently
+   conflicts against master, resolve/rebase first. After it, master equals npm latest
+   AND carries the v3 doc. (The two merges are order-safe: with v3 live, #4659's head
+   `bugfix-v0.1.206` matches neither path and no-ops; with v2 live, base=`master`
+   matches no trigger at all);
+3. create + protect the `bugfix` gate branch from master (payload above);
+4. manually cut the first v3 lane from ALIGNED MASTER (same recipe as the auto-cut
+   step's manual-recovery block, base swapped for aligned master), pre-bump
+   package.json to the next patch over npm latest (`0.1.208`), protect it (same payload);
+5. do NOT apply `backport` labels before step 4 lands — they would auto-cut
+   `bugfix-v0.1.207` from the stale tag instead;
+6. carry the outstanding fixes into the new lane — including advisory bc-2026-001
+   (#4655): its original target `bugfix-v0.1.206` is frozen by the monotonic guard
+   and can never ship it;
+7. open the ship PR (lane → `bugfix`, label `ci:full`) and merge = publish `0.1.208`.
+
+Two accepted consequences of cutting from aligned master: the epoch-1 push trips
+`lane-leak-guard.yml`'s tag-based window unless the fork-point baseline shipped with
+#4660 is present (it is), and the epoch-1 publish ships everything master held at cut
+time — the narrow "tag + fixes only" property is lost for this ONE cycle only; every
+later lane is auto-cut from its freshly shipped tag, whose tree carries the v3 file, so
+the property holds indefinitely after that. (The alternative — cut from the stale tag
+and carry the v3 workflow file in as an inert first commit — was rejected: it strands
+the tag stream on the v2-era ci.yml, so lane PRs lose the core matrix permanently.)
+
+Ship PRs run the COMPLETE suite: ci.yml forces FULL scope for base=`bugfix`
+(no label needed), and the e2e lanes ride the standard `ci:full` label on the
+ship PR. Belt-and-braces, the publish pipeline ALSO dispatches whatever is
+missing of the full set at the exact post-merge sha and waits for green before
+npm publish (hard fail; fast-mode skip = owner-owned risk).
+
+**Cycle stages:** P1 carries land in the lane (silent) → P2 the ship PR
+(lane → `bugfix`) merges = publish → P3 right after success the alignment PR
+(`bugfix` → master) is auto-opened; the owner merges it (structural conflicts
+EXPECTED — resolve master-first, keeping only lane-unique content) → **P4 the
+merge of THAT alignment PR auto-cuts the next lane**: `release-bugfix.yml`'s
+second path cuts `bugfix-vX.Y.Z` from tag `vX.Y.Z`, pre-bumps package.json
+(+1 patch) and pushes it — zero manual steps per cycle after the very first
+(one-time manual cut: `bugfix-v0.1.206`). GITHUB_TOKEN cannot apply branch
+protection, so each auto-cut ends with an announcement comment carrying the
+one remaining click (Settings → Branches, or the payload below).
+
+**Alignment PR title contract (load-bearing for P4 — do not rename):**
+`align master with vX.Y.Z (shipped from <lane>)`. An alignment PR whose title
+lacks this prefix is ignored by the auto-cut path.
 
 `release.yml` cannot do this: it builds the post-merge MASTER tree on push-to-master,
 so it can never exclude commits already on master. This channel checks out and
-publishes the carve-out PR's head tree instead — the artifact is exactly that tree,
+publishes the LANE HEAD tree instead — the artifact is exactly that tree,
 nothing else.
 
-**Process:**
+**Process (legacy one-off carve-out path — kept DORMANT; new work uses the
+protected lane described above):**
 
 1. Cut the hotfix branch from the last released TAG (not master), apply ONLY the fix
    plus the version bump (regenerate `package-lock.json` as in step 3 above; sync the
@@ -264,28 +388,46 @@ nothing else.
 
 **Emergency fallback:** a manual `workflow_dispatch` run against an explicitly chosen
 ref (picked in the Actions UI) still works and runs every guard above — for when the
-PR dance is slower than the fire.
+PR dance is slower than the fire. It also carries the emergency FAST valve (#3613,
+restored 2026-10-28 after the #4718 removal): ticking `fast` AND typing exactly
+`FAST PUBLISH CONFIRMED` into `confirm_fast` skips the full-CI dispatch/gate and the
+local full test while keeping every version guard + npm ci + typecheck + build;
+any partial or default input silently keeps the normal slow path (the typed phrase
+is the anti-misfire guard from #4718).
 
-**Conflicted ship PRs (label publish):** a lane/carve cut from an OLD tag can
-conflict with master at ship time — the fixes already landed there and master
-moved on, so GitHub's merge button refuses. Resolving on the lane is FORBIDDEN
-(`Never merge master into a lane` below — the publish tree must stay leak-free)
-and resolving on master needs a direct master push. For that case: add the
-`backport-ship` label to the OPEN ship PR (head branch must match `bugfix-v*` /
-`bugfix-release/*`, same-repo, not a fork). `release-bugfix.yml`'s
-`pull_request_target` trigger then publishes the PR's HEAD tree with every guard
-above — no merge required; the PR stays open as the publish record (the workflow
-leaves the audit comment on it). `pull_request_target` runs the master copy of the
-workflow, so lanes cut from old tags — whose own `release-bugfix.yml` predates the
-`bugfix-v*` marker and would silently skip the closed-PR path — publish correctly
-too. Master syncs later via a normal metadata-only PR, or simply advances on its
-next regular release (which must be higher anyway).
+**Label publish: DECOMMISSIONED (2026-10-25).** The former `backport-ship`
+label path (a single label made CI publish WITHOUT any merge decision) is
+removed from `release-bugfix.yml` and from the repository vocabulary: a
+publish action must be a human MERGE into the protected lane. Runs labeled
+before the removal complete on their own terms; do not apply the label again.
 
-**Master interaction:** merging the carve-out PR brings the version bump INTO master
-(master then equals npm latest, so the one-click fast path's drift guard sees a clean
-tree again). Master advances independently on its next normal release, which MUST be
-higher than the carve-out version (after v0.1.182 was cut off v0.1.181, the next
-normal release must be ≥ 0.1.183).
+**Lane / gate-branch protection (same status as master — the one manual
+click per new branch):** Settings → Branches → Add rule (or API — GITHUB_TOKEN
+cannot):
+```json
+PUT /repos/<owner>/billion-context/branches/{bugfix | bugfix-vX.Y.Z}/protection
+{
+  "required_status_checks": { "strict": true, "contexts": ["<observed PR context roster; lanes: gate>"], "context_options": [] },
+  "enforce_admins": false,
+  "required_pull_request_reviews": { "required_approving_review_count": 0 },
+  "allow_force_pushes": { "enabled": false },
+  "allow_deletions": { "enabled": false }
+}
+```
+Context rosters come from the PR's own commits/check-runs (a required context
+that ever lands `skipped` deadlocks merges — verified on #4577: lane PRs
+produce only `gate`; ship PRs into `bugfix` produce the full ci.yml names plus
+the e2e lanes once labeled `ci:full`).
+
+**Master interaction:** after a publish the pipeline AUTO-OPENS the alignment
+PR (`bugfix` → master — the gate branch contains exactly the merged lane)
+carrying the shipped content incl. the version bump; structural conflicts vs
+an evolved master are EXPECTED — resolve master-first, keeping only
+lane-unique content. Merging it completes the cycle (master then equals npm
+latest, so the master lane's drift guard sees a clean tree again) and triggers
+stage P4 (auto-cut of the next lane). Master's next normal release MUST be
+higher than the shipped version (after v0.1.207 ships off its lane, the next
+normal release is ≥ 0.1.208).
 
 ## Dual-lane releases: label → carry PR → ship
 
@@ -304,6 +446,11 @@ patch, 0.1.207 feature, 0.1.208 patch … all legal). The lane name IS its base
 tag — no stored pointer anywhere: GITHUB_TOKEN cannot touch the actions-
 variables API (the earlier variable-based bot 403'd on its maiden run), so the
 current lane is always DERIVED as `bugfix-v$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)`.
+Since 2026-10-25 every lane is PROTECTED with the same status as master (see
+the gate-branch rules above). Lane cutting: the FIRST lane of the epoch is
+cut manually (push + protect); every later lane is AUTO-CUT by
+release-bugfix.yml stage P4 (from the freshly shipped tag, pre-bumped),
+leaving only the protection click for the owner.
 
 **Routing a fix (label BEFORE merge):** apply the `backport` label to the
 fix's OPEN PR — any base, any state. `backport.yml` reacts at once:
@@ -337,18 +484,24 @@ on `merge^1..merge^2` semantics and must refuse squash/rebase merges outright
 (rewritten SHAs would ship a PARTIAL fix silently). Pick-from-head works for
 every merge shape, every time, and lets temporary fixes stay lane-only.
 
-**Ship the lane** (owner-gated, #2910): **Actions → "Release (one-click)" →
-tick `train`**. That resolves `bugfix-v<latest-tag>` (cutting it if missing —
-an EMPTY lane refuses to ship with a clear error), drift-guards (lane version
-== npm latest), adds the isolated `release v{NEXT}` commit, pushes it to the
-lane, dispatches the FULL CI set, and opens the ship PR against master with a
-changelog. You merge it; `release-bugfix.yml` publishes the PRE-MERGE head tree
-(tag + carried fixes) and creates the fresh tag — which by derivation CLOSES
-this cycle: the next `backport` label automatically cuts `bugfix-v{NEXT}` from
-the fresh tag. No closeout step exists because nothing is stored. If the ship
-PR CONFLICTS with master (fixes already landed there, master moved on): do not
-resolve on the lane, do not touch master — apply the `backport-ship` label to
-publish the head tree without merging (see the carve-out channel section).
+**Ship the lane (v3, 2026-10-25 — GATE-BRANCH):** the lane is protected
+exactly like master, so the ONLY way content reaches it is a reviewed PR — and
+carries merging into the lane publish NOTHING. When the batch is ready, open
+the ship PR **`bugfix-vX.Y.Z` → `bugfix`** (tag it `ci:full` for the e2e
+lanes; ci.yml already forces the FULL core matrix for base=`bugfix`).
+**Merging THAT PR IS the release**: `release-bugfix.yml` (executing the
+`bugfix`-side copy) publishes the POST-MERGE lane head (= the ship PR's
+`merge_commit_sha`), runs the full guard chain, tags + publishes + creates the
+GitHub Release, leaves the audit comment on the merged ship PR, and
+AUTO-OPENS the alignment PR (`bugfix` → master). Merging the alignment PR
+closes the cycle and auto-cuts the next lane (stage P4). No mechanism labels,
+no direct pushes, no closeout step — nothing is stored.
+
+(LEGACY, retired with the same change: the "Release (one-click)" `train`
+dispatch — bump the lane / open a ship PR vs master / publish on that merge —
+now refuses at its first step; it predates merge-gating and its direct-push
+mechanics are incompatible with a protected lane. That workflow's MASTER-lane
+normal-release flow is unaffected.)
 
 ⚠ Severe fixes riding the lane: include the release-notes entry (#1870) in the
 source fix PR so the carry picks transport it — the publish gate checks the
@@ -372,10 +525,23 @@ SHA-differing cherry-pick is the price of leak safety, and
 `lane-leak-guard.yml` fails any lane push whose history contains a merge whose
 second parent is a master ancestor.
 
-**CI wiring:** pushes to `bugfix-v*` / PRs INTO a lane / carry branches run the
-CORE matrix (ci.yml trigger filters); the FULL matrix at ship time comes from
-`release-bugfix.yml`'s dispatch. The `ci.yml` version-guard allowlists
-`bugfix-v*` heads (their ship PR carries the one legal bump commit).
+**CI wiring (v3):** lane carry PRs produce the per-e2e-workflow `gate`
+contexts (scope-decision jobs, green while e2e suites report skipped) — those
+are the lane's required checks (verified live on #4577: 16× `gate` success,
+every e2e suite context present-as-skipped). SHIP PRS (into `bugfix`) get the
+real deal: ci.yml runs FULL scope for base=`bugfix` (the 16-leg test matrix
+under its legacy `test (...)` shard names + static gates) and the `ci:full`
+label rides all eight e2e lanes green — so the gate branch's required-checks
+list is the ship PR's observed context roster, i.e. full gating realized
+literally where a green full suite is actually achievable. Pushes to
+`bugfix-v*`/`bugfix` still match ci.yml's push trigger (moot under protection
+— direct pushes are forbidden). The `ci.yml` version-guard allowlists
+`bugfix-v*` heads (the lane carries its one legal bump commit, made at cut
+time). Whatever a ship PR does not cover is closed structurally: at publish
+time the post-merge sha is brand-new, so `release-bugfix.yml` dispatches
+whatever is missing of the FULL matrix at the exact publish sha and waits for
+green before npm publish (hard fail; fast-mode skip = owner-owned risk, see
+the workflow).
 
 ## CI publish mechanism (what release.yml does)
 

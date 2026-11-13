@@ -159,9 +159,15 @@ test("#847: preflight reports honest exhaustion when every listed range is sub-g
         model: "test-model",
         log: (_level, msg) => { logs.push(msg); },
     };
+    // Contract update (#4288 re-land, PR #4725): this payload fits its own
+    // window by the floorless estimate (~900 tok vs 6000), so the round-top
+    // exit forwards it BEFORE any range walk — the honest-exhaustion path now
+    // only runs for payloads that genuinely exceed the target with nothing
+    // sub-gate-foldable. The usage baseline (6000) is stale-by-shrink-shaped:
+    // a request at the limit cannot have succeeded under it.
     const result = await preflightCompress(deps, messages);
     assert.equal(result.compressedRanges, 0, "nothing compressed");
-    assert.equal(result.failure?.kind, "exhausted", `honest exhaustion, not an upstream call (got: ${JSON.stringify(result.failure)})`);
-    assert.match(result.failure?.detail ?? "", /no compressible ranges remain/i, "does not misreport sub-gate ranges as tried viable ranges");
+    assert.equal(result.failure, undefined, `a fitting payload exits fit-forward, no exhaustion verdict (got: ${JSON.stringify(result.failure)})`);
+    assert.equal(result.fitsWindow, true, "the exit's verdict is fits-forward (#4288)");
     assert.equal(session.state.blocks.length, 0, "no blocks created");
 });

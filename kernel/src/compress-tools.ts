@@ -21,6 +21,14 @@ export const DECOMPRESS_TOOL_NAME = "decompress";
 export const SEARCH_CONTEXT_TOOL_NAME = "search_context";
 export const ACP_STATUS_TOOL_NAME = "acp_status";
 export const ACP_CACHE_TOOL_NAME = "acp_cache";
+/** #5765 block ops: retire/restore move a block's summary out of (back into)
+ *  the resident view; rewrite replaces its stored summary with supplied text.
+ *  OPT-IN (config.blockOps.enabled, default off): hosts advertise, inject and
+ *  prompt for these only when enabled — the tool definitions below stay exported
+ *  unconditionally (same pattern as the absorb tools). */
+export const ACP_RETIRE_TOOL_NAME = "acp_retire";
+export const ACP_RESTORE_TOOL_NAME = "acp_restore";
+export const ACP_REWRITE_TOOL_NAME = "acp_rewrite";
 export const ABSORB_TOOL_NAME = "absorb";
 
 /** Text-protocol trigger tags. The model emits these in its text output to
@@ -40,93 +48,48 @@ export const ACP_DECOMPRESS_CLOSE = "</acp_decompress>";
  *  parseCompressArgs accepts both (startRef/endRef canonical, startId/endId
  *  legacy drift) — a pre-validating host must reject nothing the kernel
  *  accepts (#374). */
-const COMPRESS_RANGE_OBJECT = {
-  type: "object",
-  properties: {
-    topic: { type: "string" },
-    startId: {
-      type: "string",
-      description: "mNNNNN ref at the start of the range",
-    },
-    endId: {
-      type: "string",
-      description: "mNNNNN ref at the end of the range",
-    },
-    startRef: {
-      type: "string",
-      description: "Alternate spelling of startId",
-    },
-    endRef: {
-      type: "string",
-      description: "Alternate spelling of endId",
-    },
-    summary: {
-      type: "string",
-      description: "Self-contained summary replacing the range",
-    },
-  },
-};
 
-/** Shared parameter schema for every compress wire shape (anthropic
+/**
+ *  Shared parameter schema for every compress wire shape (anthropic
  *  `input_schema`, openai `function.parameters`, responses flat
  *  `parameters`).
  *
- *  ADVERTISED FORM (#4252 decision): exactly one — content = ONE plain
- *  string holding ALL ranges (line form). The parser keeps honoring the
- *  legacy shapes (array content of line strings / range objects, the flat
- *  single-range call, and summary-as-plain-text in content with top-level
- *  refs), but the schema no longer teaches them: advertising several forms
- *  is what led models to blend them into invalid hybrids.
+ *  ADVERTISED FORM (#4252 decision, completed 2026-10-26): exactly one —
+ *  content = ONE plain string holding ALL ranges (line form), declared as
+ *  a single {type:"string"}. The earlier #4252 pass rewrote only the prose
+ *  and kept the anyOf branches; guided-decoding models still blended the
+ *  branches into parser-invalid hybrids (bili gate 2026-10-26: content sent
+ *  as an array of headerless bare-summary strings with a top-level topic),
+ *  so the array alternatives and the top-level `topic` declaration are now
+ *  structurally removed. The parser keeps honoring every legacy shape
+ *  (array content of line strings / range objects, the flat single-range
+ *  call, summary-as-plain-text with top-level refs, top-level topic) —
+ *  narrowing is advertise-side only.
  *
- *  Contract (#374, still holds): the schema must never kill a call the
- *  kernel would honor. It stays an OPEN object schema — no top-level
- *  `required`, no `additionalProperties: false` — so a flat single-range
- *  call {startId, endId, summary} still validates even though those
- *  properties are no longer declared. Do not add strictness here without
+ *  Contract (#374, still holds for the object shell): the schema stays an
+ *  OPEN object schema — no top-level `required`, no
+ *  `additionalProperties: false` — so a flat single-range call
+ *  {startId, endId, summary} and an undeclared top-level `topic` still
+ *  validate. One deliberate acceptance-set reduction vs the pre-2026-10
+ *  schema: `content` as a JSON ARRAY no longer validates (the kernel
+ *  parser still honors it). Do not add strictness here without
  *  re-checking parse-compress-input.ts.
  *
  *  Wire-legality constraint (bili #1299, fixed after the #374 follow-up
- *  regressed it): the TOP LEVEL must stay a plain object schema — no
+ *  regressed it): the TOP LEVEL stays a plain object schema — no
  *  `oneOf`/`allOf`/`anyOf`/`not`. Anthropic rejects tool input_schema with
- *  top-level combinators (400 on every request carrying the tool), so the
- *  content string-vs-array alternation lives in the `anyOf` under `content`
- *  and is enforced by parseCompressInput, never by a top-level combinator.
- *  Copilot Gemini also needs scalar types and self-contained typed
- *  alternatives; keep each nested object alternative's properties with it.
+ *  top-level combinators (400 on every request carrying the tool).
+ *  Copilot Gemini needs scalar types; the single string branch is
+ *  trivially compliant.
  */
+
 export const COMPRESS_PARAMETERS = {
   type: "object",
   properties: {
-    topic: {
-      type: "string",
-      description: "Optional short title for the compressed range",
-    },
     content: {
+      type: "string",
       description:
         "ONE plain string holding ALL ranges to compress — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary markdown (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Batch multiple ranges into ONE call — do not split into one call per range.",
-      anyOf: [
-        {
-          type: "array",
-          items: {
-            anyOf: [
-              {
-                type: "string",
-                description:
-                  "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
-              },
-              {
-                ...COMPRESS_RANGE_OBJECT,
-                required: ["startId", "endId", "summary"],
-              },
-              {
-                ...COMPRESS_RANGE_OBJECT,
-                required: ["startRef", "endRef", "summary"],
-              },
-            ],
-          },
-        },
-        { type: "string" },
-      ],
     },
   },
 };
@@ -221,25 +184,39 @@ export const COMPRESS_TOOL_OPENAI = {
   },
 };
 
+/** #4313 (toggle, PR #5236): timestamps-off default — the exact pre-feature ACP TAGS section; the default assembly ships these so `messageTimestamps` off renders byte-identical to pre-#4313 masters. The time-aware variants below reach hosts that enable the feature (bili selects them at the prompt-exit when compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS is on). */
+const FUNCTION_ACP_TAGS_DEFAULT = `ACP TAGS
+
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+
+export const FUNCTION_ACP_TAGS_TIMESTAMPED = `ACP TAGS
+
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+
+const TEXT_ACP_TAGS_DEFAULT = `ACP TAGS
+
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+
+export const TEXT_ACP_TAGS_TIMESTAMPED = `ACP TAGS
+
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+
 const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
 > = [
-  [
-    "acpTags",
-    `ACP TAGS
-
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`,
-  ],
+  ["acpTags", FUNCTION_ACP_TAGS_DEFAULT],
   [
     "tools",
     `TOOLS
 
-You have five context-management tools:
+You have four context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range.
-- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
-- search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
-- acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Never split a batch into one call per range.
+- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
+- search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
+- acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
+
+Message refs are per-generation: mNNNNN ids are assigned in ingest order for THIS conversation view. Switching model or upstream mid-conversation starts a fresh generation whose refs restart at m00001 and old ones stop resolving — after any such switch (or any unknown-ref failure), call acp_status for current refs before compressing.`,
   ],
   [
     "summariesInContext",
@@ -278,12 +255,7 @@ export function buildCompressSystemPrompt(
 const TEXT_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
 > = [
-  [
-    "acpTags",
-    `ACP TAGS
-
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
-  ],
+  ["acpTags", TEXT_ACP_TAGS_DEFAULT],
   [
     "textProtocol",
     `COMPRESSION PROTOCOL (TEXT)
@@ -353,7 +325,7 @@ const HYBRID_PROMPT_SECTIONS: ReadonlyArray<
     "acpTags",
     `ACP TAGS
 
-Each message in the conversation is annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
+Addressable messages in the conversation are annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
   ],
   [
     "textProtocol",
@@ -400,6 +372,25 @@ export function buildCompressHybridSystemPrompt(
   ].join("\n\n");
 }
 
+/** #5765: system-prompt section for the opt-in block-lifecycle tools
+ *  (acp_retire / acp_restore / acp_rewrite). Hosts append it ONLY when they
+ *  also inject the tools (config.blockOps.enabled), so the prompt never
+ *  advertises a tool the request's tools array lacks. "function" = the
+ *  function-tool lanes (anthropic/chat/google + responses function mode);
+ *  "hybrid" = the Responses text-protocol lane, where compress stays a text
+ *  marker and the block ops ride as real function tools. */
+export function buildBlockOpsSystemPrompt(lane: "function" | "hybrid"): string {
+  if (lane === "hybrid") {
+    return `You also have these block-management function tools:
+- acp_retire / acp_restore — move blocks out of (back into) the resident view without losing them. Arguments: {"blockId":"b5"} or {"ids":["b3","b7"]}.
+- acp_rewrite — replace a block's stored summary with shorter supplied text (no re-compression; originals untouched). Arguments: {"blockId":"b5","summary":"..."} or {"items":[{"blockId":"b5","summary":"..."}]}.`;
+  }
+  return `BLOCK-LIFECYCLE MANAGEMENT (acp_retire / acp_restore / acp_rewrite)
+
+- acp_retire / acp_restore — Move compressed blocks out of (back into) the resident view without losing them: acp_retire({ blockId }) or acp_retire({ ids: ["b3","b7"] }) stops injecting those blocks' summaries every turn (decompress/search_context still work; acp_status lists them under RETIRED BLOCKS); acp_restore({ blockId }) puts them back. Use for old material that no longer needs to be resident.
+- acp_rewrite — Replace a block's stored summary with shorter text you write: acp_rewrite({ blockId: "b5", summary: "..." }) or batch via items:[{blockId,summary}]. No re-compression; the previous summary stays available one step deep for rollback and the originals are untouched.`;
+}
+
 export const DECOMPRESS_TOOL_OPENAI = {
   type: "function" as const,
   function: {
@@ -444,21 +435,54 @@ export const SEARCH_CONTEXT_TOOL_OPENAI = {
   },
 };
 
+// #5555 audit: handleAcpStatus has always read scope/view/tool/sort/limit/
+// archiveDetail, but every wire advertised ZERO parameters so models could
+// only guess them from prose tips. Declared once here; all four wire
+// variants share this object (anthropic/responses/google alias it).
+const ACP_STATUS_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    scope: {
+      type: "string",
+      description:
+        '"uncompressed": history outside active blocks; "compressed": block ledger; omit = default overview',
+    },
+    view: {
+      type: "string",
+      description: '"messages" for a per-message listing; "ranges" is the default',
+    },
+    tool: {
+      type: "string",
+      description: 'With view:"messages": only list results of this tool name',
+    },
+    sort: {
+      type: "string",
+      description: 'With view:"messages": order by "size", "time", "tool", or "age"',
+    },
+    limit: {
+      type: "number",
+      description: "Max entries to list",
+    },
+    archiveDetail: {
+      type: "boolean",
+      description:
+        "List pre-compaction archived blocks per-id instead of grouped by reason",
+    },
+  },
+};
+
 export const ACP_STATUS_TOOL_OPENAI = {
   type: "function" as const,
   function: {
     name: ACP_STATUS_TOOL_NAME,
     description:
-      "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
-    parameters: {
-      type: "object",
-      properties: {},
-    },
+      "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+    parameters: ACP_STATUS_PARAMETERS,
   },
 };
 
 export const ACP_CACHE_TOOL_DESCRIPTION =
-  'Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request\'s miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail="full" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.';
+  'Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request\'s miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail="full" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.';
 
 export const ACP_CACHE_TOOL_OPENAI = {
   type: "function" as const,
@@ -472,10 +496,90 @@ export const ACP_CACHE_TOOL_OPENAI = {
           type: "string",
           enum: ["summary", "full"],
           description:
-            '"summary" (default): totals, verdicts, notable folds, anomalous requests only. "full": every retained fold and line item.',
+            '"summary" (default): totals, verdicts, notable folds, anomalous requests only. "full": every retained fold and its line-item breakdown (most-recent window — the output states the cap).',
         },
       },
     },
+  },
+};
+
+// #5765 block ops — shared parameter schemas. Open objects, no top-level
+// required: retire/restore accept blockId OR ids (the executor enforces
+// "at least one"), rewrite accepts a single pair OR an items batch.
+const BLOCK_IDS_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    blockId: {
+      type: "string",
+      description: "One block id (e.g. b5)",
+    },
+    ids: {
+      type: "array",
+      items: { type: "string" },
+      description: "Several block ids in one call (e.g. [\"b3\", \"b7\"])",
+    },
+  },
+};
+
+const ACP_RETIRE_DESCRIPTION =
+  "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.";
+
+const ACP_RESTORE_DESCRIPTION =
+  "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.";
+
+const ACP_REWRITE_DESCRIPTION =
+  "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.";
+
+const ACP_REWRITE_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    blockId: {
+      type: "string",
+      description: "Block id to rewrite (e.g. b5) — single-block form",
+    },
+    summary: {
+      type: "string",
+      description: "The replacement summary text — single-block form",
+    },
+    items: {
+      type: "array",
+      description: "Batch form: several rewrites in one call",
+      items: {
+        type: "object",
+        properties: {
+          blockId: { type: "string", description: "Block id (e.g. b5)" },
+          summary: { type: "string", description: "Replacement summary text" },
+        },
+        required: ["blockId", "summary"],
+      },
+    },
+  },
+};
+
+export const ACP_RETIRE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_RETIRE_TOOL_NAME,
+    description: ACP_RETIRE_DESCRIPTION,
+    parameters: BLOCK_IDS_PARAMETERS,
+  },
+};
+
+export const ACP_RESTORE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_RESTORE_TOOL_NAME,
+    description: ACP_RESTORE_DESCRIPTION,
+    parameters: BLOCK_IDS_PARAMETERS,
+  },
+};
+
+export const ACP_REWRITE_TOOL_OPENAI = {
+  type: "function" as const,
+  function: {
+    name: ACP_REWRITE_TOOL_NAME,
+    description: ACP_REWRITE_DESCRIPTION,
+    parameters: ACP_REWRITE_PARAMETERS,
   },
 };
 
@@ -514,6 +618,24 @@ export const ACP_CACHE_TOOL = {
   name: ACP_CACHE_TOOL_NAME,
   description: ACP_CACHE_TOOL_DESCRIPTION,
   input_schema: ACP_CACHE_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_RETIRE_TOOL = {
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  input_schema: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL = {
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  input_schema: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL = {
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  input_schema: ACP_REWRITE_PARAMETERS,
 };
 
 export const ACP_TOOLS_ANTHROPIC = [
@@ -560,6 +682,27 @@ export const ACP_CACHE_TOOL_RESPONSES = {
   parameters: ACP_CACHE_TOOL_OPENAI.function.parameters,
 };
 
+export const ACP_RETIRE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL_RESPONSES = {
+  type: "function" as const,
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  parameters: ACP_REWRITE_PARAMETERS,
+};
+
 /** All ACP tools in Responses API flat format, matching ACP_TOOL_NAMES. */
 export const ACP_TOOLS_RESPONSES = [
   COMPRESS_TOOL_RESPONSES,
@@ -583,8 +726,9 @@ export const ACP_READONLY_TOOLS_RESPONSES = [
 ] as const;
 
 /** All ACP tool names (dynamic membership — Set, not a static record). Does
- *  NOT include absorb or acp_retrieve: both are opt-in (config.absorb.enabled
- *  / config.ccr.enabled) and hosts only register/inject them when on. */
+ *  NOT include absorb, acp_retrieve or the #5765 block ops: all opt-in
+ *  (config.absorb.enabled / config.ccr.enabled / config.blockOps.enabled) and
+ *  hosts only register/inject them when on. */
 export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
   DECOMPRESS_TOOL_NAME,
@@ -593,11 +737,27 @@ export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   ACP_CACHE_TOOL_NAME,
 ]);
 
-/** compress/decompress: mutate history → must drive the compress loop (their
- *  result is folded into the request before the model continues). */
+/** #5765: the opt-in block-lifecycle tool names. Like absorb/acp_retrieve they
+ *  stay OUT of ACP_TOOL_NAMES (config.blockOps.enabled gates the surface), but
+ *  every "is this a bili-owned tool" check (absorb candidacy, ccr placeholder
+ *  skip, side-request demotion) must still recognize them — when enabled their
+ *  receipts behave like any other ACP tool receipt. */
+export const BLOCK_OP_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ACP_RETIRE_TOOL_NAME,
+  ACP_RESTORE_TOOL_NAME,
+  ACP_REWRITE_TOOL_NAME,
+]);
+
+/** compress/decompress/acp_retire/acp_restore/acp_rewrite: mutate session
+ *  state → must drive the compress loop (their result is folded into the
+ *  request before the model continues — for the block ops that is what makes
+ *  the shrink/restore land within the same turn). */
 export const ACP_MUTATING_TOOLS: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
   DECOMPRESS_TOOL_NAME,
+  ACP_RETIRE_TOOL_NAME,
+  ACP_RESTORE_TOOL_NAME,
+  ACP_REWRITE_TOOL_NAME,
 ]);
 
 /** acp_status/search_context/acp_cache: read-only → must NOT loop. Looping them
@@ -611,7 +771,7 @@ export const ACP_READONLY_TOOLS: ReadonlySet<string> = new Set([
 /** Opt-in absorb tool (instant tool-result absorption). Inject/register only
  *  when config.absorb.enabled — NOT part of ACP_TOOLS_* arrays. */
 export const ABSORB_TOOL_DESCRIPTION =
-  "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.";
+  "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. \'(nothing needed)\') \u2014 that discards the output cleanly.";
 
 const ABSORB_PARAMETERS = {
   type: "object" as const,
@@ -647,48 +807,15 @@ export const ABSORB_TOOL_OPENAI = {
 
 // Gemini native format: flat `{ name, description, parameters }` function
 // declarations (no `{type:"function"}` wrapper), injected as
-// `tools[].functionDeclarations`.
+// `tools[].functionDeclarations`. Since the 2026-10-26 narrowing the
+// parameters are the shared single-string schema: the historical reason
+// for a separate Google shape was `anyOf` rejection by older API
+// revisions, and the narrowed schema no longer uses anyOf at all. The
+// legacy object-array form stays parser-honored (parseCompressInput).
 export const COMPRESS_TOOL_GOOGLE = {
   name: COMPRESS_TOOL_NAME,
   description: COMPRESS_TOOL.description,
-  // `anyOf` is rejected by older API revisions, so `content` declares the
-  // object form; a JSON-encoded string of that array is still accepted by
-  // parseCompressInput, and the line form (a summary whose first line is
-  // 'm00150–m00220 optional topic') is documented in the description.
-  parameters: {
-    type: "object",
-    properties: {
-      topic: {
-        type: "string",
-        description: "Optional short title for the compressed range",
-      },
-      content: {
-        type: "array",
-        description:
-          "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
-        items: {
-          type: "object",
-          properties: {
-            topic: { type: "string" },
-            startId: {
-              type: "string",
-              description: "mNNNNN ref at the start of the range",
-            },
-            endId: {
-              type: "string",
-              description: "mNNNNN ref at the end of the range",
-            },
-            summary: {
-              type: "string",
-              description: "Self-contained summary replacing the range",
-            },
-          },
-          required: ["startId", "endId", "summary"],
-        },
-      },
-    },
-    required: ["content"],
-  },
+  parameters: COMPRESS_PARAMETERS,
 };
 
 export const DECOMPRESS_TOOL_GOOGLE = {
@@ -709,12 +836,39 @@ export const ACP_STATUS_TOOL_GOOGLE = {
   parameters: ACP_STATUS_TOOL_OPENAI.function.parameters,
 };
 
+/** #5555 audit: google previously shipped acp_status but NOT acp_cache —
+ *  Gemini lanes could be asked about cache economics through prose alone. */
+export const ACP_CACHE_TOOL_GOOGLE = {
+  name: ACP_CACHE_TOOL_NAME,
+  description: ACP_CACHE_TOOL_DESCRIPTION,
+  parameters: ACP_CACHE_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_RETIRE_TOOL_GOOGLE = {
+  name: ACP_RETIRE_TOOL_NAME,
+  description: ACP_RETIRE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_RESTORE_TOOL_GOOGLE = {
+  name: ACP_RESTORE_TOOL_NAME,
+  description: ACP_RESTORE_DESCRIPTION,
+  parameters: BLOCK_IDS_PARAMETERS,
+};
+
+export const ACP_REWRITE_TOOL_GOOGLE = {
+  name: ACP_REWRITE_TOOL_NAME,
+  description: ACP_REWRITE_DESCRIPTION,
+  parameters: ACP_REWRITE_PARAMETERS,
+};
+
 /** All ACP tools in Gemini flat format, matching ACP_TOOL_NAMES. */
 export const ACP_TOOLS_GOOGLE = [
   COMPRESS_TOOL_GOOGLE,
   DECOMPRESS_TOOL_GOOGLE,
   SEARCH_CONTEXT_TOOL_GOOGLE,
   ACP_STATUS_TOOL_GOOGLE,
+  ACP_CACHE_TOOL_GOOGLE,
 ] as const;
 
 /** Opt-in absorb tool in Gemini flat format (config.absorb.enabled). */
@@ -730,14 +884,14 @@ export const ABSORB_TOOL_GOOGLE = {
 export const RETRIEVE_TOOL_NAME = "acp_retrieve";
 
 export const RETRIEVE_TOOL_DESCRIPTION =
-  "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.";
+  "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.";
 
 const RETRIEVE_PARAMETERS = {
   type: "object" as const,
   properties: {
     ref: {
       type: "string",
-      description: "mNNNNN ref shown in the 📦 [acp-stored placeholder",
+      description: "mNNNNN ref shown in the 📦 [acp-stored …] placeholder",
     },
   },
   required: ["ref"],

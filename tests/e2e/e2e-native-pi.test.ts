@@ -363,21 +363,15 @@ async function startCtx(): Promise<Ctx> {
 
 // Graceful-stop the hermetic native proxy (SIGTERM — the server flushes
 // dirty sessions on shutdown) so persisted state is observable on disk.
-async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
-  const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+function liveInstancePids(instancesDir: string): number[] {
+  const out: number[] = [];
   try {
     for (const f of fs.readdirSync(instancesDir)) {
       try {
         const rec = JSON.parse(
           fs.readFileSync(path.join(instancesDir, f), "utf8"),
         ) as { pid?: number };
-        if (typeof rec.pid === "number" && rec.pid > 0) {
-          try {
-            process.kill(rec.pid, "SIGTERM");
-          } catch {
-            /* already gone */
-          }
-        }
+        if (typeof rec.pid === "number" && rec.pid > 0) out.push(rec.pid);
       } catch {
         /* unreadable record */
       }
@@ -385,7 +379,35 @@ async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
   } catch {
     /* no instances dir */
   }
-  await new Promise((r) => setTimeout(r, 500));
+  return out;
+}
+
+async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
+  const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+  for (const pid of liveInstancePids(instancesDir)) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  // Wait for actual EXIT, not a blind sleep: the product drains keep-alives
+  // BEFORE flushing sessions on SIGTERM (SHUTDOWN_DRAIN_GRACE_MS = 10s
+  // backstop), so a fixed short read can land pre-flush and flake
+  // ("proxy must persist the session", #4599). Exit ⇒ flush completed.
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const alive = liveInstancePids(instancesDir).filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (alive.length === 0 || Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 function teardown(ctx: Ctx): void {
@@ -436,6 +458,17 @@ function piRun(
       cwd: ctx.piCwd,
       env: {
         ...cleanEnv(),
+        // This suite documents the SPAWN-posture package-native contract:
+        // instance record + proxy origin, per-request wire stamps, the
+        // shared-proxy delegate-child ACP channel (#2268), /__bili/plugin/status
+        // over HTTP. #5428 flipped the pi lane DEFAULT to inline (in-process
+        // engine, no instance record) and this suite was not updated with it:
+        // primary-lane tests then pass for the wrong reason while the
+        // instance-record and delegate-child stamp assertions fail structurally
+        // (CI sentinel incident, #4599). Pin the legacy posture so this
+        // coverage stays deterministic; inline posture is covered by
+        // tests/pi-inline-ws.test.ts and tests/pi-native.test.ts.
+        BILI_PI_INLINE: "0",
         PI_CODING_AGENT_DIR: ctx.piAgentDir,
         XDG_CONFIG_HOME: ctx.xdg.config,
         XDG_CACHE_HOME: ctx.xdg.cache,
