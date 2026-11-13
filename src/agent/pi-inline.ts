@@ -36,13 +36,17 @@ export function installInlineTransport(): boolean {
         return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
             const url = urlOf(input);
             if (url === undefined || !url.startsWith(INLINE_ORIGIN)) return send(input, init);
+            const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
+            signal?.throwIfAborted();
             try {
                 const engine = await getInlineEngine();
+                signal?.throwIfAborted();
                 return await engine.dispatch(input, init, rawSend);
             } catch (err) {
                 // Caller-side cancel is not an engine failure — propagate it:
                 // degrading would consume the one-shot warning and re-send a
                 // request the caller already abandoned.
+                signal?.throwIfAborted();
                 if (err instanceof Error && err.name === "AbortError") throw err;
                 const msg = err instanceof Error ? err.message : String(err);
                 if (url.startsWith(MODEL_PREFIX)) {
