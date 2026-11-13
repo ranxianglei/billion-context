@@ -301,6 +301,44 @@ test("#5780 P4: a sub-gate run (below minCompressRange) stays UNMARKED — its r
     assert.match(receipt, /too small/i, `expected the size-gate refusal, got:\n${receipt}`);
 });
 
+test("#5780 P5: an isolated protected-tool run gets the FILTERED marker (not the zone marker) — the no-op cause is the content filter, not the zone", () => {
+    // A standalone compress exchange (a call with no preceding assistant act
+    // forms its own pair group) sits in mid-history, far from the recent
+    // window. Both messages are ALWAYS_PROTECTED, so the offer never reaches
+    // it (both passes) and the screen sees the kernel's filter no-op — "all of
+    // its content is protected or filtered" — which the zone marker would
+    // mislabel. A covered gap isolates the pair from the visible tail, and the
+    // tail (3 turns) keeps the recent-3 zone away from the pair.
+    const GAP_TURNS = 36;
+    const TAIL_TURNS = 3;
+    const allProbe = buildSession(GAP_TURNS + TAIL_TURNS, 4000, "probe");
+    const gap = allProbe.slice(0, GAP_TURNS * MSGS_PER_TURN);
+    const tail = allProbe.slice(GAP_TURNS * MSGS_PER_TURN);
+    const fill = "z".repeat(2900);
+    const head: CoreMessage[] = [
+        { id: "comp_user", role: "user", contentType: "text", text: `Compress request. ${"w".repeat(200)}` },
+        { id: "comp_call", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "tc_comp", text: JSON.stringify({ input: `fold ${fill}` }) },
+        { id: "comp_result", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "tc_comp", text: `compressed: ${fill}` },
+    ];
+    const ctx = withRefs(makeCtx([...head, ...gap, ...tail], { preserveRecentMessages: 3, preserveRecentTokens: 0 }));
+    const userOnly = { startRef: refAt(0), endRef: refAt(0) }; // idx 0: the compress request
+    const gapSpan = { startRef: refAt(3), endRef: refAt(3 + gap.length - 1) }; // idx 3..326: the covered gap
+    const out = runApply(ctx, foldArgs([userOnly, gapSpan]));
+    assert.ok(out.startsWith("[Compressed"), `setup folds expected to land, got: ${out.slice(0, 200)}`);
+    const runs = uncoveredHistoryRuns({ core: ctx.core, messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 100000 });
+    const pair = runs.find((r) => r.startRef === refAt(1)); // m00002: the compress call
+    assert.ok(pair, `isolated protected-tool run missing: ${JSON.stringify(runs)}`);
+    assert.equal(pair.endRef, refAt(2), `run = the pair only: ${JSON.stringify(pair)}`);
+    assert.match(pair.note ?? "", /not foldable/, `run must carry the marker: ${JSON.stringify(pair)}`);
+    assert.match(pair.note ?? "", /protected or filtered/i, `marker must name the filter cause: ${JSON.stringify(pair)}`);
+    assert.doesNotMatch(pair.note ?? "", /protected zone/i, `zone marker would mislabel the filter no-op: ${JSON.stringify(pair)}`);
+    // Consistency pin: verbatim submission is the filter no-op the marker
+    // predicts — nothing folds, nothing fails.
+    const receipt = runApply(ctx, foldArgs([{ startRef: pair.startRef, endRef: pair.endRef }]));
+    assert.match(receipt, /no-op/, `verbatim submission must no-op:\n${receipt}`);
+    assert.match(receipt, /all of its content is protected or filtered/, `expected the filter no-op wording, got:\n${receipt}`);
+});
+
 test("#5780 unit: describeUncoveredRuns renders notes inside the parens and keeps the cap", () => {
     const runs = [
         { startRef: "m00100", endRef: "m00110", count: 9, tokens: 5000 },
