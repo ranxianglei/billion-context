@@ -1867,6 +1867,7 @@ export function settleUsageReport(
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        if (session.transient?.nudgeHeldAfterReject) delete session.transient.nudgeHeldAfterReject;
         session.stats.inputTokens += s.total;
         // #4899: USD spend ledger — input/cache-read/cache-write billed at the
         // per-request stamped price, in lockstep with the token counters above
