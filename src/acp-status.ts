@@ -20,6 +20,7 @@ import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
+import { readGenerationBoundary } from "./generation-boundary.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
@@ -370,6 +371,24 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push(`HOST-NATIVE COMPACTION — the client (${lane ?? "unknown lane"}) compacted this conversation natively at ${atIso} and bili rebased onto it at ${rebasedIso}. Refs minted before that boundary no longer resolve — compress only the live refs listed above (DEAD REFS names which ones died).`);
             }
         }
+    }
+    // #5542: witnessed/detected generation boundary — the ref ledger restarted
+    // mid-conversation (persona fork or native-compaction rebase) or previous-
+    // generation residue was detected. Display-only, user-visible in tool
+    // output: the canonical surface saying "your old refs are dead and here is
+    // why", so the model stops retrying them and verifies execution tails.
+    try {
+        const genBnd = readGenerationBoundary(ctx.session);
+        if (genBnd) {
+            const genIso = new Date(genBnd.at).toISOString();
+            const why = genBnd.reason ?? "previous-generation ref residue detected in visible history";
+            const detailTxt = genBnd.detail ? ` ${genBnd.detail}.` : "";
+            const frontierTxt = genBnd.frontier ? ` Previous-generation frontier: ${genBnd.frontier}.` : "";
+            extra.push("");
+            extra.push(`GENERATION BOUNDARY — this session's ref ledger was reset mid-conversation (${why}, ${genIso}).${detailTxt}${frontierTxt} Refs above that frontier belong to the previous generation and are PERMANENTLY INERT here: compress/decompress targeting them always fails by design — do not retry variations. Any number at or below the frontier that exists in this report may point at a DIFFERENT message than before the boundary. If your last pre-boundary instruction involved executing steps (writes, commands, pushes, syncs, deploys), verify disk/git state before reporting completion.`);
+        }
+    } catch {
+        // Display-only; never break the status report.
     }
     if (breaker) {
         extra.push("");

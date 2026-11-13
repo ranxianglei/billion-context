@@ -23,6 +23,7 @@ import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { readGenerationBoundary } from "./generation-boundary.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
@@ -597,6 +598,15 @@ function resolveDerivedDecompress(
         const count = view?.count ?? 0;
         const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;
         return toolOk(`${header}\n${body}`);
+    }
+    // #5542: when this session's ledger was reset mid-conversation (witnessed
+    // or detected), a not-found is overwhelmingly a previous-generation id —
+    // say so explicitly instead of the bare "not found" that reads like a typo
+    // and invites retry loops on ids that can never resolve here.
+    const genBnd = readGenerationBoundary(ctx.session);
+    if (genBnd) {
+        const genIso = new Date(genBnd.at).toISOString();
+        return toolFail(`[Block ${blockId} not found] This session's ref/block ledger was reset mid-conversation (generation boundary since ${genIso}): ids minted before that boundary belong to the previous generation and are PERMANENTLY INERT under this session — decompress will always fail for them, do not retry variations. Recover context from surviving summaries (search_context) or re-derive from visible history.`);
     }
     return toolFail(`[Block ${blockId} not found]`);
 }
