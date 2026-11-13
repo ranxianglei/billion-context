@@ -78,10 +78,10 @@ async function readPkgVersion(dir: string): Promise<string> {
     return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
 }
 
-// The updater's uninstall→reinstall half-deletes the install dir (npm drops
-// package.json before the directory): readPkgVersion ENOENTs inside that
-// window. waitFor probes must treat "gone for a moment" as "not there yet",
-// not crash — anything other than ENOENT still throws.
+// package.json can be momentarily absent while the updater rewrites the
+// install dir: readPkgVersion ENOENTs inside that window. waitFor probes
+// must treat "gone for a moment" as "not there yet", not crash — anything
+// other than ENOENT still throws.
 async function pkgVersionOrAbsent(dir: string): Promise<string | null> {
     try {
         return await readPkgVersion(dir);
