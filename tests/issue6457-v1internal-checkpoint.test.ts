@@ -186,6 +186,22 @@ test("#6457 unit: truncateV1ContentsForBudget — single giant anchor → return
     assert.ok((result.contents[0].parts as { text: string }[])[0].text.startsWith("TURN-0 "), "the giant anchor is the returned entry");
 });
 
+test("#6457 unit: truncateV1ContentsForBudget — tail head collides with anchor role → shifted to keep alternation", () => {
+    // 4 entries, each ~502 tokens: [user(0), model(1), user(2), model(3)].
+    // Budget keeps the two most recent entries (2, 3) but not entry 1 — the
+    // tail head (user, entry 2) then collides with the anchor's role (user,
+    // entry 0); the shift must drop entry 2 to keep the join alternating.
+    const contents = bigContents(4, 2000);
+    const budget = 1750; // anchor 502 + tail budget 1248 → keeps 2 entries, not 3
+    const result = truncateV1ContentsForBudget(contents, budget);
+    assert.equal(result.truncated, true, "over → truncated");
+    assert.equal(result.fits, true, "truncated result fits the budget");
+    assert.equal(result.contents.length, 2, "colliding tail head shifted out (would be 3 without the shift)");
+    assert.ok((result.contents[0].parts as { text: string }[])[0].text.startsWith("TURN-0 "), "anchor kept");
+    assert.ok((result.contents[1].parts as { text: string }[])[0].text.startsWith("TURN-3 "), "most recent entry kept");
+    assert.notEqual(result.contents[1].role, result.contents[0].role, "join is role-alternating");
+});
+
 test("#6457 A: small checkpoint fits the window → forwarded verbatim (byte-for-byte, no tool injection, enveloped response)", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls);
