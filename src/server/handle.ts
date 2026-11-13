@@ -120,7 +120,7 @@ const codexConfigWindowWarned = new Set<string>();
 const pluginBypassForceWarned = new Set<string>();
 
 /** Test seam: clear the #6220 warn-once set so a suite can assert the warns
- *  from a clean slate (same pattern as _resetNoOutputCeilingWarningsForTest). */
+ *  from a clean slate (same warn-once reset pattern as the no-output-ceiling seam). */
 export function _resetPluginBypassForceWarnForTest(): void {
     pluginBypassForceWarned.clear();
 }
