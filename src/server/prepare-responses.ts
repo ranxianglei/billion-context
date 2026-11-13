@@ -102,13 +102,20 @@ export async function prepareResponses(
     // of replayed items), so a retry, a restart, or the response-side close
     // repeating the same event never rebases twice.
     const inputCompactions = codexCompactionItems(parsed.input);
+    // The replayed-item channel names an event, but only a REPLACED history is
+    // a boundary: a client that still resends every covered message (an older
+    // checkpoint observed for the first time after an upgrade) keeps its folds.
+    const inputCovered = coveredRealHistoryIds(session.state.blocks);
+    const inputGap = foldCoverage(inputCovered, responsesToCore(parsed).msgs.map((message) => message.id));
+    const inputReplaced = inputCovered.size === 0 || inputGap !== null;
     const headerBoundary = checkpointSignal !== null
         && checkpointHost
         && !triggerTurn
         && isNewCodexBoundary(checkpointRecord, checkpointSignal);
     const inputBoundary = checkpointHost
         && !triggerTurn
-        && inputCompactions.count > (checkpointRecord?.seq ?? 0);
+        && inputCompactions.count > (checkpointRecord?.seq ?? 0)
+        && inputReplaced;
     const codexCheckpointBoundary = headerBoundary || inputBoundary;
     // The generation covers the history the checkpoint REPLACED, not the
     // truncated tail the client resends: keep the previous full turn view so
