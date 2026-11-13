@@ -125,7 +125,7 @@ test("#2360: unknown-ref failures label stale-ref; covered ranges label covered-
     const ok = applyRanges(args("m00003", "m00008"), fullCtx).text;
     assert.ok(ok.startsWith("[Compressed "), `large range compresses (got: ${ok.slice(0, 120)})`);
     const again = applyRanges(args("m00003", "m00008"), fullCtx).text;
-    assert.ok(again.startsWith("[Compression FAILED:"));
-    assert.match(again, /covered by active block/);
-    assert.match(again, /\[cause: covered-by-block/);
+    assert.ok(again.startsWith("[Compression no-op:"), "#4521 flip: a fully covered range is an idempotent no-op success, not a failure");
+    assert.match(again, /covered by active block/, "the no-op receipt still labels the cause");
+    assert.doesNotMatch(again, /\[cause: covered-by-block\]/, "no-op receipts carry no failure cause tag");
 });

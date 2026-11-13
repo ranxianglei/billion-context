@@ -186,12 +186,7 @@ const LEAN_TOOL_PROMPTS: ToolPrompts = {
       "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).",
     paramDescriptions: {
       content:
-        "ONE JSON-escaped string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown; object entries in the content array also accepted.",
-      startId: "Inclusive first mNNNNN or bN ref.",
-      endId: "Inclusive last mNNNNN or bN ref.",
-      summary: "Self-contained replacement preserving exact technical details.",
-      topic: "Short label; a per-range label overrides the top-level fallback.",
-      summaryMaxChars: "Optional summary length limit override.",
+        "ONE JSON-escaped string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown.",
     },
   },
   decompress: {
@@ -255,6 +250,30 @@ export function leanHowToCompress(languagePreservation = false): string {
     ? `${LEAN_HOW_TO_COMPRESS}\n\n${LANGUAGE_PRESERVATION_RULE}`
     : LEAN_HOW_TO_COMPRESS;
 }
+
+// #4313 (toggle, PR #5236): the timeline rule line and its time-aware
+// composite, exported for hosts that enable message timestamps (bili
+// swaps them in at the prompt exit when compress.messageTimestamps /
+// BILI_MESSAGE_TIMESTAMPS is on; off ships LEAN_HOW_TO_COMPRESS, byte-
+// identical to pre-#4313 masters). The line inserts directly AFTER the
+// "Message refs of key anchors" bullet — exactly where #4313 first
+// shipped it — so the composite equals the once-hardcoded text.
+export const TIMELINE_RULE_LINE =
+  '- TIMELINE \u2014 open each summary with one diary line stating when it happened: "Occurred: <first covered time> \u2013 <last covered time>" (yyyy-mm-dd hh:mm:ss, copied from the covered messages\' time attributes; omit the line when none carry a time).';
+const LEAN_TIMELINE_ANCHOR =
+  "- Message refs of key anchors (m00420, m00510\u2013m00520) for decompress.";
+const leanWithTimeline = LEAN_HOW_TO_COMPRESS.replace(
+  LEAN_TIMELINE_ANCHOR,
+  LEAN_TIMELINE_ANCHOR + "\n" + TIMELINE_RULE_LINE,
+);
+if (leanWithTimeline === LEAN_HOW_TO_COMPRESS) {
+  // Module-init fail-fast: the anchor bullet moved upstream — re-pin the
+  // insertion point rather than silently shipping a variant without the rule.
+  throw new Error(
+    "packs: TIMELINE anchor bullet missing from LEAN_HOW_TO_COMPRESS",
+  );
+}
+export const LEAN_HOW_TO_COMPRESS_TIMESTAMPED = leanWithTimeline;
 
 /** #2335: the lean prompt sections, shared verbatim by the TOP-LEVEL
  * surface (every host — the proxy's function/text/hybrid builders) and the

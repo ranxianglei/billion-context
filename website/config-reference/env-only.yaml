@@ -10,6 +10,7 @@ entries:
     group: envonly
     desc_en: "Let bili ANSWER dsh compaction summarize calls locally with the folded snapshot instead of refusing (#3733): identity header + kernel-rendered block summaries, zero egress; replay recognized via the #2432 rebase."
     desc_zh: "让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。"
+    desc_ja: "bili が dsh のコンパクト化要約呼び出しを拒否する (#3733) 代わりに、折り畳みスナップショットでローカルに ANSWER する: アイデンティティヘッダー + カーネルレンダリングされたブロック要約、ゼロエグレス; リプレイは #2432 リベースによって認識される。"
   - key: BILI_DSH_CONTEXT_TAB
     type: boolean
     default: "true"
@@ -18,6 +19,7 @@ entries:
     group: envonly
     desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
     desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+    desc_ja: "dsh.contextTab (#4237) の環境変数ティア: 0/false で DSH トップバーの「上下文」/「Context」タブを削除 (その他はすべて動作維持); その他の値はファイルティアを上書きして強制オン; 未設定 = ファイルティアが適用 (デフォルト true)。次のページ読み込み / dsh 再起動時に有効化。"
   - key: BILI_DSH_MAX_TESTED_VERSION
     type: string
     default: "0.2.0-rc.2 (CI e2e anchor)"
@@ -26,14 +28,25 @@ entries:
     group: envonly
     desc_en: "Newest-tested @deepseek-ai/dsh build behind the dsh native lane's boot note (#4545): the running client build is resolved from the nearest node_modules/@deepseek-ai/dsh/package.json above the injected bundle; being STRICTLY NEWER than this cap earns ONE boot-time note (durable log record + banner) advising roll-back until support lands. One direction only — at-or-below-cap builds stay silent (known older-build break modes have their own overlay-latch detectors). Warns only — never gates or blocks traffic. Move the cap up as builds get verified; an EMPTY string turns the check off for this lane. Unresolvable/unparseable versions fail open to silence."
     desc_zh: “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。”
+    desc_ja: "dsh ネイティブレーンのブートノート (#4545) 背後にある最新テスト済み @deepseek-ai/dsh ビルド: 実行中のクライアントビルドは、注入バンドルより上位の最も近い node_modules/@deepseek-ai/dsh/package.json から解決される; この上限より厳密に新しい場合、サポートが実装されるまでロールバックを推奨するブート時のノート (永続ログ記録 + バナー) が 1 回発行される。片方向のみ — 上限以下または等しいビルドは沈黙する (既知の旧ビルド破損モードには独自のオーバーレイラッチ検出器がある)。警告のみ — トラフィックをゲートまたはブロックしない。ビルドが検証されるにつれて上限を引き上げる; 空文字列はこのレーンでのチェックをオフにする。解決不能/解析不能なバージョンは沈黙に向けてオープンに失敗する。"
+  - key: BILI_IDENTITY_HARVEST
+    type: string
+    default: "off"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Rollout-gated loopback harvest of client-local transcripts/sqlite for stable message-id lanes (#5825). Unset/empty = OFF (fully inert). `all` or a comma list of source ids (`claude,codebuddy,mcode`) enables matching sources for requests whose identity is loopback; every match also requires the `pluginLaneServerHistory` rollout to be ON. Anything undecidable degrades to the pre-wiring path for the whole turn — never a partial mapping. Dev/verification switch by design (the lanes are already safe per client), not a tuning knob."
+    desc_zh: "#5825 身份信道接线的采集开关（灰度门控下的回环本地转录/SQLite 采集）：缺省关闭、完全惰性；`all` 或逗号列表（`claude,codebuddy,mcode`）开启对应来源，且仅对回环身份请求生效，同时要求 pluginLaneServerHistory 灰度为开。任何无法判定的情形整轮退化为接线前路径，绝不做部分映射。设计上是开发/验证开关而非调参旋钮。"
+    desc_ja: "安定したメッセージ ID レーン (#5825) 向けクライアントローカルトランスクリプト/sqlite のロールアウトゲート付きループバックハーベスト。未設定/空 = OFF (完全に不活性)。`all` またはソース ID のカンマ区切りリスト (`claude,codebuddy,mcode`) は、アイデンティティがループバックであるリクエストの一致するソースを有効化する; すべての一致には `pluginLaneServerHistory` ロールアウトが ON であることも必要。判定不能なものは、ターン全体で配線前のパスにデグレード — 部分的なマッピングは決して行われない。設計上の開発/検証スイッチ (レーンはすでにクライアントごとに安全であるため)、調整ノブではない。"
   - key: BILI_STORAGE_BACKEND
     type: "sqlite|mysql"
     default: "sqlite"
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC via the async twins; export too). Wins over the file tier."
-    desc_zh: "storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。"
+    desc_en: "Env tier for storage.backend (#3931): sqlite (default) or mysql (fully wired, #3388 steps 2+3 - saves ingest through the async shadow queue, sync reads ride the JSON envelope, replicas/ext/GC/fork via the async twins (#4911); export too). Wins over the file tier."
+    desc_zh: "storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。"
+    desc_ja: "storage.backend (#3931) の環境変数ティア: sqlite (デフォルト) または mysql (完全配線済み, #3388 ステップ 2+3 - 非同期シャドウキュー経由でインジェストを保存、同期読み取りは JSON エンベロープに乗る、レプリカ/拡張/GC/フォークは非同期ツイン経由 (#4911); エクスポートも)。ファイルティアに優先する。"
   - key: BILI_MYSQL_DSN
     type: string
     default: "unset"
@@ -42,6 +55,7 @@ entries:
     group: envonly
     desc_en: "MySQL DSN (mysql://user:pass@host:3306/db) for storage.backend=\"mysql\" (#3388, #3931). Wins over the file key storage.mysql.dsn. Empty = the mysql backend cannot open; the documented error names both knobs. The pool opens lazily; closeQuietlyAsync drains the ingest queue and closes it."
     desc_zh: "storage.backend=\"mysql\" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。"
+    desc_ja: "storage.backend=\"mysql\" (#3388, #3931) 用の MySQL DSN (mysql://user:pass@host:3306/db)。ファイルキー storage.mysql.dsn に優先する。空 = mysql バックエンドが開けない; 文書化されたエラーは両方のノブを名指しする。プールは遅延で開かれる; closeQuietlyAsync はインジェストキューをドレインして閉じる。"
   - key: BILI_STORAGE_ARCHIVE_AFTER_DAYS
     type: integer
     default: "365"
@@ -50,14 +64,16 @@ entries:
     group: envonly
     desc_en: "GC age sweep window in days (#3463): sessions idle longer than this are archived (one JSON line appended to the single archive log (archive/archive.jsonl) + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form."
     desc_zh: "GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。"
+    desc_ja: "GC 年齢スウィープウィンドウ (日) (#3463): これより長くアイドル状態のセッションはアーカイブされる (単一のアーカイブログ (archive/archive.jsonl) に 1 行の JSON が追記 + トombstone 行 + コンテンツ/メディア参照の解放)。0 で年齢スウィープを無効化; 手動エントリ POST /__bili/storage/gc は常に実行される。設定ファイルキー storage.archiveAfterDays が永続形式である。"
   - key: BILI_STORAGE_QUICK_CHECK
     type: string
     default: "on"
     kind: env-only
     audience: user
+    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——JSON 信封始终是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底（活的第二写者已于 2026-10-31 移出该拒绝清单：多进程共享一个本地盘 index.db 是受支持拓扑，只提示、永不阻断启动）；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（或留空）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。"
     group: envonly
-    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
-    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
+    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; if a corruption is PROVEN by THIS BOOT's own scan NOTHING is moved, copied or rebuilt automatically (auto-recovery was withdrawn #4609/#4626-era: with BILI_STORAGE_JSON_WRITER=off the index is the SOLE durable copy, so an automatic move or rebuild cannot guarantee full data recovery) and bili STARTS ANYWAY — serving from the JSON envelopes with a loud, actionable alarm naming the manual fix (back up then move index.db/-wal/-shm aside BY HAND, then start again — a fresh index rebuilds from the JSON envelopes). A successful PASS is cached so later starts skip the rescan; a FAIL verdict is NEVER persisted (2026-10-30 owner policy): runtime/background findings are alarms only (loud logs + runtime-status, the process keeps serving — JSON envelopes remain the recovery source) and every boot decides again from a fresh scan of the CURRENT file set, so a stale FAIL left behind by an older version can never block future boots. There is NO automatic rename/repair AND no legacy-only fallback: continuing legacy-only would fork the JSON envelopes from the dead index forever (never reconcilable). TRANSIENT open failures (no SQLite engine / CANTOPEN / readonly / backend DSN) make bili REFUSE TO START loudly with an actionable error — no silent legacy fallback for environment problems either (2026-10-30 owner policy; a live second writer left this refusal list on 2026-10-31 — sharing one local-disk index.db is the supported topology, informational only, never blocking); deployments that genuinely want JSON-only serve explicitly (BILI_STORAGE_UNIFIED=legacy or unset). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
+    desc_ja: "オープン時のストレージ整合性セルフチェック (#4175): すべての index.db オープン時にマイグレーション前に PRAGMA quick_check を実行; このブートのスキャンによって破損が証明された場合、何も自動的に移動、コピー、再構築されない (自動回復は #4609/#4626 時代に撤回: BILI_STORAGE_JSON_WRITER=off ではインデックスが唯一の永続コピーであり、自動的な移動または再構築では完全なデータ回復を保証できないため) かつ bili はそれでも起動する — JSON エンベロープからサーブし、手動修正 (バックアップしてから index.db/-wal/-shm を手動で退避し、再起動 — 新しいインデックスは JSON エンベロープから再構築される) を名指しする大きくて実行可能なアラームを発する。成功した PASS はキャッシュされ、後の起動で再スキャンをスキップする; FAIL 判定は決して永続化されない (2026-10-30 オーナーポリシー): ランタイム/バックグラウンドの発見はアラームのみ (大きなログ + ランタイムステータス、プロセスはサーブを継続 — JSON エンベロープは回復ソースのまま) であり、すべてのブートは現在のファイルセットの新しいスキャンから再決定するため、古いバージョンが残した古い FAIL が将来のブートをブロックすることは決してない。自動リネーム/修復もレガシー専用フォールバックもない: レガシー専用で続行すると、JSON エンベロープが死んだインデックスから永遠に分岐する (決して調整不能)。一時的なオープン失敗 (SQLite エンジンなし / CANTOPEN / 読み取り専用 / バックエンド DSN) は、実行可能なエラーで bili が大きく起動を拒否する — 環境問題に対するサイレントレガシーフォールバックもない (2026-10-30 オーナーポリシー; ライブな第二ライターがこの拒否リストを 2026-10-31 に残した — 1 つのローカルディスク index.db を共有することはサポートされるトポロジーであり、情報提供のみ、決してブロックしない); 真に JSON のみでサーブしたいデプロイは明示的に設定する (BILI_STORAGE_UNIFIED=legacy または未設定)。チェックのコストが重要なブート時感度の高い巨大デプロイでのみ 0 を設定する。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"
@@ -66,6 +82,7 @@ entries:
     group: envonly
     desc_en: "Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later."
     desc_zh: "快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。"
+    desc_ja: "スナップショットレンダリングのシャドウ観測可能性（#3756 のフォローアップ）: アームされたターンごとに送信スナップショットビューを計算するが使用せず、レガシー送信との差分を分類し、セッションごとのカウンターを Web パネルおよびスナップショットシャドウ診断トピックに表示する。0/false/off で無効化、1/true/on で有効化、それ以外の場合は設定ファイルの snapshot.shadow ブール値が適用される（デフォルトは on）。レンダリングレーン自体はロールアウトゲート（BILI_ROLLOUT_SNAPSHOT_RENDER）で制御されるため、シャドウレーンは送信バイト列を変更しない - これは後日のロールアウトを切り替えるためのドライラン証拠である。"
   - key: BILI_CONFIG_FILE
     type: string
     default: "unset (XDG config path)"
@@ -74,6 +91,7 @@ entries:
     group: envonly
     desc_en: "Override the config file path (path relocation)."
     desc_zh: "覆盖配置文件路径（路径重定位）。"
+    desc_ja: "設定ファイルのパスを上書きする（パスの再配置）。"
   - key: BILI_SESSIONS_DIR
     type: string
     default: "unset (XDG state path)"
@@ -82,6 +100,7 @@ entries:
     group: envonly
     desc_en: "Where session records are stored (path relocation)."
     desc_zh: "会话记录的存放目录（路径重定位）。"
+    desc_ja: "セッションレコードの保存先（パスの再配置）。"
   - key: BILI_ENCRYPTION_KEY
     type: string
     default: "unset"
@@ -90,6 +109,7 @@ entries:
     group: envonly
     desc_en: "Key material for encrypted persisted payloads (secret)."
     desc_zh: "加密持久化载荷的密钥材料（机密）。"
+    desc_ja: "暗号化された永続化ペイロード用の鍵材料（シークレット）。"
   - key: BILI_TUNNEL_ALLOWED_HOSTS
     type: "string[] (csv)"
     default: "unset"
@@ -98,6 +118,7 @@ entries:
     group: envonly
     desc_en: "Host allowlist for the MITM tunnel lane."
     desc_zh: "MITM 隧道车道的主机白名单。"
+    desc_ja: "MITM トンネルレーン用のホスト許可リスト。"
   - key: BILI_RECLAIM_FETCH_PATCH
     type: boolean-ish
     default: "on"
@@ -106,6 +127,7 @@ entries:
     group: envonly
     desc_en: "Toggle for reclaiming the global fetch patch on shutdown."
     desc_zh: "进程退出时回收全局 fetch 补丁的开关。"
+    desc_ja: "シャットダウン時にグローバル fetch パッチを回収するためのトグル。"
   - key: BILI_CONFLICT_SCAN
     type: boolean-ish
     default: "off"
@@ -114,6 +136,7 @@ entries:
     group: envonly
     desc_en: "Enable the install-lane conflict scanner probe."
     desc_zh: "启用安装车道冲突扫描探针。"
+    desc_ja: "インストールレーンの競合スキャナープローブを有効にする。"
   - key: BILI_CHAIN_MAX_FUTURE_SKEW_MS
     type: number
     default: "(built-in)"
@@ -122,6 +145,7 @@ entries:
     group: envonly
     desc_en: "Tolerance for future-skewed chain checkpoint timestamps."
     desc_zh: "链检查点时间戳未来偏移的容忍度。"
+    desc_ja: "未来にずれたチェーンチェックポイントタイムスタンプの許容範囲。"
   - key: BILI_CHAIN_RECENT_WINDOW_MS
     type: number
     default: "(built-in)"
@@ -130,6 +154,7 @@ entries:
     group: envonly
     desc_en: "Recent-window size for chain checkpoint validation."
     desc_zh: "链检查点校验的近期窗口大小。"
+    desc_ja: "チェーンチェックポイント検証用の最近ウィンドウサイズ。"
   - key: BILI_ZONE_PORT
     type: number
     default: "18787 base (derived per lane)"
@@ -138,6 +163,7 @@ entries:
     group: envonly
     desc_en: "Base port for lane-spawned proxy zones (port relocation)."
     desc_zh: "车道派生代理端口区的基础端口（端口重定位）。"
+    desc_ja: "レーン生成プロキシゾーン用のベースポート（ポートの再配置）。"
   - key: BILI_ZCODE_ROUTE
     type: string
     default: "unset"
@@ -146,6 +172,7 @@ entries:
     group: envonly
     desc_en: "Route selection for the zcode lane."
     desc_zh: "zcode 车道的路由选择。"
+    desc_ja: "zcode レーン用のルート選択。"
   - key: BILI_ZCODE_PORT
     type: number
     default: "unset"
@@ -154,6 +181,7 @@ entries:
     group: envonly
     desc_en: "Port pin for the zcode lane."
     desc_zh: "zcode 车道的端口钉死。"
+    desc_ja: "zcode レーン用のポート固定。"
   - key: BILI_ZCODE_SIGNING_FIXED
     type: boolean-ish
     default: "off"
@@ -162,6 +190,7 @@ entries:
     group: envonly
     desc_en: "Fixed-signing mode for the zcode credential lane."
     desc_zh: "zcode 凭据车道的固定签名模式。"
+    desc_ja: "zcode 認証情報レーン用の固定署名モード。"
   - key: BILI_CLAUDE_UPSTREAM
     type: string
     default: "unset"
@@ -170,6 +199,7 @@ entries:
     group: envonly
     desc_en: "Upstream pin for the claude lane."
     desc_zh: "claude 车道的上游钉死。"
+    desc_ja: "claude レーン用のアップストリーム固定。"
   - key: BILI_CODEX_STATE_MODE
     type: string
     default: "auto"
@@ -178,6 +208,7 @@ entries:
     group: envonly
     desc_en: "codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time."
     desc_zh: "codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。"
+    desc_ja: "codex 状態の処理: auto（モダン codex では CODEX_SQLITE_HOME 経由の共有 DB、それ以外はレガシーオーバーレイコピー）、shared、または legacy。shared モードでは最大 16 個の並行セッションを処理し、それぞれに 1 つのセッション別オーバーレイスロットを使用する。legacy は同時に 1 つの排他オーバーレイを保持する。"
   - key: BILI_ATTACH_HEALTH_DEADLINE_MS
     type: number
     default: "(built-in)"
@@ -186,6 +217,25 @@ entries:
     group: envonly
     desc_en: "Deadline for attach health checks when joining an external daemon."
     desc_zh: "挂接外部守护进程时健康检查的截止时间。"
+    desc_ja: "外部デーモンに参加する際のヘルスチェック接続の期限。"
+  - key: BILI_SPAWN_WAIT_MS
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait."
+    desc_zh: "新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。"
+    desc_ja: "新規に生成されたプロキシ子プロセスについて、ランチャーが待機を延長するまでの初期ヘルスウェイトウィンドウ（ms）。"
+  - key: BILI_SLOW_START_GRACE_MS
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two."
+    desc_zh: "对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。"
+    desc_ja: "まだ生存しているがバインドが遅い子プロセス（低速ストレージ、AVスキャン、共有ストレージのロック競合など）に対する追加の猶予時間（ms）。生成の総予算はこれら2つの合計である。"
   - key: BILI_ATTACH_EVIDENCE_GRACE_MS
     type: number
     default: "(built-in)"
@@ -194,6 +244,16 @@ entries:
     group: envonly
     desc_en: "Grace period for attach ownership evidence."
     desc_zh: "挂接归属证据的宽限期。"
+    desc_ja: "アタッチ所有権の証拠に対する猶予期間。"
+  - key: BILI_SILENT_DIRECT_MAX_MB
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Silent-direct oversized guard ceiling (MiB)."
+    desc_zh: "静默直连超大请求保护上限（MiB）。"
+    desc_ja: "サイレントダイレクトの過大ガード上限（MiB）。"
   - key: BILI_PROVIDER_REWRITES
     type: string
     default: "unset"
@@ -202,6 +262,7 @@ entries:
     group: envonly
     desc_en: "Provider URL rewrite rules applied before routing."
     desc_zh: "路由前应用的 provider URL 重写规则。"
+    desc_ja: "ルーティング前に適用されるプロバイダーURL書き換えルール。"
   - key: BILI_MCP_PROXY
     type: string
     default: "unset"
@@ -210,6 +271,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: MCP proxy target for plugin-hosted tools."
     desc_zh: "派生通道：插件宿主工具的 MCP 代理目标。"
+    desc_ja: "生成チャネル：プラグインホスト型ツールのMCPプロキシターゲット。"
   - key: BILI_PARENT_PID
     type: number
     default: "unset"
@@ -218,6 +280,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: parent process id for lifecycle supervision."
     desc_zh: "派生通道：父进程 id，用于生命周期监管。"
+    desc_ja: "生成チャネル：ライフサイクル監視用の親プロセスID。"
   - key: BILI_STRICT_PORT
     type: number
     default: "unset"
@@ -226,6 +289,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: exact-port requirement (squatters refused loudly instead of hopping)."
     desc_zh: "派生通道：精确端口要求（被占用时响亮拒绝而非跳端口）。"
+    desc_ja: "生成チャネル：正確なポート要件（スキャッターはホッピングせず、明確に拒否される）。"
   - key: BILI_UPGRADE_REPLACEMENT
     type: boolean-ish
     default: "unset"
@@ -234,6 +298,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: marks a self-restart replacement — it must own exactly the freed port or exit without hopping (#3044)."
     desc_zh: "派生通道：标记自重启替换进程——必须独占被释放的精确端口，否则直接退出而非跳端口（#3044）。"
+    desc_ja: "生成チャネル：自己再起動による置換をマークする — 解放されたポートを正確に所有するか、ホッピングせずに終了しなければならない（#3044）。"
   - key: BILI_OPENCODE_ACP_SPEC
     type: string
     default: "unset"
@@ -242,6 +307,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: ACP spec marker for opencode-native lanes."
     desc_zh: "派生通道：opencode 原生车道的 ACP 规格标记。"
+    desc_ja: "生成チャネル：opencodeネイティブレーン用のACP仕様マーカー。"
   - key: BILI_LAUNCHER_MODEL_WINDOWS
     type: string
     default: "unset"
@@ -250,6 +316,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: model-window overrides passed into spawned clients."
     desc_zh: "启动器通道：传入被派生客户端的模型窗口覆盖。"
+    desc_ja: "ランチャーチャネル：生成されたクライアントに渡されるモデルウィンドウのオーバーライド。"
   - key: BILI_LAUNCHER_LANE
     type: string
     default: "unset"
@@ -258,6 +325,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: lane identity of the spawning bili process."
     desc_zh: "启动器通道：派生方 bili 进程的车道身份。"
+    desc_ja: "ランチャーチャネル：生成元のbiliプロセスのレーンID。"
   - key: BILI_LAUNCHER_PLUGIN
     type: string
     default: "unset"
@@ -266,6 +334,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: plugin-mode handoff marker."
     desc_zh: "启动器通道：插件模式交接标记。"
+    desc_ja: "ランチャーチャネル：プラグインモードのハンドオフマーカー。"
   - key: BILI_LAUNCHER_DIRECT
     type: boolean-ish
     default: "off"
@@ -274,6 +343,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: bypass the injected proxy for this launch."
     desc_zh: "启动器通道：本次启动绕过注入的代理。"
+    desc_ja: "ランチャーチャネル：この起動において注入されたプロキシをバイパスする。"
   - key: BILI_INHERITED_HTTP_PROXY
     type: string
     default: "unset"
@@ -282,6 +352,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: inherited http_proxy value preserved across the spawn boundary."
     desc_zh: "启动器通道：跨派生边界保留的 http_proxy 继承值。"
+    desc_ja: "Launcher channel: spawn 境界をまたいで継承された http_proxy の値が保持されます。"
   - key: BILI_INHERITED_HTTPS_PROXY
     type: string
     default: "unset"
@@ -290,6 +361,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: inherited https_proxy value preserved across the spawn boundary."
     desc_zh: "启动器通道：跨派生边界保留的 https_proxy 继承值。"
+    desc_ja: "Launcher channel: spawn 境界をまたいで継承された https_proxy の値が保持されます。"
   - key: BILI_INHERITED_ALL_PROXY
     type: string
     default: "unset"
@@ -298,6 +370,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: inherited all_proxy value preserved across the spawn boundary."
     desc_zh: "启动器通道：跨派生边界保留的 all_proxy 继承值。"
+    desc_ja: "Launcher channel: spawn 境界をまたいで継承された all_proxy の値が保持されます。"
   - key: BILI_INHERITED_NO_PROXY
     type: string
     default: "unset"
@@ -306,6 +379,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: inherited no_proxy value preserved across the spawn boundary."
     desc_zh: "启动器通道：跨派生边界保留的 no_proxy 继承值。"
+    desc_ja: "Launcher channel: spawn 境界をまたいで継承された no_proxy の値が保持されます。"
   - key: BILI_NATIVE_CLAUDE
     type: boolean-ish
     default: "off"
@@ -314,6 +388,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks a claude-native plugin process."
     desc_zh: "宿主姿态：标记 claude 原生插件进程。"
+    desc_ja: "Host posture: claude ネイティブプラグインプロセスであることを示します。"
   - key: BILI_NATIVE_DSH
     type: boolean-ish
     default: "off"
@@ -322,6 +397,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks a dsh-native plugin process."
     desc_zh: "宿主姿态：标记 dsh 原生插件进程。"
+    desc_ja: "Host posture: dsh ネイティブプラグインプロセスであることを示します。"
   - key: BILI_NATIVE_KIMI
     type: boolean-ish
     default: "off"
@@ -330,6 +406,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks a kimi-native plugin process."
     desc_zh: "宿主姿态：标记 kimi 原生插件进程。"
+    desc_ja: "Host posture: kimi ネイティブプラグインプロセスであることを示します。"
   - key: BILI_NATIVE_OMP
     type: boolean-ish
     default: "off"
@@ -338,6 +415,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks an omp-native plugin process."
     desc_zh: "宿主姿态：标记 omp 原生插件进程。"
+    desc_ja: "Host posture: omp ネイティブプラグインプロセスであることを示します。"
   - key: BILI_NATIVE_OPENCODE
     type: boolean-ish
     default: "off"
@@ -346,6 +424,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks an opencode-native plugin process."
     desc_zh: "宿主姿态：标记 opencode 原生插件进程。"
+    desc_ja: "Host posture: opencode ネイティブプラグインプロセスであることを示します。"
   - key: BILI_NATIVE_PI
     type: boolean-ish
     default: "off"
@@ -354,14 +433,16 @@ entries:
     group: envonly
     desc_en: "Host posture: marks a pi-native plugin process."
     desc_zh: "宿主姿态：标记 pi 原生插件进程。"
+    desc_ja: "Host posture: pi ネイティブプラグインプロセスであることを示します。"
   - key: BILI_PI_INLINE
     type: boolean-ish
-    default: "off (opt-in)"
+    default: "inline when unset (DEFAULT-ON since #5428; explicit 0/false/no/off opts out)"
     kind: env-only
     audience: internal
     group: envonly
-    desc_en: "Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. OPT-IN: #4687 reverts the #4571 default flip — unset env/file behaves exactly as before (attach/spawn). Truthy = any non-empty value except 0/false/no/off (on/yes/TRUE all enable). Codex Responses WS traffic is routed through a loopback-only bridge booted with the engine; if that bridge fails, the WS lane degrades DIRECT (warned) while HTTP compression stays in-process."
-    desc_zh: "宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：#4687 收回 #4571 的默认翻转，不设置时行为与旧版完全一致（attach/spawn）；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。codex 的 Responses WS 流量改走随引擎启动的仅回环桥；桥起不来时该通道退回直连（打 warn），HTTP 压缩仍留在进程内。"
+    desc_en: "Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. DEFAULT-ON since #5428 (supersedes the #4687 opt-in rule): unset env+file runs inline; an announced attach target still beats the DEFAULT, so `bili pi` keeps its launcher proxy. Explicit OPT-OUT = 0/false/no/off (or `\"pi\": {\"inline\": false}`) — restores the old attach/spawn posture. Human surface: `bili -i/--inline pi` forces inline, `bili -s/--server pi` pins the proxy posture (beats an inherited inline env). Truthy = any non-empty value except 0/false/no/off (on/yes/TRUE all enable). Codex Responses WS traffic is routed through a loopback-only bridge booted with the engine; if that bridge fails, the WS lane degrades DIRECT (warned) while HTTP compression stays in-process."
+    desc_zh: "宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。自 #5428 起默认开启（取代 #4687 的手动开启规则）：未设置 env+文件时走内联；显式宣告的附着目标仍压过默认，`bili pi` 照旧用 launcher 代理。显式关闭 = 0/false/no/off（或 `\"pi\": {\"inline\": false}`）——恢复旧的 attach/spawn 姿态。人类入口：`bili -i/--inline pi` 强制内联，`bili -s/--server pi` 钉死代理姿态（压过继承的内联变量）。除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。codex 的 Responses WS 流量改走随引擎启动的仅回环桥；桥起不来时该通道退回直连（打 warn），HTTP 压缩仍留在进程内。"
+    desc_ja: "Host posture: pi インラインレーン (#3278) — pi 拡張機能は、独自のプロキシを spawn するのではなく、擬似オリジン経由でプロセス内で圧縮を行います。プリセットの BILLION_CONTEXT_PROXY アタッチターゲットよりも優先されます。#5428 以降、デフォルトで有効 (#4687 のオプトインルールを置き換え): 環境変数とファイルが未設定の場合はインラインで実行されます。アタッチターゲットが明示されている場合でも DEFAULT より優先されるため、`bili pi` はランチャープロキシを維持します。明示的なオプトアウト = 0/false/no/off (または `\"pi\": {\"inline\": false}`) — 従来のアタッチ/spawn ポスチャを復元します。人間向けインターフェース: `bili -i/--inline pi` でインラインを強制、`bili -s/--server pi` でプロキシポスチャを固定 (継承されたインライン環境変数よりも優先)。Truthy = 0/false/no/off 以外の空でない任意の値 (on/yes/TRUE はすべて有効化)。Codex Responses WS トラフィックは、エンジンと共に起動されるループバック専用ブリッジ経由でルーティングされます。このブリッジが失敗した場合、WS レーンは DIRECT にデグレードし (警告が表示されます)、HTTP 圧縮はプロセス内で維持されます。"
   - key: BILI_OPENCODE_INLINE
     type: boolean-ish
     default: "off (opt-in)"
@@ -370,6 +451,7 @@ entries:
     group: envonly
     desc_en: "Host posture: opencode inline lane (#3278 port) — the opencode plugin compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. OPT-IN: the opencode lane keeps its legacy default (spawned proxy) unless this env or \"opencode\": {\"inline\": true} explicitly enables it (owner decision on #4687). Truthy = any non-empty value except 0/false/no/off (on/yes/TRUE all enable). Verified on the Bun host (engine boots and dispatches without node:sqlite)."
     desc_zh: "宿主姿态：opencode 内联压缩通道（#3278 移植）——opencode 插件在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：按 #4687 决定，opencode 通道默认保持旧行为（另起代理），只有本环境变量或 \"opencode\": {\"inline\": true} 显式开启才切换；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。已在 Bun 宿主上验证（无 node:sqlite 时引擎 boot/dispatch 正常）。"
+    desc_ja: "Host posture: opencode インラインレーン (#3278 ポート) — opencode プラグインは、独自のプロキシを spawn するのではなく、擬似オリジン経由でプロセス内で圧縮を行います。プリセットの BILLION_CONTEXT_PROXY アタッチターゲットよりも優先されます。オプトイン: opencode レーンは、この環境変数または \"opencode\": {\"inline\": true} が明示的に有効化されない限り、レガシーのデフォルト (spawn されたプロキシ) を維持します (#4687 におけるオーナーの決定)。Truthy = 0/false/no/off 以外の空でない任意の値 (on/yes/TRUE はすべて有効化)。Bun ホスト上で検証済み (エンジンは node:sqlite なしで起動およびディスパッチ可能)。"
   - key: BILI_INLINE_DEBUG
     type: boolean-ish
     default: "off"
@@ -378,6 +460,7 @@ entries:
     group: envonly
     desc_en: "Inline lane (#3278) only: keep the engine's log lines on stderr after muting them (the inline engine runs inside the pi process, where stderr is the interactive TUI — every [persist]/[storage]/[inline] line would scroll the input box away; default keeps them in bili.log only)."
     desc_zh: "仅内联通道（#3278）：把引擎日志保留在 stderr 上（默认关闭——内联引擎跑在 pi 进程里，stderr 就是交互终端，每行 [persist]/[storage]/[inline] 都会把输入框挤掉；默认只写 bili.log）。"
+    desc_ja: "インラインレーン (#3278) のみ: ミュート後もエンジンのログ行を stderr に保持します (インラインエンジンは pi プロセス内で実行され、stderr は対話型 TUI です。すべての [persist]/[storage]/[inline] 行が入力ボックスをスクロールさせてしまうため、デフォルトでは bili.log にのみ保持されます)。"
   - key: BILI_NATIVE_ZCODE
     type: boolean-ish
     default: "off"
@@ -386,6 +469,7 @@ entries:
     group: envonly
     desc_en: "Host posture: marks a zcode-native plugin process."
     desc_zh: "宿主姿态：标记 zcode 原生插件进程。"
+    desc_ja: "Host posture: zcode ネイティブプラグインプロセスであることを示します。"
   - key: BILI_PI_BIN
     type: string
     default: "pi (PATH lookup)"
@@ -394,6 +478,7 @@ entries:
     group: envonly
     desc_en: "Host posture: explicit binary path for the pi client binary."
     desc_zh: "宿主姿态：pi 客户端二进制的显式路径。"
+    desc_ja: "Host posture: pi クライアントバイナリの明示的なバイナリパス。"
   - key: BILI_DSH_BIN
     type: string
     default: "dsh (PATH lookup)"
@@ -402,6 +487,7 @@ entries:
     group: envonly
     desc_en: "Host posture: explicit binary path for the dsh client binary."
     desc_zh: "宿主姿态：dsh 客户端二进制的显式路径。"
+    desc_ja: "ホストの姿勢: dsh クライアントバイナリの明示的なバイナリパス。"
   - key: BILI_MODEL_INFO_RETRY_MS
     type: number
     default: "(built-in)"
@@ -410,6 +496,7 @@ entries:
     group: envonly
     desc_en: "Test hook: retry interval for model-info lookups."
     desc_zh: "测试钩子：模型信息查询的重试间隔。"
+    desc_ja: "テストフック: モデル情報の参照におけるリトライ間隔。"
   - key: BILI_DSH_RETRY_INTERVAL_MS
     type: number
     default: "(built-in)"
@@ -418,6 +505,7 @@ entries:
     group: envonly
     desc_en: "Test hook: retry interval for dsh lane operations."
     desc_zh: "测试钩子：dsh 车道操作的重试间隔。"
+    desc_ja: "テストフック: dsh レーン操作におけるリトライ間隔。"
   - key: BILI_DSH_RECOVERY_INTERVAL_MS
     type: number
     default: "(built-in)"
@@ -426,6 +514,7 @@ entries:
     group: envonly
     desc_en: "Test hook: recovery sweep interval for the dsh lane."
     desc_zh: "测试钩子：dsh 车道恢复清扫间隔。"
+    desc_ja: "テストフック: dsh レーンのリカバリスウィープ間隔。"
   - key: ACP_DUMP_DIR
     type: string
     default: "unset"
@@ -434,6 +523,7 @@ entries:
     group: envonly
     desc_en: "Base directory override for wire dump output (path relocation)."
     desc_zh: "线路转储输出基础目录覆盖（路径重定位）。"
+    desc_ja: "ワイヤダンプ出力のベースディレクトリのオーバーライド（パスの再配置）。"
   - key: BILI_STREAM_STALL_MS
     type: number
     default: "(built-in)"
@@ -442,6 +532,7 @@ entries:
     group: envonly
     desc_en: "Stall-detection timeout for committed upstream streams (no-byte silence before abort)."
     desc_zh: "已提交上游流的停滞检测超时（无字节静默多久后中止）。"
+    desc_ja: "コミット済みアップストリームストリームのストール検出タイムアウト（中断前の無バイト沈黙）。"
   - key: BILI_CLIENT_BIN
     type: string
     default: "unset (PATH lookup)"
@@ -450,6 +541,7 @@ entries:
     group: envonly
     desc_en: "Explicit binary override for the launched client (resolved on PATH)."
     desc_zh: "被启动客户端二进制的显式覆盖（在 PATH 上解析）。"
+    desc_ja: "起動するクライアントの明示的なバイナリオーバーライド（PATH で解決）。"
   - key: BILI_CONVERSATION_ID
     type: string
     default: "unset (per-spawn UUID written by bili)"
@@ -458,6 +550,7 @@ entries:
     group: envonly
     desc_en: "Per-spawn conversation UUID handed to MCP children whose host passes no session id (headless self-registration)."
     desc_zh: "传给 MCP 子进程的逐派生会话 UUID（宿主不传会话 id 时用于无头自注册）。"
+    desc_ja: "セッション ID を渡さないホストを持つ MCP 子プロセスに渡す、スポン時に生成される会話 UUID（ヘッドレス自己登録）。"
   - key: BILI_LAUNCHER_MODEL_MAX_OUTPUTS
     type: "string (JSON id→maxOutput map)"
     default: "unset"
@@ -466,6 +559,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: per-model max-output map handed to the spawned proxy for output-headroom reservation."
     desc_zh: "启动器通道：传给被派生代理的逐模型最大输出映射，用于输出预留。"
+    desc_ja: "ランチャーチャネル: 出力ヘッドルームの予約のためにスポンされたプロキシに渡す、モデルごとの最大出力マップ。"
   - key: BILI_LAUNCH_TOKEN
     type: string
     default: "unset (generated per launch)"
@@ -474,6 +568,7 @@ entries:
     group: envonly
     desc_en: "Launch token authenticating lane-internal endpoints between a launcher and its spawned proxy (secret)."
     desc_zh: "启动令牌，鉴权启动器与其派生代理之间的车道内部端点（机密）。"
+    desc_ja: "ランチャーとそのスポンされたプロキシ間のレーン内部エンドポイントを認証するランチャートークン（シークレット）。"
   - key: BILI_MCP_DEFAULT_ORIGIN
     type: string
     default: "http://127.0.0.1:8787"
@@ -482,6 +577,7 @@ entries:
     group: envonly
     desc_en: "Fallback proxy origin candidate for MCP entry points."
     desc_zh: "MCP 入口的兜底代理 origin 候选。"
+    desc_ja: "MCP エントリポイント用のフォールバックプロキシオリジン候補。"
   - key: BILI_MCP_NO_ORPHAN_ADOPT
     type: boolean-ish
     default: "off (=1 disables orphan adoption)"
@@ -490,6 +586,7 @@ entries:
     group: envonly
     desc_en: "Opt out of resumed-session orphan adoption when several host sessions share one proxy."
     desc_zh: "多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。"
+    desc_ja: "複数のホストセッションが 1 つのプロキシを共有する場合、再開セッションの孤児採用を無効にする。"
   - key: BILI_MITM_HOSTS
     type: "string[] (csv)"
     default: "unset"
@@ -498,6 +595,7 @@ entries:
     group: envonly
     desc_en: "Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS)."
     desc_zh: "启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。"
+    desc_ja: "ランチャーチャネル: スポンされたプロキシに渡す MITM ホワイトリストホスト（設定ファイルの双子 BILI_MITM_DOMAINS とは別物）。"
   - key: BILI_PLUGIN_AGENT
     type: boolean-ish
     default: "off"
@@ -506,6 +604,7 @@ entries:
     group: envonly
     desc_en: "Spawn channel: marks a plugin-agent process."
     desc_zh: "派生通道：标记插件 agent 进程。"
+    desc_ja: "スポンチャネル: プラグインエージェントプロセスを示す。"
   - key: BILI_IMAGE_RESCALE_MAX_DIM
     type: integer
     default: "1600"
@@ -514,3 +613,4 @@ entries:
     group: envonly
     desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
     desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"
+    desc_ja: "エグレス画像のダウンスケールパスのトリガー閾値（px）（#3400）; 数値でない場合または 128 未満の場合は無視される（デフォルトが適用される）。設計上、環境変数のみ。"
