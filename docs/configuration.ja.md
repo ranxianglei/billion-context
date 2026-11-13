@@ -237,7 +237,7 @@
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | セルフアップデート用のカスタム npm レジストリベース URL（プライベートミラー）。 |
 | `update.checkIntervalMs` | number | 180000 | BILI_UPDATE_CHECK_INTERVAL_MS | npm レジストリのバージョンチェックの間隔。 |
 | `update.staggerMinDelayMs` | number \| string | 900000 (built-in 15 min) | BILI_UPDATE_STAGGER_MIN_MS | #3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの下限; ms 数値または期間文字列 (15m / 2d / 1d12h); 0 で遅延を無効化 (従来の即時実行)。リモートポリシーのデフォルトウィンドウとバージョン別の上書きがこれに重ねて適用される。 |
-| `update.staggerMaxDelayMs` | number \| string | 172800000 (built-in 48 h) | BILI_UPDATE_STAGGER_MAX_MS | #3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの上限; ms 数値または期間文字列 (48h / 2d); min とともに 0 に設定すると従来の即時アップグレードに戻る。 |
+| `update.staggerMaxDelayMs` | number \| string | 604800000 (built-in 7 days) | BILI_UPDATE_STAGGER_MAX_MS | #3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの上限; ms 数値または期間文字列 (7d / 168h); min とともに 0 に設定すると従来の即時アップグレードに戻る。 |
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | リモート自動更新ポリシーファイルの URL 上書き (テスト用シーム — 本番環境では公式リポジトリに固定される)。 |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 重大な欠陥に関するアドバイザリーウォッチャー; 実行中のバージョンが影響を受ける場合、推奨される修正を強制インストールする。 |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | アドバイザリーフィードの URL 上書き。 |
@@ -758,7 +758,7 @@
 - **Type:** `boolean`
 - **Default:** `true`
 - **Status:** ACTIVE
-- **Description:** 定期的な npm レジストリバージョンチェック (`update.checkIntervalMs` ごと、デフォルト 3 分; プロセスごとの最初のチェックはスロットリングを無視する)。設定された `updateTag` チャンネル上の新しいビルドを検出する; 実行中のプロセスが実際に切り替えるかどうかは、`autoRestartOnUpdate` (自己再起動) または助言レーン (強制インストール) に依存する。`ACP_AUTO_UPDATE=0` で無効化。`advisoryCheck` とは独立: オートアップデートをオフにしたインストールでも、助言ウォッチャーを通じて既知の壊れたバージョン範囲を回避できる。#3619 以降、発見されたアップグレードは即座に適用されない — 自動アップグレードはランダムな遅延ウィンドウ内で段階的に実行される (組み込み 15 分 – 48 時間、リモートポリシーで調整可能; 以下の [`update`](#update) を参照) ため、悪いリリースは全フリートが移動した後にではなく、ロールアウト中に捕捉できる。
+- **Description:** 定期的な npm レジストリバージョンチェック (`update.checkIntervalMs` ごと、デフォルト 3 分; プロセスごとの最初のチェックはスロットリングを無視する)。設定された `updateTag` チャンネル上の新しいビルドを検出する; 実行中のプロセスが実際に切り替えるかどうかは、`autoRestartOnUpdate` (自己再起動) または助言レーン (強制インストール) に依存する。`ACP_AUTO_UPDATE=0` で無効化。`advisoryCheck` とは独立: オートアップデートをオフにしたインストールでも、助言ウォッチャーを通じて既知の壊れたバージョン範囲を回避できる。#3619 以降、発見されたアップグレードは即座に適用されない — 自動アップグレードはランダムな遅延ウィンドウ内で段階的に実行される (組み込み 15 分 – 7 日、リモートポリシーで調整可能; 以下の [`update`](#update) を参照) ため、悪いリリースは全フリートが移動した後にではなく、ロールアウト中に捕捉できる。
 
 ### `autoRestartOnUpdate`
 
@@ -1059,15 +1059,15 @@
 ### `update`
 
 - **Type:** `{ registry?: string; checkIntervalMs?: number; staggerMinDelayMs?: number | string; staggerMaxDelayMs?: number | string; policyUrl?: string }`
-- **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }` (stagger フィールド未設定 → 組み込みウィンドウ 15 分 – 48 時間；`policyUrl` 未設定 → 公式リポジトリの raw URL)
+- **Default:** `{ registry: https://registry.npmjs.org, checkIntervalMs: 180000 }` (stagger フィールド未設定 → 組み込みウィンドウ 15 分 – 7 日；`policyUrl` 未設定 → 公式リポジトリの raw URL)
 - **Status:** ACTIVE
 - **Description:** セルフアップデーターのソース（対応する環境変数 `BILI_UPDATE_REGISTRY`, `BILI_UPDATE_CHECK_INTERVAL_MS`, `BILI_UPDATE_STAGGER_MIN_MS`, `BILI_UPDATE_STAGGER_MAX_MS`, `BILI_UPDATE_POLICY_URL`）。stagger ファイルフィールドは人間が読める期間文字列（`"15m"`, `"2d"`, `"1d12h"`, 単位 s/m/h/d/w、組み合わせ可能）を受け入れる；環境変数の対応物は生のミリ秒のまま。`registry`/`checkIntervalMs` はインポート時に解決されるため、次の再起動で有効になる — 環境変数と同様。`registry` はハーメティックテスト（verdaccio e2e レーン）のために意図されている；本番環境ではデフォルトのままにすること（#1153）。stagger フィールドおよび `policyUrl` は更新サイクルごとにライブ読み取りされる。
 
 #### スタグダードロールアウトおよびリモート更新ポリシー (#3619)
 
-新しいバージョンが発見された場合、自動アップグレードは即座に実行されない：インスタンスは遅延ウィンドウ内のランダムな 1 つの時刻を引き — 組み込みデフォルトは **15 分から 48 時間** — その時刻が来たらアップグレードする。引き出された時刻はキャッシュディレクトリ（`~/.cache/billion-context/.update-stagger.json`）に `(dist-tag, target version)` をキーとして永続化されるため、プロセスの再起動では再抽選されない（再起動が多いマシンが早期の値を引き続けることはない）。これにより、リリースから数分以内に全員が移動するのではなく、フリートのアップグレードがウィンドウ内に分散され、ロールアウト中に不良リリースを捕捉するための応答ウィンドウが確保される（#3401/#3600/#3394）。
+新しいバージョンが発見された場合、自動アップグレードは即座に実行されない：インスタンスは遅延ウィンドウ内のランダムな 1 つの時刻を引き — 組み込みデフォルトは **15 分から 7 日** — その時刻が来たらアップグレードする。引き出された時刻はキャッシュディレクトリ（`~/.cache/billion-context/.update-stagger.json`）に `(dist-tag, target version)` をキーとして永続化されるため、プロセスの再起動では再抽選されない（再起動が多いマシンが早期の値を引き続けることはない）。これにより、リリースから数分以内に全員が移動するのではなく、フリートのアップグレードがウィンドウ内に分散され、ロールアウト中に不良リリースを捕捉するための応答ウィンドウが確保される（#3401/#3600/#3394）。
 
-ウィンドウの構成（各側独立して）：ローカル設定/環境変数 > リモートポリシーの `default` > 組み込み（15 分 / 48 時間）。**`0` はこのマシンの遅延を無効化する** — レガシーの即時アップグレードのために両側を `0` に設定する。
+ウィンドウの構成（各側独立して）：ローカル設定/環境変数 > リモートポリシーの `default` > 組み込み（15 分 / 7 日）。**`0` はこのマシンの遅延を無効化する** — レガシーの即時アップグレードのために両側を `0` に設定する。
 
 リモートポリシーファイル：bili は公式リポジトリの raw アドレスから `auto-update-policy.json` を匿名で GET する（`update.policyUrl` / `BILI_UPDATE_POLICY_URL` のオーバーライドはテストシームのみ）。キャッシュディレクトリに ETag/If-None-Match を使用してキャッシュされる。失敗ラダー（fail-open — ファイルによってアップグレード機能がブロックされることはない）：フェッチ/HTTP 失敗 → 30 日以内であれば最後に正常にキャッシュされたコピーを再利用、それ以外はローカルデフォルト；不正な JSON または不明な `schemaVersion` → キャッシュを破棄し、ローカルデフォルト。テレメトリゼロ：プレーン GET、クエリパラメータなし、デバイス ID なし。
 
@@ -2051,7 +2051,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
-| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 172800000 (built-in 48 h) |
+| `BILI_UPDATE_STAGGER_MAX_MS` | `update.staggerMaxDelayMs` | 604800000 (built-in 7 days) |
 | `BILI_UPDATE_STAGGER_MIN_MS` | `update.staggerMinDelayMs` | 900000 (built-in 15 min) |
 | `BILI_UPSTREAM_FIRST_BYTE_MS` | `network.upstreamFirstByteMs` | = upstreamTimeoutMs (resolved; 720000 when unset) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
@@ -2100,7 +2100,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_UPDATE_REGISTRY` | 自動更新プログラムと `bili update` が使用する npm レジストリのベース URL のオーバーライド (デフォルト `https://registry.npmjs.org`)。ループバックレジストリ (e2e スイートの `ACP_TEST_REGISTRY` 内の verdaccio インスタンス) に対する密閉テストを想定しています; 本番環境では未設定のままにしてください (#1153)。 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | 自動更新チェックの間隔 (ミリ秒) (デフォルト `180000`、つまり 3 分; 0 以下の値は無視されデフォルトが適用されます)。密閉 e2e スイートでは短縮され、完全なサイクルを待たないようにしています (#1153)。 |
 | `BILI_UPDATE_STAGGER_MIN_MS` | ランダムなアップグレード遅延ウィンドウの下限 (#3619): 新しいバージョンを発見した後、自動アップグレードは [min, max] 内の抽選された時刻まで待機します — 未設定の場合は組み込み 15 分。リモートポリシーの `default` より優先されます; `0` でこのマシンの遅延を無効にします (レガシーの即時アップグレード)。ここでは生の ms; ファイルの双子は期間文字列 (`"15m"`) も受け入れます。 |
-| `BILI_UPDATE_STAGGER_MAX_MS` | ランダムなアップグレード遅延ウィンドウの上限 (#3619) — 未設定の場合は組み込み 48 時間。両方の境界が `0` に設定されている場合、アップグレードは #3619 以前と同様に即時に行われます。ここでは生の ms; ファイルの双子は期間文字列 (`"2d"`) も受け入れます。 |
+| `BILI_UPDATE_STAGGER_MAX_MS` | ランダムなアップグレード遅延ウィンドウの上限 (#3619) — 未設定の場合は組み込み 7 日。両方の境界が `0` に設定されている場合、アップグレードは #3619 以前と同様に即時に行われます。ここでは生の ms; ファイルの双子は期間文字列 (`"2d"`) も受け入れます。 |
 | `BILI_UPDATE_POLICY_URL` | リモート更新ポリシー JSON URL のオーバーライド (#3619)。デフォルト: 公式リポジトリの raw アドレスにある `auto-update-policy.json` — 設計上固定されています。ポリシーはタイミング/スキップ/ピンを誘導できますが、インストールソースは決して変更できないためです; オーバーライドは密閉テストのために存在します。ファイルの双子: `update.policyUrl`。 |
 | `BILI_MODEL_INFO_RETRY_MS` | dsh ネイティブプラグインが、解決に失敗したかウィンドウを返さなかった現在のモデルのコンテキストウィンドウを再解決するまでのクールダウン (ms) (#1812/#1836): ウィンドウのないキャッシュエントリは最終的ではありません — プロセスの生存期間中ヘッダーなしに固定する代わりに、このクールダウン後の次のリクエストがリトライをトリガーします。デフォルトは `30000`; 数値でない場合や負の値は `30000` にフォールバックします。テストフック — dsh-native ユニットテストでは壁時計を待たないように短縮されています; 本番環境では未設定のままにしてください。 |
 | `BILI_DSH_RETRY_INTERVAL_MS` | dsh ネイティブプラグインのツール登録リトライ間のバックオフ (ms) (#2082): マニフェスト取得またはツール登録が一時的に失敗した後、次のリトライはこのクールダウンより早く行われません。デフォルトは `10000`; 数値でない場合や非正の値は `10000` にフォールバックします。テストフック — dsh-native ユニットテストでは壁時計を待たないように短縮されています; 本番環境では未設定のままにしてください。 |
