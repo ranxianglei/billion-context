@@ -162,6 +162,7 @@
 | `network` | object | {} (all defaults) | — | 上游调用的传输超时、看门狗与重放策略。 |
 | `network.upstreamTimeoutMs` | number | 720000 | BILI_UPSTREAM_TIMEOUT_MS | 单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。 |
 | `network.upstreamFirstByteMs` | number | = upstreamTimeoutMs (resolved; 720000 when unset) | BILI_UPSTREAM_FIRST_BYTE_MS | 阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。未设时跟随解析后的 upstreamTimeoutMs——包括把 BILI_UPSTREAM_TIMEOUT_MS 提到 12 分钟以上的部署（#5917 评审：常量 720000 回落会悄悄把它们压回 12 分钟）——行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。当该值被收紧到低于 upstreamTimeoutMs 时，首字节超时成为独立失败类 `upstream-headers-timeout`——因为一个响应字节都未收到，bili 会在代理内按既有重试预算（BILI_REPLAY_RETRY_MAX，默认 3 次）重放，而不是让整步只失败一次；流中途（body）空闲超时仍是 `upstream-timeout` 且不重试。未设时行为与之前逐字节一致（#5807/#5831）。发布 gate 设 120000。 |
+| `network.wsIdleTimeoutMs` | number | 600000 | BILI_WS_IDLE_TIMEOUT_MS | Responses WebSocket 车道的逐事件空闲预算（#6171）：任何上游帧都会重新上弦，所以稳定流式永不触发——只有完全卡死才会。握手阶段同样受管（升级卡死会快速失败而不是永远等待）。触发时该交换获得唯一终态、同一 conn/session 标识下可关联的 `upstream failed … event=timeout reason=idle-timeout` 日志行，并断开连接让下一轮重新连接。此前完全卡死的 WS 交换会一直挂到客户端放弃——HTTP 车道的对应物是 BILI_UPSTREAM_TIMEOUT_MS。 |
 | `network.requestWatchdogMs` | number | 2× upstreamTimeoutMs | BILI_REQUEST_WATCHDOG_MS | 绝对看门狗：即使按调用计时器从未挂上，也强制中止卡死的上游套接字。 |
 | `network.keepAliveTimeoutMs` | number | 5000 | BILI_KEEP_ALIVE_TIMEOUT_MS | 连接池内上游套接字的空闲保活超时。 |
 | `network.clientErrorBackstopMs` | number | 30000 | BILI_CLIENT_ERROR_BACKSTOP_MS | 中止停止读取已提交响应的客户端连接的兜底超时。 |
@@ -2045,6 +2046,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WS_IDLE_TIMEOUT_MS` | `network.wsIdleTimeoutMs` | 600000 |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
@@ -2136,6 +2138,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_UPSTREAM_PROXY` | 代理自身出站连接的上游代理 —— 在*全局*来源中优先级最高（高于 Web UI 手动代理与配置文件 `proxy`）。per-URL 的 `providers.<url>.proxy` 对其匹配的 provider URL 仍然优先。完整解析顺序、防环规则与示例见 [服务端设置 → `proxy`](#服务端设置)。 |
 | `BILI_INHERITED_HTTP_PROXY` / `BILI_INHERITED_HTTPS_PROXY` / `BILI_INHERITED_ALL_PROXY` / `BILI_INHERITED_NO_PROXY` | 非用户直接使用 —— launcher 起代理子进程时自动设置（#1012）。launcher 会从客户端和代理子进程两侧剥掉 shell 的代理变量（客户端必须把流量发给 bili；代理的模型出网也不能被 shell 代理劫持），但会把用户剥离前的代理转发到这些变量里，让代理的**辅助出网**（MITM 盲隧道 —— 客户端侧的 MCP/web 流量）仍能走用户的 VPN。它们只作用于盲隧道的 fallback 层：显式路由 / 全局 `proxy` / `BILI_UPSTREAM_PROXY` / 显式 `"upstreamProxyMode": "direct"` 仍然优先，指向 bili 自身端口的值会被丢弃。模型出网不受影响（未显式配置则保持直连）。 |
 | `BILI_UPSTREAM_TIMEOUT_MS` | 上游请求的空闲预算（毫秒）：首字节时间（TTFB）与响应体块之间的间隔（默认 `720000` = 12 分钟）。持续产出数据块的健康流永远不会被中途切断；静默的流才会。同一个值同时驱动底层 HTTP 客户端的传输层超时，因此这一个旋钮即可端到端约束本地大模型的超长 prefill（#551）。 |
+| `BILI_WS_IDLE_TIMEOUT_MS` | Responses WebSocket 车道的逐事件空闲预算（毫秒）（#6171）：任何上游帧都会重新上弦，所以稳定流式永不触发——只有完全卡死才会。握手阶段同样受管（升级卡死会快速失败而不是永远等待）。触发时该交换获得唯一终态——一帧合成的客户端错误加断开连接（下一轮重新连接）——并在同一 conn/session 标识下记一条可关联的 `upstream failed … event=timeout reason=idle-timeout` 日志行。此前完全卡死的 WS 交换会一直挂到客户端放弃；本旋钮是 WS 车道上 `BILI_UPSTREAM_TIMEOUT_MS` 的对应物。默认 `600000` = 10 分钟（owner 在 #6171 拍板）；非整数或非正值回落到默认值。文件配置键：`network.wsIdleTimeoutMs`。 |
 | `BILI_CA_FILE` | 指向一个 PEM 文件的路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 TLS。做 HTTPS/加密连接扫描的安全软件（卡巴斯基、企业 DLP）或企业 MITM 代理会用自家 CA 重签上游：浏览器通过系统证书库信任它，但 Node 的 fetch 只读内置根证书加 `NODE_EXTRA_CA_CERTS`——于是 bili 报 `SELF_SIGNED_CERT_IN_CHAIN`，而机器上其他一切连接正常。把扫描软件/厂商根证书导出为 PEM 后设置此项（或 `NODE_EXTRA_CA_CERTS`）；或在安全软件的 HTTPS 检查中排除 node.exe。该文件与 Node 内置根证书及 `NODE_EXTRA_CA_CERTS` 条目合并——从不替换。未设置 = 当前默认信任，逐字节不变。配置键：`network.caFile`。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | dsh/opencode attach 校验中，attach 目标已挂但本进程模型通道**钉死**在其上（观察到指向它的 `/bili/…` 路由流量）时的健康等待上限（毫秒）：bili 等待目标恢复而不是 spawn 第二实例——spawn 会把会话劈成两半（模型流量保持钉死，bili 工具在另一实例上 404）。超时后大声报错，并在每次模型请求时持续重查直到目标恢复（默认 `15000`）。见 #1365。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | dsh/opencode attach 校验探测到目标已挂时，等待路由通道证据出现的宽限窗口（毫秒），超时才回退到旧的 spawn 路径（覆盖「判定早于首个请求」的竞态：t≈0 时探测失败、t≈1s 时首个模型请求才落地）（默认 `5000`）。见 #1365。 |

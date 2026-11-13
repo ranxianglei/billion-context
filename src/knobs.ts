@@ -104,6 +104,21 @@ export function upstreamFirstByteMs(): number {
     return Number.isInteger(v) && v > 0 ? v : upstreamTimeoutMs();
 }
 
+const WS_IDLE_TIMEOUT_MS_DEFAULT = 600_000; // owner-set on #6171: 10 minutes
+
+/** BILI_WS_IDLE_TIMEOUT_MS > network.wsIdleTimeoutMs > 10 minutes. Inter-event idle
+ *  budget for the Responses WebSocket leg (#6171): any upstream frame re-arms it, so
+ *  steady streaming never trips it — only a full stall does. The HTTP lane's
+ *  equivalent is the fetchWithTimeout watchdog; the WS leg owns its own socket and had
+ *  no server-side bound, so a stalled supplier hung the exchange until the client gave
+ *  up. Covers the handshake too (a wedged upgrade request fails fast instead of
+ *  waiting forever). On fire the exchange gets its single terminal state and the
+ *  connection drops for a fresh reconnect next turn. */
+export function wsIdleTimeoutMs(): number {
+    const v = tNum("BILI_WS_IDLE_TIMEOUT_MS", fileNetwork().wsIdleTimeoutMs);
+    return Number.isInteger(v) && v > 0 ? v : WS_IDLE_TIMEOUT_MS_DEFAULT;
+}
+
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
  *  trusted by bili's OWN outbound upstream fetch — for security software doing
  *  HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate

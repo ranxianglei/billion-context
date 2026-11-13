@@ -2297,6 +2297,12 @@ type FileConfig = {
          *  answers fails fast instead of silently eating the full 12-minute watchdog
          *  while the client times out first (#5904). */
         upstreamFirstByteMs?: number;
+        /** Inter-event idle budget for the Responses WebSocket leg (was env-only
+         *  BILI_WS_IDLE_TIMEOUT_MS; default 600000 = 10 min). Any upstream frame
+         *  re-arms it — steady streaming never trips it, only a full stall does.
+         *  Covers the handshake too; on fire the exchange gets its single terminal
+         *  state and the connection drops for a fresh reconnect next turn (#6171). */
+        wsIdleTimeoutMs?: number;
         /** Request watchdog budget (was BILI_REQUEST_WATCHDOG_MS; default 2× upstream timeout). */
         requestWatchdogMs?: number;
         /** Server keep-alive timeout (was BILI_KEEP_ALIVE_TIMEOUT_MS; default 5000). */

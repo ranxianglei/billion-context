@@ -161,6 +161,7 @@
 | `network` | object | {} (all defaults) | — | 上流呼び出しのタイムアウト、ウォッチドッグ、リプレイポリシー。 |
 | `network.upstreamTimeoutMs` | number | 720000 | BILI_UPSTREAM_TIMEOUT_MS | 単一の上流呼び出しに対する絶対上限（12分は、遅い深層思考モデルをカバーする）。 |
 | `network.upstreamFirstByteMs` | number | = upstreamTimeoutMs (resolved; 720000 when unset) | BILI_UPSTREAM_FIRST_BYTE_MS | フェーズ1の予算：リクエスト送信 → 最初のレスポンスバイト（undiciは最初のボディデータ付近でfetchを解決する）。未設定の場合、解決済みの上流タイムアウト（upstreamTimeoutMs）に従う — BILI_UPSTREAM_TIMEOUT_MS を12分以上に引き上げるデプロイメントを含む（#5917 レビュー：定数 720000 のフォールバックはそれらを静かに再制限してしまう）— したがって動作は変更されない；より厳格なデプロイメントはオプトインする（#5904：リクエストを受け入れるが以前は応答しなかったスタックした上流は、クライアントが中断するまで静かにハングしていた）。最初のバイト後、チャンク間の沈黙は引き続き完全な upstreamTimeoutMs によって管理される（#1706/#1714 の保証）。この値が upstreamTimeoutMs 未満に設定されると、最初のバイトのタイムアウトは独自の失敗クラス upstream-headers-timeout となる — レスポンスバイトがゼロであるため、bili はリクエスト全体を一度で失敗させるのではなく、既存のリトライ予算（BILI_REPLAY_RETRY_MAX、デフォルト 3）の下でプロキシ内でリプレイする；ストリーム中（ボディ）のアイドルタイムアウトは upstream-timeout のままであり、リトライされない。未設定の場合、動作は以前とバイト単位で同一である（#5807/#5831）。リリースゲートは 120000 を設定する。 |
+| `network.wsIdleTimeoutMs` | number | 600000 | BILI_WS_IDLE_TIMEOUT_MS | Responses WebSocket レグのイベント間アイドル予算（#6171）：上流フレームのたびに再アームされるため、安定したストリーミングでは決してトリガーされず、完全なスタック時のみ発火する。ハンドシェイクも対象（アップグレードがスタックしても永遠に待たず即失敗する）。発火時、その交換は単一の終端状態を取得し、同一 conn/session スタンプの下で相関可能な `upstream failed … event=timeout reason=idle-timeout` ログ行を出力し、接続を切断して次のターンで新たに再接続する。以前は完全にスタックした WS 交換はクライアントが諦めるまでハングしていた — HTTP レグの対応物は BILI_UPSTREAM_TIMEOUT_MS。 |
 | `network.requestWatchdogMs` | number | 2× upstreamTimeoutMs | BILI_REQUEST_WATCHDOG_MS | 呼び出しごとのタイマーが設定されていなくても、スタックした上流ソケットを強制中断する絶対的なウォッチドッグ。 |
 | `network.keepAliveTimeoutMs` | number | 5000 | BILI_KEEP_ALIVE_TIMEOUT_MS | プールされた上流ソケットのアイドルキープアライブタイムアウト。 |
 | `network.clientErrorBackstopMs` | number | 30000 | BILI_CLIENT_ERROR_BACKSTOP_MS | コミットされたレスポンスの読み取りを停止したクライアント接続を中断するバックストップ。 |
@@ -2057,6 +2058,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WS_IDLE_TIMEOUT_MS` | `network.wsIdleTimeoutMs` | 600000 |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
