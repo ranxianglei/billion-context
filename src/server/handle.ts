@@ -114,6 +114,16 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
 
+// #6220: BILI_PLUGIN_BYPASS forces the bypass decision for EVERY request, and
+// both forced states carry an approved risk that must not be silent (decision
+// thread #6220): force-on with the in-process compressor absent sends all
+// traffic out uncompressed; force-off sends legacy in-process sessions through
+// the full bili pipeline, and their acp-store history degrades to a read-only
+// archive. Warn once per process per state — a line per request would be noise
+// on a stream that re-sends the same posture every turn.
+let bypassOverrideOnWarned = false;
+let bypassOverrideOffWarned = false;
+
 // #5608 v3: weakest VERIFIED common-prefix ratio (verifiedPrefix / chainDepth)
 // at which a byte-exact MISS may still weakly adopt the closest tracked chain.
 // Floor set just below the lowest production telemetry reading in #5608's
@@ -642,8 +652,16 @@ async function handleRequest(
     //   "off" → never bypass (ignore the header)
     //   unset → current behavior (the header decides)
     const bypassOverride = pluginBypassOverride();
-    const bypass = bypassOverride === "on"
-        || (bypassOverride === "auto" && headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1");
+    const headerBypass = headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1";
+    if (bypassOverride === "on" && !bypassOverrideOnWarned) {
+        bypassOverrideOnWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=on — every inbound request is forwarded verbatim (no tool injection, no nudge, no session binding); if the in-process compressor is not loaded, traffic goes out with NO compression (#6220)");
+    }
+    if (bypassOverride === "off" && headerBypass && !bypassOverrideOffWarned) {
+        bypassOverrideOffWarned = true;
+        log("warn", "BILI_PLUGIN_BYPASS=off — inbound x-bili-plugin-bypass header ignored; legacy in-process compression sessions now run the full bili pipeline (their acp-store history degrades to a read-only archive) (#6220)");
+    }
+    const bypass = bypassOverride === "on" || (bypassOverride === "auto" && headerBypass);
     if (bypass) {
         const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
