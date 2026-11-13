@@ -11,7 +11,10 @@
 // Modes:
 //   --dispatch   Fire (workflow_dispatch) every required lane that has no run
 //                at any target sha. Idempotent: lanes with an existing run
-//                (any status) are left alone. Call this EARLY in the release
+//                (any status) are left alone. Exception: approval-gated
+//                `action_required` runs do NOT count — they never execute a
+//                job (bot-authored PR runs, #772), so a lane whose only run
+//                is action_required is dispatched (#6552). Call this EARLY in the release
 //                workflow so lanes run in parallel with the local pre-flight.
 //                BEFORE dispatching it verifies the ref's current head equals
 //                the target sha and refuses otherwise (#3539): dispatching at
@@ -181,19 +184,33 @@ async function api(path, init) {
 }
 
 // Newest run of `workflow` at `sha`, or null.
+//
+// Approval-gated `action_required` runs are treated as NON-runs (#6552):
+// GitHub auto-creates pull_request runs the moment a bot/app opens the
+// release fallback PR, and those runs complete `action_required` without
+// ever executing a job (PRs authored by an app sit behind manual approval,
+// #772). They are not a CI signal — they can never turn green on their own
+// — but they always carry NEWER run ids than the workflow_dispatch
+// compensation runs. Counting them makes the gate pick them as "the latest
+// run at the publish sha" and fail fast seconds after the PR opens (or
+// skip dispatching a lane that has no runnable run at all), while the
+// compensation runs that actually certify the sha are masked.
 async function latestRunAt(workflow, sha) {
   const res = await api(
-    `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?head_sha=${encodeURIComponent(sha)}&per_page=5`,
+    `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?head_sha=${encodeURIComponent(sha)}&per_page=10`,
   );
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`GET runs for ${workflow}@${sha.slice(0, 8)} → HTTP ${res.status}: ${body.slice(0, 300)}`);
   }
   const runs = (await res.json()).workflow_runs || [];
-  if (!runs.length) return null;
   // Defensive: the API is newest-first, but sort explicitly by run id.
   runs.sort((a, b) => b.id - a.id);
-  return runs[0];
+  // #6552: drop terminal approval-gated runs so the gate falls through to
+  // the run that actually executed — or to "missing", which dispatches.
+  const real = runs.filter((r) => !(r.status === "completed" && r.conclusion === "action_required"));
+  if (!real.length) return null;
+  return real[0];
 }
 
 // Newest up-to-30 runs of `workflow` regardless of sha (stale-run scan).
