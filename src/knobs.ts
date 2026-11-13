@@ -715,6 +715,7 @@ type PluginBypassOverride = "auto" | "on" | "off";
  *    unset / "auto"    → current behavior: the inbound header decides per request
  *    "1"/"on"/"true"   → force bypass: every inbound request is forwarded verbatim
  *    "0"/"off"/"false" → never bypass: ignore any inbound x-bili-plugin-bypass header
+ *    unrecognized value → "auto" (current behavior)
  *  Env-only per the owner-approved design in #6220: the header is a wire
  *  contract stamped by hosts; the override is a per-process operator
  *  posture, not a per-route config field. */
