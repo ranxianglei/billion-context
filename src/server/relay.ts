@@ -50,7 +50,7 @@ import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipe
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
-import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
+import { diagnoseSuccessWithoutUsage, markDirty, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
@@ -2097,6 +2097,7 @@ async function forwardCaptured(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        if (prepared?.session && prepared.nudgeStampsBefore && upstream.status >= 400 && upstream.status < 500) rejectNudge(prepared.session, prepared.nudgeStampsBefore, upstream.status);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
         // keyring_all_limited and every ambiguous response remain account-wide.

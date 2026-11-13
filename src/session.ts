@@ -338,6 +338,10 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
+        /** The upstream rejected a request that carried a nudge: its stamps were
+         *  rolled back, and no nudge rides until a request succeeds (the nudge may
+         *  be what drew the rejection). Cleared by settleUsageReport. */
+        nudgeHeldAfterReject?: boolean;
         /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
          *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
          *  Re-stamped on every prepare (injected rounds re-mint the window,
@@ -1134,6 +1138,29 @@ export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): v
     nudge.lastShownByTier = {};
     delete t.abortReanchor;
     loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}, growth debt +${recovered} → ${nudge.absorbedDebt ?? 0} over ${nudge.absorbCount} absorb(s)) (#5293/#5415)`);
+}
+
+export type NudgeStamps = { shown: number; byTier: Session["state"]["nudge"]["lastShownByTier"] };
+
+export function nudgeStampsOf(session: Session): NudgeStamps {
+    return { shown: session.state.nudge.lastNudgeShownTokens, byTier: session.state.nudge.lastShownByTier };
+}
+
+export function restoreNudgeStamps(session: Session, stamps: NudgeStamps): void {
+    session.state.nudge.lastNudgeShownTokens = stamps.shown;
+    session.state.nudge.lastShownByTier = stamps.byTier;
+}
+
+/** The kernel stamps a nudge as shown when it decides to inject it. When the
+ *  upstream rejects that request the model never saw the nudge, so the stamp
+ *  would hold the cadence against a nudge nobody received (a Claude Code session,
+ *  2026-11-11: the session's only nudge drew a 400 and it never nudged again).
+ *  Roll the stamps back and hold nudges until the next success. */
+export function rejectNudge(session: Session, before: NudgeStamps, status: number): void {
+    restoreNudgeStamps(session, before);
+    (session.transient ??= {}).nudgeHeldAfterReject = true;
+    markDirty(session);
+    loggerLog("info", `[${session.id}] nudge rejected with its request (upstream ${status}): stamps rolled back to shown=${before.shown}; nudges held until a request succeeds`);
 }
 
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
