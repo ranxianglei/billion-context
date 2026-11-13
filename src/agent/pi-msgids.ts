@@ -44,6 +44,11 @@
 // stripped with pi's own regex; cache_control decorations are ignored (the
 // wire may add them; they never change identity).
 
+// #6525: the core-alignment proof below runs the KERNEL's own wire→core
+// projection (the same one the proxy runs before pinning), so a stamp that
+// passes it is guaranteed to be the exact array the server will validate.
+import { anthropicToCore, openaiToCore } from "acp-kernel/wire";
+
 type FpPart = { t: "text" | "img" | "tooluse" | "toolres" | "think" | "redact"; v: string };
 
 /** Mirror of pi's sanitizeSurrogates (utils/sanitize-unicode.js): strips
@@ -464,4 +469,54 @@ export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[
     }
     const leftover = take();
     return leftover === "exhausted" ? ids : undefined;
+}
+
+// #6525 (发): CORE-alignment proof shared by every client's full-resend
+// msgid envelope stamp (dsh #6532 inlines the same logic; pi/omp call this).
+// Input = the WALKER's wire-aligned output (openai wire keeps its leading
+// bili-ps-N hoist slots) + the wire messages + the full payload. Returns the
+// core-aligned id array — == the POST-hoist core count the server validates
+// — or undefined when a 1:1 host pin is not provable; the caller must then
+// send NO envelope (byte-identical to before, never a misaligned array).
+// The kernel's wireIndex is the alignment authority: a wire element that
+// splits into N cores (or vanishes) has no 1:1 host id, so the whole stamp
+// bails. Duplicates are refused here too (validateMsgIds would reject them
+// server-side anyway — refusing locally skips the one-time warn path).
+export function coreAlignEnvelopeIds(
+    fmt: "openai" | "anthropic",
+    wireAligned: string[],
+    wire: unknown,
+    parsed: Record<string, unknown>,
+): string[] | undefined {
+    if (!Array.isArray(wire)) return undefined;
+    // The walk's contract is 1:1 with the element count — a mismatched pair
+    // here would silently misalign the envelope, so refuse it outright.
+    if (wireAligned.length !== wire.length) return undefined;
+    // OpenAI wire only: the leading system/developer run becomes synthetic
+    // bili-ps-N slots (== the kernel's hoisted prefix) — drop them; the
+    // envelope must be CORE-aligned (the server validates against the
+    // post-hoist core count). Anthropic has no hoist (system is a separate
+    // field), so lead stays 0 there. A bili-ps- slot anywhere PAST the lead
+    // run means a mid-body system the walker could not place → bail.
+    let lead = 0;
+    while (lead < wireAligned.length && (wireAligned[lead] as string).startsWith("bili-ps-")) lead += 1;
+    for (let i = lead; i < wireAligned.length; i++) {
+        if ((wireAligned[i] as string).startsWith("bili-ps-")) return undefined;
+    }
+    const coreAligned = wireAligned.slice(lead);
+    if (coreAligned.length === 0) return undefined;
+    const flat = fmt === "anthropic"
+        ? anthropicToCore(parsed as Parameters<typeof anthropicToCore>[0])
+        : openaiToCore(parsed as Parameters<typeof openaiToCore>[0]);
+    const perEl = new Map<number, number>();
+    for (const c of flat.msgs) {
+        const w = c.wireIndex;
+        if (w === undefined) continue;
+        perEl.set(w, (perEl.get(w) ?? 0) + 1);
+    }
+    for (let i = lead; i < wire.length; i++) {
+        if ((perEl.get(i) ?? 0) !== 1) return undefined; // element split into N cores (or vanished) — no 1:1 host pin exists
+    }
+    if (new Set(coreAligned).size !== coreAligned.length) return undefined;
+    return coreAligned;
 }

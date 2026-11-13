@@ -21,7 +21,7 @@ Discipline: collectors only "obtain and pre-screen"; they hold NO identity-adjud
 
 Four carriers, **ALL stripped before forwarding to the model upstream** — the model wire still carries no message-level ids (#2821 doctrine):
 
-1. **Envelope field** `biliMsgIds`: parallel array on full-resend model bodies, length-locked to messages, same lifecycle (stripped at ingress, src/server/prepare-anthropic.ts et al.).
+1. **Envelope field** `biliMsgIds`: parallel array on full-resend model bodies, length-locked to the **post-hoist core count** (not the wire element count) — clients prove core-alignment via the kernel `wireIndex` before stamping (src/agent/pi-msgids.ts `coreAlignEnvelopeIds`; any mismatch bails and the request ships byte-identical). Wired: pi + omp full-resend (src/agent/pi.ts `stampMsgIdEnvelope`), gated by `destinationRoutedThroughProxy` — a blind tunnel never gets stamped (#1403). Same lifecycle (stripped at ingress, src/server/prepare-anthropic.ts et al.).
 2. **Incremental turn payload** `msgIds`: envelope on `POST /__bili/plugin/turn` (src/agent/incremental-client.ts); server re-stamps `biliMsgIds` (src/incremental-lane.ts).
 3. **Watermark headers** `x-bili-pf-tail-ids` (v2-v4, #5403/#5418): window segment only = last anchor element + all elements added since K, percent-encoded per segment, comma-separated (commas inside ids travel as `%2C`, separators stay literal); sibling `x-bili-pf-count` count stamp. pf-* headers are **protocol headers, not hop headers**: stripped before upstream via `UPSTREAM_HOP_HEADERS`.
 4. **Ledger-seq sibling** `biliLedgerSeqs` / `ledgerSeq` stamps (#4316 L3 PR2/3): 1-based positive-int parallel arrays, validated by `validateMsgSeqs`, same strict-validate-then-degrade lifecycle.

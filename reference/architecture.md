@@ -234,7 +234,7 @@ billion-context/
 │   │   ├── opencode-v2-msgids.ts #   Opencode V2 per-turn msgid extraction + header stamp (#5825)
 │   │   ├── pf-channel.ts         #   Watermark channel client state machine: learn, capture, emit (#5403)
 │   │   ├── pi-inline.ts          #   Pi inline lane: serves INLINE_ORIGIN traffic in-process (#3278)
-│   │   ├── pi-msgids.ts          #   Pi wire-branch lockstep walker resolving host msgids (#4491)
+│   │   ├── pi-msgids.ts          #   Pi wire-branch lockstep walker resolving host msgids (#4491) + core-alignment proof for the full-resend envelope (#6525)
 │   │   ├── pi-subagent-registry.ts #   Self-registration into pi-subagents required-child extensions (#2185)
 │   │   ├── tool-guardrails.ts    #   Tool-output guardrails migrated from billion-context-pi (#3066)
 │   │   └── dsh-native-client-react-shim.d.ts #  Ambient "react" types for the dsh bundle (#1590)
