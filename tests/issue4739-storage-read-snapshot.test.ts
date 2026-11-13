@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { UnifiedStore, type IngestSessionInput } from "../src/storage/store.ts";
+import { UnifiedStore, sha256Hex, type IngestSessionInput } from "../src/storage/store.ts";
 import { SqliteBackend } from "../src/storage/backend.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { MysqlBackend, type Mysql2Module } from "../src/storage/mysql.ts";
@@ -20,12 +20,15 @@ function fixture(requests = 1): IngestSessionInput {
             seq, msgId: `m${seq}`, ref: null, refNum: null, role: "user", kind: "message",
             content: JSON.stringify({ id: `m${seq}`, role: "user", text: `text${seq}` }),
         })),
-        blocks: [0, 1, 2].map((ord) => ({
-            blockId: `b${ord}`, ord, startSeq: ord, endSeq: ord, startRef: null, endRef: null, tier: 0,
-            summary: JSON.stringify({ text: `full${ord}`, count: 1 }),
-            one: JSON.stringify({ text: `one${ord}`, count: 1 }), supersedesBlockId: null,
-            active: ord !== 1, createdAt: 1, coveredHash: "[]", payloadJson: JSON.stringify({ blockId: `b${ord}` }),
-        })),
+        blocks: [0, 1, 2].map((ord) => {
+            const summary = JSON.stringify({ text: `full${ord}`, count: 1 });
+            const one = JSON.stringify({ text: `one${ord}`, count: 1 });
+            return {
+                blockId: `b${ord}`, ord, startSeq: ord, endSeq: ord, startRef: null, endRef: null, tier: 0,
+                summary, one, summaryHash: sha256Hex(summary), oneHash: sha256Hex(one), supersedesBlockId: null,
+                active: ord !== 1, createdAt: 1, coveredHash: "[]", payloadJson: JSON.stringify({ blockId: `b${ord}` }),
+            };
+        }),
         refs: [
             { ord: 0, rawId: "a", ref: "m00001", refNum: 1 },
             { ord: 1, rawId: "b", ref: "m00001", refNum: 1 },

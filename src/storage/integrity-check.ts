@@ -20,9 +20,10 @@
  *     read-only connection in a worker thread (WAL allows concurrent
  *     readers, and the main handle has already run recovery, so the
  *     read-only open cannot hit WAL-recovery). Boot returns in
- *     milliseconds; a failure is recorded loudly and cached so the NEXT
- *     open throws StorageIntegrityError and reuses the #4175
- *     quarantine-and-reopen-fresh machinery. Small stores keep the
+ *     milliseconds; a failure is recorded loudly as an ALARM ONLY — never
+ *     persisted as a boot-blocker (2026-10-30 owner policy: a running
+ *     store's background finding must not refuse future boots; each next
+ *     boot re-scans fresh). No automatic file moves, #4175.
  *     synchronous pre-migration check — the #4175 premise (a corrupt file
  *     must never be migrated against) stays intact wherever it is cheap.
  *     The one concession: on a big store's first boot after upgrade,
@@ -35,6 +36,7 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { log as loggerLog } from "../logger.js";
+import { isBunRuntime } from "./driver.js";
 import { recordIntegrityOutcome } from "./runtime-status.js";
 import { STORAGE_SCHEMA_VERSION } from "./schema.js";
 
@@ -64,7 +66,6 @@ interface IntegrityCache {
 type IntegrityMode =
     | { kind: "skip" }
     | { kind: "cached-ok" }
-    | { kind: "cached-fail"; detail: string }
     | { kind: "sync" }
     | { kind: "async"; sizeBytes: number };
 
@@ -88,14 +89,27 @@ function statKeyOf(dbPath: string): { db: StatKeyPart | null; wal: StatKeyPart |
     return { db: statPart(dbPath), wal: statPart(`${dbPath}-wal`) };
 }
 
+function isStatKeyPart(value: unknown): value is StatKeyPart {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const part = value as Partial<StatKeyPart>;
+    return typeof part.s === "number" && Number.isSafeInteger(part.s) && part.s >= 0
+        && typeof part.m === "number" && Number.isFinite(part.m);
+}
+
 /** Read + validate the sidecar. Malformed/absent → null (a plain cache
  * miss — never a boot failure). */
 export function readIntegrityCache(dbPath: string): IntegrityCache | null {
     const file = integrityCachePath(dbPath);
     if (!existsSync(file)) return null;
     try {
-        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<IntegrityCache>;
-        if (parsed.v !== 1 || typeof parsed.ok !== "boolean") return null;
+        const value: unknown = JSON.parse(readFileSync(file, "utf8"));
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+        const parsed = value as Partial<IntegrityCache>;
+        if (parsed.v !== 1 || typeof parsed.ok !== "boolean"
+            || typeof parsed.schema !== "number" || !Number.isSafeInteger(parsed.schema) || parsed.schema < 0
+            || !isStatKeyPart(parsed.db) || (parsed.wal !== null && !isStatKeyPart(parsed.wal))
+            || typeof parsed.at !== "number" || !Number.isFinite(parsed.at) || parsed.at < 0
+            || (parsed.detail !== undefined && typeof parsed.detail !== "string")) return null;
         return parsed as IntegrityCache;
     } catch {
         return null;
@@ -130,7 +144,10 @@ export function integrityModeFor(dbPath: string, env: { BILI_STORAGE_QUICK_CHECK
             cache.schema === STORAGE_SCHEMA_VERSION;
         if (matches) {
             if (cache.ok) return { kind: "cached-ok" };
-            return { kind: "cached-fail", detail: cache.detail ?? "cached quick_check failure" };
+            // A stale FAIL verdict planted by an OLDER version (this one never
+            // caches failures anymore) no longer refuses boots — owner policy
+            // 2026-10-30: treat it as a cache miss and let a FRESH scan decide.
+            loggerLog("warn", `[storage] previous quick_check verdict for ${dbPath} was FAIL (${cache.detail ?? "no detail"}) — stale verdicts no longer block boots; re-checking with a fresh scan (2026-10-30 owner policy)`);
         }
     }
     const size = statPart(dbPath)?.s ?? 0;
@@ -146,29 +163,107 @@ const { parentPort, workerData } = require("node:worker_threads");
 // (node:sqlite is NOT in module.builtinModules, so it is not skipped as a
 // builtin); variable indirection is that gate's sanctioned invisible path.
 // Do NOT inline the specifier back into the call — it re-trips the gate
-// (same class as #3511/#3516/#4008; see 8b70e913 for the same fix in
-// src/storage/quick-check-worker.ts).
+// (same class as #3511/#3516/#4008; driver.ts uses the same indirection for
+// bun:sqlite).
+// bun is not Node: it has no node:sqlite, and its own builtin speaks the
+// better-sqlite3-shaped API (Database, the "readonly" option instead of node's
+// "readOnly"), so the worker picks the engine by the runtime it actually runs
+// on — the same process.versions.bun test driver.ts uses.
 const SQLITE_SPEC = "node:sqlite";
+const BUN_SQLITE_SPEC = "bun:sqlite";
+const isBunRuntime = typeof process !== "undefined" && process.versions != null && process.versions.bun != null;
+const openReadOnly = isBunRuntime
+    ? (p) => new (require(BUN_SQLITE_SPEC).Database)(p, { readonly: true })
+    : (p) => new (require(SQLITE_SPEC).DatabaseSync)(p, { readOnly: true });
 try {
-    const { DatabaseSync } = require(SQLITE_SPEC);
-    const db = new DatabaseSync(workerData.path, { readOnly: true });
+    const db = openReadOnly(workerData.path);
     const rows = db.prepare("PRAGMA quick_check").all();
     db.close();
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
     parentPort.postMessage({ ok: true, verdict });
 } catch (err) {
-    parentPort.postMessage({ ok: false, error: String(err) });
+    // #5108/#4816: a corruption-shaped THROW out of quick_check (truncated file,
+    // garbage header, broken overflow chain) is a FAIL VERDICT, not "could not
+    // run" — classify it exactly like src/storage/sqlite-errors.ts does (inlined
+    // here because this string is bundled verbatim and cannot import modules;
+    // keep the two in sync, the worker-facet regression test pins both).
+    const m = String((err && err.message) || err);
+    const c = String((err && err.code) || "").toUpperCase();
+    const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
+    parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
 }
 `;
+
+// --- worker stderr hygiene (#5940) ------------------------------------------
+
+const KNOWN_SQLITE_EXPERIMENTAL_NOTICE = "ExperimentalWarning: SQLite is an experimental feature";
+
+/** One filter instance per captured worker-stderr stream. Returns true when
+ * a line must be KEPT (routed to diagnostics), false when dropped.
+ *
+ * Node prints its built-in module notices as a block: the header line (with a
+ * "(node:<pid>)" prefix in current releases), then either the
+ * "(Use `node --trace-warnings ...`)" hint or indented stack frames when
+ * --trace-warnings is enabled. After recognizing the header we swallow the
+ * whole block trailer so no fragment of the notice leaks; any other content
+ * ends the block and is kept. Only the SQLite notice is recognized — every
+ * other warning/error passes through untouched (both directions pinned by
+ * tests/integrity-worker-stderr.test.ts). If Node ever rewords the notice,
+ * the filter stops matching and the notice becomes visible again — graceful
+ * degradation, never a silent drop of unrelated output. */
+export function createIntegrityWorkerStderrFilter(): (line: string) => boolean {
+    let inNoticeBlock = false;
+    return (line: string): boolean => {
+        if (line.includes(KNOWN_SQLITE_EXPERIMENTAL_NOTICE)) {
+            inNoticeBlock = true;
+            return false;
+        }
+        if (inNoticeBlock && (line === "" || /^\s/.test(line) || /^\(Use `node /.test(line))) {
+            return false;
+        }
+        inNoticeBlock = false;
+        return true;
+    };
+}
+
+/** Consume the captured worker stderr (#5940): line-buffer it, drop only the
+ * known SQLite experimental-notice block, route every kept line through
+ * loggerLog. In the inline lane the logger's stderr leg is muted against the
+ * TUI (src/inline-engine.ts), so kept lines land in the durable bili.log
+ * file; standalone bili keeps its usual file+stderr surface. Call right
+ * after construction — the stream flows immediately and can deliver data
+ * even after the verdict message arrives. */
+function attachWorkerStderr(worker: Worker, dbPath: string): void {
+    const stream = worker.stderr;
+    if (!stream) return; // runtime without a capturable worker stderr: nothing to route
+    const keep = createIntegrityWorkerStderrFilter();
+    let pending = "";
+    const emitLine = (line: string): void => {
+        if (line === "") return;
+        if (keep(line)) loggerLog("warn", `[storage] integrity worker stderr for ${dbPath}: ${line}`);
+    };
+    stream.on("data", (chunk: Buffer | string) => {
+        pending += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        let nl: number;
+        while ((nl = pending.indexOf("\n")) >= 0) {
+            emitLine(pending.slice(0, nl));
+            pending = pending.slice(nl + 1);
+        }
+    });
+    stream.on("close", () => {
+        if (pending.length > 0) emitLine(pending);
+    });
+}
 
 /** Paths with a background check still running (close-time cache refresh
  * defers to the worker's own completion write). */
 const inflight = new Set<string>();
 
 /** Fire-and-forget background quick_check on a second read-only connection
- * (#4609). Records the outcome, caches it (ok or fail — a cached fail makes
- * the NEXT open throw and quarantine via the #4175 path), and tells the
- * caller's store instance so a clean close can refresh the cache key. */
+ * (#4609). Records the outcome for the operator's alarms (ok or fail —
+ * 2026-10-30 owner policy: background findings are ALARMS ONLY, never
+ * boot-blockers — no cache write on failure), and tells the caller's store
+ * instance so a clean close can refresh the PASS cache key. */
 export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean) => void): void {
     const size = statPart(dbPath)?.s ?? 0;
     loggerLog("info", `[storage] background quick_check started for ${dbPath} (${(size / (1024 * 1024)).toFixed(1)} MiB over the ${Math.round(effectiveSyncThreshold() / (1024 * 1024))} MiB sync threshold) — serving continues; the verdict lands in /__bili/status (#4609)`);
@@ -176,7 +271,20 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
     noteCheckRun();
     let worker: Worker;
     try {
-        worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { path: dbPath } });
+        // stderr: true — capture the worker's own stderr instead of inheriting
+        // the host terminal (#5940): Node emits "ExperimentalWarning: SQLite is
+        // an experimental feature" once per thread on first node:sqlite use,
+        // and with default stdio that printed straight into the agent's TUI
+        // mid-session. attachWorkerStderr drops only that known notice block;
+        // every other line still reaches loggerLog diagnostics. Node-only:
+        // bun workers expose no capturable stderr (and bun:sqlite emits no
+        // such notice), so nothing is routed there.
+        worker = new Worker(WORKER_SOURCE, {
+            eval: true,
+            workerData: { path: dbPath },
+            ...(isBunRuntime() ? {} : { stderr: true }),
+        });
+        attachWorkerStderr(worker, dbPath);
     } catch (err) {
         inflight.delete(dbPath);
         loggerLog("warn", `[storage] background quick_check could not start for ${dbPath}: ${String(err)} — the store serves unverified; the next boot rechecks`);
@@ -190,7 +298,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
             worker.unref();
         }
     };
-    worker.on("message", (msg: { ok?: boolean; verdict?: string; error?: string }) => {
+    worker.on("message", (msg: { ok?: boolean; corrupt?: boolean; verdict?: string; error?: string }) => {
         finish(() => {
             if (msg.ok === true) {
                 const verdict = String(msg.verdict ?? "");
@@ -199,16 +307,26 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                     writeIntegrityCache(dbPath, true);
                     onVerdict?.(true);
                 } else {
-                    // A real integrity failure found post-open: record loudly,
-                    // cache the fail so the next open quarantines + reopens
-                    // fresh (#4175 path), and keep serving (writes into a
-                    // corrupt store are quarantined with it; envelopes are
-                    // the recovery source).
+                    // A real integrity failure found post-open: record loudly as an
+                    // ALARM (owner policy 2026-10-30). It is NOT cached as a
+                    // boot-blocker — the NEXT boot re-scans and decides from fresh
+                    // evidence; files stay exactly where they are (no automatic
+                    // rename, #4175); keep serving now (writes into a provably-
+                    // corrupt store surface as ingest errors that are retried on
+                    // every subsequent save; envelopes are the recovery source).
                     recordIntegrityOutcome(dbPath, false, 0, verdict.slice(0, 400));
-                    writeIntegrityCache(dbPath, false, verdict.slice(0, 400));
-                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — verdict cached; the next open quarantines this file set and reopens fresh (JSON envelopes remain the recovery source, #4175/#4609)`);
+                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — ALARM ONLY, no boot-blocking verdict written (owner policy 2026-10-30: runtime findings never refuse future boots — each boot re-scans fresh); files left UNTOUCHED (back up ${dbPath}{,-wal,-shm} and move them aside only if you want to force a rebuild); JSON envelopes remain the recovery source (#4175/#4609)`);
                     onVerdict?.(false);
                 }
+            } else if (msg.corrupt === true) {
+                // #5108/#4816: the scan itself threw a corruption-shaped error
+                // (the throwing shapes of CORRUPT/NOTADB). Same ALARM-ONLY
+                // consequences as a bad verdict row (owner policy 2026-10-30:
+                // loud alarm, no cache write, next boot re-scans fresh).
+                const detail = String(msg.error ?? "").slice(0, 400);
+                recordIntegrityOutcome(dbPath, false, 0, detail);
+                loggerLog("error", `[storage] background quick_check threw a corruption-shaped error for ${dbPath}: ${detail} — ALARM ONLY, no boot-blocking verdict written (owner policy 2026-10-30); files left UNTOUCHED`);
+                onVerdict?.(false);
             } else {
                 loggerLog("warn", `[storage] background quick_check could not run for ${dbPath}: ${String(msg.error)} — the store serves unverified; the next boot rechecks`);
             }

@@ -17,7 +17,7 @@ const REPORT = [
     '  b1 (T1)  474.4K→169  3 msgs  "preflight overflow compress"',
     '  b2 (T1)  400.0K→150  5 msgs  "exploration"',
     "",
-    'Tip: buildStatusReport({scope:"uncompressed", view:"messages", tool:"bash"}) for per-message listing',
+    'Tip: call again with scope:"uncompressed", view:"messages", tool:"bash" for a per-message listing',
 ].join("\n");
 
 const EXTRAS = [
@@ -124,4 +124,23 @@ test("#2789: array content parts are cleaned per part", () => {
 test("#2789: outgoing forged-marker filter stays head-only (#717 contract)", () => {
     const s = `intro\n📊 [ACP] acp_status result:\nBreakdown: 4.2K system (21%)\ntail`;
     assert.equal(stripAcpTags(s), "intro\nBreakdown: 4.2K system (21%)\ntail");
+});
+
+// #5920 moved the conflict docs pointer from CONFIGURATION.md to
+// docs/configuration.md. Reports persisted BEFORE that move still carry the
+// old spelling — the legacy strip grammar must recognize both or the tail of
+// such reports leaks back into model-visible text after an upgrade.
+test("#5920: legacy conflict report strips fully under BOTH docs-pointer spellings", () => {
+    const body = (pointerLine: string) => `intro\n📊 [ACP] acp_status result:\nCOMPRESSION CONFLICTS — 1 session(s), 1 event(s)\nEvery event above is an UNCONFIRMED signal\nFix (opencode): disable opencode's native auto-compaction\n${pointerLine}\nSTORAGE — ok\n\nAlright, let me fold that range.`;
+    for (const pointerLine of [
+        'CONFIGURATION.md → "Detecting other compression plugins (#1206)"',
+        'docs/configuration.md → "Detecting other compression plugins (#1206)"',
+    ]) {
+        const messages = [{ role: "assistant", content: body(pointerLine) }];
+        stripAcpStatusMarkers(messages);
+        const out = (messages[0] as { content: string }).content;
+        assert.ok(!out.includes("Detecting other compression plugins"), `pointer line leaked (${pointerLine}): ${JSON.stringify(out)}`);
+        assert.ok(!out.includes("STORAGE — ok"), `report tail leaked past the pointer (${pointerLine}): ${JSON.stringify(out)}`);
+        assert.ok(out.includes("Alright, let me fold that range."), out);
+    }
 });

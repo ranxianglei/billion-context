@@ -105,7 +105,11 @@ test("cold canonical rebuild: identical resync keeps the shared prefix; delta as
         // #5155: the wrap-up defers the durable flush (debounced) — let the
         // rows settle before dropping the resident caches, or the cold
         // rebuild reads a one-turn-stale table and honestly 409s.
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        // Await the settle itself (afterNextFlush resolves once the armed save
+        // lands) instead of a fixed sleep: the settle is a real condition, and
+        // a magic millisecond budget is a deadline a loaded windows-latest
+        // runner can miss — the 409 flake this replaces.
+        assert.equal(await getStore().afterNextFlush("conv-ptrs"), true, "the turn's durable save must land before the cold reset");
         __resetIncrementalLaneForTests();
 
         const delta = await h.turn({ sinceSeq: 3, messages: [core("u4", "four")] });
@@ -135,7 +139,7 @@ test("cold canonical rebuild: edited-tail resync keeps the shared prefix, drops 
         await h.turn({ sinceSeq: 0, resync: true, messages: [core("u1", "one"), core("u2", "two-EDITED")] });
         await __incrementalPtrChainForTests("conv-ptrs");
         // #5155: settle the debounced flush before the cold reset (see above).
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        assert.equal(await getStore().afterNextFlush("conv-ptrs"), true, "the resync's durable save must land before the cold reset");
         __resetIncrementalLaneForTests();
         const delta = await h.turn({ sinceSeq: 2, messages: [core("u3", "three")] });
         assert.equal(delta.status, 200);

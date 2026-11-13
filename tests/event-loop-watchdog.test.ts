@@ -4,6 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
     WATCHDOG_HEARTBEAT_MS,
     WATCHDOG_HARD_TIMEOUT_MS,
@@ -55,7 +57,15 @@ test("wedged main loop trips the watchdog: warn + fatal forensic lines land in t
         assert.ok(handle, "handle expected");
         await sleep(50); // beats flowing — worker initialized
         blockMainLoop(400); // synchronous spin: zero heartbeats reach the worker
-        await sleep(80); // deliver the queued trip message
+        // Deliver the queued trip message. Poll to a bounded deadline instead
+        // of one fixed grace sleep: under runner load, worker init or the
+        // postMessage hop can land past any small fixed window without the
+        // mechanism breaking (#4762; same load-flake family as #4161 — the
+        // 2026-11-04 windows-latest/node-24 shard-4 red fired exactly this
+        // line on green code). A genuinely dead trip path still fails — after
+        // the full budget.
+        const tripDeadline = Date.now() + 3_000;
+        while (typeof trippedWith !== "number" && Date.now() < tripDeadline) await sleep(20);
         if (typeof trippedWith !== "number") throw new Error(`onTrip must fire after a continuous block past hardTimeoutMs (got ${String(trippedWith)})`);
         assert.ok(trippedWith >= 150, `gap ${trippedWith} must reach the hard threshold`);
         const content = fs.readFileSync(logFile, "utf8");
@@ -181,5 +191,36 @@ test("with NO file leg the worker's stderr is the sole forensic record and must 
     } finally {
         handle?.stop();
         await sleep(20);
+    }
+});
+
+test("exit mode kills the WHOLE process while the main thread is wedged, not just the worker", () => {
+    // process.exit() in a worker thread ends only the worker: the wedged proxy
+    // used to survive its own watchdog, keep the port and log "could not arm
+    // (... exited with code 1) - continuing unwatched". Run the real "exit"
+    // path in a child; SURVIVED on stdout means the watchdog failed.
+    // The child is a module FILE, not `-e --input-type=module`: the eval worker
+    // inherits execArgv, and an ESM-typed eval worker has no `require`.
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-watchdog-exit-"));
+    const logFile = path.join(dir, "bili.log");
+    const child = path.join(dir, "child.mts");
+    const modUrl = pathToFileURL(path.join(root, "src", "event-loop-watchdog.ts")).href;
+    fs.writeFileSync(child, [
+        `import { armEventLoopWatchdog } from ${JSON.stringify(modUrl)};`,
+        `armEventLoopWatchdog({ logFile: ${JSON.stringify(logFile)}, heartbeatMs: 20, checkIntervalMs: 20, softWarnMs: 60, hardTimeoutMs: 150, fatalMode: "exit", stderrTty: false });`,
+        "setTimeout(() => {",
+        "  const end = Date.now() + 5000;",
+        "  while (Date.now() < end) { /* wedge the main loop */ }",
+        "  process.stdout.write(\"SURVIVED\");",
+        "}, 100);",
+    ].join("\n"));
+    try {
+        const r = spawnSync(process.execPath, ["--import", "tsx", child], { encoding: "utf8", cwd: root, timeout: 60_000 });
+        assert.ok(!r.stdout.includes("SURVIVED"), `wedged process outlived its watchdog (status=${r.status} signal=${r.signal})`);
+        assert.ok(r.status !== 0 || r.signal !== null, `child must die abnormally (status=${r.status} signal=${r.signal})`);
+        assert.match(fs.readFileSync(logFile, "utf8"), /FATAL: main event loop silent/);
+    } finally {
+        rmrf(dir);
     }
 });

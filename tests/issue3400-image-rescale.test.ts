@@ -87,7 +87,7 @@ test("big image shrunk: anthropic standalone gets copied block + adjacent note m
     assert.notEqual(out[0], input[0], "input object not mutated in place");
     assert.equal(out[1].id, "acp_imgnote_msg_img_1");
     assert.equal(out[1].role, "user");
-    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB\(约 [\d.]+ 倍\)。需要原分辨率细节\(小字、颜色、对齐\)时,调用 acp_read_original_image\("m12345"\) 读取原图。原图较大,按需读取。$/);
+    assert.match(String(out[1].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled: now \d+×\d+ \(\d+KB\), original 2400×1800 \(\d+KB\)\. \(≈[\d.]+×\) Call acp_read_original_image\("m12345"\) to read the original when full-resolution detail matters \(small text, colors, alignment\)\. 需要原分辨率细节时调用该工具读取原图,按需读取。$/);
     // original sidecar untouched in the input array
     assert.equal((input[0].rawAnthropicBlock as { source: { data: string } }).source.data, BIG.b64);
 });
@@ -137,6 +137,31 @@ test("byte-stable: same history → identical outbound bytes across cache states
     assert.equal(out2, out1, "two independent encodes of the same history must be byte-identical (upstream prefix-cache protection)");
 });
 
+for (const [firstDim, nextDim] of [[1600, 800], [800, 1600]]) {
+    test(`encode cache respects a changed dimension limit (${firstDim} to ${nextDim})`, async () => {
+        const { ctx } = ctxFor(`s-cache-dim-${firstDim}`);
+        const input = [anthropicImageMsg("msg_dim", BIG.b64)];
+        const first = await applyImageRescalePass(input, { ...ctx, maxDim: firstDim });
+        const next = await applyImageRescalePass(input, { ...ctx, maxDim: nextDim });
+        const imageData = (messages: BiliMessage[]) => (messages[0].rawAnthropicBlock as { source: { data: string } }).source.data;
+        const decoded = await Jimp.read(Buffer.from(imageData(next), "base64"));
+        assert.equal(decoded.width, nextDim, "cached encodes must use the current policy");
+        assert.notEqual(imageData(first), imageData(next));
+        assert.deepEqual(await applyImageRescalePass(input, { ...ctx, maxDim: nextDim }), next, "the same policy still reuses byte-identical output");
+        assert.equal(logLines.filter((line) => line.includes("[image-rescale]")).length, 2);
+    });
+}
+
+test("a cached low-benefit result does not suppress a later stricter resize", async () => {
+    const { ctx } = ctxFor("s-cache-null-dim");
+    const input = [anthropicImageMsg("msg_null_dim", BMP.b64, "image/bmp")];
+    assert.equal((await applyImageRescalePass(input, { ...ctx, maxDim: 1600 }))[0], input[0]);
+    const next = await applyImageRescalePass(input, { ...ctx, maxDim: 800 });
+    const block = next[0].rawAnthropicBlock as { source: { data: string } };
+    const decoded = await Jimp.read(Buffer.from(block.source.data, "base64"));
+    assert.equal(decoded.width, 800);
+});
+
 test("openai singular image_url converts to plural parts with inline note", async () => {
     const { session, ctx } = ctxFor("s-openai");
     session.state.messageRefs.byRaw["msg_o"] = "m20001";
@@ -172,7 +197,7 @@ test("google inlineData shrunk, note appended to core text (never a raw text par
     const parts = out[0].rawGoogleParts as Array<{ inlineData?: { data?: string } }>;
     assert.equal(parts.length, 1);
     assert.notEqual(parts[0].inlineData?.data, BIG.b64);
-    assert.match(String(out[0].text), /^hello\n\n\[bili\] 本图已降采样:.*acp_read_original_image\("m30001"\)/);
+    assert.match(String(out[0].text), /^hello\n\n\[bili\]\[resized\] 本图已降采样\/downsampled:.*acp_read_original_image\("m30001"\)/);
 });
 
 test("responses item: image url replaced, NO text part inside item, note rides separate message", async () => {
@@ -204,7 +229,7 @@ test("items walker (responses steady path): shrinks + inserts input_text note af
     assert.equal(out.length, 1);
     assert.equal(out[0].content.length, 3);
     assert.equal(out[0].content[2].type, "input_text");
-    assert.match(String(out[0].content[2].text), /^\[bili\] 本图已降采样:/);
+    assert.match(String(out[0].content[2].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled:/);
 });
 
 test("items walker exemption: output answering acp_read_original_image passes verbatim", async () => {
@@ -248,16 +273,16 @@ test("size-only note when the tool lane is not armed (codex/plugin lanes)", asyn
     const input = [anthropicImageMsg("msg_c", BIG.b64)];
     const out = await applyImageRescalePass(input, ctx);
     assert.equal(out.length, 2);
-    assert.match(String(out[1].text), /^\[bili\] 本图已降采样:当前 \d+×\d+ \/ \d+KB;原图 2400×1800 \/ \d+KB。$/);
+    assert.match(String(out[1].text), /^\[bili\]\[resized\] 本图已降采样\/downsampled: now \d+×\d+ \(\d+KB\), original 2400×1800 \(\d+KB\)。$/);
     assert.doesNotMatch(String(out[1].text), /acp_read_original_image/);
 });
 
 test("buildRescaleNote: deterministic templates (full + size-only)", () => {
     const full = buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
-    assert.equal(full, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB(约 4.3 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image(\"m12345\") 读取原图。原图较大,按需读取。");
+    assert.equal(full, "[bili][resized] 本图已降采样/downsampled: now 1600×1173 (73KB), original 2140×1560 (317KB). (≈4.3×) Call acp_read_original_image(\"m12345\") to read the original when full-resolution detail matters (small text, colors, alignment). 需要原分辨率细节时调用该工具读取原图,按需读取。");
     assert.equal(full, buildRescaleNote({ ref: "m12345", toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 }));
     const sizeOnly = buildRescaleNote({ ref: "m12345", toolArmed: false, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
-    assert.equal(sizeOnly, "[bili] 本图已降采样:当前 1600×1173 / 73KB;原图 2140×1560 / 317KB。");
+    assert.equal(sizeOnly, "[bili][resized] 本图已降采样/downsampled: now 1600×1173 (73KB), original 2140×1560 (317KB)。");
     const noRef = buildRescaleNote({ ref: undefined, toolArmed: true, width: 1600, height: 1173, kb: 73, origWidth: 2140, origHeight: 1560, origKb: 317, ratio: 4.3 });
     assert.equal(noRef, sizeOnly);
 });
