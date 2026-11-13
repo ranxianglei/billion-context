@@ -1966,7 +1966,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const active = deps.session.state.blocks.filter((b) => b.active);
         return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
     };
-    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string };
+    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string; structural: boolean };
     const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
         let callsUsed = 0;
         let netSaved = 0;
@@ -2032,10 +2032,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             return parts.join("\n\n");
         };
         let stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" = "fit";
+        // #4563: track the structural termination cause separately from the
+        // human-facing why — a round that ends because NO foldable target remains
+        // (or distilling nets nothing) is doomed for the identical payload and must
+        // not be advertised as a relay-dependent retry; a round that ends on a relay
+        // error, a racy target change, or a budget cap may still recover. This drives
+        // the deterministic flag on the exhaustion verdict (server.ts maps it to 413).
+        let structural = false;
         // #3646: name WHY the candidate search ended — "no eligible blocks",
         // "unpositionable", and "source-budget-blocked" are three different truths
         // the old blanket "every compression tier is exhausted" conflated.
         let exhaustedWhy: string | undefined;
+        // #4563: name WHY an "unavailable" stop happened — the old blanket
+        // "the distillation summary was unavailable" hid the real cause (a
+        // projection that resolved to no target is NOT a summarizer outage).
+        let unavailableWhy: string | undefined;
         let est = measureEst();
         // #5974: judge recovery on the corrected scale too — a blind-view est under the window can still leave the true body over.
         while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est + viewDeltaCorrection >= limit && !deps.signal?.aborted) {
@@ -2090,6 +2101,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             if (!chosen) {
                 stopReason = "exhausted";
+                // #4563: no candidate span survived the position/budget gates —
+                // nothing left to distill for the identical payload.
+                structural = true;
                 exhaustedWhy = pools.length === 0
                     ? "no tier held two or more active blocks to distill"
                     : poolProblems.join("; ");
@@ -2102,7 +2116,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const content = spanContent(lo, hi);
             const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
             if (targetKey === undefined) {
+                // #4563: the projection resolved the chosen span to no foldable
+                // target — a structural "nothing left to distill", not a relay
+                // outage. Name it as such and mark the round doomed.
                 stopReason = "unavailable";
+                structural = true;
+                unavailableWhy = "no foldable target block remained to distill (the fold projection resolved the span to nothing)";
                 break;
             }
             let outcome;
@@ -2121,16 +2140,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     : safePrefix(error instanceof Error ? error.message : String(error), 200);
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${distillDetail}); stopping recovery (#2952)`);
                 stopReason = "unavailable";
+                unavailableWhy = `the distillation summary call failed (${distillDetail})`;
                 break;
             }
             if ("unusable" in outcome) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
                 stopReason = "unavailable";
+                unavailableWhy = `the distillation produced no usable summary (${outcome.unusable})`;
                 break;
             }
             if (previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId) !== targetKey) {
                 deps.log("warn", `[preflight] discarded tier-distillation summary: fold targets changed while awaiting the summary`);
                 stopReason = "unavailable";
+                unavailableWhy = "the fold targets changed while awaiting the summary";
                 break;
             }
             const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, lastNudge: measuredNudge, log: (m) => deps.log("info", m) };
@@ -2139,6 +2161,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
                 stopReason = "unavailable";
+                // #4563: a projection refusal is deterministic for the identical
+                // payload — the fold cannot be applied, retrying cannot change it.
+                structural = true;
+                unavailableWhy = `the distillation fold was refused by the projection (${safePrefix(applied.text, 200)})`;
                 break;
             }
             deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
@@ -2154,6 +2180,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (gained <= 0) {
                 deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation netted ${gained} tokens (no shrink); stopping recovery (#2952)`);
                 stopReason = "no-shrink";
+                // #4563: a distill that nets nothing — and nothing saved before it —
+                // means distillation cannot close this gap; doomed for the payload.
+                if (netSaved <= 0) structural = true;
                 break;
             }
             netSaved += gained;
@@ -2172,13 +2201,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // found no candidate, say WHICH gate blocked it instead of the blanket claim.
         const why = stopReason === "exhausted" ? (exhaustedWhy ?? "every compression tier is exhausted")
             : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
-            : stopReason === "unavailable" ? "the distillation summary was unavailable"
+            : stopReason === "unavailable" ? (unavailableWhy ?? "the distillation summary was unavailable")
             : "a distillation pass produced no further shrink";
         const honestDetail =
             `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
             `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
             `Raise the model context window or restart the session.`;
-        return { recovered, callsUsed, netSaved, honestDetail };
+        return { recovered, callsUsed, netSaved, honestDetail, structural };
     };
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
@@ -3228,7 +3257,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const rec = await attemptTierRecovery();
             deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
             if (!rec.recovered) {
-                failure = { kind: "exhausted", detail: rec.honestDetail };
+                // #4563: the recovery path was the one exhaustion verdict missing the
+                // deterministic flag — it defaulted to non-deterministic, so a
+                // structurally doomed round (no foldable target left, net ~0 saved)
+                // was answered 502 and status-code-driven hosts spun on a payload that
+                // can never fit. Carry the recovery's own structural determination into
+                // the verdict: structural → 413/non-retryable (server.ts:4675),
+                // relay-dependent → 502 (progress may continue on the next, smaller
+                // baseline).
+                failure = { kind: "exhausted", deterministic: rec.structural, detail: rec.honestDetail };
             }
         }
         if (currentTokens >= limit && !failure) {
