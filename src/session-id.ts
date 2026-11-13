@@ -283,15 +283,23 @@ export function dshPersonaFingerprintApplies(headers: Record<string, string | st
 }
 
 /** Persona text for the openai chat wire: the concatenation of every
- *  system-role message's text (string content or text parts). Empty string
- *  when the request carries no system message — subagentNamespace treats
+ *  system/developer-role message's text (string content or text parts).
+ *  #6303: pi-ai emits the system prompt as `role: "developer"` (string
+ *  content) when the model declares reasoning and the upstream supports the
+ *  developer role (openai-completions instructionRole), so the carrier MUST
+ *  match openaiToCore (kernel/src/wire/openai.ts), which hoists BOTH — a
+ *  system-only read left dsh's developer-role lanes riding the verbatim raw
+ *  key and clobbering the main lane's fold state. Empty string when the
+ *  request carries no system/developer message — subagentNamespace treats
  *  that as non-anchoring (verbatim key, no anchor claim), so system-less
  *  auxiliary calls keep riding the main session. */
 export function openaiSystemTextForPersona(body: { messages?: unknown }): string {
     const msgs = Array.isArray(body.messages) ? body.messages : [];
     const texts: string[] = [];
     for (const m of msgs) {
-        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "system") continue;
+        if (m === null || typeof m !== "object") continue;
+        const role = (m as { role?: unknown }).role;
+        if (role !== "system" && role !== "developer") continue;
         const content = (m as { content?: unknown }).content;
         if (typeof content === "string") {
             if (content.length > 0) texts.push(content);
