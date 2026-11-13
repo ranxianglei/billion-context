@@ -17,6 +17,7 @@
 // be used as conversation identity; extractConversationId does that instead.
 
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
+import { estimateRawBodyTokens } from "./preflight.js";
 
 const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTokens"] as const;
 
@@ -98,6 +99,65 @@ export function isV1BackgroundSideRequest(meta: Record<string, unknown>, inner: 
     if (Array.isArray(tools) && tools.length > 0) return false;
     const model = typeof meta.model === "string" ? meta.model : "";
     return model.includes("flash-lite");
+}
+
+// #6457: a background side request (requestType=checkpoint etc.) packs the FULL
+// uncompressed local history into inner.contents. When that payload exceeds the
+// upstream window, the verbatim passthrough is a guaranteed 400 that kills the
+// client's agent loop — Antigravity terminates the whole session on a checkpoint
+// error. Shrink the payload to fit instead: keep the first user-role anchor (the
+// task instruction) + the most recent contiguous tail that fits, preserving
+// Gemini's strict role alternation at the join. The snapshot is partial, but the
+// session survives — availability over fidelity (#3128).
+export function truncateV1ContentsForBudget(contents: unknown, budget: number): unknown {
+    if (!Array.isArray(contents) || contents.length === 0) return contents;
+    const total = estimateRawBodyTokens({ contents });
+    if (total <= budget) return contents;
+
+    const list = contents as { role?: unknown }[];
+    // Anchor: first user-role content (the task instruction).
+    let anchorIdx = -1;
+    for (let i = 0; i < list.length; i++) {
+        if (list[i]?.role === "user") { anchorIdx = i; break; }
+    }
+    if (anchorIdx === -1) anchorIdx = 0;
+
+    const anchor = list[anchorIdx];
+    const anchorTokens = estimateRawBodyTokens({ contents: [anchor] });
+    const tailBudget = budget - anchorTokens;
+    if (tailBudget <= 0) return [anchor];
+
+    // Walk backwards from the tail, keeping the most recent contents that fit.
+    let startIdx = list.length;
+    let acc = 0;
+    for (let i = list.length - 1; i > anchorIdx; i--) {
+        const t = estimateRawBodyTokens({ contents: [list[i]] });
+        if (acc + t > tailBudget) break;
+        acc += t;
+        startIdx = i;
+    }
+    const tail = startIdx < list.length ? list.slice(startIdx) : [];
+
+    let result: { role?: unknown }[];
+    if (tail.length > 0 && startIdx <= anchorIdx) {
+        // The anchor is inside the kept tail (short history) — use the tail as-is.
+        result = tail;
+    } else {
+        result = [anchor, ...tail];
+    }
+
+    // Preserve Gemini's strict role alternation at the join: if the tail head's
+    // role matches the anchor's, drop the tail head (NOT the anchor) so the
+    // first user instruction survives and the join alternates. The original is
+    // alternating, so at most one drop is needed.
+    if (result.length > 1 && result[1].role === result[0].role) {
+        result.splice(1, 1);
+    }
+    // Gemini requires the first content to be user role.
+    while (result.length > 0 && result[0].role !== "user") {
+        result = result.slice(1);
+    }
+    return result.length > 0 ? result : [anchor];
 }
 
 // Inbound unwrap: pull the GenerateContentResponse out of `response`. No-op when
