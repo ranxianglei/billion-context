@@ -14,8 +14,10 @@
 // `id` OPTIONAL (ai/src/schema/messages.ts:240-270), so one missing or
 // foreign-shaped id poisons the whole turn → no header → the session rides
 // exactly as before. The server re-proves everything anyway (exact count
-// parity vs the wire body + canonical validation + role spot-checks);
-// client-side we just keep the obvious poison classes out.
+// parity vs the POST-HOIST core count + canonical validation); client-side we
+// core-align — skip the leading system/developer run the kernel hoists out of
+// the fold space (see opencodeV2MsgIdList) — and keep the obvious poison
+// classes out.
 
 /** Hard ceiling on ids per turn — real sessions are hundreds of messages, not
  *  thousands of KB of header; beyond this the turn degrades. */
@@ -33,17 +35,41 @@ const HOST_MSG_ID = /^msg_[A-Za-z0-9]+$/;
 
 type OpencodeV2MessageLike = { id?: unknown; role?: unknown } | null | undefined;
 
-/** Extract the full ordered host-id list from a V2 turn's message array, or
- *  undefined when ANY entry cannot be proven usable (whole-turn degrade). */
+/** Extract the CORE-ALIGNED ordered host-id list from a V2 turn's message
+ *  array, or undefined when ANY entry cannot be proven usable (whole-turn
+ *  degrade).
+ *
+ *  #6525/#6539 core alignment: the openai wire hoists the contiguous leading
+ *  system/developer run OUT of the fold space (kernel openaiToCore), so the
+ *  server pins against the POST-HOIST core count — not the raw wire-message
+ *  count. If the header carried the leading system ids, its count would always
+ *  exceed the core count and the pin would be rejected (a safe content-derived
+ *  degrade, but opencode V2 would never actually pin on the openai wire). We
+ *  therefore skip the contiguous leading system/developer run so the header
+ *  count equals the post-hoist core count. The anthropic wire keeps its system
+ *  as a separate field (never inside messages), so this skip is a no-op there.
+ *  A mid-conversation system message is NOT part of the leading run and keeps
+ *  its id. */
 export function opencodeV2MsgIdList(messages: readonly OpencodeV2MessageLike[] | null | undefined): string[] | undefined {
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
     if (messages.length > MAX_IDS_PER_TURN) return undefined;
+    // Skip the contiguous leading system/developer run (matches the kernel's
+    // openaiToCore hoist) so the id list aligns to the post-hoist core count.
+    let start = 0;
+    while (start < messages.length) {
+        const m = messages[start];
+        const role = m !== null && typeof m === "object" ? (m as { role?: unknown }).role : undefined;
+        if (role === "system" || role === "developer") start += 1;
+        else break;
+    }
     const ids: string[] = [];
-    for (const m of messages) {
+    for (let i = start; i < messages.length; i++) {
+        const m = messages[i];
         const id = m !== null && typeof m === "object" ? (m as { id?: unknown }).id : undefined;
         if (typeof id !== "string" || !HOST_MSG_ID.test(id)) return undefined; // poison → no stamp
         ids.push(id);
     }
+    if (ids.length === 0) return undefined; // only a leading system run → nothing to pin
     return ids;
 }
 
