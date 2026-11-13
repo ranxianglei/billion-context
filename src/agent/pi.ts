@@ -573,7 +573,7 @@ function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
     return isModelApiUrl(base) || isModelApiUrl(expanded);
 }
 
-// #6525 (发): full-resend turns ride the msgid envelope too — the
+// #6525 (send): full-resend turns ride the msgid envelope too — the
 // LANE-INDEPENDENT send path. The incremental lane stamps its own msgIds on
 // the delta it diverts (and early-returns before this line); this covers the
 // turns the lane shape-gates away (#3433: OpenAI-family full resends) plus
@@ -605,7 +605,7 @@ function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: C
     }
 }
 
-// #6525 (发): stamp the core-aligned host ids onto the outgoing full-resend
+// #6525 (send): stamp the core-aligned host ids onto the outgoing full-resend
 // body. Returns the payload to send (base + biliMsgIds), or undefined to
 // leave the request exactly as-is. base = the pck-stamped payload when the
 // pck stamp fired (omp), else the original event payload (pi / omp-not-
@@ -1726,7 +1726,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental turn skipped (${err instanceof Error ? err.message : String(err)}) — full resend this turn`);
                 }
             }
-            // #6525 (发): full-resend turns also carry the msgid envelope
+            // #6525 (send): full-resend turns also carry the msgid envelope
             // (the lane-independent send path). stampMsgIdEnvelope folds in
             // the pck stamp when it fired (base = pck-stamped payload for
             // omp, original payload for pi) and returns undefined to leave

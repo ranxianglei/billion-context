@@ -92,7 +92,7 @@ import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { featureEnabled } from "../rollout.js";
-import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, scrubMsgIdFields, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
@@ -602,7 +602,7 @@ async function handleRequest(
             return;
         }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     // #5795: pre-ingest 429-hold fast path — while the egress governor holds
@@ -672,7 +672,7 @@ async function handleRequest(
     if (bypass) {
         const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -710,7 +710,7 @@ async function handleRequest(
         v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
             log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
@@ -737,7 +737,7 @@ async function handleRequest(
                 }
                 log("warn", `[commandcode] declared endpoint body is not a convertible streaming CLI conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
         parsed = unwrapped.body;
@@ -837,7 +837,7 @@ async function handleRequest(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
             return;
         }
     }
@@ -2577,7 +2577,7 @@ async function handleRequest(
                     autoModeForge: { variant, body: forgeBody, contentType },
                 };
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), amPrepared, core, reqConfig, log, route, instanceId, affinity);
                 return;
             }
         }
@@ -2680,6 +2680,7 @@ async function handleRequest(
                 }
             }
             sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
+            sideBody = scrubMsgIdFields(sideBody, log);
             // Gemini and Vertex encode stream mode in the path rather than the body.
             const requestStream = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
                 && "stream" in parsed && parsed.stream === true;
@@ -3382,6 +3383,13 @@ async function handleRequest(
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
+                    // #6539: no msgid-field scrub here on purpose — this is the #1884
+                    // signed-passthrough escape hatch with a body-covering signature
+                    // (sdk-hmac-sha256); mutating the body would break the signature
+                    // the client already shipped. The byte-untouched contract wins;
+                    // a stamped body on this lane rides as-is (bounded: the lane is an
+                    // explicit user opt-in, and the kernel is bypassed on this lane,
+                    // so no bili pin ever consumes the field).
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
                     return;
                 }
@@ -3470,6 +3478,6 @@ async function handleRequest(
                 logUnrecognizedPath(log, req.url ?? "");
             }
         }
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
     }
 }

@@ -53,6 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -3012,6 +3013,35 @@ export function scrubAnthropicPck(protocol: WireProtocol | null, bodyBuffer: Buf
     return Buffer.from(JSON.stringify(p), "utf8");
 }
 
+// #6539: protocol-neutral egress scrub for the bili-owned msgid transport
+// fields (biliMsgIds / biliLedgerSeqs, src/msgid-pin.ts). Same contract as
+// prompt_cache_key (#1403): the four fully-processed prepares strip them
+// unconditionally, but every VERBATIM forward branch (side-request passthrough,
+// hop-marker chain, bypass/passthrough marks, route/global passthrough #661,
+// decode-fail fallback, count_tokens) bypasses the prepares — a stamped
+// full-resend body would otherwise ship biliMsgIds to a real model endpoint
+// (strict-schema upstreams 400 'Extra inputs are not permitted'; #661 body
+// fingerprinting breaks). A body WITHOUT the fields passes back
+// byte-identical, so #661's contract is untouched in the normal case.
+export function scrubMsgIdFields(bodyBuffer: Buffer, log: (level: string, msg: string) => void): Buffer {
+    if (bodyBuffer.length === 0) return bodyBuffer;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(bodyBuffer.toString("utf8"));
+    } catch {
+        return bodyBuffer;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyBuffer;
+    const p = parsed as Record<string, unknown>;
+    const hasIds = Object.prototype.hasOwnProperty.call(p, MSG_IDS_BODY_FIELD);
+    const hasSeqs = Object.prototype.hasOwnProperty.call(p, MSG_SEQS_BODY_FIELD);
+    if (!hasIds && !hasSeqs) return bodyBuffer;
+    if (hasIds) delete p[MSG_IDS_BODY_FIELD];
+    if (hasSeqs) delete p[MSG_SEQS_BODY_FIELD];
+    log("debug", "stripped biliMsgIds/biliLedgerSeqs from verbatim forward (#6539)");
+    return Buffer.from(JSON.stringify(p), "utf8");
+}
+
 // #1757: protocol-neutral companion to scrubAnthropicPck for opt-in
 // compat.dropFields — client-fixed fields some strict-schema gateways reject
 // (SenseNova Responses 400 'json: unknown field "summary"' on pi-ai's fixed
@@ -3060,6 +3090,8 @@ export function prepareCountTokens(
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages };
         delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+        delete (rebuilt as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (rebuilt as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(rebuilt),
             session,
@@ -3073,6 +3105,8 @@ export function prepareCountTokens(
         log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
         const fallback: AnthropicRequestBody = { ...parsed };
         delete (fallback as Record<string, unknown>).prompt_cache_key;
+        delete (fallback as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (fallback as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(fallback),
             session,

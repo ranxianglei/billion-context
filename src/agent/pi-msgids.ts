@@ -471,7 +471,7 @@ export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[
     return leftover === "exhausted" ? ids : undefined;
 }
 
-// #6525 (发): CORE-alignment proof shared by every client's full-resend
+// #6525 (send): CORE-alignment proof shared by every client's full-resend
 // msgid envelope stamp (dsh #6532 inlines the same logic; pi/omp call this).
 // Input = the WALKER's wire-aligned output (openai wire keeps its leading
 // bili-ps-N hoist slots) + the wire messages + the full payload. Returns the

@@ -39,22 +39,31 @@ type OpencodeV2MessageLike = { id?: unknown; role?: unknown } | null | undefined
  *  array, or undefined when ANY entry cannot be proven usable (whole-turn
  *  degrade).
  *
- *  #6525/#6539 core alignment: the openai wire hoists the contiguous leading
- *  system/developer run OUT of the fold space (kernel openaiToCore), so the
- *  server pins against the POST-HOIST core count — not the raw wire-message
- *  count. If the header carried the leading system ids, its count would always
- *  exceed the core count and the pin would be rejected (a safe content-derived
- *  degrade, but opencode V2 would never actually pin on the openai wire). We
- *  therefore skip the contiguous leading system/developer run so the header
- *  count equals the post-hoist core count. The anthropic wire keeps its system
- *  as a separate field (never inside messages), so this skip is a no-op there.
- *  A mid-conversation system message is NOT part of the leading run and keeps
- *  its id. */
+ *  #6525/#6539 core alignment: the V2 lane stamps turns on the `/responses`
+ *  and `/messages` endpoints — the server pins against the POST-hoist core
+ *  count of the wire the turn actually rides. Both hoist rules drop exactly
+ *  the contiguous LEADING system/developer run:
+ *   • responsesToCore: `sysDevHead` stays true until the first non-system/
+ *     developer item (kernel/src/wire/responses.ts) — mid-history system/
+ *     developer items are position-preserved sidecar cores (#4166), and the
+ *     head-neutral opaque items (`additional_tools` / `mcp_list_tools`) do
+ *     not clear the head flag. If opencode ever interleaves a head-neutral
+ *     item inside the head run, this host-side skip cannot express that
+ *     nuance and the counts diverge — SAFELY: the opaque item carries no
+ *     msg_ id, so the whole turn degrades (no header) and the server never
+ *     sees a miscounted list.
+ *   • anthropicToCore: system is a separate top-level field (never inside
+ *     messages), so the skip is a no-op there.
+ *  If the header carried the leading system ids, its count would exceed the
+ *  core count and the pin would be rejected (a safe content-derived degrade,
+ *  but the session would never actually pin). A mid-conversation system
+ *  message is NOT part of the leading run and keeps its id. */
 export function opencodeV2MsgIdList(messages: readonly OpencodeV2MessageLike[] | null | undefined): string[] | undefined {
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
     if (messages.length > MAX_IDS_PER_TURN) return undefined;
     // Skip the contiguous leading system/developer run (matches the kernel's
-    // openaiToCore hoist) so the id list aligns to the post-hoist core count.
+    // responsesToCore sysDevHead / anthropic separate-field rules) so the id
+    // list aligns to the post-hoist core count.
     let start = 0;
     while (start < messages.length) {
         const m = messages[start];
