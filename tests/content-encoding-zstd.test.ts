@@ -8,6 +8,9 @@ import { DecodedRequestBusyError } from "../src/request-body-budget.ts";
 const hasNativeZstd = typeof zlib.createZstdDecompress === "function";
 const plain = Buffer.from('{"model":"gpt-5","input":"hello"}');
 const encoded = Buffer.from("KLUv/SAhCQEAeyJtb2RlbCI6ImdwdC01IiwiaW5wdXQiOiJoZWxsbyJ9", "base64");
+const unknownSize = Buffer.from("KLUv/QAACQEAeyJtb2RlbCI6ImdwdC01IiwiaW5wdXQiOiJoZWxsbyJ9", "base64");
+const checksummed = Buffer.from("KLUv/SQhCQEAeyJtb2RlbCI6ImdwdC01IiwiaW5wdXQiOiJoZWxsbyJ9TTP3+Q==", "base64");
+const skippable = Buffer.from("5f2a4d1803000000010203", "hex");
 
 test("zstd decoding can be cancelled after starting without processing the whole body", { skip: !hasNativeZstd }, async () => {
     const raw = Buffer.alloc(4 * 1024 * 1024, 65);
@@ -53,11 +56,65 @@ test("zstd decoding preserves exact byte limits and the resource-admission error
 });
 
 test("zstd decoding supports concatenated frames and stacked content encodings", async () => {
-    assert.deepEqual((await decodeRequestBody("zstd", Buffer.concat([encoded, encoded]), 1024)).body,
+    const input = Buffer.concat([encoded, encoded]);
+    const observed: number[] = [];
+    assert.deepEqual((await decodeRequestBody("zstd", input, plain.length * 2, {
+        onBytes: (count) => observed.push(count),
+    })).body,
         Buffer.concat([plain, plain]));
+    assert.equal(observed.at(-1), plain.length * 2);
+    assert.ok(observed.every((count, i) => i === 0 || count >= observed[i - 1]));
+    await assert.rejects(decodeRequestBody("zstd", input, plain.length * 2 - 1),
+        (error) => error instanceof DecompressedTooLargeError && error.limit === plain.length * 2 - 1);
+    const busy = new DecodedRequestBusyError();
+    await assert.rejects(decodeRequestBody("zstd", input, 1024, {
+        onBytes: (count) => { if (count > plain.length) throw busy; },
+    }), (error) => error === busy);
+    const controller = new AbortController();
+    const reason = new Error("cancelled in the second frame");
+    await assert.rejects(decodeRequestBody("zstd", input, 1024, {
+        signal: controller.signal,
+        onBytes: (count) => { if (count > plain.length) controller.abort(reason); },
+    }), (error) => error === reason);
     assert.deepEqual((await decodeRequestBody("zstd, gzip", zlib.gzipSync(encoded), 1024)).body, plain);
     await assert.rejects(decodeRequestBody("zstd, gzip", zlib.gzipSync(encoded), plain.length - 1),
         DecompressedTooLargeError);
+});
+
+test("zstd decoding accepts unknown-size and checksummed frames with interleaved skippable data", async () => {
+    assert.deepEqual((await decodeRequestBody("zstd", unknownSize, plain.length)).body, plain);
+    assert.deepEqual((await decodeRequestBody("zstd", checksummed, plain.length)).body, plain);
+    const input = Buffer.concat([skippable, unknownSize, skippable, checksummed, skippable]);
+    assert.deepEqual((await decodeRequestBody("zstd", input, plain.length * 2)).body,
+        Buffer.concat([plain, plain]));
+    assert.deepEqual((await decodeRequestBody("zstd", skippable, 0)).body, Buffer.alloc(0));
+});
+
+test("zstd decoding accepts RLE and compressed blocks", async () => {
+    const rle = Buffer.from("28b52ffd20210b010041", "hex");
+    assert.deepEqual((await decodeRequestBody("zstd", rle, 33)).body, Buffer.alloc(33, 65));
+    const compressed = Buffer.from("KLUv/WDoAk0AABBBQQEA4yuABQ==", "base64");
+    assert.deepEqual((await decodeRequestBody("zstd", compressed, 1000)).body, Buffer.alloc(1000, 65));
+});
+
+for (const [name, input] of [
+    ["unknown-size block", unknownSize.subarray(0, -1)],
+    ["checksum", checksummed.subarray(0, -1)],
+    ["second frame", Buffer.concat([encoded, encoded.subarray(0, -1)])],
+    ["skippable payload", skippable.subarray(0, -1)],
+    ["trailing skippable payload", Buffer.concat([encoded, skippable.subarray(0, -1)])],
+    ["frame header", encoded.subarray(0, 5)],
+    ["block header", encoded.subarray(0, 8)],
+] as const) {
+    test(`zstd decoding rejects a truncated ${name}`, async () => {
+        await assert.rejects(decodeRequestBody("zstd", input, 1024));
+    });
+}
+
+test("zstd decoding keeps native checksum validation for later frames", { skip: !hasNativeZstd }, async () => {
+    const corrupt = Buffer.from(checksummed);
+    corrupt[corrupt.length - 1] ^= 1;
+    await assert.rejects(decodeRequestBody("zstd", Buffer.concat([encoded, corrupt]), 1024));
 });
 
 test("zstd decoding rejects truncated input and respects pre-aborted requests", async () => {
