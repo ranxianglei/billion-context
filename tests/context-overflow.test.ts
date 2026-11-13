@@ -308,6 +308,45 @@ test("empty body is NOT an overflow", () => {
     assert.equal(inspectContextOverflow(400, "").isOverflow, false);
 });
 
+test("#6122: bili's own oversize-gate refusal (bili_gate_oversize_refusal*) is an overflow, window undefined", () => {
+    // Field case: the native-intercept gate refused an unattributed oversized
+    // body; the relay saw that refusal come back through the client as a 400
+    // and — with no parseable marker — logged the #4452 CANNOT-engage warning
+    // while the oversized history was re-sent every turn. bili's own refusal
+    // code IS the definitive over-window proof: it must read as an overflow so
+    // self-heal (same-request refold / emergency shrink) arms.
+    const body = JSON.stringify({
+        error: {
+            type: "server_error",
+            code: "bili_gate_oversize_refusal_unattributed",
+            message:
+                "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte counts as text, and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). ",
+            retryable: false,
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true, "the gate's own refusal must read as an overflow");
+    assert.equal(
+        info.window,
+        undefined,
+        "the 1,000,000 in the prose is a pricing FLOOR, not the model's window — the no-window arm (min of judging window and payload estimate) must fire",
+    );
+    // Every oversize variant shares the code prefix.
+    for (const code of [
+        "bili_gate_oversize_refusal",
+        "bili_gate_oversize_refusal_fallback",
+        "bili_gate_oversize_refusal_no_live_state",
+        "bili_gate_oversize_refusal_unattributed_bytes",
+    ]) {
+        const v = inspectContextOverflow(400, JSON.stringify({ error: { type: "server_error", code } }));
+        assert.equal(v.isOverflow, true, `${code} must be recognized`);
+    }
+    // The compaction refusal is a different class (no proxy available, body
+    // fits fine) — it must stay dark.
+    const compaction = inspectContextOverflow(400, JSON.stringify({ error: { type: "server_error", code: "bili_gate_dsh_compaction_refused" } }));
+    assert.equal(compaction.isOverflow, false, "compaction refusal is not an over-window proof");
+});
+
 // reserveOutputHeadroom: the effective window handed to the kernel after
 // reserving the model's per-request output budget. The kernel's nudge/truncate
 // bands are a fraction of this window, so reserving maxOutput keeps the context

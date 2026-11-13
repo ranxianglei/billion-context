@@ -398,6 +398,20 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
     // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
     /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
+    // #6122: the native-intercept gate's OWN oversize refusal (src/agent/
+    // native-intercept.ts) — bili's definitive "provably over window" signal.
+    // The field case: the gate refused an unattributed oversized body, the
+    // relay saw that refusal come back through the client as a 400, and — no
+    // parseable marker — logged the #4452 CANNOT-engage warning while the
+    // oversized history was re-sent on every turn (400 forever). The code
+    // covers all five oversize variants (bare / _fallback / _no_live_state /
+    // _unattributed / _unattributed_bytes). The compaction refusal
+    // (bili_gate_dsh_compaction_refused) is a different class (no proxy
+    // available, body fits fine) and must stay dark. No window number is
+    // learnable from the prose ("1,000,000 tokens" is a pricing FLOOR, not
+    // the model's window) — the no-window arm (min of judging window and
+    // payload estimate) is what engages.
+    /bili_gate_oversize_refusal/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
