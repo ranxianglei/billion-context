@@ -106,6 +106,32 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
     }
 }
 
+for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
+    test(`external summary HTTP: ${protocol} accepts a JSON event split across multiple data fields`, async () => {
+        const multiline = streamCompletion(protocol).replace(/^data: (.+)$/gm, (line, data: string) => data === "[DONE]" ? line :
+            JSON.stringify(JSON.parse(data), null, 2).split("\n").map((part) => `data: ${part}`).join("\n: keepalive\n"));
+        await upstream((_req, res) => {
+            res.setHeader("content-type", "text/event-stream");
+            res.end(multiline.replace(/\n/g, "\r\n"));
+        }, async (url) => {
+            const candidate = createSummaryHttpCandidate(target(url, protocol, true), 8192);
+            const result = await new ExternalSummaryExecutor(1).execute(work, [candidate], budget);
+            assert.equal(result.status, "success");
+            if (result.status === "success") assert.equal(result.summary, summary);
+        });
+    });
+}
+
+test("external summary HTTP: malformed multiline JSON still rejects the entire summary", async () => {
+    await upstream((_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.end(streamCompletion("responses") + 'data: {\ndata: invalid json\ndata: }\n\n');
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate(target(url, "responses", true), 8192);
+        await assert.rejects(candidate.summarize(work, AbortSignal.timeout(4000)), { message: "External summary response contains an invalid frame" });
+    });
+});
+
 for (const status of [400, 401, 403]) {
     test(`external summary HTTP: ${status} fails fast to the backup without leaking errors`, async () => {
         const paths: string[] = [];
@@ -169,6 +195,27 @@ test("external summary HTTP: a transient 429 with Retry-After recovers on the se
     assert.equal(hits, 2);
     assert.deepEqual(_summaryRetryDelaysForTest(), [7000]);
 });
+
+for (const [label, header, delays] of [
+    ["empty", "", [1000, 2000]],
+    ["whitespace-only", " \t ", [1000, 2000]],
+    ["explicit zero", "0", [0, 0]],
+] as const) {
+    test(`external summary HTTP: ${label} Retry-After preserves the intended retry delay`, async () => {
+        let hits = 0;
+        _setSummaryRetryDelayForTest(0);
+        await upstream((_req, res) => {
+            hits++;
+            if (hits < 3) { res.writeHead(429, { "retry-after": header }); res.end("rate limited"); return; }
+            res.end(JSON.stringify(completion("responses")));
+        }, async (url) => {
+            const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+            assert.equal(result.status, "success");
+        });
+        assert.equal(hits, 3);
+        assert.deepEqual(_summaryRetryDelaysForTest(), delays);
+    });
+}
 
 test("external summary HTTP: a hostile Retry-After is capped so it cannot eat the attempt budget", async () => {
     let hits = 0;
@@ -269,7 +316,12 @@ test("external summary HTTP: a stalled response is cancelled before the backup a
     }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(`${url}/primary`), 4096), createSummaryHttpCandidate(target(`${url}/backup`), 4096)], { ...budget, targetTimeoutMs: 150 });
         assert.equal(result.status, "success");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "timeout" }, { targetIndex: 1, outcome: "success" }]);
+        if (result.status !== "success") throw new Error("unreachable");
+        assert.equal(result.attempts.length, 2);
+        assert.equal(result.attempts[0].outcome, "timeout");
+        // #4833: the stalled primary's timeout names its source and budget.
+        assert.match(result.attempts[0].detail ?? "", /^target-timeout 150ms \(elapsed \d+ms\)$/);
+        assert.equal(result.attempts[1].outcome, "success");
     });
     assert.deepEqual(paths, ["/primary", "/backup"]);
 });

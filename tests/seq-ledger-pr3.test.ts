@@ -112,35 +112,52 @@ test("S12b: partial branch (throughSeq) clones only the prefix", async () => {
     st.close(); // release the handle before test.after's rmSync — Windows cannot unlink an open index.db
 });
 
-test("S14: superseded-ref compress rejection — old refs refused with guidance, current refs pass", () => {
+test("S14: superseded-ref compress resolution — old refs translate (or refuse on dead-end), current refs pass untouched", () => {
     const session = {
         restampSuperseded: new Map([
             ["m00003", "d"],
             ["m00004", "e"],
+            ["m00009", "ghost"],
         ]),
+        state: { messageRefs: { byRef: { m00004: "x", m00005: "d" }, byRaw: { d: "m00005" } } },
     } as unknown as Session;
+    // m00003 is vacated (not live) and translatable onto its raw id; the guard
+    // resolves it, never rejects it (#4797: refusal of status-advertised refs
+    // dead-looped the session). The resolution carries translated endpoints.
     const hit = supersededRefRejection(
-        [{ startRef: "m00003", endRef: "m00004", summary: "s" } as never],
+        [{ startRef: "m00003", endRef: "m00003", summary: "s" }],
         session,
     );
-    assert.ok(hit !== null);
-    assert.match(hit, /re-numbered|renumbered/i);
-    assert.match(hit, /acp_status/);
-    // Current refs (outside the superseded set) pass through untouched.
-    const pass = supersededRefRejection(
-        [{ startRef: "m00010", endRef: "m00012", summary: "s" } as never],
+    assert.equal(hit.rejection, null);
+    assert.equal(hit.translated, 2, "endpoint-granular: start+end both translate");
+    // A dead-end key (raw id lost its mapping) still refuses with guidance.
+    const dead = supersededRefRejection(
+        [{ startRef: "m00009", endRef: "m00009", summary: "s" }],
         session,
     );
-    assert.equal(pass, null);
+    assert.ok(dead.rejection !== null);
+    assert.match(dead.rejection, /acp_status/);
+    // Live refs pass untouched even with a map present — live-first priority
+    // is what breaks the #4797 collision loop (a superseded key can be the
+    // live ref of a different message after the one-time alignment).
+    const live = supersededRefRejection(
+        [{ startRef: "m00004", endRef: "m00010", summary: "s" }],
+        session,
+    );
+    assert.equal(live.rejection, null);
+    assert.equal(live.translated, 0);
     // No map on the session → no rejection (fresh sessions).
-    assert.equal(supersededRefRejection([{ startRef: "m00003", endRef: "m00004" } as never], {} as Session), null);
+    assert.equal(supersededRefRejection([{ startRef: "m00003", endRef: "m00004" }], {} as Session).rejection, null);
 });
 
-test("S15: cold load re-stamps legacy counter refs onto seq+1 exactly once", async () => {
+test("S15: citation-space alignment defers from cold load to the next fold save (#5608-D)", async () => {
     // A persisted session whose kernel refs came from the counter path (a
     // BLOCKED protected message skipped a number, so refs drift ahead of
-    // seq+1). Cold load must align refs = seq+1, record the superseded map,
-    // and a SECOND cold load must be a no-op (kept only, map preserved).
+    // seq+1). #5608-D: cold load must NOT re-stamp anymore — restarts must
+    // leave every rendered byte untouched so the provider prefix survives;
+    // the one-time alignment rides the NEXT fold's save (its history rewrite
+    // already breaks the prefix once), armed via session.pendingLedgerAlign.
+    // A second fold/save cycle must be a no-op (kept only, map preserved).
     const dir = join(testRoot, `s15-${Math.random().toString(36).slice(2)}`);
     const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
     const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
@@ -178,25 +195,40 @@ test("S15: cold load re-stamps legacy counter refs onto seq+1 exactly once", asy
         _setStoreForTest(store2);
         const reloaded = store2.loadSync("pr3-restamp");
         assert.ok(reloaded, "session loads");
-        // Cold load fires the one-time alignment (restart boundary — no
-        // in-flight compress call can observe the renumbering).
+        // #5608-D: cold load alone must keep the legacy counter refs — the
+        // rendered bytes stay byte-identical to what the provider cached.
         const refs = reloaded.state.messageRefs;
         assert.equal(refs.byRaw.a, "m00001");
         assert.equal(refs.byRaw.b, "m00002");
         assert.equal(refs.byRaw.c, "BLOCKED", "protected keeps taking no number");
-        assert.equal(refs.byRaw.d, "m00004", "d re-stamped to seq3+1");
-        assert.equal(refs.byRaw.e, "m00005", "e re-stamped to seq4+1");
-        assert.equal((reloaded.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
-        assert.ok(reloaded.restampSuperseded instanceof Map);
-        assert.equal(reloaded.restampSuperseded!.get("m00003"), "d");
-        assert.equal(reloaded.restampSuperseded!.get("m00004"), "e");
-        // Persist the aligned state deterministically before closing (the
-        // restamp scheduled a debounced save; closeQuietly should flush it,
-        // but the second reload below must not race that decision).
-        assert.ok(store2.flushSync(reloaded), "aligned state committed");
+        assert.equal(refs.byRaw.d, "m00003", "legacy counter ref kept on cold load");
+        assert.equal(refs.byRaw.e, "m00004", "legacy counter ref kept on cold load");
+        assert.notEqual((reloaded.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
+        assert.equal(reloaded.restampSuperseded, undefined);
 
-        // Second cold load: aligned state is a no-op (kept only), and the
-        // superseded map rides the Session object for this process only.
+        // Simulate the fold commit (stream.ts sets the marker right after
+        // `ctx.session.state = res.state;`) then the follow-up save:
+        // scheduleSave consumes the marker BEFORE serializing anything.
+        (reloaded as { pendingLedgerAlign?: boolean }).pendingLedgerAlign = true;
+        assert.ok(store2.flushSync(reloaded), "post-fold save commits");
+        // The alignment ran in that single pass: refs settled onto seq+1,
+        // the superseded map published for stale-citation refusal.
+        const refs2 = reloaded.state.messageRefs;
+        assert.equal(refs2.byRaw.d, "m00004", "d re-stamped to seq3+1");
+        assert.equal(refs2.byRaw.e, "m00005", "e re-stamped to seq4+1");
+        assert.equal((reloaded.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
+        const rs = reloaded as { restampSuperseded?: Map<string, string> };
+        assert.ok(rs.restampSuperseded instanceof Map);
+        assert.equal(rs.restampSuperseded.get("m00003"), "d");
+        assert.equal(rs.restampSuperseded.get("m00004"), "e");
+        assert.equal((reloaded as { pendingLedgerAlign?: boolean }).pendingLedgerAlign, undefined, "marker consumed exactly once");
+        // A further save without a new fold is a plain no-op (flag already set).
+        assert.ok(store2.flushSync(reloaded), "second save committed");
+        assert.equal(reloaded.state.messageRefs.byRaw.e, "m00005", "second save does not re-settle");
+
+        // Cold load after the fold: aligned state is a no-op (kept only),
+        // and the superseded map rides the Session object for this process
+        // only — this reload proves the new process starts without one.
         store2.closeQuietly();
         const store3 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         _setStoreForTest(store3);

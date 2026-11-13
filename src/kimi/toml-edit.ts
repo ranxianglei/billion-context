@@ -3,6 +3,7 @@
 // own writeback is line-surgical per domain — our block survives login/logout/
 // catalog refresh as long as it uses its own provider name + model alias
 // (the refresh orchestrator preserves user-owned entries).
+import { nonNegativeTomlInteger } from "../toml-integer.js";
 
 export const KIMI_PROVIDER = "bili";
 export const KIMI_ALIAS = "bili-kimi";
@@ -55,8 +56,11 @@ function keyValue(line: string): { key: string; strVal?: string; numVal?: number
     if (!l || l.startsWith("#") || l.startsWith("[")) return undefined;
     const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(l);
     if (strMatch) return { key: strMatch[1], strVal: strMatch[2] !== undefined ? strMatch[2] : strMatch[3] };
-    const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(l);
-    if (numMatch) return { key: numMatch[1], numVal: Number(numMatch[2]) };
+    const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(l);
+    if (numMatch) {
+        const numVal = nonNegativeTomlInteger(numMatch[2]);
+        if (numVal !== undefined) return { key: numMatch[1], numVal };
+    }
     // Inline tables / arrays ({ x-bili-plugin = "kimi" }, ["a"]) have no scalar
     // value — key-only, so callers can still locate/replace the line.
     const tblMatch = /^([A-Za-z0-9_.-]+)\s*=\s*[{[]/.exec(l);

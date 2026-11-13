@@ -1,6 +1,6 @@
 // #2451 review fix (M1): the /v1/responses lane had the #2372 codex
 // local-compaction rebase but NOT the #2432 dsh variant — yet
-// CONFIGURATION.md names responses "the lane dsh desktop's compaction
+// docs/configuration.md names responses "the lane dsh desktop's compaction
 // actually rides" (#2360). Before the fix, a dsh-bound session replaying
 // [checkpoint summary, retained tail…] on this wire fell back into the
 // pre-#2432 death spiral: partially-alive blocks, self-destructing fold
