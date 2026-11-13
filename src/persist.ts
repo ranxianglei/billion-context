@@ -1610,7 +1610,7 @@ export class SessionStore {
         const unifiedAvailable = this.replicasAvailable();
         if (unifiedAvailable) {
             try {
-                const row = this.liveShadow().sessionSummaries().find((r) => r.sessionId === id);
+                const row = this.liveShadow().sessionIdentity(id);
                 if (row && (row.protocol || row.origin)) meta = { protocol: row.protocol, upstreamOrigin: row.origin };
             } catch { /* sidecar degraded mid-call: fall back to tree-only probing */ }
         }

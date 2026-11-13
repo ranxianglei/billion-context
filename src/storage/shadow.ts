@@ -858,6 +858,11 @@ export class UnifiedShadow {
         return this.sync.sessionUpdatedAt(sessionId);
     }
 
+    sessionIdentity(sessionId: string): { protocol?: string; origin?: string } | null {
+        if (this.sync === null) return null;
+        return this.sync.sessionIdentity(sessionId);
+    }
+
     /** Absolute-seq tip of the session's message log (+1 = next free seq).
      *  Used as a checkpoint's seq_at. #4739 follow-up: one MAX(seq) aggregate
      *  over live rows (#4730's lastLiveSeq) instead of materializing the whole
