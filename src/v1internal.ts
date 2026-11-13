@@ -16,6 +16,7 @@
 // int64 of the FNV-1a empty-string hash, "-3750763034362895579") — it must NOT
 // be used as conversation identity; extractConversationId does that instead.
 
+import { defaultCountTokens } from "acp-kernel";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 
 const V1_MODEL_ENDPOINTS = ["streamGenerateContent", "generateContent", "countTokens"] as const;
@@ -98,6 +99,81 @@ export function isV1BackgroundSideRequest(meta: Record<string, unknown>, inner: 
     if (Array.isArray(tools) && tools.length > 0) return false;
     const model = typeof meta.model === "string" ? meta.model : "";
     return model.includes("flash-lite");
+}
+
+// #6457: a CloudCode/Antigravity `requestType=checkpoint` background side
+// request packs the FULL uncompressed local history into inner.contents.
+// Forwarding it verbatim past the upstream window is a guaranteed 400 ("input
+// token count exceeds the maximum number of tokens") that Antigravity treats as
+// fatal — it terminates the whole agent loop. Shrink the contents to fit a token
+// budget: keep the first user instruction (the anchor — the original task) plus
+// the most recent contiguous tail that fits, role-alternation-safe at the join
+// (two consecutive same-role entries are rejected by Gemini). A pathological
+// single giant anchor that alone exceeds the budget is returned alone with
+// fits=false so the caller blocks it (413) instead of forwarding a guaranteed 400.
+export interface V1TruncateResult {
+    contents: Array<Record<string, unknown>>;
+    truncated: boolean;
+    fits: boolean;
+}
+
+function v1ContentTokens(entry: Record<string, unknown>): number {
+    const parts = entry.parts;
+    if (typeof parts === "string") return defaultCountTokens(parts);
+    if (!Array.isArray(parts)) return 0;
+    let tokens = 0;
+    for (const p of parts) {
+        if (typeof p === "string") tokens += defaultCountTokens(p);
+        else if (p && typeof p === "object") {
+            const t = (p as { text?: unknown }).text;
+            if (typeof t === "string") tokens += defaultCountTokens(t);
+        }
+    }
+    return tokens;
+}
+
+export function truncateV1ContentsForBudget(
+    contents: unknown,
+    budget: number,
+): V1TruncateResult {
+    if (!Array.isArray(contents) || contents.length === 0) {
+        const empty = Array.isArray(contents) ? (contents as Array<Record<string, unknown>>) : [];
+        return { contents: empty, truncated: false, fits: true };
+    }
+    const all = contents as Array<Record<string, unknown>>;
+    const total = all.reduce((s, c) => s + v1ContentTokens(c), 0);
+    if (total <= budget) return { contents: all, truncated: false, fits: true };
+    // First user instruction = the anchor (the original task to preserve).
+    let anchorIdx = -1;
+    for (let i = 0; i < all.length; i++) {
+        if ((all[i] as { role?: unknown }).role === "user") { anchorIdx = i; break; }
+    }
+    const anchor = anchorIdx >= 0 ? all[anchorIdx] : undefined;
+    const anchorTokens = anchor ? v1ContentTokens(anchor) : 0;
+    if (anchor && anchorTokens > budget) {
+        // Pathological: the anchor alone exceeds the budget — nothing to shrink.
+        return { contents: [anchor], truncated: true, fits: false };
+    }
+    const tailBudget = budget - anchorTokens;
+    // Most recent contiguous tail that fits: walk backwards from the end, stop
+    // at the first entry that would push the running total over the budget.
+    const tail: Array<Record<string, unknown>> = [];
+    let tailTokens = 0;
+    const start = anchorIdx >= 0 ? anchorIdx + 1 : 0;
+    for (let i = all.length - 1; i >= start; i--) {
+        const t = v1ContentTokens(all[i]);
+        if (tailTokens + t > tailBudget) break;
+        tail.unshift(all[i]);
+        tailTokens += t;
+    }
+    // Role-alternation-safe at the join: the tail's first entry must not share
+    // the anchor's role (Gemini rejects two consecutive same-role entries).
+    if (anchor) {
+        while (tail.length > 0 && (tail[0] as { role?: unknown }).role === anchor.role) tail.shift();
+    }
+    const result = anchor ? [anchor, ...tail] : tail;
+    const resultTokens = result.reduce((s, c) => s + v1ContentTokens(c), 0);
+    return { contents: result, truncated: true, fits: resultTokens <= budget };
 }
 
 // Inbound unwrap: pull the GenerateContentResponse out of `response`. No-op when
