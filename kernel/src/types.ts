@@ -122,6 +122,12 @@ export interface CompressionBlock {
    *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
   startSeq?: number;
   endSeq?: number;
+  /** #5667 defect A: the id of the block that CONSUMED this one (nested fold).
+   *  Written only at the single consumption point (compress.ts); non-consumptive
+   *  deactivation (orphan GC / host expand) leaves it unset, which is exactly
+   *  what makes an inactive block's death cause readable. Optional: states
+   *  persisted before this field exist read as "no lineage recorded". */
+  supersedesBlockId?: string;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */
@@ -708,6 +714,15 @@ export interface CompressibleRange {
    *  has no index gap and the index check alone would let mergeRangesToThreshold
    *  bridge back into one doomed span bracketing the dead ref. */
   noMergeBefore?: boolean;
+  /** #5667 defect B (display-only): ids of ACTIVE blocks whose ref-spans sit
+   *  strictly inside this range's numeric span — the range's literal label
+   *  bridges an already-folded interior (surface-replace hosts leave no gap, so
+   *  the segmenter joins the flanks; billion-context #5508 family). Renderers
+   *  append " · spans folded bN" so the model does not re-submit the covered
+   *  interior as new content. Set by buildCompressibleRanges / mergeBatch;
+   *  NEVER consulted by foldability judgment (KDD#12 single projection). Absent
+   *  when nothing is spanned or on hand-built ranges. */
+  crossesCoveredBy?: string[];
 }
 
 export interface ProtectedRange {

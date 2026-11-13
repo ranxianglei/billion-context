@@ -429,7 +429,7 @@ function finishPlan(
             // recomputes nothing — same bytes, same utf8, same sha256).
             summaryHash: sha256Hex(summaryJson),
             oneHash: oneJson === null ? null : sha256Hex(oneJson),
-            supersedesBlockId: null,
+            supersedesBlockId: b.supersedesBlockId ?? null,
             active: b.active,
             createdAt: b.createdAt,
             coveredHash: sha256Hex(JSON.stringify(covered)),
