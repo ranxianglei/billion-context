@@ -370,8 +370,13 @@ function makeDispatcher(ctx: EngineContext): InlineEngine["dispatch"] {
             // itself on abort (once:true) or when the response terminates.
             if (signal != null && onAbort != null) {
                 const detach = (): void => signal.removeEventListener("abort", onAbort!);
-                res.once("finish", detach);
-                res.once("close", detach);
+                // A synchronous admin/error response can finish before the
+                // committed promise resumes; its terminal events already ran.
+                if (res.writableEnded || res.destroyed) detach();
+                else {
+                    res.once("finish", detach);
+                    res.once("close", detach);
+                }
             }
         }
         return responseFrom(res);
