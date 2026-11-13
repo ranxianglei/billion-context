@@ -89,6 +89,37 @@ test("openai: host entry missing an id → bail (all-or-nothing)", () => {
     assert.strictEqual(resolve(wire, host), undefined);
 });
 
+test("openai: dsh flat host shape (role tool + block tool-call) → core-aligned (churn fix #6525 B7)", () => {
+    // dsh's flat host messages differ from the pi-ai form the shared walker's
+    // host fingerprint assumes: tool results carry role "tool" (not
+    // "toolResult") and assistant tool-call blocks are type "tool-call"
+    // (hyphen, not camel "toolCall"). Without the resolver's fingerprint-only
+    // normalization, EVERY tool-bearing turn bailed the all-or-nothing
+    // envelope and the host ids churned back to content digests on the next
+    // full-resend (the B7 root cause found via a real-dsh e2e dump).
+    const wire = oai([
+        { role: "system", content: "S" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "acp_status", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_1", content: "r1" },
+        { role: "assistant", content: "done" },
+    ]);
+    const host = [
+        sys("S"),
+        user("u1", "hello"),
+        { id: "a1", role: "assistant", content: [{ type: "tool-call", id: "call_1", name: "acp_status", arguments: "{}" }], timestamp: 1 },
+        { id: "t1", role: "tool", toolCallId: "call_1", content: [{ type: "text", text: "r1" }], timestamp: 1 },
+        { id: "a2", role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 1 },
+    ];
+    assert.deepStrictEqual(resolve(wire, host), ["u1", "a1", "t1", "a2"]);
+});
+
+test("openai: dsh parallel tool_calls still bail (one host id cannot cover N cores)", () => {
+    const wire = oai([{ role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "g", arguments: "{}" } }] }]);
+    const host = [{ id: "a1", role: "assistant", content: [{ type: "tool-call", id: "c1", name: "f", arguments: "{}" }, { type: "tool-call", id: "c2", name: "g", arguments: "{}" }], timestamp: 1 }];
+    assert.strictEqual(resolve(wire, host), undefined);
+});
+
 test("anthropic: system field separate, full conversation → 1:1 ids", () => {
     const wire = { model: "fake-model", max_tokens: 100, system: "S", messages: [
         { role: "user", content: "hi" },

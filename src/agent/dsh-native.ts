@@ -1253,6 +1253,31 @@ function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
     return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
 }
 
+/** dsh's flat host message shape differs from the pi-ai form the shared
+ *  walkers' host-side fingerprint (entryFingerprint / assistantParts in
+ *  pi-msgids.ts) understands in exactly two places, and the mismatch made
+ *  every tool-bearing turn bail the all-or-nothing envelope — the host ids
+ *  then churned back to content digests on the next full-resend (#6525 B7):
+ *   1. assistant tool-call blocks are `type:"tool-call"` (hyphen); the
+ *      fingerprint only recognizes `type:"toolCall"` (camel) and reads `.id`.
+ *   2. tool results carry role `"tool"`; the fingerprint takes the `toolres`
+ *      branch only for role `"toolResult"` (reading `.toolCallId`), so an
+ *      un-normalized `tool` fell into the text branch and mismatched.
+ *  Normalize ONLY for fingerprinting: the envelope ids come from `mm.id` and
+ *  the wire-side pairing is unchanged, so this cannot cause a mis-pin. */
+function dshFpRole(role: unknown): unknown {
+    return role === "tool" ? "toolResult" : role;
+}
+function dshFpContent(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    return content.map((b) => {
+        if (b === null || typeof b !== "object") return b;
+        const o = b as Record<string, unknown>;
+        if (o.type === "tool-call") return { type: "toolCall", id: o.id, name: o.name };
+        return b;
+    });
+}
+
 /** #6525: resolve the envelope (carrier ①) id array for a full-resend model
  *  body — CORE-aligned (== the post-hoist core count the server validates
  *  against, prepare-openai/anthropic) or undefined (degrade to
@@ -1284,7 +1309,7 @@ function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: un
         if (m === null || typeof m !== "object") return;
         const mm = m as Record<string, unknown>;
         if (mm.role === "system" || mm.role === "developer") continue;
-        entries.push({ type: "message", id: mm.id, message: { role: mm.role, content: mm.content, toolCallId: mm.toolCallId } });
+        entries.push({ type: "message", id: mm.id, message: { role: dshFpRole(mm.role), content: dshFpContent(mm.content), toolCallId: mm.toolCallId } });
     }
     const wireAligned = fmt === "anthropic" ? laneMsgIdsForWire(wire, entries) : laneMsgIdsForOpenAiWire(wire, entries);
     if (wireAligned === undefined) return undefined; // pairing not provable — degrade
