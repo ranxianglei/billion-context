@@ -111,8 +111,6 @@ export const LIVE_FILES = [
     // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
     // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
     "tests/log-retention.test.ts",
-    // Heap-bounded log readers in isolated children; private files, no sockets.
-    "tests/web-logs-query.test.ts",
     // #5631 restart survival: real bili proxy children under OS signals
     // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
     // probed-free ports re-probed on every restart — no band reuse.
@@ -136,6 +134,13 @@ export const LIVE_FILES = [
     // child binds no port and does no network I/O, so no zone band is needed —
     // the entry is for the tripwire alone, like #3890/#5114
     "tests/integrity-worker-stderr.test.ts",
+    // Real npm pack/install children use mkdtemp package fixtures and the
+    // preload's per-process XDG roots; they bind no listener ports.
+    "tests/pack-install.test.ts",
+    // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
+    "tests/ci-janitor-fork-heads.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

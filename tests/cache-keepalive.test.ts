@@ -590,3 +590,34 @@ noteSuccessfulForward({
     fs.rmSync(tmp, { recursive: true, force: true });
     assert.equal(exitCode, 0, `an armed keepalive must not hold the event loop open (got ${exitCode === null ? "TIMEOUT — the cadence timer kept the process alive" : `exit code ${exitCode}`})\n--- child output ---\n${out}`);
 });
+
+for (const reply of [
+    { label: "rate limit", status: 429, body: { error: "slow down" } },
+    { label: "cache miss", status: 200, body: MISS_BODY },
+    { label: "cache hit", status: 200, body: HIT_BODY },
+]) {
+    test(`ping: a stale ${reply.label} body cannot change a replacement snapshot`, async (t) => {
+        let finishBody!: (text: string) => void;
+        let startedBody!: () => void;
+        const body = new Promise<string>((resolve) => { finishBody = resolve; });
+        const started = new Promise<void>((resolve) => { startedBody = resolve; });
+        const response = new Response(null, { status: reply.status });
+        t.mock.method(response, "text", () => {
+            startedBody();
+            return body;
+        });
+        t.mock.method(globalThis, "fetch", async () => response);
+
+        noteSuccessfulForward(armInput());
+        timers.advance(270_000);
+        await started;
+        noteSuccessfulForward(armInput({ wireBody: BODY_1H }));
+        const replacement = _keepaliveEntryForTest(sid);
+        assert.equal(replacement?.tierLabel, "1h");
+
+        finishBody(JSON.stringify(reply.body));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(_keepaliveEntryForTest(sid), replacement);
+        assert.equal(timers.pendingCount(), 1, "only the replacement snapshot stays scheduled");
+    });
+}

@@ -707,6 +707,25 @@ export function dshContextTabLabel(): string | undefined {
     return s.length > 0 ? s : undefined;
 }
 
+type PluginBypassOverride = "auto" | "on" | "off";
+
+/** BILI_PLUGIN_BYPASS — operator override of the x-bili-plugin-bypass
+ *  passthrough decision (#6220). Three-state, read per-request (flips live,
+ *  no restart):
+ *    unset / "auto"    → current behavior: the inbound header decides per request
+ *    "1"/"on"/"true"   → force bypass: every inbound request is forwarded verbatim
+ *    "0"/"off"/"false" → never bypass: ignore any inbound x-bili-plugin-bypass header
+ *    unrecognized value → "auto" (current behavior)
+ *  Env-only per the owner-approved design in #6220: the header is a wire
+ *  contract stamped by hosts; the override is a per-process operator
+ *  posture, not a per-route config field. */
+export function pluginBypassOverride(): PluginBypassOverride {
+    const raw = process.env.BILI_PLUGIN_BYPASS?.trim().toLowerCase();
+    if (raw === "1" || raw === "on" || raw === "true") return "on";
+    if (raw === "0" || raw === "off" || raw === "false") return "off";
+    return "auto";
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
