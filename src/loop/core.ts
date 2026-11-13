@@ -481,7 +481,7 @@ export function executeProxyTool(
     }
     if (toolName === "acp_rewrite") {
         if (!blockOpsOn) return toolOk("acp_rewrite is not enabled on this bili proxy (compress.blockOps.enabled is not true) — no summary was rewritten.");
-        return executeAcpRewrite(args, ctx.session);
+        return executeAcpRewrite(args, ctx.session, ctx.config);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
