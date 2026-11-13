@@ -1,9 +1,12 @@
 // #5582: host-stamped management calls stranded on a sidecar-stub parent.
 //
-// Failure family (#2156/#2160 lineage): at session start a dsh sidecar (title
-// gen / auto review) that the recognition gates fail to classify rides the
-// full pipeline under the RAW conversation id and CLAIMS the virgin raw-key
-// anchor (shallow history + persona tag = claim by design). The first MAIN
+ // Failure family (#2156/#2160 lineage): at session start a dsh aux request
+ // that the recognition gates fail to classify rides the full pipeline under
+ // the RAW conversation id and CLAIMS the virgin raw-key anchor (shallow
+ // history + persona tag = claim by design). Pre-#5656 the incident shape was
+ // a single-user sidecar; post-#5656 that shape is a recognized side lane, so
+ // the residual claim shape is a two-user aux request (this test uses it).
+ // The first MAIN
 // turn then arrives under a different persona with disjoint history: every
 // continuity rung fails against the 1-cell shallow recording, so the whole
 // conversation forks onto `|sub:<fp>` forever. From then on:
@@ -78,6 +81,14 @@ const forkKey = (conv: string, system: string): string =>
 const long = (s: string): string => `${s}-` + "z".repeat(800);
 const msgs = (n: number, tag: string): { role: string; content: string }[] =>
     Array.from({ length: n }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: long(`${tag}-${i + 1}`) }));
+/** Two consecutive user cells: misses the #5656 single-shot gate (which
+ *  requires exactly one user message) yet stays below mainShaped's 3-cell
+ *  floor, so the raw-key claim it mints is a sidecar STUB, not a young real
+ *  conversation (the orderIsMainShaped veto must not fire on it). */
+const twoUsers = (tag: string): { role: string; content: string }[] => [
+    { role: "user", content: long(`${tag}-1`) },
+    { role: "user", content: long(`${tag}-2`) },
+];
 
 type Rig = { baseUrl: string; chatUrl: string; proxy: http.Server; relay: http.Server };
 
@@ -156,12 +167,17 @@ async function dshTurn(rig: Rig, conv: string, system: string, history: { role: 
     await res.json();
 }
 
-/** Builds the #5582 pathology: an unrecognized-sidecar-shaped single-user
- *  request claims the raw key (shallow + tagged = claim by design), the main
- *  conversation forks onto |sub:, and two same-persona sidecars keep stamping
- *  the stub's lastSeen AFTER the fork was born (birth-order follow dead). */
+/** Builds the #5582 pathology: an aux request in a shape the #5656
+ *  single-shot gate misses (two user cells — the gate requires exactly one
+ *  user message) rides the full pipeline and claims the raw key (shallow +
+ *  tagged = claim by design), the main conversation forks onto |sub:, and two
+ *  same-persona single-shot sidecars (now #5656 side-lane requests) keep
+ *  stamping the stub's lastSeen AFTER the fork was born (birth-order follow
+ *  dead). Post-#5656 a single-user claim turn is itself a recognized sidecar
+ *  and never claims the raw key, so the claim uses the residual two-user
+ *  shape — below mainShaped's 3-cell floor, so the stub is not main-shaped. */
 async function buildStubParentPathology(rig: Rig, conv: string): Promise<{ forkB: string }> {
-    await dshTurn(rig, conv, SYSTEM_A, msgs(1, "claim"));
+    await dshTurn(rig, conv, SYSTEM_A, twoUsers("claim"));
     const FORK_B = forkKey(conv, SYSTEM_B);
     await dshTurn(rig, conv, SYSTEM_B, msgs(64, "main"));
     assert.ok(peekSession(FORK_B), "the main conversation forked onto |sub:");
@@ -188,11 +204,11 @@ test("#5582 stub-parent rescue: acp_status/acp_cache follow the deep descendant;
 
         // Ref-less host-stamped call: follows the unique deep fresh descendant.
         // acp_status renders no session id — assert on the message inventory:
-        // the fork holds the 64 main-turn messages, the stub holds one blob.
+        // the fork holds the 64 main-turn messages, the stub holds two blobs.
         const stat = await forwardTool(rig.baseUrl, CONV, "acp_status", { scope: "uncompressed", view: "messages" }, undefined, true);
         assert.equal(stat.failed, false);
         assert.ok(/\b64 msgs\b/.test(stat.text), `acp_status resolves into the fork lane (64 msgs), got: ${stat.text.slice(0, 120)}`);
-        assert.ok(!/\b1 msgs\b/.test(stat.text), "acp_status no longer reports the stub's single message");
+        assert.ok(!/\b1 msgs\b/.test(stat.text) && !/\b2 msgs\b/.test(stat.text), "acp_status no longer reports the stub's blobs");
         assert.ok(!stat.text.includes(`|sub:${createHash("sha256").update(SYSTEM_A, "utf8").digest("hex").slice(0, 16)}`),
             "no |sub: lane of the sidecar persona leaks into the answer");
         const cache = await forwardTool(rig.baseUrl, CONV, "acp_cache", {}, undefined, true);
