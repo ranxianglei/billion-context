@@ -65,8 +65,7 @@ interface SnapEgressDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Gate (config-file only — #2030: no env knob; soak default ON at 100%,
-// flip to opt-in before the release cut).
+// Gate (config-file only — #2030: no env knob; opt-in, #5874 §9).
 // ---------------------------------------------------------------------------
 
 const DEFAULT_COHORTS: ReadonlySet<SnapEgressProtocol> = new Set(["openai", "anthropic", "google", "responses"]);
@@ -74,9 +73,10 @@ const DEFAULT_COHORTS: ReadonlySet<SnapEgressProtocol> = new Set(["openai", "ant
 function snapEgressFlags(): { egress: boolean; cohorts: ReadonlySet<SnapEgressProtocol> } {
     const file = loadConfigFile();
     const v = file.storage?.snapBase;
-    // SOAK (#5874): default ON at 100% for the soak + full-CI run.
-    // Release cut: change to `v?.egress === true` (opt-in).
-    const egress = v?.egress !== false;
+    // Opt-in (#5874 §9): the egress transform ships behind an explicit
+    // storage.snapBase.egress=true (the 2026-11-08 soak ON default was
+    // reverted before the merge, 2026-11-13).
+    const egress = v?.egress === true;
     const cohorts = Array.isArray(v?.egressCohorts) && v.egressCohorts.length > 0
         ? new Set<SnapEgressProtocol>(v.egressCohorts as SnapEgressProtocol[])
         : DEFAULT_COHORTS;

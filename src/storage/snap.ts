@@ -742,9 +742,10 @@ export function snapR3LatchedRead(db: DbLike, sessRaw: string): boolean {
     return !!r && !!r.r3_latched_at;
 }
 
-/** #6181 M3: persist the R3 breaker latch (UPDATE only — the l1 row is
- *  created by snapL1Record before the lane arms; a missing row degrades
- *  silently, the in-memory latch still fires for this process). */
+/** #6181 M3: persist the R3 breaker latch. UPSERT (not UPDATE-only) — the
+ *  first fault of a fresh session happens BEFORE its stage-0 snapL1Record
+ *  call (the R3 check runs at pin validation), so an UPDATE-only latch
+ *  would silently no-op for sessions with no l1 row yet. */
 export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): void {
     // Upsert — the first fault of a fresh session happens BEFORE its stage-0
     // snapL1Record call (the R3 check runs at pin validation), so an

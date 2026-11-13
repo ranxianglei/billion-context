@@ -248,7 +248,10 @@ test("#5874 T9: growth is bounded under continuous B1 re-sends", () => {
     const dir = tmpDir("bili-5874-t9-");
     const p = path.join(dir, "index.db");
     const store = openPlane(p);
-    const N = 40; // 40 full saves over a 12-message session
+    // N MUST cross SNAP_FOLD_DEPTH (128) — at 40 saves the fold path was
+    // structurally unreachable (max depth ~51) and the ≤256 bound was
+    // vacuous; 160 forces several folds.
+    const N = 160;
     try {
         const base = Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
         for (let i = 0; i < N; i++) {
@@ -259,6 +262,10 @@ test("#5874 T9: growth is bounded under continuous B1 re-sends", () => {
             assert.ok(depth <= 256, `log depth ${depth} must stay bounded (got > 256)`);
         }
         const db = raw(store);
+        // The fold actually ran: a ckpt exists past seq 0 and the log is
+        // shorter than the total number of events that passed through.
+        const ckpt = (db.prepare("SELECT ckpt_seq FROM snap_ckpt WHERE sid = 'sess-t9'").get() as { ckpt_seq: number } | undefined)?.ckpt_seq ?? 0;
+        assert.ok(ckpt >= 1, `a fold must have checkpointed by save ${N} (ckpt_seq ${ckpt})`);
         const rows = (db.prepare("SELECT COUNT(*) AS n FROM snap_rows WHERE sid = 'sess-t9'").get() as { n: number }).n;
         assert.ok(rows <= 12 + N, `rows (${rows}) must stay O(pos), not O(saves)`);
         const view = readSnapView(db, "sess-t9");

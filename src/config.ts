@@ -2290,9 +2290,10 @@ type FileConfig = {
             enabled?: boolean;
             shadowWrite?: boolean;
             /** #5874 P2 (mapEgress): serve the outbound compressed context
-             *  from the verified snap plane (tripwire-guarded; any normalized
-             *  mismatch keeps the legacy bytes). SOAK default: ON at 100% —
-             *  flip to opt-in (`egress: true` only) at the release cut. */
+             *  from the verified snap plane — DIRECT authority (the plane
+             *  stores the kernel's own tagged processTurn output; any plane
+             *  gap/exception degrades to the legacy bytes for one round).
+             *  Opt-in: default OFF when unset (#5874 §9). */
             egress?: boolean;
             /** Protocol cohorts allowed to cut over (subset of
              *  openai|anthropic|google|responses). Default: all four. */

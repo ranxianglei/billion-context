@@ -474,7 +474,20 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // new input).
         const isChained = typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
         planeBypass = isChained && !s0.cohortRan && !wsAnchored;
-        if (planeBypass) session.skipPlaneFlush = true;
+        if (planeBypass) {
+            session.skipPlaneFlush = true;
+            // #5901 review fix (2026-11-13, review round 2): the view just
+            // captured is a DELTA, not the world — it must not outlive this
+            // round. The one-shot skipPlaneFlush above only protects the
+            // in-request flush; the relay success path re-arms the debounced
+            // save (relay markDirty) and that save would ride this delta as a
+            // TAGGED world (persist guardedBuild → shadow.record livePlane →
+            // snapShadowSync tagged path, B4 guard untagged-only) —
+            // snapViewEvents would DELETE every plane row the delta lacks.
+            // Untag: the later save derives from the DB final state instead
+            // (append-only rows for this exchange — correct).
+            session.lastPlaneMessages = undefined;
+        }
         // #5874 P2-final: snapshot application (in-request) — the canonical
         // transcript up to THIS user message plus the kernel's post-fold state
         // must be on the snapshot plane before the egress stage reads it

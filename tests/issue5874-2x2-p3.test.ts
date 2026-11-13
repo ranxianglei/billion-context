@@ -836,6 +836,14 @@ async function withProxyT(
     try {
         if (opts.storeDir) {
             process.env.BILI_STORAGE_UNIFIED = "shadow";
+            // Plane + egress are OPT-IN since the 2026-11-13 soak revert
+            // (all four snapBase keys default off) — these e2e tests exercise
+            // the plane, so arm all three keys in a dedicated config file.
+            fs.mkdirSync(opts.storeDir, { recursive: true });
+            const e2eConfig = path.join(opts.storeDir, "config.json");
+            fs.writeFileSync(e2eConfig, JSON.stringify({ storage: { snapBase: { enabled: true, shadowWrite: true, egress: true } } }));
+            savedEnv.BILI_CONFIG_FILE = process.env.BILI_CONFIG_FILE;
+            process.env.BILI_CONFIG_FILE = e2eConfig;
             store = new SessionStore({ enabled: true, dir: opts.storeDir, debounceMs: 0 });
             _setStoreForTest(store);
         } else {

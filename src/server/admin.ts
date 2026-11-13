@@ -1329,9 +1329,9 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
 // flags with zeroed counters; a throw → all-off with zeroed counters
 // (status is informational and must never take the endpoint down).
 function snapplaneStatusPayload(): SnapPlaneStatusWire {
-    // SOAK (PR #5901): mirrors the store's soak default — REVERT to
-    // { enabled: false, shadowWrite: false } before merge.
-    const flags = fileSnapBase() ?? { enabled: true, shadowWrite: true };
+    // Default off when the config file is silent (#5874 §9) — the 2026-11-08
+    // soak ON default was reverted before the merge (2026-11-13).
+    const flags = fileSnapBase() ?? { enabled: false, shadowWrite: false };
     const zeroed: SnapPlaneStatusWire = {
         enabled: flags.enabled,
         shadowWrite: flags.shadowWrite,

@@ -1,6 +1,6 @@
 # 提案：快照表式压缩底座（六段固定链，单一存储真源）
 
-> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 直接权威出站 —— 提案里的 tripwire（J 裁定）后被 owner 移除：平面存内核自己的打标输出，与旧出站逐字节一致是结构保证，逐轮比对只添复杂度）。P2-final 按提案原序落地六段链：快照写入（事件→表，cast/update/delete/compact 事件级增量）在**请求内**完成 —— 内核改写之后、出站改写之前，平面在响应发出前即可读，本轮自身重发的尾窗为空。
+> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写；P2 = mapEgress 直接权威出站 —— 提案里的 tripwire（J 裁定）后被 owner 移除：平面存内核自己的打标输出，与旧出站逐字节一致是结构保证，逐轮比对只添复杂度）。全部开关**出厂默认关**（显式开启；2026-11-08 的 100% soak 已在合并前翻回）。P2-final 按提案原序落地六段链：快照写入（事件→表，cast/update/delete/compact 事件级增量）在**请求内**完成 —— 内核改写之后、出站改写之前，平面在响应发出前即可读，本轮自身重发的尾窗为空。
 > 2026-11-07 作为设计提案撰写；本文件是已落地实现的设计记录。
 > **基线：** origin/master（写于 2026-11-07；存储 schema v11，#5854 已把 v6 整线撤出 master）。
 > **来源讨论：** [#5643](https://github.com/ranxianglei/billion-context/issues/5643)（含定位纠正评论）。
@@ -79,7 +79,7 @@
 | 2 | 改写/压缩 | 内核一行不改，产出结构化事件；落表时序按附录二 | 内核零改动 |
 | 3 | 快照表应用 | 单事务提交原语写入 snap 三件套(rows/log/ckpt)；ckpt meta 携带内核态+覆盖映射+S4 | **新增核心** |
 | 4 | 出站映射 | 存活行按 pos 排序 ++ 尾窗新解析；双 carrier 分支 | 读侧重建 |
-| 5 | 出站 | tripwire 抽样比对后放行上游 | 守卫强化 |
+| 5 | 出站 | S4 校验过的平面即直接出站权威；平面缺/死/异常时降级旧字节一轮（无逐轮 tripwire —— owner 裁定 2026-11-11） | 守卫：仅降级 |
 
 横切两条：**红门降级带**（§7，任何疑点回落 legacy）与**共存路由**（§8，每种流量只有一个家）。
 
@@ -268,7 +268,7 @@ lane-decisions 矩阵：每个组合一行，正负成对（触发时触发、�
 - **两级嵌套开关**：master 旗 ⊃ lane 旗（lane 旗只在 master 开时有意义），config-file key 经 `src/knobs.ts`（env > file > default）解析；**不新增 env 旋钮**（env 稀缺面纪律 #2030）。落地 key：config-file `storage.snapBase.enabled`（master 旗）/ `storage.snapBase.shadowWrite`（lane 旗，master ⊃ lane），见[配置文档](../../configuration.zh-CN.md)。
 - **cohort 名单**：配置级声明（哪些 carrier/宿主声称具备双信道），初值待定（遗留 D4：shim/pi/opencode/codex/cc/gemini 六候选逐个核实）。
 - **Web「配置」页**三态快速开关同步出厂；i18n en/zh 对；registry-test 死键守护行；website/config-reference yaml 种子（若 ship 旋钮）。
-- 默认 OFF，按会话分桶（announcement-id 盐值桶之外的独立桶），P2 单车道灰度起步。（#5901 soak 现状：影子写默认 100% 打开，跑 `ci:full` + 本地 gate 真实流量；发布版出厂前翻回 OFF。）
+- 默认 OFF（落地状态：四个键全部出厂关；2026-11-08 的 100% soak 已在合并前翻回），按会话分桶（announcement-id 盐值桶之外的独立桶），P2 单车道灰度起步。
 
 ---
 
@@ -276,7 +276,7 @@ lane-decisions 矩阵：每个组合一行，正负成对（触发时触发、�
 
 - **决策日志**：统一词汇表（hit / miss / red:<R编号> / degrade / resync / arm …），每行可 grep 可聚合；rollout 期间就是信心证据。
 - **`/__bili/status`**：attribution 字段扩展新底座维度（哪条链路在服务本会话、平面健康）。
-- **面板健康度**：snap 表行数 / log 深度 / ckpt lag（seq 落后量）/ GC 水位 / tripwire 抽验命中率，进 sessions 面板或独立小卡。
+- **面板健康度**：snap 表行数 / log 深度 / ckpt lag（seq 落后量）/ GC 水位 / egress 降级原因计数（`/__bili/status` 的 `snaplane.egress`），进 sessions 面板或独立小卡。
 - **acp_status uncompressed view**：判决输入源指到新表行（KDD#12 共享投影的 apply/recommend/status 三方一致性在新表上重新钉测试）。
 
 ---

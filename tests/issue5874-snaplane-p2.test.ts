@@ -492,7 +492,9 @@ test("G2 cohort: a protocol outside egressCohorts serves the legacy bytes", () =
     sess.lastPlaneMessages = foldedView();
     store.ingestSession(planIngest(sess));
 
-    setConfig({ storage: { snapBase: { egressCohorts: ["anthropic"] } } });
+    // egress: true is explicit now (opt-in since the 2026-11-13 soak revert);
+    // this test exercises COHORT exclusion, not the master opt-in gate.
+    setConfig({ storage: { snapBase: { egress: true, egressCohorts: ["anthropic"] } } });
     const legacy = [taggedMsg(99)];
     const out = applySnapEgress(stateFor(blk), legacy, {
         sessionId: sid,
@@ -508,6 +510,7 @@ test("G3 plane miss: an sid the plane never recorded serves the legacy bytes", (
     const dir = tmpDir("bili-5874-g3-");
     const store = openPlane(path.join(dir, "index.db"));
     registerStore(store);
+    setConfig({ storage: { snapBase: { egress: true } } });
     const legacy = [taggedMsg(99)];
     const out = applySnapEgress({ blocks: [] } as unknown as CompressionState, legacy, {
         sessionId: "never-ingested",
@@ -530,6 +533,7 @@ test("G4 plane dead: a latched sid serves the legacy bytes", () => {
         { id: "ghost-msg", role: "assistant", contentType: "text", text: "no legacy row" } as BiliMessage,
     ];
     store.ingestSession(planIngest(sess)); // latches dead
+    setConfig({ storage: { snapBase: { egress: true } } });
 
     const legacy = [taggedMsg(99)];
     const out = applySnapEgress({ blocks: [] } as unknown as CompressionState, legacy, {
@@ -551,6 +555,7 @@ test("G5 direct authority: the plane is served regardless of the legacy bytes", 
     const { sess, blk } = foldedSession(sid);
     sess.lastPlaneMessages = foldedView();
     store.ingestSession(planIngest(sess));
+    setConfig({ storage: { snapBase: { egress: true } } });
 
     const legacy = [{ id: "sentinel", role: "user", contentType: "text", text: "not served" } as BiliMessage];
     const out = applySnapEgress(stateFor(blk), legacy, {

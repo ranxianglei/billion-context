@@ -1,6 +1,6 @@
 # Proposal: Snapshot-Table Compression Foundation (six-stage fixed chain, single storage truth)
 
-> **Status: P0 + P1 + P2 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow-write soak; P2 = mapEgress tripwire-guarded egress cutover, soak at 100% for the `ci:full` + local-gate run, release flips it back to OFF-before-ship like every soak flag). P2-final lands the six-stage chain in the proposal's own order: the snapshot write (events → tables) runs **in-request**, after the kernel rewrite and before the egress stage — the plane is readable before the response is sent, and this round's own resend carries an empty tail.
+> **Status: P0 + P1 + P2 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow write; P2 = mapEgress **direct-authority** egress — owner ruling 2026-11-11 removed the proposal's tripwire: the plane stores the kernel's OWN tagged processTurn output, so byte-identity with the legacy egress is a construction guarantee, and any plane gap degrades to the legacy bytes for one round). All flags ship **default OFF** (explicit opt-in; the 2026-11-08 soak ran them at 100% and was reverted before merge). P2-final lands the six-stage chain in the proposal's own order: the snapshot write (events → tables) runs **in-request**, after the kernel rewrite and before the egress stage — the plane is readable before the response is sent, and this round's own resend carries an empty tail.
 > Written 2026-11-07 as a design proposal; this doc is the design record of the landed implementation.
 > **Baseline:** origin/master (written 2026-11-07; storage schema v11; #5854 has fully reverted the v6 line from master).
 > **Origin thread:** [#5643](https://github.com/ranxianglei/billion-context/issues/5643) (incl. the re-positioning comment).
@@ -79,7 +79,7 @@ One-line duties per stage:
 | 2 | Rewrite / compression | Kernel untouched; emits structured events; landing timing per appendix-two | Kernel zero-change |
 | 3 | Apply to snapshot tables | Single-transaction commit primitive writes the snap trio (rows/log/ckpt); ckpt meta carries kernel state + coverage map + S4 | **NEW CORE** |
 | 4 | Egress mapping | Live rows ordered by pos ++ fresh-parse of tail window; dual-carrier branch | Read-side rebuild |
-| 5 | Outbound | Tripwire sampling comparison before release upstream | Guard strengthened |
+| 5 | Outbound | The verified plane IS the outbound authority; any gap degrades to the legacy bytes for one round (no per-round tripwire — owner ruling 2026-11-11) | Guard: degrade-only |
 
 Two cross-cutting bands: the **red-gate degradation band** (§7 — any doubt falls back to legacy) and **coexistence routing** (§8 — every traffic class has exactly one home).
 
@@ -167,53 +167,60 @@ any step throws ⇒ abandon the whole turn, no half-state (invariant i)
 
 ## 5. Storage schema (final DDL landed as schema v12 in #5901)
 
-Version-stacking rule: #5901 landed this DDL as schema **v12** (`SNAPBASE_DDL_V12` in `src/storage/schema.ts`) directly on the v11 master, because #5855 was still open at the time; if #5855 lands first, the later-landing side renumbers mechanically (same DDL, one version bump). Old-library upgrade is purely additive (`CREATE ... IF NOT EXISTS`), no data migration. Per-table read/write map (zh/en): [storage-relations.en.svg](../../storage-relations.en.svg) / [storage-relations.zh.svg](../../storage-relations.zh.svg). DDL (final types as landed in P0):
+Version-stacking rule: #5901 landed this DDL as schema **v12** (`SNAPBASE_DDL_V12` in `src/storage/schema.ts`) directly on the v11 master, because #5855 was still open at the time; if #5855 lands first, the later-landing side renumbers mechanically (same DDL, one version bump). Old-library upgrade is purely additive (`CREATE ... IF NOT EXISTS`), no data migration — and the application itself is probe-first (below), so the version number is a hygiene step, not a gate. Per-table read/write map (zh/en): [storage-relations.en.svg](../../storage-relations.en.svg) / [storage-relations.zh.svg](../../storage-relations.zh.svg). DDL (final types as landed):
 
 ```sql
 -- L1 identity thin table (vehicle of ruling G; restores baseline §4.1.1's two columns as a dedicated table)
-CREATE TABLE IF NOT EXISTS l1_world(
-  sess_raw      TEXT    NOT NULL,         -- host session id, ORIGINAL value, never truncated (P9)
-  ledger_id     TEXT    NOT NULL,         -- bili canonical sid (existing key space, ruling D)
-  witness_probe TEXT,                     -- echo spot-check witness sample (diagnostics stream only)
-  issued_at     INTEGER NOT NULL,
-  armed_at      INTEGER,                  -- arming-round mark for freshly minted identities
-  PRIMARY KEY (sess_raw)
+-- v12's 2×2 stage-0 ADDS the per-element msgid envelope (envelope_json /
+-- envelope_checksum) and the R3 latch (r3_latched_at) via probe-first
+-- ALTERs — a fresh DB already has all of it.
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw       TEXT PRIMARY KEY,     -- host session id, ORIGINAL value, never truncated (P9)
+    ledger_id      TEXT NOT NULL,        -- bili canonical sid (existing key space, ruling D)
+    witness_probe  TEXT NOT NULL,        -- echo spot-check witness sample (diagnostics stream only)
+    issued_at      INTEGER NOT NULL,
+    armed_at       INTEGER,              -- arming-round mark for freshly minted identities
+    envelope_json  TEXT,                 -- 2×2: {id, pos} element canon (matchWorld / matchAppend)
+    envelope_checksum TEXT,              -- 2×2: canonical-checksum over the envelope
+    r3_latched_at  INTEGER               -- R3 identity-breach persistent latch (M3)
 );
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
 
 -- Row table: the transcript proper
-CREATE TABLE IF NOT EXISTS snap_rows(
-  sid         TEXT    NOT NULL,
-  pos         INTEGER NOT NULL,           -- ledger absolute position, append-only, never reused
-  core_ids    TEXT    NOT NULL,           -- canonical-core element id list (json text)
-  pre_json    TEXT,                       -- pre-rewrite form reference (CAS digest); ruling A② defaults to reference, not inline
-  post_json   TEXT    NOT NULL,           -- post-rewrite canonical form (the ONLY form allowed to be cached)
-  tokens_est  INTEGER,                    -- estimated tokens (ruling L: growth data source for judgment + billing share)
-  active      INTEGER NOT NULL DEFAULT 1, -- 0 = covered/inactive (kept for decompress; lifecycle per §4.3)
-  cover_ref   TEXT,                       -- id of the summary block covering it (lifecycle anchor for physical cleanup)
-  updated_at  INTEGER NOT NULL,
-  PRIMARY KEY (sid, pos)
+CREATE TABLE IF NOT EXISTS snap_rows (
+    sid          TEXT NOT NULL,
+    pos          INTEGER NOT NULL,       -- ledger absolute position, append-only, never reused
+    core_ids     TEXT NOT NULL,          -- canonical-core element id list (json text)
+    pre_json     TEXT,                   -- pre-rewrite form reference (CAS digest); ruling A② defaults to reference, not inline
+    post_json    TEXT,                   -- post-rewrite canonical form (the ONLY form allowed to be cached)
+    tokens_est   INTEGER NOT NULL DEFAULT 0, -- estimated tokens (ruling L: growth data source for judgment + billing share)
+    active       INTEGER NOT NULL DEFAULT 1, -- 0 = covered/inactive (kept for decompress; lifecycle per §4.3)
+    cover_ref    TEXT,                   -- id of the summary block covering it (lifecycle anchor for physical cleanup)
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (sid, pos)
 );
 
 -- Event log (LSM log layer)
-CREATE TABLE IF NOT EXISTS snap_log(
-  sid        TEXT    NOT NULL,
-  seq        INTEGER NOT NULL,            -- strictly > max(log.max_seq, ckpt.seq)
-  kind       TEXT    NOT NULL,            -- cast|append|update|delete|compact
-  payload    TEXT    NOT NULL,
-  created_at INTEGER NOT NULL,
-  PRIMARY KEY (sid, seq)
+CREATE TABLE IF NOT EXISTS snap_log (
+    sid        TEXT NOT NULL,
+    seq        INTEGER NOT NULL,         -- strictly > max(log.max_seq, ckpt.seq)
+    kind       TEXT NOT NULL,            -- cast|append|update|delete|compact
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (sid, seq)
 );
 
 -- Checkpoint (LSM meta layer; absorbs log payloads AND explicitly retains the coverage map)
-CREATE TABLE IF NOT EXISTS snap_ckpt(
-  sid        TEXT    NOT NULL PRIMARY KEY,
-  ckpt_seq   INTEGER NOT NULL,
-  meta_json  TEXT    NOT NULL,            -- serialized kernel state + coverage map + own checksum
-  checksum   TEXT    NOT NULL,            -- S4 aggregate checksum
-  updated_at INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS snap_ckpt (
+    sid        TEXT PRIMARY KEY,
+    ckpt_seq   INTEGER NOT NULL,
+    meta_json  TEXT NOT NULL DEFAULT '{}', -- serialized kernel state + coverage map + own checksum
+    checksum   TEXT NOT NULL,              -- S4 aggregate checksum
+    updated_at INTEGER NOT NULL
 );
 ```
+
+**Migration is probe-first, not version-gated** (landed behavior): the DDL is pure `CREATE ... IF NOT EXISTS`, so it runs at ANY from-version; the migrator probes for `snap_rows` itself. Real-world reason: #5855 consumed v12+v13 (`pf_*` planes) in a shared database while this was unmerged, and the old `if (from < 12)` gate silently skipped the plane on first save ("no such table: l1_world"). The final master version number stays a mechanical merge-time hygiene step.
 
 **Write-model assumption** (ruling H item): default is the single-process assumption (WAL serializes cross-process writes naturally). If multi-instance concurrent writes are wanted, an in-memory-view invalidation protocol must ship with it (who invalidates resident core arrays / metadata caches on commit) — P0 contract picks one, definitively.
 
@@ -265,10 +272,10 @@ lane-decisions matrix: one row per combination, positive+negative pairs ("trigge
 
 ## 9. Rollout & config surface (owner-gated; keys finalized in #5901)
 
-- **Two-level nested flags:** master flag ⊃ lane flags (a lane flag means anything only when master is on), config-file keys resolved through `src/knobs.ts` (env > file > default); **no new env knobs** (scarce-surface discipline #2030). Keys as landed: config-file `storage.snapBase.enabled` (master flag) / `storage.snapBase.shadowWrite` (lane flag, master ⊃ lane), see [configuration](../../configuration.md).
+- **Two-level nested flags:** master flag ⊃ lane flags (a lane flag means anything only when master is on), config-file keys resolved through `src/knobs.ts` (env > file > default); **no new env knobs** (scarce-surface discipline #2030). Keys as landed, all **default OFF** (explicit opt-in): config-file `storage.snapBase.enabled` (master flag) / `storage.snapBase.shadowWrite` (lane flag, master ⊃ lane) / `storage.snapBase.egress` (P2 direct-authority egress, opt-in) / `storage.snapBase.egressCohorts` (protocol subset, default all four), see [configuration](../../configuration.md).
 - **Cohort roster:** config-level declaration (which carriers/hosts claim dual-channel capability); initial value TBD (open item D4: verify the six candidate carriers one by one).
 - **Web config page** tri-state quick switches shipped in lockstep; i18n en/zh pairs; registry-test dead-key guard rows; website/config-reference yaml seeds where a knob ships.
-- Default OFF, bucketed per session (an independent salted bucket), P2 starts as single-lane gray rollout. (#5901 soak reality: shadow-write runs at 100% by default for the `ci:full` + local-gate traffic run; the release build flips it back to OFF before shipping.)
+- Default OFF (landed state: all four keys ship off; the 2026-11-08 soak ran them at 100% and was reverted before merge), bucketed per session (an independent salted bucket), P2 starts as single-lane gray rollout.
 
 ---
 
@@ -276,7 +283,7 @@ lane-decisions matrix: one row per combination, positive+negative pairs ("trigge
 
 - **Decision log:** unified vocabulary (hit / miss / red:<R-n> / degrade / resync / arm …), every line grep-able and aggregatable; during rollout it IS the confidence evidence.
 - **`/__bili/status`:** attribution field extended with foundation dimensions (which chain serves this session, plane health).
-- **Panel health metrics:** snap table row counts / log depth / ckpt lag (seq distance) / GC waterline / tripwire sampling agreement rate — sessions panel or a dedicated card.
+- **Panel health metrics:** snap table row counts / log depth / ckpt lag (seq distance) / GC waterline / egress degrade-reason counters (`snaplane.egress` on `/__bili/status`) — sessions panel or a dedicated card.
 - **acp_status uncompressed view:** judgment input source repointed to new-table rows (KDD#12 shared-projection apply/recommend/status consistency re-pinned on the new tables).
 
 ---

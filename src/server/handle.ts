@@ -3071,8 +3071,13 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
-                    // #6181 B3: a PLUGIN-lane chained round whose input is
-                    // EMPTY is a pure chain continuation — the provider
+                    // #6181 B3: a PLUGIN-lane chained round whose input
+                    // carries no ARRAY content (absent or empty — a
+                    // bare-string input is admitted too: the provider
+                    // concatenates it to its retained chain, the same
+                    // outcome the kernel path would produce, with none of
+                    // its side effects) is a pure chain continuation — the
+                    // provider
                     // already has the full world via its retained chain. The
                     // kernel path for such a round is HARMFUL: it injects the
                     // standing dev message into an otherwise-empty input and

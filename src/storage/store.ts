@@ -534,13 +534,11 @@ export class UnifiedStore {
      *  Set from UnifiedStore.open's opts — the constructor stays untouched
      *  (readSnapshotAsync's reader stores inherit the flag harmlessly: the
      *  reader connection is query-only and never ingests).
-     *  SOAK DEFAULT (2026-11-08, PR #5901): while the PR soaks ci:full and
-     *  the local real-traffic gate, the plane runs ON for 100% of sessions
-     *  when the config file is silent — REVERT both spots (here and the
-     *  open() fallback below, plus admin.ts's status default) to
-     *  { enabled: false, shadowWrite: false } before merge: the release
-     *  stays default-off per discussion #5874 §9. */
-    snapPlane: { enabled: boolean; shadowWrite: boolean } = { enabled: true, shadowWrite: true };
+     *  DEFAULT OFF (discussion #5874 §9): when the config file is silent
+     *  the plane is fully off; opt in with storage.snapBase.
+     *  (2026-11-08 soak ran this at ON per owner directive; reverted to
+     *  off on 2026-11-13 before the merge — review of #5901 round 2.) */
+    snapPlane: { enabled: boolean; shadowWrite: boolean } = { enabled: false, shadowWrite: false };
     /** #5744: last periodic checkpoint result (plus its wall time) for the
      * slow-ingest warn line — lets an operator attribute a stall spike to a
      * checkpoint burst instead of guessing. Null until the first tick. */
@@ -775,9 +773,9 @@ export class UnifiedStore {
             // lane flag only means something with the master flag); the
             // && here is the storage layer's own belt (a store opened
             // directly, bypassing knobs, can never shadow without the master).
-            // SOAK: config absent ⇒ the soak default ON (see the field
-            // comment above — revert before merge).
-            const f = opts?.snapBase ?? { enabled: true, shadowWrite: true };
+            // Default off when the config is absent (#5874 §9; the 2026-11-08
+            // soak ON default was reverted before merge, 2026-11-13).
+            const f = opts?.snapBase ?? { enabled: false, shadowWrite: false };
             store.snapPlane = {
                 enabled: f.enabled === true,
                 shadowWrite: f.enabled === true && f.shadowWrite === true,

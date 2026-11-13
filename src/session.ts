@@ -692,7 +692,12 @@ export type Session = {
      *  the plane persists the kernel's OWN tagged output instead of the
      *  pre-rewrite transcript. The egress then reads the plane rows and runs
      *  only the light transform (absorb/attach/strip/drop) — no seam walk,
-     *  no re-tagging, no id re-keying. Cleared per turn like lastMessages. */
+     *  no re-tagging, no id re-keying. Set per world-view round after
+     *  processTurn; deliberately UNSET on #6181 B0 bypass rounds (the view
+     *  there is a chained delta, not the world — a later debounced save
+     *  riding it tagged would let snapViewEvents delete every plane row the
+     *  delta lacks), so such saves fall back to the untagged DB final-state
+     *  derivation. */
     lastPlaneMessages?: CoreMessage[];
     /** #6181 B0: one-shot "skip the snapshot-plane write on the next
      *  save" — set by the lane for a turn that CANNOT be addressed against

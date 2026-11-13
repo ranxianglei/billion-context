@@ -66,6 +66,8 @@ const LEGACY_TABLES = [
     "ccr_entries",
     "conversations",
     "session_ext",
+    "kv_store", // #5901 review (2026-11-13): was missing — the byte-identity
+    // oracle skipped one of the twelve legacy tables (schema.ts kv_store)
     "message_media",
 ] as const;
 
@@ -299,6 +301,17 @@ test("#5874 T2: the commit primitive is atomic (invalid event ⇒ no half-state)
         assert.throws(() => applySnapCommit(db, "s1", bad), /not canonical core shape/);
         assert.equal(tableCount(db, "snap_rows"), 2, "the good event in a failed batch must not land");
         assert.equal(tableCount(db, "snap_log"), 2, "the log must have no partial entry");
+        // IN-TRANSACTION rollback (not just pre-txn validation): a VALID
+        // event followed by one that can only fail inside the txn — the R2
+        // "no row to update" check lives in applyEvent (snap.ts), after the
+        // earlier append has already written its row + log entry.
+        const mixed: SnapEvent[] = [
+            { ev: "append", pos: 3, coreIds: ["m3"], preJson: null, postJson: postJson("c"), tokensEst: 3 },
+            { ev: "update", pos: 99, postJson: postJson("z") },
+        ];
+        assert.throws(() => applySnapCommit(db, "s1", mixed), /no row to update \(R2\)/);
+        assert.equal(tableCount(db, "snap_rows"), 2, "the earlier valid event of a failed batch must roll back");
+        assert.equal(tableCount(db, "snap_log"), 2, "no partial log entry survives the in-txn rollback");
         // A structurally bad batch (duplicate pos) rolls back too.
         const dup: SnapEvent[] = [
             { ev: "append", pos: 1, coreIds: ["x"], preJson: null, postJson: postJson("x"), tokensEst: 1 },
@@ -442,9 +455,9 @@ test("#5874 T6: deleteSession cascades the plane tables", () => {
             ]);
             // L1 entry under the session's ledger id.
             snapL1Record(db, "sess-t6", "sess-t6", "probe", Date.now());
-            // The soak default also made the ingest hook write plane rows,
-            // so assert "at least the manual evidence exists" — the cascade
-            // assertions below are the point of this test.
+            // Plane is default-off (no snapBase in the open above) — the
+            // manual applySnapCommit above is the only plane evidence; the
+            // cascade assertions below are the point of this test.
             assert.ok(tableCount(db, "snap_rows") >= 1);
             assert.ok(tableCount(db, "snap_log") >= 1);
             assert.ok(tableCount(db, "l1_world") >= 1);
@@ -491,10 +504,10 @@ test("#5874 flags: master ⊃ lane, resolved at the store", () => {
             shadowWrite: false,
         });
         assert.deepEqual(mk(path.join(dir, "d.db"), { enabled: true }), { enabled: true, shadowWrite: false });
-        // SOAK (PR #5901): absent config ⇒ 100% ON default while the PR soaks
-        // ci:full + the local gate — REVERT this expectation (and the store/
-        // admin defaults) to { enabled: false, shadowWrite: false } before merge.
-        assert.deepEqual(mk(path.join(dir, "e.db"), undefined), { enabled: true, shadowWrite: true });
+        // Default OFF (#5874 §9): absent config ⇒ the plane stays fully off.
+        // (The 2026-11-08 soak pinned this expectation to ON; reverted with
+        // the store/admin defaults before the merge, 2026-11-13.)
+        assert.deepEqual(mk(path.join(dir, "e.db"), undefined), { enabled: false, shadowWrite: false });
         assert.deepEqual(
             mk(path.join(dir, "f.db"), { enabled: false, shadowWrite: false }),
             { enabled: false, shadowWrite: false },
