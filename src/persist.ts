@@ -13,7 +13,9 @@ import {
     persistTailTokens as knobPersistTailTokens,
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
-    resolveJsonWriterOff as knobResolveJsonWriterOff,
+    effectiveJsonWriterOff as knobEffectiveJsonWriterOff,
+    jsonWriterOffRequested as knobJsonWriterOffRequested,
+    resolveJsonWriterChoice,
     contentStorePinned,
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
@@ -640,14 +642,23 @@ export class SessionStore {
         // fabricating a "no SQLite engine" degrade for a sidecar that was never
         // supposed to open.
         recordRequestedMode(storageMode, unifiedBlockedByEncryption, !this.enabled);
-        // Phase 3 (#2960): stop writing the legacy JSON envelope while the
-        // unified store runs in effective-full mode. Ignored (warned once)
-        // under shadow/legacy/encryption — there the JSON file is the sole
-        // source of truth.
-        const wantJsonWriterOff = knobResolveJsonWriterOff(process.env, fileStorageJsonWriter());
-        this.jsonWriterOff = wantJsonWriterOff && storageMode === "full" && !unifiedBlockedByEncryption && resolveBackendName(process.env, fileStorageBackend()) === "sqlite";
-        if (wantJsonWriterOff && !this.jsonWriterOff) {
-            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full on the sqlite backend (network backends keep the JSON envelope as the sync read path)");
+        // Phase 3 (#2960) + pure-sqlite default: the JSON envelope writer is
+        // OFF by default for pure-sqlite selections (storage.unified absent or
+        // "sqlite") — the SQLite index is the only persistent copy. Explicit
+        // "full" keeps the historical dual-write default. Ignored (warned
+        // once, and only when explicitly REQUESTED) under shadow/legacy/
+        // encryption — there the JSON file is the sole source of truth.
+        const jsonWriterOffChoice = resolveJsonWriterChoice(process.env, fileStorageJsonWriter());
+        // The backend check honors a seam-injected sidecar (#4942 test seam):
+        // an async (network) shadow keeps the envelope as its sync read path
+        // even when the env spells sqlite — writerOff stays sqlite-only.
+        const writerBackendIsSqlite = opts?.shadow !== undefined ? !opts.shadow.isAsyncBackend : resolveBackendName(process.env, fileStorageBackend()) === "sqlite";
+        this.jsonWriterOff = knobEffectiveJsonWriterOff(process.env, fileStorageJsonWriter(), fileStorageUnified()) && storageMode === "full" && !unifiedBlockedByEncryption && writerBackendIsSqlite;
+        if (this.jsonWriterOff && jsonWriterOffChoice === "unset") {
+            baseLog("info", "[storage] json envelope writer off (pure-sqlite default — index.db is the only persistent copy; restore dual-write with storage.jsonWriter=on)");
+        }
+        if (knobJsonWriterOffRequested(process.env, fileStorageJsonWriter()) && !this.jsonWriterOff) {
+            baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires the unified full/sqlite posture on the sqlite backend (shadow/legacy keep the JSON envelope as sole source of truth; network backends keep it as the sync read path)");
         }
         const legacyLoad = recordToLegacyView;
         // #3931 step 3: network backends (mysql) can only open asynchronously
@@ -4310,8 +4321,8 @@ export function storageStatusLabel(): string {
         return `storage: ${mode} requested — blocked by BILI_ENCRYPTION_KEY, running legacy-only`;
     }
     if (mode !== "full") return "storage: shadow (dual-write dry-run → index.db)";
-    return knobResolveJsonWriterOff(process.env, fileStorageJsonWriter()) && !encrypted
-        ? "storage: full (unified-only, json envelope off)"
+    return knobEffectiveJsonWriterOff(process.env, fileStorageJsonWriter(), fileStorageUnified()) && !encrypted
+        ? "storage: sqlite (unified-only, json envelope off)"
         : "storage: full (unified-first reads, dual-write)";
 }
 
