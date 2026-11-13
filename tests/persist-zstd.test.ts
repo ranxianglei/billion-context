@@ -48,31 +48,39 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
 interface Harness {
     dir: string;
     logs: LogLine[];
+
+    /** #6480: explicit dual-write opens the SQLite sidecar in this dir, so a
+     *  lingering store pins index.db and teardown hits Windows EBUSY
+     *  (deterministic since #6480; #2799/#2908 family). Close before rmrf. */
+    stores: SessionStore[];
 }
 
 async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Promise<void> {
     await test(name, async () => {
         const dir = mkdtempSync(join(tmpdir(), "bili-zstd-"));
         const logs: LogLine[] = [];
-        const h = { dir, logs };
+        const h = { dir, logs, stores: [] as SessionStore[] };
         try {
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
+            for (const store of h.stores) store.closeQuietly();
             rmrf(dir);
         }
     });
 }
 
 function newStore(h: Harness, debounceMs = 0): SessionStore {
-    return new SessionStore({
+    const store = new SessionStore({
         dir: h.dir,
         debounceMs,
         enabled: true,
         log: (level, msg) => h.logs.push({ level, msg }),
     });
+    h.stores.push(store);
+    return store;
 }
 
 function filePath(dir: string, id: string): string {
