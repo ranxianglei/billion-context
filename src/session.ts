@@ -713,6 +713,13 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
+    /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
+     *  receipt note has already fired in this session. Once per session, never
+     *  re-nagged: repeating the note after every successful fold drove models
+     *  into an infinite compress→note loop. The same detail stays available on
+     *  demand via acp_status(scope:"uncompressed"). Lost on restart (at most
+     *  one extra note). */
+    uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
      *  full text in the tool result itself — this carrier now only serves

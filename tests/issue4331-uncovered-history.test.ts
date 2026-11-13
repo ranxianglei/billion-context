@@ -252,3 +252,59 @@ test("#4331 unit: describeUncoveredRuns caps the listing and counts the rest", (
     assert.equal(shortTokenCount(1500), "~1.5K");
     assert.equal(shortTokenCount(50000), "~50K");
 });
+
+// #6522: the uncovered-history receipt note must fire at most ONCE per session.
+// Re-emitting it after every subsequent successful fold drove models into an
+// infinite compress→note loop — as the session grows, the newly offered ranges
+// sit INSIDE the big uncovered tail run, so every fold split/shrunk a run and
+// the note re-fired. The note is advisory; the same detail stays available on
+// demand via acp_status(scope:"uncompressed") (read-only, no gate).
+//
+// 50-turn layout — fold 1 covers [0..5, 11..15, 26..35], leaving runs:
+//   R1 = turns 6..10   (m00055..m00089)
+//   R2 = turns 16..25  (m00145..m00224)
+//   R3 = turns 36..48 + turn 49 head (m00325..m00447, tail 49 protected)
+function dualHoleSession(): { ctx: Ctx; fold1: { startRef: string; endRef: string }[]; mid: { startRef: string; endRef: string }; tailBit: { startRef: string; endRef: string }; R1: { startRef: string; endRef: string } } {
+    const ctx = withRefs(makeCtx(buildSession(50, 4000, "bash"), { preserveRecentMessages: 3, preserveRecentTokens: 100 }));
+    const fold1 = [turnSpan(0, 5), turnSpan(11, 15), turnSpan(26, 30), turnSpan(31, 35)];
+    const mid = turnSpan(21, 25); // inside R2
+    const tailBit = turnSpan(36, 40); // inside R3 (the tail run)
+    const R1 = turnSpan(6, 10);
+    setOffer(ctx, fold1.map((r) => offerRange(r.startRef, r.endRef, 45)));
+    return { ctx, fold1, mid, tailBit, R1 };
+}
+
+test("#6522 P1: the note fires on the first fold and stays silent on later successful folds — even when they split an uncovered run", () => {
+    const { ctx, fold1, mid } = dualHoleSession();
+    // Fold 1 (offer exhausted) -> the note fires and latches the session.
+    const out1 = runApply(ctx, foldArgs(fold1));
+    assert.ok(out1.startsWith("[Compressed"), `fold 1: ${out1.slice(0, 160)}`);
+    assert.ok(out1.includes(UNCOVERED_HEADER), "first note expected:\n" + out1);
+    assert.ok(out1.includes("m00055") && out1.includes("m00145"), "hole runs named:\n" + out1);
+    // Fold 2: the model folds a span INSIDE uncovered run R2 (the exact "模型
+    // 无穷压缩" step — the run splits, a span-level "changed set" check would
+    // re-nag here). The latch keeps the receipt quiet.
+    setOffer(ctx, [offerRange(mid.startRef, mid.endRef, 45)]);
+    const out2 = runApply(ctx, foldArgs([mid]));
+    assert.ok(out2.startsWith("[Compressed"), `fold 2: ${out2.slice(0, 160)}`);
+    assert.ok(!out2.includes(UNCOVERED_HEADER), "second fold must not re-nag:\n" + out2);
+    assert.ok(out2.includes(NO_RANGES_REMAIN_TEXT), "plain stop signal expected:\n" + out2);
+});
+
+test("#6522 P2: silence persists across further folds of the uncovered history itself", () => {
+    const { ctx, fold1, tailBit, R1 } = dualHoleSession();
+    const out1 = runApply(ctx, foldArgs(fold1));
+    assert.ok(out1.includes(UNCOVERED_HEADER), "first note expected:\n" + out1);
+    // The model keeps compressing: part of the tail run, then all of R1.
+    // Every one of these successful folds used to re-emit the note.
+    setOffer(ctx, [offerRange(tailBit.startRef, tailBit.endRef, 45)]);
+    const out2 = runApply(ctx, foldArgs([tailBit]));
+    assert.ok(out2.startsWith("[Compressed"), `fold 2: ${out2.slice(0, 160)}`);
+    assert.ok(!out2.includes(UNCOVERED_HEADER), "tail-run fold: quiet:\n" + out2);
+    setOffer(ctx, [offerRange(R1.startRef, R1.endRef, 45)]);
+    const out3 = runApply(ctx, foldArgs([R1]));
+    assert.ok(out3.startsWith("[Compressed"), `fold 3: ${out3.slice(0, 160)}`);
+    assert.ok(!out3.includes(UNCOVERED_HEADER), "R1 fold: quiet:\n" + out3);
+    assert.ok(out3.includes(NO_RANGES_REMAIN_TEXT), "plain stop signal expected:\n" + out3);
+    assert.equal(ctx.session.uncoveredReceiptNoted, true, "latch is a session field");
+});
