@@ -53,6 +53,7 @@ import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -427,7 +428,6 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // above, same event, so there is deliberately NO separate `context`
         // hook here (that seam fired pre-request in older builds and could
         // race the wire; reading this event can't).
-
         if (options.onResponse !== undefined) {
             const onResponse = options.onResponse;
             try {

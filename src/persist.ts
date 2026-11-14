@@ -162,6 +162,21 @@ const STALE_WARN_THROTTLE_MS = 60_000;
  *  with a size change is foreign and forces the full read. */
 const OWN_WRITE_STAMP_EPSILON_MS = 1;
 
+/** #5219: decoded-file-count guards for the #3199 bounded-boot parse window.
+ *  The window's stop condition (candidates ≥ maxSessions AND bytes ≥ maxBytes)
+ *  degenerates when neither term binds: at maxSessions=0 (the sessionWarmMax()
+ *  default) the count term is vacuous and the loop decoded the WHOLE corpus
+ *  pre-listen before the savedAt-desc trim popped every candidate anyway;
+ *  with many small files the byte budget fills one file at a time and does
+ *  the same. Decoded attempts are capped — 0 when nothing survives the trim,
+ *  otherwise a multiple of the warm-set size, clamped so normal corpora never
+ *  hit it (the byte budget stops first there). Files past the cap stay
+ *  lazy-loadable through loadSync; their alias bookkeeping lands in
+ *  scanRemainderInBackground. */
+const BOOT_WINDOW_DECODES_PER_SESSION = 16;
+const BOOT_WINDOW_MIN_DECODES = 64;
+const BOOT_WINDOW_MAX_DECODES = 2048;
+
 interface PersistedSession {
     version: number;
     savedAt: number;
@@ -1044,11 +1059,17 @@ export class SessionStore {
             const parsedFiles = new Set<string>();
             const parsedCands: Array<{ file: string; id: string; meta: PersistedSession["meta"]; savedAt: number; bytes: number }> = [];
             let windowBytes = 0;
+            const decodeCap = limits.maxSessions === 0
+                ? 0
+                : Math.min(BOOT_WINDOW_MAX_DECODES, Math.max(BOOT_WINDOW_MIN_DECODES, limits.maxSessions * BOOT_WINDOW_DECODES_PER_SESSION));
+            let decoded = 0;
             for (const cand of hot) {
+                if (decoded >= decodeCap) break;
                 if (parsedCands.length >= limits.maxSessions && windowBytes >= limits.maxBytes) break;
                 // on-disk size lower-bounds decoded size (#2803) — cheap pre-filter
                 if (cand.size > limits.maxBytes) continue;
                 const parsed = await this.readRawFileWithBytes(cand.file);
+                decoded++;
                 parsedFiles.add(cand.file);
                 if (!parsed) continue;
                 const rec = this.parseBootPayload(parsed.value);
