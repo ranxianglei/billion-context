@@ -242,6 +242,15 @@ export type CompressSettings = {
      *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
      *  string ("75%"). Maps to kernel `nudge.maxContextLimitPct`. */
     maxContextLimit?: number | string;
+    /** Host-side escalation-nudge line: force the tier-1 nudge every turn once
+     *  billed input reaches this fraction of the (output-headroom-adjusted)
+     *  window — filling the cadence-silent climb BELOW `maxContextLimit` seen
+     *  in #453/#14. Previously hardcoded at 0.7 (`EMERGENCY_NUDGE_ESCALATION_PCT`).
+     *  Accepts a ratio (0.7) or percent string ("70%"). Default: 0.7 (unchanged).
+     *  Host-only — never passed to the kernel. If set >= `maxContextLimit` the
+     *  kernel's own pressure branch fires first, so this line never arms. Deepest
+     *  level wins PER FIELD across global → provider → model (#5230). */
+    nudgeEscalationPct?: number | string;
     /** Context usage percentage that triggers emergency truncation of large
      *  tool outputs. Accepts a ratio (0.95) or percent string ("95%"). Must
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
@@ -2550,7 +2559,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // an unknown top-level key that appears here almost certainly belongs one
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
-    "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
+    "modelContextLimit", "maxContextLimit", "nudgeEscalationPct", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
@@ -3269,7 +3278,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) ok = false;
         else (out as Record<string, unknown>)[key] = obj[key];
     };
-    for (const key of ["modelContextLimit", "maxContextLimit", "emergencyThresholdPercent"] as const) {
+    for (const key of ["modelContextLimit", "maxContextLimit", "nudgeEscalationPct", "emergencyThresholdPercent"] as const) {
         if (!(key in obj)) continue;
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
