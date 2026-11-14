@@ -40,30 +40,42 @@ function terminalFromSseFrame(frame: string): TerminalState | null {
 async function observeSseTerminalState(stream: ReadableStream<Uint8Array>): Promise<TerminalState> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const fragments: string[] = [];
+    let trailingCr = "";
+    let trailingLf = "";
     let state: TerminalState = "unknown";
-    const consumeFrames = () => {
+    const consumeFrames = (chunk: string, done = false) => {
+        const normalize = done ? finalizeSseLineEndings : normalizeSseLineEndings;
+        let text = normalize(trailingCr + chunk);
+        trailingCr = text.endsWith("\r") ? "\r" : "";
+        if (trailingCr) text = text.slice(0, -1);
+        text = trailingLf + text;
+        trailingLf = "";
+        let start = 0;
         let boundary: number;
-        while ((boundary = buf.indexOf("\n\n")) >= 0) {
-            const frame = buf.slice(0, boundary);
-            buf = buf.slice(boundary + 2);
-            const next = terminalFromSseFrame(frame);
+        while ((boundary = text.indexOf("\n\n", start)) >= 0) {
+            fragments.push(text.slice(start, boundary));
+            const next = terminalFromSseFrame(fragments.join(""));
+            fragments.length = 0;
+            start = boundary + 2;
             if (next !== null) {
                 state = next;
-                break;
+                return;
             }
         }
+        const residual = text.slice(start);
+        trailingLf = residual.endsWith("\n") ? "\n" : "";
+        const fragment = trailingLf ? residual.slice(0, -1) : residual;
+        if (fragment) fragments.push(fragment);
     };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
-                buf = finalizeSseLineEndings(buf + decoder.decode());
-                consumeFrames();
+                consumeFrames(decoder.decode(), true);
                 break;
             }
-            buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
-            consumeFrames();
+            consumeFrames(decoder.decode(value, { stream: true }));
             if (state !== "unknown") {
                 // Release this tee branch; the client branch keeps draining the source.
                 await reader.cancel().catch(() => {});

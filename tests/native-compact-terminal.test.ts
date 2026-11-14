@@ -41,6 +41,7 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const bodies: string[] = [];
+    const largeCompaction = sse("response.output_item.done", { type: "response.output_item.done", item: { type: "compaction", encrypted_content: "x".repeat(2 << 20) } }).replace(/\n/g, "\r\n");
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -82,6 +83,11 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
                 return;
             }
             res.write(sse("response.created", { type: "response.created", response: { id: "r1" } }));
+            if (mode === "large") {
+                for (let offset = 0; offset < largeCompaction.length; offset += 16 << 10) {
+                    res.write(largeCompaction.slice(offset, offset + (16 << 10)));
+                }
+            }
             res.write(sse("response.completed", { type: "response.completed", response: { id: "r1", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } } }));
             res.end();
         });
@@ -157,6 +163,17 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
         assert.equal(pendingRebase("term-sess"), false, "rebase reconciled on next turn");
         const s1 = listSessions().find((x) => x.meta.label === "term-sess");
         assert.equal(s1?.blockContents.size, 0, "blocks cleared by the rebase");
+
+        const large = await postResponses("/responses?mode=large", {
+            model: "gpt-resp",
+            stream: true,
+            session_id: "term-large",
+            input: [...conversation(), { type: "compaction_trigger" }],
+        });
+        assert.equal(large.status, 200);
+        const largeText = await large.text();
+        assert.ok(largeText.replace(/\r\n/g, "\n").includes(largeCompaction.replace(/\r\n/g, "\n")), "the client receives the complete compaction payload");
+        assert.equal(pendingRebase("term-large"), true, "the observer schedules a rebase after a large fragmented frame");
 
         // 2. Trigger form, SSE failed → NO rebase.
         const r2 = await postResponses("/responses?mode=failed", {
