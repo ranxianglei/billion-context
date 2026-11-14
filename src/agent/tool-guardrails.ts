@@ -74,11 +74,9 @@ export function capToolOutput(
 ): ToolContent | undefined {
     const max = maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
     if (!Number.isFinite(max) || max <= 0) return undefined;
-    const kept: ContentPart[] = [];
     const texts: string[] = [];
     for (const c of content) {
         if (c.type === "text") texts.push(c.text ?? "");
-        else kept.push(c);
     }
     if (texts.length === 0) return undefined;
     const combined = texts.join("\n");
@@ -86,7 +84,29 @@ export function capToolOutput(
     if (total <= max) return undefined;
     const head = keepHead(combined, max);
     const dropped = total - Buffer.byteLength(head, "utf8");
-    kept.push({ type: "text", text: head + buildCapNotice(dropped, max, fullPath) });
+    // Map the shared text prefix back onto its original parts. Grouping all
+    // non-text blocks first moves captions away from their images/resources.
+    const kept: ContentPart[] = [];
+    let textOffset = 0;
+    let lastTextIndex = -1;
+    for (const part of content) {
+        if (part.type !== "text") {
+            kept.push(part);
+            continue;
+        }
+        const text = part.text ?? "";
+        const remaining = head.length - textOffset;
+        if (remaining > 0 || lastTextIndex < 0) {
+            kept.push({ ...part, text: text.slice(0, Math.max(0, remaining)) });
+            lastTextIndex = kept.length - 1;
+        }
+        textOffset += text.length + 1; // The separator used by texts.join("\n").
+    }
+    const lastText = kept[lastTextIndex]!;
+    kept[lastTextIndex] = {
+        ...lastText,
+        text: (lastText.text ?? "") + buildCapNotice(dropped, max, fullPath),
+    };
     return kept;
 }
 
