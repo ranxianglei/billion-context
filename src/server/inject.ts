@@ -9,6 +9,8 @@ import { PROXY_TOOL_NAMES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { renderMemoryToc, resolveMemoryToc, resolveMemoryTocWindow, type BlockTocItem } from "../memory-toc.js";
+import type { CompressionBlock } from "acp-kernel";
 
 export const CODEX_EXEC_EXEMPT_NOTE = " This proxy-provided tool has no functions.exec SDK binding: call it DIRECTLY as a normal tool call using its declared name and namespace. Do not invoke it through tools.* inside functions.exec; the proxy executes the direct call server-side.";
 
@@ -44,6 +46,10 @@ export function injectSystem(
     suppressCompressPrompt = false,
     mcpDialectNote = false,
     generationBoundaryActive = false,
+    /** #memory-toc: session memory TOC (already rendered and gated by the
+     *  caller). Appended LAST so the static compress prompt above stays
+     *  byte-stable between folds — only a new block changes these bytes. */
+    memoryToc?: string,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -64,6 +70,7 @@ export function injectSystem(
     // #5765: block-lifecycle tools ride as a separate appended section only
     // when enabled (default off) — byte-stable like the absorb section.
     if (opts.compress.injectTool && blockOpsEnabled(config)) parts.push(buildBlockOpsSystemPrompt("function"));
+    if (memoryToc !== undefined && memoryToc !== "") parts.push(memoryToc);
     if (parts.length === 0) return parsed.system;
     // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)
     // instead of merging everything into one block via kernel buildSystem.
@@ -131,6 +138,27 @@ export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name
     const missing = wanted.filter((t) => !present.has(t.name));
     if (missing.length === 0) return tools;
     return [...tools, { functionDeclarations: missing as GoogleFunctionDeclaration[] }];
+}
+
+/** #memory-toc: render the session memory index for the system block, or
+ *  `undefined` when the knob is off or the session holds no active blocks.
+ *  Deliberately cheap: block topics/summaries already live in session state,
+ *  and the string only changes when a fold creates or rewrites a block, so the
+ *  prefix cache survives every non-folding turn. */
+export function renderSessionMemoryToc(
+    session: { state: { blocks: readonly BlockTocItem[] } },
+    config: Config,
+    log?: (level: string, msg: string) => void,
+): string | undefined {
+    const compress = (config as { compress?: { memoryToc?: boolean; memoryTocWindow?: number } }).compress;
+    if (!resolveMemoryToc(process.env, compress?.memoryToc)) return undefined;
+    const window = resolveMemoryTocWindow(process.env, compress?.memoryTocWindow);
+    const blocks = session.state.blocks;
+    const toc = renderMemoryToc(blocks, { window });
+    if (toc === null) return undefined;
+    const activeCount = blocks.filter((b) => b.active !== false).length;
+    log?.("info", `[memory-toc] injected ${activeCount} block topic(s) into system context (window=${window > 0 ? window : "all"})`);
+    return toc;
 }
 
 /** When true, the Responses path teaches compression via a text trigger

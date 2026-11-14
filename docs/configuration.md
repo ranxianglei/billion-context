@@ -305,6 +305,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
 | `compress.messageTimestamps` | boolean | true | BILI_MESSAGE_TIMESTAMPS | Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly. |
+| `compress.memoryToc` | boolean | true | BILI_MEMORY_TOC | Inject a compact single-line index of active memory blocks into system context. |
+| `compress.memoryTocWindow` | number | 10 | BILI_MEMORY_TOC_WINDOW | Number of most-recent active blocks rendered in the memory index; older blocks collapse into an overflow notice. |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
@@ -1996,6 +1998,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
+| `BILI_MEMORY_TOC` | `compress.memoryToc` | true |
+| `BILI_MEMORY_TOC_WINDOW` | `compress.memoryTocWindow` | 10 |
 | `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
 | `BILI_MITM` | `mitm.enabled` | true |
 | `BILI_MITM_DOMAINS` | `mitm.domains` | [] |

@@ -314,6 +314,28 @@ entries:
     desc_ja: "圧縮メッセージレコードに不変の壁時計タイムスタンプを付与：ワイヤー上の ACP タグに `time=`、`compress` 受領証に `[start – end]` カバレッジスパン、サマリーに `Occurred` 行。デフォルトで ON：各メッセージに1つの不変な初回表示スタンプが決定論的にレンダリングされるため、再レンダリングされた履歴はバイト安定性を保つ（有効化時の再起動によるプレフィックス書き換えを超えるプロンプトキャッシュコストなし）。`false` に設定すると、#4313 以前のバイトを正確に再現する。"
     site_en: "Message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; ON by default. Set `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS=0 to keep every byte identical to pre-feature master. Env wins when defined (0 forces off, any other value forces on); resolved once per instance — changing the flag needs a restart, and the first restart with the flag on pays one frozen-prefix cache rewrite per active session."
     site_zh: "消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认开启。设 `compress.messageTimestamps: false` 或 env BILI_MESSAGE_TIMESTAMPS=0 可让线上字节与特性前逐字节一致。env 有定义时优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启，开关生效后的首个重启每个活跃会话付一次冻结前缀缓存重写。"
+  - key: compress.memoryToc
+    type: boolean
+    default: "true"
+    env: BILI_MEMORY_TOC
+    group: compress
+    id: ct.mtoc
+    render: compress-row
+    desc_en: "Inject a compact single-line index of active memory blocks into system context."
+    desc_zh: "向系统上下文中注入紧凑的活动内存块单行索引。"
+    site_en: "Inject a compact single-line index of active compression blocks into system context (on by default)."
+    site_zh: "向系统上下文中注入紧凑的活动压缩块单行索引（默认开）。"
+  - key: compress.memoryTocWindow
+    type: number
+    default: "10"
+    env: BILI_MEMORY_TOC_WINDOW
+    group: compress
+    id: ct.mtocw
+    render: compress-row
+    desc_en: "Number of most-recent active blocks rendered in the memory index; older blocks collapse into an overflow notice."
+    desc_zh: "内存索引中渲染的最近活动块数量；更早的块折叠为一条溢出提示。"
+    site_en: "Number of most-recent active blocks rendered in the memory index (default 10). Older blocks collapse into an overflow notice naming the omitted range; search_context continues to reach them. Value <= 0 lists every active block."
+    site_zh: "内存索引中渲染的最近活动块数量（默认 10）。更早的块折叠为标明遗漏范围的溢出提示；search_context 仍可检索它们。值 <= 0 列出全部活动块。"
   - key: compress.rules
     type: boolean
     default: "false"
