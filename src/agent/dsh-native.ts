@@ -53,7 +53,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
 import * as pfChannel from "./pf-channel.js";
-import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
+import { DSH_BUILD_CHECK, emitNewerClientBuildNote, isDshGoHost, walkUpNodeModuleVersion } from "./client-build-note.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
@@ -285,6 +285,7 @@ let nonWebTraceLogged = false;
 // Unverified dsh client build note (#warn): once-per-process, same channel
 // discipline.
 let dshNewerBuildNoted = false; // #4545, once per process
+let dshGoHostNoted = false; // #6588, once per process
 let regAdoptLogged = false;
 
 // #4545 newer-than-tested dsh client-build note (soft, never gates). Shared
@@ -2805,6 +2806,23 @@ export async function apply(ctx: PluginContext): Promise<void> {
             if (emitNewerClientBuildNote(DSH_BUILD_CHECK, found)) dshNewerBuildNoted = true;
         } catch {
             // resolver is fail-open: layout surprises stay silent
+        }
+    }
+
+    // DSH Go host posture (#6588): that host ships its own dsh runtime inside a
+    // proot rootfs and its client is native, so this bundle's web client face
+    // (dsh.client.platform: web — the Context tab and the settings page) has no
+    // surface to render into while the host-side lane is unaffected. One probe,
+    // never a gate; the durable record is the readable one there (the host
+    // exposes at most its last engine log lines elsewhere).
+    if (!dshGoHostNoted) {
+        try {
+            if (isDshGoHost()) {
+                logHostEvent("info", "[dsh-client]", "bili-native-dsh: DSH Go host (third-party Android app) — the plugin's web client face (Context tab, settings page) has no surface in its native client; the host-side lane is unaffected (#6588)");
+                dshGoHostNoted = true;
+            }
+        } catch {
+            // posture probe is fail-open: an odd env stays silent
         }
     }
 
