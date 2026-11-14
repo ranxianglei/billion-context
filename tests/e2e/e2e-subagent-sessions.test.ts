@@ -394,6 +394,11 @@ async function ocRun(
       cwd: ctx.ocCwd,
       env: {
         ...cleanEnv(),
+        // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope
+        // writer OFF, but this lane asserts on the on-disk .json session
+        // file. Pin the writer ON so the envelope this test was written for
+        // is still produced regardless of the storage-mode default.
+        BILI_STORAGE_JSON_WRITER: "on",
         HOME: ctx.homeDir,
         TMPDIR: ctx.tmdir,
         XDG_CONFIG_HOME: ctx.xdg.config,
