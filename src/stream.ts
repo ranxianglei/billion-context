@@ -525,15 +525,15 @@ export function blockCoverageTimes(block: CompressionBlock, state: CompressionSt
     if (!stamps) return null;
     let lo: number | undefined;
     let hi: number | undefined;
-    const covered: Array<{ id: string; ts?: number }> = [];
+    const covered = new Map<string, number | undefined>();
     const consider = (id: string | undefined | null) => {
-        if (!id || covered.some((e) => e.id === id)) return;
-        covered.push({ id, ts: stamps[id] });
+        if (!id || covered.has(id)) return;
+        covered.set(id, stamps[id]);
     };
     for (const id of block.effectiveMessageIds) consider(id);
     consider(block.startRef ? state.messageRefs.byRef[block.startRef] : undefined);
     consider(block.endRef ? state.messageRefs.byRef[block.endRef] : undefined);
-    for (const { ts } of covered) {
+    for (const ts of covered.values()) {
         if (typeof ts !== "number") return null; // never invent / narrow a range
         if (lo === undefined || ts < lo) lo = ts;
         if (hi === undefined || ts > hi) hi = ts;

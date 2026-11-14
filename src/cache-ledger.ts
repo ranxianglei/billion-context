@@ -1280,12 +1280,13 @@ export function getCacheLedger(session: Session): CacheLedger {
     return led;
 }
 
-function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">): void {
+function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">, closeFrom: number): void {
     // Freeze k = samples since each open fold (#1286): samples arrive in
     // order, so at this instant the count equals the batch-path
     // turnsToNextFold window (f.at < s.at <= nextFold.at); requestsAfter
     // keeps growing afterward to the full post-fold total.
-    for (const open of led.folds) {
+    for (let i = closeFrom; i < led.folds.length; i++) {
+        const open = led.folds[i];
         if (open.k === null) open.k = open.requestsAfter;
     }
     led.foldSeqCounter += 1;
@@ -1350,6 +1351,7 @@ function recordFoldRecovery(led: CacheLedger, at: number, S: number, seq: number
 export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
     if (blocks.length === 0) return;
     const led = getCacheLedger(session);
+    let closeFrom = 0;
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
@@ -1361,7 +1363,10 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,
-        });
+        }, closeFrom);
+        // The first new fold closes every older open record. Within this
+        // synchronous batch, only the just-appended record can remain open.
+        closeFrom = led.folds.length - 1;
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
 }
