@@ -3229,6 +3229,17 @@ async function handleRequest(
                     requireRecommendation: preparedCs?.requireRecommendation === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment, so
+                // the receipt may note the uncovered runs once more in this cycle;
+                // folds without a new injection stay silent (anti-nag, #6522 loop).
+                // Only the post-gate delivery fact "injected" resets — the same
+                // fact that mints the nudge credit above; "gated"/"vetoed"/
+                // "skipped" never reached the model and never re-open the note.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
