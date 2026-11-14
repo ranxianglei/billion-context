@@ -296,8 +296,16 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  reply. Floor the reduction target at min(OUTPUT_CLAMP_MIN_OUTPUT, window - input)
  *  — always <= window - input, so input+output can never exceed the window
  *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
- *  stays byte-identical. */
-export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number): number | undefined {
+ *  stays byte-identical.
+ *  #5596: `skipSafetyInflation` — set when the planning basis is NOT a token
+ *  estimate of what will actually be sent but an over-counting high-water
+ *  proxy of host-side scale (the dsh ledger floor: bytes/4, which reads ~18%
+ *  above dsh's own tokenizer in the field). The #5278 safe pass inflates a
+ *  systematically LOW local estimator; on an already-over-counting proxy it
+ *  double-counts and, near the window, slams the clamp into the 4096
+ *  capability-floor plateau (the #5596 field lane: 4096 where the raw formula
+ *  gives ~28K). Absent → the #5278 two-pass behavior, byte-identical. */
+export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number, skipSafetyInflation?: boolean): number | undefined {
     const ceilingBound = typeof knownOutputCeiling === "number" && Number.isFinite(knownOutputCeiling) ? knownOutputCeiling : Number.POSITIVE_INFINITY;
     const clampFor = (est: number): number | undefined => {
         const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(est * OUTPUT_CLAMP_MARGIN_PCT));
@@ -323,6 +331,10 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
         if (clamped >= requested) return undefined;
         return clamped;
     };
+    // #5596: the planning basis is already an over-counting high-water proxy
+    // (the dsh ledger floor) — the #5278 safe pass would double-count it.
+    // See the function doc for the field numbers.
+    if (skipSafetyInflation) return clampFor(inputEstimate);
     // #5278: judge on the safety-inflated estimate so a systematically low estimator
     // cannot eat the margin (see OUTPUT_CLAMP_ESTIMATE_SAFETY).
     const safe = clampFor(Math.ceil(inputEstimate * OUTPUT_CLAMP_ESTIMATE_SAFETY));
@@ -341,15 +353,15 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
  *  planning basis. bytes/4 mirrors the default estimator's chars/4 caliber
  *  (the replay is JSON text riding the same wires). 0 when nothing was
  *  recorded — legacy behavior.
- *  STICKY BY DESIGN: the guard records a high-water mark and nothing decays
- *  or clears it while the session lives. While compaction stays refused the
- *  raw ledger only grows (refused checkpoints never land), so the max bounds
- *  every future re-send; decaying the floor would re-open the #2490 kill
- *  chain. Lifetime ends with the session (metadata eviction). Known
- *  conservative residue: if a checkpoint lands anyway (direct-bypass path;
- *  the #2028 opt-out was removed, #3666) and shrinks the ledger, the floor
- *  stays at its old high until eviction — fail-closed over-tightening,
- *  accepted.
+ *  STICKY WHILE REFUSED: the guard records a high-water mark and nothing
+ *  decays it while compaction stays refused — the raw ledger only grows
+ *  then (refused checkpoints never land), so the max bounds every future
+ *  re-send; decaying the floor would re-open the #2490 kill chain. Two
+ *  things end a floor early: an AUTHORED checkpoint landing deletes the key
+ *  outright (#5596: the landed checkpoint resets dsh's raw ledger, so the
+ *  old high-water would keep planning output budget against bytes dsh will
+ *  never count again — the field lane sat clamped at 4096 behind an 866KB
+ *  envelope), and session eviction (metadata lifetime) as before.
  *  Note (#3384): recording stays sticky; what changed is APPLICATION — the
  *  clamp gates where this floor may drive planning (see clampOutgoingOutput),
  *  so a stale high-water mark can no longer starve a healthy session. */
@@ -532,7 +544,14 @@ export function clampOutgoingOutput(
     const viewAtEnforcedTarget = typeof ctx.headroomWindow === "number" && Number.isFinite(ctx.headroomWindow) && ctx.headroomWindow > 0 && inputEstimate >= ctx.headroomWindow;
     const giantRequestedBudget = ctx.nativeWindow > 0 && raw >= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT * ctx.nativeWindow;
     const planningInput = viewAtEnforcedTarget || giantRequestedBudget ? Math.max(inputEstimate, ledgerFloor) : inputEstimate;
-    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling);
+    // #5596: when the ledger floor IS the planning basis (the #3384 gate fired
+    // AND it is strictly above the folded estimate), it is a bytes/4 high-water
+    // proxy that already over-counts the host's own tokenizer — skip the #5278
+    // ×1.12 safe pass there. Gate OFF the floor never plans, so the est-driven
+    // path keeps the safe pass byte-identical — a sticky floor above the est
+    // must not strip #5278's under-estimator protection from the folded view.
+    const floorDrivesPlanning = (viewAtEnforcedTarget || giantRequestedBudget) && ledgerFloor > inputEstimate;
+    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling, floorDrivesPlanning);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
         // #2096: in the band (headroom target, native window) the clamp can only
@@ -540,7 +559,7 @@ export function clampOutgoingOutput(
         // the input back under the enforced target. Say so instead of advertising
         // rescue right before the turn dies.
         const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
-        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${floorDrivesPlanning ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
         onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
     }
 }
