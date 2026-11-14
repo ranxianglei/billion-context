@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, validateMsgIds } from "../src/msgid-pin.js";
 import { collectRequestIds } from "../src/request-membership.js";
 import { PF_SLOT_UNKNOWN, pfCaptureIds, pfLearnStamp, pfRequestHeaders } from "../src/agent/pf-channel.js";
-import { _hostMsgIdsOfForTest, _pfSlotIdsOfForTest } from "../src/agent/dsh-native.js";
+import { ENVELOPE_MSG_IDS_FIELD, _hostMsgIdsOfForTest, _pfSlotIdsOfForTest } from "../src/agent/dsh-native.js";
 import { _screenMsgIdsForTest } from "../src/agent/incremental-client.js";
 import { _parseTailIdsForTest } from "../src/server/fastpath.js";
 
@@ -145,6 +145,14 @@ test("pf-channel end-to-end screening via the public handshake API (#5826 parity
     assert.deepEqual(pfRoundTrip(2, [GOOD, GOOD]), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "%3F" }, "duplicate second slot screens to ?");
     assert.deepEqual(pfRoundTrip(3, LONG_LIST), { "x-bili-pf-count": "3" }, "MAX_IDS (2048) cap degrades to count-only");
     assert.deepEqual(pfRoundTrip(3, "not-an-array"), { "x-bili-pf-count": "3" }, "failed resolution clears stored list (honest absence beats stale)");
+});
+
+test("dsh envelope body field == server MSG_IDS_BODY_FIELD (structural mirror, review n2)", () => {
+    // The host bundle mirrors the server's field name (it cannot import
+    // server modules); if either side renames biliMsgIds the dsh full-resend
+    // envelope would silently stop being consumed. This pin makes the drift
+    // a CI failure instead of a one-time "pin rejected" warn.
+    assert.equal(ENVELOPE_MSG_IDS_FIELD, MSG_IDS_BODY_FIELD);
 });
 
 test("watermark wire encode/decode contract: %2C inside ids, literal commas separate (#5826 parity)", () => {

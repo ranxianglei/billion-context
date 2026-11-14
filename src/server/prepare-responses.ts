@@ -305,6 +305,11 @@ export async function prepareResponses(
         // + kernel-input assembly (src/snapshot/stage0.ts — the SAME helper
         // as the openai lane, same red gate). Before processTurn, so an R3
         // FoundationRejectError carries zero kernel side effects.
+        // #6564 note: the responses-wire pin that #6564 added inline here is
+        // SUBSUMED by runStage0 (same validateMsgIds+applyMsgIdPin under the
+        // pluginLaneServerHistory gate); the pinned `msgs` flows through
+        // `renderMsgs = s0.kernelInput ?? maybeSnapshotView(session, msgs, …)`
+        // below to the kernel/store. No double-pin.
         const s0 = runStage0({
             sessionId,
             lane: "responses",
