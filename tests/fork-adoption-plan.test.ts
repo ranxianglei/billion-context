@@ -79,6 +79,9 @@ test("resume adoption never writes the kernel BLOCKED sentinel into byRef (#2620
             messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
         },
         blockContents: new Map(),
+        // Session metadata is a required field (persist assigns it on every load);
+        // applyForkAdoption writes the #5519 ladder-init flag into it.
+        metadata: {},
     } as unknown as Session;
     const plan = planForkAdoption(parent, new Set(["p1", "p2", "r1"]), { seedAllRefs: true, includeBlocks: false });
     assert.equal(plan.refs.byRaw.p1, BLOCKED_REF, "plan carries the sentinel in byRaw");
@@ -144,7 +147,7 @@ test("fork adoption deep-copies adopted blocks: mutating the child never leaks i
     _setStoreForTest(new SessionStore({ enabled: false }));
     const parent = retainedParent([retainedBlock()]);
     parent.state = syncBlocks([{ id: "side", role: "user", contentType: "text", text: "short view" }], parent.state).state;
-    const child = { state: createInitialState(), blockContents: new Map() } as unknown as Session;
+    const child = { state: createInitialState(), blockContents: new Map(), metadata: {} } as unknown as Session;
     const plan = planForkAdoption(parent, new Set(["raw1", "raw2"]));
     applyForkAdoption(child, plan, parent);
     assert.equal(child.state.blocks.length, 1);

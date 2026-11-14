@@ -24,6 +24,18 @@ import { noCacheControl as knobNoCacheControl } from "../knobs.js";
  * the LCP. Cap = 3 message marks + 1 system breakpoint = Anthropic's 4-block
  * limit.
  *
+ * #5519 fork exception to "accumulate from zero": a session that just
+ * adopted its parent's compression state (applyForkAdoption arms
+ * metadata.cacheMarkLadderInitPending) has NO mark history of its own, but
+ * its stable region already runs hundreds of messages long — the plain
+ * single-tail push would leave its first turns one anchor deep while most of
+ * the shared prefix sits behind no cached segment at all. The child has sent
+ * nothing under its own identity yet, so its INITIAL layout owes no
+ * byte-stability debt: the first mark pass seeds the full ladder across the
+ * stable region (tail + half + quarter) instead of the single tail, then
+ * hands back to the sticky cumulative dynamics above unchanged (from turn 2
+ * on, marks are frozen at the cap exactly like any other session).
+ *
  * Client-managed caching wins: any pre-existing cache_control (harvested
  * from the client's messages, present on system blocks, or on tools entries —
  * the 4-breakpoint budget counts all three) suppresses our stamps entirely
@@ -53,9 +65,27 @@ export function computeAnthropicMessageMarks(
     // Retire marks whose messages folded away; keep the survivors' order.
     const kept = ((session.metadata["anthropicCacheMarkIds"] as string[] | undefined) ?? []).filter((id) => liveIds.has(id));
     const lastIndex = processed.length - 1 - ephemeralTailCount;
-    const currentId = processed[lastIndex]?.id;
-    if (typeof currentId === "string" && currentId.length > 0 && !kept.includes(currentId) && kept.length < MESSAGE_MARK_CAP) {
-        kept.push(currentId);
+    // #5519: one-shot ladder seed for a freshly adopted fork/resume. The flag
+    // is consumed by every pass that reaches this point (seeded or not), so
+    // no later turn re-lays-out mid-history. A client-managed or too-short
+    // FIRST turn never reaches this point and leaves the flag pending — safe:
+    // the seed is a first-appearance layout, not a rewrite of stamped bytes.
+    const ladderInitPending = session.metadata["cacheMarkLadderInitPending"] === true;
+    delete session.metadata["cacheMarkLadderInitPending"];
+    if (ladderInitPending && kept.length === 0 && lastIndex >= 3) {
+        // Tail + half + quarter of the stable region: three anchors spanning
+        // what is already cached-worthy, deepest last so the list stays in
+        // positional order like the steady-state accumulator produces.
+        for (const frac of [0.25, 0.5, 1]) {
+            const at = Math.floor(lastIndex * frac);
+            const id = processed[at]?.id;
+            if (typeof id === "string" && id.length > 0 && !kept.includes(id)) kept.push(id);
+        }
+    } else {
+        const currentId = processed[lastIndex]?.id;
+        if (typeof currentId === "string" && currentId.length > 0 && !kept.includes(currentId) && kept.length < MESSAGE_MARK_CAP) {
+            kept.push(currentId);
+        }
     }
     session.metadata["anthropicCacheMarkIds"] = kept;
     for (const id of kept) marks.set(id, { type: "ephemeral" });

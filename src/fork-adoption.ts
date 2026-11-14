@@ -319,6 +319,15 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     if (parent.state.timestampsHighWaterRefSeq !== undefined) {
         session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
     }
+    // #5519: the parent's Anthropic cache-breakpoint ledger (metadata
+    // .anthropicCacheMarkIds) is NOT carried over — the parent's positions are
+    // stale relative to the child's own view, and inheriting a full cap would
+    // block the child's tail push. Instead arm the one-shot ladder init: the
+    // child's FIRST anthropic-owned mark pass lays out its full CAP ladder
+    // across its own stable region (tail + half + quarter), where the plain
+    // single-tail push would leave most of the shared prefix behind no cached
+    // segment at all (#5519).
+    session.metadata["cacheMarkLadderInitPending"] = true;
     markDirty(session);
 }
 
