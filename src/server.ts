@@ -374,12 +374,17 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     const budgetMs = requestWatchdogBudgetMs();
     if (!Number.isFinite(budgetMs) || budgetMs <= 0) return; // operator opted out
     const startedAt = Date.now();
+    let lastWriteAt = startedAt;
     let timer: NodeJS.Timeout | undefined;
     const fire = (): void => {
         timer = undefined;
         if (res.writableEnded || res.destroyed || !res.socket || res.socket.destroyed) return;
-        const secs = Math.round((Date.now() - startedAt) / 1000);
-        log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} produced no output for ${secs}s (idle budget ${Math.round(budgetMs / 1000)}s) — closing the request so the client can fail fast instead of hanging forever`);
+        const idleSecs = Math.round((Date.now() - lastWriteAt) / 1000);
+        const ageSecs = Math.round((Date.now() - startedAt) / 1000);
+        const ct = res.getHeader("content-type");
+        const ctStr = ct ? String(ct).split(";")[0].trim() : "none";
+        const bytes = res.socket ? res.socket.bytesWritten : 0;
+        log("error", `[watchdog] ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} stall-abort idle=${idleSecs}s age=${ageSecs}s budget=${Math.round(budgetMs / 1000)}s upstreamCt=${ctStr} bytes=${bytes} — closing the request so the client can fail fast instead of hanging forever`);
         requestAborts.get(res)?.abort();
         try {
             if (!res.headersSent) {
@@ -399,8 +404,15 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     // patch is transparent to backpressure (returns the same boolean) and works
     // with any write signature (string/Buffer/Uint8Array, encoding, callback).
     const origWrite = res.write.bind(res);
+    // #6534: expose the pre-watchdog write so the stream keepalive (#1647) can
+    // emit its SSE comment pings WITHOUT re-arming this idle timer. A keepalive
+    // ping is not upstream progress — re-arming on it would let a truly stalled
+    // stream hold the client forever (the keepalive's ~10s cadence always beats
+    // the idle budget, so fire() never runs).
+    (res as unknown as { __biliOriginalWrite?: typeof origWrite }).__biliOriginalWrite = origWrite;
     res.write = ((...args: Parameters<typeof origWrite>) => {
         arm();
+        lastWriteAt = Date.now();
         requestWatchdogRearmCount += 1;
         return origWrite(...args);
     }) as typeof res.write;
@@ -3508,7 +3520,21 @@ export function beginStreamKeepalive(res: http.ServerResponse, sid: string, log:
             // skips — effective cadence ≈ 2×interval. Harmless vs the 300s
             // budget; noted here so the 2× isn't mistaken for a bug.)
             if (anyRes.__biliKeepaliveBoundary === false) return;
-            res.write(": bili-keepalive\n\n");
+            // #6534: emit the ping through the PRE-watchdog write so it does not
+            // re-arm the idle request watchdog. A keepalive ping is not upstream
+            // progress; routing it through res.write (which the watchdog patched
+            // to re-arm on every write) let a truly stalled stream hold the
+            // client forever — the ~10s ping cadence always beat the idle
+            // budget, so fire() never ran. Fall back to res.write when the
+            // watchdog never armed (it stores the original only when active).
+            // The comment is a complete line, so the boundary flips to true.
+            const anyRes2 = res as unknown as { __biliOriginalWrite?: typeof res.write };
+            if (anyRes2.__biliOriginalWrite) {
+                anyRes.__biliKeepaliveBoundary = true;
+                anyRes2.__biliOriginalWrite(": bili-keepalive\n\n");
+            } else {
+                res.write(": bili-keepalive\n\n");
+            }
             if (!warned) {
                 warned = true;
                 log("info", `[${sid}] stream silent ${idleMs}ms — holding client with SSE keep-alive comments past its undici body timeout (#1647)`);
