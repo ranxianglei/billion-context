@@ -12,7 +12,7 @@ import {
     collectModelWindows,
     type ClientConfig,
 } from "../src/client-config.ts";
-import { parseLauncherModelWindows, anthropicBetaContextWindow } from "../src/server.ts";
+import { parseLauncherModelWindows, anthropicBetaContextWindow, anthropicBetaMessageThreads } from "../src/server.ts";
 import { MAX_ANTHROPIC_BETA_WINDOW } from "../src/server/context-window.ts";
 
 test("parseOmpYaml: captures per-model contextWindow (models after baseUrl)", () => {
@@ -221,6 +221,13 @@ test("parseLauncherModelWindows: valid JSON, invalid input, non-numeric filtered
 // 1M window with the upstream — the model table's 200K default must be
 // overridden. The parser is per-request (the header may appear/disappear
 // between requests of the same session).
+
+test("#6088 anthropicBetaMessageThreads: detects the message-threads beta among others", () => {
+    assert.equal(anthropicBetaMessageThreads({ "anthropic-beta": "oauth-2025-04-20, message-threads-2026-08-12" }), true);
+    assert.equal(anthropicBetaMessageThreads({ "anthropic-beta": ["context-1m-2025-08-07", "message-threads-2026-08-12"] }), true);
+    assert.equal(anthropicBetaMessageThreads({ "anthropic-beta": "context-1m-2025-08-07" }), false);
+    assert.equal(anthropicBetaMessageThreads({}), false);
+});
 
 test("anthropicBetaContextWindow: context-1m beta → 1,000,000", () => {
     assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1m-2025-08-07" }), 1_000_000);

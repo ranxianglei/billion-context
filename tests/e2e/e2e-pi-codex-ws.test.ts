@@ -32,7 +32,7 @@ process.env.NODE_ENV = "test";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const TMO = Number(process.env.E2E_TMO ?? 180_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
@@ -52,7 +52,7 @@ function piAvailable(): boolean {
 const skipReason = !run
     ? "set ACP_TEST_E2E_PI_WS=1 (real pi + local mock WS upstream; deterministic, zero tokens)"
     : !fs.existsSync(PI_NATIVE_ENTRY)
-        ? "dist/agent/pi-native.js missing — run `npm run build` first"
+        ? "dist/agent/billion-context.js missing — run `npm run build` first"
         : !piAvailable()
             ? `pi binary "${PI_BIN}" not found on PATH`
             : undefined;
@@ -342,6 +342,12 @@ function piRun(
             cwd: ctx.piCwd,
             env: {
                 ...cleanEnv(opts.extraEnv),
+                // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON
+                // envelope writer OFF, but this lane asserts on the on-disk
+                // .json session file. Pin the writer ON so the envelope this
+                // test was written for is still produced regardless of the
+                // storage-mode default.
+                BILI_STORAGE_JSON_WRITER: "on",
                 PI_CODING_AGENT_DIR: ctx.piAgentDir,
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,
