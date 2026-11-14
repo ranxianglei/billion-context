@@ -1633,8 +1633,16 @@ const MESSAGE_PREVIEW_CHARS = 110;
 
 function messagePreview(text: string): string {
     const flat = text.replace(/\s+/g, " ").trim();
-    const chars = Array.from(flat);
-    return chars.length > MESSAGE_PREVIEW_CHARS ? chars.slice(0, MESSAGE_PREVIEW_CHARS).join("") + "…" : flat;
+    // A tool result can be megabytes long; only walk the displayed code points
+    // instead of allocating an array containing every character of the result.
+    let end = 0;
+    let count = 0;
+    for (const char of flat) {
+        if (count === MESSAGE_PREVIEW_CHARS) return flat.slice(0, end) + "…";
+        end += char.length;
+        count++;
+    }
+    return flat;
 }
 
 /** A frozen full-view snapshot (collectBlockContent) renders each original
