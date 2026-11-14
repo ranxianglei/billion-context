@@ -1087,11 +1087,18 @@ export function truncatedUpstreamOf(session: Session): { at: number; protocol: s
 /** Stamp a pending aborted-turn re-anchor; call from the plugin pipe's
  *  client-abort path AFTER settleUsage has landed whatever the interrupted
  *  stream reported (the request's input size — the partial output itself
- *  never reports). A zero/unknown meter carries no information: skip. */
+ *  never reports). A zero/unknown meter carries no information: skip. An
+ *  ESTIMATE-grade/unprovenanced meter carries FALSE information (#5500
+ *  family): a char-bound arm would delay the re-anchor ~4x — the absorb
+ *  never sees the calibrated meter cross it — and #5415 would bank phantom
+ *  growth debt (anchor − reference) into the nudge cadence, so those are
+ *  skipped too. */
 export function noteAbortedTurn(session: Session): void {
-    if (!Number.isFinite(session.stats.lastInputTokens) || session.stats.lastInputTokens <= 0) return;
+    const st = session.stats;
+    const trustworthy = st.lastInputTokensSource === "usage" || st.lastInputTokensSource === "overflow-arm";
+    if (!trustworthy || !Number.isFinite(st.lastInputTokens) || st.lastInputTokens <= 0) return;
     session.transient ??= {};
-    session.transient.abortReanchor = { anchor: session.stats.lastInputTokens, at: Date.now() };
+    session.transient.abortReanchor = { anchor: st.lastInputTokens, at: Date.now() };
 }
 
 /** Consume a pending aborted-turn re-anchor if — and only if — the meter has
