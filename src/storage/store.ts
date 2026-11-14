@@ -2124,8 +2124,9 @@ export class UnifiedStore {
      *  a crash mid-append leaves at most one truncated line which the
      *  restore reader skips), then swept with the deleteSession refcount
      *  discipline. Unlike deleteSession the sessions row survives as a
-     *  tombstone (status 'archived', label intact — the web list keeps
-     *  showing it) and the conversations identity binding survives (identity
+     *  tombstone (status 'archived', label intact, runtime payload columns
+     *  reset to schema defaults — #4991; the web list keeps showing it) and
+     *  the conversations identity binding survives (identity
      *  is forever; a restore must land on the same session id). Pinned
      *  checkpoints keep their rows + refs. Idempotent: an already-archived
      *  session is a no-op returning the log path. */
@@ -2192,7 +2193,15 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
-            this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
+            // #4991: the row bodies are gone — reset the runtime payload
+            // columns to their schema defaults so the tombstone stops
+            // carrying the pre-archive state (field: 30.3 MiB of dead
+            // kstate/meta/tail/stats across 161 archived sessions). Restore
+            // is unaffected: the archive line carries the full pre-wipe row
+            // (`session: row` above) and restoreArchived re-inserts it
+            // verbatim. The id counters (next_block_id/next_run_id/
+            // last_ingested_seq) stay intact — they must never be re-issued.
+            this.db.prepare("UPDATE sessions SET status = 'archived', meta_json = '{}', stats_json = '{}', metadata_json = '{}', kstate_json = '{}', tail_json = '{}', ccr_json = NULL, orphans_json = NULL WHERE session_id = ?").run(sessionId);
             for (const hash of rel) this.releaseContent(hash);
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
@@ -2460,7 +2469,7 @@ export class UnifiedStore {
      *  freelist back without the rewrite, but only on a file whose header
      *  says auto_vacuum=INCREMENTAL (see storagePragmas); on a file created
      *  with auto_vacuum=0 it is a no-op until one full VACUUM converts it. */
-    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number; skipped: number } {
         // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
         // write lock with no intermediate progress. Running it against a db that
         // another live process is writing starves that process until its storage
@@ -2476,6 +2485,7 @@ export class UnifiedStore {
         }
         const now = opts.now ?? Date.now();
         let archived = 0;
+        let skipped = 0;
         let contentRowsDeleted = 0;
         if (opts.archiveAfterDays > 0) {
             const cutoff = now - opts.archiveAfterDays * 86_400_000;
@@ -2483,6 +2493,14 @@ export class UnifiedStore {
             for (const s of stale) {
                 const r = this.archiveSession(s.session_id, { archiveDir: opts.archiveDir });
                 if (r.ok) archived++;
+                // #4991: a soft failure used to vanish here — the sweep
+                // reported success-only counts and exit 0. A stale candidate
+                // that did not archive (e.g. concurrently deleted between
+                // select and sweep) is counted and logged, not swallowed.
+                else {
+                    skipped++;
+                    loggerLog("warn", `[#4991] gc: ${s.session_id} skipped — archiveSession: ${r.reason ?? "unknown"}`);
+                }
                 if (r.contentRowsDeleted) contentRowsDeleted += r.contentRowsDeleted;
             }
         }
@@ -2508,7 +2526,7 @@ export class UnifiedStore {
         } else if (opts.vacuum === "incremental") {
             this.vacuum("incremental");
         }
-        return { archived, contentRowsDeleted };
+        return { archived, contentRowsDeleted, skipped };
     }
 
     /** #4796: batched zero-ref CAS collection — the working half of the fix

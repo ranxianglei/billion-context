@@ -913,8 +913,8 @@ export class UnifiedShadow {
         return this.sync.backupInto(dstPath);
     }
 
-    gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
-        if (this.sync === null) return { archived: 0, contentRowsDeleted: 0 };
+    gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number; skipped: number } {
+        if (this.sync === null) return { archived: 0, contentRowsDeleted: 0, skipped: 0 };
         return this.sync.gc(opts);
     }
 
@@ -1373,8 +1373,8 @@ export class UnifiedShadow {
         return this.viaAsync(false, () => this.deleteCheckpoint(cpId), () => this.backend!.deleteCheckpoint(cpId));
     }
 
-    gcAsync(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number }> {
-        return this.viaAsync({ archived: 0, contentRowsDeleted: 0 }, () => this.gc(opts), () => this.enqueue(() => this.backend!.gc(opts)));
+    gcAsync(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number; skipped: number }> {
+        return this.viaAsync({ archived: 0, contentRowsDeleted: 0, skipped: 0 }, () => this.gc(opts), () => this.enqueue(() => this.backend!.gc(opts)));
     }
 
     restoreArchivedAsync(sessionId: string, opts: { archiveDir: string }): Promise<{ ok: boolean; reason?: string }> {

@@ -191,8 +191,8 @@ class StubMysqlBackend implements StorageBackend {
     restoreArchived(): Promise<{ ok: boolean; reason?: string }> {
         return Promise.resolve({ ok: false, reason: "stub" });
     }
-    gc(): Promise<{ archived: number; contentRowsDeleted: number }> {
-        return Promise.resolve({ archived: 0, contentRowsDeleted: 0 });
+    gc(): Promise<{ archived: number; contentRowsDeleted: number; skipped: number }> {
+        return Promise.resolve({ archived: 0, contentRowsDeleted: 0, skipped: 0 });
     }
     contentRefCountOfBody(): Promise<number> {
         return Promise.resolve(0);

@@ -2309,7 +2309,7 @@ export class SessionStore {
      *  collection + optional vacuum) through the live sidecar. Returns null
      *  when the unified store is unavailable (legacy-only lanes). The
      *  archive dir defaults to <sessions>/archive next to the envelopes. */
-    unifiedGc(opts: { archiveAfterDays?: number; vacuum?: "full" | "incremental"; archiveDir?: string } = {}): { archived: number; contentRowsDeleted: number } | null {
+    unifiedGc(opts: { archiveAfterDays?: number; vacuum?: "full" | "incremental"; archiveDir?: string } = {}): { archived: number; contentRowsDeleted: number; skipped: number } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             const days = opts.archiveAfterDays ?? resolveArchiveAfterDays(undefined, fileStorageArchiveAfterDays());

@@ -1821,7 +1821,10 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
-            await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
+            // #4991: sqlite twin — reset the runtime payload columns to
+            // their schema defaults (restore round-trips from the archive
+            // line's full pre-wipe row; id counters stay intact).
+            await c.query("UPDATE sessions SET status = 'archived', meta_json = '{}', stats_json = '{}', metadata_json = '{}', kstate_json = '{}', tail_json = '{}', ccr_json = NULL, orphans_json = NULL WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
@@ -1982,9 +1985,10 @@ export class MysqlBackend implements StorageBackend {
         return { ok: true };
     }
 
-    async gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number }> {
+    async gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number; skipped: number }> {
         const now = opts.now ?? Date.now();
         let archived = 0;
+        let skipped = 0;
         let contentRowsDeleted = 0;
         if (opts.archiveAfterDays > 0) {
             const cutoff = now - opts.archiveAfterDays * 86_400_000;
@@ -1995,6 +1999,12 @@ export class MysqlBackend implements StorageBackend {
             for (const s of stale) {
                 const r = await this.archiveSession(str(s.session_id), { archiveDir: opts.archiveDir });
                 if (r.ok) archived++;
+                // #4991: sqlite twin — a soft failure is counted and logged,
+                // never swallowed into a success-only report.
+                else {
+                    skipped++;
+                    loggerLog("warn", `[#4991] gc: ${str(s.session_id)} skipped — archiveSession: ${r.reason ?? "unknown"}`);
+                }
                 if (r.contentRowsDeleted) contentRowsDeleted += r.contentRowsDeleted;
             }
         }
@@ -2009,7 +2019,7 @@ export class MysqlBackend implements StorageBackend {
             await this.pool.query("OPTIMIZE TABLE messages");
             await this.pool.query("OPTIMIZE TABLE content");
         }
-        return { archived, contentRowsDeleted };
+        return { archived, contentRowsDeleted, skipped };
     }
 
     /** #4796: batched zero-ref CAS collection — mysql counterpart of
