@@ -114,7 +114,15 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.deepEqual(lost, [], `regression: lost ${lost.join(", ")}`);
     const after = coveredMessageIds(res.state);
     for (const id of toolIds) assert.ok(after.has(id), `${id} must stay covered`);
-    assert.equal(computeIntegrityWithdrawals(messages, after).withdrawn.size, 0);
+    const nfIds = new Set(
+      Object.entries(res.state.messageRefs.byRaw)
+        .filter(([, ref]) => ref === "BLOCKED")
+        .map(([id]) => id),
+    );
+    assert.equal(
+      computeIntegrityWithdrawals(messages, after, undefined, undefined, nfIds).withdrawn.size,
+      0,
+    );
   });
 
   it("parallel-tail cut: merging b1..b2 keeps both Read/Bash pairs folded", () => {
@@ -132,7 +140,15 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.deepEqual(lost, [], `regression: lost ${lost.join(", ")}`);
     const after = coveredMessageIds(res.state);
     for (const id of toolIds) assert.ok(after.has(id), `${id} must stay covered`);
-    assert.equal(computeIntegrityWithdrawals(messages, after).withdrawn.size, 0);
+    const nfIds = new Set(
+      Object.entries(res.state.messageRefs.byRaw)
+        .filter(([, ref]) => ref === "BLOCKED")
+        .map(([id]) => id),
+    );
+    assert.equal(
+      computeIntegrityWithdrawals(messages, after, undefined, undefined, nfIds).withdrawn.size,
+      0,
+    );
   });
 
   // b2 covers ONLY the call half of the Read pair — its tail cut mid-tool-group.

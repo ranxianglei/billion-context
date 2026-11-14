@@ -448,11 +448,25 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     // kept-visible and cannot strand its turn's reasoning (#564 reverse-split
     // residue, billion-context#5531). Merges already model post-fold coverage
     // through foldedRef ∪ survivingCoverage and stay untouched.
+    // #6709: on a merge, ids that can NEVER fold (BLOCKED ref) must not block
+    // the integrity gate — they are already visible and their turn-mates are
+    // already covered, so the merge does not change the model's view. Without
+    // this, a session with even one BLOCKED message in a covered turn
+    // dead-locks EVERY merge that touches that turn (the reported 6,115
+    // BLOCKED messages / 67% context-watermark case).
+    let neverFoldableIds: Set<string> | undefined;
+    if (isMerge) {
+      neverFoldableIds = new Set<string>();
+      for (const [id, ref] of Object.entries(input.state.messageRefs.byRaw)) {
+        if (ref === "BLOCKED") neverFoldableIds.add(id);
+      }
+    }
     const initial = computeIntegrityWithdrawals(
       input.messages,
       foldedRef,
       shared?.integrityPre,
       isMerge ? undefined : input.preExistingCoverage,
+      neverFoldableIds,
     );
     splitTurnCount = initial.splitTurnCount;
     splitPairCount = initial.splitPairCount;
@@ -508,6 +522,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
             input.messages,
             recheck,
             shared?.integrityPre,
+            undefined,
+            neverFoldableIds,
           ).withdrawn;
         }
         if (stuck || current.size > 0) {
@@ -620,6 +636,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
                   input.messages,
                   check,
                   shared?.integrityPre,
+                  undefined,
+                  neverFoldableIds,
                 ).withdrawn;
                 if (w.size === 0) {
                   clean = true;

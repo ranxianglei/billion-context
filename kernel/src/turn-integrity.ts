@@ -194,12 +194,23 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
  * residue grows monotonically until nothing left is big enough to fold
  * (billion-context#5531). Omit the parameter for the legacy model where
  * everything not folded reads as visible.
+ *
+ * `neverFoldableIds` (#6709): ids that can NEVER fold (BLOCKED ref,
+ * unrecoverable media, protected tool). Unlike `invisibleIds` these are
+ * still VISIBLE (full body in the wire) — they simply can never enter
+ * coverage. A merge that covers their turn-mates would otherwise be
+ * dead-locked: the turn can never close, the gate withdraws it, and every
+ * retry re-fails identically. Passing them here lets the merge proceed —
+ * the model's view is unchanged (the member was already visible and its
+ * turn-mates were already covered), so no new wire inconsistency is
+ * introduced.
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
   foldedIds: ReadonlySet<string>,
   pre?: IntegrityPre,
   invisibleIds?: ReadonlySet<string>,
+  neverFoldableIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
@@ -227,7 +238,8 @@ export function computeIntegrityWithdrawals(
         (id) =>
           !remaining.has(id) &&
           callIds.has(id) &&
-          !invisibleIds?.has(id),
+          !invisibleIds?.has(id) &&
+          !neverFoldableIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);
@@ -243,6 +255,15 @@ export function computeIntegrityWithdrawals(
       if (callId === undefined || handledPairs.has(callId)) continue;
       const resultId = resultIdByCallId.get(callId);
       if (resultId === undefined) continue;
+      // #6709: a never-foldable (BLOCKED) member makes the pair permanently
+      // split — the merge cannot close it, and withdrawing it dead-locks every
+      // merge that touches the turn.  The member is already visible; the merge
+      // does not change the model's view, so skip the withdrawal.
+      if (
+        neverFoldableIds?.has(m.id) ||
+        neverFoldableIds?.has(resultId)
+      )
+        continue;
       if (remaining.has(m.id) === remaining.has(resultId)) continue;
       handledPairs.add(callId);
       remaining.delete(m.id);

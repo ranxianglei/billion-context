@@ -172,7 +172,7 @@ test("5919-1: foldable stranded partner outside the span → merge extends and r
   );
 });
 
-test("5919-2: protected (BLOCKED) stranded partner → no-op success, not a retryable error", () => {
+test("5919-2: protected (BLOCKED) stranded partner → merge succeeds (#6709)", () => {
   const { core, messages, state } = build("BLOCKED", "Read");
   const res = core.applyCompression({
     messages,
@@ -180,22 +180,18 @@ test("5919-2: protected (BLOCKED) stranded partner → no-op success, not a retr
     config,
     ranges: [{ startRef: "b2", endRef: "b3", summary: SUMMARY }],
   });
-  // idempotent no-op success (#4521): zero errors, zero blocks
+  // #6709: BLOCKED partners no longer block the merge integrity gate —
+  // the merge succeeds, creating a new block that covers the foldable
+  // messages in the range. The BLOCKED message itself is never included.
   assert.deepEqual(res.result.errors, []);
-  assert.equal(res.result.blocksCreated, 0);
-  // b3 stays ACTIVE — nothing was consumed
-  assert.equal(res.state.blocks.find((b) => b.blockId === "b3")!.active, true);
-  const skip = res.result.warnings.find((w) =>
-    w.startsWith("Merge of b3 skipped"),
-  );
+  assert.equal(res.result.blocksCreated, 1);
+  // b3 is consumed (deactivated)
+  assert.equal(res.state.blocks.find((b) => b.blockId === "b3")!.active, false);
+  // the old no-op warnings must be gone
   assert.ok(
-    skip,
-    `expected the skip warning naming the blocked merge, got: ${res.result.warnings.join(" | ")}`,
+    !res.result.warnings.some((w) => w.startsWith("Merge of b3 skipped")),
+    "the skip warning must not appear — the merge now succeeds",
   );
-  assert.ok(skip!.includes("cannot be closed now"));
-  assert.ok(skip!.includes("Do not retry this merge"));
-  assert.ok(skip!.includes("BLOCKED"));
-  // the old false promise must be gone
   assert.ok(
     !res.result.warnings.some((w) => w.includes("age into coverage")),
     "the 'age into coverage' promise must not appear anywhere",
