@@ -909,12 +909,15 @@ test("HTTP CCR shared payload deletion fails closed before persistence", { timeo
 
 for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
     test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
-        // The corrupted-store detection path needs the JSON content-store
-        // sidecar on disk. Under the pure-sqlite default (5a80e2b8e) the
-        // JSON writer is OFF, so pin it ON to keep exercising the envelope
-        // corruption path this test was written for.
-        const oldJsonWriter = process.env.BILI_STORAGE_JSON_WRITER;
-        process.env.BILI_STORAGE_JSON_WRITER = "on";
+        // Pure-SQLite is the default storage writer now (2026-11-13): these
+        // corruption tests corrupt and re-read a .content-store.json envelope,
+        // which never exists on disk under the default writer (ENOENT on
+        // sessions/<protocol> — red in the e2e-dsh-plugin-lane). Pin dual-write
+        // like the other e2e lanes (d252543a/74a925db); the test still removes
+        // index.db below, so the fail-closed 409 contract is unchanged, and
+        // pure-sqlite-only semantics stay covered by the storage unit tests.
+        const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+        process.env.BILI_STORAGE_JSON_WRITER = "1";
         const h = await harness(true);
         try {
             const parent = resolveConversation("parent").session!;
@@ -973,8 +976,8 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
             store2.closeQuietly();
         } finally {
-            if (oldJsonWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
-            else process.env.BILI_STORAGE_JSON_WRITER = oldJsonWriter;
+            if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+            else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
             await h.close();
         }
     });
