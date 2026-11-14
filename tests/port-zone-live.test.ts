@@ -403,7 +403,12 @@ test(
                 daemon2 = h2.child?.pid;
                 trackKill(daemon2);
                 assert.equal(h2.port, ZONE_PORT_BASE + 1, "budget exhausted → the +1 ladder still lands the launch");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows (residual drift, now warned)");
+                // Owner decision A (#4566 vs #1723/#3801, 2026-11-09): the
+                // record stays UNDER the live same-lane holder even when the
+                // new child laddered away — moving it would strand every host
+                // pinned to BASE. Residual drift is bounded and warned; the
+                // pointer converges back once the holder exits (A1e pins it).
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "record stays under the live holder — owner decision A (#4566); converges when it exits");
             } finally {
                 killNow(daemon1);
                 killNow(daemon2);
@@ -521,7 +526,8 @@ test(
 // "twin" (same build, same lane) and exited without binding; the launch then
 // failed and every later launch repeated it until someone killed the holder
 // or picked another port by hand. Now: the holder keeps serving its own
-// sessions untouched, the newcomer settles base+1, sticky follows.
+// sessions untouched, the newcomer settles base+1; the sticky record stays
+// under the live holder (owner decision A, #4566 vs #1723/#3801).
 // ---------------------------------------------------------------------------
 
 test(
@@ -543,7 +549,11 @@ test(
                 trackKill(daemon2);
                 assert.equal(h2.attached, undefined, "the drifted instance is not attachable — we got our own proxy");
                 assert.equal(h2.port, ZONE_PORT_BASE + 1, "laddered off the drifted holder's port instead of exiting");
-                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE + 1, "sticky follows the new canonical instance");
+                // Owner decision A (#4566 vs #1723/#3801, 2026-11-09): a
+                // drifted holder is still a LIVE same-lane holder, so the
+                // record stays under it — hosts pinned to BASE keep their
+                // lane; the pointer converges when the holder exits.
+                assert.equal(readZonePort("zcode"), ZONE_PORT_BASE, "record stays under the live drifted holder — owner decision A (#4566)");
                 assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the drifted holder keeps serving undisturbed");
                 assert.equal(await portOpen(ZONE_PORT_BASE), true, "the old port still answers");
                 assert.equal(await portOpen(ZONE_PORT_BASE + 1), true, "the new instance answers at the drifted port");

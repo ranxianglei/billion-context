@@ -107,6 +107,11 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #4566 part 2: settleZonePort/ensureProxyRunning rows drive a fully
+    // simulated world (mocked SpawnFn, temp zone file, squatted-port set);
+    // the only real spawn is spawnSync(node -e "") for a pid probe, so no
+    // zone band is needed — the entry is for the tripwire
+    "tests/issue4566-lane-port-sticky.test.ts",
     // #5487: spawns a one-shot sealer child (process.execPath) against its own
     // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
     // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
