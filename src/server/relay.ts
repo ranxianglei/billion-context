@@ -2546,13 +2546,20 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // the main conversation (see pipePluginChatWithStrip docs).
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
+            // #6466: side-lane requests (title-gen / auto-review / single-shot)
+            // are best-effort utility calls. A degenerate or empty response must
+            // end the turn as-is — never re-issue (double-bill a utility call)
+            // and never emit an in-band #870 error that a host like DSH would
+            // write into the session title. Passing refetch=undefined disables
+            // the pipe's degenerate gate (retry + #870) and cut retries; the
+            // non-side-lane non-injected path below keeps the gate unchanged.
             if (p.protocol === "responses") {
                 await pipePluginResponsesWithStrip(
                     responseBody,
                     res,
                     undefined,
                     tagLog,
-                    makeContinuationRefetch({
+                    p.sidePassthrough ? undefined : makeContinuationRefetch({
                         protocol: "responses",
                         body,
                         model: throttleModel ?? p.google?.model,
@@ -2578,7 +2585,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     p.protocol,
                     undefined,
                     tagLog,
-                    makeContinuationRefetch({
+                    p.sidePassthrough ? undefined : makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
                         model: throttleModel ?? p.google?.model,
