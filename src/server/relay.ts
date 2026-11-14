@@ -70,13 +70,35 @@ import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { detectThinkingSignatureRejection, rememberStrictThinkingPosture, stripUnsignedThinkingFromWire, thinkingPostureIsStrict } from "./thinking-posture.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
-import { estimateWireOverhead } from "./budget.js";
+import { estimateWireOverhead, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+
+/** Retry the same input when the provider proved only its output reservation overflows. */
+function capOverflowOutput(body: string | Buffer, info: ContextOverflowInfo): { body: string; cap: number } | null {
+    const { window, requestedTotal: total, requestedMessages: input, requestedCompletion: output } = info;
+    if (!info.isOverflow || typeof body !== "string" || window === undefined || input === undefined || output === undefined) return null;
+    const cap = window - input;
+    if (!Number.isSafeInteger(window) || !Number.isSafeInteger(input) || input <= 0 || cap <= 0 || cap >= output) return null;
+    if (total !== input + output) return null;
+
+    let parsed: Record<string, unknown>;
+    try {
+        parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+    const field = outputBudgetField(parsed);
+    if (field === null || readOutputBudget(parsed, field) !== output) return null;
+    const thinking = parsed.thinking as { budget_tokens?: unknown } | undefined;
+    if (typeof thinking?.budget_tokens === "number" && cap <= thinking.budget_tokens) return null;
+    writeOutputBudget(parsed, field, cap);
+    return { body: JSON.stringify(parsed), cap };
+}
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -1820,12 +1842,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     };
     // #1195: a context overflow used to arm the shrink and pass the 400 through
     // verbatim, expecting the NEXT turn to fold — but wire clients treat the
-    // error as fatal and end the session, so the armed rescue never runs and the
-    // session locks. With a refold hook: arm, let the caller re-run prepare+
-    // preflight against the window the upstream STATED (per-call override, no
-    // learning), and re-send the folded body ONCE within this same request. An
-    // unchanged body (nothing foldable), a null refold, or a transport failure
-    // falls back to today's verbatim passthrough below.
+    // error as fatal and end the session. Try a budget-only retry when the
+    // provider proves the current input fits. Otherwise refold within this
+    // request, with the same budget-only option on the newly measured body.
     if (
         overflowRefold &&
         prepared?.session &&
@@ -1928,46 +1947,64 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // margin under it, the same headroom discipline as the arm's
                 // own min(declared, est) clamp — the rejection proved the
                 // ceiling is below the payload, give the fold real room.
-                const armedWindow = overflowInfo.window ?? (prepared.session.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(prepared.session.stats.lastInputTokens * 0.9) : undefined);
-                const refolded = await overflowRefold(armedWindow).catch(() => null);
-                if (refolded) {
-                    try {
-                        // #816 family: the refold rebuilds the body from state
-                        // summaries — scrub string bodies again so a lone
-                        // surrogate can't poison the retry (see the #1884 seam).
-                        const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(wireRefolded) }, undefined, clientAbort.signal);
-                        if (retried.response.ok) {
-                            upstreamResult.clearTimer();
-                            wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
-                            upstreamResult = retried;
-                            log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
-                            prepared = refolded.prepared;
-                        } else {
-                            let retryErrText: string | null = null;
-                            if (retried.response.body) {
-                                try {
-                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
-                                } catch {
-                                    retryErrText = null;
-                                }
-                            }
-                            // Answer with the retry's own verdict, not the stale first 400.
-                            upstreamResult.clearTimer();
-                            upstreamResult = {
-                                response: new Response(retryErrText ?? "", {
-                                    status: retried.response.status,
-                                    statusText: retried.response.statusText,
-                                    headers: new Headers(retried.response.headers),
-                                }),
-                                clearTimer: retried.clearTimer,
-                                stopIdleTimer: retried.stopIdleTimer,
-                            };
-                            log("warn", `[${prepared.session.id}] context overflow — refold retry still rejected (HTTP ${retried.response.status}); passing the retry response through (#1195)`);
-                        }
-                    } catch {
-                        // transport failure — the buffered original 400 answers below
+                const s = prepared.session;
+                const armedWindow = overflowInfo.window ?? (s.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(s.stats.lastInputTokens * 0.9) : undefined);
+                // Keep the latest complete upstream verdict if recovery cannot continue.
+                const resendOverflow = async (retryBody: string | Buffer): Promise<ContextOverflowInfo | null> => {
+                    const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(retryBody) }, undefined, clientAbort.signal);
+                    upstreamResult.clearTimer();
+                    if (retried.response.ok) {
+                        wireBody = retryBody; // #1900: the accepted body is the next wire base
+                        upstreamResult = retried;
+                        return null;
                     }
+                    const retryText = retried.response.body
+                        ? await readStreamToBuffer(retried.response.body).then(body => body.toString("utf8"), () => "")
+                        : "";
+                    upstreamResult = {
+                        ...retried,
+                        response: new Response(retryText, {
+                            status: retried.response.status,
+                            statusText: retried.response.statusText,
+                            headers: new Headers(retried.response.headers),
+                        }),
+                    };
+                    if (retried.response.status !== 400 && retried.response.status !== 413) {
+                        return { isOverflow: false, message: "" };
+                    }
+                    return inspectContextOverflow(retried.response.status, retryText);
+                };
+                // A user transform can change the input again on the retry stage,
+                // so the rejected token count cannot bound that send.
+                const mayRetryWithCap = !egressBaseFields;
+                const resendWithCap = async (recovery: { body: string; cap: number }): Promise<ContextOverflowInfo | null> => {
+                    log("info", `[${s.id}] context overflow — retrying with output capped at ${recovery.cap} using upstream's measured input (#1195)`);
+                    return resendOverflow(recovery.body);
+                };
+                try {
+                    let rejection: ContextOverflowInfo | null = overflowInfo;
+                    const cap = mayRetryWithCap ? capOverflowOutput(wireBody, overflowInfo) : null;
+                    if (cap !== null && !clientAbort.signal.aborted) {
+                        rejection = await resendWithCap(cap);
+                        if (rejection === null) log("info", `[${s.id}] context overflow — budget-only retry accepted (#1195)`);
+                    }
+                    if (rejection?.isOverflow && !clientAbort.signal.aborted) {
+                        const refolded = await overflowRefold(rejection.window ?? armedWindow).catch(() => null);
+                        if (refolded) {
+                            const retryBody = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
+                            rejection = await resendOverflow(retryBody);
+                            if (mayRetryWithCap && rejection?.isOverflow && !clientAbort.signal.aborted) {
+                                const foldedCap = capOverflowOutput(retryBody, rejection);
+                                if (foldedCap !== null) rejection = await resendWithCap(foldedCap);
+                            }
+                            if (rejection === null) {
+                                prepared = refolded.prepared;
+                                log("info", `[${s.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
+                            }
+                        }
+                    }
+                } catch {
+                    // The most recent buffered rejection answers below.
                 }
             }
         }
