@@ -97,6 +97,23 @@ export function applyOmpFirstEventTimeout(env: NodeJS.ProcessEnv): void {
     if (value !== undefined) env[OMP_FIRST_EVENT_TIMEOUT_ENV] = value;
 }
 
+/** #6088: OMP >= 18.18 sends official-URL Claude turns as Anthropic message
+ *  threads — after the first turn each request carries only the newest
+ *  message(s) and Anthropic keeps the history server-side, so bili never sees
+ *  the conversation and never compresses it (silently). PI_PROXY_ANTHROPIC
+ *  leaves the model's base URL official, so OMP's model policy keeps threads on.
+ *  When bili owns the process's model traffic we therefore default threads off;
+ *  an explicit user value wins (blank counts as unset). */
+export const OMP_MESSAGE_THREADS_ENV = "PI_ANTHROPIC_MESSAGE_THREADS";
+
+/** Stamp "0" onto env for OMP's message-threads switch when (and only when) the
+ *  user has not pinned a value. No-op otherwise. */
+export function applyOmpMessageThreadsOff(env: NodeJS.ProcessEnv): void {
+    const raw = env[OMP_MESSAGE_THREADS_ENV];
+    if (raw !== undefined && raw.trim().length > 0) return;
+    env[OMP_MESSAGE_THREADS_ENV] = "0";
+}
+
 /** Coexistence marker (#820): tells standalone in-process bili extensions
  *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
  *  process so they back off instead of double-compressing. Set synchronously
@@ -167,4 +184,11 @@ export function setNativeOriginWaiter(waiter: NativeOriginWaiter): void {
 
 export async function awaitNativeProxyOrigin(): Promise<string | undefined> {
     return originWaiter === undefined ? undefined : originWaiter.wait();
+}
+
+/** Test hook: clear the registered origin waiter so suites that import a
+ *  native entry (which arms at module load) do not leak its INLINE_ORIGIN
+ *  waiter into the shared factory's awaitNativeProxyOrigin(). */
+export function _resetNativeOriginWaiterForTest(): void {
+    originWaiter = undefined;
 }
