@@ -9,7 +9,7 @@ import { parseCompressInput, buildCompressSystemPrompt } from "../src/compress-t
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { recordBlindTunnel, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
 import { _resetAdvisoryWatcherForTest, _setAdvisoryStateForTest } from "../src/advisory.ts";
-import { logUnrecognizedPath } from "../src/server.ts";
+import { logUnrecognizedPath, logUnroutedModelEndpoint } from "../src/server.ts";
 
 function textMsg(id: string, role: "user" | "assistant", text: string): CoreMessage {
     return { id, role, contentType: "text", text };
@@ -170,6 +170,20 @@ test("#2863: UNRECOGNIZED PATHS section renders the live count with an unambiguo
     // example. The endpoint pointer must stay clearly a pointer, not data.
     assert.ok(!/:\s*GET\s/i.test(line!), "no '…: GET …' data-shaped pointer on the section line");
     assert.ok(line!.includes("the unrecognizedPaths field of GET /__bili/stats"), "pointer names the stats field explicitly");
+});
+
+test("#6641: LAYER-BYPASSED section renders when a host plugin reports a client-side bypass", () => {
+    const ctx = makeCtx12();
+    const clean = handleAcpStatus({}, ctx).text;
+    assert.ok(!clean.includes("LAYER-BYPASSED"), "no section when no bypass has been reported");
+
+    logUnroutedModelEndpoint("https://custom-wire.example/api/agent/v3/llm_utils_chat");
+    const out = handleAcpStatus({}, ctx).text;
+    const line = out.split("\n").find((l) => l.startsWith("LAYER-BYPASSED"));
+    assert.ok(line, "section present when a bypass has been reported");
+    assert.ok(line!.includes("llm_utils_chat"), "example endpoint rendered from the live count");
+    assert.ok(line!.includes("modelEndpointPatterns"), "remedy names the config key");
+    assert.ok(line!.includes("the unroutedModelEndpoints field of GET /__bili/stats"), "pointer names the stats field explicitly");
 });
 
 test("#1577: acp_status surfaces an active instance-level advisory", () => {

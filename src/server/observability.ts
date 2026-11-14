@@ -65,6 +65,30 @@ export function isModelDiscoveryPath(path: string): boolean {
     return path.replace(/\/+$/, "").endsWith("/models");
 }
 
+// #6641: client-side bypass — a host plugin (dsh lane) detected a model request
+// whose URL is not a recognized model endpoint and sent it DIRECT (uncompressed),
+// so the proxy never saw it. The host reports each distinct endpoint once per
+// process (bounded like unroutedEndpoints in dsh-native.ts) so acp_status can
+// surface "lane bypassed, compression inactive" instead of the misleading
+// "0 messages / nothing compressible".
+const unroutedModelEndpointCounts = new Map<string, number>();
+export function logUnroutedModelEndpoint(url: string): void {
+    const key = maskUrlsInText(url.split("?")[0]);
+    const n = (unroutedModelEndpointCounts.get(key) ?? 0) + 1;
+    unroutedModelEndpointCounts.set(key, n);
+}
+
+type UnroutedModelEndpointStats = { total: number; endpoints: Record<string, number> };
+export function getUnroutedModelEndpointStats(): UnroutedModelEndpointStats {
+    const endpoints: Record<string, number> = {};
+    let total = 0;
+    for (const [ep, n] of unroutedModelEndpointCounts) {
+        endpoints[ep] = n;
+        total += n;
+    }
+    return { total, endpoints };
+}
+
 // #3129: Antigravity fires seven non-model /v1internal:* control-plane POSTs
 // (loadCodeAssist, fetchUserInfo, retrieveUserQuotaSummary, listExperiments,
 // fetchAdminControls, fetchAvailableModels, writeTrajectoryAcls) at startup and

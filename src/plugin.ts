@@ -27,6 +27,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./s
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
+import { logUnroutedModelEndpoint } from "./server/observability.js";
 import type { HandoffReply } from "./server/handoff-response.js";
 import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
 
@@ -886,6 +887,33 @@ export function handlePluginAttribution(payload: string, res: import("node:http"
         ...(error !== undefined ? { error } : {}),
         ...(endpoint !== undefined ? { endpoint } : {}),
     });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
+/** Accept a client-side bypass report (#6641). Body: { url } — a host plugin
+ *  (dsh lane) detected a model request whose URL is not a recognized model
+ *  endpoint and sent it DIRECT (uncompressed), so the proxy never saw it. The
+ *  host reports each distinct endpoint once per process; the proxy records it
+ *  so acp_status can surface "lane bypassed, compression inactive" instead of
+ *  the misleading "0 messages / nothing compressible". */
+export function handlePluginBypass(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(payload);
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
+        return;
+    }
+    const body = parsed as { url?: unknown };
+    const url = typeof body.url === "string" && body.url.length > 0 && body.url.length <= 2048 ? body.url : undefined;
+    if (url === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "url (<=2048 chars) is required" }));
+        return;
+    }
+    logUnroutedModelEndpoint(url);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 }

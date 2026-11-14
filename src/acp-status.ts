@@ -17,7 +17,7 @@ import { activeThrottleHolds } from "./upstream-throttle.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
-import { getUnrecognizedPathStats } from "./server/observability.js";
+import { getUnrecognizedPathStats, getUnroutedModelEndpointStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
@@ -604,6 +604,22 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             .join(", ");
         extra.push("");
         extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
+    }
+    const unrt = getUnroutedModelEndpointStats();
+    if (unrt.total > 0) {
+        // #6641: a host plugin (dsh lane) detected a model request whose URL
+        // is not a recognized model endpoint and sent it DIRECT (uncompressed),
+        // so the proxy never saw it — the session's cache ledger stays empty
+        // and acp_status would otherwise show the misleading "0 messages /
+        // nothing compressible". Surface it here so the operator knows the
+        // lane is bypassed, not that the session is short.
+        const top = Object.entries(unrt.endpoints)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([ep, n]) => `${ep}×${n}`)
+            .join(", ");
+        extra.push("");
+        extra.push(`LAYER-BYPASSED (instance-level, #6641): ${unrt.total} distinct model endpoint(s) were sent DIRECT (uncompressed) by the host plugin because their path is not a recognized model endpoint (${top}). Those sessions never entered the proxy, so their cache ledger is empty and compression is INACTIVE for them. To compress such a lane: declare the endpoint in "modelEndpointPatterns" in billion-context.json (e.g. {"match":"https://<host>/api/agent/v3/llm_utils_chat","wire":"openai"}), then restart the host. Exact per-endpoint counts: the unroutedModelEndpoints field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }

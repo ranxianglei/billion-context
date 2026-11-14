@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 process.env.NODE_ENV = "test";
 
 import { setLogCapture } from "../src/logger.ts";
-import { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "../src/server.ts";
+import { getUnrecognizedPathStats, getUnroutedModelEndpointStats, logDumpFailure, logUnrecognizedPath, logUnroutedModelEndpoint } from "../src/server.ts";
 import { maskUrlsInText } from "../src/log-mask.ts";
 
 interface Line { level: string; msg: string; }
@@ -81,4 +81,31 @@ test("getUnrecognizedPathStats: exposes per-path counts for /__bili/stats (#1290
     const after = getUnrecognizedPathStats();
     assert.equal(after.paths[key], base + 5, "counted under the masked path key");
     assert.ok(after.total >= 5);
+});
+
+// #6641: client-side bypass — a host plugin (dsh lane) detected a model request
+// whose URL is not a recognized model endpoint and sent it DIRECT (uncompressed),
+// so the proxy never saw it. The host reports each distinct endpoint once per
+// process; the proxy records it so acp_status can surface "lane bypassed" instead
+// of the misleading "0 messages / nothing compressible".
+test("logUnroutedModelEndpoint + getUnroutedModelEndpointStats: exposes per-endpoint counts for /__bili/stats (#6641)", () => {
+    const url = "https://cc-stats-6641.example/api/agent/v3/llm_utils_chat?x=1";
+    const key = maskUrlsInText(url.split("?")[0]);
+    const before = getUnroutedModelEndpointStats();
+    const base = before.endpoints[key] ?? 0;
+    logUnroutedModelEndpoint(url);
+    logUnroutedModelEndpoint(url);
+    const after = getUnroutedModelEndpointStats();
+    assert.equal(after.endpoints[key], base + 2, "counted under the masked endpoint key");
+    assert.ok(after.total >= 2);
+});
+
+test("logUnroutedModelEndpoint: distinct endpoints are counted independently", () => {
+    logUnroutedModelEndpoint("https://a.example/api/agent/v3/llm_utils_chat");
+    logUnroutedModelEndpoint("https://b.example/api/agent/v3/llm_utils_chat");
+    const stats = getUnroutedModelEndpointStats();
+    const keyA = maskUrlsInText("https://a.example/api/agent/v3/llm_utils_chat");
+    const keyB = maskUrlsInText("https://b.example/api/agent/v3/llm_utils_chat");
+    assert.ok(stats.endpoints[keyA] !== undefined, "endpoint A counted");
+    assert.ok(stats.endpoints[keyB] !== undefined, "endpoint B counted");
 });
