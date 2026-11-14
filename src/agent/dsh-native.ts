@@ -70,7 +70,7 @@ import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -303,12 +303,7 @@ export { DSH_BUILD_CHECK } from "./client-build-note.js";
  * the gate rows' fate implied. Best-effort by necessity: preset configs
  * resolve lazily, so "so far" is the honest frame. */
 function gateCoverageSuffix(): string {
-    const t = dshCompactionGateTelemetry();
-    if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
-    }
-    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+    return ` Overlay coverage so far: ${compactionCoverageText()}.`;
 }
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
@@ -1192,6 +1187,12 @@ interface LlmDispatchScope {
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
 let noticedScopedAttribution = false;
+// #6770: the #3962 coverage readout only ever rode the profile-bundle note,
+// which stays silent wherever profileContext.startedBundles cannot be read
+// (observed on both a desktop dsh build and the dsh-go runtime), so the
+// coverage reading had no reachable exit. Emit it once per process on the
+// first routed request instead.
+let compactionCoverageNoted = false;
 
 /** #4491: extract the host message ids from llm/stream `options.messages`,
  *  all-or-nothing. Mirrors validateMsgIds in src/msgid-pin.ts (the 400-class
@@ -1276,6 +1277,15 @@ function attributionOf(ctx: PluginContext): GateAttribution {
     // driving), and it survives exactly the shapes the ambient reading does
     // not (agentless compaction/title lanes, disposed scopes, retried
     // re-sends whose initiator scope went away between attempts).
+    // #6770: first routed request is the earliest point where the overlay's
+    // structural rewrites can have happened (preset configs resolve lazily),
+    // so the coverage reading goes out here — the durable profile note that
+    // used to carry it never fires when profileContext.startedBundles cannot
+    // be read, which is the observed state on every host we checked.
+    if (!compactionCoverageNoted) {
+        compactionCoverageNoted = true;
+        persistClientEvent(`bili-native-dsh: compaction overlay coverage — ${compactionCoverageText()} (#6770)`);
+    }
     const scoped = dispatchScope.getStore();
     if (scoped !== undefined && scoped.sid.length > 0) {
         if (!noticedScopedAttribution) {
