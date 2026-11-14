@@ -94,6 +94,26 @@ test("recall: unknown lane and TTL expiry keep today's direct-send behavior", ()
     assert.ok(conversationRecallStats().expired >= 1);
 });
 
+test("recall: #6511 same-hostname different-scheme-port-pathname shares one lane", () => {
+    __resetConversationRecallForTests();
+    // Attributed traffic rides the proxy to http://host:9452/v1/… while an
+    // unattributed connector dials https://host/v2/… directly — the learn
+    // lane and the claim lane MUST intersect or the recall net is dead.
+    const learn = recallLaneKey("http://192.168.1.50:9452/v1/chat/completions");
+    const claim = recallLaneKey("https://192.168.1.50/v2/chat/completions");
+    assert.equal(learn, claim, "same hostname must share one lane regardless of scheme/port/pathname");
+
+    // Distinct hostnames stay in distinct lanes (no cross-provider leakage).
+    const other = recallLaneKey("https://other-provider.example.com/v1/chat/completions");
+    assert.notEqual(learn, other, "different hostname must be a different lane");
+
+    // The lane is still a working namespace: learn on one form, recall on the other.
+    const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
+    assert.ok(boundary !== undefined);
+    learnConversation(learn, "sess-1", boundary);
+    assert.equal(recallConversation(claim, historyFps(MSG_A, MSG_B)), "sess-1");
+});
+
 test("recall: per-lane LRU cap evicts the idle session, not the active one", () => {
     __resetConversationRecallForTests();
     const lane = recallLaneKey("https://api.example.com/v1/messages");
