@@ -1362,7 +1362,7 @@ export function planReconciliation(
     // byTwin / byNorm / byTurn / byImage) run BELOW Pass 0, so by the time
     // this tier sees a gap cell every exact channel has already had its
     // bite — what remains is tiered corroboration, in order of evidence
-    // strength:
+    // strength. User-role messages stay on the exact passes above:
     //   (a) simhash: a re-rendered cell (formatting churn normalization
     //       still misses — key reordering beyond canonical-Json's reach,
     //       template re-stamps) keeps its word-shingle mass, so a 64-bit
@@ -1394,6 +1394,8 @@ export function planReconciliation(
             const anchor = anchors[gap.oldId];
             const message = byId.get(gap.newId);
             if (anchor === undefined || message === undefined) continue;
+            // Changed user instructions must reach the model, even between unchanged neighbors.
+            if (anchor.r === "user") continue;
             if (anchor.r !== undefined && anchor.r !== message.role) continue;
             const len = message.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
@@ -1439,7 +1441,9 @@ export function planReconciliation(
     // the words still on the wire. Doctrine (order carries, content gates,
     // the id is only a hint): when a MISSING MASSES of cells still carry
     // word evidence, pair them in order instead of diagnosing destruction.
-    //   prose anchors: wordbag equality + simhash ≤ GAP bar (the same
+    //   text user anchors: exact normalizedIdentity after newline→space unwrap
+    //     (line wrap that reconstructs the stored identity; never wordbag/simhash);
+    //   other prose anchors: wordbag equality + simhash ≤ GAP bar (the same
     //     edit-honesty gate as the sim tier) — role-checked, length-guarded;
     //   textless anchors (image families, no sh/wh by construction): k-th
     //     family pairing, only when the anchor/candidate counts per
@@ -1450,10 +1454,15 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
-            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) return false;
+            if (anchor.r === "user") {
+                if (anchor.c !== "text" || m.contentType !== "text") return false;
+                const unwrapped: CoreMessage = { ...m, text: (m.text ?? "").replace(/\r?\n/g, " ") };
+                return normalizedIdentity(unwrapped) === anchor.n;
+            }
+            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
             if (wh !== anchor.wh) return false;
             const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));
@@ -2305,14 +2314,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                     for (const id of block.directMessageIds ?? []) deadIds.add(id);
                 }
                 for (const id of deadIds) delete nextAnchors[id];
-                for (let i = nextOrder.length - 1; i >= 0; i--) {
-                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
-                }
-                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[]; canon?: string[] } | undefined;
                 const positionIds = storedPositions?.ids;
+                const positionCanon = storedPositions?.canon;
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) {
+                        nextOrder.splice(i, 1);
+                        if (positionIds === nextOrder && Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                    }
+                }
                 if (Array.isArray(positionIds) && positionIds !== nextOrder) {
                     for (let i = positionIds.length - 1; i >= 0; i--) {
-                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                        if (deadIds.has(positionIds[i])) {
+                            positionIds.splice(i, 1);
+                            if (Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                        }
                     }
                 }
                 recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
