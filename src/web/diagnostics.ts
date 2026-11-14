@@ -17,6 +17,15 @@
  * `--- recent conflict-related log lines ---` (the exact signatures a
  * maintainer greps to adjudicate a native-compaction episode).
  *
+ * #4649: the #3611 coverage was dsh-only — a codex conflict report shipped
+ * zero log signatures and no client version (#4648), stalling triage on data
+ * the reporter had to dig out by hand. The conflict tail now also matches the
+ * codex compaction evidence chain (intercepted / not-intercepted / forge
+ * failed) plus the client-agnostic #2695 zombie reap verdict (#4688), and the
+ * versions section lists the process's recent observed client User-Agents
+ * (src/client-ua-registry) — for UA-carried clients like codex the UA IS the
+ * version string (`codex_cli_rs/<ver>`), seen on every request.
+ *
  * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body (copied
  * verbatim AND embedded in the prefilled URL). Every byte passes redactForPublish
  * at the SINK (buildDiagnostics) — unconditional host masking + credential-shape
@@ -157,6 +166,9 @@ function storageLogTail(lines: string[]): string[] {
 // (#3008/#2372, both openai and responses wires), the intercepted forge
 // (trigger form AND endpoint form share the prefix), and the forge failure
 // that passes through (src/server/prepare-responses.ts).
+// #4688: the client-agnostic tail of the chain — the #2695 zombie reap verdict
+// (the line a pure orphan-reap ledger lives on; without it such reports ship
+// an empty evidence section even with the reap in the log pair).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
@@ -167,6 +179,7 @@ const CONFLICT_LOG_PATTERNS = [
     "codex local auto-compaction detected",
     "codex compact intercepted",
     "codex compact forge failed",
+    "zombie fold reap",
 ];
 
 function conflictLogTail(lines: string[]): string[] {

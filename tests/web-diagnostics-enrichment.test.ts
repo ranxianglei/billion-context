@@ -202,6 +202,31 @@ test("#3813 single-read: storage tail and conflict tail share one candidate set 
     assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
 });
 
+// #4688: a PURE orphan-reap ledger (no plugin events, no dsh/codex framing)
+// shipped with an empty evidence section because neither reap verdict nor the
+// OpenAI-lane codex detection was in CONFLICT_LOG_PATTERNS — the report's own
+// log tail was blind to the very event it was reporting. Pin both signatures
+// (and the unrelated-line exclusion) so orphan-reap reports carry their proof.
+test("#4688 orphan-reap report carries the reap verdict and the OpenAI-lane codex detection", async (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-reap-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const stateHome = path.join(root, "state");
+    mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
+    const reapLine = "[ses_734d5481] zombie fold reap: removed 2 block(s) (b1, b2) from ACP state; blockContents retained, refs pruned to live ids (#2695)";
+    const codexOpenaiLine = "[ses_codex_9] codex local auto-compaction detected (3/120 covered ids retained) — rebasing ACP state onto the compacted history (#2372/#4521)";
+    writeFileSync(path.join(stateHome, "billion-context", "bili.log"), [
+        "[acp-usage] round 4 input=120000 cached=100000 (cache hit 83%)",
+        reapLine,
+        codexOpenaiLine,
+    ].join("\n") + "\n");
+    const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    const blob = (await withEnv(env, () => buildDiagnostics("conflict-banner"))).blob;
+    assert.ok(blob.includes("zombie fold reap"), "orphan-reap verdict captured (pre-fix: empty evidence section)");
+    assert.ok(blob.includes("blockContents retained"), "reap line kept whole enough to show contents survived");
+    assert.ok(blob.includes("codex local auto-compaction detected"), "OpenAI-lane codex detection captured");
+    assert.ok(!blob.includes("[acp-usage] round 4"), "unrelated log lines still excluded");
+});
+
 test("#3611 enrichment is generic: storage topic and unknown topics carry it too", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-gen-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
