@@ -779,7 +779,7 @@ export class UnifiedShadow {
     activeBlockCount(id: string): number | null {
         if (this.sync === null) return null;
         try {
-            return this.sync.getBlocks(id).filter((b) => b.active).length;
+            return this.sync.activeBlockCount(id);
         } catch {
             return null;
         }

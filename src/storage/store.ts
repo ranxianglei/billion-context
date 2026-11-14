@@ -3024,6 +3024,14 @@ export class UnifiedStore {
         return Buffer.from(row.bytes).toString("utf8");
     }
 
+    /** Scalar drift arbitration without reading or decoding block CAS views.
+     *  Count rows even when the session header is absent, as getBlocks does. */
+    activeBlockCount(sessionId: string): number {
+        const row = this.db.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ? AND active = 1")
+            .get(sessionId) as { n: number };
+        return row.n;
+    }
+
     /** Small arbitration fields for lazy reads; no serialized session surfaces. */
     getLoadHeader(sessionId: string): { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number } | null {
         const row = this.db.prepare(`
