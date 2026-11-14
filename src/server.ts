@@ -1839,6 +1839,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
         let lastStaleHb: number[] = [];
+        // #6257: adoption-after-parent-death tracking for the one-time
+        // detached-proxy warning (the declared spawner is gone but this proxy
+        // keeps serving for a NEW owner that registered during/after the idle
+        // grace).
+        let parentGone = false;
+        let parentGoneAnnounced = false;
         // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
         const deadStreak = new Map<number, number>();
         // #5152: the stale-heartbeat reading is taken on THIS event loop, so it
@@ -1883,6 +1889,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     deadStreak.delete(pid);
                     hbStreaks.delete(pid);
                     dead.push(pid);
+                    if (pid === initialWatcherPid) parentGone = true;
                     if (decision.staleHeartbeat) {
                         staleByHeartbeat.push(pid);
                         // #4994: attribute the killing branch here — the [stale-heartbeat]
@@ -1930,6 +1937,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
             if (dead.length > 0) lastDead = dead;
             if (staleByHeartbeat.length > 0) lastStaleHb = staleByHeartbeat; else lastStaleHb = [];
+            // #6257: the declared parent is dead but this proxy is still
+            // serving for a NEW owner (registered during the idle grace or
+            // after) — it will outlive its spawner. On macOS a detached proxy
+            // has lost Local Network authorization (every LAN upstream
+            // EHOSTUNREACH, cloud fine) and nothing restores the grant short
+            // of a proxy restart; the log line is the self-heal hint the
+            // attaching host's user can act on. One line per parent-death
+            // episode.
+            if (parentGone && !parentGoneAnnounced && proxyWatchers.size > 0) {
+                parentGoneAnnounced = true;
+                log("warn", `[watchdog] declared parent (pid ${initialWatcherPid}) is gone but this proxy is still serving for ${proxyWatchers.size} adopted watcher(s) — it will outlive its spawner; on macOS a detached proxy has lost Local Network authorization (LAN upstreams EHOSTUNREACH, #6257) — restart the proxy to restore LAN egress`);
+            }
             if (proxyWatchers.size > 0) {
                 idleSince = null;
                 return;

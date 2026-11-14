@@ -23,6 +23,7 @@ import { resolveNonHttpProviders } from "../src/config.js";
 import {
     LAUNCHER_DEFAULT_HOST,
     findLiveAttachableInstance,
+    isOrphanedWatchdog,
     isLaunchClient,
     baseClientName,
     piTestArgs,
@@ -2312,6 +2313,205 @@ test("findLiveAttachableInstance: attachUrl pointing elsewhere leaves no candida
         },
     );
     assert.equal(inst, undefined, "target mismatch → nothing to attach to");
+});
+
+// #6257: orphan gate. An armed resident whose declared spawner (BILI_PARENT_PID
+// at boot, reported as watchdog.parentPid) is dead and which has no other live
+// watcher is a zombie — on macOS it has lost Local Network authorization
+// (every LAN upstream EHOSTUNREACH) and re-attaching to it never heals.
+// Gate discipline (#3617): both directions — refuses when it should, and does
+// NOT refuse when it should not (live parent, live co-owner, attachExternal).
+test("isOrphanedWatchdog: orphan only when armed, parent dead, and no other live watcher (#6257)", () => {
+    const alive = (pid: number) => pid === 1000 || pid === 2000;
+    const health = (wd?: { armed: boolean; parentPid?: number; watchers?: number[] }) => ({ ok: true, watchdog: wd });
+    // armed, parent dead, no watchers → orphan
+    assert.equal(isOrphanedWatchdog(health({ armed: true, parentPid: 3000, watchers: [] }), 1000, alive), true, "dead parent, no watchers → orphan");
+    // a watcher entry that is OURSELF is excluded from the scan (a previous
+    // bring-up cycle of this same host may already have registered us)
+    assert.equal(isOrphanedWatchdog(health({ armed: true, parentPid: 3000, watchers: [1000] }), 1000, alive), true, "self-only watcher set → still orphan");
+    // a LIVE co-owner keeps it attachable — legitimate multi-owner sharing (#1190)
+    assert.equal(isOrphanedWatchdog(health({ armed: true, parentPid: 3000, watchers: [2000] }), 1000, alive), false, "live co-owner → not orphan");
+    // live declared parent → not orphan
+    assert.equal(isOrphanedWatchdog(health({ armed: true, parentPid: 1000, watchers: [] }), 3000, alive), false, "live parent → not orphan");
+    // unarmed → never orphaned (the #1335 gate covers that case)
+    assert.equal(isOrphanedWatchdog(health({ armed: false, parentPid: 3000, watchers: [] }), 1000, alive), false, "unarmed → not orphan");
+    // older build: armed but parentPid absent → unverifiable, not orphaned
+    assert.equal(isOrphanedWatchdog(health({ armed: true, watchers: [] }), 1000, alive), false, "armed without parentPid (older build) → not orphan");
+    // no watchdog field at all
+    assert.equal(isOrphanedWatchdog(health(undefined), 1000, alive), false, "no watchdog → not orphan");
+});
+
+test("findLiveAttachableInstance: orphaned same-lane daemon is refused (#6257)", async () => {
+    const diag: string[] = [];
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true, parentPid: 424242, watchers: [] } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+            isPidAlive: (pid: number) => pid === process.pid,
+            attachDiag: (msg: string) => { diag.push(msg); },
+        },
+    );
+    assert.equal(inst, undefined, "dead declared owner + no other live watcher → refused");
+    assert.ok(diag.some((m) => m.includes("refusing to attach") && m.includes("6257")), "refusal is logged once with the #6257 reason");
+});
+
+test("findLiveAttachableInstance: armed daemon with a LIVE co-owner is still attachable (#6257)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true, parentPid: 424242, watchers: [424243] } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+            isPidAlive: (pid: number) => pid === process.pid || pid === 424243,
+        },
+    );
+    assert.ok(inst, "a live co-owner keeps the daemon attachable (#1190 multi-owner sharing)");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("findLiveAttachableInstance: armed daemon with a live declared parent is still attachable (#6257)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true, parentPid: process.pid, watchers: [] } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            scriptPath: FP_SCRIPT,
+            isPidAlive: (pid: number) => pid === process.pid,
+        },
+    );
+    assert.ok(inst, "live declared parent → the daemon is not orphaned");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("findLiveAttachableInstance: attachExternal bypasses the orphan gate (#6257)", async () => {
+    const inst = await findLiveAttachableInstance(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "pi" },
+        {
+            fetchHealthInfo: async () => ({ ok: true, watchdog: { armed: true, parentPid: 424242, watchers: [] } }),
+            readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:18788", port: 18788, lane: "pi" }),
+            resolveAttachPolicy: () => "own-lane",
+            resolveAttachExternal: () => true,
+            scriptPath: FP_SCRIPT,
+            isPidAlive: (pid: number) => pid === process.pid,
+        },
+    );
+    assert.ok(inst, "the #1335 permissive opt-in stays fully permissive — orphan included");
+    assert.equal(inst?.origin, "http://127.0.0.1:18788");
+});
+
+test("ensureProxyRunning: orphaned same-lane holder on the pinned port is reaped (graceful shutdown) before spawn (#6257)", async () => {
+    const st = isoStateDir();
+    try {
+        // The repro from the issue: the host restarted, the surviving proxy's
+        // declared spawner is dead, no other watcher remains, and it still
+        // holds the lane's canonical port. The #6257 gate refuses to attach;
+        // reapOrphanedPredecessor must free the port (supervised graceful
+        // shutdown) so the spawn binds the canonical port instead of laddering
+        // to a sticky drift (#1660).
+        const O = liveRegistryInstance({ instanceId: "inst-6257-o", origin: "http://127.0.0.1:8787", port: 8787, lane: "pi" });
+        registerInstanceAndWarn(O, () => {});
+        // The orphan's listener (and its instance record) vanish once the
+        // graceful shutdown is accepted; afterwards the spawned child answers
+        // health on the freed port under its own pid.
+        let orphanAlive = true;
+        const orphanHealth = () => ({ ok: true, instanceId: "inst-6257-o", watchdog: { armed: true, parentPid: 424242, watchers: [] } });
+        let noReuseCalls = 0;
+        const shutdownCalls: string[] = [];
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi", strictPort: true },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42470);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async (origin) =>
+                    origin.endsWith(":8787") && orphanAlive
+                        ? orphanHealth()
+                        : { ok: true, pid: 42470 },
+                // First call = the pre-shutdown re-probe (still orphaned); after
+                // the shutdown is accepted the listener closes → undefined.
+                fetchHealthInfoNoReuse: async (origin) => {
+                    noReuseCalls++;
+                    return noReuseCalls === 1 && origin.endsWith(":8787") && orphanAlive ? orphanHealth() : undefined;
+                },
+                requestInstanceShutdown: async (origin) => {
+                    shutdownCalls.push(origin);
+                    orphanAlive = false;
+                    return true;
+                },
+                readInstanceFile: () => (orphanAlive ? O : undefined),
+                scriptPath: FP_SCRIPT,
+                isPidAlive: (pid: number) => pid === process.pid,
+            },
+        );
+        assert.deepEqual(shutdownCalls, ["http://127.0.0.1:8787"], "the orphan's graceful shutdown is requested exactly once");
+        assert.ok(noReuseCalls >= 2, "the re-probe and the post-shutdown poll both ran on fresh connections");
+        assert.equal(spawnCalls, 1, "a fresh session-owned proxy is spawned after the reap");
+        assert.equal(handle.origin, "http://127.0.0.1:8787", "the client dials the freed canonical port");
+        assert.ok(handle.child, "the result is a spawned child, not an attach to the orphan");
+    } finally {
+        unregisterInstance("inst-6257-o");
+        st.restore();
+    }
+});
+
+test("ensureProxyRunning: orphan reap aborts when a live owner appears before the shutdown (#6257)", async () => {
+    const st = isoStateDir();
+    try {
+        // Discovery sees an orphan, but by the time the pre-shutdown re-probe
+        // runs a NEW owner has registered (watchers: [424243], alive) — the
+        // candidate is no longer orphaned. No shutdown may be requested; the
+        // normal spawn ladder runs (the orphan is simply not attached).
+        const O = liveRegistryInstance({ instanceId: "inst-6257-o2", origin: "http://127.0.0.1:8787", port: 8787, lane: "pi" });
+        registerInstanceAndWarn(O, () => {});
+        const orphanHealth = () => ({ ok: true, instanceId: "inst-6257-o2", watchdog: { armed: true, parentPid: 424242, watchers: [] } });
+        const adoptedHealth = () => ({ ok: true, instanceId: "inst-6257-o2", watchdog: { armed: true, parentPid: 424242, watchers: [424243] } });
+        const shutdownCalls: string[] = [];
+        let spawnCalls = 0;
+        let spawned = false;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi", strictPort: true },
+            {
+                spawnImpl: () => {
+                    spawned = true;
+                    spawnCalls++;
+                    return makeFakeChild(42471);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                // Discovery sees the orphan; the reap's re-probe (noReuse) sees
+                // the adopted health → abort. In the real world the holder is
+                // attachable once its live owner exists, so the spawn ladder
+                // converges through the #3654/#1903 machinery; here the child
+                // is modeled as answering health on the port once it spawns so
+                // the ladder completes.
+                fetchHealthInfo: async (origin) =>
+                    origin.endsWith(":8787") && !spawned
+                        ? orphanHealth()
+                        : { ok: true, pid: 42471 },
+                fetchHealthInfoNoReuse: async () => adoptedHealth(),
+                requestInstanceShutdown: async (origin) => {
+                    shutdownCalls.push(origin);
+                    return true;
+                },
+                readInstanceFile: () => undefined,
+                scriptPath: FP_SCRIPT,
+                isPidAlive: (pid: number) => pid === process.pid || pid === 424243,
+            },
+        );
+        assert.deepEqual(shutdownCalls, [], "no shutdown may be requested once a live owner exists");
+        assert.equal(spawnCalls, 1, "the spawn ladder runs untouched after the abort");
+        assert.equal(handle.origin, "http://127.0.0.1:8787");
+    } finally {
+        unregisterInstance("inst-6257-o2");
+        st.restore();
+    }
 });
 
 test("runLaunch: omitted ACP_PORT rides a lane-less user-zone daemon only when attachPolicy=global-fallback (#2877)", async () => {

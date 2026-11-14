@@ -370,6 +370,10 @@ export interface LauncherDeps {
     /** #5955: process birth-stamp lookup for PID-reuse detection in the ledger
      *  key (default: processBirthStamp — /proc on linux, ps/powershell elsewhere). */
     processBirthStamp?: (pid: number) => Promise<string | undefined>;
+    /** #6257: pid-liveness probe for the orphan-attach gate (isOrphanedWatchdog)
+     *  and the orphan reap (default: isPidAlive — kill-0, EPERM counts as alive).
+     *  Tests inject a fake so no real pid is ever probed. */
+    isPidAlive?: (pid: number) => boolean;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -4039,8 +4043,11 @@ interface HealthInfo {
      *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed.
      *  #1753 (shutdown side): `watchers` is the live watcher-pid set — the
      *  launcher consults it at client exit so a spawned-but-SHARED instance
-     *  is spared for its remaining owners instead of group-killed. */
-    watchdog?: { armed: boolean; watchers?: number[] };
+     *  is spared for its remaining owners instead of group-killed.
+     *  #6257: `parentPid` is the BILI_PARENT_PID captured at boot (the
+     *  declared spawner) — present whenever `armed` is true; the orphan gate
+     *  (isOrphanedWatchdog) probes it. Absent on pre-#6257 builds. */
+    watchdog?: { armed: boolean; parentPid?: number; watchers?: number[] };
 }
 
 async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boolean }): Promise<HealthInfo | undefined> {
@@ -4061,9 +4068,10 @@ async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boo
         if (typeof data.auxProxy === "string" && data.auxProxy.length > 0) info.auxProxy = data.auxProxy;
         if (typeof data.auxProxySource === "string" && data.auxProxySource.length > 0) info.auxProxySource = data.auxProxySource;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
-            const wd = data.watchdog as { armed: boolean; watchers?: unknown };
+            const wd = data.watchdog as { armed: boolean; parentPid?: unknown; watchers?: unknown };
             const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
-            info.watchdog = { armed: wd.armed, watchers };
+            const parentPid = typeof wd.parentPid === "number" ? wd.parentPid : undefined;
+            info.watchdog = { armed: wd.armed, parentPid, watchers };
         }
         return info;
     } catch {
@@ -4280,6 +4288,30 @@ function attachGateAllows(health: HealthInfo | undefined, attachExternal: boolea
     return health?.watchdog?.armed === true;
 }
 
+/** #6257: orphaned-resident detection — the declared spawner (BILI_PARENT_PID
+ *  at boot, reported as watchdog.parentPid) is dead AND no other live watcher
+ *  remains. `selfPid` is excluded from the watcher scan: a previous bring-up
+ *  cycle of this same host may already have registered us, and our own
+ *  liveness must not keep a zombie attachable. The server reports parentPid
+ *  whenever armed is true (both derive from the same boot-time value), so the
+ *  check applies to every armed candidate; a missing parentPid (older build)
+ *  is unverifiable and NOT orphaned — the #1335 gate's existing refusal covers
+ *  that case. A dead parent with a LIVE co-owner is not an orphan: legitimate
+ *  multi-owner sharing (#1190) must stay attachable. The probe is injectable
+ *  (tests); the default kill-0 is existence-blind (a reused pid reads alive) —
+ *  the same limitation as the server-side watchdog, closed by the #4367
+ *  heartbeat design. */
+export function isOrphanedWatchdog(
+    health: HealthInfo,
+    selfPid: number,
+    isAlive: (pid: number) => boolean = isPidAlive,
+): boolean {
+    const wd = health.watchdog;
+    if (wd?.armed !== true || wd.parentPid === undefined) return false;
+    if (isAlive(wd.parentPid)) return false;
+    return (wd.watchers ?? []).every((w) => w === selfPid || !isAlive(w));
+}
+
 /** #1660: the user-sovereignty zone marker — neither a declared lane nor a
  *  launcher launch token exists only for a manually started `bili start`
  *  daemon. By definition the user maintains it (they typed the command; it
@@ -4337,6 +4369,7 @@ function pickAttachable(
     refusedLog: Set<string>,
     diag?: (msg: string) => void,
     foreignLanes: readonly string[] = [],
+    isAlive: (pid: number) => boolean = isPidAlive,
 ): ProxyInstanceFile | undefined {
     let best: ProxyInstanceFile | undefined;
     let bestClass = Number.MAX_SAFE_INTEGER;
@@ -4411,6 +4444,25 @@ function pickAttachable(
                 refusedLog.add(c.inst.origin);
                 console.error(gateRefusalMessage(c.inst, c.health));
                 diag?.(gateRefusalMessage(c.inst, c.health));
+            }
+            continue;
+        }
+        // #6257: orphan gate — an armed resident whose declared spawner is dead
+        // and which has no other live owner is a zombie, not a shared daemon:
+        // on macOS a detached proxy has lost Local Network authorization
+        // (every LAN upstream EHOSTUNREACH, cloud fine — #6257) and its own
+        // watchdog cannot detect the grant loss (the process is alive; only
+        // LAN connects fail). Refusing it is what lets the host spawn a fresh,
+        // authorized proxy; reapOrphanedPredecessor frees the port first so
+        // the spawn does not ladder to a sticky port drift (#1660).
+        // attachExternal stays fully permissive (#1335 opt-in semantics
+        // unchanged); a live co-owner keeps the candidate attachable (#1190).
+        if (!attachExternal && c.health !== undefined && isOrphanedWatchdog(c.health, process.pid, isAlive)) {
+            if (!refusedLog.has(c.inst.origin)) {
+                refusedLog.add(c.inst.origin);
+                const msg = `bili: refusing to attach to ${c.inst.origin} (pid ${c.inst.pid}) — its declared owner (pid ${c.health.watchdog?.parentPid}) is gone and no other live watcher remains; a detached proxy like this has lost macOS Local Network authorization (LAN upstreams EHOSTUNREACH, #6257). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
+                console.error(msg);
+                diag?.(msg);
             }
             continue;
         }
@@ -4495,7 +4547,7 @@ export async function findLiveAttachableInstance(
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
     const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
     const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
-    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
+    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes, deps.isPidAlive ?? isPidAlive);
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -4996,6 +5048,74 @@ async function rotateStalePredecessor(
         if (!h?.ok) break;
         if (now() >= deadline) {
             console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still accepts fresh connections (listener open); falling back to the normal spawn ladder`);
+            return;
+        }
+        await sleep(HEALTH_POLL_INTERVAL_MS);
+    }
+}
+
+/** #6257: supervised drain+exit of an ORPHANED same-lane resident holding our
+ *  target port — its declared spawner is dead and no other live watcher
+ *  remains (isOrphanedWatchdog), so the #6257 gate refused to attach to it,
+ *  but it still holds the canonical port: a plain spawn would hit EADDRINUSE
+ *  and ladder to a sticky port drift (#1660). The orphan's own watchdog would
+ *  reap it within ~5s of its last watcher dying (WATCHER_IDLE_GRACE_MS) — we
+ *  just make that deterministic and free the port BEFORE the spawn. Same
+ *  supervised machinery as rotateStalePredecessor (#3544): graceful shutdown
+ *  request, then poll a FRESH connection until the listener closes; any doubt
+ *  (refused, timed out, a live owner appeared in the meantime) falls through
+ *  to the untouched spawn ladder. No raw kill: the pid could be reused, and
+ *  the shutdown route is the version-safe ask. Unlike #3544 there is NO
+ *  version requirement — the orphan's bytes are irrelevant, only its LAN
+ *  authorization loss is, and a fresh spawn runs whatever our host has. */
+async function reapOrphanedPredecessor(
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
+    resolveTargetPort: () => number | undefined,
+    opts: LaunchOptions,
+    attachUrl: string | undefined,
+    foreignLanes: readonly string[],
+    selfPid: number,
+    fetchHealthInfoNoReuse: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleep: (ms: number) => Promise<void>,
+    requestShutdown: (origin: string) => Promise<boolean>,
+    isAlive: (pid: number) => boolean,
+): Promise<void> {
+    if (attachUrl !== undefined) return;
+    const orphaned = probed.filter(
+        (c): c is { inst: ProxyInstanceFile; health: HealthInfo } =>
+            c.health !== undefined
+            && !isUserZoneInstance(c.inst)
+            && instanceShapeMismatch(c.inst, opts, foreignLanes) === undefined
+            && isOrphanedWatchdog(c.health, selfPid, isAlive));
+    if (orphaned.length === 0) return;
+    const targetPort = resolveTargetPort();
+    if (targetPort === undefined) return;
+    const candidate = orphaned.find((c) => c.inst.port === targetPort);
+    if (!candidate) return;
+    // Re-probe on a fresh connection right before the shutdown: if a live
+    // owner registered in the window since discovery, the candidate is no
+    // longer orphaned — abort and let the normal ladder handle it (the next
+    // bring-up may even attach to it).
+    const fresh = await fetchHealthInfoNoReuse(candidate.inst.origin);
+    if (fresh === undefined || !isOrphanedWatchdog(fresh, selfPid, isAlive)) {
+        console.error(`bili: orphan reap skipped — ${candidate.inst.origin} (pid ${candidate.inst.pid}) is no longer orphaned (a live owner appeared in the meantime)`);
+        return;
+    }
+    console.error(
+        `bili: reaping orphaned proxy ${candidate.inst.origin} (pid ${candidate.inst.pid}) — its declared owner (pid ${candidate.health.watchdog?.parentPid}) is gone and no other live watcher remains; on macOS such a detached proxy has lost Local Network authorization (LAN upstreams EHOSTUNREACH, #6257). Requesting graceful shutdown before taking over port ${targetPort}`,
+    );
+    const asked = await requestShutdown(candidate.inst.origin);
+    if (!asked) {
+        console.error(`bili: orphan reap skipped — ${candidate.inst.origin} refused /__bili/shutdown; falling back to the normal spawn ladder`);
+        return;
+    }
+    const deadline = now() + STALE_ROTATION_WAIT_MS;
+    for (;;) {
+        const h = await fetchHealthInfoNoReuse(candidate.inst.origin);
+        if (!h?.ok) break;
+        if (now() >= deadline) {
+            console.error(`bili: orphan reap timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still accepts fresh connections (listener open); falling back to the normal spawn ladder`);
             return;
         }
         await sleep(HEALTH_POLL_INTERVAL_MS);
@@ -5578,6 +5698,9 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const registerWatcher = deps.registerWatcher ?? registerWatcherDefault;
+    // #6257: pid-liveness probe for the orphan gate and the orphan reap
+    // (default: isPidAlive — kill-0, EPERM counts as alive).
+    const isAlive = deps.isPidAlive ?? isPidAlive;
     // #1335: attach-gate escape hatch, resolved once per bring-up (env > file >
     // false). One knob for every lane — explicit user-directed attaches (kimi/dsh
     // BILLION_CONTEXT_ATTACH / preset BILLION_CONTEXT_PROXY) never pass through
@@ -5657,7 +5780,7 @@ export async function ensureProxyRunning(
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
     const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps?.isConnectable ?? tcpConnectable);
-    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
+    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes, isAlive);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
@@ -5715,6 +5838,25 @@ export async function ensureProxyRunning(
             deps?.requestInstanceShutdown ?? requestInstanceShutdown,
         );
     }
+    // #6257: the #6257 gate refused an orphaned same-lane holder, but it still
+    // holds our canonical port — reap it (supervised graceful shutdown) so the
+    // spawn below binds the canonical port instead of laddering to a sticky
+    // drift; on any doubt the spawn ladder runs untouched.
+    {
+        await reapOrphanedPredecessor(
+            probed,
+            resolveTargetPort,
+            opts,
+            attachUrl,
+            foreignLanes,
+            process.pid,
+            deps?.fetchHealthInfoNoReuse ?? ((origin: string) => fetchHealthInfoDefault(origin, { noKeepAlive: true })),
+            now,
+            sleepImpl,
+            deps?.requestInstanceShutdown ?? requestInstanceShutdown,
+            isAlive,
+        );
+    }
     // #5955: the cell neither attach nor rotation covers — a BUSY same-lane
     // holder with foreign bytes on our canonical port. Bounded patience across
     // bring-up cycles, then a supervised forced takeover; on any doubt the
@@ -5743,7 +5885,17 @@ export async function ensureProxyRunning(
         // pinned port — self-managed fallback is impossible here (we cannot
         // bind that port either). Fail fast with an actionable error instead
         // of burning SPAWN_WAIT_MS into a confusing EADDRINUSE.
-        const squatter = probed.find((c) => c.inst.port === opts.port && instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes) === undefined);
+        // #6257: an ORPHANED armed holder is NOT lifecycle-less — its watchdog
+        // is armed, and the orphan reap above already asked it to drain
+        // (success: the port is free and the spawn binds it; abort: the #1903
+        // rediscovery after a child EADDRINUSE re-probes and attaches once a
+        // live owner appears). Throwing "kill that process" here would advise
+        // killing a proxy that may serve other sessions, or one that just
+        // released its port.
+        const squatter = probed.find((c) =>
+            c.inst.port === opts.port
+            && instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes) === undefined
+            && !(c.health !== undefined && isOrphanedWatchdog(c.health, process.pid, isAlive)));
         if (squatter) {
             throw new Error(
                 `bili: port ${opts.port} is held by a lifecycle-less bili proxy at ${squatter.inst.origin} (pid ${squatter.inst.pid}) — ` +
@@ -6212,7 +6364,7 @@ export async function ensureProxyRunning(
             while (now() < rediscoveryDeadline) {
                 await sleepImpl(HEALTH_POLL_INTERVAL_MS);
                 const probedAgain = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag, deps.isConnectable ?? tcpConnectable);
-                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes);
+                const late = pickAttachable(probedAgain, opts, codeFingerprint, attachExternal, attachPolicy, attachUrl, refusedLog, attachDiag, foreignLanes, isAlive);
                 if (late) {
                     // #3404: successful-attach announcement on the recovery
                     // path — same class as attachTo, host-safe channel.
