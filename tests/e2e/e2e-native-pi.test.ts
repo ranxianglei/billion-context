@@ -4,7 +4,7 @@
 // interception, x-bili-plugin stamping, ACP tool registration, plugin-tool
 // execution (acp_status / compress) and real compression — runs in-process
 // with zero tokens and no network. Gated by ACP_TEST_E2E_NATIVE=1 (needs
-// `npm run build` first — the pi package loads dist/agent/pi-native.js).
+// `npm run build` first — the pi package loads dist/agent/billion-context.js).
 //
 // Assertions map 1:1 to #1239's acceptance list:
 //   1. traffic is intercepted + plugin-mode claimed (x-bili-plugin: pi)
@@ -34,7 +34,7 @@ import { assertPortDead } from "../port-race.js";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO = Number(process.env.E2E_TMO ?? 150_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
@@ -112,7 +112,7 @@ const skipReason = !run
 const suiteSkipReason =
   skipReason ??
   (!distBuilt()
-    ? "dist/agent/pi-native.js missing — run `npm run build` first"
+    ? "dist/agent/billion-context.js missing — run `npm run build` first"
     : undefined);
 const checkOnly = process.env.E2E_CHECK === "1";
 

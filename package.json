@@ -111,7 +111,7 @@
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
     "extensions": [
-      "./dist/agent/pi-native.js"
+      "./dist/agent/billion-context.js"
     ]
   },
   "publishConfig": {
