@@ -1,0 +1,114 @@
+{
+  "description": "billion_context_native: bounded capture, optional version-declared readiness policy, untrusted history restore",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" nudge",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" nudge",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" precompact",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 0",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 1",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 2",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 3",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 4",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 5",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 6",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 7",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" restore 8",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" observe",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; \"$P\" -c '' 2>/dev/null || P=python; \"$P\" -X utf8 \"${CLAUDE_PLUGIN_ROOT}/billion_context_native/hook.py\" observe",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
