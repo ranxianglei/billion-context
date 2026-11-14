@@ -400,11 +400,11 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
 
     const env: NodeJS.ProcessEnv = {
         ...cleanEnv(),
-        // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope
-        // writer OFF, but this lane asserts on the on-disk .json session
-        // envelope. Pin the writer ON so the envelope this test was written
-        // for is still produced regardless of the storage-mode default.
-        BILI_STORAGE_JSON_WRITER: "on",
+        // Pure-SQLite is the default storage writer now (2026-11-13): this lane
+        // asserts the JSONL session envelopes — pin dual-write (same reason as
+        // the other client e2e lanes); pure-sqlite semantics are covered by the
+        // unit tests and the real-model gate.
+        BILI_STORAGE_JSON_WRITER: "1",
         HOME: home,
         TMPDIR: tmp,
         DSH_HOME: dshHome,
