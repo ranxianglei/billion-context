@@ -1852,13 +1852,11 @@ export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
 // byRaw/byRef are pruned to liveRawIds (stops the #390 additive leak).
 // nextIndex is left alone so a freed ref slot is never re-allocated onto a
 // retained tail's live tag.
-/** Synthetic byRaw key pinning a session's ref high-water mark. Its value is
- *  the highest ref this session must never re-allocate (refs the parent used
- *  before a fork/resume, or numbers freed by an archive prune); the kernel
- *  cursor (highestUsedIndex+1) then starts above it. Never a real message id
- *  (those are SHA-256 hex), so it matches no incoming message and has no
- *  byRef entry. */
-export const REF_FLOOR_RAW_ID = "bili:ref-floor";
+// #5589: defined in state-hydration.js so the storage rebuild seam can skip
+// the floor row without importing the session layer; re-exported for the
+// existing test importers.
+export { REF_FLOOR_RAW_ID } from "./state-hydration.js";
+import { REF_FLOOR_RAW_ID } from "./state-hydration.js";
 
 /** Raise `session`'s ref floor to at least `index` (no-op when its map
  *  already reaches that high). */
