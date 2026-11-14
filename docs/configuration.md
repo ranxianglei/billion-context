@@ -12,11 +12,13 @@
 |-------|------|-------|
 | **Config file (Linux)** | `~/.config/billion-context/billion-context.json` | XDG Base Directory — the canonical, user-editable config |
 | **Config file (override)** | value of `XDG_CONFIG_HOME` | relocates the whole config dir |
-| **Config file (explicit)** | value of `BILI_CONFIG_FILE` | points directly at any JSON file |
-| **CLI flag** | `--config <FILE>` | same as `BILI_CONFIG_FILE`; highest precedence for the file path |
+| **Config file (explicit)** | value of `BILI_CONFIG_FILE` | points directly at any JSON file; a bare NAME (no `/`) selects the named config `<configDir>/NAME.json` |
+| **CLI flag** | `--config <NAME\|FILE>` (short: `-c`) | same as `BILI_CONFIG_FILE`; highest precedence for the file path |
 | **Session data** | `~/.local/share/billion-context/sessions/` | persisted compression state, grows over time |
 
 On first run, `billion-context` seeds an empty template (`{ "providers": {} }`) at the config path so you have something to edit. It never overwrites an existing file.
+
+A bare **name** (no directory separator, and no matching file in the CWD) is not a path but a **named config**: it resolves to `<configDir>/<name>.json` — e.g. `bili start -c dsh-test` uses `~/.config/billion-context/dsh-test.json`. Keep one file per model/purpose and switch with `-c` instead of the `BILI_CONFIG_FILE` env var. A typo'd name refuses to start and lists the names that exist (a missing explicit *path* keeps its historical empty-config behavior).
 
 The config file is a pure override layer — every field is optional. Anything unset falls through to the built-in default.
 
@@ -391,7 +393,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC age sweep window in days (#3463): sessions idle longer than this are archived (one JSON line appended to the single archive log (archive/archive.jsonl) + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form. |
 | `BILI_STORAGE_QUICK_CHECK` | string | on | — | Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; if a corruption is PROVEN by THIS BOOT's own scan NOTHING is moved, copied or rebuilt automatically (auto-recovery was withdrawn #4609/#4626-era: with BILI_STORAGE_JSON_WRITER=off the index is the SOLE durable copy, so an automatic move or rebuild cannot guarantee full data recovery) and bili STARTS ANYWAY — serving from the JSON envelopes with a loud, actionable alarm naming the manual fix (back up then move index.db/-wal/-shm aside BY HAND, then start again — a fresh index rebuilds from the JSON envelopes). A successful PASS is cached so later starts skip the rescan; a FAIL verdict is NEVER persisted (2026-10-30 owner policy): runtime/background findings are alarms only (loud logs + runtime-status, the process keeps serving — JSON envelopes written while the jsonWriter was on remain the recovery source) and every boot decides again from a fresh scan of the CURRENT file set, so a stale FAIL left behind by an older version can never block future boots. There is NO automatic rename/repair AND no legacy-only fallback: continuing legacy-only would fork the JSON envelopes from the dead index forever (never reconcilable). TRANSIENT open failures (no SQLite engine / CANTOPEN / readonly / backend DSN) make bili REFUSE TO START loudly with an actionable error — no silent legacy fallback for environment problems either (2026-10-30 owner policy; a live second writer left this refusal list on 2026-10-31 — sharing one local-disk index.db is the supported topology, informational only, never blocking); deployments that genuinely want JSON-only serve explicitly (BILI_STORAGE_UNIFIED=legacy — leaving it unset is the pure-sqlite default, not legacy). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters. |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later. |
-| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). |
+| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). A bare NAME (no `/`) selects the named config `<configDir>/NAME.json`; a missing NAME fails fast listing the available names, a missing explicit PATH keeps its historical empty-config behavior. |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | Where session records are stored (path relocation). |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | Key material for encrypted persisted payloads (secret). |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | Host allowlist for the MITM tunnel lane. |
@@ -2283,7 +2285,7 @@ Anything after `--` in a launcher command is passed through to the client verbat
 |---|---|
 | `--port <N>` | Listen port (default `8787`) |
 | `--host <ADDR>` | Listen host (default `127.0.0.1`) |
-| `--config <FILE>` | Path to config JSON (default: XDG location) |
+| `--config <NAME\|FILE>` | Path to config JSON, or a bare named config `<configDir>/NAME.json` (short: `-c`; default: XDG location) |
 | `--debug` | Verbose logging |
 | `--passthrough` | Forward without compression |
 | `--no-passthrough` | Force compression on (overrides config) |
