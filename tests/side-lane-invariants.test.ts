@@ -354,12 +354,16 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // isStructuredOutputCall — same category once more: a pure toolless
 // structured-output shape predicate (no threshold, no session state) consulted
 // to set sideIntent and to keep the call out of the restoreOutputBudget
-// high-water path, exactly like the #2500 server-tool predicate.
+// high-water path, exactly like the #2500 server-tool predicate. #4840 adds
+// isClaudeNotificationRequest — same category once more: a pure Claude Desktop
+// notification-classifier shape predicate (no threshold, no session state)
+// consulted to set sideIntent, keep the request off the persona-fork path, and
+// skip restoreOutputBudget for its oversized 3072 budget.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isClaudeCodeTitleRequest", "isClaudeNotificationRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
