@@ -29,6 +29,32 @@ export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 // 1M-token window could hold are stopped.
 export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
 
+/** Resolve a raw `contextLimit` value to an absolute token count.
+ *  - `number` → used as-is (absolute window).
+ *  - `string` ending in `%` (e.g. `"70%"`) → that fraction of `nativeLimit`.
+ *  - any other `string` → parsed as a number (absolute window).
+ *  - `undefined` → `nativeLimit` (the model's full window).
+ *
+ *  `contextLimit` is the **window size** the kernel uses as the denominator for
+ *  its usage ratio (`usage = tokens / contextLimit`) — it is NOT a truncation
+ *  cap. All ratio-based thresholds (`emergencyThreshold`, truncate) scale off
+ *  it, so shrinking it pulls every threshold down proportionally. To leave
+ *  headroom, raise/lower `emergencyThreshold` instead. Always returns int ≥ 1.
+ *
+ *  Lives here (not compress-settings.ts) because host-injected agent bundles
+ *  (#5937: dsh-native's oversize gate) must share this exact resolution without
+ *  pulling the kernel pack machinery into the host process. */
+export function resolveContextLimitValue(raw: number | string | undefined, nativeLimit: number): number {
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.max(1, Math.floor(raw));
+    if (typeof raw === "string") {
+        const pct = /^(\d+(?:\.\d+)?)\s*%$/.exec(raw.trim());
+        if (pct) return Math.max(1, Math.floor((nativeLimit * Number(pct[1])) / 100));
+        const n = Number(raw);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+    }
+    return Math.max(1, Math.floor(nativeLimit));
+}
+
 // Session-ledger measurement (#5613): the wire bodies this host family sends
 // are billed upstream ~14% ABOVE the optimistic bytes/4 token FLOOR — the
 // floor is a strict lower bound, so a body that sits just under the window in

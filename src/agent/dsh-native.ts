@@ -58,10 +58,10 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } fr
 import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
-import { adminRelayEnabled, resolveResignSettings } from "../config.js";
+import { adminRelayEnabled, loadConfigFile, resolveResignSettings } from "../config.js";
 import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
-import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
+import { MIN_ASSUMED_WINDOW_TOKENS, resolveContextLimitValue } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
@@ -592,11 +592,38 @@ function globalModelTarget(svc: { agentDefaultModel?: PluginContext["agentDefaul
 // SAME resolution headersFor stamps (#2381: the session's live model first,
 // the host's global default as fallback, cached model info only). A miss
 // anywhere disables the size arm; it must never yield a wrong model's window.
+// #5937: an explicit GLOBAL-level compress.modelContextLimit overrides the
+// cached model info — it is the operator's deliberate wall, and the oversize
+// arm and the x-bili-plugin-context-window stamp (#2924) must both size off it
+// together. Route/model-level compress overrides stay proxy-side only: the
+// host bundle deliberately does not replicate route resolution. "N%" resolves
+// against the cached info window; with no info window a percentage has no
+// base, so only an ABSOLUTE declaration is trusted there (never guess).
+function operatorContextLimit(infoWindow: number | undefined): number | undefined {
+    let configured: number | string | undefined;
+    try {
+        configured = loadConfigFile().compress?.modelContextLimit;
+    } catch {
+        return undefined;
+    }
+    if (configured === undefined) return undefined;
+    if (typeof infoWindow === "number" && infoWindow > 0) {
+        // With a base, even unparseable values degrade harmlessly to
+        // floor(base) == the info window itself (== no config set).
+        return resolveContextLimitValue(configured, infoWindow);
+    }
+    const n = typeof configured === "number" ? configured : Number(configured.trim());
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
+}
+
 function effectiveContextWindow(ctx: PluginContext): number | undefined {
     const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
     if (target === undefined) return undefined;
-    return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
+    const infoWindow = modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
+    return operatorContextLimit(infoWindow) ?? infoWindow;
 }
+
+export const _effectiveContextWindowForTest = effectiveContextWindow;
 
 // Gate face of the shared doom math (#4111/#4516): keeps the gate's
 // init-body signature for its call sites and tests, decoding init.body into

@@ -277,7 +277,7 @@
 
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
-| `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。 |
+| `compress.modelContextLimit` | number \| "N%" | native window (model-declared) | — | 有效上下文窗口（token 数或 N%）：使用率的分母、硬性 preflight 墙，以及所有按 token 计量的出站守卫的墙（#5937）；除上游 400 证据外优先级最高的窗口来源。 |
 | `compress.maxContextLimit` | number \| "N%" | "75%" | — | 强制压缩提醒阈值：历史超过窗口该占比时提醒立即触发，绕过增长门槛。不是硬上限。 |
 | `compress.emergencyThresholdPercent` | number \| % | "95%" | — | 历史超过窗口该占比时对超大工具输出做紧急截断（必须 >= maxContextLimit）。 |
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | max_tokens 输出预留占窗口的最大比例。 |
@@ -1424,6 +1424,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。注意它同时也是**预检压缩的硬墙**：一旦载荷达到该值，代理会在转发前主动折叠上下文；若折叠后仍超出，请求会直接快速失败而不是发往上游。若希望日常上下文保持较小、同时允许大读取任务突发到原始窗口，请让 `modelContextLimit` 保持为原始窗口值，改用 `maxContextLimit` 作为软目标（见[软目标与弹性余量](#软目标与弹性余量-1122)）。
 - **溢出武装行为 (#3450)。** 当上游以"窗口超限"错误拒绝载荷时，代理会把这次拒绝"武装"给下一次尝试：若此处声明的窗口与上游给出的数值不一致，会记一条一次性警告（同时给出两个值）并按两者中较小者折叠；若错误正文还给出了 token 计数（如 `you requested N tokens (M in the messages, K in the completion)`），则把 `M` 记为实测载荷大小（上限不是尺寸），并在该武装存续期间从本墙中扣除 `K` 再判断载荷是否装得下——上游已证明完成份额与输入共用同一预算。下一次真实的 usage 报告会同时退役该武装与预留。如果你的声明有误，把本键设为真实窗口即可：警告消失，折叠目标随之修正。
+- **出站/计量守卫墙 (#5937)。** 本键同时驱动所有按 token 计量的出站守卫，而不只是 preflight 折叠：折后实测 token 的装得下证明、relay 出站熔断、以及 DSH native 插件模式下的宿主侧超尺寸闸门与 `x-bili-plugin-context-window` 戳记，在本键设置时（全局级；路由/模型级覆盖仍只在代理侧生效）都以该值为有效窗口。显式声明被视为运营者刻意的墙，因此携带它的会话上出站熔断**不再**套用 1M 防猜测下限：实测超过 `limit × 7.5 B/tok`（最小 2 MB）的正文会被本地以 413 拒绝并指明该设置 —— 调高或移除 `compress.modelContextLimit` 即可放行。窗口优先级从高到低：上游 400 证据（overflow arm）> 本键 > registry/原生解析 > 顶层 `modelContextLimit` 兜底。
 
 #### `outputHeadroomMaxPct`
 

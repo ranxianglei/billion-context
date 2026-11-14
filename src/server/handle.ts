@@ -861,6 +861,15 @@ async function handleRequest(
     // codex's own output headroom (effective_context_window_percent) — see
     // codexWindowNetsOutputHeadroom. Gates the default output reservation below.
     let codexWindowNetsOutput = false;
+    // #5937: true when resolveCompress found an explicit compress.modelContextLimit
+    // for this request (global → provider → model merge). The pre-headroom value
+    // rides operatorWindow into preflight so metering bars judge the operator cap
+    // instead of the raw native window; proven upstream evidence still clamps
+    // lower (#5191). Tri-state on purpose: UNDEFINED until the window-resolution
+    // block ran — a no-model body never resolves a window and must not erase a
+    // stamp a prior modeled turn wrote (the egress fuse reads it across turns).
+    // Hoisted like its siblings: the capture site sits below the block.
+    let operatorWindowTuned: boolean | undefined;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -942,7 +951,7 @@ async function handleRequest(
             const launcherWindow = launcherContextWindow(model);
             const configuredModelEntry = resolveModelEntry(opts.routes, embeddedUrl, model);
             const configuredWindow = configuredModelEntry.entry?.context && configuredModelEntry.entry.context > 0 ? configuredModelEntry.entry.context : undefined;
-            const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
+            operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
             // #2317: the providers key this request resolved against (or proof of a
             // route-miss) plus the origin/host the match ran on — surfaced by the
             // [window]/clamp lines, the once-per-upstream route-miss WARN, and the
@@ -2711,6 +2720,14 @@ async function handleRequest(
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
         const nativeWindow = reqConfig.modelContextLimit;
+        // #5937: the operator's explicit compress.modelContextLimit REPLACES the
+        // resolved native window as the effective cap for metering judgments —
+        // same substitution applyCompressSettings applies to the judging chain
+        // above. Captured post-self-heal by design: an emergency shrink armed by
+        // a real overflow is upstream evidence and beats the declaration (#5191).
+        // Undefined when no explicit setting exists — the fallback default is not
+        // an operator assertion and must never arm metering bars on its own.
+        const operatorWindow = operatorWindowTuned ? nativeWindow : undefined;
         const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
         // #3450 follow-up (#3973): a 400 that stated a completion share disproves
         // any separate-wall evidence for this origin+model — judging input against
@@ -2883,6 +2900,15 @@ async function handleRequest(
         // plugin sessions, so wire-mode panels fell back to a hardcoded 200K.
         session.metadata.effectiveContextLimit = nativeWindow;
         session.metadata.reservedContextLimit = reqConfig.modelContextLimit;
+        // #5937: provenance twin of effectiveContextLimit — the egress fuse must
+        // NOT apply its anti-guess floor when the declared window is an explicit
+        // compress.modelContextLimit (a deliberate wall, not a registry miss).
+        // Rewritten every full-pipeline request, so no fork-inheritance entry is
+        // needed (same lifecycle as effectiveContextLimit above).
+        if (operatorWindowTuned === true) session.metadata.operatorWindowTuned = true;
+        else if (operatorWindowTuned === false) delete session.metadata.operatorWindowTuned;
+        // undefined: this request never ran window resolution (no model in the
+        // body) — leave any prior stamp untouched.
         // #955 runtime-info: record the model id + window source for this
         // session so /__bili/plugin/status can show them pre-first-request and
         // post-hoc forensics can tell which source sized the window.
@@ -3219,6 +3245,7 @@ async function handleRequest(
                         requestModel,
                         resolvedNativeWindow,
                         windowShrinkReason,
+                        operatorWindow,
                         route,
                         affinity,
                         anonAffinity !== null,

@@ -3784,6 +3784,11 @@ export async function preflightCompressIfNeeded(
     model: string | undefined,
     resolvedNativeWindow: number | undefined,
     windowShrinkReason: "operator" | "codex" | undefined,
+    // #5937: the operator's explicit compress.modelContextLimit for this request
+    // (post-self-heal, pre output-headroom), or undefined when no explicit
+    // setting exists. Metering bars judge it in preference to the raw native
+    // window; proven upstream evidence still clamps lower via `limit` (#5191).
+    operatorWindow: number | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
     anonymous: boolean,
@@ -4613,8 +4618,19 @@ export async function preflightCompressIfNeeded(
     const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
     const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
-    const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
-        && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
+    // #5937: the window the size-metering judgments run against. An explicit
+    // compress.modelContextLimit REPLACES the resolved native window (same
+    // substitution the judging chain above already applies via `limit`): a body
+    // over the operator's declared wall can never fit even when it fits the raw
+    // native window. Without an explicit setting this IS resolvedNativeWindow
+    // (or undefined) — behavior unchanged. Proven upstream evidence still wins:
+    // statedWall > 0 closes this arm entirely, and `limit` clamps every other
+    // judgment below (#5191).
+    const meteringWindow = typeof operatorWindow === "number" && operatorWindow > 0
+        ? operatorWindow
+        : typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : undefined;
+    const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof meteringWindow === "number"
+        && outboundCalibrated + outboundBudgetTokens <= meteringWindow;
     if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         // #5000/#4543: the measured body is the stronger reading — if it exceeds
@@ -4650,7 +4666,7 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846/#4185)`);
         } else {
             const viaNativeFit = nativeFitAfterClamp && !noUpstreamEvidence && !unknownBaseline;
-            log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the native window ${resolvedNativeWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)`);
+            log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the effective window ${meteringWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185, #5937)`);
             return outbound;
         }
     }
