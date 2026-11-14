@@ -116,6 +116,16 @@ npm test               # node --import tsx --test tests/*.test.ts (bili suite; k
 
 Test against the REAL published artifact: `npm run build && npm install -g billion-context@latest && bili start --port 8787`. `npm install -g . --install-links` also works, but `--install-links` is REQUIRED on npm ≥ 9 (without it the global install is a SYMLINK to the dev tree — leaks edits and silently re-links on reinstall, #1225). Verify: `readlink $(npm root -g)/billion-context` — empty = real copy. Full recipe: [reference/testing.md](reference/testing.md).
 
+**Per-model / per-purpose testing:** keep one config file per model under `~/.config/billion-context/<name>.json` and switch with `-c` (short for `--config`) instead of exporting `BILI_CONFIG_FILE`:
+
+```bash
+bili start -c dsh-test            # plain proxy with the dsh-test.json config
+bili -c dsh-test pi               # launcher lane: the spawned proxy inherits the same named config
+bili -c typo-ref                  # refuses to start (exit 2) and lists the names that exist
+```
+
+Resolution rule: a value with `/` (or `\`, or an existing file in the CWD) is a PATH exactly as before; a bare NAME maps to `<configDir>/<NAME>.json`. A missing NAME fails fast with the sibling list; a missing explicit PATH keeps its historical empty-config behavior.
+
 ### E2E Regression (real client through bili)
 
 The `tests/e2e/` suites are the only coverage that exercises real client behavior (UA, wire quirks, retry loops):
