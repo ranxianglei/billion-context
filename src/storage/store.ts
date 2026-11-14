@@ -357,7 +357,8 @@ export interface IngestSessionInput {
  *  namespace by convention like "r3:" / "web:" / "lane:"), hostile by
  *  accident is what we guard, not hostile by design. */
 const EXT_KEY_MAX = 256;
-const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+/** Shared ceiling for producers of bounded kv / session_ext snapshots. */
+export const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
 export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {

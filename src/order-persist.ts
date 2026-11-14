@@ -8,6 +8,7 @@ import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
 import { persistDebounceMs, persistMaxDelayMs } from "./knobs.js";
 import { kvStore } from "./persist.js";
+import { EXT_VALUE_MAX_BYTES } from "./storage/store.js";
 
 /**
  * #3397: session-order skeleton persistence. The resolver's recorded
@@ -113,15 +114,16 @@ function mergeWithDisk(mine: OrderSkeletonEntry[], disk: OrderSkeletonEntry[]): 
  *  one entry per conversation that churns through the lifetime. Frags can also
  *  grow with turn count — the byte budget keeps the debounced serialization
  *  cheap even for a pathological snapshot (freshest entries kept first). */
-function normalizeForWrite(entries: OrderSkeletonEntry[]): OrderSkeletonEntry[] {
-    const capped = entries.length <= MAX_ORDER_ENTRIES
-        ? entries
-        : [...entries].sort((a, b) => b.lastSeen - a.lastSeen).slice(0, MAX_ORDER_ENTRIES);
+function normalizeForWrite(entries: OrderSkeletonEntry[], maxBytes = MAX_SNAPSHOT_BYTES): OrderSkeletonEntry[] {
+    // The byte budget can bind well before the entry-count cap, so order the
+    // union by recency FIRST: otherwise a large history evicts the newest
+    // conversations merely because older records sit earlier in the array.
+    const capped = [...entries].sort((a, b) => b.lastSeen - a.lastSeen).slice(0, MAX_ORDER_ENTRIES);
     const kept: OrderSkeletonEntry[] = [];
     let size = JSON.stringify({ version: 1, entries: [] }).length;
     for (const e of capped) {
-        const delta = JSON.stringify(e).length + 1;
-        if (kept.length > 0 && size + delta > MAX_SNAPSHOT_BYTES) break;
+        const delta = Buffer.byteLength(JSON.stringify(e), "utf8") + 1;
+        if (kept.length > 0 && size + delta > maxBytes) break;
         kept.push(e);
         size += delta;
     }
@@ -176,7 +178,7 @@ function persistUnifiedNow(): Promise<void> {
         }
         const mine = orderSnapshot();
         const merged = live === null ? mine : mergeWithDisk(mine, live);
-        const entries = normalizeForWrite(merged);
+        const entries = normalizeForWrite(merged, EXT_VALUE_MAX_BYTES);
         await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries });
     }).catch((err) => {
         kvWarnOnce("persist", err);
@@ -217,7 +219,7 @@ export async function hydrateOrderUnified(): Promise<void> {
         // One-time migration: file rows missing from the store travel up once.
         const kvIds = new Set(kvEntries.map((e) => e.id));
         if (!hadRow || fileEntries.some((e) => !kvIds.has(e.id))) {
-            await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries: normalizeForWrite(merged) });
+            await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries: normalizeForWrite(merged, EXT_VALUE_MAX_BYTES) });
             if (!hadRow && merged.length > 0) log("info", `[session-order] migrated ${merged.length} skeleton(s) from the legacy JSON file into unified storage`);
         }
         kvReady = true;
