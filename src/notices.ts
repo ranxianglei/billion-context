@@ -7,10 +7,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { effectivePromptCacheRouting, loadConfigFile } from "./config.js";
+import { fileStorageBackend, fileStorageJsonWriter, fileStorageUnified, persistEnabled, resolveJsonWriterChoice, resolveStorageMode, unifiedSelectionIsSqlite } from "./knobs.js";
 import { resolveDshHome } from "./client-config.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { featureOverrideAbsent } from "./rollout.js";
-import { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, dismissedUpgradeNotices, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "./pck-notice.js";
+import { resolveBackendName } from "./storage/backend.js";
+import { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, SQLITE_DEFAULT_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissedUpgradeNotices, pckNoticeActive } from "./pck-notice.js";
+export { SQLITE_DEFAULT_NOTICE_ID };
 
 interface NoticeEntry {
     readonly id: string;
@@ -57,7 +60,39 @@ export const NOTICES: readonly NoticeEntry[] = [
             !dismissedUpgradeNotices(process.env).has(IOT_INCOMPAT_NOTICE_ID) &&
             dshIotThinkingActive(process.env),
     },
+    // This release: the storage default flipped to pure-sqlite — JSON
+    // envelopes are no longer written by default, so index.db is the sole
+    // durable copy. Visible while the DEFAULT posture is in effect (explicit
+    // full / explicit jsonWriter choice = the user made the call) and not
+    // dismissed.
+    {
+        id: SQLITE_DEFAULT_NOTICE_ID,
+        tone: "warn",
+        keys: { on: "sqdef.on", desc: "sqdef.desc", hint: "sqdef.hint", dismiss: "sqdef.dismiss_btn" },
+        active: () =>
+            !dismissedUpgradeNotices(process.env).has(SQLITE_DEFAULT_NOTICE_ID) &&
+            sqliteDefaultNoticeActive(process.env),
+    },
 ];
+
+/** Is the NEW default posture actually in effect? Pure-sqlite selection
+ *  (storage.unified absent or "sqlite"), no explicit jsonWriter choice at
+ *  either tier (an explicit on/off means the user made the call), the sqlite
+ *  backend open, no encryption, persistence enabled. Never throws. */
+export function sqliteDefaultNoticeActive(env: NodeJS.ProcessEnv = process.env): boolean {
+    try {
+        const fileUnified = fileStorageUnified();
+        const fileJson = fileStorageJsonWriter();
+        if (resolveJsonWriterChoice(env, fileJson) !== "unset") return false;
+        if (!unifiedSelectionIsSqlite(env, fileUnified)) return false;
+        if (resolveStorageMode(env, fileUnified) !== "full") return false;
+        if (env.BILI_ENCRYPTION_KEY !== undefined && env.BILI_ENCRYPTION_KEY !== "") return false;
+        if (resolveBackendName(env, fileStorageBackend()) !== "sqlite") return false;
+        return persistEnabled();
+    } catch {
+        return false;
+    }
+}
 
 /** Uncached: does ANY dsh profile carry the iot-thinking plugin? Never throws
  *  (no profiles / unreadable home ⇒ false — an advisory must not fail a page). */

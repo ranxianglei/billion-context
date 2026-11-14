@@ -23,7 +23,7 @@ Companion package mechanics mirror `advisories/` (#1481):
 | version  | yes      | Exact released version (semver)                    |
 | date     | no       | `YYYY-MM-DD` release date                          |
 | tier     | yes      | `routine` (default) / `recommended` (restart soon, record-only) / `critical` (see below) |
-| summary  | yes      | One user-meaningful line, ≤400 chars, model-written|
+| summary  | yes      | One user-meaningful line, ≤400 chars, model-written. Clients enforce the same bound on read: line breaks collapse into spaces, longer text is truncated |
 | summaryZh | no      | Chinese one-liner (≤400 chars) — zh-locale web surfaces pick it; `/acp` text stays English. Unset = every locale uses `summary` |
 | minVersion | no      | Targeting: only RUNNING versions ≥ this (inclusive) see the entry. Unset = no floor |
 | maxVersion | no      | Targeting: only RUNNING versions ≤ this (inclusive) see the entry. Unset = no ceiling |
