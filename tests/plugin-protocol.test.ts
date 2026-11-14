@@ -65,8 +65,8 @@ function textScript(): string[] {
     ];
 }
 
-function compressToolScript(): string[] {
-    const compressArgs = JSON.stringify({ startId: "m00001", endId: "m00002", topic: "plugin-e2e-topic", summary: "plugin e2e compress summary" });
+function compressToolScript(summary = "plugin e2e compress summary with enough context about the folded range"): string[] {
+    const compressArgs = JSON.stringify({ startId: "m00001", endId: "m00002", topic: "plugin-e2e-topic", summary });
     return [
         anthropicSse("message_start", {
             type: "message_start",
@@ -172,14 +172,15 @@ async function callPluginAnthropic(
     h: Harness,
     conversationId: string,
     messages: AnthropicMessage[],
-    opts: { tools?: unknown[]; stream?: boolean; contextWindow?: number } = {},
+    opts: { tools?: unknown[]; stream?: boolean; contextWindow?: number; compressionProxy?: boolean; agent?: string } = {},
 ): Promise<{ raw: string; events: SseEvent[]; json: Record<string, unknown> | undefined }> {
     const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
         method: "POST",
         headers: {
             "content-type": "application/json",
-            "x-bili-plugin": "pi-plugin/0.0.1",
+            "x-bili-plugin": opts.agent ?? "pi-plugin/0.0.1",
             "x-bili-plugin-conversation": conversationId,
+            ...(opts.compressionProxy ? { "x-bili-plugin-compression": "proxy" } : {}),
             ...(opts.contextWindow !== undefined ? { "x-bili-plugin-context-window": String(opts.contextWindow) } : {}),
         },
         body: JSON.stringify({
@@ -843,6 +844,58 @@ test("plugin-reported context window becomes the nudge denominator and is visibl
             contextLimit: number | null;
         };
         assert.equal(status2.contextLimit, 400000);
+    } finally {
+        await h.close();
+    }
+});
+
+function sizedPluginHistory(): AnthropicMessage[] {
+    const headFiller = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(28);
+    const tailFiller = "enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate. ".repeat(28);
+    const history: AnthropicMessage[] = [];
+    for (let i = 1; i <= 2; i++) {
+        history.push({ role: "user", content: `turn-${i}-marker question: ${headFiller}` });
+        history.push({ role: "assistant", content: `turn-${i}-marker answer: ${headFiller}` });
+    }
+    for (let i = 3; i <= 5; i++) {
+        history.push({ role: "user", content: `turn-${i} padding question: ${tailFiller}` });
+        history.push({ role: "assistant", content: `turn-${i} padding answer: ${tailFiller}` });
+    }
+    return history;
+}
+
+test("plugin-bound proxy compression continues the tool loop instead of ending on the marker", async () => {
+    const h = await startHarness([compressToolScript(), textScript()], undefined, { visibilityMarkers: false });
+    try {
+        const { raw } = await callPluginAnthropic(h, "20261031_032204_cec004da", sizedPluginHistory(), {
+            agent: "hermes",
+            tools: ["tool_search", "tool_describe", "tool_call"].map((name) => ({
+                name, description: `Hermes ${name}`, input_schema: { type: "object", properties: {} },
+            })),
+            compressionProxy: true,
+        });
+
+        assert.equal(h.captured.length, 2, `proxy compression must re-request the model after executing compress; raw=${raw}`);
+        assert.ok(raw.includes("plain answer"), `expected the continued answer, got: ${raw}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("a successful compression summary containing FAILED still continues with markers hidden", async () => {
+    const summary = "summary records an earlier FAILED tool result while this compression itself succeeds";
+    const h = await startHarness([compressToolScript(summary), textScript()], undefined, { visibilityMarkers: false });
+    try {
+        const { raw } = await callPluginAnthropic(h, "plug-conv-failed-in-summary", sizedPluginHistory(), {
+            agent: "hermes",
+            tools: ["tool_search", "tool_describe", "tool_call"].map((name) => ({
+                name, description: `Hermes ${name}`, input_schema: { type: "object", properties: {} },
+            })),
+            compressionProxy: true,
+        });
+
+        assert.equal(h.captured.length, 2, `a success marker must not be classified by FAILED inside its summary; raw=${raw}`);
+        assert.ok(raw.includes("plain answer"), `expected the continued answer, got: ${raw}`);
     } finally {
         await h.close();
     }
