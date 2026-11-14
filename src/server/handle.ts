@@ -70,7 +70,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import {demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools} from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
