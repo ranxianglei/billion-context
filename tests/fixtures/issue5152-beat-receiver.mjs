@@ -3,7 +3,7 @@
 // reaching it while the sender's own thread was pinned. An in-process receiver
 // would be pinned by the same block and the proof would be vacuous.
 import http from "node:http";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 
 const out = process.argv[2];
 if (!out) throw new Error("usage: issue5152-beat-receiver.mjs <beat-log-path>");
@@ -17,5 +17,12 @@ const server = http.createServer((req, res) => {
     });
 });
 server.listen(0, "127.0.0.1", () => {
-    appendFileSync(`${out}.port`, String(server.address().port));
+    // Publish the port ATOMICALLY. appendFileSync opens (creates) the file
+    // before writing its bytes, so a parent polling existsSync() can observe an
+    // empty file and read Number("") === 0 — the #5152 CI flake. rename() is
+    // atomic within one filesystem, so every observer sees either no file or
+    // the complete port.
+    const tmp = `${out}.port.tmp`;
+    writeFileSync(tmp, String(server.address().port));
+    renameSync(tmp, `${out}.port`);
 });

@@ -48,7 +48,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { endsWithAnnouncement, isDraftDump, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -1290,14 +1290,15 @@ export async function* runCompressLoop(
                 const stalledTail: "draft" | "announce" | null =
                     assistantText.length === 0 || calls.length > 0
                         ? null
-                        : endsWithDraftClose(assistantText)
+                        : isDraftDump(assistantText)
                           ? "draft"
                           : endsWithAnnouncement(assistantText)
                             ? "announce"
                             : null;
-                // #2303: a terminal turn that DID deliver visible prose but ends with a
-                // compression-draft closing tag (summary/analysis close forms) and no
-                // tool call — the model wrote a handoff/compression draft in prose
+                // #2303: a terminal turn that DID deliver visible prose but carries a
+                // compression-draft dump (tail close form, or the analysis-to-summary
+                // envelope mid-text, #5175) and no tool call — the model wrote a
+                // handoff/compression draft in prose
                 // instead of issuing the action it described, most often after the
                 // upstream cut the final tool call out of the step (149 silent stops /
                 // 70 sessions, DSH native). Same non-convergence as the zero-visible
@@ -1320,7 +1321,7 @@ export async function* runCompressLoop(
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
-                    (stalledTail === "draft" || stalledTail === "announce") &&
+                    stalledTail !== null &&
                     // #2612: the client's own compaction request instructs the
                     // model to answer with a plain-text summary block and no
                     // tool call — that compliant reply is a draft tail by
@@ -1334,7 +1335,7 @@ export async function* runCompressLoop(
                         ctx.log(`[acp-loop] round ${round}: terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with continuation nudge (#3905)`);
                         loggerLog("warn", `[acp-loop] announcement-tail auto-retry round ${round} (session ${ctx.session.id})`);
                     } else {
-                        ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                        ctx.log(`[acp-loop] round ${round}: terminal turn carries a compression-draft dump (tail or mid-text envelope) and no tool call; retrying once with continuation nudge (#2303)`);
                         loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
                     }
                     const nudge: CoreMessage = {
