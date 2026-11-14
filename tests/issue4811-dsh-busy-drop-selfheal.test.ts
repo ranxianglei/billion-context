@@ -362,7 +362,7 @@ test("B: the failure report samples this spawn's output, not offset 0 of a rotat
         const err2 = await pending2.then(() => undefined, (e: unknown) => e);
         assert.ok(err2 instanceof Error, "the silent child must still fail the bring-up");
         assert.equal(secondSpawnCalls, 1);
-        assert.match(err2.message, /this child appended nothing of its own/, "a zero-output child must be said so, not quoted from history");
+        assert.match(err2.message, /0 bytes since this spawn — EMPTY/, "a zero-output child must be said so, not quoted from history");
         assert.doesNotMatch(err2.message, /OLD NOISE|NEW LINE/, "an earlier spawn's bytes must never be quoted as this child's output");
     } finally {
         for (const [k, v] of Object.entries(prev)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
