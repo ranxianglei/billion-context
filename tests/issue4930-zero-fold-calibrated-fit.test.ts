@@ -367,13 +367,17 @@ test("#4930 raw-body fallback: processed-empty views measure the original body, 
     assert.equal(ff.status, 502);
 });
 
-test("#4930 unknown-baseline arbitration is untouched: anonymous fresh sessions still forward once for the upstream to arbitrate (#553/#3146)", async () => {
+test("#4930 unknown-baseline: anonymous fresh session with a measured over-window body is doomed locally (current policy, #5000/#4543)", async () => {
     const r = await runGate({ textTarget: RAW_OVER_TARGET, k: 0.9, anonymous: true });
-    // Over-window even by the char-count upper bound regime — the unknown-baseline
-    // arm judges result.fitsWindow (the loop's own raw-based value), NOT k̂.
+    // The measured-body gate now dominates inside the arbitration arm (#5000/#4543):
+    // a measured outbound body over the window is doomed locally for EVERY baseline
+    // regime, including the anonymous unknown baseline. The original forward-once
+    // size-arbitration only remains for measured-FITTING bodies, which this
+    // over-window fixture cannot produce.
     assert.ok(raw(r.t, r.oh, r.i) >= r.window, "payload must measure over-window raw");
-    assert.equal(isPreflightFailFast(r.outcome), false, "the forward-once arbitration must survive the fix");
-    assert.ok(r.logs.some((l) => l.includes("arbitrate size before failing fast")), `expected the #3146 arbitration log, got: ${r.logs.join(" | ")}`);
+    const ff = expectFailFast(r.outcome);
+    assert.equal(ff.status, 413, "measured over-window body is doomed locally (413)");
+    assert.ok(r.logs.some((l) => l.includes("body ITSELF exceeds the window")), `expected the measured-body doom log, got: ${r.logs.join(" | ")}`);
 });
 
 test("#4930 prior refusal closes the hatch: a deterministic exhaustion under a calibrated over-window verdict with a covering local refusal fails 413, no re-bet (#3846)", async () => {
