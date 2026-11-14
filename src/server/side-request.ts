@@ -5,6 +5,7 @@ import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
+import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -72,6 +73,34 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
     return false;
 }
 
+const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
+
+/** #5073: structural identification of a tool-less structured-output utility
+ *  call — a memory-extraction daemon such as Hindsight (inheriting the host's
+ *  HTTPS_PROXY, under the main session id) sends no tools, asks for a JSON
+ *  reply (`response_format` of type `json_schema`/`json_object` on the chat
+ *  wire, or `text.format` of those types on the Responses wire), and carries a
+ *  large output budget. Such a call is a one-shot utility request, not an
+ *  agent turn: agent turns always carry an action surface (#546), so a strict
+ *  backend rejects `tools` injected beside `response_format` with a 400. It
+ *  therefore rides the #388 verbatim side passthrough.
+ *  The no-tools veto is part of the predicate (not only the caller's #546
+ *  guard) so callers that consult it independently of `isSideRequest` — the
+ *  restoreOutputBudget skip in handle.ts, the same category as the #2500
+ *  server-tool predicate — can never demote a tool-carrying main turn.
+ *  `{type:"text"}` is plain prose and does not count. */
+export function isStructuredOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const text = p.text;
+    const format = p.response_format
+        ?? (text !== null && typeof text === "object" ? (text as { format?: unknown }).format : undefined);
+    if (format === null || typeof format !== "object") return false;
+    const type = (format as { type?: unknown }).type;
+    return typeof type === "string" && STRUCTURED_FORMAT_TYPES.has(type);
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
@@ -84,6 +113,13 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // gets injected into it. Explicit host intent above still outranks this.
     if (isServerToolUtilityCall(p)) return true;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // #5073: a toolless request that demands a structured JSON reply is a
+    // utility call, not an agent turn (memory-extraction daemons such as
+    // Hindsight that inherit the host's HTTPS_PROXY, with a large output
+    // budget). Wire tools injected into it make strict backends reject the
+    // pair with a 400. Routed through the #388 side passthrough like the #2500
+    // server-tool shape above.
+    if (isStructuredOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
@@ -117,9 +153,9 @@ export function isDshTitleRequest(parsed: unknown): boolean {
 
 // #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
 // classifyRisk()) fires before every native tool call under the Auto permission
-// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
-// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
-// no tools, same conversation id as the main turn. On at least one deployment
+// tier: a fixed REVIEW_POLICY system prompt + a freshly-flattened user body
+// (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION), no
+// tools, same conversation id as the main turn. On at least one deployment
 // class (web profile behind a gateway) the extension's own model client reaches
 // bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
 // keeps the #2432 rebase gate armed for it: every header-gated isolation gate
@@ -130,12 +166,37 @@ export function isDshTitleRequest(parsed: unknown): boolean {
 // skips the output clamp (#453) into permanent upstream 400s.
 // Shape-decisive WITHOUT a caller-side header gate — deliberately different from
 // isDshTitleRequest's discipline: the shape carries its own client evidence
-// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// (dsh's fixed REVIEW_POLICY sentence, version-pinned like
 // DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
 // gate is precisely what failed here. A main turn can never match: it carries a
-// tools surface and multi-turn history; the single-blob bar rejects every
-// history-replaying request.
+// tools surface, and every entry-level loop below vetoes any assistant/tool
+// turn — which every real history resend has.
+// #6104: two bars were host-side FORMAT decisions that moved, not identity.
+// REVIEW_POLICY gained a `REVIEW_POLICY` banner line (the sentence is no longer
+// line 1 ⇒ line-scan, see DSH_AUTO_REVIEW_HEAD_LINES), and 0.2.2's
+// reviewMessages() replays the WHOLE conversation as role:"user" text blobs (so
+// the old `users === 1` bar rejected the very request it was written for, and
+// the review then ate the fold ledger it was supposed to leave alone: 107 DEAD
+// tombstones, 0 compressions across the reporter's 5 sessions). The replay veto
+// never needed the user count — the assistant/tool veto carries it.
 export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+// #6104: dsh versions its REVIEW_POLICY by PREFIXING it with a banner line
+// (`REVIEW_POLICY` on 0.2.2-rc.1), so a first-line pin silently misses the
+// whole review traffic on any host build that adds one more line above the
+// sentence. The pin stays version-pinned to the SENTENCE; only its position is
+// read tolerantly — the first few lines of the system carrier, never the whole
+// prompt (a policy QUOTED deep inside some other agent's prompt must not
+// identify a review call; the reporter's own #6104 body shows nothing else in
+// the request can rescue the match, so a miss here runs the review through the
+// full pipeline and tombstones its refs as DEAD).
+const DSH_AUTO_REVIEW_HEAD_LINES = 5;
+
+/** The pinned reviewer sentence on any line of the system carrier's head. */
+function isDshAutoReviewPolicy(text: string): boolean {
+    const lines = text.split("\n", DSH_AUTO_REVIEW_HEAD_LINES);
+    return lines.some((line) => line.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX));
+}
 
 export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
@@ -146,7 +207,7 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     // The fixed reviewer policy on ANY wire's system carrier (top-level system,
     // instructions, systemInstruction.parts, or a role:system entry in
     // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
-    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    if (!systemCarrierTexts(p).some(isDshAutoReviewPolicy)) return false;
     const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
     if (!Array.isArray(entries)) return false;
     let users = 0;
@@ -168,10 +229,37 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
             userHasContent = true;
         }
     }
-    // Exactly ONE non-system message with content: the freshly-flattened review
-    // snapshot. A replayed history (any assistant/tool turn or a second user
-    // message) vetoes — see the comment above the constant.
-    return users === 1 && userHasContent;
+    // ONE or MORE non-system messages with content: the freshly-flattened
+    // review snapshot (#4438) or its history-replaying form (#6104). The replay
+    // veto is the loop above — any assistant/tool turn returns false — so a real
+    // history resend can never reach this line, whatever its user count.
+    return users >= 1 && userHasContent;
+}
+/** #5687 follow-up: a sidecar never carries a durable-state marker. dsh injects
+ *  its durable payloads (skills, workspace instructions, MCP catalog, runtime
+ *  context, image typing, job notices) into the FIRST main turn's user blob. A
+ *  tool-less single-user body carrying one of those markers is therefore a MAIN
+ *  turn whose assistant surface happens to be empty — routing it to the verbatim
+ *  side lane skips the kernel, so the classifier can never stamp the carrier's
+ *  BLOCKED ref (#2419/#2446/#2447/#2481) and the wire-byte contracts of
+ *  #2817/#5403 reset. Genuine sidecars (title / enhance / translate /
+ *  auto-review) carry the host's own prompt and no marker, so they keep the
+ *  side lane. */
+function carriesDurableState(text: string): boolean {
+    for (const marker of dshCarrierRawMarkers) if (text.indexOf(marker) >= 0) return true;
+    return false;
+}
+
+/** #5687 follow-up (call-site narrowing): a utility sidecar pins a TINY fixed
+ *  output budget (host presets: prompt-enhance 4096). Agent main turns either
+ *  omit the field (openai wire) or size it from their conversation, so
+ *  `isDshSingleShotSidecar` alone over-matches the FIRST unstyled main turn. */
+const SINGLE_SHOT_SIDECAR_MAX_BUDGET = 8192;
+export function hasSingleShotBudget(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    const budget = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+    return typeof budget === "number" && budget > 0 && budget <= SINGLE_SHOT_SIDECAR_MAX_BUDGET;
 }
 
 // #5656/#5584: dsh's per-feature sidecar pins above (title #2503, auto-review
@@ -196,10 +284,12 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
 // A non-empty system carrier is REQUIRED so the kernel's empty-instructions
 // path (aux calls riding the main session through the full pipeline, pinned in
 // tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
-// Residual, accepted: a tool-less MAIN turn 1 matches the single-shot shape and
-// rides the verbatim side lane for that one turn (tiny — nothing to compress);
-// turn 2+ replays history and rejoins the full pipeline. The caller must gate
-// on the dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+// Residual, accepted (narrowed by #5687 follow-up): a tool-less MAIN turn 1
+// that ALSO passes the call-site budget screen (small pinned output,
+// hasSingleShotBudget) and carries no durable-state marker still rides the
+// verbatim side lane for that one turn; turn 2+ replays history and rejoins
+// the full pipeline. The caller must gate on the dsh lane
+// (evidence-per-client discipline, cf. isDshTitleRequest).
 export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
@@ -225,8 +315,16 @@ export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown)
         const c = rec.content ?? rec.parts;
         if (typeof c === "string") {
             if (c.length > 0) userHasContent = true;
+            // #5687 follow-up: a durable-state marker means this is a MAIN turn's
+            // injected context, never a utility sidecar.
+            if (carriesDurableState(c)) return false;
         } else if (Array.isArray(c) && c.length > 0) {
             userHasContent = true;
+            for (const part of c) {
+                if (part === null || typeof part !== "object") continue;
+                const text = (part as { text?: unknown }).text;
+                if (typeof text === "string" && carriesDurableState(text)) return false;
+            }
         }
     }
     return users === 1 && userHasContent;

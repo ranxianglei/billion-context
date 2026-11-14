@@ -64,7 +64,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
@@ -73,6 +73,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
+import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
@@ -346,14 +347,19 @@ async function forwardCaptured(
     v1Meta?: Record<string, unknown>,
     throttleModelHint?: string,
     onWireBody?: (body?: Buffer | string) => void,
+    releaseRequestInput?: () => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
-    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
+    const hostOwnsTruncationRecovery = req.headers[BILI_HOST_RECOVERY_OWNER_HEADER] === BILI_HOST_RECOVERY_OWNER_OMP;
+    // #4861: persistence answers "did the upstream turn finish?", not "is the
+// client socket still open?" — a client that hangs up on the terminal frame
+// (pi's shape) must not lose the finished reply. Partial turns (no terminal)
+// are still never captured.
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
-        onWireBody?.();
-        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
+        onWireBody?.();        releaseRequestInput?.();        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
         return;
@@ -362,6 +368,7 @@ async function forwardCaptured(
     // zero-egress contract as codexForge; the audit line was written in
     // prepare (this line is the egress-proof for the serve itself).
     if (prepared?.autoModeForge) {
+        releaseRequestInput?.();
         log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
         res.end(prepared.autoModeForge.body);
@@ -1965,6 +1972,11 @@ async function forwardCaptured(
             }
         }
     }
+    // No further overflow refold can run. Release its inbound-only state before
+    // consuming a potentially long response; wireBody still owns retry/echo data.
+    releaseRequestInput?.();
+    releaseRequestInput = undefined;
+    overflowRefold = undefined;
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
     // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is
@@ -2052,14 +2064,18 @@ async function forwardCaptured(
                 }
                 log("warn", `[${s.id}] upstream image-count wall (cap ${info.imageCountCap}, request carried ${info.imageCountSeen ?? "?"}) — learned for pre-send convergence on this route; no token-space arm (#4124)`);
             } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
-                // #4452: the gateway rewrote this overflow-shaped reject into a body with no
-                // parseable marker, so bili's self-heal cannot engage from it — name that here
-                // (+ the last meter reading) so a body-rewriting gateway's silent starvation is
-                // diagnosable from the log rather than the opaque line further down.
+                // #4452: a 413 IS the payload-size verdict, yet this body carries no
+                // parseable marker, so bili's self-heal cannot engage from it — name that
+                // here (+ the last meter reading) so a body-rewriting gateway's silent
+                // starvation is diagnosable from the log rather than the opaque line
+                // further down. Only 413 reaches this branch: an unmarked 400 is the
+                // generic malformed/schema-rejected bucket across relays and says nothing
+                // about size, so it is never diagnosed as overflow here (see
+                // isMarkerlessOverflowReject).
                 const est = s.stats.lastInputTokens > 0 ? s.stats.lastInputTokens : 0;
                 const win = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
                 const meterNote = est > 0 && win > 0 ? `; last settled input ~${Math.round(est)} vs effective window ${win}` : "";
-                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
+                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the payload-size rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -2096,7 +2112,15 @@ async function forwardCaptured(
         let snippet = bodyText.slice(0, 600).replace(/\s+/g, " ").trim();
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
-        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4452: a relay that fans out to several targets answers a total failure
+        // with ONE aggregate body whose real cause sits in the LAST attempt's
+        // `details.error.message` — past the 600-byte snippet above, so the log
+        // showed only "all targets failed". Append that single terminal cause
+        // (bounded + credential-scrubbed by the helper; empty when absent, leaving
+        // this line byte-identical to before). Read-only: no recovery decision
+        // here depends on it.
+        const terminalCause = rejectionDiagnosticSuffix(bodyText);
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
         // keyring_all_limited and every ambiguous response remain account-wide.
@@ -2266,7 +2290,13 @@ async function forwardCaptured(
                 // first attempt's status/content-type (a resolveFakeCompletion
                 // re-send is not reflected; the pipes' own diag says which
                 // retry budget was spent instead).
-                const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+                const upstreamMeta: UpstreamMeta = {
+                    status: upstream.status,
+                    contentType: upstream.headers.get("content-type") ?? undefined,
+                    requestId: upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id") ?? undefined,
+                    opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
+                    cfRay: upstream.headers.get("cf-ray") ?? undefined,
+                };
                 // #2346: intrinsic runaway-enumeration terminator for the plugin-streamed
                 // body (the incident lane). Applied after any fake-completion buffering so
                 // both the live and replayed paths are guarded; byte-verbatim otherwise.
@@ -2311,6 +2341,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        hostOwnsTruncationRecovery,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -2341,6 +2372,7 @@ async function forwardCaptured(
                         upstreamMeta,
                         reply,
                         opts.streamErrorShape,
+                        hostOwnsTruncationRecovery,
                     );
                 }
             } else {
@@ -2445,7 +2477,13 @@ async function forwardCaptured(
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         // #2328: pipes cite the first upstream response's HTTP identity.
-        const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+        const upstreamMeta: UpstreamMeta = {
+            status: upstream.status,
+            contentType: upstream.headers.get("content-type") ?? undefined,
+            requestId: upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id") ?? undefined,
+            opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
+            cfRay: upstream.headers.get("cf-ray") ?? undefined,
+        };
         if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
@@ -2478,6 +2516,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    hostOwnsTruncationRecovery,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2530,6 +2569,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    hostOwnsTruncationRecovery,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2557,6 +2597,7 @@ async function forwardCaptured(
                     upstreamMeta,
                     reply,
                     opts.streamErrorShape,
+                    hostOwnsTruncationRecovery,
                 );
             }
         } else if (

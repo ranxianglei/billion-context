@@ -13,7 +13,7 @@ async function serve(protocol: string, stream: boolean, chunks: Array<string | B
     const session = createSession(`handoff-test-${Math.random()}`);
     session.stats.requests = 1;
     const server = createServer((_req, res) => {
-        const reply = opts.capture === false ? undefined : createHandoffReply(session, () => !opts.abort && !res.destroyed);
+        const reply = opts.capture === false ? undefined : createHandoffReply(session);
         const input = new ReadableStream<Uint8Array>({ start(controller) {
             for (const chunk of chunks) controller.enqueue(Buffer.from(chunk));
             if (opts.error) controller.enqueue(Buffer.from(event({ type: "error", error: { message: "failed" } })));
