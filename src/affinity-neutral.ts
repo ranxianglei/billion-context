@@ -47,6 +47,11 @@ import { USER_IMAGE_PLACEHOLDER } from "./fold-reconcile.js";
  *    name+args remain a strong position discriminator).
  *  - consecutive anthropic assistant messages (thinking message + tool_use
  *    message) MERGE into one turn (openai renders the same turn once).
+ *  - parallel tool rounds (#6659): a round with N calls and no commentary
+ *    projects to ONE assistant turn with N calls on every wire — responses
+ *    renders it as adjacent function_call items with no preceding assistant
+ *    message, gemini as N functionCall parts + N functionResponse parts in
+ *    one user message; both reduce to the openai one-turn-per-round shape.
  *  - client synthetic markers (dsh "[model changed: …]" user turns —
  *    machinery notices, not user words) are dropped, same discipline as the
  *    #1148 leading system run and the #2636 placeholder lines.
@@ -239,7 +244,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const role = m.role === "model" ? "assistant" : typeof m.role === "string" ? m.role : "user";
             const texts: string[] = [];
             const calls: string[] = [];
-            let toolBody: string | undefined;
+            const toolBodies: string[] = [];
             for (const part of m.parts) {
                 if (!part || typeof part !== "object") continue;
                 const p = part as { text?: unknown; functionCall?: unknown; functionResponse?: unknown };
@@ -253,11 +258,16 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     // gemini clients wrap the tool body under an arbitrary key
                     // ({output:…}/{result:…}/{content:…}); a single-string-valued
                     // object IS the body — unwrap so it equals the openai render.
-                    if (typeof resp === "string") toolBody = resp;
+                    // A parallel round carries EVERY result in one user message's
+                    // parts — emit each in order (keeping only the last would
+                    // fork the chain on a protocol switch, #6659).
+                    let body: string;
+                    if (typeof resp === "string") body = resp;
                     else if (resp && typeof resp === "object" && !Array.isArray(resp)) {
                         const entries = Object.entries(resp as Record<string, unknown>);
-                        toolBody = entries.length === 1 && typeof entries[0]![1] === "string" ? entries[0]![1]! : canon(resp);
-                    } else toolBody = canon(resp ?? p.functionResponse);
+                        body = entries.length === 1 && typeof entries[0]![1] === "string" ? entries[0]![1]! : canon(resp);
+                    } else body = canon(resp ?? p.functionResponse);
+                    toolBodies.push(body);
                 }
             }
             // model turns MERGE into the pending assistant run — gemini splits
@@ -273,8 +283,8 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                 continue;
             }
             flushAssistant();
-            if (toolBody !== undefined) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
-            if (calls.length > 0 && toolBody === undefined) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
+            for (const body of toolBodies) turns.push({ kind: "tool", text: body, frags: [fragmentHash("tool", body, [])] });
+            if (calls.length > 0 && toolBodies.length === 0) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
             else if (texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
             continue;
         }
@@ -283,15 +293,16 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
         // {type:"function_call_output", …} arrive as siblings of messages.
         if (typeof m.type === "string" && m.type === "function_call" && typeof m.name === "string") {
             const call = `${m.name}\u0000${canonicalCallArgs(m.arguments)}`;
-            // codex splits assistant commentary and the tool call across items —
-            // merge into the pending run so it reduces like the openai render.
-            if (asst !== null) {
-                asst.calls = [...(asst.calls ?? []), call];
-                asstFrags.push(fragmentHash("assistant", "", [call]));
-                continue;
-            }
-            flushAssistant();
-            turns.push({ kind: "assistant", calls: [call], frags: [fragmentHash("assistant", "", [call])] });
+            // codex splits assistant commentary and the tool call across items,
+            // and a PARALLEL round with no commentary arrives as adjacent
+            // function_call items with no preceding assistant message — both
+            // must reduce to the ONE pending run the openai render uses (one
+            // turn per call would fork the chain on a protocol switch, #6659).
+            // The run flushes on the first non-assistant item, so sequential
+            // rounds (call → output → call) still stay separate turns.
+            asst = asst ?? { kind: "assistant", text: "", calls: [] };
+            asst.calls = [...(asst.calls ?? []), call];
+            asstFrags.push(fragmentHash("assistant", "", [call]));
             continue;
         }
         if (typeof m.type === "string" && (m.type === "function_call_output" || m.type === "local_shell_call_output")) {

@@ -201,6 +201,137 @@ test("#2791: dsh model-switch client markers are not user words — a marker tur
     assert.equal(after.sessionId, first.sessionId);
 });
 
+// #6659: a PARALLEL tool round with no assistant commentary. openai/anthropic
+// render it as one assistant turn carrying all calls + one tool turn per
+// result; responses renders it as adjacent function_call items with NO
+// preceding assistant message; gemini renders it as N functionCall parts in
+// one model message + N functionResponse parts in one user message. The
+// neutral projection must reduce all four to the same turns — otherwise a
+// stateless client's protocol switch forks the anonymous session.
+const parallelUser = "audit both ledgers";
+const parallelCalls = [
+    { name: "read_file", args: { path: "/a" } },
+    { name: "read_file", args: { path: "/b" } },
+];
+const parallelResults = ["ledger A: stable", "ledger B: stable"];
+
+function parallelOpenai(): Array<Record<string, unknown>> {
+    return [
+        { role: "user", content: parallelUser },
+        {
+            role: "assistant",
+            content: null,
+            tool_calls: parallelCalls.map((c, i) => ({ id: `call_${i + 1}`, type: "function", function: { name: c.name, arguments: JSON.stringify(c.args) } })),
+        },
+        ...parallelResults.map((r, i) => ({ role: "tool", tool_call_id: `call_${i + 1}`, content: r })),
+        { role: "user", content: "now summarize" },
+    ];
+}
+
+function parallelAnthropic(): Array<Record<string, unknown>> {
+    return [
+        { role: "user", content: [{ type: "text", text: parallelUser }] },
+        {
+            role: "assistant",
+            content: parallelCalls.map((c, i) => ({ type: "tool_use", id: `call_${i + 1}`, name: c.name, input: c.args })),
+        },
+        {
+            role: "user",
+            content: parallelResults.map((r, i) => ({ type: "tool_result", tool_use_id: `call_${i + 1}`, content: r })),
+        },
+        { role: "user", content: [{ type: "text", text: "now summarize" }] },
+    ];
+}
+
+function parallelResponses(): Array<Record<string, unknown>> {
+    return [
+        { type: "message", role: "user", content: [{ type: "input_text", text: parallelUser }] },
+        ...parallelCalls.map((c, i) => ({ type: "function_call", call_id: `call_${i + 1}`, name: c.name, arguments: JSON.stringify(c.args) })),
+        ...parallelResults.map((r, i) => ({ type: "function_call_output", call_id: `call_${i + 1}`, output: r })),
+        { type: "message", role: "user", content: [{ type: "input_text", text: "now summarize" }] },
+    ];
+}
+
+function parallelGoogle(): Array<Record<string, unknown>> {
+    return [
+        { role: "user", parts: [{ text: parallelUser }] },
+        { role: "model", parts: parallelCalls.map((c) => ({ functionCall: { name: c.name, args: c.args } })) },
+        { role: "user", parts: parallelResults.map((r, i) => ({ functionResponse: { name: parallelCalls[i]!.name, response: { output: r } } })) },
+        { role: "user", parts: [{ text: "now summarize" }] },
+    ];
+}
+
+test("#6659: a parallel tool round with no commentary projects to IDENTICAL turns on all four wires", () => {
+    const o = neutralTurns(parallelOpenai());
+    const a = neutralTurns(parallelAnthropic());
+    const r = neutralTurns(parallelResponses());
+    const g = neutralTurns(parallelGoogle());
+    assert.equal(o.length, a.length, `openai vs anthropic turn counts (got ${o.length} vs ${a.length})`);
+    assert.equal(o.length, r.length, `openai vs responses turn counts (got ${o.length} vs ${r.length})`);
+    assert.equal(o.length, g.length, `openai vs google turn counts (got ${o.length} vs ${g.length})`);
+    for (let i = 0; i < o.length; i++) {
+        const oc = neutralTurnCanonical(o[i]!);
+        assert.equal(oc, neutralTurnCanonical(a[i]!), `turn ${i} (${o[i]!.kind}) openai vs anthropic`);
+        assert.equal(oc, neutralTurnCanonical(r[i]!), `turn ${i} (${o[i]!.kind}) openai vs responses`);
+        assert.equal(oc, neutralTurnCanonical(g[i]!), `turn ${i} (${o[i]!.kind}) openai vs google`);
+    }
+    // The round must reduce to ONE assistant turn carrying BOTH calls, and
+    // BOTH tool results must survive (neither dropped nor last-only).
+    const callsTurn = o.find((t) => t.kind === "assistant" && t.calls !== undefined);
+    assert.ok(callsTurn, "the parallel round must project to an assistant calls turn");
+    assert.equal(callsTurn!.calls!.length, 2, "both parallel calls must land in the one turn");
+    assert.equal(o.filter((t) => t.kind === "tool").length, 2, "both tool results must survive the projection");
+});
+
+test("#6659: a parallel round keeps the SAME anonymous session across the responses and google switches", () => {
+    for (const [label, switched] of [
+        ["responses", parallelResponses()],
+        ["google", parallelGoogle()],
+    ] as const) {
+        const r = new PrefixAffinityResolver();
+        const first = r.resolve(parallelOpenai())!;
+        assert.equal(first.via, "new", `${label}: the openai lane establishes the session`);
+        r.note(first.sessionId, first.incomingDepth, first.tailHash, first.itemHashes, false, first.sketches, first.userFlags);
+        const sw = r.resolve(switched)!;
+        assert.equal(sw.via, "prefix", `${label}: the parallel round must resolve by exact prefix, not mint`);
+        assert.equal(sw.sessionId, first.sessionId, `${label}: the session must survive the protocol switch`);
+    }
+});
+
+test("#6659: SEQUENTIAL single-call rounds stay separate turns (the merge must not over-reach)", () => {
+    const seqOpenai: Array<Record<string, unknown>> = [
+        { role: "user", content: "go" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: "r1" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c2", type: "function", function: { name: "g", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c2", content: "r2" },
+    ];
+    const seqResponses: Array<Record<string, unknown>> = [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+        { type: "function_call", call_id: "c1", name: "f", arguments: "{}" },
+        { type: "function_call_output", call_id: "c1", output: "r1" },
+        { type: "function_call", call_id: "c2", name: "g", arguments: "{}" },
+        { type: "function_call_output", call_id: "c2", output: "r2" },
+    ];
+    const seqGoogle: Array<Record<string, unknown>> = [
+        { role: "user", parts: [{ text: "go" }] },
+        { role: "model", parts: [{ functionCall: { name: "f", args: {} } }] },
+        { role: "user", parts: [{ functionResponse: { name: "f", response: { output: "r1" } } }] },
+        { role: "model", parts: [{ functionCall: { name: "g", args: {} } }] },
+        { role: "user", parts: [{ functionResponse: { name: "g", response: { output: "r2" } } }] },
+    ];
+    const o = neutralTurns(seqOpenai).map(neutralTurnCanonical);
+    const r = neutralTurns(seqResponses).map(neutralTurnCanonical);
+    const g = neutralTurns(seqGoogle).map(neutralTurnCanonical);
+    assert.equal(o.length, 5, "two sequential rounds must stay two assistant turns");
+    assert.equal(r.length, o.length, `responses sequential turn count (got ${r.length} vs ${o.length})`);
+    assert.equal(g.length, o.length, `google sequential turn count (got ${g.length} vs ${o.length})`);
+    for (let i = 0; i < o.length; i++) {
+        assert.equal(r[i], o[i], `turn ${i} openai vs responses sequential`);
+        assert.equal(g[i], o[i], `turn ${i} openai vs google sequential`);
+    }
+});
+
 test("#2791: pre-upgrade (raw-hash) entries still match through the v1 fallback rung and upgrade on re-note", () => {
     const openai = openaiRender();
     // A TRUE pre-upgrade entry: the raw-wire (v1) products a pre-#2791
