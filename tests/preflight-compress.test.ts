@@ -62,6 +62,7 @@ function bigConversation(): Array<{ role: string; content: string }> {
 test("e2e: model switch to a smaller window → preflight compresses before forward", async () => {
     const calls: Array<{ stream: boolean; body: string }> = [];
     let streamCalls = 0;
+    const billedCalls: number[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -73,10 +74,16 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
             if (parsed.stream) {
                 // The real forward: normal 200 SSE. The first forward (big
                 // model) reports a 300k-token context; later ones (small
-                // model, post-preflight) report 1000.
+                // model, post-preflight) bill at chars/4 (billing caliber) so
+                // the report tracks the rebuilt payload's scale — the #4425
+                // non-main settle gate rejects reports an order of magnitude
+                // below the established session load, and a constant tiny
+                // mock would read as aux-shaped against the 300k incumbent.
                 streamCalls += 1;
+                const inputTokens = streamCalls === 1 ? 300_000 : Math.round(raw.length / 4);
+                if (streamCalls > 1) billedCalls.push(inputTokens);
                 res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse(streamCalls === 1 ? 300_000 : 1000));
+                res.end(okSse(inputTokens));
             } else {
                 // A preflight summarization call: non-streaming JSON message.
                 res.writeHead(200, { "content-type": "application/json" });
@@ -179,8 +186,12 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 
-        // The successful turn's usage report overwrote the 300k figure.
-        assert.equal(s2?.stats.lastInputTokens, 1000);
+        // The successful turn's usage report overwrote the 300k figure — it
+        // bills far below the incumbent but matches the prepared body it
+        // bills, so the #4425 gate admits it as this request's own report.
+        assert.ok(billedCalls.length >= 1, "a post-preflight forward was billed");
+        assert.equal(s2?.stats.lastInputTokensSource, "usage", "the baseline grade is the real report's, not the stale big-model one");
+        assert.equal(s2?.stats.lastInputTokens, billedCalls[billedCalls.length - 1], "the successful turn's usage report overwrote the 300k figure");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
@@ -284,6 +295,7 @@ test("e2e: no preflight when the context fits the (small) model window", async (
 
 test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the window → preflight compresses", async () => {
     const calls: Array<{ stream: boolean; body: string }> = [];
+    const billedCalls: number[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -293,8 +305,13 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
             calls.push({ stream: !!parsed.stream, body: raw });
             if (parsed.stream) {
+                // Billing caliber (chars/4 of the forwarded body): see the
+                // switch-test handler above for why a constant tiny mock
+                // would read as aux-shaped under the #4425 settle gate.
+                const inputTokens = Math.round(raw.length / 4);
+                billedCalls.push(inputTokens);
                 res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse(1000));
+                res.end(okSse(inputTokens));
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({
@@ -377,8 +394,12 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
 
         // The session's input baseline is corrected from 0 to the real
         // (small) post-fold size via the usage report — the next turn is not
-        // stuck on a stale figure.
-        assert.equal(s?.stats.lastInputTokens, 1000);
+        // stuck on a stale figure. (The rebuilt-payload estimate written by
+        // the post-preflight re-anchor is overwritten: the report matches the
+        // prepared body it bills, so the #4425 gate admits it.)
+        assert.ok(billedCalls.length >= 1, "the post-preflight forward was billed");
+        assert.equal(s?.stats.lastInputTokensSource, "usage", "the baseline grade is the real report's, not the local estimate");
+        assert.equal(s?.stats.lastInputTokens, billedCalls[billedCalls.length - 1], "baseline corrected from 0 to the real post-fold size via the usage report");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();
