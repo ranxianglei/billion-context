@@ -10,6 +10,7 @@ import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
+import { orderIsMainShaped } from "./session-resolve.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { blockOpsEnabled, effectiveBlockOpsConfig } from "./acp-block-ops.js";
@@ -1580,13 +1581,15 @@ function personaDescendantsOf(baseId: string): Session[] {
     return listSessions().filter((s) => s.id.startsWith(prefix) && (s.stats?.requests ?? 0) > 0 && now - (s.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS && holdsRefs(s));
 }
 
-/** #3397: highest ref number cited anywhere in the tool arguments
- *  (`mNNNNN`, the kernel's ref format) — recursive string walk. 0 = none. */
-function maxCitedRefNum(args: Record<string, unknown>): number {
-    let max = 0;
+/** #5582: every ref number cited anywhere in the tool arguments (`mNNNNN`,
+ *  the kernel's ref format) — recursive string walk. Within a session ids are
+ *  minted in order and NEVER reused (kernel contract), so membership in a
+ *  session's byRef map is proof that session minted the ref. */
+function citedRefSet(args: Record<string, unknown>): Set<string> {
+    const refs = new Set<string>();
     const visit = (v: unknown): void => {
         if (typeof v === "string") {
-            for (const m of v.matchAll(/\bm(\d{5,})\b/g)) max = Math.max(max, Number(m[1]));
+            for (const m of v.matchAll(/\bm(\d{5,})\b/g)) refs.add(`m${m[1]}`);
         } else if (Array.isArray(v)) {
             for (const item of v) visit(item);
         } else if (v !== null && typeof v === "object") {
@@ -1594,6 +1597,14 @@ function maxCitedRefNum(args: Record<string, unknown>): number {
         }
     };
     visit(args);
+    return refs;
+}
+
+/** #3397: highest ref number cited anywhere in the tool arguments
+ *  (`mNNNNN`, the kernel's ref format) — recursive string walk. 0 = none. */
+function maxCitedRefNum(args: Record<string, unknown>): number {
+    let max = 0;
+    for (const ref of citedRefSet(args)) max = Math.max(max, Number(ref.slice(1)));
     return max;
 }
 
@@ -1649,6 +1660,121 @@ function livePersonaDescendant(parent: Session, maxCited?: number): Session | un
         if (fits.length > 0) return fits[0]; // listSessions order = lastSeen desc
     }
     return cands[0];
+}
+
+/** #5582 stub-parent rescue thresholds. A sidecar-stub parent mints ~1-2 refs
+ *  per claimant blob (the title sidecar's single user message + its reply); a
+ *  real turn sequence passes STUB_PARENT_MAX_REFS within its first exchanges,
+ *  and RECOGNIZED sidecars ride the passthrough lane minting nothing.
+ *  FOLLOW_MIN_DEPTH_REFS is conversation scale: aux lanes ingest ~1-3 refs per
+ *  firing (#2948 class), so a lane that deep is the owner conversation, not a
+ *  sidecar. */
+const STUB_PARENT_MAX_REFS = 8;
+const FOLLOW_MIN_DEPTH_REFS = 32;
+
+/** #5582: rank descendant candidates that all provably hold the cited refs
+ *  (or fit their frontier). Every session mints its OWN numbering space from
+ *  m00001, so bare recency (#3397's fits[0]) can chase a chatty sidecar whose
+ *  space merely OVERLAPS the citation. Ladder: outbound-witness match first
+ *  (decisive when present), then freshness, then MAIN-shaped recorded
+ *  skeleton (the owner conversation, not an aux blob), then minted-frontier
+ *  descent (the conversation that grew past the citation owns it), then
+ *  lastSeen, then id for determinism. */
+function rankRefCandidates(cands: Session[], witnessId?: string): Session | undefined {
+    const now = Date.now();
+    const sorted = [...cands].sort((a, b) => {
+        const aw = a.id === witnessId ? 1 : 0;
+        const bw = b.id === witnessId ? 1 : 0;
+        if (aw !== bw) return bw - aw;
+        const af = now - (a.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS ? 1 : 0;
+        const bf = now - (b.lastSeen ?? 0) <= PERSONA_LINEAGE_FRESH_MS ? 1 : 0;
+        if (af !== bf) return bf - af;
+        const am = orderIsMainShaped(a.id) ? 1 : 0;
+        const bm = orderIsMainShaped(b.id) ? 1 : 0;
+        if (am !== bm) return bm - am;
+        const fr = highestMintedRefNum(b) - highestMintedRefNum(a);
+        if (fr !== 0) return fr;
+        const ls = (b.lastSeen ?? 0) - (a.lastSeen ?? 0);
+        if (ls !== 0) return ls;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    return sorted[0];
+}
+
+/** #5582: the descendant of a RAW base id that holds the CITED refs — the
+ *  rescue for the #2156/#5582 split-brain: a non-recognized sidecar claimed
+ *  the virgin raw-key anchor and the whole main conversation forked onto
+ *  `|sub:<fp>` for life, so every host-stamped management call (compress /
+ *  acp_status / decompress keep stamping the raw id) lands on the sidecar
+ *  stub and dies "total compressible content too small". Two tiers:
+ *   1. SHARP — EVERY cited ref sits in the candidate's byRef map. Ids are
+ *      never reused within a session (kernel contract), so membership proves
+ *      the candidate minted them;
+ *   2. FRONTIER FIT — only when tier 1 finds nothing and the args cite a max
+ *      ref: the candidate's minted frontier reached past the citation (covers
+ *      compaction-pruned byRef entries, the #421 class).
+ * No freshness gate: an idle-return hours later must still route home — the
+ * refs are hard evidence, unlike lastSeen. No requests>0 gate either:
+ * holdsRefs suffices. Undefined when nothing qualifies (fail closed — the
+ * caller keeps today's behavior). */
+function descendantServingRefs(baseId: string, citedRefs: Set<string>, maxCited: number, witnessId?: string): Session | undefined {
+    if (baseId.includes("|sub:") || citedRefs.size === 0) return undefined;
+    const prefix = `${baseId}|sub:`;
+    const pool = listSessions().filter((s) => s.id.startsWith(prefix) && holdsRefs(s));
+    if (pool.length === 0) return undefined;
+    const sharp = pool.filter((s) => {
+        const byRef = s.state.messageRefs?.byRef ?? {};
+        for (const ref of citedRefs) if (!(ref in byRef)) return false;
+        return true;
+    });
+    const tier = sharp.length > 0 ? sharp : (maxCited > 0 ? pool.filter((s) => highestMintedRefNum(s) >= maxCited) : []);
+    return rankRefCandidates(tier, witnessId);
+}
+
+/** #5582: a RAW-key session squatted on by a non-main conversation — minted
+ *  frontier at sidecar-blob scale (≤ STUB_PARENT_MAX_REFS) AND a recorded
+ *  skeleton that is not main-shaped. The second conjunct is the veto: a
+ *  genuinely YOUNG real conversation sits below the ref threshold too, and it
+ *  is never treated as a stub (its management calls stay put, full stop). */
+function isStubParentShape(parent: Session): boolean {
+    return !parent.id.includes("|sub:") && highestMintedRefNum(parent) <= STUB_PARENT_MAX_REFS && !orderIsMainShaped(parent.id);
+}
+
+/** #5582: stub-parent rescue for host-stamped native calls. Fires ONLY when
+ *  the resolved parent provably CANNOT serve the call:
+ *   - ref-citing args: the parent's minted frontier sits below the max cited
+ *     ref (it cannot hold them). A parent whose frontier reaches the citation
+ *     serves its own refs and is NEVER bypassed — that guard preserves the
+ *     #2601 fusion-board incident shape (an active parent with a fresher
+ *     parallel fork stays authoritative);
+ *   - ref-less args (acp_status / acp_cache / block-less decompress): the
+ *     parent is a STUB — frontier ≤ STUB_PARENT_MAX_REFS AND its recorded
+ *     skeleton is not main-shaped (orderIsMainShaped: a genuinely young real
+ *     conversation is never bypassed) — with EXACTLY ONE fresh descendant at
+ *     conversation depth (frontier ≥ FOLLOW_MIN_DEPTH_REFS; ambiguity fails
+ *     closed and stays put).
+ * Returns the target or undefined (today's behavior, unchanged). */
+function stubParentFollow(parent: Session, maxCited: number, citedRefs: Set<string>, witnessId?: string): Session | undefined {
+    if (parent.id.includes("|sub:")) return undefined;
+    const parentFrontier = highestMintedRefNum(parent);
+    if (maxCited > 0) {
+        if (parentFrontier >= maxCited) return undefined;
+        return descendantServingRefs(parent.id, citedRefs, maxCited, witnessId);
+    }
+    if (!isStubParentShape(parent)) return undefined;
+    const cands = personaDescendantsOf(parent.id);
+    const deep = cands.filter((s) => highestMintedRefNum(s) >= FOLLOW_MIN_DEPTH_REFS);
+    if (deep.length === 0) {
+        // Sole-descendant fallback (#5582): exactly one live descendant and it
+        // holds strictly more history than the stub — nothing to chase wrong,
+        // so heal early instead of waiting for the conversation to grow past
+        // the depth gate. Multiple shallow descendants stay ambiguous → put.
+        if (cands.length === 1 && highestMintedRefNum(cands[0]) > parentFrontier) return cands[0];
+        return undefined;
+    }
+    const mains = deep.filter((s) => orderIsMainShaped(s.id));
+    const pool = mains.length > 0 ? mains : deep;
+    return pool.length === 1 ? pool[0] : undefined;
 }
 
 /** #2601: pick the witness session when it is a fresh `|sub:` fork of the
@@ -2329,8 +2455,23 @@ export async function handlePluginTool(
                     witnessLastSeen,
                 });
             } else {
-                routedBy = "native";
-                deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+                // #5582: the witness may name a descendant the lineage check
+                // above rejected (idle >10min / no traffic bookkeeping) while
+                // the resolved parent is a sidecar stub that provably lacks
+                // the cited refs — honoring the caller would die "ref above
+                // highest allocated". The cited refs are hard evidence: follow
+                // the descendant that holds them. No rescue → today's
+                // honor-the-caller behavior, unchanged.
+                const citedRefsA = citedRefSet(bodyArgs);
+                const rescue = stubParentFollow(session, maxCitedRefNum(bodyArgs), citedRefsA, witnessIds.values().next().value);
+                if (rescue) {
+                    session = rescue;
+                    routedBy = "native";
+                    deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" sits on a sidecar stub lacking the cited refs — following descendant "${rescue.id}" that holds them (#5582)`);
+                } else {
+                    routedBy = "native";
+                    deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+                }
             }
         } else if (session && nativeCaller) {
             // #2601 no-witness case: host-initiated nudges (dsh's periodic
@@ -2341,11 +2482,23 @@ export async function handlePluginTool(
             // #3397: among several live forks, the args' cited refs pick the
             // fork whose ref space can hold them (recency alone chased dsh's
             // chatty sidecar persona instead of the owner conversation).
-            const live = livePersonaDescendant(session, maxCitedRefNum(bodyArgs));
-            if (live) {
-                session = live;
+            const citedMaxB = maxCitedRefNum(bodyArgs);
+            // #5582: route on EVIDENCE whenever the parent provably cannot
+            // serve the call — the citation sits past its minted frontier, or
+            // it is a ref-less call against a sidecar-stub parent. In those
+            // shapes the birth-order rule is unsound: with several forks
+            // alive it chases the newest-born SHALLOW aux lane (#3397's
+            // recency failure mode) and dies there, while the deep owner
+            // conversation sits untouched. Every other shape keeps the
+            // pre-#5582 path byte-identical.
+            const evidenceRouted = isStubParentShape(session) || highestMintedRefNum(session) < citedMaxB;
+            const rescueB = evidenceRouted
+                ? stubParentFollow(session, citedMaxB, citedRefSet(bodyArgs))
+                : livePersonaDescendant(session, citedMaxB);
+            if (rescueB) {
+                session = rescueB;
                 routedBy = "native";
-                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live fork "${live.id}" (#2601)`);
+                deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live fork "${rescueB.id}" (${evidenceRouted ? "#5582" : "#2601"})`);
             }
         }
     } else if (witnessIds.size === 1) {
