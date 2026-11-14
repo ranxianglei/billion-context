@@ -19,6 +19,7 @@ import {
     APIG_RESIGN_CREDENTIAL_HEADER,
     APIG_RESIGN_HEADER,
     APIG_RESIGN_SCHEME,
+    KNOWN_SIGNATURE_SCHEMES,
     apigBenefitFor,
     clearSignedRefusal,
     decodeApigCredential,
@@ -29,6 +30,7 @@ import {
     resignApig,
     resignEnabled,
     resignPassthroughEnabled,
+    signedRefusal,
     signApigHeaders,
     type ApigCredential,
     unresolvedRefusals,
@@ -524,6 +526,8 @@ test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED; passthrou
         const payload = JSON.parse(await result.text()) as { error: { code: string; message: string } };
         assert.equal(payload.error.code, "bili_resign_unavailable");
         assert.match(payload.error.message, /x-ofm-signature/, "names the offending scheme");
+        assert.match(payload.error.message, /#4632/, "carries the service-side block note (#4632), not a re-signer promise");
+        assert.doesNotMatch(payload.error.message, /until bili ships re-signing support/, "no re-signer promise for a deliberately blocked channel");
         assert.deepEqual(dispatches, ["refused"]);
         assert.equal(pendingMap()["x-ofm-signature"]?.count, 1, "refusal remembered for the startup reminder");
         assert.equal(pendingMap()["x-ofm-signature"]?.origin, "http://127.0.0.1:9199");
@@ -546,6 +550,38 @@ test("#2090 intercept: x-ofm-signature (the reported bug) → REFUSED; passthrou
     }
     // iii) the reminder stays until bili ships the re-signer — the inert opt-in does not clear it
     assert.ok(pendingMap()["x-ofm-signature"], "inert passthrough leaves the pending record in place");
+});
+
+test("#4632 registry: x-ofm-signature carries the block+stance+options note (en + zh); other schemes do not", () => {
+    const ofm = KNOWN_SIGNATURE_SCHEMES["x-ofm-signature"];
+    assert.ok(ofm.note, "english note present");
+    assert.ok(ofm.noteZh, "chinese note present for the bilingual web UI");
+    assert.match(ofm.note, /#4632/, "names the blocking issue");
+    assert.match(ofm.note, /does not support software that violates others' terms of service/, "carries the stance statement");
+    assert.match(ofm.note, /bili plugin remove dsh/, "offers the remove-the-plugin option");
+    for (const name of ["sdk-hmac-sha256", "aws4-hmac-sha256", "hmac-sha256"]) {
+        assert.equal(KNOWN_SIGNATURE_SCHEMES[name].note, undefined, `${name} has no note — its refusal keeps the generic promise`);
+        assert.equal(KNOWN_SIGNATURE_SCHEMES[name].noteZh, undefined, `${name} has no zh note`);
+    }
+});
+
+test("#4632 note: x-ofm refusal message carries the note; un-noted and built-in schemes keep their messages", () => {
+    const msg = (r: { body: string }): string => (JSON.parse(r.body) as { error: { message: string } }).error.message;
+    // i) positive: the registry note is rendered into the x-ofm refusal
+    const ofmMsg = msg(signedRefusal("x-ofm-signature", "openai"));
+    assert.match(ofmMsg, /#4632/, "states the service-side block");
+    assert.match(ofmMsg, /does not support software that violates others' terms of service/, "stance statement present");
+    assert.match(ofmMsg, /Do NOT restore this channel/, "warns against the signature-invalid escape hatch");
+    assert.doesNotMatch(ofmMsg, /until bili ships re-signing support/, "no re-signer promise for a deliberately blocked channel");
+    assert.doesNotMatch(ofmMsg, /Restoring pre-resign handling/, "no enabled=false escape-hatch OFFER for a blocked channel (the note only mentions it to warn against)");
+    // ii) negative gate: an un-noted scheme keeps the generic promise verbatim
+    const awsMsg = msg(signedRefusal("aws4-hmac-sha256", "openai"));
+    assert.match(awsMsg, /until bili ships re-signing support for it/, "generic promise intact for un-noted schemes");
+    assert.doesNotMatch(awsMsg, /#4632/, "the x-ofm note does not leak into other schemes");
+    // iii) built-in scheme message is untouched by the note mechanism
+    const builtinMsg = msg(signedRefusal(APIG_RESIGN_SCHEME, "openai"));
+    assert.doesNotMatch(builtinMsg, /#4632/);
+    assert.match(builtinMsg, /BILI_RESIGN_PASSTHROUGH=1/, "built-in pass-through opt-in still offered");
 });
 
 test("#2090 intercept: resign.<scheme>.enabled=false un-deploys the branch (pre-resign rewrite path restored)", async () => {
@@ -876,7 +912,7 @@ test("e2e #2090: GET /__bili/resign reports schemes, pending refusals, and the u
         assert.match(String(r.headers.get("content-type")), /application\/json/);
         const data = (await r.json()) as {
             builtinScheme: string;
-            schemes: Record<string, { known?: { label: string }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }>;
+            schemes: Record<string, { known?: { label: string; note?: string; noteZh?: string }; builtIn: boolean; enabled: boolean; passthrough: boolean; passthroughApplies: boolean }>;
             pending: Record<string, { count: number }>;
             unresolved: string[];
         };
@@ -886,6 +922,10 @@ test("e2e #2090: GET /__bili/resign reports schemes, pending refusals, and the u
         assert.equal(data.schemes["x-ofm-signature"].builtIn, false);
         assert.equal(data.schemes["sdk-hmac-sha256"].passthroughApplies, true, "only the built-in scheme has a pass-through outcome");
         assert.equal(data.schemes["x-ofm-signature"].passthroughApplies, false, "no config can pass a non-built-in scheme through (#2090 binary contract)");
+        assert.ok(data.schemes["x-ofm-signature"].known?.note, "#4632 block note served for x-ofm-signature");
+        assert.match(data.schemes["x-ofm-signature"].known?.note ?? "", /#4632/, "note names the blocking issue");
+        assert.ok(data.schemes["x-ofm-signature"].known?.noteZh, "zh variant served for the bilingual web UI");
+        assert.equal(data.schemes["aws4-hmac-sha256"].known?.note, undefined, "no note for un-noted schemes");
         assert.ok(data.pending["x-ofm-signature"] && data.pending["x-ofm-signature"].count >= 1);
         assert.ok(data.pending["aws4-hmac-sha256"] && data.pending["aws4-hmac-sha256"].count >= 1);
         assert.ok(data.unresolved.includes("x-ofm-signature"), "recorded + unconfigured → unresolved");
