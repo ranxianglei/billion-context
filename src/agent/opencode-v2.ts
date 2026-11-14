@@ -567,11 +567,13 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (ctx.session?.hook) {
                 for (const name of ["context", "compaction", "title", "generate"]) {
                     const reg = await ctx.session.hook(name, (event) => {
-                        if (!event.messages) return;
-                        const kept = event.messages.filter((message) => !(
-                            message.role === "user" && BILI_REPORT_ID_RE.test(message.id ?? "")
-                        ));
-                        event.messages.splice(0, event.messages.length, ...kept);
+                        const messages = event.messages;
+                        if (!messages) return;
+                        let kept = 0;
+                        messages.forEach((message) => {
+                            if (message.role !== "user" || !BILI_REPORT_ID_RE.test(message.id ?? "")) messages[kept++] = message;
+                        });
+                        messages.length = kept;
                     });
                     if (reg) registrations.push(reg);
                 }

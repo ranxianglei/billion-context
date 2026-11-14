@@ -1779,7 +1779,11 @@ export async function* runCompressLoop(
                     dropIds.add(`acp_loop_r${round}_asst_tc_${pr.callId}`);
                     dropIds.add(`acp_loop_r${round}_tool_${pr.callId}`);
                 }
-                coreMessages.splice(0, coreMessages.length, ...coreMessages.filter((m) => !dropIds.has(m.id)));
+                let kept = 0;
+                coreMessages.forEach((message) => {
+                    if (!dropIds.has(message.id)) coreMessages[kept++] = message;
+                });
+                coreMessages.length = kept;
                 if (streamedMarkers.length > 0) {
                     ctx.log(`[acp-loop] round ${round}: failed-only mutating round; feeding the model a recovery receipt (${streamedMarkers.length} marker line(s)) and re-requesting (#5220)`);
                     coreMessages.push({ id: `acp_loop_r${round}_rcpt`, role: "assistant", contentType: "text", text: streamedMarkers.join("") });
