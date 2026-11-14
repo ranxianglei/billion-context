@@ -250,6 +250,8 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         L.push("### " + t("det.rec_title"));
         L.push("");
         L.push("- " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none) + " · " + t("det.rec_nudge") + " " + (s.nudges || 0) + " · " + t("det.rec_active") + " " + (s.activeFolds || 0) + " · " + t("det.rec_rec_total") + " " + f.W(s.totalPending || 0) + " · " + t("det.rec_fold_total") + " " + f.W(s.totalFolded || 0));
+        L.push("- " + t("det.rec_note_t1"));
+        L.push("- " + t("det.rec_note_burst"));
         const eps = rec.episodes || [];
         if (eps.length) {
             L.push("");
@@ -266,7 +268,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
             const pct = ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-";
             L.push("| " + (i + 1) + " | " + (ev.at ? f.DT(ev.at) : "-") + " | " + kind + " | " + f.W(ev.pending || 0) + " | " + (ev.folded != null ? f.W(ev.folded) : "-") + " | " + pct + " |");
         });
-        if (evs.length > 30) L.push("… +" + (evs.length - 30) + " earlier events");
+        if (evs.length > 30) { L.push("- " + t("det.rec_note_window", { n: 30 })); L.push("… +" + (evs.length - 30) + " earlier events"); }
     }
     return L.join(NL);
 }
@@ -443,6 +445,8 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             [t("det.rec_rec_total"), f.W(s.totalPending || 0)],
             [t("det.rec_fold_total"), f.W(s.totalFolded || 0)]
         ]);
+        noteLine(t("det.rec_note_t1"));
+        noteLine(t("det.rec_note_burst"));
         const revs = (rec.events || []).slice(-10);
         const rcols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rec_kind"), w: 150 }, { t: t("det.rec_rec"), w: 120 }, { t: t("det.rec_folded"), w: 120 }, { t: t("det.rec_pct"), w: W - PAD * 2 - 558 }];
         // #6729 follow-up: recovery-per-nudge-round line chart (one point per
@@ -488,7 +492,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");
             tableRow([String(i + 1), ev.at ? f.DT(ev.at) : "-", kind, f.W(ev.pending || 0), ev.folded != null ? f.W(ev.folded) : "-", ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-"], [rcols[0].w, rcols[1].w, rcols[2].w, rcols[3].w, rcols[4].w, rcols[5].w]);
         });
-        if ((rec.events || []).length > 10) noteLine("… +" + ((rec.events || []).length - 10) + " earlier events (see .md)");
+        if ((rec.events || []).length > 10) { noteLine(t("det.rec_note_window", { n: 10 })); noteLine("… +" + ((rec.events || []).length - 10) + " earlier events (see .md)"); }
     }
     y += 24;
     const H = Math.ceil(y);
