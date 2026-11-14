@@ -6,6 +6,12 @@ import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 import { dshCarrierRawMarkers } from "../durable-message-guards.js";
+import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./budget.js";
+
+// #6752: the output-budget field plumbing lives in budget.ts now (generic wire
+// plumbing, not side-lane logic); re-exported here so existing importers
+// (server.ts, tests) keep working unchanged.
+export { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField };
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -605,49 +611,6 @@ export function stripLeakedBiliTools(parsed: unknown): boolean {
     if (!hasLeakedBiliToolsOnly(parsed)) return false;
     delete (parsed as Record<string, unknown>).tools;
     return true;
-}
-
-export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
-
-/** The declared output budget, proto-agnostically. Gemini nests it under
- *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
- *  families keep it flat, so every reader goes through these two accessors. */
-export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
-    if (!parsed || typeof parsed !== "object") return null;
-    const p = parsed as Record<string, unknown>;
-    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
-        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
-    }
-    const gen = p.generationConfig;
-    if (gen && typeof gen === "object") {
-        const v = (gen as Record<string, unknown>).maxOutputTokens;
-        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
-    }
-    return null;
-}
-
-export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
-    if (field !== "generationConfig.maxOutputTokens") {
-        const v = parsed[field];
-        return typeof v === "number" ? v : undefined;
-    }
-    const gen = parsed.generationConfig;
-    if (!gen || typeof gen !== "object") return undefined;
-    const v = (gen as Record<string, unknown>).maxOutputTokens;
-    return typeof v === "number" ? v : undefined;
-}
-
-export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
-    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
-    // sole writer so NO caller can emit a fractional token count — the clamp path already
-    // floors, but this also guards the restore path and any future caller at the type boundary.
-    const tokens = Number.isInteger(value) ? value : Math.floor(value);
-    if (field !== "generationConfig.maxOutputTokens") {
-        parsed[field] = tokens;
-        return;
-    }
-    const gen = parsed.generationConfig;
-    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
 }
 
 // #3071: absolute capability floor for the output budget when NO source knows a

@@ -41,7 +41,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
@@ -139,6 +139,16 @@ export async function prepareOpenai(
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
+            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
+            // the rebind below re-parses scalar fields from the raw wire text,
+            // which would silently discard the restored budget (the log claims
+            // the restore while the wire still carries the client's shrunk
+            // value). Carry the restored budget across the rebind.
+            const budgetField = outputBudgetField(parsed);
+            const restoredBudget =
+                budgetField !== null
+                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
+                    : undefined;
             const fields: Record<string, unknown> = {};
             for (const [key, span] of wpHit.fieldSpans) {
                 // "messages" keeps its WIRE POSITION (the scanner records it
@@ -146,6 +156,9 @@ export async function prepareOpenai(
                 // span so no bytes of the prefix are ever decoded.
                 if (key === "messages") fields[key] = wpHit.windowMessages;
                 else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
+            }
+            if (budgetField !== null && restoredBudget !== undefined) {
+                writeOutputBudget(fields, budgetField, restoredBudget);
             }
             parsed = fields as OpenAIRequestBody;
             inboundMessageCount = wpHit.totalT;
