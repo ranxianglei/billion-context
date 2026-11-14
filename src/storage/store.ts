@@ -79,7 +79,7 @@ export function rewriteArchiveLog(file: string, text: string): void {
     }
 }
 /** #4739 test instrumentation: message rows materialized by getMessages /
- *  getMessagesAt (each row = one CAS read + media hydration). Production
+ *  getMessagesAt (including content decoding + media hydration). Production
  *  code never reads this; tests assert ordinary loads stop decoding the
  *  whole historical log. */
 export const messageRowReads = { count: 0 };
@@ -3340,7 +3340,7 @@ export class UnifiedStore {
                 + ` AND (${clauses.join(" OR ")}) ORDER BY seq`;
             for (const row of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) rows.push(row);
         }
-        return rows.map((r) => ({
+        return Array.from(this.messageContents(rows), ([r, content]) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
             ref: (r.ref as string | null) ?? null,
@@ -3349,8 +3349,26 @@ export class UnifiedStore {
             kind: r.kind as string,
             contentHash: r.content_hash as string,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
         }));
+    }
+
+    /** Fetch bodies for captured message rows in bounded batches. Keeping
+     *  the metadata query separate avoids holding a whole history's BLOBs
+     *  alongside all of its decoded strings. Hashes preserve row identity. */
+    private *messageContents(rows: readonly Record<string, unknown>[]): Generator<readonly [Record<string, unknown>, string]> {
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => row.content_hash as string))];
+            const contents = this.db.prepare(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
+                .all(...hashes) as { hash: string; bytes: Uint8Array }[];
+            const byHash = new Map(contents.map((row) => [row.hash, row.bytes]));
+            for (const row of chunk) {
+                const bytes = byHash.get(row.content_hash as string);
+                yield [row, bytes === undefined ? "" : Buffer.from(bytes).toString("utf8")];
+            }
+        }
     }
 
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[]; fromSeqExclusive?: number }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
@@ -3371,7 +3389,7 @@ export class UnifiedStore {
                 `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
             )
             .all(...params) as Record<string, unknown>[];
-        return rows.map((r) => {
+        return Array.from(this.messageContents(rows), ([r, content]) => {
             messageRowReads.count++;
             return {
             seq: r.seq as number,
@@ -3383,7 +3401,7 @@ export class UnifiedStore {
             contentHash: r.content_hash as string,
             retiredAt: (r.retired_at as number | null) ?? null,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
             };
         });
     }
@@ -3403,7 +3421,8 @@ export class UnifiedStore {
             const chunk = unique.slice(i, i + CHUNK);
             const rows = this.db
                 .prepare(
-                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                     LEFT JOIN content c ON c.hash = messages.content_hash
                      WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 )
                 .all(sessionId, ...chunk) as Record<string, unknown>[];
@@ -3418,7 +3437,7 @@ export class UnifiedStore {
                     kind: r.kind as string,
                     contentHash: r.content_hash as string,
                     ts: (r.ts as number | null) ?? null,
-                    content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+                    content: this.hydrateMedia(r.content_bytes === null ? "" : Buffer.from(r.content_bytes as Uint8Array).toString("utf8")),
                 });
             }
         }
