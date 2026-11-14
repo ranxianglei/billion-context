@@ -10,7 +10,6 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { MAX_PREFLIGHT_ROUNDS, MAX_SUMMARY_CALLS_PER_PREFLIGHT } from "../src/preflight.ts";
 
 // The preflight folds ONE range per round and caps a range at CHUNK_FRACTION of
 // the window (src/preflight.ts), so the round budget is a hard limit
@@ -21,8 +20,12 @@ import { MAX_PREFLIGHT_ROUNDS, MAX_SUMMARY_CALLS_PER_PREFLIGHT } from "../src/pr
 // compress budget was exhausted after 8 rounds" and dropped the turn even
 // though every fold it attempted had succeeded. #1933 made the depth dynamic:
 // base MAX_PREFLIGHT_ROUNDS scales with the entry overshoot (payload vs window),
-// capped at 2x the base — an ~11x overshoot like the second fixture below gets
-// the full raised budget of 32 rounds / 32 summary calls.
+// capped at 2x the base — an ~11x overshoot like the first fixture below gets
+// the full raised budget of 32 rounds / 32 summary calls. The second fixture
+// sits in the zone #5671's adaptive bound rescues-or-exposes: below the 19.2x
+// entry trigger but hopeless in BOTH fold regimes, so the invocation flips to
+// digests mid-flight, proves the doom deterministically, and answers 413
+// non-retryable instead of spinning a relay-dependent 502.
 
 const WINDOW = 30_000;
 const MESSAGES = 60;
@@ -148,7 +151,7 @@ test("e2e preflight: a payload that needs more folds than one round allows is st
     }
 });
 
-test("e2e preflight: beyond the round budget the fail-fast reports the post-fold state", async () => {
+test("e2e preflight: a pool hopeless in both fold regimes fails fast with a deterministic non-retryable verdict", async () => {
     CALLS.length = 0;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -161,12 +164,14 @@ test("e2e preflight: beyond the round budget the fail-fast reports the post-fold
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // 400 small turns (~384k tokens vs a 30k window, ~11x overshoot): each
-        // fold removes far less than the chunk budget, so even the raised
-        // #1933 budget of 32 successful rounds (base 16 scaled by overshoot,
-        // capped at 2x) leaves the payload well over the window — the walk
-        // stops at the raised round cap.
-        const COUNT = 400;
+        // 600 small turns (~482k tokens vs a 30k window, ~16x overshoot):
+        // below the 19.2x entry trigger, so the invocation starts on the LLM
+        // path and #5671's adaptive bound flips it to digests mid-flight — but
+        // the pool is hopeless in BOTH regimes: the LLM budget covers far too
+        // little mass, and even fully digested the ~150 block summaries alone
+        // exceed the 30k window. The walk must still fail fast with an honest
+        // post-fold report instead of forwarding an over-window payload.
+        const COUNT = 600;
         const REPEATS = 200;
         assert.ok(materialiseTokens(COUNT, REPEATS) > WINDOW * 3, `fixture must start well over the window (${materialiseTokens(COUNT, REPEATS)} vs ${WINDOW})`);
 
@@ -176,15 +181,16 @@ test("e2e preflight: beyond the round budget the fail-fast reports the post-fold
             body: JSON.stringify({ model: "gpt-test", stream: true, messages: longMessages(COUNT, REPEATS) }),
         });
         const body = await resp.text();
-        assert.equal(resp.status, 502, `beyond the round budget the turn must be refused: HTTP ${resp.status} ${body.slice(0, 240)}`);
-        const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
+        assert.equal(resp.status, 413, `the deterministic can-never-fit pool must be refused 413: HTTP ${resp.status} ${body.slice(0, 240)}`);
+        const json = JSON.parse(body) as { error?: { code?: string; message?: string; retryable?: boolean } };
         assert.equal(json.error?.code, "preflight_compress_failed");
-        assert.match(json.error?.message ?? "", new RegExp(`exhausted after ${MAX_PREFLIGHT_ROUNDS * 2} rounds`, "i"), `names the raised round budget (got: ${json.error?.message})`);
+        assert.equal(json.error?.retryable, false, `a deterministic doom must not invite host spin (got ${JSON.stringify(json.error?.retryable)})`);
+        assert.match(json.error?.message ?? "", /could not bring it under/i, `reports the non-convergence verdict with context (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /down from ~\d+ before preflight/, `quotes the post-fold size, not only the original (got: ${json.error?.message})`);
         assert.match(json.error?.message ?? "", /compressible range\(s\) still visible/, `reports how many compressible ranges remain (got: ${json.error?.message})`);
 
         const summaries = CALLS.filter((c) => c.summary);
-        assert.equal(summaries.length, MAX_SUMMARY_CALLS_PER_PREFLIGHT * 2, `one fold per round, one call each, raised #1933 budget (got ${summaries.length})`);
+        assert.equal(summaries.length, 0, `the hopeless pool is fully digested mid-flight — no LLM summary call may fire (got ${summaries.length})`);
         assert.equal(CALLS.filter((c) => c.raw.includes('"stream":true')).length, 0, "the over-window payload was NOT forwarded");
     } finally {
         proxy.close();

@@ -167,6 +167,22 @@ const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
 // covers ~250x the window at observed per-fold savings (~0.5-0.6x window) —
 // far beyond any realistic resend size.
 const EMERGENCY_ROUND_CAP = 512;
+// #5671: slack on the budget-aware achievability bound (the adaptive trigger
+// of the digest regime, checked per round below). The static coverage bound
+// above prices an IDEAL fold (CHUNK_FRACTION x window each); a fragmented
+// pool saves far less per fold, so payloads well below EMERGENCY_FOLD_COVERAGE
+// can still be unreachable for the LLM path within its raised call budget
+// (field evidence: 7.3x overshoot, 1312 viable ranges, largest ~18K tok vs a
+// ~590K chunk budget — 32 LLM folds removed <10% of the deficit, then the
+// fail-fast 413 killed an already-unrecoverable session). That bound prices
+// the pool ACTUALLY in front of the walker: the summaryBudget largest ranges
+// are all this invocation can touch (one summarization call per fold
+// minimum). Slack absorbs re-fold amplification (a folded head regrows as a
+// bigger range, #2682) and estimator noise; a false positive costs
+// digest-quality summaries instead of LLM-quality ones (originals stay
+// restorable via decompress), a false negative costs the whole session — err
+// toward switching.
+const ADAPTIVE_EMERGENCY_SLACK = 1.5;
 // Per-entry head-fragment length in digest form A (form B strips heads when
 // even that does not fit the bounds).
 const DIGEST_HEAD_CHARS = 120;
@@ -1934,8 +1950,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (summaryBudget > MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
         deps.log("warn", `[preflight] payload ~${entryTokens} tok vs window ${limit} (~${overshootRatio.toFixed(1)}x) — raising summarization budget ${MAX_SUMMARY_CALLS_PER_PREFLIGHT} -> ${summaryBudget}, rounds ${MAX_PREFLIGHT_ROUNDS} -> ${roundBudget}`);
     }
-    // #2383: the fold MECHANISM is decided once per invocation from the entry
-    // overshoot (same discipline as baselineKnown — no mid-loop regime flips).
+    // #2383: the fold MECHANISM is decided per invocation from the entry
+    // overshoot; #5671 adds one further trigger point mid-loop — when the
+    // budget-aware achievability bound below proves the LLM path cannot close
+    // the gap within its raised call budget, the remainder of THIS invocation
+    // switches to digests. The flip is monotonic by construction: it only ever
+    // fires in the direction "LLM proven hopeless for exactly this payload",
+    // so no session that would have converged on the LLM path loses quality.
     // Beyond EMERGENCY_FOLD_COVERAGE the LLM path cannot converge here, so
     // every fold becomes a deterministic digest: zero upstream calls, no
     // failure modes, originals restorable via decompress.
@@ -1946,8 +1967,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // digest-fold ordinary payloads (caught by the model-switch e2e: its
     // summarization calls vanished under a 300k foreign-model baseline).
     const entryOvershoot = limit > 0 && entryLocal > 0 ? entryLocal / limit : 1;
-    const emergencyFold = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
-    const effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
+    let emergencyFold = entryOvershoot > EMERGENCY_FOLD_COVERAGE;
+    let effectiveRoundCap = emergencyFold ? EMERGENCY_ROUND_CAP : roundBudget;
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
@@ -2420,6 +2441,41 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: the maximum possible saving from all foldable content (~${calibrateFoldMass(potential)} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
                 deps.log("warn", `[preflight] skipping futile round: max possible saving ~${calibrateFoldMass(potential)} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
                 break;
+            }
+        }
+        if (baselineKnown && !emergencyFold && ranges.length > 0) {
+            // #5671: budget-aware achievability — the #1841 gate above prices
+            // the WHOLE pool against the deficit, but the walker can touch at
+            // most summaryBudget folds this invocation (one summarization call
+            // per fold minimum). When even the largest N ranges cannot close
+            // the gap by more than the slack, the LLM path is structurally
+            // doomed no matter how many minutes it burns: switch the remainder
+            // of this invocation to the CPU-only deterministic-digest regime
+            // (#2383), whose EMERGENCY_ROUND_CAP converges fragment pools in
+            // seconds. Gated on baselineKnown exactly like the #1841 gate: in
+            // the unknown-baseline regime the deficit counts raw chars while
+            // range.tokens carry calibrated estimates — mixing those scales
+            // overstates the gap and would switch sessions whose LLM path can
+            // actually converge (preflight-covered-ranges unknown-baseline
+            // case). A false positive still only costs digest-quality
+            // summaries (originals restorable via decompress).
+            const deficitHere = result.payloadEstimate - limit;
+            if (deficitHere > 0) {
+                const { refToIdx: reachRefs } = refMaps(messages, deps.session.state);
+                const reachableMasses = ranges
+                    .map((r) => {
+                        const si = reachRefs.get(r.startRef);
+                        const ei = reachRefs.get(r.endRef);
+                        return si !== undefined && ei !== undefined && si <= ei ? r.tokens : 0;
+                    })
+                    .filter((t) => t > 0)
+                    .sort((a, b) => b - a);
+                const reachable = reachableMasses.slice(0, summaryBudget).reduce((s, t) => s + t, 0);
+                if (calibrateFoldMass(reachable) * ADAPTIVE_EMERGENCY_SLACK < deficitHere) {
+                    emergencyFold = true;
+                    effectiveRoundCap = EMERGENCY_ROUND_CAP;
+                    deps.log("warn", `[preflight] LLM fold path cannot close the gap within budget: the ${summaryBudget} largest viable range(s) hold ~${calibrateFoldMass(reachable)} tok vs a ~${deficitHere}-tok deficit across ${reachableMasses.length} range(s) (> ${ADAPTIVE_EMERGENCY_SLACK}x short even after re-folds) — switching to deterministic digest folds for the remainder of this invocation (#5671, extends #2383's entry-only trigger)`);
+                }
             }
         }
         if (ranges.length === 0) {
