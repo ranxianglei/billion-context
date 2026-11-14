@@ -31,7 +31,10 @@ import { isLegacyBcpEntry } from "./agent/native-bootstrap.js";
 import { isCodexClient } from "./codex-compact.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 
-type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+export type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+/** Runtime membership list for the same union (announcement `requiresScan`
+ *  validation, #5984) — keep in sync with the switch in scanClientPlugins. */
+export const SCAN_CLIENTS: readonly ScanClient[] = ["opencode", "pi", "omp", "kimi", "hermes", "dsh", "claude"];
 
 export interface ThirdPartyFinding {
     client: ScanClient;
