@@ -2051,7 +2051,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
