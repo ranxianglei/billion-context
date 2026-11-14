@@ -186,6 +186,58 @@ test("cross-wire switch keeps the anonymous session AND its fold attached end-to
     }
 });
 
+// #6659: the history is a wire-NEUTRAL logical transcript that may carry a
+// PARALLEL tool round (one assistant turn with N calls + N tool results).
+// Each wire renders it differently: openai keeps one assistant message with
+// all tool_calls; responses emits N adjacent function_call items with NO
+// preceding assistant message + N function_call_output items; google emits
+// N functionCall parts in one model message + N functionResponse parts in
+// one user message. The renderers below are the load-bearing shapes — the
+// responses/google ones must reproduce the exact wire forms that the
+// affinity-neutral projection is being fixed to reduce to the openai turns.
+type HistMsg =
+    | { role: "user" | "assistant"; content: string }
+    | { role: "assistant"; content: null; tool_calls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> }
+    | { role: "tool"; tool_call_id: string; content: string };
+
+function renderResponsesItems(hist: HistMsg[]): Array<Record<string, unknown>> {
+    const items: Array<Record<string, unknown>> = [];
+    for (const m of hist) {
+        if ("tool_calls" in m) {
+            // parallel round: adjacent function_call items, NO assistant message.
+            for (const tc of m.tool_calls) items.push({ type: "function_call", call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments });
+        } else if (m.role === "tool") {
+            items.push({ type: "function_call_output", call_id: m.tool_call_id, output: m.content });
+        } else {
+            items.push({ type: "message", role: m.role, content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }] });
+        }
+    }
+    return items;
+}
+
+function renderGoogleContents(hist: HistMsg[]): Array<Record<string, unknown>> {
+    const contents: Array<Record<string, unknown>> = [];
+    let toolParts: Array<Record<string, unknown>> = [];
+    const flushTools = (): void => {
+        if (toolParts.length > 0) { contents.push({ role: "user", parts: toolParts }); toolParts = []; }
+    };
+    for (const m of hist) {
+        if ("tool_calls" in m) {
+            flushTools();
+            // parallel round: ALL functionCall parts in ONE model message.
+            contents.push({ role: "model", parts: m.tool_calls.map((tc) => ({ functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) } })) });
+        } else if (m.role === "tool") {
+            // parallel round: ALL functionResponse parts in ONE user message.
+            toolParts.push({ functionResponse: { name: "read_file", response: { output: m.content } } });
+        } else {
+            flushTools();
+            contents.push({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] });
+        }
+    }
+    flushTools();
+    return contents;
+}
+
 // #2791 follow-up (neutral projections for responses/google): the same
 // proxy-level conjunction, extended onto the responses (/v1/responses,
 // codex / dsh openai-responses shape) and google (v1beta
@@ -193,6 +245,8 @@ test("cross-wire switch keeps the anonymous session AND its fold attached end-to
 // lane; phase B switches the SAME history onto the responses wire; phase C
 // switches it again onto the google wire. Every switch must keep the one
 // anonymous session, the fold carrier, and the covered content folded.
+// #6659 extends the history with a parallel tool round so the switch exercises
+// the parallel-round projection (the shape that used to fork the session).
 test("cross-wire switch onto the responses and google lanes keeps the session AND its fold (#2791)", { timeout: 180_000 }, async () => {
     const bodies: { openai: string[]; responses: string[]; google: string[] } = { openai: [], responses: [], google: [] };
     let suppress = false;
@@ -278,8 +332,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
     const responsesBase = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
     const googleBase = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/probe-model:streamGenerateContent?alt=sse`;
 
-    type Msg = { role: string; content: string };
-    const hist: Msg[] = [];
+    const hist: HistMsg[] = [];
     try {
         // Phase A — openai lane establishes the anonymous session and folds.
         const openaiTurn = async (t: number): Promise<void> => {
@@ -290,6 +343,25 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
             hist.push({ role: "assistant", content: `Reply about province ${t}: acknowledged. ` + FILLER(t, 0.2) });
         };
         for (let t = 1; t <= 12; t++) await openaiTurn(t);
+
+        // #6659 — the established session carries a PARALLEL tool round
+        // (two calls, no assistant commentary) before the wire switch.
+        hist.push({ role: "user", content: "Turn 12b: audit both ledgers in parallel." });
+        hist.push({
+            role: "assistant",
+            content: null,
+            tool_calls: [
+                { id: "call_p1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "/ledger/a" }) } },
+                { id: "call_p2", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "/ledger/b" }) } },
+            ],
+        });
+        hist.push({ role: "tool", tool_call_id: "call_p1", content: "ledger A: stable, no anomalies" });
+        hist.push({ role: "tool", tool_call_id: "call_p2", content: "ledger B: stable, no anomalies" });
+        const respP = await fetch(openaiBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, messages: [...hist] }) });
+        assert.equal(respP.status, 200, "openai parallel-round turn");
+        await respP.text();
+        hist.push({ role: "assistant", content: "Both ledgers are stable; no anomalies in either." });
+
         const pfas = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
         assert.equal(pfas.length, 1, "one anonymous session on the openai lane");
         const sessionId = pfas[0]!;
@@ -300,11 +372,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
         // Phase B — switch onto the RESPONSES wire (codex / dsh openai-responses
         // render): same history re-rendered as input[] items.
         hist.push({ role: "user", content: "Turn 13: which provinces did the audit cover, and were there anomalies?" });
-        const respItems = hist.map((m) => ({
-            type: "message",
-            role: m.role,
-            content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }],
-        }));
+        const respItems = renderResponsesItems(hist);
         const respB = await fetch(responsesBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, instructions: "crosswire probe", input: respItems }) });
         const respRaw = await respB.text();
         if (respB.status !== 200) assert.fail(`responses switch turn: ${respB.status}: ${respRaw.slice(0, 200)}`);
@@ -322,7 +390,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
         // Phase C — switch AGAIN onto the GOOGLE wire (Gemini render): same
         // history re-rendered as contents[].parts[].
         hist.push({ role: "user", content: "Turn 14: continue with province seven." });
-        const contents = hist.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+        const contents = renderGoogleContents(hist);
         const respG = await fetch(googleBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", contents }) });
         const googleRaw = await respG.text();
         if (respG.status !== 200) assert.fail(`google switch turn: ${respG.status}: ${googleRaw.slice(0, 200)}`);
