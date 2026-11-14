@@ -39,7 +39,7 @@ const SENTINELS = [4781, 2903, 6577, 1249, 8461, 30217];
 type Ctx = {
     proxy?: { pid: number; logPath: string };
     codexHome: string;
-    xdg: { config: string; cache: string; state: string };
+    xdg: { config: string; cache: string; state: string; data: string };
     port: number;
     resumed: boolean;
     turnCount: number;
@@ -87,6 +87,7 @@ async function startProxy(ctx: Ctx, env: Record<string, string> = {}): Promise<v
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,
                 XDG_STATE_HOME: ctx.xdg.state,
+                XDG_DATA_HOME: ctx.xdg.data,
                 BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
                 ...env,
             },
@@ -198,12 +199,13 @@ async function setup(): Promise<Ctx> {
             config: path.join(WORK, "xdg", "config"),
             cache: path.join(WORK, "xdg", "cache"),
             state: path.join(WORK, "xdg", "state"),
+            data: path.join(WORK, "xdg", "data"),
         },
         port: await freePort(),
         resumed: false,
         turnCount: 0,
     };
-    for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
+    for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state, ctx.xdg.data]) fs.mkdirSync(d, { recursive: true });
     return ctx;
 }
 
