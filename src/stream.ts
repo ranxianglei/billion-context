@@ -415,6 +415,17 @@ function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number 
     return highest;
 }
 
+/** #6712: number-preserving scrub marker for a stale requested ref. `m00010`
+ *  becomes `[stale-ref:00010]` — the digits stay in the receipt so the caller
+ *  can tell which ref it used (and the `range …:` diagnostic line stays
+ *  readable), while the bare `mNNNNN` token never reaches the client-persisted
+ *  receipt, so the #2146 echo channel stays dead. Non-m ids (unreachable when
+ *  `beyond` fires, which requires m-refs) fall back to the bare marker. */
+function staleRefMarker(id: string): string {
+    const m = /^m(\d+)$/i.exec(id.trim());
+    return m ? `[stale-ref:${m[1]}]` : "[stale-ref]";
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -1494,10 +1505,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // keeps the real refs for the operator. Live refs are untouched:
             // when the note fires, every requested ref exceeds the session's
             // highest mapped ref, so no live snapshot number can collide.
+            // #6712: the scrub must not erase WHICH ref was requested — a bare
+            // `[stale-ref]` leaves the caller unable to tell what it asked
+            // for, so it cannot self-correct. The marker keeps the ref number
+            // (`[stale-ref:00010]`) while never emitting the bare `mNNNNN`
+            // token, so the #2146 echo channel stays dead.
             if (beyond !== "") {
                 for (const rg of ranges) {
                     for (const id of [rg.startRef, rg.endRef]) {
-                        receipt = receipt.split(id).join("[stale-ref]");
+                        receipt = receipt.split(id).join(staleRefMarker(id));
                     }
                 }
             }
