@@ -1563,7 +1563,8 @@ export class MysqlBackend implements StorageBackend {
             const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
             if (chunk.length === 0) continue;
             const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                 LEFT JOIN content c ON c.hash = messages.content_hash
                  WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 [sessionId, ...chunk],
             )) as unknown as Row[][];
@@ -1578,7 +1579,7 @@ export class MysqlBackend implements StorageBackend {
                     kind: str(r.kind),
                     contentHash,
                     ts: nullableNum(r.ts),
-                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
+                    content: await this.hydrateMediaAsync(str(r.content_bytes), this.pool),
                 });
             }
         }
@@ -1606,20 +1607,31 @@ export class MysqlBackend implements StorageBackend {
             [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
-        for (const r of rows) {
-            const contentHash = str(r.content_hash);
-            out.push({
-                seq: num(r.seq),
-                msgId: str(r.msg_id),
-                ref: nullableStr(r.ref),
-                refNum: nullableNum(r.ref_num),
-                role: str(r.role),
-                kind: str(r.kind),
-                contentHash,
-                retiredAt: nullableNum(r.retired_at),
-                ts: nullableNum(r.ts),
-                content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
-            });
+        // Keep body batches bounded even when the selected metadata spans a
+        // whole historian log. Every query stays on the caller's connection.
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => str(row.content_hash)))];
+            const [contents] = (await conn.query(
+                `SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`, hashes,
+            )) as unknown as Row[][];
+            const byHash = new Map(contents.map((row) => [str(row.hash), str(row.bytes)]));
+            for (const r of chunk) {
+                const contentHash = str(r.content_hash);
+                out.push({
+                    seq: num(r.seq),
+                    msgId: str(r.msg_id),
+                    ref: nullableStr(r.ref),
+                    refNum: nullableNum(r.ref_num),
+                    role: str(r.role),
+                    kind: str(r.kind),
+                    contentHash,
+                    retiredAt: nullableNum(r.retired_at),
+                    ts: nullableNum(r.ts),
+                    content: await this.hydrateMediaAsync(byHash.get(contentHash) ?? "", conn),
+                });
+            }
         }
         return out;
     }
