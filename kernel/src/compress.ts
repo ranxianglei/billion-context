@@ -298,11 +298,11 @@ function tierActionHint(config: Config, state: CompressionState): string {
   const live = activeBlocks(state).filter((b) => !b.retired);
   const t2 = live.filter((b) => b.tier === 2);
   if (t2.length >= config.tiers.tier3Trigger) {
-    return ` Tier condensation is actionable now: compress({ content: [{ startId: "${t2[0]!.blockId}", endId: "${t2[t2.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-2 blocks into one tier-3 block.`;
+    return ` Tier condensation is actionable now: compress({ content: "${t2[0]!.blockId}–${t2[t2.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-2 blocks into one tier-3 block.`;
   }
   const t1 = live.filter((b) => b.tier === 1);
   if (t1.length >= config.tiers.tier2Trigger) {
-    return ` Tier distillation is actionable now: compress({ content: [{ startId: "${t1[0]!.blockId}", endId: "${t1[t1.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-1 blocks into one tier-2 block.`;
+    return ` Tier distillation is actionable now: compress({ content: "${t1[0]!.blockId}–${t1[t1.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-1 blocks into one tier-2 block.`;
   }
   return "";
 }
