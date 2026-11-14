@@ -160,7 +160,14 @@ export interface NativeInterceptState {
      *  recoverable refusal for a body that provably cannot fit the model's
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
-     *  call without re-reading the request. */
+     *  call without re-reading the request.
+     *  Every lane AWAITs the verdict (the fetch lane here, the WS lane inside
+     *  its deferred window, #5838), so a Promise is honored in either case.
+     *  dsh still answers no-init (WS-shaped) calls with a NON-Promise verdict
+     *  (lower latency: skips the settle-retry round-trip; self-heal survives
+     *  because the top-of-gate probe re-runs on every call) — the none arm is
+     *  sync by construction, the threw arm via its no-init fast path. Pinned
+     *  by tests/dsh-native.test.ts. */
     takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */

@@ -2272,35 +2272,11 @@ export async function apply(ctx: PluginContext): Promise<void> {
         }
         return false;
     };
-    // #2924 direction 2: `threw` is an INTERNAL error in the host's
-    // attribution lookup (a disposed/closing agent scope), never evidence of
-    // a legitimate agentless lane — and the scope often settles within a tick
-    // or two. Give it a bounded settle-retry before deciding: claiming the
-    // request after recovery is the only path that RESTORES an over-window
-    // session (the host's own compaction and the #1117 direct fallback must
-    // both ship the full history upstream, which 400s once it exceeds the
-    // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
-        // #3581: after giveUpStreak consecutive requests whose settle-retry
-        // exhausted STILL threw, stop re-settling — a disposed ctx stays
-        // disposed for the host's whole lifetime (#3578), so retrying the same
-        // dead scope per request is pure latency. The gate's single cheap
-        // attributionOf probe per request keeps self-heal alive: the first ok
-        // claim (new agent scope) clears the streak and resumes normal retries.
-        if (threwStreak < threwRetry.giveUpStreak) {
-            for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
-                await new Promise<void>((resolve) => {
-                    setTimeout(resolve, threwRetry.delayMs);
-                });
-                const again = attributionOf(ctx);
-                if (again.state === "ok") {
-                    persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
-                    noteAttrRecovery();
-                    return true;
-                }
-                if (again.state === "none") return refuseUnattributed(url, again, body, init);
-            }
-        }
+    // #4841: the threw-state verdict once settle-retry is done OR deliberately
+    // skipped — shared by settleThrewAttribution's exhausted tail and the gate's
+    // no-init sync fast path below, so both shapes judge oversize identically
+    // (one doom call, one event wording).
+    const threwExhaustedVerdict = (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
         // #2924 direction 1: still `threw` AND the body cannot fit — fail
         // this one request locally instead of handing upstream a request
         // that can only 400 (and, on a >window history, kills the session).
@@ -2331,6 +2307,37 @@ export async function apply(ctx: PluginContext): Promise<void> {
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx), body);
+    };
+    // #2924 direction 2: `threw` is an INTERNAL error in the host's
+    // attribution lookup (a disposed/closing agent scope), never evidence of
+    // a legitimate agentless lane — and the scope often settles within a tick
+    // or two. Give it a bounded settle-retry before deciding: claiming the
+    // request after recovery is the only path that RESTORES an over-window
+    // session (the host's own compaction and the #1117 direct fallback must
+    // both ship the full history upstream, which 400s once it exceeds the
+    // window — all recovery paths vanish the instant the gate lets go).
+    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
+        // #3581: after giveUpStreak consecutive requests whose settle-retry
+        // exhausted STILL threw, stop re-settling — a disposed ctx stays
+        // disposed for the host's whole lifetime (#3578), so retrying the same
+        // dead scope per request is pure latency. The gate's single cheap
+        // attributionOf probe per request keeps self-heal alive: the first ok
+        // claim (new agent scope) clears the streak and resumes normal retries.
+        if (threwStreak < threwRetry.giveUpStreak) {
+            for (let attempt = 1; attempt < threwRetry.attempts; attempt++) {
+                await new Promise<void>((resolve) => {
+                    setTimeout(resolve, threwRetry.delayMs);
+                });
+                const again = attributionOf(ctx);
+                if (again.state === "ok") {
+                    persistClientEvent(`bili-native-dsh: takeover gate attribution recovered after ${attempt} settle-retr${attempt === 1 ? "y" : "ies"} — ${gateKeyOf(url)} claimed (#2924)`);
+                    noteAttrRecovery();
+                    return true;
+                }
+                if (again.state === "none") return refuseUnattributed(url, again, body, init);
+            }
+        }
+        return threwExhaustedVerdict(message, url, body, init);
     };
 
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
@@ -2408,6 +2415,19 @@ export async function apply(ctx: PluginContext): Promise<void> {
             });
         }
         if (attr.state === "threw") {
+            // #4841: the WS-lane consumer (native-ws-intercept.ts) compares its
+            // gate result with === false WITHOUT awaiting — a Promise verdict
+            // silently loses the refusal and the connection gets rewritten onto
+            // the proxy. No-init (WS-shaped) calls therefore get the sync
+            // verdict class: exactly the exhausted-settle tail (without init
+            // there is no body to decode or doom-check, and the settle-retry's
+            // tick-scale recovery is unreachable synchronously — the top-of-gate
+            // probe re-runs on every call, so self-heal is not lost). Streak
+            // untouched: this path attempts no settle, so it consumes no
+            // give-up budget.
+            if (init === undefined) {
+                return threwExhaustedVerdict(attr.message, url, body, init);
+            }
             return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
