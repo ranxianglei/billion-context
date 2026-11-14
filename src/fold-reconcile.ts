@@ -131,7 +131,8 @@
 //   "warn"   — compute + log only, no rewrite.
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
-import { defaultCountTokens, type CoreMessage } from "acp-kernel";
+import { defaultCountTokens, hasMediaPayload, type CoreMessage } from "acp-kernel";
+import type { BiliMessage } from "acp-kernel/wire";
 // Deep kernel import (same convention as src/storage/ingest.ts): the thinking
 // forms live in ONE place — kernel/src/wire/demoted-thinking.ts FORMS.
 import { FORMS as THINKING_MERGE_FORMS } from "../kernel/src/wire/demoted-thinking.js";
@@ -562,11 +563,36 @@ export function normalizedIdentityWorkCount(): number {
     return normalizedIdentityWork;
 }
 
+function carriesReconciliationMedia(message: CoreMessage): boolean {
+    const m = message as BiliMessage;
+    return hasMediaPayload(message) || m.imagePart === true || (m.rawGoogleParts?.some((part) =>
+        typeof part === "object" && part !== null && ("inlineData" in part || "fileData" in part)) ?? false);
+}
+
+function mediaIdentity(message: CoreMessage): string {
+    if (!carriesReconciliationMedia(message)) return "";
+    const m = message as BiliMessage;
+    const h = createHash("sha256");
+    if (m.imageBase64) {
+        h.update(JSON.stringify([m.imageMediaType ?? "", m.imageBase64]));
+        return `media:${h.digest("hex")}`;
+    }
+    for (const value of [m.rawAnthropicBlock, m.rawAnthropicMessage,
+        m.rawOpenaiContent, m.rawOpenaiContentParts, m.rawResponsesItem, m.rawGoogleParts]) {
+        h.update(JSON.stringify(value) ?? "null");
+        h.update("\u0000");
+    }
+    // Split remote images can share a whole-message sidecar, but not an occurrence id.
+    if (m.imagePart && !m.imageBase64) h.update(message.id);
+    return `media:${h.digest("hex")}`;
+}
+
 export function normalizedIdentity(message: CoreMessage): string {
     normalizedIdentityWork++;
+    const media = mediaIdentity(message);
     const h = createHash("sha256");
-    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(message.text)}`);
-    return h.digest("hex").slice(0, 16);
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(message.text)}${media}`);
+    return (media ? "media:" : "") + h.digest("hex").slice(0, 16);
 }
 
 /** #2396: normalized identity with the toolCallId factor removed — pairs a
@@ -574,9 +600,10 @@ export function normalizedIdentity(message: CoreMessage): string {
  *  tool-call id. Same work-count seam as normalizedIdentity (#2334). */
 export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
     normalizedIdentityWork++;
+    const media = mediaIdentity(message);
     const h = createHash("sha256");
-    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normalizeMessageText(message.text)}`);
-    return h.digest("hex").slice(0, 16);
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normalizeMessageText(message.text)}${media}`);
+    return (media ? "media:" : "") + h.digest("hex").slice(0, 16);
 }
 
 /** Identity-layout hash over an arbitrary replacement text — used by the
@@ -584,9 +611,10 @@ export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
  *  has a placeholder line stripped/appended. */
 function identityWithText(message: CoreMessage, text: string): string {
     normalizedIdentityWork++;
+    const media = mediaIdentity(message);
     const h = createHash("sha256");
-    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(text)}`);
-    return h.digest("hex").slice(0, 16);
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(text)}${media}`);
+    return (media ? "media:" : "") + h.digest("hex").slice(0, 16);
 }
 
 /** #2636: assistant-turn key — the turn's full normalized text, whichever
@@ -788,8 +816,9 @@ export function positionalFingerprint(message: CoreMessage): string {
         h.update(`${message.role}\u0000reasoning-id-carrier\u0000`);
         return h.digest("hex").slice(0, 16);
     }
-    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalTextOf(message.text ?? "")}`);
-    return h.digest("hex").slice(0, 16);
+    const media = mediaIdentity(message);
+    h.update(`${message.role}\u0000${message.toolName ?? ""}\u0000${canonicalTextOf(message.text ?? "")}${media}`);
+    return (media ? "media:" : "") + h.digest("hex").slice(0, 16);
 }
 
 function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
@@ -799,7 +828,7 @@ function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
         anchor.t = t;
         anchor.m = normalizedIdentityNoToolCallId(message);
     }
-    if (message.text !== undefined && message.text !== "" && message.contentType !== "reasoning") {
+    if (!carriesReconciliationMedia(message) && message.text !== undefined && message.text !== "" && message.contentType !== "reasoning") {
         anchor.sh = simhashHex(canonicalTextOf(message.text));
         anchor.wh = wordBagDigest(canonicalTextOf(message.text));
     }
@@ -923,13 +952,15 @@ export function planReconciliation(
     const canon: string[] = [];
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
+    const mediaIds = new Set<string>();
     for (const m of msgs) {
         if (m.id === undefined) continue;
         const i = newOrder.length;
         newOrder.push(m.id);
         byId.set(m.id, m);
+        if (carriesReconciliationMedia(m)) mediaIds.add(m.id);
         const priorCanon = canonById.get(m.id);
-        canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
+        canon.push(priorCanon !== undefined && !mediaIds.has(m.id) ? priorCanon : positionalFingerprint(m));
     }
     plan.newOrder = newOrder;
     plan.nextCanon = canon;
@@ -969,7 +1000,8 @@ export function planReconciliation(
         const id = newOrder[i];
         if (covered.has(id)) continue;
         const message = byId.get(id);
-        if (message === undefined) continue;
+        // Payload equality cannot prove the same upload occurrence; only an exact id can.
+        if (message === undefined || mediaIds.has(id)) continue;
         candidates.push({ id, message, pos: i });
     }
     const claimedCandidates = new Set<string>();
@@ -978,7 +1010,7 @@ export function planReconciliation(
     const missingMiddle: string[] = [];
     for (let i = prefix; i < oldOrder.length - suffix; i++) {
         const id = oldOrder[i];
-        if (missingSet.has(id)) missingMiddle.push(id);
+        if (missingSet.has(id) && !anchors[id]?.n?.startsWith("media:")) missingMiddle.push(id);
     }
 
     // Pass 0 — positional identity (#2480), order-centric since #2915. A
@@ -1006,7 +1038,8 @@ export function planReconciliation(
     const gapPairs: { oldIdx: number; oldId: string; newId: string }[] = [];
     const claimedIdx: number[] = [];
     const recordGap = (oldIdx: number, oldId: string, newId: string): void => {
-        if (oldId !== newId && missingSet.has(oldId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
+        if (oldId !== newId && missingSet.has(oldId) && !anchors[oldId]?.n?.startsWith("media:")
+            && !mediaIds.has(newId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
             gapPairs.push({ oldIdx, oldId, newId });
         }
     };
@@ -1030,7 +1063,8 @@ export function planReconciliation(
             }
             const oldId = oldOrder[i];
             const newId = newOrder[i];
-            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId)) { i++; continue; }
+            if (oldId === newId || !missingSet.has(oldId) || anchors[oldId]?.n?.startsWith("media:")
+                || mediaIds.has(newId) || covered.has(newId) || claimedCandidates.has(newId)) { i++; continue; }
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
@@ -1060,7 +1094,8 @@ export function planReconciliation(
             }
             const oldId = oldOrder[iOld];
             const newId = newOrder[iNew];
-            if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId) || plan.claims.has(oldId)) { j++; continue; }
+            if (oldId === newId || !missingSet.has(oldId) || anchors[oldId]?.n?.startsWith("media:")
+                || mediaIds.has(newId) || covered.has(newId) || claimedCandidates.has(newId) || plan.claims.has(oldId)) { j++; continue; }
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
@@ -1754,6 +1789,23 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
 
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    if (mode === "repair") {
+        const unsafeMedia = new Set<string>();
+        for (const m of msgs) {
+            const priorNorm = anchors[m.id]?.n;
+            if (covered.has(m.id) && priorNorm !== undefined && carriesReconciliationMedia(m) && priorNorm !== normalizedIdentity(m)) unsafeMedia.add(m.id);
+        }
+        if (unsafeMedia.size > 0) {
+            // Legacy text-only anchors may already have claimed unrelated images, even with exact ids.
+            // Withdraw only their coverage; ids, summaries and the remaining text fold stay intact.
+            for (const block of blocks) {
+                if (block.effectiveMessageIds !== undefined) block.effectiveMessageIds = block.effectiveMessageIds.filter((id) => !unsafeMedia.has(id));
+                if (block.directMessageIds !== undefined) block.directMessageIds = block.directMessageIds.filter((id) => !unsafeMedia.has(id));
+            }
+            for (const id of unsafeMedia) covered.delete(id);
+            opts.log?.("info", `[fold-reconcile] released ${unsafeMedia.size} media cell(s) without matching payload evidence`);
+        }
+    }
     // #3301: a wire-shape flip puts legacy (pre-#2644, no p/x) ids off the wire
     // on the FIRST post-flip pass — and this same pass rolls the order backbone
     // forward without them, so any backfill landing later can never claim (the
@@ -1968,11 +2020,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             }
             continue;
         }
-        // An unchanged id means unchanged bytes (kernel deriveMessageId hashes
-        // exactly the fields normalizedIdentity covers), so the stored anchor is
-        // necessarily still valid — reuse it instead of re-normalizing +
-        // re-hashing the full text every pass (#1930-2: keeps steady-state
-        // rounds near-free on 8K-message histories).
+        // An unchanged id means unchanged bytes (kernel deriveMessageId is
+        // content- and payload-addressed over role/contentType/tool ids/text
+        // plus the media payload — the same evidence surface
+        // normalizedIdentity covers), so the stored anchor is necessarily
+        // still valid — reuse it instead of re-normalizing + re-hashing the
+        // full text every pass (#1930-2: keeps steady-state rounds near-free
+        // on 8K-message histories).
         const prior = anchors[id];
         if (prior !== undefined) {
             if (anchorCount >= MAX_ANCHORS) {
