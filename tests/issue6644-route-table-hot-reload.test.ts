@@ -113,7 +113,7 @@ test("#6644: a changed proxy URL resets the dispatcher cache (stale agent is dro
     assert.notEqual(after, before, "the cache must have been reset — a fresh agent is created");
 });
 
-test("#6644: applyRouteTables logs the applied provider count", () => {
+test("#6644: route refresh logs the applied provider count when the file changes", () => {
     const f = pointAt("log.json");
     write(f, JSON.stringify({ providers: { "https://a.example": {}, "https://b.example": {} } }));
     const opts = buildOpts();

@@ -1544,10 +1544,11 @@ export function currentConfigRawText(): string {
 /** Re-read the route/proxy tables from the config file and swap them into `opts`
  *  in place (the SAME object references the in-flight handle() closures captured,
  *  so resolveUpstream/resolveProxyDecision see the new entries without
- *  reassignment), then refresh the change tracker. Does NOT reset the proxy
- *  dispatcher cache — the caller does that (a changed proxy URL must not keep a
- *  stale cached agent). */
-export function applyRouteTables(opts: ProxyOptions, log: (level: string, msg: string) => void): void {
+ *  reassignment), then refresh the change tracker. Returns the applied provider
+ *  names (for caller logging / responses). Does NOT reset the proxy dispatcher
+ *  cache — the caller does that (a changed proxy URL must not keep a stale
+ *  cached agent). */
+export function applyRouteTables(opts: ProxyOptions): string[] {
     const fresh = loadRoutes();
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
@@ -1555,8 +1556,7 @@ export function applyRouteTables(opts: ProxyOptions, log: (level: string, msg: s
     for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
     Object.assign(opts.namedProviders, loadNamedProviders());
     lastAppliedRouteConfigRaw = currentConfigRawText();
-    const names = Object.keys(fresh);
-    log("info", `[acp-config] route tables applied from config file (${names.length} providers): ${names.join(", ") || "(none)"}`);
+    return Object.keys(fresh);
 }
 
 /** Per-request hook: re-apply the route tables only when the config file's
@@ -1571,8 +1571,9 @@ export function refreshRouteTablesIfFileChanged(opts: ProxyOptions, log: (level:
     if (lastAppliedRouteConfigRaw === null) return false;
     const raw = currentConfigRawText();
     if (raw === lastAppliedRouteConfigRaw) return false;
-    applyRouteTables(opts, log);
+    const names = applyRouteTables(opts);
     resetProxyCache();
+    log("info", `[acp-config] route tables applied from config file (${names.length} providers): ${names.join(", ") || "(none)"}`);
     return true;
 }
 
