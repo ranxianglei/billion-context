@@ -1007,7 +1007,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boolean) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
     /** Settled prose deferred alongside a NON-definite tag-head tail: it
      *  carries a dead ref-close unit whose verdict is content-determined
@@ -1055,25 +1055,37 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     // the cap drops repeatedly until its close. swallowSessionCounted keeps
     // any one swallow session at exactly one count.
     let swallowSessionCounted = false;
-    const recordDrop = (snippet: string) => {
+    // #5192: a drain drop is a different event from an ordinary strip — the
+    // stream ended while the filter still held bytes, so the one-shot notice
+    // below (spent by the response's FIRST drop) left it with no line at all.
+    // It gets its own one-shot budget so a held head at EOF is always audible.
+    let drainNoticed = false;
+    const recordDrop = (snippet: string, duringDrain = false) => {
         droppedAny = true;
+        if (duringDrain) {
+            if (onDrop && !drainNoticed) {
+                drainNoticed = true;
+                onDrop(snippet, true);
+            }
+            return;
+        }
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string) => {
+    const drop = (snippet: string, duringDrain = false) => {
         dropCount += 1;
-        recordDrop(snippet);
+        recordDrop(snippet, duringDrain);
     };
     /** Any drop inside a live swallow session — the session counts once. */
-    const dropSwallowSpan = (snippet: string) => {
+    const dropSwallowSpan = (snippet: string, duringDrain = false) => {
         if (!swallowSessionCounted) {
             dropCount += 1;
             swallowSessionCounted = true;
         }
-        recordDrop(snippet);
+        recordDrop(snippet, duringDrain);
     };
     /** #2862: strip dead ref-close units (ref + unterminated close head) from
      *  a span about to be RELEASED as prose; each unit is one self-contained
@@ -1522,7 +1534,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // imitation (never released, #1720), or an attrs-bearing
                 // opening whose tail never closed — that tail is tag content
                 // (a ref, possibly truncated), not prose (#644 EOF rule).
-                if (rest.length > 0) dropSwallowSpan(rest);
+                if (rest.length > 0) dropSwallowSpan(rest, true);
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
@@ -1531,15 +1543,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    dropSwallowSpan(t[0]);
+                    dropSwallowSpan(t[0], true);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        dropSwallowSpan(tc[0]);
+                        dropSwallowSpan(tc[0], true);
                         result = rest.slice(0, tc.index);
                     } else if (REFS_ONLY.test(rest)) {
-                        dropSwallowSpan(rest);
+                        dropSwallowSpan(rest, true);
                         result = "";
                     } else {
                         // Payload accumulated under the session may carry
@@ -1564,13 +1576,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                             if (payload === "") break;
                             const t2 = new RegExp(TRUNC_OPEN.source).exec(payload);
                             if (t2 !== null) {
-                                dropSwallowSpan(t2[0]);
+                                dropSwallowSpan(t2[0], true);
                                 r += payload.slice(0, t2.index);
                                 break;
                             }
                             const tc2 = new RegExp(TRUNC_CLOSE.source).exec(payload);
                             if (tc2 !== null) {
-                                dropSwallowSpan(tc2[0]);
+                                dropSwallowSpan(tc2[0], true);
                                 r += payload.slice(0, tc2.index);
                                 break;
                             }
@@ -1579,7 +1591,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                             // ahead of a refs tail was emitted, the tail is a
                             // prose-cited ref and must be released (#1760).
                             if (r === "" && REFS_ONLY.test(payload)) {
-                                dropSwallowSpan(payload);
+                                dropSwallowSpan(payload, true);
                                 break;
                             }
                             if (payload === prev || guard >= 64) {
@@ -1596,12 +1608,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             } else {
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    drop(t[0]);
+                    drop(t[0], true);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        drop(tc[0]);
+                        drop(tc[0], true);
                         result = rest.slice(0, tc.index);
                     } else {
                         result = rest;

@@ -402,8 +402,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const absorbArmedLocal = absorbName !== undefined;
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
