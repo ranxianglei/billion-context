@@ -909,6 +909,12 @@ test("HTTP CCR shared payload deletion fails closed before persistence", { timeo
 
 for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
     test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
+        // The corrupted-store detection path needs the JSON content-store
+        // sidecar on disk. Under the pure-sqlite default (5a80e2b8e) the
+        // JSON writer is OFF, so pin it ON to keep exercising the envelope
+        // corruption path this test was written for.
+        const oldJsonWriter = process.env.BILI_STORAGE_JSON_WRITER;
+        process.env.BILI_STORAGE_JSON_WRITER = "on";
         const h = await harness(true);
         try {
             const parent = resolveConversation("parent").session!;
@@ -966,7 +972,11 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(parentState(), before);
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
             store2.closeQuietly();
-        } finally { await h.close(); }
+        } finally {
+            if (oldJsonWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+            else process.env.BILI_STORAGE_JSON_WRITER = oldJsonWriter;
+            await h.close();
+        }
     });
 }
 
