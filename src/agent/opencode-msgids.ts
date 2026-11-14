@@ -1,34 +1,46 @@
 // #4491 host wiring (opencode): client msgIds for incremental-lane turns.
 //
-// opencode 1.x fires `experimental.chat.messages.transform` per LLM request
-// with `{ info, parts }[]` — info.id is the host message id (msg_ + 12 hex +
-// 14 base62; zero reuse observed across 378K messages, and a
-// streaming-settled message re-fires under the SAME id with grown content —
-// edit semantics the server-side history reconciles, so the host side only
-// ever stores the LATEST fire per session). That hook is the ONLY opencode
-// seam carrying host ids: the V2 `http.request` interception sees the final
-// wire body and nothing else, so V2-shaped turns never carry msgIds — they
-// degrade to the lane's content-derived identities by design (#4491 host
-// wiring audit; opencode is the weakest of the four host seams).
+// Two opencode host seams carry the host's own message ids (msg_ + base62
+// tail, zero reuse observed across 378K messages; a streaming-settled
+// message re-fires under the SAME id with grown content — edit semantics
+// the server-side history reconciles, so each harvester only ever stores
+// the LATEST fire per session):
+//   • V1 (`opencode` ≤1.x): `experimental.chat.messages.transform` fires
+//     per LLM request with `{ info, parts }[]`.
+//   • V2 (`opencode` ≥2.0): `ctx.session.hook("context")` fires right
+//     before every provider request assembly with the full conversation
+//     list `{ id, role, content }[]` (roles user/assistant/tool) plus
+//     sessionID — verified live on 2.0.4, anthropic AND openai-compatible
+//     providers alike. (The V2 `http.request` seam itself sees only the
+//     final wire body; ids reach the planner through this harvest.)
 //
 // Alignment is proof, not guesswork (宁可降级不可错位): ids ride only when
-// every harvested message provably lowers 1:1 onto the wire — text-only
-// parts, role user|assistant, and the derived text sequence exactly equal to
-// the observed wire messages (cache_control and other block props ignored).
-// Any deviation — tool/reasoning/file parts, ignored or synthetic text, a
-// missing or foreign-shaped id, a content drift, duplicate ids — drops the
-// whole field and the turn rides exactly as before. Order-preserving lowering
-// plus per-position equality is what makes the positional pairing safe; a
-// compensating merge+split that still byte-matches every position can only
-// swap ids between byte-identical content, which the ledger joins as one.
+// every harvested message provably lowers onto the wire 1:1 — same role
+// (host `tool` normalizes to wire `user`) and an exactly-equal ordered
+// token sequence, where each token fingerprints one semantic part:
+//   t␀<text>            text blocks (byte-compared, cache_control ignored)
+//   c␀<id>␀<name>       assistant tool call ↔ wire tool_use (anchored by the
+//                      provider-unique tool-use id, not input bytes — the
+//                      id IS the identity; input lowering fidelity varies)
+//   r␀<id>␀<err>        tool result ↔ wire tool_result (same anchor)
+//   o:r                 reasoning part ↔ thinking/redacted_thinking block
+//   o:m                 media part ↔ image/document block
+// Host bookkeeping parts that never reach the wire (step markers,
+// snapshots, patches) are skipped on the host side; ANY other unrecognized
+// part type, a missing or foreign-shaped id, a count/role/token mismatch,
+// or duplicate ids drops the WHOLE field and the turn rides exactly as
+// before (content-derived identities). Order-preserving lowering plus
+// per-position equality makes the positional pairing safe; a compensating
+// merge+split that still byte-matches every position can only swap ids
+// between identical-fingerprint content, which the ledger joins as one.
 
 interface HarvestedEntry {
     /** Host message id; "" when unusable (missing/foreign-shaped) — poisons
      *  alignment for any list containing it, never the lane itself. */
     id: string;
-    /** Derivable wire shape ({role, ordered text-part texts}), or null when
+    /** Derivable wire shape ({role, ordered part tokens}), or null when
      *  this message cannot be proven to lower 1:1 onto one wire message. */
-    shape: { role: "user" | "assistant"; texts: string[] } | null;
+    shape: { role: "user" | "assistant"; toks: string[] } | null;
 }
 
 const MAX_SESSIONS = 256;
@@ -39,27 +51,97 @@ const harvests = new Map<string, { at: number; entries: HarvestedEntry[] }>();
  *  and control characters, the kernel's acp_summary_ namespace, empty ids). */
 const HOST_MSG_ID = /^msg_[A-Za-z0-9]+$/;
 
-function deriveEntry(raw: unknown): HarvestedEntry {
-    const holder = raw as { info?: unknown; parts?: unknown } | null | undefined;
-    const info = holder !== null && typeof holder === "object" ? holder.info : undefined;
-    const parts = holder !== null && typeof holder === "object" ? holder.parts : undefined;
-    const infoObj = info !== null && typeof info === "object" ? (info as { id?: unknown; role?: unknown }) : undefined;
-    const id = typeof infoObj?.id === "string" && HOST_MSG_ID.test(infoObj.id) ? infoObj.id : "";
-    if (infoObj?.role !== "user" && infoObj?.role !== "assistant") return { id, shape: null };
-    if (!Array.isArray(parts)) return { id, shape: null };
-    const texts: string[] = [];
-    for (const part of parts) {
-        const p = part !== null && typeof part === "object" ? (part as { type?: unknown; text?: unknown; ignored?: unknown; synthetic?: unknown }) : undefined;
-        // ignored text never reaches the model (host-render notices) and
-        // synthetic text has no proven lowering — both stay underivable.
-        if (p === undefined || p.type !== "text" || p.ignored === true || p.synthetic === true || typeof p.text !== "string") return { id, shape: null };
-        texts.push(p.text);
-    }
-    return { id, shape: { role: infoObj.role, texts } };
+/** Host bookkeeping parts that produce no wire block — present in the host
+ *  store (and in these events) but rendered client-side only. */
+const NOISE_PART_TYPES = new Set(["step-start", "step-finish", "snapshot", "patch"]);
+
+const T = "\u0000"; // token separator — cannot appear in well-formed JSON text
+
+function str(v: unknown): string | undefined {
+    return typeof v === "string" ? v : undefined;
 }
 
-/** Record the latest messages.transform fire for one session (V1 hook). The
- *  host's outgoing messages are left untouched — harvesting never mutates. */
+function obj(v: unknown): Record<string, unknown> | undefined {
+    return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : undefined;
+}
+
+/** Tokenize ONE host part (V1 `{ parts }` and V2 `{ content }` share the
+ *  relevant fields). Returns the token, `false` for known-noise parts, or
+ *  `null` when the part type cannot be proven to lower onto the wire. */
+function hostPartToken(part: unknown, hostRole: string): string | false | null {
+    const p = obj(part);
+    if (p === undefined) return null;
+    const type = str(p.type);
+    switch (type) {
+        case "text": {
+            if (p.ignored === true || p.synthetic === true) return null; // never reaches the model
+            const text = str(p.text);
+            return text === undefined ? null : `t${T}${text}`;
+        }
+        case "reasoning":
+            return "o:r";
+        case "file":
+        case "image":
+            return "o:m";
+        // V2 ai-sdk style tool parts.
+        case "tool-call": {
+            const id = str(p.id);
+            const name = str(p.name);
+            if (id === undefined || name === undefined) return null;
+            return `c${T}${id}${T}${name}`;
+        }
+        case "tool-result": {
+            const id = str(p.id);
+            if (id === undefined) return null;
+            const result = obj(p.result);
+            const isErr = result?.type === "error";
+            return `r${T}${id}${T}${isErr ? "1" : "0"}`;
+        }
+        // V1 legacy tool part: lives on the assistant (call) or user/tool
+        // (settled result) side — anchored by callID either way.
+        case "tool": {
+            const id = str(p.callID) ?? str(p.id);
+            if (id === undefined) return null;
+            if (hostRole === "assistant") {
+                const name = str(p.tool) ?? "";
+                return `c${T}${id}${T}${name}`;
+            }
+            const state = obj(p.state);
+            const isErr = state?.status === "error";
+            return `r${T}${id}${T}${isErr ? "1" : "0"}`;
+        }
+        default:
+            return type !== undefined && NOISE_PART_TYPES.has(type) ? false : null;
+    }
+}
+
+/** Normalize one harvested host message (either seam's element shape) to
+ *  { id, shape }. Never throws — unparseable elements poison their own
+ *  session's alignment only. */
+export function deriveOpencodeEntry(raw: unknown): HarvestedEntry {
+    const holder = obj(raw);
+    // V1: { info: { id, role }, parts: [...] }; V2 context: { id, role, content: [...] }.
+    const info = holder === undefined ? undefined : obj(holder.info);
+    const idSrc = holder === undefined ? undefined : str(holder.id) ?? str(info?.id);
+    const id = idSrc !== undefined && HOST_MSG_ID.test(idSrc) ? idSrc : "";
+    const roleRaw = info?.role ?? holder?.role;
+    const parts = holder?.parts ?? holder?.content;
+    if (!Array.isArray(parts)) return { id, shape: null };
+    // Host `tool` messages lower onto wire `user` tool_result blocks.
+    const normRole = roleRaw === "user" || roleRaw === "assistant" ? roleRaw : roleRaw === "tool" ? "user" : undefined;
+    if (normRole === undefined) return { id, shape: null };
+    const toks: string[] = [];
+    for (const part of parts) {
+        const tok = hostPartToken(part, String(roleRaw));
+        if (tok === null) return { id, shape: null };
+        if (tok !== false) toks.push(tok);
+    }
+    return { id, shape: { role: normRole, toks } };
+}
+
+/** Record the latest id-bearing fire for one session (V1 messages.transform
+ *  or V2 "context"). The host's outgoing messages are left untouched —
+ *  harvesting never mutates. */
 export function harvestOpencodeMsgIds(sid: string | undefined, messages: unknown): void {
     if (typeof sid !== "string" || sid.length === 0 || !Array.isArray(messages)) return;
     if (!harvests.has(sid) && harvests.size >= MAX_SESSIONS) {
@@ -70,27 +152,58 @@ export function harvestOpencodeMsgIds(sid: string | undefined, messages: unknown
         }
         if (oldestKey !== undefined) harvests.delete(oldestKey);
     }
-    harvests.set(sid, { at: Date.now(), entries: messages.map(deriveEntry) });
+    harvests.set(sid, { at: Date.now(), entries: messages.map(deriveOpencodeEntry) });
 }
 
-/** Wire text sequence of one wire message: string content → [text]; block
- *  array → text blocks' text in order (cache_control et al. ignored). Any
- *  non-text block (tool_use, tool_result, image, thinking…) → null. */
-function wireTexts(content: unknown): string[] | null {
-    if (typeof content === "string") return [content];
-    if (!Array.isArray(content)) return null;
-    const texts: string[] = [];
-    for (const block of content) {
-        const b = block !== null && typeof block === "object" ? (block as { type?: unknown; text?: unknown }) : undefined;
-        if (b === undefined || b.type !== "text" || typeof b.text !== "string") return null;
-        texts.push(b.text);
+/** Token for one ANTHROPIC-WIRE content block, or null when the block type
+ *  cannot be matched against a host part. */
+function wireBlockToken(block: unknown): string | null {
+    const b = obj(block);
+    if (b === undefined) return null;
+    switch (b.type) {
+        case "text": {
+            const text = str(b.text);
+            return text === undefined ? null : `t${T}${text}`;
+        }
+        case "tool_use": {
+            const id = str(b.id);
+            const name = str(b.name);
+            return id === undefined || name === undefined ? null : `c${T}${id}${T}${name}`;
+        }
+        case "tool_result": {
+            const id = str(b.tool_use_id);
+            return id === undefined ? null : `r${T}${id}${T}${b.is_error === true ? "1" : "0"}`;
+        }
+        case "thinking":
+        case "redacted_thinking":
+            return "o:r";
+        case "image":
+        case "document":
+            return "o:m";
+        default:
+            // server_tool_use / tool_reference / anything newer: no proven
+            // host counterpart — degrade this turn rather than misalign.
+            return null;
     }
-    return texts;
+}
+
+/** Token sequence of one ANTHROPIC-WIRE message, or null on any unmatchable
+ *  block. */
+function wireContentToks(content: unknown): string[] | null {
+    if (typeof content === "string") return [`t${T}${content}`];
+    if (!Array.isArray(content)) return null;
+    const toks: string[] = [];
+    for (const block of content) {
+        const tok = wireBlockToken(block);
+        if (tok === null) return null;
+        toks.push(tok);
+    }
+    return toks;
 }
 
 /** Client ids for the FULL wire message list of one planned turn, or
  *  undefined when alignment cannot be proven (no harvest for the session,
- *  count mismatch, underivable/divergent entries, duplicate ids). The
+ *  count mismatch, unalignable/divergent entries, duplicate ids). The
  *  planner slices the result in lockstep with the delta messages. */
 export function alignedMsgIdsForWire(sid: string, wire: unknown): string[] | undefined {
     const stored = harvests.get(sid);
@@ -100,12 +213,12 @@ export function alignedMsgIdsForWire(sid: string, wire: unknown): string[] | und
     for (let i = 0; i < wire.length; i++) {
         const entry = stored.entries[i];
         if (entry.id === "" || entry.shape === null) return undefined;
-        const msg = wire[i] as { role?: unknown; content?: unknown } | null | undefined;
-        if (msg === null || typeof msg !== "object" || msg.role !== entry.shape.role) return undefined;
-        const texts = wireTexts(msg.content);
-        if (texts === null || texts.length !== entry.shape.texts.length) return undefined;
-        for (let j = 0; j < texts.length; j++) {
-            if (texts[j] !== entry.shape.texts[j]) return undefined;
+        const msg = obj(wire[i]);
+        if (msg === undefined || msg.role !== entry.shape.role) return undefined;
+        const toks = wireContentToks(msg.content);
+        if (toks === null || toks.length !== entry.shape.toks.length) return undefined;
+        for (let j = 0; j < toks.length; j++) {
+            if (toks[j] !== entry.shape.toks[j]) return undefined;
         }
         if (seen.has(entry.id)) return undefined;
         seen.add(entry.id);
