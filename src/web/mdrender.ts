@@ -36,7 +36,8 @@ export function makeMdRender(): MdRenderApi {
 
     function inlineMd(s: string): string {
         let out = escape(s);
-        out = out.replace(/`([^`]+)`/g, (_m, code: string) => `<code>${code}</code>`);
+        out = out.replace(/`([^`]+)`/g, (_m, code: string) =>
+            `<code>${code.replace(/[*[\]]/g, (c) => `&#${c.charCodeAt(0)};`)}</code>`);
         // ![alt](url) — must run before the link rule so the image syntax is
         // consumed whole. Only published image sources survive: http(s), or the
         // panel's own bundled-asset route (/__bili/blog-assets/*, see
