@@ -960,3 +960,36 @@ test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their sta
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 });
+
+test("#6325: unchanged large session columns are not rewritten on delta ingest", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-6325-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const now = Date.now();
+        const makeSession = (id: string, text: string): LegacySessionLike => ({
+            id,
+            createdAt: now,
+            lastSeen: now,
+            meta: { protocol: "openai" },
+            stats: {},
+            metadata: { cacheLedger: { keep: "x".repeat(4096) } },
+            state: { blocks: [], nextBlockId: 1, nextRunId: 1, messageRefs: { byRaw: {}, byRef: {} } },
+            blockContents: new Map(),
+            lastMessages: [{ id: "m1", role: "user", contentType: "text", text } as unknown as CoreMessage],
+            lastMessagesFolded: false,
+            pluginSnapshot: undefined,
+            contentStore: undefined,
+        } as unknown as LegacySessionLike);
+        const session = makeSession("sess-6325", "hello");
+        const before = store.ingestSession(planIngest(session));
+        assert.ok(before);
+        const first = store.getSessionRow("sess-6325");
+        assert.ok(first?.metadataJson?.includes("cacheLedger"));
+        store.ingestSession(planIngest({ ...session, lastMessages: [{ id: "m2", role: "assistant", contentType: "text", text: "world" } as unknown as CoreMessage] }));
+        const second = store.getSessionRow("sess-6325");
+        assert.equal(second?.metadataJson, first?.metadataJson, "unchanged metadata_json should reuse the stored value");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
