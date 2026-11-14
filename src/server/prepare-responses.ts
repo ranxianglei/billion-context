@@ -6,7 +6,7 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, isTagShapedText, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -403,7 +403,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isTagShapedText(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }

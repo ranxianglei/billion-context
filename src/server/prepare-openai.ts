@@ -9,7 +9,7 @@ import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } 
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, isTagShapedText, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -356,7 +356,7 @@ export async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isTagShapedText(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }

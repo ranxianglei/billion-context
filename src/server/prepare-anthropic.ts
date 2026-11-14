@@ -7,7 +7,7 @@ import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforg
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, isTagShapedText, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -407,7 +407,7 @@ export async function prepareAnthropic(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isTagShapedText(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }

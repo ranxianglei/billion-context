@@ -28,7 +28,7 @@ import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-noti
 import { dismissUpgradeNotice } from "../pck-notice.js";
 import { mergedNotices, localDismissKey, localDismissMode, markInstanceDismissal } from "../announcements.js";
 import { remoteAnnouncementPayloads, remoteDismissKey, remoteDismissMode } from "../remote-notices.js";
-import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
+import { anonymousIdentitySummary, listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
@@ -1310,14 +1310,18 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    const splitWarnings = splitSessionWarnings(listSessions());
+    const statusSessions = listSessions();
+    const splitWarnings = splitSessionWarnings(statusSessions);
     for (const w of splitWarnings) {
         if (!splitWarnedBases.has(w.base)) {
             splitWarnedBases.add(w.base);
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    // #4776: additive honest count for identity-less clients — splitSessions above
+    // is the #2165 shared-base canary and structurally blind to pfa-* forks.
+    const anonymousIdentity = anonymousIdentitySummary(statusSessions);
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, anonymousIdentity, conflicts: summarizeConflicts(statusSessions), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
