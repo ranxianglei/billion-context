@@ -67,7 +67,8 @@ test("bucket: deterministic, in range, id-independent of percent", () => {
     assert.equal(rollout.rolloutBucket("salt", id), rollout.rolloutBucket("salt", id));
     const b = rollout.rolloutBucket("salt", id);
     assert.ok(b >= 0 && b < rollout.BP_MAX);
-    assert.notEqual(b, rollout.rolloutBucket("other-salt", id));
+    // A single draw collides across salts with probability 1/BP_MAX (observed on CI) — assert over the sample.
+    assert.ok(ids.some((i) => rollout.rolloutBucket("salt", i) !== rollout.rolloutBucket("other-salt", i)));
 });
 
 test("unknown feature with no config is OFF (fail closed)", () => {
