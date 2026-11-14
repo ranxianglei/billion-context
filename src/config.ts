@@ -386,10 +386,11 @@ export type CompressSettings = {
     protectedLatestTools?: string[];
     /* (durable virtual paths) dsh lanes project their durable-state TEXT
      *  carriers to `durable/<name>` identities (#2446 family: skill catalog,
-     *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
-     *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
-     *  instance of every carrier (all four are cumulative snapshots — the
-     *  older catalogs/baselines fold away). Default when nothing is
+     *  mcp catalog, agents-md baseline, runtime-context snapshot, in-history
+     *  system-prompt update), so the same pattern machinery governs them:
+     *  `"durable/*"` keeps the LATEST instance of every carrier (all five
+     *  are cumulative snapshots — the older catalogs/baselines/prompt copies
+     *  fold away). Default when nothing is
      *  configured: `durable/*` latest-per-identity in
      *  `protectedLatestTools` (pi-reference single-live-copy semantics —
      *  skill/MCP visibility can never be lost, superseded snapshots
