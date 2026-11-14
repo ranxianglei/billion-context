@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createCore } from "../src/compress.js";
+import { createCore, filterDeadRefRanges } from "../src/compress.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
 import { formatRanges } from "../src/nudge-text.js";
 import { resolveBoundaries } from "../src/boundaries.js";
@@ -352,4 +352,60 @@ test("applyCompression folds the exact offered span for either label order (#568
       `${startRef}–${endRef}: exactly the offered positional span`,
     );
   }
+});
+
+// ─── #6661: the statusLine must not offer a range the gate will refuse ───────
+
+// The per-turn statusLine is the one offer surface built INSIDE the kernel, so
+// the dead-ref filter every host offer surface applies never reached it: it
+// advertised the very ranges the gate then refused ("recorded as DEAD"), and
+// the model looped re-issuing them until the breaker tripped. The hole-break in
+// buildCompressibleRanges (#3192/#3205) only catches a dead ref STRICTLY
+// between two consecutive compressible messages (hasDeadRefBetween is
+// endpoint-exclusive) — a dead ref sitting at a range endpoint still leaked
+// into the line. filterDeadRefRanges is the statusLine's own guard: drop any
+// offered range whose canonicalized span contains a dead ref (endpoint-
+// inclusive), and go silent when none are left.
+test("filterDeadRefRanges drops ranges spanning a dead ref, keeps the rest (#6661)", () => {
+  const ranges = [
+    { startRef: "m00001", endRef: "m00004" }, // live
+    { startRef: "m00005", endRef: "m00008" }, // spans dead m00006
+    { startRef: "m00009", endRef: "m00010" }, // dead ref at the start endpoint
+    { startRef: "m00011", endRef: "m00014" }, // live
+  ];
+  const filtered = filterDeadRefRanges(ranges, ["m00006", "m00009"]);
+  // m00005–m00008 spans m00006 → dropped; m00009–m00010 carries m00009 at its
+  // start endpoint → dropped (endpoint-inclusive, unlike the hole-break); the
+  // two live ranges survive untouched.
+  assert.deepEqual(
+    filtered.map((r) => `${r.startRef}–${r.endRef}`),
+    ["m00001–m00004", "m00011–m00014"],
+  );
+});
+
+test("filterDeadRefRanges canonicalizes reversed spans before the dead check (#6661/#5680)", () => {
+  // A stored descending pair (m00008–m00005) still spans m00006 — the check
+  // must canonicalize lo/hi first or a reversed range slips through the filter.
+  const ranges = [
+    { startRef: "m00008", endRef: "m00005" }, // reversed, span [5,8] contains m00006
+    { startRef: "m00007", endRef: "m00004" }, // reversed, span [4,7] contains m00006
+    { startRef: "m00011", endRef: "m00014" }, // live
+  ];
+  const filtered = filterDeadRefRanges(ranges, ["m00006"]);
+  assert.deepEqual(
+    filtered.map((r) => `${r.startRef}–${r.endRef}`),
+    ["m00011–m00014"],
+  );
+});
+
+test("filterDeadRefRanges is a no-op with no dead refs and keeps unparseable endpoints (#6661)", () => {
+  const ranges = [
+    { startRef: "m00001", endRef: "m00004" },
+    { startRef: "BLOCKED", endRef: "m00006" }, // unparseable start → kept
+    { startRef: "b1", endRef: "b2" }, // block ids → kept
+  ];
+  assert.deepEqual(filterDeadRefRanges(ranges), ranges, "no deadRefs → same array");
+  assert.deepEqual(filterDeadRefRanges(ranges, []), ranges, "empty deadRefs → same array");
+  // A dead ref that matches no parseable span leaves everything intact.
+  assert.deepEqual(filterDeadRefRanges(ranges, ["m00999"]), ranges);
 });

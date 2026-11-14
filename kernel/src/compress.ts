@@ -209,6 +209,32 @@ function formatK(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
 }
 
+// #6661: the per-turn statusLine is built here in the kernel, so the dead-ref
+// filter the other offer surfaces apply never reached it — it advertised the
+// doomed ranges the gate then refused, contradicting the "recorded as DEAD"
+// receipt in the same message. Drop any offered range whose span contains a
+// dead ref. Canonicalize the span first (reversed storage, #5680) so a
+// descending pair is checked correctly. Conservative: drops the whole span
+// rather than splitting around the dead cell.
+export function filterDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
+  if (!deadRefs || deadRefs.length === 0) return ranges;
+  const deadNumbers: number[] = [];
+  for (const ref of deadRefs) {
+    const m = /^m(\d+)$/i.exec(ref);
+    if (m) deadNumbers.push(Number(m[1]));
+  }
+  if (deadNumbers.length === 0) return ranges;
+  return ranges.filter((range) => {
+    const s = /^m(\d+)$/i.exec(range.startRef);
+    const e = /^m(\d+)$/i.exec(range.endRef);
+    if (!s || !e) return true;
+    let lo = Number(s[1]);
+    let hi = Number(e[1]);
+    if (lo > hi) [lo, hi] = [hi, lo];
+    return !deadNumbers.some((n) => n >= lo && n <= hi);
+  });
+}
+
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -1055,20 +1081,28 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // (#196 regime scoping, #3910 lane baseline).
     const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
     if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      const highest = highestUsedIndex(state.messageRefs);
-      // #5680: after a generation reset the stored endpoints of a positional
-      // span can be numerically descending — canonicalize to ascending like
-      // every other display surface (formatRanges, acp_status) or the model
-      // reads the line as corrupt and skips compression.
-      const offered = nudge.compressibleRanges!
-        .slice(0, 3)
-        .map((r) => {
-          const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
-          return `${lo}–${hi} (${formatK(r.tokens)})`;
-        })
-        .join(", ");
-      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
-      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
+      // #6661: never offer a range the gate will refuse — drop any span that
+      // contains a dead ref. The "recorded as DEAD" receipt in the same message
+      // already says those ranges can't be anchored, so offering them makes the
+      // line contradict the receipt and the model loops re-issuing doomed
+      // ranges until the breaker trips.
+      const liveRanges = filterDeadRefRanges(nudge.compressibleRanges!, state.deadRefs);
+      if (liveRanges.length > 0) {
+        const highest = highestUsedIndex(state.messageRefs);
+        // #5680: after a generation reset the stored endpoints of a positional
+        // span can be numerically descending — canonicalize to ascending like
+        // every other display surface (formatRanges, acp_status) or the model
+        // reads the line as corrupt and skips compression.
+        const offered = liveRanges
+          .slice(0, 3)
+          .map((r) => {
+            const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+            return `${lo}–${hi} (${formatK(r.tokens)})`;
+          })
+          .join(", ");
+        const extra = liveRanges.length > 3 ? `, +${liveRanges.length - 3} more` : "";
+        statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
+      }
     }
     return {
       messages: result.messages,
