@@ -60,7 +60,7 @@ function formatK(n: number): string {
  *  a checklist attached. */
 export function buildDecisionPrompt(ranges: CompressibleRange[]): string {
     const spans = ranges.slice(0, SPANS_SHOWN).map(
-        (r) => `  ${r.startRef}\u2013${r.endRef}  ${r.count} msgs  ${formatK(r.tokens)} [tool ${r.toolPct}% | text ${r.textPct}%]`,
+        (r) => `  ${r.startRef}\u2013${r.endRef}  ${r.count} msgs  ${formatK(r.tokens)} [tool ${r.toolPct}% | text ${r.textPct}%]${r.crossesCoveredBy && r.crossesCoveredBy.length > 0 ? ` \u00b7 spans folded ${r.crossesCoveredBy.join(", ")}` : ""}`,
     );
     return [
         "[bili-compress-decision] Side-channel question \u2014 answer ONLY this. Do not continue your task, do not call any tools.",
