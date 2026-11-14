@@ -356,7 +356,8 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tree-stats { display: flex; gap: 16px; flex-wrap: wrap; padding: 2px 0 10px; color: var(--text-muted); }
 .tree-actions { display: flex; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
 /* #3917: list ⇄ graph switch for the compression pane, plus the graph itself
-   (layered block boxes on a light canvas, tier-tinted borders). */
+   (layered block boxes, tier-tinted borders; #5417: node fills follow the
+   theme so the themed text stays readable in dark mode). */
 .tree-modes { display: flex; gap: 6px; margin: 0 0 10px; align-items: center; }
 .tree-modes .hint { flex: 1; font-size: 11px; color: var(--text-muted); }
 .tree-mode { color: var(--text-muted); }
