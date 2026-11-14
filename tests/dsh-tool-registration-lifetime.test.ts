@@ -1,5 +1,6 @@
 import test, { afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
+import { Context, Service, type Plugin } from "@deepseek-ai/cordis";
 import {
     apply, maybeRetryForTest, _resetRegisterForTest, _settleNativeForTest, _nativeStateForTest,
     _registerStateForTest, _stateToolsReadyForTest, _stateHeadersForTest,
@@ -157,9 +158,8 @@ test("a late old manifest cannot register tools or clear the new activation's pe
 // registrations die — so the final scenario runs against a real fiber with the
 // `@deepseek-ai/cordis` dev dependency. TestTools mirrors the real
 // ToolsService ownership: extending cordis Service makes `this.ctx` resolve to
-// the CALLING plugin's context, so each registration is held by that fiber's
-// effect and teardown emits tools/change.
-import { Context, Service, type Plugin } from "@deepseek-ai/cordis";
+ // the CALLING plugin's context, so each registration is held by that fiber's
+ // effect and teardown emits tools/change.
 
 class TestTools extends Service {
     definitions = new Map<string, Definition>();
