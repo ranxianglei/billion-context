@@ -11,7 +11,8 @@
     "./dsh-compaction-gate": "./dist/agent/dsh-compaction-gate.js",
     "./package.json": "./package.json",
     "./dsh/package.json": "./package.json",
-    "./client": "./dist/agent/dsh-native-client.js"
+    "./client": "./dist/agent/dsh-native-client.js",
+    "./salvage": "./dist/salvage.js"
   },
   "bin": {
     "bili": "./dist/index.js",
