@@ -171,7 +171,7 @@ test("#4444: an unsupported Node surfaces the Node.js upgrade lever on the degra
         assert.ok(text.includes("⚠ degraded —"), `the degrade warning line is present (got: ${text.slice(-400)})`);
         assert.ok(text.includes("no self-downloaded SQLite engine supports this Node.js"), "the specific coverage detail surfaces");
         assert.ok(/Node\.js 21\.6\.1/.test(text), "the reason names the runtime the table could not serve");
-        assert.ok(/Node\.js >= 22\.5/.test(text), `#4444: the unsupported-node reason must carry the Node.js upgrade lever (got: ${text.slice(-400)})`);
+        assert.ok(/Node\.js 22 or newer/.test(text), `#4444: the unsupported-node reason must carry the Node.js upgrade lever (got: ${text.slice(-400)})`);
     } finally {
         if (origNodeDesc) Object.defineProperty(process.versions, "node", origNodeDesc);
         store?.closeQuietly();
