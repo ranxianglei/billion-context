@@ -917,6 +917,7 @@ Top-level keys that control how the proxy listens and behaves globally.
       "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
     },
     "notifyIfRead": "skip",      // "skip" — no completion nudge if the model already read the result file
+    "notifyStructured": false,   // true — notices become typed custom messages carrying a versioned details envelope (runId/status + launch provenance) for third-party UIs; model-visible text unchanged (#5750)
     "fleetShortcut": "ctrl+alt+d", // "" disables the keyboard shortcut (/acp-fleet still works)
     "prompt": null,              // replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS appendix
     "debug": false               // debug events in ~/.pi/acp.log, scoped to sub-agents
