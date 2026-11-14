@@ -147,6 +147,20 @@ test("sync is gated on opencode and prunes dead blocks; empty re-capture keeps t
     assert.equal(subagentSessionNote("b2", ["ses_old"]), "[acp-subagent-sessions b2: ses_old]");
 });
 
+test("large dispatch histories preserve first-seen ID order across carriers and the persisted cap", () => {
+    const expected = Array.from({ length: 5_000 }, (_, i) => `ses_bulk${i}`);
+    const messages: CoreMessage[] = expected.flatMap((id, i) => [
+        ...seedDispatch(`call-${i}`, `result-${i}`, id),
+        { id: `again-${i}`, role: "assistant", contentType: "tool-call", toolName: "subagent", text: JSON.stringify({ sessionId: id, sessionID: id, session_id: id }) },
+    ]);
+    const covered = new Set(messages.map(message => message.id));
+    assert.deepEqual(captureSubagentSessionIds(messages, covered), expected);
+    const session = { metadata: { pluginAgent: "opencode" }, state: { blocks: [{ blockId: "b1", active: true }] } };
+    syncSubagentSessions(session, [{ blockId: "b1", effectiveMessageIds: [...covered], directBlockIds: [] }], messages);
+    assert.deepEqual(subagentSessionsOf(session), { b1: expected.slice(0, 100) });
+    assert.deepEqual(captureSubagentSessionIds(messages, new Set(["again-4999", "result-1"])), ["ses_bulk1", "ses_bulk4999"]);
+});
+
 test("attach appends the id line to the active carrier only, without mutating inputs", () => {
     const carrier = { id: summaryMessageId("b1"), role: "system", contentType: "text" as const, text: "SUMMARY-BODY" };
     const other = { id: "raw_1", role: "user", contentType: "text" as const, text: "hello" };
