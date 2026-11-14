@@ -413,12 +413,14 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
             factory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
             clientFactory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
         };
-        // #3776: trust the merged CA bundle for end-to-end TLS to the target through the tunnel.
+        // ProxyAgent builds separate connectors for the proxy and the tunneled
+        // target; its internal connector replaces a top-level connect option.
+        // Apply the configured merged trust to both TLS legs (#3776).
         const ca = upstreamExtraCa();
-        const withConnect = ca ? { ...base, connect: { ca } } : base;
+        const withTls = ca ? { ...base, requestTls: { ca }, proxyTls: { ca } } : base;
         agent = ka > 0
-            ? new ProxyAgent({ ...withConnect, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
-            : new ProxyAgent(withConnect);
+            ? new ProxyAgent({ ...withTls, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
+            : new ProxyAgent(withTls);
         dispatcherCache.set(key, agent);
     }
     return agent;
@@ -434,7 +436,9 @@ export function resetProxyCache(): void {
 
 function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
     if (proxy.protocol === "https:") {
-        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host });
+        const ca = upstreamExtraCa();
+        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host,
+            ...(ca ? { ca } : {}) });
     }
     return net.connect(proxy.port, proxy.host);
 }
