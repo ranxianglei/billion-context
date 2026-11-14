@@ -6,6 +6,7 @@
 // log forensics. These tests pin the four dimensions + the caps.
 import assert from "node:assert";
 import { test } from "node:test";
+import { countMessageTokens, defaultCountTokens } from "acp-kernel";
 
 import {
     contextAnalysisView,
@@ -71,6 +72,42 @@ test("first request snapshots the init profile (size + per-message sample)", () 
     if (!(top.estTokens > second.estTokens)) throw new Error("largest first");
     const lines = formatContextAnalysis("s-init")!;
     if (!lines.some((l) => l.startsWith("init:"))) throw new Error(`init line present: ${lines.join(" | ")}`);
+});
+
+test("init sample retains the largest 100 while totals cover the full request", () => {
+    resetContextAnalysisForTest();
+    const messages = Array.from({ length: 513 }, (_, i) => ({
+        ...msg(String(i), (i * 137) % 1200, i % 2 ? "assistant" : "user"),
+        toolName: `tool-${String(i).padStart(3, "0")}`,
+        thinkingTokens: i % 17 === 0 ? 1000 : undefined,
+    }));
+    const expected = messages.map((m) => ({
+        role: m.role,
+        contentType: m.contentType,
+        toolName: m.toolName,
+        estTokens: countMessageTokens(m, defaultCountTokens),
+    })).sort((a, b) => b.estTokens - a.estTokens).slice(0, 100);
+    recordNudgeObservation("s-many", { nudge: null, messages }, 50_000, 750_000, false);
+    recordNudgeObservation("s-many", { nudge: null, messages: [msg("later", 4)] }, 52_000, 750_000, false);
+    const init = contextAnalysisView("s-many")!.init!;
+    assert.equal(init.messageCount, messages.length);
+    assert.equal(init.totalChars, messages.reduce((sum, m) => sum + m.text.length + m.toolName.length, 0));
+    assert.equal(init.estTokens, messages.reduce((sum, m) => sum + countMessageTokens(m, defaultCountTokens), 0));
+    assert.deepEqual(init.perMessage, expected);
+});
+
+test("init sample keeps earlier messages when equal token sizes cross the cap", () => {
+    resetContextAnalysisForTest();
+    const messages = Array.from({ length: 250 }, (_, i) => ({
+        ...msg(String(i), 100),
+        toolName: `tool-${String(i).padStart(3, "0")}`,
+    }));
+    recordNudgeObservation("s-ties", { nudge: null, messages }, 50_000, 750_000, false);
+    recordNudgeObservation("s-ties", { nudge: null }, 50_000, 750_000, false);
+    assert.deepEqual(
+        contextAnalysisView("s-ties")!.init!.perMessage.map((m) => m.toolName),
+        messages.slice(0, 100).map((m) => m.toolName),
+    );
 });
 
 test("heavy-init verdict fires when the first request already carries ≥15% of the window", () => {
