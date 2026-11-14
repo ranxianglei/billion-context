@@ -144,6 +144,9 @@ export const LIVE_FILES = [
     "tests/ci-janitor-fork-heads.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
+    // Native-zstd absence is simulated in an isolated Node child; it binds
+    // no sockets and changes only that child's built-in module exports.
+    "tests/content-encoding-zstd.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
