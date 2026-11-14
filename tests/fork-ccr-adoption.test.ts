@@ -38,6 +38,12 @@ import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
+// Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope writer OFF,
+// so the per-session CCR content-store sidecar (.content-store.json) this
+// suite asserts on is never written. Pin the writer ON at module load (before
+// any SessionStore is constructed) so the companion-envelope coverage this
+// test was written for still runs regardless of the storage-mode default.
+process.env.BILI_STORAGE_JSON_WRITER = "on";
 
 const LIMIT = 200_000;
 const META = { protocol: "openai" as const, upstreamOrigin: "http://upstream.example/v1" };
