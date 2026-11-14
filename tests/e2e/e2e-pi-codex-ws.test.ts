@@ -342,6 +342,12 @@ function piRun(
             cwd: ctx.piCwd,
             env: {
                 ...cleanEnv(opts.extraEnv),
+                // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON
+                // envelope writer OFF, but this lane asserts on the on-disk
+                // .json session file. Pin the writer ON so the envelope this
+                // test was written for is still produced regardless of the
+                // storage-mode default.
+                BILI_STORAGE_JSON_WRITER: "on",
                 PI_CODING_AGENT_DIR: ctx.piAgentDir,
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,
