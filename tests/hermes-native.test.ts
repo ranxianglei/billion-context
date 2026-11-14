@@ -368,6 +368,22 @@ def install_sidecar(bad):
     with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
         json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
 
+def write_dist(base_dir):
+    d = os.path.join(base_dir, "billion-context", "dist")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "index.js")
+    with open(p, "w") as f:
+        f.write("// dummy bili dist entry point\n")
+    os.chmod(p, 0o755)  # npm chmods the bin it links onto; `bili` must be executable on PATH
+    return p
+
+def stub_bili(bin_dir, target):
+    p = os.path.join(bin_dir, "bili")
+    if os.path.exists(p):
+        os.remove(p)
+    os.symlink(target, p)
+    return p
+
 # --- #2905 instance-record fixtures (identity fields discovery now checks) ---
 
 def fp_of(bad):
@@ -499,7 +515,42 @@ elif SCENARIO.startswith("gate-"):
     os.environ[envvar] = "http://127.0.0.1:1" if envvar == "BILLION_CONTEXT_PROXY" else "0"
     mod.register(ctx)
 elif SCENARIO == "no-sidecar":
+    # Hermetic: a `bili` on the machine's own PATH must not turn "no dist anywhere" into a
+    # resolution — the ladder's last rung is asserted against a PATH that holds node only.
+    os.environ["PATH"] = os.path.dirname(os.environ["BC_NODE"])
     mod.register(ctx)
+elif SCENARIO == "load-sidecar":
+    # #6672: the sidecar resolution ladder, first hit wins and nothing is ever written.
+    before = sorted(os.listdir(PLUGIN_DIR))
+    res = {}
+    install_sidecar(False)
+    res["sidecar"] = mod.load_sidecar()
+    os.remove(os.path.join(PLUGIN_DIR, "bili.json"))
+    global_dist = write_dist(os.path.join(BASE, "global"))
+    write_dist(os.path.join(PLUGIN_DIR, "node_modules"))
+    res["bundled"] = mod.load_sidecar()
+    shutil.rmtree(os.path.join(PLUGIN_DIR, "node_modules"))
+    if os.name == "nt":
+        res["path"] = res["path_wrapper"] = res["none"] = "skip"
+    else:
+        bin_dir = os.path.join(BASE, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        node_dir = os.path.dirname(os.environ["BC_NODE"])
+        wrapper = os.path.join(BASE, "wrapper.sh")
+        with open(wrapper, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(wrapper, 0o755)
+        stub_bili(bin_dir, global_dist)
+        os.environ["PATH"] = bin_dir + os.pathsep + node_dir
+        res["path"] = mod.load_sidecar()
+        # A shell wrapper is not the dist: the realpath+.js guard falls through to inert.
+        stub_bili(bin_dir, wrapper)
+        res["path_wrapper"] = mod.load_sidecar()
+        os.remove(os.path.join(bin_dir, "bili"))
+        os.environ["PATH"] = node_dir
+        res["none"] = mod.load_sidecar()
+    out["sidecar_resolution"] = res
+    out["plugin_dir_unchanged"] = sorted(os.listdir(PLUGIN_DIR)) == before
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
     mod.register(ctx)
@@ -1272,6 +1323,8 @@ interface DriverOut {
     rf_dead?: unknown;
     rf_dup_pid?: string | null;
     rf_none?: unknown;
+    sidecar_resolution?: Record<string, { script: string; node: string } | null | string>;
+    plugin_dir_unchanged?: boolean;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1665,6 +1718,38 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
+    });
+
+    test("no sidecar: resolves the dist from a host-managed copy, then from `bili` on PATH (#6672)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("load-sidecar");
+        assert.ok(out, err);
+        const res = out!.sidecar_resolution!;
+        const scriptOf = (v: unknown): string | null => (v && typeof v === "object" ? (v as { script: string }).script : null);
+        // 1. the installer's sidecar still wins untouched
+        assert.match(scriptOf(res.sidecar)!, /[/\\]proxy\.js$/, "bili.json stays the first hit");
+        // 2. a host-managed copy in the plugin's own node_modules
+        assert.match(
+            scriptOf(res.bundled)!,
+            /[/\\]node_modules[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+            "no sidecar: the plugin resolves the dist its own npm install put there",
+        );
+        if (process.platform !== "win32") {
+            // 3. the global install, reached through `bili` on PATH (realpath onto dist/index.js)
+            assert.match(
+                scriptOf(res.path)!,
+                /[/\\]global[/\\]billion-context[/\\]dist[/\\]index\.js$/,
+                "no sidecar, no local copy: the reference lane's global dist is resolved off PATH",
+            );
+            // 3b. a shell wrapper named bili is not the dist — the realpath+.js guard keeps it inert
+            assert.equal(res.path_wrapper, null, "a non-.js entry point falls through instead of spawning it");
+            // 4. nothing anywhere is still inert
+            assert.equal(res.none, null);
+        }
+        assert.equal(out!.plugin_dir_unchanged, true, "resolution is read-only: no sidecar is ever written");
     });
 
     test("spawn failure: child dies -> inert, env untouched, starting marker cleaned up", () => {
