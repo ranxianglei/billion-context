@@ -703,6 +703,18 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
+                // #5872: when EVERY reported run sits below the kernel's
+                // minCompressRange gate, the listed refs fail by construction —
+                // naming them as inspectable work orders drove single-message
+                // compress retries at the most anxious moment (post-success).
+                // Keep the honest mass report; drop the refs, the "not at its
+                // minimum" claim, and the acp_status pointer; end on the
+                // contract stop phrase. Any foldable run present → old wording
+                // byte-for-byte (#4331's honesty pin stands).
+                const anyFoldable = minChars <= 0 || runs.some((r) => r.chars >= minChars);
+                if (!anyFoldable) {
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block; every run is below the fold-size gate (min ${minChars} chars), so no single run can be folded right now. Continue the task without compressing.`;
+                }
                 return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
             }
         }
@@ -1463,11 +1475,28 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
             const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
+            // #5872: the kernel's too-small line states both numbers but never
+            // the GAP — the looping model walked single-message specs forward
+            // one ref at a time (187 attempts) without reading the arithmetic.
+            // Make the shortfall explicit while unarmed (one instruction per
+            // receipt, #2360 §2 — once armed the hard-stop paragraph owns the
+            // receipt); suppressed when noViableAnywhere already delivers the
+            // conclusive verdict.
+            let gapNote = "";
+            if (gateReason === "gate:too-small" && loopGuard === "" && noViableAnywhere === "") {
+                const m = /Total compressible content too small \((\d+) chars across (\d+) range\(s\), min (\d+)\)/.exec(errs);
+                if (m) {
+                    const picked = Number(m[1]);
+                    const spanned = Number(m[2]);
+                    const need = Number(m[3]);
+                    gapNote = ` You picked ${picked} char(s) — ${Math.max(0, need - picked)} short of the ${need}-char gate${spanned === 1 ? "; a single message almost never clears it, widen the range to cover more messages" : ""}.`;
+                }
+            }
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}${gapNote}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-
