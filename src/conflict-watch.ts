@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred" | "identity-orphan" | "id-churn-adoption" | "fold-vacuum";
 
 export interface ConflictEvent {
     at: number;
@@ -203,6 +203,10 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // landing was fully rebased onto (#2372/#2432) — handled, no ongoing risk. Gated to the
     // pure case so mixed ledgers keep their existing tier verbatim.
     const handledNativeOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "native-compaction");
+    // #2438 F1-a: a ledger whose every event is a fold-substrate vacuum report
+    // is bili's OWN terminal diagnostic, not external-rewrite evidence — gate
+    // the pure case like the #2802/#2912 tiers so mixed ledgers stay verbatim.
+    const vacuumOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "fold-vacuum");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
         ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
@@ -253,6 +257,15 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         advice = active.length > 0
             ? "The events above are possible identity-loss replays (#2791 family): an anonymous request shared history with an identified conversation. This does NOT prove that the original client stopped sending its id or that fold continuity was lost; older tail-only matches can also come from unrelated auxiliary requests. Original session state is retained. Verify whether subsequent main requests still use the original conversation id. There is NO second compressor to hunt for and no auto-compaction to disable."
             : "All events above are possible identity-loss replays older than 7 days (historical stock), not proof of continuity loss. Older tail-only matches may be unrelated auxiliary requests. Verify the client's main requests still use their conversation id, then clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (vacuumOnly) {
+        // #2438 F1-a: fold-substrate vacuum — bili's OWN terminal diagnostic
+        // (stored folds lost every anchorable surface to a host representation
+        // rewrite). Commanding a plugin hunt or an auto-compaction toggle here
+        // would send the reader after a cause that does not exist; the recovery
+        // path is host-side (resend matching bytes) or a fresh conversation.
+        advice = active.length > 0
+            ? "The events above are fold-substrate vacuum reports (#2438 F1-a): this session's stored folds no longer expose any anchorable surface — the host resent history matching none of the folded originals, so coverage cannot re-establish by itself and every covered original stays unfolded on the wire. There is NO second compressor involved and nothing to disable: summaries are retained. Recovery happens when the host resends matching bytes again (e.g. switching back to the original route/model); otherwise start a fresh conversation."
+            : "All events above are fold-substrate vacuum reports older than 7 days (historical stock): the coverage loss named above already happened and the summaries were retained. If the sessions are gone, clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (signals.length === 0) {
         advice = active.length > 0
             ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
