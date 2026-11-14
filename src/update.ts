@@ -2067,22 +2067,13 @@ export async function installViaTarball(
         }
     }
 
-    // Back up the current install before overwriting. If anything fails after
-    // the copy (partial copy, version drift, corrupted entry), the backup is
-    // restored so the previously working version keeps running.
+    // #6309: the atomic swap renames the current install ASIDE into backupDir,
+    // and that rename requires backupDir to be absent (ENOTEMPTY otherwise) —
+    // so the file backup is created only on the fallback merge-copy path,
+    // into a fresh destination. A pre-existing non-empty backup both kills
+    // the atomic path and makes the re-copy over it trip libuv's self-copy
+    // guard on npm's relative node_modules/.bin symlinks (gate Lane X, 2026-11-14).
     const backupDir = path.join(workDir, "backup");
-    if (!pnpmOldLink) {
-        // The pnpm-link lane needs no file backup: the displaced artifact IS
-        // the link itself (kept at pnpmOldLink) and the store contents it
-        // points into were never touched.
-        try {
-            await cp(installDir, backupDir, { recursive: true, force: true });
-        } catch (e) {
-            // Fail closed: without a backup we refuse to overwrite the running
-            // install — the current version keeps working.
-            return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
-        }
-    }
 
     const restoreFromBackup = async (): Promise<string | null> => {
         try {
@@ -2099,21 +2090,53 @@ export async function installViaTarball(
         }
     };
 
-    // Copy staging over install dir using Node's built-in fs.cp (Node 16.7+).
-    // Cross-platform — no dependency on the `cp` binary (absent on Windows).
-    // `recursive: true` + the trailing `/.` semantics: fs.cp copies the
-    // *contents* of stagingDir into installDir, merging without nesting.
-    let copyError: string | null = null;
+    // #6309: prefer an atomic directory swap. Copy staging next to the
+    // install dir on the same volume, then rename the current install aside
+    // and rename the prepared copy into place. The old copy is the rollback
+    // source and is only removed after verification. If rename is not
+    // possible (common on Windows while the running install holds handles),
+    // fall back to the previous merge-copy path.
+    const swapCandidate = `${installDir}.update-new-${Date.now()}`;
+    let copiedForSwap = false;
+    let renamedBackup = false;
     try {
-        await cp(stagingDir, installDir, { recursive: true, force: true });
-    } catch (e) {
-        copyError = `failed to copy to install dir: ${String(e)}`;
-    } finally {
+        await cp(stagingDir, swapCandidate, { recursive: true, force: true });
+        copiedForSwap = true;
+        await rename(installDir, backupDir);
+        renamedBackup = true;
+        try {
+            await rename(swapCandidate, installDir);
+        } catch (e) {
+            const swapError = String(e);
+            await rename(backupDir, installDir);
+            renamedBackup = false;
+            throw new Error(swapError);
+        }
         await rm(stagingDir, { recursive: true, force: true });
-    }
-    if (copyError !== null) {
-        const rb = await restoreFromBackup();
-        return { ok: false, error: rb ?? copyError };
+    } catch {
+        if (copiedForSwap) await rm(swapCandidate, { recursive: true, force: true });
+        if (!pnpmOldLink && !renamedBackup) {
+            // File backup for the merge-copy path, created into a FRESH
+            // destination — re-copying over the existing backup tree trips
+            // libuv's self-copy guard on npm's relative .bin symlinks.
+            try {
+                await cp(installDir, backupDir, { recursive: true, force: true });
+            } catch (e) {
+                return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
+            }
+        }
+        let copyError: string | null = null;
+        try {
+            await cp(stagingDir, installDir, { recursive: true, force: true });
+        } catch (e) {
+            copyError = `failed to copy to install dir: ${String(e)}`;
+        } finally {
+            await rm(stagingDir, { recursive: true, force: true });
+        }
+        if (copyError !== null) {
+            const rb = await restoreFromBackup();
+            return { ok: false, error: rb ?? copyError };
+        }
     }
 
     // Final verification: version must match and every declared entry must
@@ -2151,7 +2174,7 @@ export async function installViaTarball(
 
     // Success: the backup is no longer needed, and neither is the displaced
     // pnpm link (the store copy underneath it was left byte-identical).
-    await rm(backupDir, { recursive: true, force: true });
+    if (!pnpmOldLink) await rm(backupDir, { recursive: true, force: true });
     if (pnpmOldLink) {
         try {
             await unlink(pnpmOldLink);
