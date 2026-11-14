@@ -96,7 +96,9 @@ async function openaiScenario(sessionId: string, decided: boolean) {
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             const messages = Array.isArray(body.messages) ? (body.messages as Record<string, unknown>[]) : [];
             const textOf = (m: Record<string, unknown>): string => (typeof m.content === "string" ? m.content : "");
-            if (typeof body.max_tokens === "number" && body.max_tokens <= 200) {
+            // The decision call is the only small-budget request (default 1024
+            // since #5030); the client's own requests carry max_tokens 64_000.
+            if (typeof body.max_tokens === "number" && body.max_tokens <= 1024) {
                 sides.push(textOf(messages[messages.length - 1] ?? {}));
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({

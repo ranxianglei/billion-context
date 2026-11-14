@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+    applyDecisionReasoningPolicy,
     DEFAULT_DECIDE_MAX_TOKENS,
     DECIDE_FALLBACK_THRESHOLD,
     buildDecisionPrompt,
@@ -12,6 +13,7 @@ import {
     parseDecision,
     recordDecision,
     resolveDecisionRange,
+    stripDecisionReasoningFields,
 } from "../src/nudge-decide.ts";
 import type { CompressibleRange } from "acp-kernel";
 
@@ -21,7 +23,9 @@ const RANGES: CompressibleRange[] = [
 ];
 
 test("constants are sane defaults", () => {
-    assert.equal(DEFAULT_DECIDE_MAX_TOKENS, 200);
+    // #5030: 1024 leaves room for short hidden reasoning plus the one-line
+    // JSON verdict; 200 starved hybrid-thinking models into empty answers.
+    assert.equal(DEFAULT_DECIDE_MAX_TOKENS, 1024);
     assert.equal(DECIDE_FALLBACK_THRESHOLD, 3);
 });
 
@@ -136,4 +140,65 @@ test("extractDecisionText pulls the answer per protocol", () => {
     );
     assert.equal(extractDecisionText("responses", { output: [] }), "");
     assert.equal(extractDecisionText("anthropic", { content: [] }), "");
+});
+
+// #5030: the reasoning policy tri-state — "strip" must stay byte-identical
+// to the pre-#5030 stripDecisionReasoningFields behavior (unset default),
+// "follow" must keep the host's knobs verbatim, and "off" must strip AND
+// stamp the protocol-native disable.
+test("applyDecisionReasoningPolicy: strip (default) matches #3004 byte-for-byte", () => {
+    const protocols = ["openai", "anthropic", "google", "responses"] as const;
+    for (const p of protocols) {
+        const a: Record<string, unknown> = { max_tokens: 1024, stream: false };
+        const b: Record<string, unknown> = { max_tokens: 1024, stream: false };
+        if (p === "openai") Object.assign(a, b, { reasoning_effort: "high", thinking: true });
+        if (p === "anthropic") Object.assign(a, b, { thinking: { type: "enabled", budget_tokens: 2048 } });
+        if (p === "google") {
+            a.generationConfig = { thinkingConfig: { thinkingBudget: 1024 }, temperature: 0.7 };
+            b.generationConfig = { thinkingConfig: { thinkingBudget: 1024 }, temperature: 0.7 };
+        }
+        if (p === "responses") Object.assign(a, b, { reasoning: { effort: "high" } });
+        applyDecisionReasoningPolicy(p, a, "strip");
+        stripDecisionReasoningFields(p, b);
+        assert.deepEqual(a, b, `${p}: strip policy must equal the legacy #3004 strip`);
+    }
+});
+
+test("applyDecisionReasoningPolicy: follow keeps host reasoning knobs verbatim", () => {
+    const openai: Record<string, unknown> = { reasoning_effort: "low", thinking: true, max_tokens: 1024 };
+    applyDecisionReasoningPolicy("openai", openai, "follow");
+    assert.equal(openai.reasoning_effort, "low");
+    assert.equal(openai.thinking, true);
+
+    const anthropic: Record<string, unknown> = { thinking: { type: "enabled", budget_tokens: 512 } };
+    applyDecisionReasoningPolicy("anthropic", anthropic, "follow");
+    assert.deepEqual(anthropic.thinking, { type: "enabled", budget_tokens: 512 });
+
+    const google: Record<string, unknown> = { generationConfig: { thinkingConfig: { thinkingBudget: 256 }, temperature: 0.7 } };
+    applyDecisionReasoningPolicy("google", google, "follow");
+    assert.deepEqual((google.generationConfig as Record<string, unknown>).thinkingConfig, { thinkingBudget: 256 });
+
+    const responses: Record<string, unknown> = { reasoning: { effort: "low" } };
+    applyDecisionReasoningPolicy("responses", responses, "follow");
+    assert.deepEqual(responses.reasoning, { effort: "low" });
+});
+
+test("applyDecisionReasoningPolicy: off strips then writes the protocol-native disable", () => {
+    const openai: Record<string, unknown> = { reasoning_effort: "high", max_tokens: 1024 };
+    applyDecisionReasoningPolicy("openai", openai, "off");
+    assert.equal(openai.reasoning_effort, "none");
+
+    const anthropic: Record<string, unknown> = { thinking: { type: "enabled", budget_tokens: 2048 } };
+    applyDecisionReasoningPolicy("anthropic", anthropic, "off");
+    assert.deepEqual(anthropic.thinking, { type: "disabled" });
+
+    const google: Record<string, unknown> = { generationConfig: { thinkingConfig: { thinkingBudget: 1024 }, temperature: 0.7 } };
+    applyDecisionReasoningPolicy("google", google, "off");
+    const gc = google.generationConfig as Record<string, unknown>;
+    assert.deepEqual(gc.thinkingConfig, { includeThoughts: false, thinkingBudget: 0 });
+    assert.equal(gc.temperature, 0.7, "non-reasoning generationConfig fields survive");
+
+    const responses: Record<string, unknown> = { reasoning: { effort: "high" } };
+    applyDecisionReasoningPolicy("responses", responses, "off");
+    assert.deepEqual(responses.reasoning, { effort: "none" });
 });
