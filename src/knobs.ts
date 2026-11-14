@@ -794,6 +794,16 @@ export function dump4xxEnabled(): boolean {
     return fileDiag().dump4xx === true;
 }
 
+/** ACP_DEBUG > debug > false — the existing global verbose-debug switch,
+ *  resolved EXACTLY like Options.debug (src/config.ts): same expression, so
+ *  the two surfaces can never disagree on any input. Reused by the
+ *  pi-lane nudge debug surface (src/nudge-debug.ts / src/agent/pi.ts) so the
+ *  feature rides the familiar debug switch instead of adding a knob of its
+ *  own. */
+export function debugEnabled(): boolean {
+    return (process.env.ACP_DEBUG ?? (loadConfigFile().debug ? "1" : "0")) === "1";
+}
+
 /** BILI_DUMP_4XX_MAX_BYTES > diagnostics.dump4xxMaxBytes > 2 MiB (floor 1 KiB). */
 export function dump4xxMaxBytes(): number {
     const envRaw = process.env.BILI_DUMP_4XX_MAX_BYTES;
