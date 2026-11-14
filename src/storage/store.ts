@@ -3061,13 +3061,17 @@ export class UnifiedStore {
     getBlockContents(sessionId: string): BlockContentsMap | null;
     getBlockContents(sessionId: string, opts?: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] | BlockContentsMap | null {
         if (opts !== undefined) {
-            const rows = this.db.prepare(`SELECT block_id, summary_hash, one_hash FROM blocks
-                WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?`)
-                .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; summary_hash: string; one_hash: string | null }[];
+            const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
+                FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
+                    WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
+                LEFT JOIN content s ON s.hash = b.summary_hash
+                LEFT JOIN content o ON o.hash = b.one_hash
+                ORDER BY b.ord, b.block_id`)
+                .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; one_hash: string | null; summary_bytes: Buffer | null; one_bytes: Buffer | null }[];
             return rows.map((row) => ({
                 blockId: row.block_id,
-                summary: this.getContent(row.summary_hash) ?? "",
-                one: row.one_hash ? this.getContent(row.one_hash) : null,
+                summary: row.summary_bytes === null ? "" : Buffer.from(row.summary_bytes).toString("utf8"),
+                one: row.one_hash && row.one_bytes !== null ? Buffer.from(row.one_bytes).toString("utf8") : null,
             }));
         }
         const row = this.db
@@ -3487,9 +3491,16 @@ export class UnifiedStore {
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
         const rows = this.db
             .prepare(
-                `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                        supersedes_block_id, active, created_at, covered_hash, payload_json
-                 FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,            )
+                `SELECT b.block_id, b.ord, b.start_seq, b.end_seq, b.start_ref, b.end_ref, b.tier, b.summary_hash, b.one_hash,
+                        b.supersedes_block_id, b.active, b.created_at, b.covered_hash, b.payload_json,
+                        s.bytes AS summary_bytes, o.bytes AS one_bytes
+                 FROM (SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
+                              supersedes_block_id, active, created_at, covered_hash, payload_json
+                       FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}) b
+                 LEFT JOIN content s ON s.hash = b.summary_hash
+                 LEFT JOIN content o ON o.hash = b.one_hash
+                 ORDER BY b.ord, b.block_id`,
+            )
             .all(sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])) as Record<string, unknown>[];
         return rows.map((r) => ({
             blockId: r.block_id as string,
@@ -3501,8 +3512,8 @@ export class UnifiedStore {
             tier: r.tier as number,
             summaryHash: r.summary_hash as string,
             oneHash: (r.one_hash as string | null) ?? null,
-            summary: this.getContent(r.summary_hash as string) ?? "",
-            one: r.one_hash ? (this.getContent(r.one_hash as string) ?? null) : null,
+            summary: r.summary_bytes === null ? "" : Buffer.from(r.summary_bytes as Buffer).toString("utf8"),
+            one: r.one_hash && r.one_bytes !== null ? Buffer.from(r.one_bytes as Buffer).toString("utf8") : null,
             supersedesBlockId: (r.supersedes_block_id as string | null) ?? null,
             active: (r.active as number) === 1,
             createdAt: r.created_at as number,
