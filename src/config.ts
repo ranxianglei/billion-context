@@ -86,6 +86,14 @@ export type ProviderRoute = {
      *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
      *  the request body (e.g. ZCode 405/3012). */
     passthrough?: boolean;
+    /** Route-scoped render-tags switch (#2483): `true` renders no ACP tags
+     *  into history for requests matching this route, `false` forces them on,
+     *  unset follows `diagnostics.renderNone`. For upstreams that keep a live
+     *  session per conversation and validate the echoed history against their
+     *  own transcript (claude-code-based relays such as magpie), where render
+     *  tags on assistant text break session reuse every turn. ACP_RENDER_NONE
+     *  still wins over both. */
+    renderNone?: boolean;
     /** Client-side routing exemption (#1622): this upstream never gets pointed
      *  through bili at all. Store-rewriting native lanes (zcode today) skip
      *  matching entries instead of wrapping them, so traffic flows
@@ -1173,7 +1181,7 @@ interface DshFileSettings {
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
  *  WITHOUT `bind` they are inert (longest-prefix matching never hits a name),
  *  so loadRoutes warns loudly instead of letting them sit dead (#1469). */
-const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
+const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap", "renderNone"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
 // the same named-provider warning (same pattern as the absorb warnings below).
@@ -3067,7 +3075,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; cacheKeepalive?: unknown; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; renderNone?: unknown; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -3090,6 +3098,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (compatDrops) compat.dropFields = compatDrops;
         if (Object.keys(compat).length > 0) route.compat = compat;
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
+        if (typeof obj.renderNone === "boolean") route.renderNone = obj.renderNone;
         if (typeof obj.direct === "boolean") route.direct = obj.direct;
         const imageBilling = parseImageBilling(obj.imageBilling);
         if (imageBilling) route.imageBilling = imageBilling;
