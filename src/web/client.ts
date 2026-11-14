@@ -2119,6 +2119,61 @@ function changelogCatOf(rawLine) {
         }
         return { marks, head };
     }
+    // #6729: dedicated recovery-rate line chart — ONE point per nudge round
+    // (a nudge plus every fold until the next nudge), so several partial folds
+    // in one round merge into a single true recovery % (the demo's 4×25% folds
+    // are one 100% point; a ratcheting session reads as 52%, 43%, …). The
+    // dashed purple line is the running average; blue ticks mark active
+    // (no-nudge) compressions. Static by design — rounds are few, no zoom.
+    function recoveryLineSvg(episodes, activesBefore, summary) {
+        episodes = episodes || [];
+        const W = TRAJ_W, H = 210, PL = 56, PR = 16, PT = 28, PB = 34;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const base = PT + ih;
+        const n = episodes.length;
+        const xAt = (i) => PL + (n <= 1 ? iw / 2 : (i / (n - 1)) * iw);
+        const yAt = (pct) => base - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+        let grid = "";
+        [0, 25, 50, 75, 100].forEach((g) => {
+            const yy = yAt(g);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            grid += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + g + "%</text>";
+        });
+        const colFor = (pct) => (pct >= 80 ? "#2da44e" : pct >= 40 ? "#bf8700" : "#cf222e");
+        let linePts = "", dots = "";
+        episodes.forEach((ep, i) => {
+            const x = xAt(i).toFixed(1);
+            const tip = t("det.rec_line_tip", { i: i + 1, tier: ep.tier != null ? ep.tier : "?", at: fmtDT(ep.at), s: fmtW(ep.folded || 0), p: fmtW(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(1) + "%" : "?", a: ep.activeFolds || 0 });
+            dots += '<text x="' + x + '" y="' + (H - 8) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + (i + 1) + "</text>";
+            if (ep.pct == null) {
+                // recommended 0 (non-T1 tier) → no measurable ratio; hollow grey at the floor.
+                dots += '<circle cx="' + x + '" cy="' + base.toFixed(1) + '" r="3.5" fill="none" stroke="#8b949e" stroke-width="1.2"><title>' + escapeHtml(tip) + "</title></circle>";
+                return;
+            }
+            const yy = yAt(ep.pct).toFixed(1);
+            linePts += (linePts ? " " : "") + x + "," + yy;
+            dots += '<circle cx="' + x + '" cy="' + yy + '" r="4.5" fill="' + colFor(ep.pct) + '" stroke="#fff" stroke-width="1"><title>' + escapeHtml(tip) + "</title></circle>";
+        });
+        let cumPts = "";
+        let cp = 0, cf = 0;
+        episodes.forEach((ep, i) => {
+            if (!(ep.pending > 0)) return;
+            cp += ep.pending; cf += ep.folded || 0;
+            cumPts += (cumPts ? " " : "") + xAt(i).toFixed(1) + "," + yAt((cf / cp) * 100).toFixed(1);
+        });
+        const tickAt = (x, count) => '<rect x="' + (x - 2).toFixed(1) + '" y="' + (base + 3) + '" width="4" height="8" rx="1" fill="#0969da"><title>' + escapeHtml(t("det.rec_line_act", { n: count })) + "</title></rect>";
+        let acts = "";
+        if ((activesBefore || 0) > 0) acts += tickAt(n > 0 ? PL - 12 : PL + iw / 2, activesBefore);
+        episodes.forEach((ep, i) => { if ((ep.activeFolds || 0) > 0) acts += tickAt(xAt(i), ep.activeFolds); });
+        let head = "";
+        if (summary && summary.pct != null) {
+            head = '<text x="' + PL + '" y="14" font-size="11" fill="var(--text-muted)">' + escapeHtml(t("det.rec_head", { pct: summary.pct.toFixed(1), n: summary.nudges || 0, a: summary.activeFolds || 0 })) + "</text>";
+        }
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
+            + (linePts ? '<path d="M' + linePts + '" fill="none" stroke="#57606a" stroke-width="1.5"/>' : "")
+            + (cumPts ? '<path d="M' + cumPts + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="5 3"/>' : "")
+            + dots + acts + head + "</svg>";
+    }
     function trajectorySvg(lines, folds, win, baseIn, seamEvents, recovery) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
@@ -3252,6 +3307,22 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
+        // #6729: dedicated recovery-per-nudge-round line chart (one point per
+        // round; blue ticks = active compressions). Only shown when the
+        // session actually has recovery data.
+        const recLine = ledger.recovery;
+        if (recLine && (((recLine.episodes || []).length > 0) || (recLine.activesBefore || 0) > 0 || ((recLine.summary || {}).activeFolds || 0) > 0)) {
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.rec_line_title") + '</span><span class="hint">' + t("det.rec_line_sub") + '</span></div><div class="card-b">');
+            parts.push('<div class="chart-wrap">' + recoveryLineSvg(recLine.episodes || [], recLine.activesBefore || 0, recLine.summary || {}) + "</div>");
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:#2da44e", t("det.rec_line_g")));
+            parts.push(legendItem("background:#bf8700", t("det.rec_line_y")));
+            parts.push(legendItem("background:#cf222e", t("det.rec_line_r")));
+            parts.push('<span><span class="dot" style="background:none;border-top:2px dashed #8250df;height:0;border-radius:0;width:14px"></span>' + t("det.rec_line_cum") + "</span>");
+            parts.push(legendItem("background:#0969da", t("det.rec_line_act_lab")));
+            parts.push("</div>");
+            parts.push("</div></div>");
+        }
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"

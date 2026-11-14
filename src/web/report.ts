@@ -51,6 +51,9 @@ interface ReportData {
         recovery?: {
             events?: Array<{ at?: number; kind?: "n" | "f"; tier?: number | null; pending?: number; folded?: number | null; foldSeq?: number | null; mode?: "n" | "a" | null; pct?: number | null; paired?: boolean }>;
             summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
+            /** #6729 follow-up: one point per nudge round for the recovery line chart. */
+            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number }>;
+            activesBefore?: number;
         };
         lines?: Array<{ input?: number; cached?: number }>;
     }) | null;
@@ -247,6 +250,14 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         L.push("### " + t("det.rec_title"));
         L.push("");
         L.push("- " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none) + " · " + t("det.rec_nudge") + " " + (s.nudges || 0) + " · " + t("det.rec_active") + " " + (s.activeFolds || 0) + " · " + t("det.rec_rec_total") + " " + f.W(s.totalPending || 0) + " · " + t("det.rec_fold_total") + " " + f.W(s.totalFolded || 0));
+        const eps = rec.episodes || [];
+        if (eps.length) {
+            L.push("");
+            L.push("- " + t("det.rec_line_title") + ":");
+            eps.forEach((ep, i) => {
+                L.push("  " + (i + 1) + ". T" + (ep.tier != null ? ep.tier : "?") + " · " + (ep.at ? f.DT(ep.at) : "-") + " · " + f.W(ep.pending || 0) + "→" + f.W(ep.folded || 0) + " · " + (ep.pct != null ? ep.pct.toFixed(1) + "%" : f.none) + ((ep.activeFolds || 0) > 0 ? " · +" + (ep.activeFolds || 0) + " " + t("det.rec_kind_active") : ""));
+            });
+        }
         L.push("");
         L.push("| # | " + t("det.fold_time") + " | " + t("det.rec_kind") + " | " + t("det.rec_rec") + " | " + t("det.rec_folded") + " | " + t("det.rec_pct") + " |");
         L.push("|---|---|---|---|---|---|");
@@ -434,6 +445,44 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
         ]);
         const revs = (rec.events || []).slice(-10);
         const rcols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rec_kind"), w: 150 }, { t: t("det.rec_rec"), w: 120 }, { t: t("det.rec_folded"), w: 120 }, { t: t("det.rec_pct"), w: W - PAD * 2 - 558 }];
+        // #6729 follow-up: recovery-per-nudge-round line chart (one point per
+        // round — partial folds in a round merge into one true recovery %).
+        const eps = rec.episodes || [];
+        if (eps.length > 0 || (rec.activesBefore || 0) > 0) {
+            const CH = 150, CPL = 38, CPR = 12, CPT = 8, CPB = 28;
+            const left = PAD + CPL, right = W - PAD - CPR, top = y + CPT, bot = y + CH - CPB;
+            const NX = eps.length;
+            const RX = (i: number) => left + (NX <= 1 ? (right - left) / 2 : (i / (NX - 1)) * (right - left));
+            const RY = (pct: number) => bot - (Math.max(0, Math.min(100, pct)) / 100) * (bot - top);
+            [0, 50, 100].forEach((g) => {
+                body.push('<line x1="' + left + '" y1="' + RY(g).toFixed(1) + '" x2="' + right + '" y2="' + RY(g).toFixed(1) + '" stroke="' + LINEC + '" stroke-width="1"/>');
+                txt(left - 6, RY(g) + 3, g + "%", { size: 9.5, color: MUT, anchor: "end", mono: true });
+            });
+            let lp = "", cpPts = "", cpSum = 0, cfSum = 0;
+            eps.forEach((ep, i) => {
+                if (ep.pct == null) return;
+                lp += (lp ? " " : "") + RX(i).toFixed(1) + "," + RY(ep.pct).toFixed(1);
+                if ((ep.pending || 0) > 0) {
+                    cpSum += ep.pending || 0;
+                    cfSum += ep.folded || 0;
+                    cpPts += (cpPts ? " " : "") + RX(i).toFixed(1) + "," + RY((cfSum / cpSum) * 100).toFixed(1);
+                }
+            });
+            if (lp) body.push('<polyline points="' + lp + '" fill="none" stroke="' + INK + '" stroke-width="1.5"/>');
+            if (cpPts) body.push('<polyline points="' + cpPts + '" fill="none" stroke="' + "#8250df" + '" stroke-width="1.2" stroke-dasharray="4 3"/>');
+            eps.forEach((ep, i) => {
+                const x = RX(i).toFixed(1);
+                if (ep.pct != null) {
+                    body.push('<circle cx="' + x + '" cy="' + RY(ep.pct).toFixed(1) + '" r="3.5" fill="' + (ep.pct >= 80 ? "#2da44e" : ep.pct >= 40 ? AMB : RED) + '"/>');
+                } else {
+                    body.push('<circle cx="' + x + '" cy="' + RY(0).toFixed(1) + '" r="3" fill="none" stroke="' + MUT + '" stroke-dasharray="2 2"/>');
+                }
+                txt(Number(x), bot + 20, String(i + 1), { size: 9.5, color: MUT, anchor: "middle", mono: true });
+                if ((ep.activeFolds || 0) > 0) body.push('<rect x="' + (Number(x) - 1.5).toFixed(1) + '" y="' + (bot + 3) + '" width="3" height="8" rx="1" fill="' + ACC + '"/>');
+            });
+            if ((rec.activesBefore || 0) > 0) body.push('<rect x="' + (left - 10) + '" y="' + (bot + 3) + '" width="3" height="8" rx="1" fill="' + ACC + '"/>');
+            y += CH + 14;
+        }
         tableHead(rcols);
         revs.forEach((ev, i) => {
             const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");

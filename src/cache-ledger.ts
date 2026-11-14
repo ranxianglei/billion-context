@@ -2202,6 +2202,15 @@ interface BodyStability {
 interface RecoveryReport {
     events: Array<{ at: number; kind: "n" | "f"; tier?: number | null; pending: number; folded: number | null; foldSeq: number | null; mode: "n" | "a" | null; pct: number | null; paired: boolean }>;
     summary: { nudges: number; folds: number; nudgeFolds: number; activeFolds: number; totalPending: number; totalFolded: number; pct: number | null };
+    /** #6729 follow-up: one point PER NUDGE ROUND for the recovery line
+     *  chart — a round is the nudge plus every fold until the next nudge,
+     *  so several partial folds in one round sum up (the demo's 4×25% folds
+     *  are ONE 100% point, the ratchet's single-folds stay low). pct is null
+     *  when the nudge carried no measurable pending (non-T1 tiers). */
+    episodes: Array<{ at: number; tier: number | null; pending: number; folded: number; pct: number | null; activeFolds: number }>;
+    /** Active (no-nudge) folds that happened BEFORE the first nudge — they
+     *  have no round to attach to, but the chart still marks their spot. */
+    activesBefore: number;
 }
 
 interface BiliCacheReport extends CacheReport {
@@ -2436,9 +2445,40 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
                 }
             }
         }
+        // Round aggregation: nudge i owns every fold until nudge i+1 (or the
+        // end). Active folds inside the window ride along as a marker count —
+        // they never count toward the round's recovery.
+        const episodes: RecoveryReport["episodes"] = [];
+        let activesBefore = 0;
+        let sawNudge = false;
+        for (let j = 0; j < recEvents.length; j++) {
+            const ev = recEvents[j];
+            if (ev.kind === "n") {
+                sawNudge = true;
+                let epFolded = 0;
+                let epActive = 0;
+                for (let k = j + 1; k < recEvents.length && recEvents[k].kind !== "n"; k++) {
+                    const f = recEvents[k];
+                    if (f.mode === "n") epFolded += f.folded ?? 0;
+                    else epActive += 1;
+                }
+                episodes.push({
+                    at: ev.at,
+                    tier: ev.tier ?? null,
+                    pending: ev.pending,
+                    folded: epFolded,
+                    pct: ev.pending > 0 ? Math.round((epFolded / ev.pending) * 1000) / 10 : null,
+                    activeFolds: epActive,
+                });
+            } else if (!sawNudge && ev.mode === "a") {
+                activesBefore += 1;
+            }
+        }
         recovery = {
             events: recEvents.map(({ i: _i, ...ev }) => ev),
             summary: { nudges, folds, nudgeFolds, activeFolds, totalPending, totalFolded, pct: totalPending > 0 ? Math.round((totalFolded / totalPending) * 1000) / 10 : null },
+            episodes,
+            activesBefore,
         };
     }
     return {
