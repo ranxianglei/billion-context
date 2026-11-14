@@ -68,7 +68,7 @@ jobs:
 
       - name: Setup
         if: steps.check.outputs.is_release == 'true'
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       - name: Build and test
         if: steps.check.outputs.is_release == 'true'

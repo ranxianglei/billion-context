@@ -51,7 +51,7 @@ on:
     # BOTH signals arrive together.
     inputs:
       fast:
-        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk."
+        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm install --no-audit --no-fund + typecheck + build. Owner-owned risk."
         type: boolean
         required: false
         default: false
@@ -240,7 +240,7 @@ jobs:
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run typecheck
           npm test
           npm run build
@@ -251,8 +251,8 @@ jobs:
         # the lane matrix above was skipped by explicit human choice.
         if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON == 'true'
         run: |
-          echo "::warning::FAST MODE by '${{ github.actor }}' (workflow_dispatch fast=true + typed confirmation) — full CI lanes and the full npm test SKIPPED. Publish sanity = version guards + npm ci + typecheck + build only."
-          npm ci
+          echo "::warning::FAST MODE by '${{ github.actor }}' (workflow_dispatch fast=true + typed confirmation) — full CI lanes and the full npm test SKIPPED. Publish sanity = version guards + npm install --no-audit --no-fund + typecheck + build only."
+          npm install --no-audit --no-fund
           npm run typecheck
           npm run build
 
