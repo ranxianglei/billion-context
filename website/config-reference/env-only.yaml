@@ -17,9 +17,9 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
-    desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
-    desc_ja: "dsh.contextTab (#4237) の環境変数ティア: 0/false で DSH トップバーの「上下文」/「Context」タブを削除 (その他はすべて動作維持); その他の値はファイルティアを上書きして強制オン; 未設定 = ファイルティアが適用 (デフォルト true)。次のページ読み込み / dsh 再起動時に有効化。"
+    desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar conversation tab (default name \"billion-context\") (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
+    desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏会话标签页（默认名 \"billion-context\"，其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+    desc_ja: "dsh.contextTab (#4237) の環境変数ティア: 0/false で DSH トップバーの会話タブ（デフォルト名 \"billion-context\"）を削除 (その他はすべて動作維持); その他の値はファイルティアを上書きして強制オン; 未設定 = ファイルティアが適用 (デフォルト true)。次のページ読み込み / dsh 再起動時に有効化。"
   - key: BILI_DSH_MAX_TESTED_VERSION
     type: string
     default: "0.2.0-rc.2 (CI e2e anchor)"

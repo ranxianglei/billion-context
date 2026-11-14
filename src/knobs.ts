@@ -699,8 +699,8 @@ export function dshContextTabEnabled(): boolean {
 /** dsh.contextTabLabel (#4237): custom label for that Context tab. File-only
  *  on purpose (#2030 env-var discipline: a display preference, not a secret /
  *  spawn channel / host posture) and settable from the Web config page. A
- *  trimmed non-empty string wins over the built-in localized label; anything
- *  else keeps it. */
+ *  trimmed non-empty string wins over the default display name
+ *  "billion-context"; anything else keeps it. */
 export function dshContextTabLabel(): string | undefined {
     const f = loadConfigFile().dsh?.contextTabLabel;
     const s = typeof f === "string" ? f.trim() : "";

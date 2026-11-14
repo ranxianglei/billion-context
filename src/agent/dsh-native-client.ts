@@ -521,7 +521,6 @@ const zh: Dict = {
     "tab_logs": "日志",
     "tab_updates": "版本",
     "tab_blog": "博客",
-    "tab_ctx": "上下文",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
     "ctx_refresh": "刷新",
@@ -550,7 +549,6 @@ const en: Dict = {
     "tab_logs": "Logs",
     "tab_updates": "Versions",
     "tab_blog": "Blog",
-    "tab_ctx": "Context",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
     "ctx_refresh": "Refresh",
@@ -577,8 +575,8 @@ function readOrigin(): string | undefined {
 /** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
  *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
  *  registration entirely (the top-bar entry only — compression is untouched),
- *  `label` overrides the built-in "上下文"/"Context" for machines where another
- *  plugin occupies the same name. Both fail open: absent fields (legacy host,
+ *  `label` overrides the default name "billion-context" for machines where
+ *  another plugin occupies the same name. Both fail open: absent fields (legacy host,
  *  pre-bootstrap page load) keep today's behavior byte-identical. */
 function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
     const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
@@ -1155,14 +1153,15 @@ export function apply(ctx: ClientContext): void {
     // build lacks the slot. #4237: dsh.contextTab=false (web settings / config
     // file / BILI_DSH_CONTEXT_TAB=0) skips this slot entirely — hiding removes
     // only the top-bar entry; the ledger stays reachable through the settings
-    // section, the plugin bundle config face, the Web UI and /acp. A custom
-    // label (dsh.contextTabLabel) replaces the built-in name where another
-    // plugin occupies it.
+    // section, the plugin bundle config face, the Web UI and /acp. The tab's
+    // default name is the product name "billion-context" (deliberately not
+    // localized — a name, not a word); a custom label (dsh.contextTabLabel)
+    // replaces it where another plugin occupies the preferred name.
     const ctxGate = readCtxTabFace();
     if (!ctxGate.hidden) {
         ctx.slots.inject(
             "conversation.view",
-            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? "billion-context", locale: NS }, contextPanel()),
         );
     }
     // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection

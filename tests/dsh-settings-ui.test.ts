@@ -674,7 +674,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.equal(viewSlot.order, 30);
     assert.equal(viewSlot.locale, "bili");
     assert.equal(typeof viewSlot.label, "function");
-    assert.equal((viewSlot.label as () => string)(), "上下文");
+    assert.equal((viewSlot.label as () => string)(), "billion-context");
     assert.ok(m.dicts["bili"] !== undefined);
     const settings = m.optionsBySlot.get("settings.section")!;
     assert.equal(settings.name, "settings.section");
@@ -2028,7 +2028,7 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
     shown.runCleanups();
 });
 
-test("#4237: contextTabLabel overrides the built-in tab name; blank or non-string falls back", async () => {
+test("#4237: contextTabLabel overrides the default tab name; blank or non-string falls back to \"billion-context\"", async () => {
     const baseExtra = (): Record<string, unknown> => ({
         open: (_url: string) => {},
         fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
@@ -2040,10 +2040,10 @@ test("#4237: contextTabLabel overrides the built-in tab name; blank or non-strin
     assert.equal((viewSlot.label as () => string)(), "压缩账本");
     named.runCleanups();
     const blank = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "   " } });
-    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "billion-context");
     blank.runCleanups();
     const junk = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: 42 } });
-    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "billion-context");
     junk.runCleanups();
 });
 
