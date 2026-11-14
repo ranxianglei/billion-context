@@ -6,7 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
-import { claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
+import { anthropicFirstUserFrag, anthropicLaterUserFrag, claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -119,18 +119,35 @@ async function startHarness(upstream: http.Server, over: Partial<ProxyOptions> =
 const sessionHeaders = { "x-claude-code-session-id": SESSION };
 const subagentHeaders = { "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-parent-agent-id": "a47c8f3e8bac7386b" };
 
-// System-block shapes captured from live Claude Code 2.1.274 traffic.
+// System-block shapes captured from live Claude Code 2.1.274 & 2.1.308 traffic.
 const MAIN_INTERACTIVE_SYSTEM = ["You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent..."];
 const MAIN_PRINT_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are an interactive agent that helps..."];
 const GENERAL_PURPOSE_SUB_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "This session is a background job. The..."];
 const EXPLORE_SUB_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
+const CLAUDE_CODE_SDK_SUB_SYSTEM = [
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task...",
+];
+const CLAUDE_CODE_SDK_MAIN_SYSTEM = [
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "\nYou are an agent working with the user toward their goals, using your own judgment along the way.",
+];
 
 test("claudeSubagentAgentId: two-signal discrimination (headers + main system prefixes)", () => {
     assert.equal(claudeSubagentAgentId(subagentHeaders, GENERAL_PURPOSE_SUB_SYSTEM), SUB_AGENT, "general-purpose subagent splits");
     assert.equal(claudeSubagentAgentId(subagentHeaders, EXPLORE_SUB_SYSTEM), SUB_AGENT, "custom agent type (Explore) splits");
+    assert.equal(claudeSubagentAgentId(subagentHeaders, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "SDK subagent with 'running within the Claude Agent SDK' splits");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT }, EXPLORE_SUB_SYSTEM), SUB_AGENT, "agent-id without parent still splits (custom agent types send no parent header)");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_PRINT_SYSTEM), undefined, "-p main turn (agent-id present, interactive system block) must not split");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_INTERACTIVE_SYSTEM), undefined, "interactive main turn must not split even with agent-id");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, CLAUDE_CODE_SDK_MAIN_SYSTEM), undefined, "SDK main turn (agent-id present, working with user toward goals) must not split");
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, ["You are Claude Code, Anthropic's official CLI for Claude. Per project notes the user may be running within the Claude Agent SDK."]),
+        undefined,
+        "an interactive main block that merely MENTIONS 'running within the Claude Agent SDK' later in its text must not split (exact-banner exclusion, not substring)",
+    );
+    assert.equal(claudeSubagentAgentId(subagentHeaders, [CLAUDE_CODE_SDK_SUB_SYSTEM[0]]), SUB_AGENT, "the SDK harness banner alone carries no main evidence (single-block SDK subagent splits)");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-parent-agent-id": "a47c8f3e8bac7386b" }, CLAUDE_CODE_SDK_SUB_SYSTEM), "a47c8f3e8bac7386b", "SDK subagent with parent header only falls back to the parent id");
     assert.equal(claudeSubagentAgentId(sessionHeaders, MAIN_INTERACTIVE_SYSTEM), undefined, "no agent headers must not split");
     assert.equal(claudeSubagentAgentId(subagentHeaders, []), SUB_AGENT, "no system at all but agent headers present splits (header-only fallback)");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "  ", "x-claude-code-parent-agent-id": "p" }, EXPLORE_SUB_SYSTEM), "p", "blank agent id falls back to the parent id");
@@ -222,4 +239,110 @@ test("#970 gate: subagentSplit:false restores the single-session behavior", asyn
         await close(proxy);
         await close(upstream);
     }
+});
+
+test("anthropicFirstUserFrag strips leading <system-reminder> blocks so long shared reminders do not collide in 1024-char cap", () => {
+    const sharedReminder = `<system-reminder>\n${"Codebase instructions line.\n".repeat(80)}</system-reminder>`;
+    const messagesA = [
+        {
+            role: "user",
+            content: [
+                { type: "text", text: sharedReminder },
+                { type: "text", text: "Task arm A: explore gateway_service.go" },
+            ],
+        },
+    ];
+    const messagesB = [
+        {
+            role: "user",
+            content: [
+                { type: "text", text: sharedReminder },
+                { type: "text", text: "Task arm B: explore gemini_messages_compat_service.go" },
+            ],
+        },
+    ];
+    const discA = anthropicFirstUserFrag(messagesA);
+    const discB = anthropicFirstUserFrag(messagesB);
+    assert.notEqual(discA, "", "discriminator A should be non-empty");
+    assert.notEqual(discA, discB, "subagents with >1024 chars shared <system-reminder> and distinct task prompts must not collide");
+});
+
+test("anthropicFirstUserFrag reminder-strip edges: string path, reminders-only fallback, no-reminder output unchanged", () => {
+    const reminder = `<system-reminder>\nShared CLAUDE.md context.\n</system-reminder>`;
+    // String content: leading reminder stripped, the task text is what discriminates.
+    const stringWithReminder = anthropicFirstUserFrag([{ role: "user", content: `${reminder}Task arm C: check the billing lane` }]);
+    assert.equal(stringWithReminder, "Task arm C: check the billing lane", "string content strips the leading reminder before slicing");
+    // Reminders-only message: nothing left after stripping → fall back to the ORIGINAL text (never "").
+    const onlyReminders = `${reminder}<system-reminder>\nSecond reminder block.\n</system-reminder>`;
+    assert.equal(anthropicFirstUserFrag([{ role: "user", content: onlyReminders }]), onlyReminders.slice(0, 1024), "reminders-only falls back to the original text");
+    // No reminder at all: byte-identical to the pre-strip behavior (common case untouched).
+    const plain = `plain task ${"x".repeat(1500)}`;
+    assert.equal(anthropicFirstUserFrag([{ role: "user", content: plain }]), plain.slice(0, 1024), "reminder-free text is sliced exactly as before");
+});
+
+test("anthropicFirstUserFrag advances past a reminders-only first user message to the next run-distinguishing message (#6011)", () => {
+    const boilerplate = `<system-reminder>\n${"Shared CLAUDE.md context.\n".repeat(40)}</system-reminder>`;
+    const messages = [
+        { role: "user", content: boilerplate },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Task arm D: inspect the retry ladder" },
+    ];
+    assert.equal(
+        anthropicFirstUserFrag(messages),
+        "Task arm D: inspect the retry ladder",
+        "the reminders-only first message carries no run material — the scan advances instead of falling back to the shared boilerplate",
+    );
+});
+
+test("anthropicFirstUserFrag advances across several uninformative user messages; reminders-only floor still wins when nothing later helps (#6011)", () => {
+    const r1 = `<system-reminder>\nFirst shared block.\n</system-reminder>`;
+    const r2 = `<system-reminder>\nSecond shared block.\n</system-reminder>`;
+    const advanceTwo = [
+        { role: "user", content: r1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: r2 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Task arm E: trace the watermark stamp" },
+    ];
+    assert.equal(anthropicFirstUserFrag(advanceTwo), "Task arm E: trace the watermark stamp", "two consecutive reminders-only messages are both skipped");
+    const nothingLater = [
+        { role: "user", content: r1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: r2 },
+    ];
+    assert.equal(
+        anthropicFirstUserFrag(nothingLater),
+        r1.slice(0, 1024),
+        "no later material → the FIRST reminders-only message's raw text stays the degradation floor",
+    );
+});
+
+test("anthropicLaterUserFrag skips the first user message and joins bounded later fragments (#6011)", () => {
+    const sharedFirst = `<system-reminder>\n${"Shared boilerplate line.\n".repeat(30)}</system-reminder>`;
+    const u1 = "Task A specifics: gateway_service.go";
+    const u2 = `Task A follow-up ${"y".repeat(600)}`;
+    const u3 = "Task A third";
+    const u4 = "Task A fourth";
+    const u5 = "Task A fifth";
+    const messages = [
+        { role: "user", content: sharedFirst },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u2 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u3 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u4 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u5 },
+    ];
+    assert.equal(
+        anthropicLaterUserFrag(messages),
+        `${u1}\u0001${u2.slice(0, 512)}\u0001${u3}\u0001${u4}`,
+        "skips the shared first message, caps each segment at 512 chars after strip, stops at four segments",
+    );
+    assert.notEqual(anthropicLaterUserFrag(messages), "", "usable later material produces a non-empty wide fragment");
+    assert.equal(anthropicLaterUserFrag([{ role: "user", content: sharedFirst }]), "", "no later user message → empty (call site keeps the un-widened key)");
+    assert.equal(anthropicLaterUserFrag([]), "", "empty body → empty");
 });

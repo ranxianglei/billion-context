@@ -7,7 +7,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, _sessionsSizeForTest, peekSession } from "../src/session.ts";
-import { anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies } from "../src/session-id.ts";
+import { anthropicFirstUserFrag, anthropicLaterUserFrag, claudeAnthropicPersonaOrderApplies } from "../src/session-id.ts";
 import { mintClaudeLaneToken } from "../src/claude-lane-token.ts";
 import { resetSessionOrderForTest, resolveSessionOrder } from "../src/session-resolve.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -276,6 +276,146 @@ test("#5095 anthropicFirstUserFrag: first extractable user text, capped at 1KB, 
         "users with no top-level text are skipped",
     );
     assert.equal(anthropicFirstUserFrag([{ role: "user", content: "z".repeat(5_000) }]).length, 1024, "capped at 1KB");
+});
+
+test("#6011 field shape: byte-identical first-user boilerplate across same-type runs widens onto distinct lanes on collision", () => {
+    const SESSION = randomUUID();
+    const MAIN_TAG = tag(MAIN_SYSTEM);
+    const SUB_TAG = tag(SUB_AGENT_SYSTEM);
+    // The #6011 field evidence: three concurrent same-type CC SDK subagent
+    // runs carried a BYTE-IDENTICAL first user message (shared boilerplate,
+    // no reminder wrapper — raw CLAUDE.md preamble), diverging only from
+    // msg#4 on. The D1-B frag is equal across runs → without widening every
+    // pass clobbered the shared lane's skeleton.
+    const SHARED_FIRST = "Shared CLAUDE.md boilerplate preamble.";
+    const disc = (msgs: Msg[]) => anthropicFirstUserFrag(msgs);
+    const wide = (msgs: Msg[]) => anthropicLaterUserFrag(msgs);
+    const ride = (msgs: Msg[]) => resolveSessionOrder(SESSION, msgs, SUB_TAG, undefined, undefined, disc(msgs), undefined, undefined, wide(msgs));
+
+    resetSessionOrderForTest();
+    const claim = resolveSessionOrder(SESSION, history("main", 4), MAIN_TAG);
+    assert.equal(claim.key, SESSION, "first sight claims the raw id");
+
+    const histA1: Msg[] = [
+        { role: "user", content: SHARED_FIRST },
+        { role: "assistant", content: "a-ok" },
+        { role: "user", content: "task A specifics: gateway_service.go" },
+        { role: "assistant", content: "a-done" },
+    ];
+    const resA = ride(histA1);
+    const keyA = forkKey3(SESSION, SUB_TAG, SHARED_FIRST);
+    assert.equal(resA.key, keyA, "first arrival under the contested base key keeps the plain three-segment form");
+    assert.equal(resA.action, "derived-persona");
+
+    const histB1: Msg[] = [
+        { role: "user", content: SHARED_FIRST },
+        { role: "assistant", content: "b-ok" },
+        { role: "user", content: "task B specifics: gemini_messages_compat_service.go" },
+    ];
+    const resB = ride(histB1);
+    const expectedB = `${keyA}:${fp16(wide(histB1))}`;
+    assert.equal(resB.key, expectedB, "the colliding run widens onto its own fourth segment instead of clobbering the occupant's skeleton");
+    assert.notEqual(resB.key, resA.key, "concurrent same-boilerplate runs no longer share one compression lane (#6011)");
+
+    const resBAgain = ride(histB1);
+    assert.equal(resBAgain.key, resB.key, "equal retry of the widened run recomputes the SAME key (stability)");
+
+    // Growth appends a FULL turn (strict u/a alternation — the wire shape);
+    // neutralTurns merges consecutive same-role messages, so a same-role
+    // append would rewrite the shared prefix's merged cell and defeat the
+    // prefix-extension check below.
+    const histA2: Msg[] = [
+        ...histA1,
+        { role: "user", content: "task A more" },
+        { role: "assistant", content: "a-progress" },
+    ];
+    const resA2 = ride(histA2);
+    assert.equal(resA2.key, keyA, "growth of the occupying run extends its own skeleton — NO rename (extendsOccupant)");
+
+    const histB2: Msg[] = [
+        ...histB1,
+        { role: "assistant", content: "b-progress" },
+        { role: "user", content: "task B more" },
+    ];
+    const resB2 = ride(histB2);
+    assert.ok(resB2.key.startsWith(`${keyA}:`), "the widened run stays ISOLATED from the occupant's base lane even as its wide window grows");
+    assert.notEqual(resB2.key, keyA, "never returns to the contested base key");
+
+    // Native-compaction shape for a widened run: the head collapses into a
+    // summary, replacing the shared first user message. The BASE frag follows
+    // the first user message by #5095 contract, so compaction re-keys the run
+    // onto a fresh base lane ONCE (pre-existing behavior class — today's
+    // three-segment key re-keys the same way when the first user message is
+    // replaced); the key then stabilizes and never collides back into the
+    // contested base lane.
+    const histB2Compact: Msg[] = [
+        { role: "user", content: "<compact summary of earlier turns>" },
+        { role: "assistant", content: "b-ok" },
+        { role: "user", content: "task B specifics: gemini_messages_compat_service.go" },
+        { role: "assistant", content: "b-progress" },
+        { role: "user", content: "task B more" },
+    ];
+    const resB2Compact = ride(histB2Compact);
+    assert.equal(resB2Compact.key, forkKey3(SESSION, SUB_TAG, "<compact summary of earlier turns>"), "compaction re-keys once onto the fresh base frag (pre-existing #5095 behavior class)");
+    assert.notEqual(resB2Compact.key, keyA, "never collides back into the contested base lane");
+    assert.equal(ride(histB2Compact).key, resB2Compact.key, "stable on retry after the one-time re-key");
+});
+
+test("#6011 negative control: healthy runs with distinct first-user frags never widen (byte-identical pre-change keys)", () => {
+    const SESSION = randomUUID();
+    resetSessionOrderForTest();
+    resolveSessionOrder(SESSION, history("main", 4), tag(MAIN_SYSTEM));
+    const disc = (msgs: Msg[]) => anthropicFirstUserFrag(msgs);
+    const wide = (msgs: Msg[]) => anthropicLaterUserFrag(msgs);
+    const histC: Msg[] = [
+        { role: "user", content: "distinct task C prompt" },
+        { role: "assistant", content: "c-ok" },
+    ];
+    const resC = resolveSessionOrder(SESSION, histC, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histC), undefined, undefined, wide(histC));
+    assert.equal(resC.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "distinct task C prompt"), "no contest on this base key → exact three-segment bytes, no fourth segment");
+    const histD: Msg[] = [
+        { role: "user", content: "task D one" },
+        { role: "assistant", content: "d-ok" },
+    ];
+    const histE: Msg[] = [
+        { role: "user", content: "task E two" },
+        { role: "assistant", content: "e-ok" },
+    ];
+    const resD = resolveSessionOrder(SESSION, histD, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histD), undefined, undefined, wide(histD));
+    const resE = resolveSessionOrder(SESSION, histE, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histE), undefined, undefined, wide(histE));
+    assert.equal(resD.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "task D one"), "distinct-first-user twin keeps today's exact key");
+    assert.equal(resE.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "task E two"), "distinct-first-user twin keeps today's exact key");
+    assert.notEqual(resD.key, resE.key, "already isolated by the base frag — widening never engages");
+    resetSessionOrderForTest();
+});
+
+test("#6011 degradation: absent/empty wide discriminator = exactly today's behavior, collision or not", () => {
+    const SESSION = randomUUID();
+    resetSessionOrderForTest();
+    resolveSessionOrder(SESSION, history("main", 4), tag(MAIN_SYSTEM));
+    const SUB_TAG = tag(SUB_AGENT_SYSTEM);
+    const SHARED_FIRST = "Shared CLAUDE.md boilerplate preamble.";
+    const histA: Msg[] = [
+        { role: "user", content: SHARED_FIRST },
+        { role: "assistant", content: "a-ok" },
+        { role: "user", content: "task A specifics" },
+    ];
+    const histB: Msg[] = [
+        { role: "user", content: SHARED_FIRST },
+        { role: "assistant", content: "b-ok" },
+        { role: "user", content: "task B specifics" },
+    ];
+    // No wide arg at all (every non-claude-anthropic call site): the colliding
+    // second run takes the SAME base key as today — pre-change behavior, byte
+    // for byte.
+    const resA = resolveSessionOrder(SESSION, histA, SUB_TAG, undefined, undefined, SHARED_FIRST);
+    assert.equal(resA.key, forkKey3(SESSION, SUB_TAG, SHARED_FIRST));
+    const resB = resolveSessionOrder(SESSION, histB, SUB_TAG, undefined, undefined, SHARED_FIRST);
+    assert.equal(resB.key, resA.key, "without the wide discriminator the pre-change (colliding) behavior is preserved exactly");
+    // Explicit empty wide discriminator degrades identically.
+    const resC = resolveSessionOrder(SESSION, histB, SUB_TAG, undefined, undefined, SHARED_FIRST, undefined, undefined, "");
+    assert.equal(resC.key, resA.key, "empty wide discriminator = absent wide discriminator");
+    resetSessionOrderForTest();
 });
 
 test("#4352 split: header-less subagent rides its own lane; the parent session is untouched", async () => {

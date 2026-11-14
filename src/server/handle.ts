@@ -35,7 +35,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, anthropicFirstUserFrag, anthropicLaterUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
@@ -1442,6 +1442,16 @@ async function handleRequest(
                        // better than the two-segment shared key; empty
                        // fragment degrades to it. NO other call site passes
                        // either.
+                       // #6011: the D1-B frag is not injective over
+                       // concurrent same-type runs whose first user message
+                       // is byte-identical shared boilerplate (three CC SDK
+                       // subagent runs collided onto ONE lane — 68.7% cache
+                       // hit vs 95% main). The wide fragment (later user
+                       // messages) rides along too: on a contested base key
+                       // the resolver widens to a fourth segment and
+                       // isolates the run WITHOUT clobbering the occupant's
+                       // skeleton; healthy runs never contest and stay
+                       // byte-identical to the pre-change keys.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
                            (parsed as AnthropicRequestBody).messages,
@@ -1449,10 +1459,11 @@ async function handleRequest(
                            pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                            anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
-                           onSessionResolveEvent,
-                           inboundMsgIds,
-                           storedMsgIdsOf,
-                         )
+                            onSessionResolveEvent,
+                            inboundMsgIds,
+                            storedMsgIdsOf,
+                            anthropicLaterUserFrag((parsed as AnthropicRequestBody).messages),
+                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""

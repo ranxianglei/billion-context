@@ -277,31 +277,49 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  `<rawId>|sub:<fp16(tag)>:<fp16(disc)>`; every other caller omits both
  *  optional args and keeps the byte-identical old ladder.
  *
- *  `msgIds` (#5719, second-to-last param for source compatibility): the
- *  host-stamped per-message id array riding the request (`biliMsgIds`, the
- *  #4491 pipeline — dsh's llm/stream waterfall mints a stable UUID per
- *  message and resends it unchanged across restarts and compactions). It
- *  adds ONE rung and nowhere else: at the FORK exits, when every byte-level
- *  escape was defeated because the host destroyed the evidence in the same
- *  turn it changed the system text (full compaction ∩ volatile-field drift —
- *  the #5517/#5719 composite field failure), ANY overlap between the
- *  incoming ids and the message ids RECORDED under this key in the UNIFIED
- *  STORE (the messages.msg_id column — #4491 pins these very ids at ingest,
- *  so there is NO parallel JSON ledger) proves the SAME conversation
- *  (host-minted random UUIDs cannot collide across distinct conversations)
- *  and the request re-anchors onto the raw lane instead of forking a
- *  zero-state `|sub:` child. Requests without stamped ids — or with an
- *  unavailable store view — take exactly the pre-change path.
+ *  `msgIds` (#5719, appended after `laneDiscriminator` for source
+ *  compatibility): the host-stamped per-message id array riding the request
+ *  (`biliMsgIds`, the #4491 pipeline — dsh's llm/stream waterfall mints a
+ *  stable UUID per message and resends it unchanged across restarts and
+ *  compactions). It adds ONE rung and nowhere else: at the FORK exits, when
+ *  every byte-level escape was defeated because the host destroyed the
+ *  evidence in the same turn it changed the system text (full compaction ∩
+ *  volatile-field drift — the #5517/#5719 composite field failure), ANY
+ *  overlap between the incoming ids and the message ids RECORDED under this
+ *  key in the UNIFIED STORE (the messages.msg_id column — #4491 pins these
+ *  very ids at ingest, so there is NO parallel JSON ledger) proves the SAME
+ *  conversation (host-minted random UUIDs cannot collide across distinct
+ *  conversations) and the request re-anchors onto the raw lane instead of
+ *  forking a zero-state `|sub:` child. Requests without stamped ids — or
+ *  with an unavailable store view — take exactly the pre-change path.
  *
- *  `readStoredMsgIds` (#5719, LAST param): `(key) => readonly string[] | null`
+ *  `readStoredMsgIds` (#5719, next to `msgIds`): `(key) => readonly string[] | null`
  *  — the recorded msg_ids for a conversation key (production:
  *  getStore().unifiedAllMessageIds — #5312's full historical id set, live AND
  *  retired rows, identity-only with no content hydration). Invoked AT MOST
  *  once, and only at a fork exit with non-empty inbound ids; never on the
  *  hot path. null = store unavailable (latch-off / legacy epoch) →
  *  byte-evidence only.
+ *
+ *  `laneWideDiscriminator` (#6011, LAST param for source compatibility):
+ *  the companion of `laneDiscriminator`, consumed ONLY by the collision
+ *  widening inside the derived-persona fork branch below. The D1-B frag is
+ *  not injective over concurrent SAME-TYPE runs whose first user message is
+ *  byte-identical shared boilerplate (#6011 field evidence: three CC SDK
+ *  subagent runs, identical 894-char msg#1, diverging from msg#4+ — all
+ *  three collided onto ONE lane and each pass clobbered its skeleton). When
+ *  a non-empty wide discriminator rides the request AND an occupant skeleton
+ *  already sits under the base fork key that the incoming does NOT continue
+ *  (neither a strict prefix EXTENSION nor a fragment-verified TAIL
+ *  continuation — both judged against the OCCUPANT, mirroring this file's
+ *  own growth/re-anchor idioms), the key widens to a fourth segment
+ *  `<base>:<fp16(wide)>`: the incoming records under its OWN widened key and
+ *  the occupant's skeleton survives untouched. Healthy runs (distinct
+ *  first-user frags) never contest a base key — they keep extending their
+ *  own skeleton and take exactly the pre-change path; every other caller
+ *  omits this arg.
  */
-export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): SessionOrderResolution {
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null, laneWideDiscriminator?: string): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
     // #5719: normalize the incoming stamped ids ONCE (malformed/absent →
@@ -330,6 +348,9 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     // #5095 D1-B fallback (no valid token on the wire): per-run fragment,
     // consumed below by the derived-persona fork branch only.
     const disc = laneDiscriminator !== undefined && laneDiscriminator.trim().length > 0 ? laneDiscriminator.trim() : "";
+    // #6011: wide fragment for the collision widening — same consume-once
+    // contract, consumed by the SAME fork branch only.
+    const wideDisc = laneWideDiscriminator !== undefined && laneWideDiscriminator.trim().length > 0 ? laneWideDiscriminator.trim() : "";
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
         // First sight under the id. A main-shaped history claims the raw
@@ -499,7 +520,36 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
         // compression session; empty degrades to the two-segment key.
-        const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
+        let laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
+        // #6011: the D1-B frag collides when concurrent same-type runs share
+        // a byte-identical first user message (shared boilerplate — the
+        // field shape above), so every pass clobbered the lane's skeleton
+        // and three live runs compressed into ONE session. When a wide
+        // discriminator rides the request and an occupant already sits under
+        // the base key that the incoming does NOT continue, widen to a fourth
+        // segment: the incoming records under its OWN widened key and the
+        // occupant's skeleton survives untouched. "Continue" means strictly
+        // what the rest of this file means by it, judged against the OCCUPANT
+        // — a strict prefix extension (growth / equal retry) or a
+        // fragment-verified tail continuation (native compaction / head
+        // truncation keep the living tail verbatim — the exact mirror of the
+        // tag-less re-anchor rung below, same window, same tests). A shared
+        // head with a divergent tail (distinct run, however early) is NOT a
+        // continuation; a stale shorter replay of the occupant is not one
+        // either and takes the widened key until the client catches up
+        // (self-heals — strictly better than today's clobber-and-rewind).
+        if (wideDisc !== "") {
+            const occupant = skeletons.get(laneKey);
+            if (occupant !== undefined) {
+                const extendsOccupant = occupant.kinds.every((k, i) => k === kinds[i])
+                    && occupant.frags.every((f, i) => f === incomingFrags[i]);
+                const w = Math.min(TAIL_WINDOW, kinds.length, occupant.kinds.length);
+                const keepsTail = w > 0
+                    && tailAligns(kinds, occupant.kinds)
+                    && incomingFrags.slice(-w).every((f, i) => f === occupant.frags[occupant.frags.length - w + i]);
+                if (!extendsOccupant && !keepsTail) laneKey = `${laneKey}:${fp16(wideDisc)}`;
+            }
+        }
         record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
@@ -605,8 +655,8 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  resolver is content-blind and keys by order+id with fragment guards,
  *  so those parameters are simply gone.
  *
- *  `msgIds` (#5719) and `readStoredMsgIds` (#5719) are deliberately the LAST
- *  parameters so every existing call site stays source-compatible; pass the
+ *  `msgIds` (#5719) and `readStoredMsgIds` (#5719) are deliberately appended
+ *  after `onResolve` so every existing call site stays source-compatible; pass the
  *  validated `biliMsgIds` array (src/msgid-pin.ts `incomingMsgIdsOf`) plus
  *  the unified-store msg_id lookup so the fork-exit rung can prove identity
  *  by sessionid+msgid when the byte-level evidence was destroyed in the same
@@ -617,11 +667,13 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  drift cluster had to be reverse-engineered from field screenshots. Claim
  *  and continue stay silent (steady-state volume); the caller decides what
  *  to log. The callback is best-effort: a throwing observer must never break
- *  resolution. */
+ *  resolution. `laneWideDiscriminator` (#6011) rides LAST as well — the
+ *  collision-widening companion of `laneDiscriminator` (see
+ *  resolveSessionOrder). */
 type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
 
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): string {
-    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, msgIds, readStoredMsgIds);
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null, laneWideDiscriminator?: string): string {
+    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, msgIds, readStoredMsgIds, laneWideDiscriminator);
     if (onResolve !== undefined) {
         try {
             onResolve(rawId, res);

@@ -307,34 +307,96 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
     return texts.join("\n\n");
 }
 
+/** #5095 D1-B / #6011: extract a user message's top-level text — string
+ *  content verbatim, or the type:"text" parts joined with "\n\n". "" when
+ *  the content holds no top-level text (pure tool_result). Shared by both
+ *  discriminator fragments below. */
+function userMessageText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    const parts: string[] = [];
+    for (const part of content) {
+        if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+            parts.push((part as { text: string }).text);
+        }
+    }
+    return parts.join("\n\n");
+}
+
+const LEADING_SYSTEM_REMINDER_RE = /^(?:\s*\x3csystem-reminder\x3e[\s\S]*?\x3c\/system-reminder\x3e\s*)+/;
+
+function stripLeadingSystemReminders(text: string): string {
+    return text.replace(LEADING_SYSTEM_REMINDER_RE, "").trim();
+}
+
 /** #5095 D1-B: per-run discriminator for the claude-anthropic derived-persona
  *  lane key. Same-type subagents re-dispatched under one parent id carry a
  *  byte-identical system (the persona tag), so the dispatch task prompt —
- *  the first user message with extractable text — is what tells runs apart;
- *  it is unique per run and stable for the agent's whole lifetime. Users
- *  whose content holds no top-level text (pure tool_result) are skipped. ""
- *  when nothing is usable → the call site degrades to the two-segment lane
- *  key. Body-only read: no header literals here (B-class guard). */
+ *  the first user message with extractable text, leading <system-reminder>
+ *  blocks stripped — is what tells runs apart; it is unique per run and
+ *  stable for the agent's whole lifetime. Users whose content holds no
+ *  top-level text (pure tool_result) are skipped.
+ *  #6011 field shape: concurrent same-type runs can carry a byte-identical
+ *  first user message that is ENTIRELY shared harness boilerplate (CLAUDE.md
+ *  / codebase context, sometimes wrapped in reminder blocks) — stripping
+ *  leaves nothing run-distinguishing there, so the scan ADVANCES past such
+ *  messages to the next user message that carries real material instead of
+ *  falling back immediately. The raw text of the FIRST reminders-only
+ *  message stays the degradation floor when no later message has material
+ *  either; "" only when nothing at all is usable → the call site degrades
+ *  to the two-segment lane key. Body-only read: no header literals here
+ *  (B-class guard). */
 export function anthropicFirstUserFrag(messages: unknown): string {
     const list = Array.isArray(messages) ? messages : [];
     const cap = 1024;
+    let remindersOnlyRaw = "";
     for (const m of list) {
         if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
-        const content = (m as { content?: unknown }).content;
-        if (typeof content === "string") {
-            if (content.length > 0) return content.slice(0, cap);
-        } else if (Array.isArray(content)) {
-            const parts: string[] = [];
-            for (const part of content) {
-                if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
-                    parts.push((part as { text: string }).text);
-                }
-            }
-            const joined = parts.join("\n\n");
-            if (joined.length > 0) return joined.slice(0, cap);
+        const text = userMessageText((m as { content?: unknown }).content);
+        if (text.length === 0) continue;
+        const stripped = stripLeadingSystemReminders(text);
+        if (stripped.length > 0) return stripped.slice(0, cap);
+        if (remindersOnlyRaw === "") remindersOnlyRaw = text;
+    }
+    return remindersOnlyRaw.slice(0, cap);
+}
+
+/** #6011: wide discriminator for the collision-widened derived-persona lane
+ *  (consumed ONLY by the resolver's collision-widening rung — see
+ *  resolveSessionOrder's `laneWideDiscriminator`). Field evidence (#6011):
+ *  three concurrent same-type CC SDK subagent runs carried a BYTE-IDENTICAL
+ *  first user message (shared boilerplate, 894 chars — the D1-B frag equal
+ *  across runs), and run-distinguishing material only appears from msg#4
+ *  onward. This fragment therefore SKIPS the first user message with
+ *  extractable text entirely (its material already feeds the base frag) and
+ *  joins up to WIDE_USER_MSG_LIMIT later user messages, each capped at
+ *  WIDE_CHAR_CAP chars AFTER reminder-strip: the field log shows CC growing
+ *  early shared messages by tail append (577→647 chars), which lands beyond
+ *  the cap and keeps a settled lane's key byte-stable. Segments join with
+ *  "\u0001" (ambiguity-free separator). "" when nothing usable → the
+ *  resolver keeps the un-widened key, exactly the pre-change behavior. */
+const WIDE_USER_MSG_LIMIT = 4;
+const WIDE_CHAR_CAP = 512;
+
+export function anthropicLaterUserFrag(messages: unknown): string {
+    const list = Array.isArray(messages) ? messages : [];
+    const segs: string[] = [];
+    let firstSeen = false;
+    for (const m of list) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
+        const text = userMessageText((m as { content?: unknown }).content);
+        if (text.length === 0) continue;
+        if (!firstSeen) {
+            firstSeen = true;
+            continue;
+        }
+        const stripped = stripLeadingSystemReminders(text);
+        if (stripped.length > 0) {
+            segs.push(stripped.slice(0, WIDE_CHAR_CAP));
+            if (segs.length >= WIDE_USER_MSG_LIMIT) break;
         }
     }
-    return "";
+    return segs.join("\u0001");
 }
 
 /**
@@ -520,11 +582,19 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  *
  * 2. SYSTEM: the MAIN agent's system always contains a block starting with
  *    one of the MAIN_SYSTEM_PREFIXES ("You are Claude Code…" for interactive
- *    sessions, "You are an interactive agent…" for -p/SDK sessions), while a
- *    subagent's system blocks are its agent definition ("This session is a
- *    background job…", "You are a file search specialist for…", …) — no
- *    stable positive marker exists across agent types, so the check is
- *    negative: none of the main prefixes may match.
+ *    CLI sessions, "You are an interactive agent…" for -p sessions, "You are
+ *    an agent working with the user toward their goals…" for Claude Agent SDK
+ *    main sessions), while a subagent's system blocks are its agent
+ *    definition ("This session is a background job…", "You are an agent for
+ *    Claude Code…", "You are a file search specialist for…", …) — no stable
+ *    positive marker exists across agent types, so the check is negative:
+ *    none of the main prefixes may match. Since Claude Code 2.1.308+ every
+ *    Agent SDK turn (main AND subagent) leads with the shared harness banner
+ *    CLAUDE_SDK_HARNESS_BANNER (#5724); it carries no classification signal
+ *    and is skipped before the prefix scan. It is matched by exact prefix,
+ *    not substring: a reworded banner then counts as "You are Claude Code"
+ *    and subagents stop splitting (pre-SDK serial behavior) instead of a
+ *    main session whose text merely mentions the phrase being mis-split.
  *
  * A request splits only when BOTH signals say subagent (header present AND
  * no main prefix in system). Failure modes degrade in the safe direction:
@@ -540,7 +610,18 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  * Responses branch. Clients without these headers (older Claude Code, other
  * agents, curl) are untouched.
  */
-const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
+const MAIN_SYSTEM_PREFIXES = [
+    "You are Claude Code",
+    "You are an interactive agent",
+    "You are an agent working with the user toward their goals",
+] as const;
+
+// Claude Code 2.1.308+ / Claude Agent SDK harness banner, present as a
+// leading system block on EVERY SDK turn (main and subagent alike) — shared
+// state, no classification signal (#5724). Exact prefix on purpose: if the
+// banner is reworded it degrades to counting as "You are Claude Code" (main
+// evidence → subagents stop splitting), never to mis-splitting a main turn.
+const CLAUDE_SDK_HARNESS_BANNER = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK";
 
 export function claudeSubagentAgentId(
     headers: Record<string, string | string[] | undefined>,
@@ -556,6 +637,7 @@ export function claudeSubagentAgentId(
     if (agentId === undefined && parentId === undefined) return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
+        if (t.startsWith(CLAUDE_SDK_HARNESS_BANNER)) return false;
         return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
     });
     if (isMain) return undefined;
