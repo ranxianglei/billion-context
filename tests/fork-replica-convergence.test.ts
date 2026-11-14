@@ -21,6 +21,10 @@ import { resetToolRingForTest } from "../src/tool-ring.ts";
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_CONFIG_FILE = join(mkdtempSync(join(tmpdir(), "bili-fkcv-hermetic-")), "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
+// 60s idle-reap: the sync UnifiedStore work below blocks the event loop past
+// the 5s default under load -> the in-process proxy reaps the client's pooled
+// socket mid-test -> stale-socket 'fetch failed' (windows/node22, PR #5008 CI).
+process.env.BILI_KEEP_ALIVE_TIMEOUT_MS = "60000";
 
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fkcv-"));
