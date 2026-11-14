@@ -42,7 +42,12 @@ export function installInlineTransport(): boolean {
             } catch (err) {
                 // Caller-side cancel is not an engine failure — propagate it:
                 // degrading would consume the one-shot warning and re-send a
-                // request the caller already abandoned.
+                // request the caller already abandoned. The engine rejects with
+                // the signal's REASON, which for a custom abort
+                // (controller.abort(new Error(...))) is not an AbortError — so
+                // classify by the signal's state, not the reason's name.
+                const cancelSignal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
+                if (cancelSignal?.aborted) throw err;
                 if (err instanceof Error && err.name === "AbortError") throw err;
                 const msg = err instanceof Error ? err.message : String(err);
                 if (url.startsWith(MODEL_PREFIX)) {

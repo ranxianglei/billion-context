@@ -372,3 +372,56 @@ test("#3278 engine: caller abort cancels the in-process round trip (spawn-mode p
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(slowCompleted, false, "upstream round trip must not complete after the caller aborted");
 });
+
+test("#6504 transport: a custom-reason Request.signal cancel propagates, never degrades to a direct resend", async () => {
+    // The engine rejects with the signal's REASON. For a custom abort
+    // (controller.abort(new Error(...))) that reason is NOT an AbortError, so
+    // the transport must classify the cancel by the signal's state — not by
+    // the reason's name — or it would degrade: consume the one-shot warning
+    // and re-send an already-abandoned request direct, uncompressed.
+    const ie = await import("../src/inline-engine.ts");
+    ie._resetInlineEngineForTest();
+    const reason = new Error("caller cancelled");
+    ie._setEngineFactoryForTest(async () => ({
+        origin: ie.INLINE_ORIGIN,
+        dispatch: async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+            // Mirror the engine's signal resolution + pre-header abort reject.
+            const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
+            await new Promise<void>((_, reject) => {
+                if (signal?.aborted) reject(signal.reason);
+                else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+            });
+            return new Response("unreachable");
+        },
+        dispatchHttp: async () => {},
+        wsOrigin: Promise.resolve(undefined),
+        webOrigin: Promise.resolve(undefined),
+    }));
+    try {
+        await freshChain();
+        const ac = new AbortController();
+        const req = new Request(`${ie.INLINE_ORIGIN}/bili/${upstreamOrigin}/v1/messages`, {
+            method: "POST",
+            body: "{}",
+            signal: ac.signal,
+        });
+        const before = hits.length;
+        const settled = fetch(req).then(
+            (r) => { throw new Error(`expected cancellation, got HTTP ${r.status}`); },
+            (e: unknown) => e,
+        );
+        setTimeout(() => ac.abort(reason), 50);
+        const err = await withTimeout(settled, 10_000, "cancel propagation") as Error;
+        // The caller's custom reason must propagate verbatim.
+        assert.equal(err, reason, "the caller's abort reason must propagate verbatim");
+        // No direct resend: the real upstream must stay untouched.
+        assert.equal(hits.length, before, "a cancelled request must not be re-sent direct");
+    } finally {
+        const piInline = await import("../src/agent/pi-inline.ts");
+        const fc = await import("../src/agent/fetch-chain/index.ts");
+        piInline._resetInlineTransportForTest();
+        fc.resetFetchChainForTest();
+        ie._setEngineFactoryForTest(undefined);
+        ie._resetInlineEngineForTest();
+    }
+});
