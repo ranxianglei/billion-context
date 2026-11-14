@@ -28,7 +28,6 @@ export const INLINE_ORIGIN = "http://billion-context.inline";
 const INLINE_HOSTNAME = new URL(INLINE_ORIGIN).hostname;
 
 type FetchInput = string | URL | Request;
-type BodyLike = string | URLSearchParams | Blob | ArrayBuffer | ArrayBufferView | ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>;
 
 export interface InlineEngine {
     origin: string;
@@ -68,22 +67,6 @@ function normalizeHeaderPairs(value: Record<string, string | number | string[]> 
 /** Hop-by-hop / framing headers that must not ride a reconstructed Response:
  *  undici recomputes length and framing from the actual stream. */
 const HOP_HEADERS = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"]);
-
-async function bodyToBuffer(body: BodyLike | null | undefined): Promise<Buffer> {
-    if (body === null || body === undefined) return Buffer.alloc(0);
-    if (typeof body === "string") return Buffer.from(body);
-    if (body instanceof URLSearchParams) return Buffer.from(body.toString());
-    if (body instanceof Blob) return Buffer.from(await body.arrayBuffer());
-    if (body instanceof ArrayBuffer) return Buffer.from(body);
-    if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
-    const iterator = (body as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator];
-    if (typeof iterator === "function") {
-        const parts: Buffer[] = [];
-        for await (const chunk of body as AsyncIterable<Uint8Array>) parts.push(Buffer.from(chunk));
-        return Buffer.concat(parts);
-    }
-    throw new Error(`inline engine: unsupported request body type ${Object.prototype.toString.call(body)}`);
-}
 
 /** Minimal duck-type of http.IncomingMessage covering everything the pipeline
  *  reads: url/method/headers/socket identity plus the readBody event surface.
@@ -224,38 +207,27 @@ class InlineRes extends EventEmitter {
 }
 
 async function toInlineReq(input: FetchInput, init?: RequestInit): Promise<InlineReq> {
-    let url: string;
-    let baseHeaders: Headers | [string, string][] | Record<string, string> | undefined;
-    let requestMethod: string | undefined;
-    let requestBody: BodyLike | null | undefined;
-    if (typeof input === "string") url = input;
-    else if (input instanceof URL) url = input.href;
-    else {
-        url = input.url;
-        baseHeaders = input.headers;
-        requestMethod = input.method;
-        requestBody = await input.arrayBuffer().catch(() => null);
-    }
-    const headers = new Headers(baseHeaders);
-    if (init?.headers !== undefined) new Headers(init.headers).forEach((v, k) => headers.set(k, v));
+    // Only normalize body/header semantics here; the dispatcher owns and
+    // detaches the caller's cancellation listener. A dependent Request signal
+    // would leave a second listener behind. Inherit dictionary members so
+    // prototype and non-enumerable RequestInit fields retain Fetch semantics.
+    const request = new Request(input, Object.create(init ?? null, { signal: { value: null } }) as RequestInit);
     const headerMap: Record<string, string | string[] | undefined> = {};
-    headers.forEach((value, key) => {
+    request.headers.forEach((value, key) => {
         const existing = headerMap[key];
         headerMap[key] = existing === undefined ? value : Array.isArray(existing) ? [...existing, value] : [existing, value];
     });
-    const method = (init?.method ?? requestMethod ?? "GET").toUpperCase();
-    const bodySource = init?.body !== undefined ? init.body as BodyLike | null : requestBody;
-    const body = await bodyToBuffer(bodySource);
+    const body = Buffer.from(await request.arrayBuffer());
     // The pipeline reads req.url as an ORIGIN-FORM request target ("/bili/…" —
     // what node:http hands a server for a normal connection). An absolute-form
     // URL would fall into resolveUpstream's forward-proxy branch and be routed
     // to its own authority — the pseudo-origin — instead of the embedded host.
-    const parsed = new URL(url);
+    const parsed = new URL(request.url);
     // Pseudo-origin traffic is same-process by definition — present the
     // loopback identity so the admin surface's DNS-rebinding Host gate passes
     // without weakening the gate itself. Other origins keep their real host.
     if (headerMap["host"] === undefined) headerMap["host"] = parsed.hostname === INLINE_HOSTNAME ? "127.0.0.1" : parsed.host;
-    return new InlineReq(parsed.pathname + parsed.search, method, headerMap, body);
+    return new InlineReq(parsed.pathname + parsed.search, request.method, headerMap, body);
 }
 
 function responseFrom(res: InlineRes, method: string): Response {
