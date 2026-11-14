@@ -1,4 +1,4 @@
-import { BLOCKED_REF, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,8 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader, stripSessPrefix } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { blockOpsEnabled, effectiveBlockOpsConfig } from "./acp-block-ops.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -35,6 +36,9 @@ import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-re
 export interface UpstreamMeta {
     status?: number;
     contentType?: string;
+    requestId?: string;
+    opencodeLogId?: string;
+    cfRay?: string;
 }
 
 /** #2328 Q4: does the dangling partial event left at a cut carry the opening
@@ -58,7 +62,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -527,10 +531,30 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
     scheduleSaveConversations();
 }
 
+interface PluginWireMetadata {
+    wireHash: string;
+    textComparable: boolean;
+}
+
+/** Capture the raw request's snapshot evidence before prepare mutates its
+ *  parsed view. Only these scalars need to survive forwarding. */
+export function preparePluginWireMetadata(rawWire: Buffer, parsedWire: unknown): PluginWireMetadata {
+    let textComparable = false;
+    try {
+        if (parsedWire !== null && typeof parsedWire === "object") {
+            const wire = parsedWire as Record<string, unknown>;
+            textComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+        }
+    } catch {
+        textComparable = false;
+    }
+    return { wireHash: createHash("sha256").update(rawWire).digest("hex"), textComparable };
+}
+
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer): void {
+export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision, rawWire?: Buffer | PluginWireMetadata): void {
     // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
     // same session key can carry a normal output budget and any message count,
     // so both the ≤200 heuristic and size-based guards are proxies that a new
@@ -651,17 +675,22 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
             snapshotRefsEvaluatedStore.set(session, session.contentStore);
         }
         if (rawWire !== undefined) {
-            // The comparable verdict is a property of the wire body: hash it
-            // (native speed) and only re-parse + walk when the body actually
-            // changed, so a retry with an identical body stays cheap.
-            const wireHash = createHash("sha256").update(rawWire).digest("hex");
+            // The handler captures this evidence before forwarding so it need
+            // not retain the raw body. Buffer callers keep the hash-gated parse.
+            const wireHash = Buffer.isBuffer(rawWire)
+                ? createHash("sha256").update(rawWire).digest("hex")
+                : rawWire.wireHash;
             if (session.metadata.publicSnapshotWireHash !== wireHash) {
                 let comparable: boolean;
-                try {
-                    const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
-                    comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
-                } catch {
-                    comparable = false;
+                if (Buffer.isBuffer(rawWire)) {
+                    try {
+                        const wire = JSON.parse(rawWire.toString("utf8")) as Record<string, unknown>;
+                        comparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+                    } catch {
+                        comparable = false;
+                    }
+                } else {
+                    comparable = rawWire.textComparable;
                 }
                 session.metadata.publicSnapshotWireHash = wireHash;
                 if (session.metadata.publicSnapshotTextComparable !== comparable) {
@@ -734,13 +763,35 @@ export function pluginRuntimeInfoFor(agent: string | undefined, model: string | 
     return entry;
 }
 
+/** Clients mint child conversation ids for work that runs on the parent's own
+ *  route+model: omp opens ephemeral turns as `<session>:side:<id>` and
+ *  subagents as `<session>:sub:<id>` (with `:side:conversation:<key>` also
+ *  seen in the wild), and never registers runtime-info under them — the
+ *  window belongs to route+model+tier, so a child resolves up to the nearest
+ *  ancestor that reported one instead of falling to the registry/#1321 cap. */
+const CHILD_CONVERSATION_SUFFIX = /:(?:side(?::conversation)?|sub):[^:]+$/;
+const MAX_CHILD_CONVERSATION_DEPTH = 4;
+
+function parentConversationId(conversationId: string): string | undefined {
+    const parent = conversationId.replace(CHILD_CONVERSATION_SUFFIX, "");
+    return parent !== conversationId && parent.length > 0 ? parent : undefined;
+}
+
 /** Latest runtime-info registered under a conversation id, usable for
- *  `model` only (#1531). */
+ *  `model` only (#1531). A client-minted child id resolves to its nearest
+ *  reporting ancestor; the model check is applied at whichever level answers,
+ *  so a child on a different model never inherits a stale window. */
 export function pluginRuntimeInfoForConversation(conversationId: string | undefined, model: string | undefined): PluginRuntimeInfo | undefined {
     if (conversationId === undefined || model === undefined) return undefined;
-    const entry = pluginRuntimeByConversation.get(conversationId);
-    if (entry === undefined || entry.model !== model) return undefined;
-    return entry;
+    const exact = pluginRuntimeByConversation.get(conversationId);
+    if (exact !== undefined) return exact.model === model ? exact : undefined;
+    let parent = parentConversationId(conversationId);
+    for (let depth = 0; parent !== undefined && depth < MAX_CHILD_CONVERSATION_DEPTH; depth++) {
+        const entry = pluginRuntimeByConversation.get(parent);
+        if (entry !== undefined) return entry.model === model ? entry : undefined;
+        parent = parentConversationId(parent);
+    }
+    return undefined;
 }
 
 /** The narrow conversation signal a header-less runtime-info lookup can
@@ -1045,6 +1096,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const absorbOn = absorbEnabled(config);
     const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
     const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
+    // #5765: block-lifecycle tools — one switch (compress.blockOps.enabled),
+    // off by default; same conservative #1192 manifest rule as absorb (base
+    // config, no route/model context here).
+    const blockOpsOn = blockOpsEnabled(config);
+    const blockOps = blockOpsOn ? blockOpsTools() : undefined;
     const rulesOn = rulesEnabled(config);
     // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
     // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
@@ -1087,11 +1143,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         proxy: "billion-context",
         version: VERSION,
         commit: BUILD_COMMIT,
-        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : []), ...(blockOpsOn ? [ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME] : [])],
         tools: {
-            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : [])],
-            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
-            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOps ? blockOps.anthropic : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOps ? blockOps.openai : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : []), ...(blockOps ? blockOps.responses : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, compression: PLUGIN_COMPRESSION_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -1874,6 +1930,12 @@ function disabledOptionalToolNote(tool: string, session: Session, config: Config
     if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
     if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
     if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
+    // #5765: block-lifecycle tools — per-session effective config (a manifest
+    // served while enabled may outlive a config change).
+    if (BLOCK_OP_TOOL_NAMES.has(tool) && effectiveBlockOpsConfig(session, config)?.enabled !== true) {
+        const verb = tool === ACP_RETIRE_TOOL_NAME ? "no blocks were retired" : tool === ACP_RESTORE_TOOL_NAME ? "no blocks were restored" : "no summary was rewritten";
+        return `${tool} is not enabled on this bili proxy (compress.blockOps.enabled is not true) — ${verb}.`;
+    }
     return undefined;
 }
 
@@ -2381,6 +2443,7 @@ export async function handlePluginTool(
         const absorb = effectiveAbsorbConfig(session, deps.config);
         if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
         if (effectiveRulesEnabled(session, deps.config)) allowed.push(RULE_TOOL_NAME);
+        if (effectiveBlockOpsConfig(session, deps.config)?.enabled === true) allowed.push(ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));
         return;
@@ -2722,6 +2785,9 @@ export async function pipePluginChatWithStrip(
     // default); hosts that need the legacy completed-turn shape opt back in with
     // streamErrorShape:"completion".
     streamErrorShape?: "protocol" | "completion",
+    // #5951: the requesting host already classifies this cut and retries on its
+    // own budget — the proxy must not spend a second one.
+    hostOwnsTruncationRecovery = false,
     // #6433: session id for witness recording only — lets the non-plugin lane
     // ring-record outbound tool calls (so the unbound shim's witness route can
     // match) without passing the full session (which would turn on usage
@@ -2916,6 +2982,17 @@ export async function pipePluginChatWithStrip(
         // answer — a client compaction asking for a plain-text <summary> block
         // must not be retried (its compliant reply IS a draft tail).
         const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #3905: the same non-convergence without a draft tag — the whole visible
+        // output is a one-line promise of the next action ("Running verify after
+        // formatting:"). Without this branch the answerChars gate below would read
+        // that promise as a delivered answer and refuse the retry.
+        // The detector reads ANSWER prose, not proseAcc: proseAcc also carries
+        // the thinking/reasoning channel, and a thought that ends mid-sentence on
+        // ":" or "…" is internal monologue, not an announcement — feeding it here
+        // reclassified #2756's whitespace-only degenerate stops as announcements
+        // and swallowed their refusal/retry logs.
+        const announceTail = !draftTail && visibleTextChars > 0 && !sawToolUse && endsWithAnnouncement(answerProse) && !requestExpectsProseSummary(requestText);
+        const stalledTail = draftTail || announceTail;
         // #2756: the gate asks "did the host receive ANSWER text?" — prose that
         // is nothing but whitespace (a bare "\n\n" from a degenerate stop, the
         // B-accident shape) is not an answer; the empty-turn retry must fire for
@@ -2923,9 +3000,9 @@ export async function pipePluginChatWithStrip(
         // chars are already excluded here), and real text keeps refusing the
         // retry byte-for-byte, so a delivered answer is never duplicated.
         const answerChars = answerProse.trim().length;
-        if (!draftTail && (answerChars > 0 || sawToolUse)) return false;
+        if (!stalledTail && (answerChars > 0 || sawToolUse)) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) {
-            if (!sawToolUse && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
+            if (!sawToolUse && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (finish ${reason ?? "none"} is not a clean stop): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
@@ -2951,14 +3028,16 @@ export async function pipePluginChatWithStrip(
         // re-issuing it double-bills an empty completion (#732/#821 keep the
         // same boundary in the compress loop). A draft-tail turn is NOT bare:
         // it delivered a full handoff draft, which is precisely the stall signal.
-        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !draftTail) {
+        if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0 && !stalledTail) {
             log?.(`[plugin] degenerate terminal turn not retried (bare: no thinking, no stripped echo, no released markup): visibleTextChars=${visibleTextChars}, releasedMarkupChars=${releasedMarkupChars} (#2756)`);
             return false;
         }
         degenerateRetried = true;
-        log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
-            : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        log?.(announceTail
+            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with a continuation nudge (#3905)"
+            : draftTail
+              ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+              : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -3062,7 +3141,11 @@ export async function pipePluginChatWithStrip(
         // it too, so the two content-only counters are what separate an answer from
         // a thinking fragment.
         if (sawToolUse || blocksForwarded > 0 || visibleTextChars > 0 || releasedMarkupChars > 0 ||
-            sawStrippedEcho || answerProse.trim().length > 0 || streams.size > 0) return false;
+            sawStrippedEcho || answerProse.trim().length > 0) return false;
+        // OpenAI reasoning identity filters are not pending answer content.
+        for (const { field } of streams.values()) {
+            if (protocol !== "openai" || (field !== "reasoning_content" && field !== "reasoning")) return false;
+        }
         if (res.destroyed || res.writableEnded) return false;
         let next: ReadableStream<Uint8Array> | null = null;
         try {
@@ -3111,10 +3194,27 @@ export async function pipePluginChatWithStrip(
         // #5951: the read error itself, so a cut that was not replayed names its
         // cause instead of only its classification.
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
+        ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
+        // #5951: the replay predicate's inputs, so a refused cut names the clause
+        // that refused it instead of only the read error.
+        replay: {
+            replayAvailable: refetch !== undefined,
+            sawThinking,
+            sawToolUse,
+            blocksForwarded,
+            openStreams: streams.size,
+            forwardedAny,
+            releasedMarkupChars,
+            proseChars: proseAcc.length,
+            answerProseChars: answerProse.trim().length,
+        },
         ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
         ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.requestId) ? { upstreamRequestId: safeDiagnosticId(upstreamMeta?.requestId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.opencodeLogId) ? { upstreamLogId: safeDiagnosticId(upstreamMeta?.opencodeLogId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.cfRay) ? { upstreamCfRay: safeDiagnosticId(upstreamMeta?.cfRay) } : {}),
     });
     /** While the retry stream feeds the client, the message the FIRST attempt
      *  opened is still open: nothing may re-open it. Returns true when the event
@@ -3754,14 +3854,14 @@ export async function pipePluginChatWithStrip(
             try {
                 step = await reader.read();
             } catch (e) {
-                if (await retryReasoningOnlyCut(e)) continue;
+                if (!hostOwnsTruncationRecovery && await retryReasoningOnlyCut(e)) continue;
                 throw e;
             }
             const { done, value } = step;
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && ((await retryZeroByteCut()) || (await retryReasoningOnlyCut()))) continue;
+                if (!hostOwnsTruncationRecovery && !sawTerminal && !res.destroyed && !res.writableEnded && ((await retryZeroByteCut()) || (await retryReasoningOnlyCut()))) continue;
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -3905,7 +4005,11 @@ export async function pipePluginChatWithStrip(
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
-        if (sawTerminal && !sawReplyError && !res.destroyed && !res.writableEnded) reply?.save();
+        // #4247-followup: persistence answers "did the upstream turn finish?",
+        // never "is the client socket still open?". pi's client hangs up the
+        // moment it holds the terminal frame, so gating this save on client
+        // liveness dropped every pi reply from the handoff render.
+        if (sawTerminal && !sawReplyError) reply?.save();
         if (truncated) {
             reply?.discard();
             // #721 → #2563: the client still owns the stream from here.
@@ -3925,6 +4029,9 @@ export async function pipePluginChatWithStrip(
             log?.("client aborted mid-stream");
             // #5293: the partial output of an aborted turn never reports usage — record the pre-abort anchor so the first nudge decision after resume can absorb that debt.
             if (session) noteAbortedTurn(session);
+            // A terminal already arrived before the client left: the reply is
+            // complete, so it still belongs in the handoff snapshot.
+            if (sawTerminal && !sawReplyError) reply?.save();
             return;
         }
         // #721: upstream read failed while the client is still connected —
@@ -4111,6 +4218,25 @@ function describeReadError(error: unknown): string {
     return `${name}: ${error.message}`.replace(/[\r\n]+/g, " ").slice(0, 200);
 }
 
+/** Retain only bounded, structured cause identity; never serialize upstream text. */
+function describeReadErrorCause(error: unknown): Array<{ name: string; code?: string }> | undefined {
+    if (!(error instanceof Error)) return undefined;
+    const chain: Array<{ name: string; code?: string }> = [];
+    let cause: unknown = error.cause;
+    for (let depth = 0; depth < 3 && cause instanceof Error; depth++) {
+        const name = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(cause.name) ? cause.name : "Error";
+        const codeValue = (cause as Error & { code?: unknown }).code;
+        const code = typeof codeValue === "string" && /^[A-Za-z0-9_]{1,64}$/.test(codeValue) ? codeValue : undefined;
+        chain.push({ name, ...(code ? { code } : {}) });
+        cause = cause.cause;
+    }
+    return chain.length > 0 ? chain : undefined;
+}
+
+function safeDiagnosticId(value: string | undefined): string | undefined {
+    return value !== undefined && value.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) ? value : undefined;
+}
+
 function hadTextOtherThanTextFields(choices: unknown): boolean {
     if (!Array.isArray(choices)) return true;
     for (const c of choices) {
@@ -4232,6 +4358,7 @@ export async function pipePluginResponsesWithStrip(
     // #2328 Q2 — see pipePluginChatWithStrip.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    hostOwnsTruncationRecovery = false,
     // #6433: session id for witness recording only — see pipePluginChatWithStrip.
     witnessSessionId?: string,
 ): Promise<void> {
@@ -4542,11 +4669,27 @@ export async function pipePluginResponsesWithStrip(
         // #5951: the read error itself, so a cut that was not replayed names its
         // cause instead of only its classification.
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
+        ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
+        // #5951: see the chat-pipe twin — the responses lane has no reasoning-only
+        // replay, so `replayAvailable` is the field that says so on a cut.
+        replay: {
+            replayAvailable: refetch !== undefined,
+            sawReasoning,
+            sawFunctionCall,
+            openStreams: argStreams.size,
+            forwardedAny,
+            proseChars: proseAcc.length,
+            fastPathChars,
+            heldVisibleChars,
+        },
         heldEvents: heldEvents.length,
         ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
         ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.requestId) ? { upstreamRequestId: safeDiagnosticId(upstreamMeta?.requestId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.opencodeLogId) ? { upstreamLogId: safeDiagnosticId(upstreamMeta?.opencodeLogId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.cfRay) ? { upstreamCfRay: safeDiagnosticId(upstreamMeta?.cfRay) } : {}),
     });
     /** Every id the retry carries is rewritten onto the first attempt's, so the
      *  client's assembled item stays the one it already holds. */
@@ -4585,6 +4728,10 @@ export async function pipePluginResponsesWithStrip(
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #3905: bare-announcement twin — see the chat-pipe twin above
+        // (including why the detector reads answerProse, not proseAcc).
+        const announceTail = !draftTail && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithAnnouncement(answerProse) && !requestExpectsProseSummary(requestText);
+        const stalledTail = draftTail || announceTail;
         // #2756: same question as the chat-pipe twin — "did the host receive
         // ANSWER text?". Reasoning inlined into item.content[] (vLLM/
         // llama.cpp reasoning_text) and whitespace-only output_text (a bare
@@ -4592,9 +4739,9 @@ export async function pipePluginResponsesWithStrip(
         // bare check below, but whitespace-only answer prose must also retry.
         // Real answer text still refuses the retry byte-for-byte.
         const answerChars = answerProse.trim().length;
-        if (!draftTail && (answerChars > 0 || sawFunctionCall)) return false;
+        if (!stalledTail && (answerChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") {
-            if (!sawFunctionCall && !draftTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
+            if (!sawFunctionCall && !stalledTail && answerChars === 0) log?.(`[plugin] degenerate terminal turn not retried (status ${status ?? "none"} is not completed): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
         if (res.destroyed || res.writableEnded) return false;
@@ -4603,14 +4750,16 @@ export async function pipePluginResponsesWithStrip(
         // double-bills an empty completion (#732/#821 keep the same boundary in
         // the compress loop). A draft-tail turn delivered a full handoff draft:
         // precisely the stall signal.
-        if (!sawReasoning && !sawStrippedEcho && !draftTail) {
+        if (!sawReasoning && !sawStrippedEcho && !stalledTail) {
             log?.(`[plugin] degenerate terminal turn not retried (bare: no reasoning, no stripped echo): visibleTextChars=${visibleTextChars}, heldVisibleChars=${heldVisibleChars} (#2756)`);
             return false;
         }
         degenerateRetried = true;
-        log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
-            : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        log?.(announceTail
+            ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying once with a continuation nudge (#3905)"
+            : draftTail
+              ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+              : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
             next = await refetch();
@@ -4682,7 +4831,7 @@ export async function pipePluginResponsesWithStrip(
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                if (!hostOwnsTruncationRecovery && !sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -4946,7 +5095,8 @@ export async function pipePluginResponsesWithStrip(
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
-        if (replyCompleted && !res.destroyed && !res.writableEnded) reply?.save();
+        // Same rule as the chat pipe: upstream completion decides, not the socket.
+        if (replyCompleted) reply?.save();
         // #721 → #2563: never leave the stream hanging on a missing done-family
         // event. Permitlist hosts (pi) get the raw cut for their native
         // classifier; everyone else gets the in-band error frame.
@@ -4963,6 +5113,8 @@ export async function pipePluginResponsesWithStrip(
             log?.("client aborted mid-stream");
             // #5293: same as the chat lane — record the pre-abort anchor for the post-resume re-anchor.
             if (session) noteAbortedTurn(session);
+            // Completed turn, dead socket: keep the reply for the handoff render.
+            if (replyCompleted) reply?.save();
             return;
         }
         // #721: upstream read failed while the client is still connected —
