@@ -107,6 +107,16 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #1724/#3397/#4125: spawns `node --import tsx` writer children (one per
+    // simulated instance), a four-writer IPC read-barrier fan-out, and
+    // store-resolver children. Their sockets are stdio/IPC only — the journal
+    // is a filesystem protocol, so no zone band is needed; the entry exists for
+    // the spawn tripwire alone, like #3890. Concurrency reviewed: each test owns
+    // a `freshDir` mkdtemp state dir (the fan-out writers deliberately SHARE
+    // one journal dir — that is the race under test), the barrier is explicit
+    // IPC rather than sleeps, and nothing binds a port, so in-file tests are
+    // parallel-safe and the suite needs no serialization.
+    "tests/snapshot-journal.test.ts",
     // #5487: spawns a one-shot sealer child (process.execPath) against its own
     // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
     // zone port band is needed — the entry is for the SPAWN_RE tripwire alone

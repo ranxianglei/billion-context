@@ -19,6 +19,7 @@ process.env.XDG_CACHE_HOME = path.join(root, "cache");
 const { getStore, unifiedKvActive } = await import("../src/persist.js");
 const { scheduleOrderPersist, flushOrderSkeletons, hydrateOrderUnified, _resetOrderPersistForTest } = await import("../src/order-persist.js");
 const { orderSnapshot, resetSessionOrderForTest } = await import("../src/session-resolve.js");
+const { journalDirOf } = await import("../src/snapshot-journal.js");
 
 const legacyFile = path.join(root, "state", "billion-context", "session-order.json");
 
@@ -71,17 +72,22 @@ test("post-hydration writes land in kv and survive the legacy file's deletion", 
     assert.equal(JSON.stringify(await kvRow()), before, "idempotent hydration");
 });
 
-test("pre-hydration mutations fall back to the file, which hydration then imports", async () => {
+test("pre-hydration mutations fall back to disk, which hydration then imports", async () => {
     _resetOrderPersistForTest();
     fs.rmSync(legacyFile, { force: true });
+    fs.rmSync(journalDirOf(legacyFile), { recursive: true, force: true });
     const { applyOrderSnapshot } = await import("../src/session-resolve.js");
     applyOrderSnapshot([{ id: "early-bird", kinds: ["api"], frags: ["h0"], tagHash: "th2", lastSeen: Date.now() + 2 }]);
     scheduleOrderPersist();
-    await new Promise((r) => setTimeout(r, 700)); // debounce window → file write (no kv yet)
-    assert.ok(fs.existsSync(legacyFile), "pre-hydration window used the legacy file");
+    await new Promise((r) => setTimeout(r, 700)); // debounce window → journal publication (no kv yet)
+    // #5480: the pre-kv fallback publishes through the immutable journal — the
+    // legacy baseline is never rewritten, so durability here means a published
+    // leaf beside it, not the baseline's own existence.
+    const leaves = fs.existsSync(journalDirOf(legacyFile)) ? fs.readdirSync(journalDirOf(legacyFile)) : [];
+    assert.ok(leaves.length > 0, "pre-hydration window published a durable journal leaf");
 
     await hydrateOrderUnified();
     const row = await kvRow();
-    assert.ok(row.entries.some((e) => e.id === "early-bird"), "late import covered the early file write");
+    assert.ok(row.entries.some((e) => e.id === "early-bird"), "late import covered the early journal write");
     assert.ok(orderSnapshot().some((e) => e.id === "early-bird"));
 });

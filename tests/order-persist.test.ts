@@ -18,13 +18,21 @@ function orderFile(): string {
     return path.join(tmp, "billion-context", "session-order.json");
 }
 
-async function waitUntilFile(ms: number): Promise<boolean> {
+/** #5480: the legacy writer publishes immutable journal leaves instead of
+ *  rewriting the baseline file — landing means a `pub-*` directory exists
+ *  under `<orderFile>.journal/`. */
+function snapshotLanded(): boolean {
+    const dir = `${orderFile()}.journal`;
+    return fs.existsSync(dir) && fs.readdirSync(dir).some((n) => n.startsWith("pub-"));
+}
+
+async function waitUntilLanded(ms: number): Promise<boolean> {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
-        if (fs.existsSync(orderFile())) return true;
+        if (snapshotLanded()) return true;
         await new Promise((r) => setTimeout(r, 50));
     }
-    return fs.existsSync(orderFile());
+    return snapshotLanded();
 }
 
 beforeEach(() => {
@@ -33,11 +41,11 @@ beforeEach(() => {
 });
 
 test("default cadence unchanged: single mutation lands within ~500ms (#6058)", async () => {
-    assert.ok(!fs.existsSync(orderFile()), "fresh state dir has no snapshot yet");
+    assert.ok(!snapshotLanded(), "fresh state dir has no published snapshot yet");
     scheduleOrderPersist();
     await new Promise((r) => setTimeout(r, 200));
-    assert.ok(!fs.existsSync(orderFile()), "no immediate write at t=0");
-    const landed = await waitUntilFile(2_000);
+    assert.ok(!snapshotLanded(), "no immediate publication at t=0");
+    const landed = await waitUntilLanded(2_000);
     assert.ok(landed, "default 500ms debounce still writes well inside 2.2s");
     flushOrderSkeletons();
 });
@@ -47,8 +55,8 @@ test("persist.debounceMs knob is honored — a larger window defers the write (#
     try {
         scheduleOrderPersist();
         await new Promise((r) => setTimeout(r, 700));
-        assert.ok(!fs.existsSync(orderFile()), "with debounce=1500 the old hardcoded 500ms must NOT have fired");
-        const landed = await waitUntilFile(2_500);
+        assert.ok(!snapshotLanded(), "with debounce=1500 the old hardcoded 500ms must NOT have fired");
+        const landed = await waitUntilLanded(2_500);
         assert.ok(landed, "the write still lands after the 1500ms knob window");
     } finally {
         delete process.env.BILI_PERSIST_DEBOUNCE_MS;
@@ -68,7 +76,7 @@ test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce u
         while (Date.now() - start < 1_500) {
             scheduleOrderPersist();
             await new Promise((r) => setTimeout(r, 100));
-            if (fs.existsSync(orderFile())) {
+            if (snapshotLanded()) {
                 saw = true;
                 break;
             }

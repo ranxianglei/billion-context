@@ -105,7 +105,8 @@ billion-context/
 │   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
-│   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
+│   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499) — immutable journal, never rewrites the legacy file
+│   ├── snapshot-journal.ts       # Immutable-publication journal shared by the two state snapshots: a private staging dir is renamed onto a unique never-reused `pub-*` name (atomic, no overwrite, no hard links, no copy), corruption-preserving per-input census; reclamation is coverage-gated — a census leaf is unlinked only when the caller's `covers(output, input)` holds for that leaf's own privately parsed data, so a bounded/merged view keeps the leaves holding records its cap dropped (reported once as `PublishResult.uncovered`) — and durability-gated: a failed directory fsync (Windows, some network mounts) leaves the publication visible but reclaims NOTHING, reporting the same `uncovered` coverage it actually has and counting as `retained` only the census leaves still on disk
 │   ├── affinity-neutral.ts       # Wire-neutral affinity turn projection across protocol switches (#2791)
 │   ├── affinity-simhash.ts       # 64-bit simhash + Hamming chain alignment for rewritten histories (#2265)
 │   ├── cache-warn.ts             # Upstream prompt-cache collapse warning (#499)
