@@ -65,7 +65,7 @@ import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAutoReviewBlockEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -73,6 +73,7 @@ import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
+import { buildAutoReviewEmptyBody, recordAutoReviewBlock } from "./dsh-auto-review-block.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
@@ -2600,6 +2601,26 @@ async function handleRequest(
         const dshReviewSidecar = requestAgent !== "main" && isDshAutoReviewRequest(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
+        // #4634: owner direction — dsh auto-review traffic is BLOCKED by default:
+        // every review call re-sends a self-contained snapshot of the main
+        // conversation and bills it in full (steady-state O(history) miss; a
+        // model switch re-bills the whole accumulated lane at once — the
+        // incident measured ~728K one-shot). Answer locally with the minimal
+        // legal low-risk verdict instead of forwarding (zero usage; the payload
+        // shape is constrained by dsh's fail-closed reviewer parser — see
+        // src/server/dsh-auto-review-block.ts). Same evidence gate as the #4438
+        // lane above; opt-out: dsh.autoReviewBlock=false / BILI_DSH_AUTOREVIEW_BLOCK=0.
+        if (dshReviewSidecar && protocol !== null && dshAutoReviewBlockEnabled()) {
+            const blocked = buildAutoReviewEmptyBody(protocol, (parsed as { stream?: unknown }).stream === true);
+            if (blocked) {
+                recordAutoReviewBlock(inboundBytes / 4);
+                log("warn", `dsh auto-review BLOCKED locally (#4634 default-on): ~${Math.round(inboundBytes / 4)} tokens NOT forwarded upstream; answered with the minimal low-risk verdict (zero usage). Disable: dsh.autoReviewBlock=false or BILI_DSH_AUTOREVIEW_BLOCK=0; root fix: turn off dsh auto-review.`);
+                res.writeHead(200, { "content-type": blocked.contentType });
+                res.end(blocked.body);
+                logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
+                return;
+            }
+        }
         // #5656/#5584: the generic single-shot sidecar joins the intent set so
         // prompt-enhance-class calls ride the #388 passthrough (kernel
         // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
