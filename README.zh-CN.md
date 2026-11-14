@@ -479,7 +479,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 派生(子)会话继承父会话的压缩上下文(#1333、#1362)
 
-当 agent 派生子会话(subagent 或 fork,从空历史起步、不重发父会话内容)时,它会在出生时上报这条血缘:身份注册携带父会话 id(`parentConversationId`),代理在子会话上记录一条只读链接(`derivedFrom`)。此后 `decompress` / `search_context` 对子会话自己从未见过的内容沿父链回退(带环检测、深度上限 8);任何东西都不复制进子会话,父会话也绝不被修改;父会话未知时子会话就按全新起步。各 lane 的父信号(pi/omp `parentSession` header、OpenCode V1/V2 `parentID`):[docs/session-identity.zh-CN.md](docs/session-identity.zh-CN.md#派生子会话出生时携带血统1333-1362)。claude/codex/dsh 在这里不需要任何信号:它们的子 agent 共享同一个会话 id,或根本没有子会话概念。
+当 agent 派生子会话(subagent 或 fork,从空历史起步、不重发父会话内容)时,它会在出生时上报这条血缘:身份注册携带父会话 id(`parentConversationId`),代理在子会话上记录一条只读链接(`derivedFrom`)。此后 `decompress` / `search_context` 对子会话自己从未见过的内容沿父链回退(带环检测、深度上限 8);任何东西都不复制进子会话,父会话也绝不被修改;父会话未知时子会话就按全新起步。各 lane 的父信号(pi/omp `parentSession` header、OpenCode V1/V2 `parentID`):[docs/session-identity.zh-CN.md](docs/session-identity.zh-CN.md#派生子会话出生时携带血统1333-1362)。claude/codex 在这里不需要任何信号:它们的子 agent 也打主会话的 id(代理用其他信号分隔这些车道)。dsh 每次 spawn 子代理都铸一个新的会话 id(已对照 deepseek-harness @ 0.2.2-alpha.3 源码核实,#5630),其子会话天然按 id 隔离。
 
 ### Windows：把会话目录加入杀软排除项（#362）
 

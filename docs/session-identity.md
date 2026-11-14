@@ -253,8 +253,10 @@ From then on:
 | **OpenCode V1** (native plugin) | SDK session info `parentID` (resolved once per session, cached) |
 | **OpenCode V2** (native plugin) | `session.created` event `data.parentID` |
 
-claude/codex/dsh need nothing here: they share one session id across
-subagents or have no child-session concept at all.
+claude/codex need nothing here: their subagents stamp the main session id
+too (the proxy separates those lanes by other signals). dsh mints a fresh
+session id per subagent spawn (verified against deepseek-harness @
+0.2.2-alpha.3, #5630), so its child conversations are already isolated by id.
 
 ## Future direction
 
