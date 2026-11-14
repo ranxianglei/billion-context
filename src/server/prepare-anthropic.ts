@@ -327,6 +327,15 @@ export async function prepareAnthropic(
         // intact history has no gap; a gap without framing falls through to
         // detectUnannouncedHistoryRewrite below). Title-gen side requests are
         // skipped like on the openai lane (same tiny-budget heuristic).
+        // #6061: honour a boundary armed on an earlier request. The detector in
+        // generation-boundary.ts arms it when stale above-frontier citations prove
+        // the persisted ledger is from a previous generation; the dsh branch below
+        // only fires on a client-side compaction signature, which a plain
+        // model/upstream switch does not produce — that left the two surfaces (nudge
+        // vs compress) permanently disagreeing about "highest allocated ref".
+        if (reconcileNativeCompactionBoundary(session)) {
+            log("info", `[${sessionId}] [acp-gen-boundary] ref ledger belongs to a previous generation — ACP compression state rebased onto the current one`);
+        }
         let dshRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
         if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
