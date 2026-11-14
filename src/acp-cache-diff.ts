@@ -461,11 +461,12 @@ const USAGE_SKEW_MS = 50;
 function alignUsage(outTs: number[], samples: UsageSample[]): UsageSample[][] {
     // A usage line belongs to the latest request whose dump predates it —
     // responses (and their usage logs) always land after the request dump.
+    // Both inputs are sorted by time, so each request need only be visited once.
     const assigned: UsageSample[][] = outTs.map(() => []);
+    let request = -1;
     for (const s of samples) {
-        for (let i = outTs.length - 1; i >= 0; i--) {
-            if (outTs[i]! <= s.ts + USAGE_SKEW_MS) { assigned[i]!.push(s); break; }
-        }
+        while (request + 1 < outTs.length && outTs[request + 1]! <= s.ts + USAGE_SKEW_MS) request++;
+        if (request >= 0) assigned[request]!.push(s);
     }
     return assigned;
 }
