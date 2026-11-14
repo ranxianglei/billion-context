@@ -18,7 +18,7 @@ export interface StampStore {
     withSessionExtTransaction?<T>(action: () => T): T;
 }
 type Stamps = Record<string, number>;
-export type StampedIdentity = { id: string; ts?: number };
+type StampedIdentity = { id: string; ts?: number };
 
 function read(store: StampStore, sessionId: string): Stamps {
     const value = store.getSessionExt(sessionId, FIRST_SEEN_KEY);

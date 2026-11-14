@@ -3000,6 +3000,8 @@ async function handleRequest(
                 sidePassthrough: true,
             };
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
+            // The explicit side lane bypasses kernel timestamps entirely.
+            if (isFirstSeenRequest(req)) commitFirstSeenRequest(req);
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
