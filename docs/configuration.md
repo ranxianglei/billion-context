@@ -20,6 +20,15 @@ On first run, `billion-context` seeds an empty template (`{ "providers": {} }`) 
 
 The config file is a pure override layer — every field is optional. Anything unset falls through to the built-in default.
 
+### When do config edits take effect?
+
+The helper reads the config file once at startup into process memory and does not re-read it on its own. To apply a change there are two paths:
+
+- **Save from the bili web panel** — hot-reloads a subset of fields (routing / providers, `compress.*`, `compat`, image billing & cap) into the running process without a restart.
+- **Stop the helper and let the host respawn it** (`POST /__bili/shutdown`, or quit + relaunch the client) — reloads *everything* from disk. Fields outside the hot-reload set (e.g. `port`, `upstream`, `modelContextLimit`, `subagentSplit`, `persist`) need this path.
+
+A common trap (#4705): **restarting the client alone usually just re-attaches to the already-running helper**, so a disk edit made while the helper was alive stays inert until one of the two paths above runs. Since #4705, when an attach lands on a helper whose boot-time config no longer matches the file on disk, bili logs a clear `STALE config` warning at attach time (naming the fix) instead of serving the old values silently.
+
 ---
 
 ## Quick Start

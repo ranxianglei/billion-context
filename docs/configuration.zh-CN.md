@@ -20,6 +20,15 @@
 
 配置文件是一个纯粹的覆盖层 —— 每个字段都是可选的。任何未设置的字段都会回退到内置默认值。
 
+### 配置改动何时生效？
+
+helper 只在启动时把配置文件读入进程内存一次，之后不会自行重读。要让改动生效有两条路径：
+
+- **从 bili web 面板保存** —— 无需重启即可把一部分字段（路由 / providers、`compress.*`、`compat`、image billing & cap）热加载进运行中的进程。
+- **停掉 helper 让宿主重新派生**（`POST /__bili/shutdown`，或退出并重新打开客户端）—— 从磁盘*完整*重读。热加载集合之外的字段（如 `port`、`upstream`、`modelContextLimit`、`subagentSplit`、`persist`）必须走这条路径。
+
+一个常见坑（#4705）：**只重启客户端通常只是重新 attach 到已在跑的 helper**，所以在 helper 存活期间改的磁盘配置会一直不生效，直到上面两条路径之一执行。自 #4705 起，当 attach 落到的 helper 其启动时配置与磁盘文件不再一致时，bili 会在 attach 时打一条清晰的 `STALE config` 警告（并指明修法），而不是静默地继续用旧值。
+
 ---
 
 ## 快速开始
