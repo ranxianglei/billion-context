@@ -62,7 +62,8 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
+import { DRAFT_TAIL_RETRY_NUDGE_COMPLETE, DRAFT_TAIL_RETRY_NUDGE_TRUNCATED } from "./degenerate-retry.js";
+import { degenerateTurnWarning, draftTailKind, endsWithAnnouncement, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
 import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
@@ -2760,7 +2761,7 @@ export async function pipePluginChatWithStrip(
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (nudgeText?: string) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // True when the outbound request carried the [ACP absorb] instruction:
     // the model may then answer with a tool call written as prose, and the
@@ -2972,7 +2973,15 @@ export async function pipePluginChatWithStrip(
         // #2612: the request's OWN instruction can make this shape the correct
         // answer — a client compaction asking for a plain-text <summary> block
         // must not be retried (its compliant reply IS a draft tail).
+        // #4764: lexical escape hatch only here (NOT the shape twin) — this
+        // requestText is the WHOLE shipped body, which carries previously
+        // injected nudges verbatim; see requestExpectsProseSummaryShape.
         const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #4764: steer the retry at the pending compress call instead of the
+        // generic "take your next concrete action" (which on OpenAI-lane
+        // compression turns read as permission to do anything else).
+        const draftTailShape = draftTail ? draftTailKind(proseAcc) ?? "complete" : undefined;
+        const draftNudge = draftTailShape === "truncated" ? DRAFT_TAIL_RETRY_NUDGE_TRUNCATED : draftTailShape === "complete" ? DRAFT_TAIL_RETRY_NUDGE_COMPLETE : undefined;
         // #3905: the same non-convergence without a draft tag — the whole visible
         // output is a one-line promise of the next action ("Running verify after
         // formatting:"). Without this branch the answerChars gate below would read
@@ -3027,11 +3036,11 @@ export async function pipePluginChatWithStrip(
         log?.(announceTail
             ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with a continuation nudge (#3905)"
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+              ? `[plugin] terminal turn ends with a compression-draft closing tag (${draftTailShape === "truncated" ? "truncated before the summary" : "complete draft written as prose"}) and no tool call; retrying once with the compress-naming continuation nudge (#2303/#4764)`
               : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(draftNudge);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;
@@ -4339,7 +4348,7 @@ export async function pipePluginResponsesWithStrip(
     res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (nudgeText?: string) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // See pipePluginChatWithStrip: whole-field tool-call emission drop,
     // gated on the request carrying the [ACP absorb] instruction (m00885).
@@ -4715,7 +4724,12 @@ export async function pipePluginResponsesWithStrip(
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
+        // #4764: lexical escape hatch only here (NOT the shape twin) — see the
+        // chat-pipe twin above.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc) && !requestExpectsProseSummary(requestText);
+        // #4764: same steer as the chat-pipe twin.
+        const draftTailShape = draftTail ? draftTailKind(proseAcc) ?? "complete" : undefined;
+        const draftNudge = draftTailShape === "truncated" ? DRAFT_TAIL_RETRY_NUDGE_TRUNCATED : draftTailShape === "complete" ? DRAFT_TAIL_RETRY_NUDGE_COMPLETE : undefined;
         // #3905: bare-announcement twin — see the chat-pipe twin above
         // (including why the detector reads answerProse, not proseAcc).
         const announceTail = !draftTail && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithAnnouncement(answerProse) && !requestExpectsProseSummary(requestText);
@@ -4746,11 +4760,11 @@ export async function pipePluginResponsesWithStrip(
         log?.(announceTail
             ? "[plugin] terminal turn is a bare announcement (ends mid-promise, no function call); retrying once with a continuation nudge (#3905)"
             : draftTail
-              ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+              ? `[plugin] terminal turn ends with a compression-draft closing tag (${draftTailShape === "truncated" ? "truncated before the summary" : "complete draft written as prose"}) and no function call; retrying once with the compress-naming continuation nudge (#2303/#4764)`
               : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(draftNudge);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;
