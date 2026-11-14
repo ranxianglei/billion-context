@@ -127,6 +127,9 @@ test("byte budget pins active state, admits concurrent requests, and releases id
     assert.equal(getSession("large-active"), session);
     assert.equal(getSession("concurrent-request"), concurrent);
     assert.ok(listSessions().includes(session));
+    // #5806: a just-touched session now rides out a 60-second shield; age it
+    // past so this fixture keeps pinning "released active state yields to the budget".
+    session.lastSeen = Date.now() - 180_000;
     releaseInFlight(session);
     assert.ok(!listSessions().includes(session));
     assert.equal(store.loadSync(session.id)?.metadata.original, "x".repeat(20000));
