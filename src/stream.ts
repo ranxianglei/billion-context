@@ -1613,7 +1613,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible
         // whenever some other range in the batch succeeded — surface them on
         // the success line too, not only on total failure.
-        let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // #6720: a partial tier-1 fold must not read as a clean "done" — the
+        // kernel reports the unharvested remainder so the model sees there is
+        // more to fold instead of treating the partial fold as complete (the
+        // ratchet's model-side enabler).
+        const remainingNote =
+            r.remainingPending !== undefined
+                ? ` ${r.remainingPending} tokens of the offered ranges remain unfolded — include them in your next compress call.`
+                : "";
+        let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${remainingNote}${warn}${applyErrorNote(r)}]`;
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
