@@ -227,6 +227,31 @@ interface MsgArrayInfo {
     items: unknown[];
 }
 
+function rootArrayStart(text: string, key: string): number {
+    let depth = 0;
+    let found = -1;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i]!;
+        if (c === '"') {
+            const start = i++;
+            while (i < text.length) {
+                if (text[i] === "\\") { i += 2; continue; }
+                if (text[i] === '"') break;
+                i++;
+            }
+            if (depth !== 1) continue;
+            let value = i + 1;
+            while (value < text.length && " \t\n\r".includes(text[value]!)) value++;
+            if (text[value] !== ":" || JSON.parse(text.slice(start, i + 1)) !== key) continue;
+            value++;
+            while (value < text.length && " \t\n\r".includes(text[value]!)) value++;
+            found = text[value] === "[" ? value : -1;
+        } else if (c === "{" || c === "[") depth++;
+        else if (c === "}" || c === "]") depth--;
+    }
+    return found;
+}
+
 function msgArrayInfo(text: string): MsgArrayInfo | null {
     let parsed: unknown;
     try { parsed = JSON.parse(text); } catch { return null; }
@@ -235,16 +260,8 @@ function msgArrayInfo(text: string): MsgArrayInfo | null {
     for (const key of MSG_KEYS) {
         const arr = obj[key];
         if (!Array.isArray(arr)) continue;
-        const re = new RegExp(`"${key}"\\s*:\\s*\\[`, "g");
-        let firstStart = -1;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(text)) !== null) {
-            const start = m.index + m[0].length - 1;
-            if (firstStart < 0) firstStart = start;
-            const spans = elementSpans(text, start);
-            if (spans.length === arr.length) return { key, spans, items: arr };
-        }
-        if (firstStart >= 0) return { key, spans: elementSpans(text, firstStart), items: arr };
+        const start = rootArrayStart(text, key);
+        if (start >= 0) return { key, spans: elementSpans(text, start), items: arr };
     }
     return null;
 }

@@ -364,6 +364,74 @@ test("batch protection checks the aggregate range length instead of rejecting va
     }, (_req, res) => { calls++; success(res); });
 });
 
+test("external refolds index selected block ids once while preserving reference order", async (t) => {
+    let sentReference: Record<string, unknown> | undefined;
+    let blockIdReads = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const count = 512;
+        const selected = 384;
+        ctx.messages = [
+            ...Array.from({ length: count }, (_, index): CoreMessage => ({
+                id: `reference-source-${index}`, role: "assistant", contentType: "text", text: `Source ${index}. ${RAW}`,
+            })),
+            ctx.messages[1],
+        ];
+        ctx.session.state = ctx.core.processTurn({ messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 200_000 }).state;
+        const seeded = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: ctx.messages.slice(0, count).map((message, index) => ({
+                startRef: ctx.session.state.messageRefs.byRaw[message.id], endRef: ctx.session.state.messageRefs.byRaw[message.id],
+                summary: `Historical summary ${index}. ${SUMMARY}`, topic: `topic-${index}`,
+            })),
+        });
+        assert.equal(seeded.result.blocksCreated, count, JSON.stringify(seeded.result));
+        ctx.session.state = seeded.state;
+        const lastId = seeded.state.blocks.at(-1)!.blockId;
+        const retired = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: [{ startRef: lastId, endRef: lastId, summary: SUMMARY, topic: "retained-distillation" }],
+        });
+        assert.equal(retired.result.blocksCreated, 1, JSON.stringify(retired.result));
+        ctx.session.state = retired.state;
+        const initial = ctx.session.state;
+        const selectedIds = new Set(initial.blocks.slice(0, selected).map((block) => block.blockId));
+        const expected = initial.blocks.filter((block) => block.active && !selectedIds.has(block.blockId))
+            .map(({ topic, summary }) => ({ topic, summary }));
+        const applyCompression = ctx.core.applyCompression.bind(ctx.core);
+        let preview = true;
+        ctx.core = { ...ctx.core, applyCompression(input) {
+            const result = applyCompression(input);
+            if (!preview) return result;
+            preview = false;
+            for (const block of result.state.blocks) {
+                if (block.summary.startsWith("external-probe-")) block.directBlockIds = new Proxy(block.directBlockIds, {
+                    get(target, key, receiver) {
+                        if (typeof key === "string" && /^\d+$/.test(key)) blockIdReads++;
+                        return Reflect.get(target, key, receiver);
+                    },
+                });
+            }
+            return result;
+        } };
+
+        const result = await applyConfiguredCompression({ content: [{
+            startId: initial.blocks[0].blockId, endId: initial.blocks[selected - 1].blockId, summary: "Retain the selected historical work.",
+        }] }, ctx);
+
+        assert.equal(result.outcome, "applied", result.text);
+        assert.deepEqual(sentReference?.otherSummaries, expected);
+        assert.deepEqual(sentReference?.currentContext, ctx.messages.slice(-5).map(({ role, text }) => ({ role, text })));
+        assert.equal(sentReference?.submittedSummaryHint, "Retain the selected historical work.");
+        t.diagnostic(`${blockIdReads} selected-block-id visits for ${count} source blocks`);
+        assert.ok(blockIdReads <= count * 8, `selected block ids were visited ${blockIdReads} times for ${count} source blocks`);
+    }, (_req, res, body) => {
+        const payload = JSON.parse((body.input as Array<{ content: string }>)[0].content) as { reference: string };
+        sentReference = JSON.parse(payload.reference) as Record<string, unknown>;
+        success(res);
+    });
+});
+
 test("inline restore refolds the original block even when originals have left the wire view", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {

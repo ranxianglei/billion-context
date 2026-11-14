@@ -2276,7 +2276,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             else byLo.set(lo, [l.hitPct]);
         }
         for (const [lo, hits] of [...byLo.entries()].sort((x, y) => x[0] - y[0]).slice(0, 24)) {
-            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: Math.min(...hits) });
+            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: hits.reduce((min, hit) => Math.min(min, hit), Infinity) });
         }
     }
     const lowGaps: number[] = [];

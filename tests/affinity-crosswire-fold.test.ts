@@ -280,11 +280,33 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
 
     type Msg = { role: string; content: string };
     const hist: Msg[] = [];
+    const parallelTools = [
+        { id: "parallel_a", name: "read_file", args: { path: "/a.ts" }, output: "parallel result alpha" },
+        { id: "parallel_b", name: "read_file", args: { path: "/b.ts" }, output: "parallel result beta" },
+    ];
+    const question = "Read both source files before the next audit turn.";
+    const withParallel = (messages: unknown[], round: unknown[]): unknown[] => messages.length > 20
+        ? [...messages.slice(0, 20), ...round, ...messages.slice(20)] : messages;
+    const openaiRound = [
+        { role: "user", content: question },
+        { role: "assistant", content: null, tool_calls: parallelTools.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: JSON.stringify(t.args) } })) },
+        ...parallelTools.map((t) => ({ role: "tool", tool_call_id: t.id, content: t.output })),
+    ];
+    const responsesRound = [
+        { type: "message", role: "user", content: [{ type: "input_text", text: question }] },
+        ...parallelTools.map((t) => ({ type: "function_call", call_id: t.id, name: t.name, arguments: JSON.stringify(t.args) })),
+        ...parallelTools.map((t) => ({ type: "function_call_output", call_id: t.id, output: t.output })),
+    ];
+    const googleRound = [
+        { role: "user", parts: [{ text: question }] },
+        { role: "model", parts: parallelTools.map((t) => ({ functionCall: { name: t.name, args: t.args } })) },
+        { role: "user", parts: parallelTools.map((t) => ({ functionResponse: { name: t.name, response: { output: t.output } } })) },
+    ];
     try {
         // Phase A — openai lane establishes the anonymous session and folds.
         const openaiTurn = async (t: number): Promise<void> => {
             hist.push({ role: "user", content: `Turn ${t}: audit province ${t}. ` + FILLER(t, 6) });
-            const resp = await fetch(openaiBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, messages: [...hist] }) });
+            const resp = await fetch(openaiBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, messages: withParallel(hist, openaiRound) }) });
             assert.equal(resp.status, 200, `openai turn ${t}`);
             await resp.text();
             hist.push({ role: "assistant", content: `Reply about province ${t}: acknowledged. ` + FILLER(t, 0.2) });
@@ -305,7 +327,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
             role: m.role,
             content: [{ type: m.role === "assistant" ? "output_text" : "input_text", text: m.content }],
         }));
-        const respB = await fetch(responsesBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, instructions: "crosswire probe", input: respItems }) });
+        const respB = await fetch(responsesBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", stream: true, instructions: "crosswire probe", input: withParallel(respItems, responsesRound) }) });
         const respRaw = await respB.text();
         if (respB.status !== 200) assert.fail(`responses switch turn: ${respB.status}: ${respRaw.slice(0, 200)}`);
         hist.push({ role: "assistant", content: "Responses reply about turn 13: acknowledged." });
@@ -314,6 +336,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
         let pfasB = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
         assert.equal(pfasB.length, 1, `the responses switch must not fork: got ${pfasB.join(", ")}`);
         assert.equal(pfasB[0], sessionId);
+        for (const tool of parallelTools) assert.ok(responsesBody.includes(tool.output), "both tool results survive the switch");
         assert.ok(responsesBody.includes(SUMMARY_TEXT), "the fold carrier is attached on the responses wire");
         assert.equal((responsesBody.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered early content must not replay unfolded on the responses switch");
         assert.equal(foldDemands, foldsBeforeSwitch, "no re-fold demanded on the responses switch");
@@ -323,7 +346,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
         // history re-rendered as contents[].parts[].
         hist.push({ role: "user", content: "Turn 14: continue with province seven." });
         const contents = hist.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-        const respG = await fetch(googleBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", contents }) });
+        const respG = await fetch(googleBase, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "probe-model", contents: withParallel(contents, googleRound) }) });
         const googleRaw = await respG.text();
         if (respG.status !== 200) assert.fail(`google switch turn: ${respG.status}: ${googleRaw.slice(0, 200)}`);
 
@@ -331,6 +354,7 @@ test("cross-wire switch onto the responses and google lanes keeps the session AN
         pfasB = prefixAffinity.trackedSessionIds().filter((id) => id.startsWith("pfa-"));
         assert.equal(pfasB.length, 1, `the google switch must not fork: got ${pfasB.join(", ")}`);
         assert.equal(pfasB[0], sessionId);
+        for (const tool of parallelTools) assert.ok(googleBody.includes(tool.output), "both tool results survive the switch");
         assert.ok(googleBody.includes(SUMMARY_TEXT), "the fold carrier is attached on the google wire");
         assert.equal((googleBody.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered early content must not replay unfolded on the google switch");
         assert.equal(foldDemands, foldsBeforeSwitch, "no re-fold demanded on the google switch");

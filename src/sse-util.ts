@@ -65,14 +65,16 @@ export function* bufferedSseEvents(text: string): Generator<{ event: string; dat
     let event = "";
     let data: string[] = [];
     for (const line of finalizeSseLineEndings(text).split("\n")) {
-        if (line.trim() === "") {
+        if (line === "") {
             if (data.length) yield { event, data: data.join("\n") };
             event = "";
             data = [];
-        } else if (line.startsWith("event:")) {
-            event = line.slice(6).trim();
-        } else if (line.startsWith("data:")) {
-            data.push(line.slice(5).replace(/^ /, ""));
+        } else {
+            const colon = line.indexOf(":");
+            const field = colon < 0 ? line : line.slice(0, colon);
+            const value = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "");
+            if (field === "event") event = value;
+            else if (field === "data") data.push(value);
         }
     }
     if (data.length) yield { event, data: data.join("\n") };

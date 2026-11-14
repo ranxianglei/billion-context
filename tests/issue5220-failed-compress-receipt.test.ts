@@ -173,6 +173,37 @@ test("#5220 T1: first-time failed compress → exactly one recovery-receipt re-r
     }
 });
 
+test("#5220 long history: a failed compress reaches the recovery re-request without an argument limit", async () => {
+    const messages = Array.from({ length: 250_000 }, (_, i) => textMsg(`m${i}`, i % 2 === 0 ? "user" : "assistant", `history ${i}`));
+    const ctx = makeCtx(messages);
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        bodies.push(String(init?.body));
+        return new Response(NATURAL_END_ROUND, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(failingRound(0), { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(bodies.length, 1);
+        assert.ok(out.includes("DONE-NATURAL-5220"));
+        const input = JSON.parse(bodies[0]).input as Array<{ role?: string; content?: unknown }>;
+        assert.equal(input.filter((message) => message.role === "user").length, 125_000);
+        assert.ok(bodies[0].includes("history 0"));
+        assert.ok(bodies[0].includes("history 249999"));
+        assert.ok(bodies[0].includes("❌"));
+        assert.ok(!bodies[0].includes("function_call"));
+        assert.ok(!bodies[0].includes("call_seq0"));
+        assert.equal(messages.length, 250_000);
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
 test("#5220 T3: identical failing call resubmitted → #156 signature breaker stops at round 2", async () => {
     let n = 0;
     const orig = globalThis.fetch;
