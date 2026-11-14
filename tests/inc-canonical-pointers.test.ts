@@ -5,7 +5,9 @@ import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { defaultConfig } from "acp-kernel";
+import { anthropicToCore } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
@@ -13,7 +15,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { __resetIncrementalLaneForTests, __incrementalPtrChainForTests } from "../src/incremental-lane.ts";
+import { __resetIncrementalLaneForTests, __incrementalPtrChainForTests, handleIncrementalTurn } from "../src/incremental-lane.ts";
 
 /**
  * #3901 / #3798 — incremental canonical row pointers.
@@ -87,6 +89,63 @@ async function harness(): Promise<{
 }
 
 const core = (id: string, text: string): Record<string, unknown> => ({ id, role: "user", contentType: "text", content: text.repeat(200) });
+
+test("pointer upkeep extends very long restored histories from their highest row", async (t) => {
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    __resetIncrementalLaneForTests();
+    const dir = mkdtempSync(join(testRoot, "long-"));
+    const store = new SessionStore({ dir, enabled: false });
+    _setStoreForTest(store);
+    const count = 250_000;
+    const ptrs = Array.from({ length: count }, (_, i) => i);
+    [ptrs[0], ptrs[count - 1]] = [ptrs[count - 1]!, ptrs[0]!];
+    const rows = Array.from({ length: count }, (_, seq) => ({
+        seq, content: JSON.stringify({ id: `prefix-${seq}`, role: "user", contentType: "text", text: "x" }), ts: null,
+    }));
+    const delta = { role: "assistant" as const, content: "new tail" };
+    const tail = anthropicToCore({ messages: [delta] }).msgs[0]!;
+    const reads: number[] = [];
+    const written: unknown[] = [];
+    const warnings: string[] = [];
+    t.mock.method(store, "getSessionExt", (_id: string, key: string) => key === "inc:canonical-ptrs" ? ptrs : undefined);
+    t.mock.method(store, "setSessionExt", (_id: string, key: string, value: unknown) => {
+        if (key === "inc:canonical-ptrs") written.push(value);
+    });
+    t.mock.method(store, "unifiedRawMessages", (_id: string, after?: number) => {
+        if (after === undefined) return rows;
+        reads.push(after);
+        return [{ seq: count, content: JSON.stringify(tail), ts: null }];
+    });
+    t.mock.method(store, "afterNextFlush", async () => true);
+    try {
+        const req = Readable.from([]) as unknown as http.IncomingMessage;
+        Object.assign(req, {
+            method: "POST", url: "/v1/messages",
+            headers: { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "long-pointers" },
+            socket: { remoteAddress: "127.0.0.1", localPort: 43210 },
+        });
+        const res = {
+            writeHead: () => {}, setHeader: () => {}, end: () => {}, on: () => res,
+        } as unknown as http.ServerResponse;
+        let forwarded = false;
+        await handleIncrementalTurn(req, res, (level, message) => { if (level === "warn") warnings.push(message); }, async (_req, response) => {
+            forwarded = true;
+            response.writeHead(200);
+            response.end();
+        }, "/v1/messages", Buffer.from(JSON.stringify({
+            conversationId: "long-pointers", sinceSeq: count,
+            request: { model: "claude-test", max_tokens: 512 }, messages: [delta],
+        })));
+        assert.equal(forwarded, true);
+        assert.deepEqual(warnings, []);
+        assert.deepEqual(reads, [count - 1], "query only rows above the highest pointer, even when it is not last");
+        assert.deepEqual(written, [[...ptrs, count]], "the settled delta extends the persisted canonical");
+    } finally {
+        __resetIncrementalLaneForTests();
+        store.closeQuietly();
+    }
+});
 
 test("cold canonical rebuild: identical resync keeps the shared prefix; delta assembles the FULL history", async () => {
     const h = await harness();

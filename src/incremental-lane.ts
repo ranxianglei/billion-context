@@ -430,7 +430,9 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
         let rows: { seq: number; content: string; ts: number | null }[] | null;
         if (prevPtrs !== null && prevPtrs.length <= msgs.length) {
             ptrs = [...prevPtrs];
-            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? Math.max(...ptrs) : -1);
+            let highest = -1;
+            for (const ptr of ptrs) highest = Math.max(highest, ptr);
+            rows = store.unifiedRawMessages(sessionId, highest);
         } else {
             ptrs = [];
             rows = store.unifiedRawMessages(sessionId);
