@@ -241,10 +241,15 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
     // completion below (see EmitCompletionOpts.terminalExtra), not vanish.
     const MESSAGE_DELTA_KNOWN_KEYS = new Set(["type", "delta", "usage", "request_id"]);
     const MESSAGE_STOP_KNOWN_KEYS = new Set(["type", "request_id"]);
+    // #5529: fat relays pad every terminal frame with schema-shaped keys set to
+    // null (content_block / delta / error / index / message). A null carries no
+    // data worth preserving (#1766 is about real unmodeled VALUES), so drop
+    // null/undefined here — forwarding them is exactly what let `delta:null`
+    // ride into the synthetic terminal below and clobber the synthesized delta.
     const terminalExtrasOf = (data: Record<string, unknown>, known: ReadonlySet<string>): Record<string, unknown> | undefined => {
         const out: Record<string, unknown> = {};
         for (const [key, value] of Object.entries(data)) {
-            if (!known.has(key)) out[key] = value;
+            if (!known.has(key) && value !== null && value !== undefined) out[key] = value;
         }
         return Object.keys(out).length > 0 ? out : undefined;
     };
@@ -289,9 +294,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         // threads turn the client's next continue must target it, not round 1's id.
         if (threadTailId ?? messageId) extra.id = threadTailId ?? messageId;
         if (model) extra.model = model;
+        // #5529: spread the upstream extras BEFORE the authoritative fields so a
+        // stray envelope key can never clobber the synthesized type/delta/usage
+        // (the fat-relay `delta:null` client crash). extras still ride verbatim —
+        // they simply lose to the adapter's own reconstruction on any collision,
+        // matching how message_start already outranks a stray zero-echo usage (#660/#790).
         return Buffer.from(
             `event: message_delta\n` +
-            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage, ...extras, ...extra })}\n\n` +
+            `data: ${JSON.stringify({ ...extras, ...extra, type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage })}\n\n` +
             `event: message_stop\n` +
             `data: ${JSON.stringify({ type: "message_stop" })}\n\n`,
             "utf8",
