@@ -1068,41 +1068,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     };
     onWireBody?.(requestBody);
     if (dispatcher) init.dispatcher = dispatcher;
-    // #1843 L1: capture this round's image facts at the SEND chokepoint so the
-    // turn's usage settle pairs with the bytes actually sent — streamed turns
-    // settle in plugin.ts's SSE handler and never revisit the request body, so
-    // a settle-site-only capture would miss every streamed turn. textSide
-    // mirrors outboundPayloadBreakdown (messages + wire overhead) so observed
-    // image mass = billed total - textSide. Retries within this forward
-    // (#5708/#5835 refolds) re-send near-identical image sets — first-send
-    // facts stay the pairing source, same as noteForwardedBody's semantics.
-    if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
-        // parsedBody (the pre-serialization object) avoids re-parsing the
-        // whole wire body here; a body that fails to parse carries no image
-        // facts to learn — skip exactly like the old raw-probe miss. When a
-        // pre-send shed rewrote the bytes, though, the pre-shed object
-        // overcounts the images actually sent — count the final string then.
-        let nImages = 0;
-        try {
-            nImages = outboundCopyRewritten
-                ? countImagesInRawBody(prepared.protocol, wireBody)
-                : countImagesInParsedBody(prepared.protocol, prepared.parsedBody ?? JSON.parse(wireBody));
-        } catch { /* unparseable — no image facts */ }
-        if (nImages > 0) {
-            const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
-            const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
-            noteForwardedImageFacts(prepared.session, {
-                nImages,
-                // Overhead against the SENT bytes: parsedBody is the pre-shed memo and
-                // would drift from wireBody once an egress shed rewrites the body; when
-                // nothing was rewritten, measuring the serialized bytes is exactly what
-                // pre-#5131 measured — one fewer branch, identical value.
-                textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
-                host: upstreamHost(learnUpstream),
-                fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
-            });
-        }
-    }
     // Must be created before fetchWithTimeout: the signal aborts the upstream
     // request when the client disconnects (IDE cancel), otherwise the proxy
     // keeps reading upstream and holds the per-session lock. Also passed to
@@ -1141,7 +1106,6 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         } catch {
             sentParsed = null;
         }
-        // Publish this send, not a historical usage baseline with a fresh timestamp.
         const est = outboundContextEstimates(prepared, sentBody, opts, upstreamUrl, sentParsed);
         // The char-count upper bound stays the published context value: it is
         // the fail-closed caliber decision paths and legacy displays trust for
@@ -1156,6 +1120,28 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // usageAnchorCycleStale reads) is testable.
         const kFactor = currentCalibrationFactor(prepared.session.stats, prepared.session.metadata?.lastModel);
         const scaledText = applyEstimateCalibration(est.textOverhead, kFactor, prepared.session.stats.calibratedEstimateOrigin, normalizeUpstreamOrigin(upstreamUrl));
+        // #4543: CJK can exceed the window well below the 7.5 B/token bar.
+        // An independent calibrated estimate may refuse only with explicit
+        // evidence for this exact route AND model; legacy/unknown provenance
+        // keeps the forward-for-evidence path. Images are a separate channel.
+        const declaredWindow = prepared.session.metadata.effectiveContextLimit;
+        const currentOrigin = normalizeUpstreamOrigin(upstreamUrl);
+        const calibratedOrigin = normalizeUpstreamOrigin(prepared.session.stats.calibratedEstimateOrigin);
+        const calibratedHere = kFactor !== undefined
+            && currentOrigin !== undefined && currentOrigin === calibratedOrigin
+            && typeof prepared.model === "string" && prepared.model.length > 0
+            && prepared.session.stats.calibratedEstimateModel === prepared.model;
+        if (typeof declaredWindow === "number" && Number.isFinite(declaredWindow) && declaredWindow > 0
+            && calibratedHere && scaledText > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS)) {
+            const message = `outbound text and wire overhead are estimated at ~${Math.ceil(scaledText)} tokens, calibrated on this upstream and model (${prepared.model}), vs the effective model window ${declaredWindow} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079); the send was stopped at the egress fuse instead of being forwarded (#4543). Compress or trim the history, or return to a model with a larger window, and retry.`;
+            log("warn", `413: [${prepared.session.id}] egress window fuse: ${message}`);
+            if (res.headersSent) emitStreamError(res, prepared.protocol, message, undefined, opts.streamErrorShape);
+            else {
+                res.writeHead(413, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message, retryable: false } }));
+            }
+            return;
+        }
         noteOutboundContextEstimates(prepared.session, {
             upperBound: est.upperBound,
             scaledText,
@@ -1221,6 +1207,41 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         });
         const sentSlot = lastForwardedBody(prepared.session);
         if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
+    }
+    // #1843 L1: capture this round's image facts at the SEND chokepoint so the
+    // turn's usage settle pairs with the bytes actually sent — streamed turns
+    // settle in plugin.ts's SSE handler and never revisit the request body, so
+    // a settle-site-only capture would miss every streamed turn. textSide
+    // mirrors outboundPayloadBreakdown (messages + wire overhead) so observed
+    // image mass = billed total - textSide. Retries within this forward
+    // (#5708/#5835 refolds) re-send near-identical image sets — first-send
+    // facts stay the pairing source, same as noteForwardedBody's semantics.
+    if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+        // parsedBody (the pre-serialization object) avoids re-parsing the
+        // whole wire body here; a body that fails to parse carries no image
+        // facts to learn — skip exactly like the old raw-probe miss. When a
+        // pre-send shed rewrote the bytes, though, the pre-shed object
+        // overcounts the images actually sent — count the final string then.
+        let nImages = 0;
+        try {
+            nImages = outboundCopyRewritten
+                ? countImagesInRawBody(prepared.protocol, wireBody)
+                : countImagesInParsedBody(prepared.protocol, prepared.parsedBody ?? JSON.parse(wireBody));
+        } catch { /* unparseable — no image facts */ }
+        if (nImages > 0) {
+            const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
+            const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            noteForwardedImageFacts(prepared.session, {
+                nImages,
+                // Overhead against the SENT bytes: parsedBody is the pre-shed memo and
+                // would drift from wireBody once an egress shed rewrites the body; when
+                // nothing was rewritten, measuring the serialized bytes is exactly what
+                // pre-#5131 measured — one fewer branch, identical value.
+                textSide: estimateCoreMessages(msgs) + estimateWireOverhead(prepared.protocol, wireBody),
+                host: upstreamHost(learnUpstream),
+                fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
+            });
+        }
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
