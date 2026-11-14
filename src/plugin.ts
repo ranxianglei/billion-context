@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
-import { clientConversationHeader } from "./session-id.js";
+import { clientConversationHeader, stripSessPrefix } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { blockOpsEnabled, effectiveBlockOpsConfig } from "./acp-block-ops.js";
@@ -2241,7 +2241,10 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
         return;
     }
-    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    // #6433: normalize the zcode `sess_` prefix (sess_<uuid> → <uuid>) so an
+    // older shim or another client sending the prefixed form still resolves the
+    // bare-uuid session the proxy created from the model request header.
+    const conversationId = stripSessPrefix(typeof parsed.conversationId === "string" ? parsed.conversationId : undefined) ?? "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
     if (parsed.toolCallId !== undefined && (typeof parsed.toolCallId !== "string" || !parsed.toolCallId.trim() || parsed.toolCallId.length > 512)) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "toolCallId must be a non-empty string of at most 512 characters" });
     if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });
@@ -2785,6 +2788,11 @@ export async function pipePluginChatWithStrip(
     // #5951: the requesting host already classifies this cut and retries on its
     // own budget — the proxy must not spend a second one.
     hostOwnsTruncationRecovery = false,
+    // #6433: session id for witness recording only — lets the non-plugin lane
+    // ring-record outbound tool calls (so the unbound shim's witness route can
+    // match) without passing the full session (which would turn on usage
+    // accounting and clobber lastInputTokens for title-gen / side calls).
+    witnessSessionId?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2930,14 +2938,15 @@ export async function pipePluginChatWithStrip(
     const compressDeltaFrame = (index: number, partialJson: string): string =>
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: partialJson } })}\n\n`;
     const settleWitnesses = () => {
-        if (!session) return;
+        const sid = witnessSessionId ?? session?.id;
+        if (!sid) return;
         for (const tc of seenToolCalls.values()) {
             if (tc.name.length === 0) continue;
-            recordToolWitness(session.id, tc.name, tc.args);
+            recordToolWitness(sid, tc.name, tc.args);
             // #4580: the same observation carries the host's tool_use id —
             // ring it so a later tools/call stamped with that id routes to
             // THIS lane even when the shared MCP shim is bound elsewhere.
-            if (tc.id.length > 0) recordToolUseId(tc.id, session.id);
+            if (tc.id.length > 0) recordToolUseId(tc.id, sid);
         }
     };
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
@@ -4350,6 +4359,8 @@ export async function pipePluginResponsesWithStrip(
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
     hostOwnsTruncationRecovery = false,
+    // #6433: session id for witness recording only — see pipePluginChatWithStrip.
+    witnessSessionId?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -4412,15 +4423,16 @@ export async function pipePluginResponsesWithStrip(
     // function_call_arguments.done; both are accumulate-then-record at settle.
     const witnessedCalls = new Map<string, { name: string; args: string; named: boolean }>();
     const settleWitnesses = () => {
-        if (!session) return;
+        const sid = witnessSessionId ?? session?.id;
+        if (!sid) return;
         for (const [itemId, wc] of witnessedCalls) {
             if (!wc.named || wc.name.length === 0) continue;
-            recordToolWitness(session.id, wc.name, wc.args);
+            recordToolWitness(sid, wc.name, wc.args);
             // #4580: the map key is the output item's id (fc_…), i.e. the
             // host's per-call id — ring it for id-stamped tools/call routing.
             // Synthetic fallback keys ("oi:<index>") are never host-stamped;
             // skip them so cross-session index keys can't shadow real ids.
-            if (itemId.length > 0 && !itemId.startsWith("oi:")) recordToolUseId(itemId, session.id);
+            if (itemId.length > 0 && !itemId.startsWith("oi:")) recordToolUseId(itemId, sid);
         }
     };
     let sawReasoning = false;
@@ -5202,6 +5214,10 @@ export async function pipePluginJson(
     // m00885: echoed (user-requested verbatim) emission spans survive.
     requestText?: string,
     reply?: HandoffReply,
+    // #6433: session id for witness recording only — lets the non-plugin JSON
+    // lane ring-record outbound tool calls (mirroring the SSE pipes) without
+    // passing the full session (which would turn on usage accounting).
+    witnessSessionId?: string,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -5267,7 +5283,11 @@ export async function pipePluginJson(
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).
-        if (session) recordJsonToolWitnesses(session.id, json, protocol);
+        // #6433: the non-plugin JSON lane passes no session (usage accounting
+        // stays off) but still ring-records via witnessSessionId, mirroring
+        // the SSE pipes, so the unbound shim's witness route can match.
+        const witnessSid = witnessSessionId ?? session?.id;
+        if (witnessSid) recordJsonToolWitnesses(witnessSid, json, protocol);
     } catch { /* non-JSON body — forward verbatim */ }
         // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
         // m00885: an absorb-instructed turn may answer with a whole-field
