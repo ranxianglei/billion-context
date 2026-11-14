@@ -328,6 +328,15 @@ function previewFoldTargetKey(core: CompressionCore, messages: CoreMessage[], st
     return target && foldTargetKey(target, state);
 }
 
+function coveredMessageChars(messages: readonly CoreMessage[], ids: readonly string[]): number {
+    const covered = new Set(ids);
+    let chars = 0;
+    messages.forEach((message) => {
+        if (covered.has(message.id)) chars += (message.text ?? "").length;
+    });
+    return chars;
+}
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
@@ -2551,7 +2560,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // baseline currentTokens is char-based, so net the folded span's
             // char count against it instead of the token-based credit.
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-            const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+            const folded = baselineKnown ? compressed : coveredMessageChars(messages, effectiveMessageIds);
             currentTokens = Math.max(0, currentTokens - folded + countText(summary));
             // The apply path (stream.ts applyRanges) already netted the gross
             // fold out of lastInputTokens and credited compressCreditTokens;
@@ -2706,7 +2715,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     const spanUnits = baselineKnown
                         ? planned.compressedTokens
-                        : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                        : coveredMessageChars(messages, planned.effectiveMessageIds);
                     const chunks = splitSummaryContent(content, budget, countText);
                     // Track reservations locally: they count against the pass
                     // budget only once the batch actually fires (≥2 nominations).
@@ -2991,7 +3000,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // summary exists; units match the post-fold accounting.
                 const spanUnits = baselineKnown
                     ? planned.compressedTokens
-                    : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                    : coveredMessageChars(messages, planned.effectiveMessageIds);
                 if (emergencyFold) {
                     // Zero-upstream-call fold. The digest fits maxSummaryLength AND
                     // the net-shrink bound by construction (fallback forms), so it
