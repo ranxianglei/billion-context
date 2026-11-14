@@ -78,6 +78,19 @@ async function readPkgVersion(dir: string): Promise<string> {
     return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
 }
 
+// The updater's uninstall→reinstall half-deletes the install dir (npm drops
+// package.json before the directory): readPkgVersion ENOENTs inside that
+// window. waitFor probes must treat "gone for a moment" as "not there yet",
+// not crash — anything other than ENOENT still throws.
+async function pkgVersionOrAbsent(dir: string): Promise<string | null> {
+    try {
+        return await readPkgVersion(dir);
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+    }
+}
+
 function packTarball(stage: string, packs: string, home: string): string {
     const listing = npmRunSync(["pack", "--silent", "--pack-destination", packs], { cwd: stage, env: { PATH: process.env.PATH ?? "", ...npmHomeEnv(home) } })
         .trim()
@@ -262,14 +275,14 @@ test("e2e: rollback-form advisory (#1588) — forced rollback, no ping-pong, per
         await waitFor(
             `disk ${START} → ${LATEST} via normal self-update`,
             90_000,
-            async () => (await readPkgVersion(installDir)) === LATEST && installedRe.test(readLog()),
+            async () => (await pkgVersionOrAbsent(installDir)) === LATEST && installedRe.test(readLog()),
         );
         assert.match(readLog(), installedRe);
     });
 
     await t.test("rollback-form advisory lands: forced install of the older target + persistent restart banner", async () => {
         await reg.publish(await makeAdvisoryTarball(work));
-        await waitFor(`disk ${LATEST} → ${TARGET} via forced advisory install`, 60_000, async () => (await readPkgVersion(installDir)) === TARGET);
+        await waitFor(`disk ${LATEST} → ${TARGET} via forced advisory install`, 60_000, async () => (await pkgVersionOrAbsent(installDir)) === TARGET);
         const log = readLog();
         assert.match(log, new RegExp(`forcing update to ${escapeRe(TARGET)}`));
         // #1588-B: disk left the range but the RUNNING process is still on the
