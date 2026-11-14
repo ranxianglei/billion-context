@@ -691,8 +691,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             return buildToolCall(call);
         },
 
-        emitMarker(toolName, result) {
-            return buildContent(buildVisibilityMarker(toolName, result));
+        emitMarker(toolName, result, outcome) {
+            return buildContent(buildVisibilityMarker(toolName, result, outcome));
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {
