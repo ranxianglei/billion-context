@@ -250,7 +250,7 @@ test("S15: citation-space alignment defers from cold load to the next fold save 
     rmSync(dir, { recursive: true, force: true });
 });
 
-test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded-tail import)", async () => {
+test("S16: deferred alignment keeps legacy refs when mapped ids own no rows (#5599 folded-tail import)", async () => {
     const refOf = (i: number): string => `m${String(i).padStart(5, "0")}`;
     const idOf = (i: number): string => (i <= 6 ? `o${i}` : `t${i - 6}`);
 
@@ -303,10 +303,13 @@ test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded
         _setStoreForTest(store);
         const reloaded = store.loadSync("pr3-folded-tail");
         assert.ok(reloaded, "session loads from the index");
+        // #5608-D: alignment runs from the post-fold save, not at cold load.
+        (reloaded as { pendingLedgerAlign?: boolean }).pendingLedgerAlign = true;
+        assert.ok(store.flushSync(reloaded!), "post-fold save commits");
         for (let i = 1; i <= 9; i++) {
             assert.equal(reloaded!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} keeps its legacy ref`);
         }
-        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "incomplete ledger: alignment skipped, retried on a later cold load");
+        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "incomplete ledger: alignment skipped");
         assert.equal(reloaded!.restampSuperseded, undefined);
         // The saved citation still resolves to the original body, not the tail.
         const ccr = reloaded!.contentStore as { byRef?: Record<string, { text?: string }> } | undefined;
@@ -328,6 +331,8 @@ test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded
             _setStoreForTest(store2);
             const aligned = store2.loadSync("pr3-complete");
             assert.ok(aligned, "complete-ledger session loads");
+            (aligned as { pendingLedgerAlign?: boolean }).pendingLedgerAlign = true;
+            assert.ok(store2.flushSync(aligned!), "post-fold save commits");
             assert.equal((aligned!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "complete ledger still aligns");
             for (let i = 1; i <= 9; i++) {
                 assert.equal(aligned!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} already at seq+1 — no-op alignment`);

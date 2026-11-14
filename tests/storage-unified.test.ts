@@ -487,8 +487,16 @@ test("storage unified FULL mode: read path serves from the index with organic im
             // #5609 CI red: the deferred-alignment high-water mark must ride
             // kstate_json — dropping it diverged the second full-mode read
             // from the legacy view on exactly this key.
+            // #5599: the folded corpus imports a collapsed ledger (folded ghosts
+            // own no rows), so the completeness guard keeps its legacy refs and
+            // no high-water mark is minted; storage-state-fields pins the
+            // kstate_json round trip itself.
             const rowKstate = JSON.parse(probe.getSessionRow(meta.id)!.kstateJson) as Record<string, unknown>;
-            assert.equal(typeof rowKstate.timestampsHighWaterRefSeq, "number", "timestampsHighWaterRefSeq must persist through kstate_json (#5608-C)");
+            if ((session.state as { refLedgerAligned?: boolean }).refLedgerAligned === true) {
+                assert.equal(typeof rowKstate.timestampsHighWaterRefSeq, "number", "timestampsHighWaterRefSeq must persist through kstate_json (#5608-C)");
+            } else {
+                assert.equal(rowKstate.timestampsHighWaterRefSeq, undefined, "unaligned ledger mints no high-water mark (#5599)");
+            }
             // #4316 PR3/3: expected = legacy view of the same files + the
             // deterministic alignment against these very rows.
             expectedDigest = alignedLegacyDigest(caseDir, meta, probe);
