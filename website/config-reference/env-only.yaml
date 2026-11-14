@@ -125,9 +125,9 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Toggle for reclaiming the global fetch patch on shutdown."
-    desc_zh: "进程退出时回收全局 fetch 补丁的开关。"
-    desc_ja: "シャットダウン時にグローバル fetch パッチを回収するためのトグル。"
+    desc_en: "Toggle for the native-mode fetch self-heal guard (#1158): `0` keeps the classic direct install (no watchdog)."
+    desc_zh: "native 模式 fetch 自愈守卫（#1158）开关：`0` 保持经典直装（无看门狗）。"
+    desc_ja: "ネイティブモードの fetch 自己修復ガード (#1158) のトグル: `0` で従来の直接インストール (ウォッチドッグなし) を維持する。"
   - key: BILI_CONFLICT_SCAN
     type: boolean-ish
     default: "off"

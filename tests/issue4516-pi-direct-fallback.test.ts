@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { runFetchIntegrityCheckForTest } from "../src/agent/fetch-chain/index.js";
 
 // #4516: the gateless lanes (pi/omp/opencode-V1) had NO size judgment on their
 // degraded direct-fallback path — a 1.06M-token raw history rode straight to
@@ -266,6 +267,11 @@ test("#4516 dead-proxy wording: after holding an origin, the refusal says it DIE
     }) as typeof fetch;
     const { sink, result } = await withFallback(async ({ fetch, rearm }) => {
         rearm(dyingFetch);
+        // #5959 data-property install: the write is no longer laundered into a
+        // fresh wrapper synchronously — the integrity watchdog adopts the
+        // evictor as downstream within one tick. Drive that tick here so the
+        // call below deterministically enters through the intercept.
+        assert.equal(runFetchIntegrityCheckForTest(), true, "integrity watchdog must be armed");
         const res = await fetch()(UPSTREAM, {
             method: "POST",
             headers: { "content-type": "application/json", "x-bili-plugin-context-window": "500" },
