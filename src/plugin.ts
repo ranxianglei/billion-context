@@ -3180,6 +3180,7 @@ export async function pipePluginChatWithStrip(
         eofBufferBytes: buf.length,
         ...(buf.length > 0 ? { eofBufferHead: buf.slice(0, 80).replace(/[\r\n]+/g, "\\n") } : {}),
         ...(finalFinishReason !== undefined ? { finishReason: finalFinishReason } : {}),
+        ...(session && typeof session.stats.lastLocalTextEstimate === "number" ? { outboundEstimateTokens: session.stats.lastLocalTextEstimate } : {}),
         visibleChars: visibleTextChars,
         sawStrippedEcho,
         // #5951: the read error itself, so a cut that was not replayed names its
@@ -4652,6 +4653,7 @@ export async function pipePluginResponsesWithStrip(
         eofBufferBytes: buf.length,
         ...(buf.length > 0 ? { eofBufferHead: buf.slice(0, 80).replace(/[\r\n]+/g, "\\n") } : {}),
         ...(responseStatus !== undefined ? { responseStatus } : {}),
+        ...(session && typeof session.stats.lastLocalTextEstimate === "number" ? { outboundEstimateTokens: session.stats.lastLocalTextEstimate } : {}),
         visibleChars: visibleTextChars,
         sawStrippedEcho,
         // #5951: the read error itself, so a cut that was not replayed names its
