@@ -492,7 +492,7 @@ after(() => drainAbandonedMounts());
 // globals. React hooks are emulated with per-mount state: useState persists
 // across renders, useEffect follows React semantics (#2288) — run on mount,
 // re-run only when their deps change (prior cleanup first).
-async function mountClient(extra: Record<string, unknown>, slotName = "settings.section", renderProps?: unknown): Promise<Mounted> {
+async function mountClient(extra: Record<string, unknown>, slotName = "settings.section", renderProps?: unknown, injectSessionId?: string): Promise<Mounted> {
     const code = await clientCode();
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
@@ -612,9 +612,25 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
         // identity as the entry's props; the test may mirror that explicitly.
         component: (): unknown => {
             hookIndex = 0;
-            const tree = renderProps === undefined
+            // #6534: mirror the real DSH render merge — the entry's inject
+            // callback runs with the current conversation id and its result is
+            // spread UNDER the owner props (owner wins). renderProps models the
+            // owner props. When a test supplies injectSessionId the harness
+            // drives the inject path exactly like the host does; otherwise the
+            // legacy renderProps-only path is preserved.
+            const opts = optionsBySlot.get(slotName);
+            const injectFn = opts !== undefined && typeof opts.inject === "function"
+                ? (opts.inject as (sessionId: string) => Record<string, unknown>)
+                : undefined;
+            let merged: unknown;
+            if (injectSessionId !== undefined && injectFn !== undefined) {
+                merged = { ...injectFn(injectSessionId), ...(renderProps as Record<string, unknown> ?? {}) };
+            } else {
+                merged = renderProps;
+            }
+            const tree = merged === undefined
                 ? bound()
-                : (bound as unknown as (props: unknown) => unknown)(renderProps);
+                : (bound as unknown as (props: unknown) => unknown)(merged);
             const queued = pendingEffects;
             pendingEffects = [];
             for (const run of queued) run();
@@ -1793,7 +1809,10 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
     const SESSION_ID = "01a152ba-38b9-7611-950c-53b211f0dea6";
     const HOST_CONVERSATION_ID = "conv-dsh-main";
     const ORIGIN = "http://127.0.0.1:8787";
-    // Exact-conversation poll: the host named this conversation in props.
+    // Exact-conversation poll: the host named this conversation via the slot
+    // inject callback (the version-stable carrier — #6534: newer DSH builds
+    // stopped putting the id in the standard kit, so props.sessionId alone
+    // was undefined and the tab fell back to the literal latest path).
     const statusUrl = `/__bili/plugin/status?conversationId=${HOST_CONVERSATION_ID}&fallback=latest`;
     const EXPECTED_SRC = `${ORIGIN}/__bili/?embed=1&lang=zh#/session/${SESSION_ID}`;
     const cannedStatus = { ok: true, panel: "x", sessionId: SESSION_ID, conversationId: HOST_CONVERSATION_ID };
@@ -1828,7 +1847,7 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         clearTimeout,
         setInterval: fakeSetInterval,
         clearInterval: fakeClearInterval,
-    }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+    }, "conversation.view", undefined, HOST_CONVERSATION_ID);
 
     m.resetHooks();
     m.component();
@@ -1963,12 +1982,15 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
             fetch: async (url: string) => {
                 const u = String(url);
                 if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
-                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", viaFallback: true }) };
+                // #6534: the server emits `fallback` (not `viaFallback`) — the
+                // regression test drives the REAL field name so a re-introduced
+                // mismatch (client reading the wrong key) reds here.
+                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", fallback: true }) };
                 if (u.endsWith("/__bili/?embed=1")) return htmlOk();
                 throw new Error(`unexpected fetch: ${u}`);
             },
             ...noopTimers,
-        }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+        }, "conversation.view", undefined, HOST_CONVERSATION_ID);
         hm.resetHooks();
         hm.component();
         await tick();
@@ -1997,6 +2019,109 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }
+});
+
+// #6534: the conversation.view registration carries a TOP-LEVEL inject
+// callback (not under `hooks`, which the DSH renderer converts into a
+// use<Name>() hook) returning { hostSessionId } — the version-stable session
+// carrier. Newer DSH builds stopped putting the id in the standard kit, so
+// props.sessionId alone was undefined and the tab fell back to the literal
+// latest path (the reported "always the recent session" bug).
+test("#6534: conversation.view registers a top-level inject returning hostSessionId", async () => {
+    const m = await mountClient({
+        __BILI__: { origin: "http://127.0.0.1:8787" },
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const viewSlot = m.optionsBySlot.get("conversation.view")!;
+    assert.ok(viewSlot !== undefined, "conversation.view is registered");
+    assert.equal(typeof viewSlot.inject, "function", "inject callback is registered");
+    assert.equal(viewSlot.hooks, undefined, "NOT under hooks (that would become a use<Name>() hook, not a prop)");
+    const injected = (viewSlot.inject as (id: string) => Record<string, unknown>)("conv-abc");
+    // Cross-realm object (vm sandbox) — deepStrictEqual rejects the foreign
+    // prototype, so assert the shape property-by-property.
+    assert.deepEqual(Object.keys(injected), ["hostSessionId"], "inject returns exactly one top-level key");
+    assert.equal(injected.hostSessionId, "conv-abc", "that key is hostSessionId carrying the conversation id");
+    m.runCleanups();
+});
+
+// #6534: a host that passes NO identity (no inject result, no props.sessionId)
+// must NOT frame whatever the fallback=latest pool resolves. The old gate
+// short-circuited `hostSessionId === undefined` to true and framed the recent
+// session — the reported bug. Unknown id ⇒ honest hint, never a guess.
+test("#6534: unknown host identity refuses to frame a fallback-resolved session", async () => {
+    const SESSION_ID = "9f2c1a3e-77aa-4b10-9c55-1d2e3f4a5b6c";
+    const ORIGIN = "http://127.0.0.1:8787";
+    const noopTimers = {
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    };
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            // No identity ⇒ the legacy literal path; the server falls back to
+            // the latest pool and resolves SOMEONE ELSE's session.
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) {
+                return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: SESSION_ID, conversationId: "conv-someone-else", fallback: true }) };
+            }
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        ...noopTimers,
+    }, "conversation.view");
+    m.resetHooks();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const txt: string[] = [];
+    collectText(tree, txt);
+    assert.ok(txt.join(" ").includes("暂无上下文数据"), "unknown identity shows the not-yet hint, not a frame");
+    assert.equal(findTag(tree, "iframe"), undefined, "never frame a session we cannot attribute");
+    m.runCleanups();
+});
+
+// #6534: older DSH builds still put the conversation id in the standard kit
+// (props.sessionId) without calling inject — the props.sessionId fallback
+// keeps those hosts framing their own session.
+test("#6534: props.sessionId fallback still frames for older hosts (no inject called)", async () => {
+    const SESSION_ID = "01a152ba-38b9-7611-950c-53b211f0dea6";
+    const HOST_CONVERSATION_ID = "conv-dsh-legacy";
+    const ORIGIN = "http://127.0.0.1:8787";
+    const statusUrl = `/__bili/plugin/status?conversationId=${HOST_CONVERSATION_ID}&fallback=latest`;
+    const noopTimers = {
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    };
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: SESSION_ID, conversationId: HOST_CONVERSATION_ID }) };
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        ...noopTimers,
+    }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+    m.resetHooks();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const frame = findTag(tree, "iframe");
+    assert.ok(frame !== undefined && frame !== null, "props.sessionId fallback still frames the own session");
+    assert.ok(frame.props !== null, "frame carries props");
+    assert.equal(frame.props.src, `${ORIGIN}/__bili/?embed=1&lang=zh#/session/${SESSION_ID}`, "fallback path targets the own session page");
+    m.runCleanups();
 });
 
 // #4237: dsh.contextTab=false drops ONLY the conversation.view registration —
