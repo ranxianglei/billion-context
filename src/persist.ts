@@ -212,13 +212,17 @@ interface PersistedSession {
         provenCompletionWallModel?: string;
         contextTokens?: number;
         contextTokensSource?: string;
-        // #2129: measurement-state fields buildRecord persists via spread —
-        // declared here so the on-disk schema documents what the loader must
-        // restore (the five decision-grade ones below plus the in-memory-only
-        // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
-        // but are deliberately not restored — see buildSession).
+        // #2129/#5914: measurement-state fields buildRecord persists via
+        // spread — declared here so the on-disk schema documents what the
+        // loader must restore. All of them ride along to disk; the loader
+        // restores the durable ones and deliberately drops the in-memory-only
+        // pendingFoldUsage / lastLocalTextEstimate(+Origin) — see buildSession.
         localInputEstimate?: number;
         lastUsagePayloadUpper?: number;
+        // #5914: the per-send billing-caliber estimate pair (#2117) rides
+        // along too — dropped by the #2129-era whitelist, restored now.
+        contextEstimateTokens?: number;
+        contextEstimateCalibrated?: boolean;
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
@@ -4198,6 +4202,20 @@ function buildSession(parsed: PersistedSession): Session {
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
+            // #5914: the per-send billing-caliber estimate pair (#2117) and the
+            // usage anchor's own payload snapshot (#4805) — buildRecord persists
+            // all three via spread, but the #2129-era whitelist dropped them, so
+            // after a restart displayContextBest fell back from the calibrated
+            // estimate to the char-count upper bound (display caliber flip, up
+            // to ~3.5× inflation on ASCII-heavy payloads) and two decision
+            // guards sat disarmed until the next send/settle re-stamped them
+            // (staleSmallAnchorFallback reads contextEstimateTokens; the
+            // effectiveTokenCount size guard requires lastUsagePayloadUpper > 0).
+            // Same validation discipline as the entries above; legal 0 / false
+            // are preserved, corrupt values rejected outright.
+            contextEstimateTokens: typeof stats.contextEstimateTokens === "number" && Number.isFinite(stats.contextEstimateTokens) && stats.contextEstimateTokens >= 0 ? stats.contextEstimateTokens : undefined,
+            contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+            lastUsagePayloadUpper: typeof stats.lastUsagePayloadUpper === "number" && Number.isFinite(stats.lastUsagePayloadUpper) && stats.lastUsagePayloadUpper >= 0 ? stats.lastUsagePayloadUpper : undefined,
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the
             // NEXT usage report (#695) — restoring a stale true would mislabel an
