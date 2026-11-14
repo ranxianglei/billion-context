@@ -52,6 +52,12 @@ export interface CoreMessage {
    *  The render path only ever READS this stored value — it never calls
    *  Date.now() itself (prefix-cache invariant). */
   ts?: number;
+  /** #6762: the tool result FAILED (Anthropic tool_result.is_error). Set by the
+   *  wire adapters on a `role:"tool"` / `contentType:"tool-result"` core so the
+   *  nudge decision can see a failed turn: while the model's LAST action just
+   *  failed, a pressure-band nudge would push it to compress and the failure
+   *  context is the first thing lost. Metering/decision-only: never rendered. */
+  toolIsError?: boolean;
 }
 
 export type CompressionTier = 1 | 2 | 3;
@@ -803,6 +809,10 @@ export interface NudgeBreakdown {
    *     (NudgeConfig.requireUsageSampleForPressure); the host early-
    *     advertising arm (emergencyNudge) must mirror this bit. Absent on
    *     hand-built decisions — pre-fix semantics apply there.
+   *   - toolFailureHold (1/0, #6762): the pressure-band injection was held
+   *     because the latest tool result FAILED — the model is about to act on
+   *     a fresh failure, so a nudge would make it compress and lose the error
+   *     context. Self-recovering: the nudge re-arms on the next turn.
    */
   [key: string]: number;
 }

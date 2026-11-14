@@ -2230,6 +2230,25 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     input.tokenCountSource === "estimate" &&
     config.nudge.requireUsageSampleForPressure !== false &&
     estimateHoldStreak <= maxEstimateHoldRounds;
+  // #6762: a FAILED tool result at the tail means the model's LAST action just
+  // failed. A pressure-band nudge fired this round would push the model to
+  // compress, and the failure context (the error message, the failed command)
+  // is the first thing a fold drops — the model then "forgets" the error and
+  // retries blindly. Hold the pressure-band injection for THIS round only: the
+  // nudge re-arms on the next turn (self-recovering), so a session that keeps
+  // failing still gets its nudge on the first non-failure turn. Pressure-band
+  // only — the growth band has a cadence and does not re-fire every turn, so
+  // the "re-fires on a failed turn" pathology is pressure-specific. The sidecar
+  // survives the pre-nudge transforms (crush/absorb-prompt/filter spread the
+  // message object; none append a new tail message), so the last element is
+  // the original failed tool result.
+  const lastMsg = input.messages[input.messages.length - 1];
+  const toolFailureHold =
+    pressure &&
+    lastMsg !== undefined &&
+    lastMsg.role === "tool" &&
+    lastMsg.contentType === "tool-result" &&
+    lastMsg.toolIsError === true;
 
   const baseline = state.nudge.lastPerMessageNudgeTokens;
   const hadPendingNudge = state.nudge.lastNudgeShownTokens > 0;
@@ -2396,7 +2415,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (
       best !== null &&
       bestPending >= minPressureBenefit &&
-      !pressureDeferredNoSample
+      !pressureDeferredNoSample &&
+      !toolFailureHold
     ) {
       injectedTier = best;
       stallEscalated = t1HarvestStall && best !== 1;
@@ -2508,6 +2528,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   } else if (pressure && pressureDeferredNoSample) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection held (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) until a usage-grade reading decides or the estimate-hold backstop elapses; hard-overflow backstop unaffected`;
+  } else if (pressure && toolFailureHold) {
+    const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+    reason = `${label}: usage ${Math.round(usage * 100)}% but the latest tool result FAILED — pressure injection held this round so the model handles the failure first (max pending ${maxPending}); the nudge re-arms on the next turn`;
   } else if (pressure) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason =
@@ -2603,6 +2626,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
       pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
+      toolFailureHold: toolFailureHold ? 1 : 0,
       estimateHoldStreak,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,
