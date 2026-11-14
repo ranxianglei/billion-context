@@ -41,7 +41,7 @@ import type { Session } from "../session.js";
 import { type RawStripCounts, stripRawStage } from "../marker/engine.js";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../incremental-lane.js";
 import { watermarkGateAllowed } from "./lane-decisions.js";
-import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
+import { scanMessagesSpans, scanMessagesSpansLimited, type RawSpan } from "./fastpath-scan.js";
 
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
@@ -86,6 +86,12 @@ interface PFSeed {
      * legacy byte-for-byte: the lane degrades to full legacy turns for the
      * rest of the history (honest fallback, no parity risk). */
     readonly multimodal: boolean;
+    /** Body offset of the LAST messages element when this seed was minted
+     *  (#5654). If the asserted-unchanged prefix kept its bytes, that
+     *  element starts at the same absolute offset next turn and the
+     *  tail-limited scan resumes there. Memory-only — it references a dead
+     *  buffer's layout, so a restart simply degrades to full scans. */
+    readonly tailAnchorStart?: number;
 }
 
 /** In-memory per-session prefix stash — deliberately OUTSIDE the Session
@@ -123,6 +129,10 @@ export interface FastpathOutcome {
      *  into the (re)seeded state either way so continuity holds across both.
      *  Absent (undefined) for count-only turns or shape-invalid lists. */
     readonly receivedTailIds?: string[];
+    /** Start offset of element T-1 in THIS body (#5654) — finalize carries
+     *  it into the (re)seed so the next id-lane turn can resume the scan
+     *  there. Undefined when nothing was measurable this turn. */
+    readonly tailAnchorStart?: number;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -196,6 +206,40 @@ function breakerArmed(saved: PFSavedState | null): boolean {
     return saved?.disabledAt !== undefined && Date.now() - saved.disabledAt < PF_DISABLED_TTL_MS;
 }
 
+/** #5654: expected NEW-element count for a tail-limited scan on the id lane.
+ *  `msgIds` is this turn's shape-valid x-bili-pf-tail-ids list (width
+ *  T - K + 1 INCLUDING the anchor element); `countPrev` is the seed's stampT
+ *  (K). Undefined anywhere outside the id lane — pure count turns,
+ *  shape-invalid lists, unseeded sessions and zero-delta turns keep the
+ *  full-scan semantics byte-for-byte (the hash/count lane is deliberately
+ *  unchanged). */
+export function pfMsgidTailScanLimit(
+    msgIds: string[] | null | undefined,
+    countPrev: number | undefined,
+): number | undefined {
+    if (msgIds === undefined || msgIds === null) return undefined;
+    if (countPrev === undefined || countPrev < 1) return undefined;
+    const tail = msgIds.length - 1;
+    return tail >= 1 ? tail : undefined;
+}
+
+/** Per-turn scan view: either the full walk or the #5654 head+tail resume.
+ *  Both expose exactly what the hit path consumes — T, head spans for the
+ *  boundary-truth check, window spans [K..T), fresh field spans. */
+type ScanView =
+    | { readonly kind: "full"; readonly T: number; readonly spans: readonly RawSpan[]; readonly fieldSpans: ReadonlyMap<string, RawSpan> }
+    | { readonly kind: "tail"; readonly T: number; readonly headSpans: readonly RawSpan[]; readonly windowSpans: readonly RawSpan[]; readonly fieldSpans: ReadonlyMap<string, RawSpan> };
+
+function fullScanView(bodyText: string): Extract<ScanView, { kind: "full" }> | null {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (scan === null) return null;
+    return { kind: "full", T: scan.total, spans: scan.messageSpans, fieldSpans: scan.fieldSpans };
+}
+
+function lastElementStart(spans: readonly RawSpan[]): number | undefined {
+    return spans.length > 0 ? spans[spans.length - 1].start : undefined;
+}
+
 /**
  * Evaluate the watermark fastpath for one chat-completions request. Pure w.r.t.
  * the legacy pipeline: on ANY miss the caller proceeds exactly as before; only
@@ -224,29 +268,58 @@ export function evaluateWatermarkFastpath(
             // strands the client's stale watermark forever (held ⇒ no stamp ⇒
             // identical verdict next turn ⇒ rearms in an infinite loop). The
             // cost is the structural scan only (≪ a full parse); no credit
-            // accrues while held.
+            // accrues while held. #5654: held turns keep the FULL scan
+            // (conservative posture) but still teach the tail anchor so the
+            // first turn after TTL expiry can resume limited.
             const scan = scanMessagesSpans(bodyText, "all");
             return scan === null
                 ? { hit: null, measuredT: undefined, decision: "breaker-held-noscan", creditedMiss: false }
-                : { hit: null, measuredT: scan.total, decision: "breaker-armed", creditedMiss: false };
+                : { hit: null, measuredT: scan.total, decision: "breaker-armed", creditedMiss: false, tailAnchorStart: lastElementStart(scan.messageSpans) };
         }
         return { hit: null, measuredT: undefined, decision: "gate-off", creditedMiss: false };
     }
-    const scan = scanMessagesSpans(bodyText, "all");
-    if (scan === null) return { hit: null, measuredT: undefined, decision: "scan-broken", creditedMiss: false };
-    const T = scan.total;
-    const rawStamp = req.headers[PF_COUNT_HEADER];
-    const stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
-    const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
-        if (credited) noteCreditedMiss(session.id, decision, log);
-        log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
-        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds };
-    };
     const seed = seeds.get(session);
     const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
     // three states: undefined = header absent (pure count mode); null =
     // present but malformed; array = shape-valid.
     const parsedTailIds = rawTailIds === undefined ? undefined : typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
+    // #5654: id-lane turns (shape-valid list + matching seeded model + known
+    // anchor) RESUME the structural scan at the seed's tail anchor instead of
+    // walking the whole resent history — only the head region, the new tail
+    // and the top-level fields get touched. The physical tail length must
+    // equal the claimed id-list width; ANY doubt falls back to the full scan
+    // this turn (self-heals via the restamp). Pure count / no-id / unseeded
+    // lanes keep the full scan byte-for-byte.
+    const tailResume = (() => {
+        if (seed === undefined || seed.model !== input.model || seed.tailAnchorStart === undefined) return undefined;
+        const limit = pfMsgidTailScanLimit(parsedTailIds, seed.stampT);
+        return limit === undefined ? undefined : { resumeAt: seed.tailAnchorStart, k: seed.stampT };
+    })();
+    let view: ScanView;
+    if (tailResume !== undefined) {
+        const lim = scanMessagesSpansLimited(bodyText, "all", { headLimit: HEAD_CHECK_ELEMENTS, resumeAt: tailResume.resumeAt });
+        if (lim !== null && parsedTailIds !== undefined && parsedTailIds !== null && parsedTailIds.length === lim.tailCount) {
+            view = { kind: "tail", T: tailResume.k + lim.tailCount - 1, headSpans: lim.headSpans, windowSpans: lim.tailSpans.slice(1), fieldSpans: lim.fieldSpans };
+        } else {
+            log("debug", `[${session.id}] fastpath tail-scan fallback (${lim === null ? "resume-mismatch" : "width-off"}) — full scan this turn`);
+            const fv = fullScanView(bodyText);
+            if (fv === null) return { hit: null, measuredT: undefined, decision: "scan-broken", creditedMiss: false };
+            view = fv;
+        }
+    } else {
+        const fv = fullScanView(bodyText);
+        if (fv === null) return { hit: null, measuredT: undefined, decision: "scan-broken", creditedMiss: false };
+        view = fv;
+    }
+    const T = view.T;
+    const nextAnchor = view.kind === "full" ? lastElementStart(view.spans) : lastElementStart(view.windowSpans);
+    const rawStamp = req.headers[PF_COUNT_HEADER];
+    const stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
+    const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
+        if (credited) noteCreditedMiss(session.id, decision, log);
+        log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds, tailAnchorStart: nextAnchor };
+    };
     // #5403/#5418 v4 count relaxation (owner ruling 2026-11-02): once a
     // session carries a ledger-proven tail-id list whose WIDTH matches its own
     // bookkeeping (len = T - seed.stampT + 1), msgid continuity proves the
@@ -298,8 +371,12 @@ export function evaluateWatermarkFastpath(
         const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
         const headFragment: { messages: unknown } = { messages: [] };
         const windowFragment: { messages: unknown } = { messages: [] };
-        headFragment.messages = parseElementSlices(bodyText, scan.messageSpans.slice(0, headEnd));
-        windowFragment.messages = parseElementSlices(bodyText, scan.messageSpans.slice(K));
+        // #5654: on the tail view the head spans are the freshly walked first
+        // headLimit elements and the window spans are the post-anchor tail;
+        // on the full view both are slices of one walk — same shapes either
+        // way, so everything downstream is view-agnostic.
+        headFragment.messages = parseElementSlices(bodyText, view.kind === "full" ? view.spans.slice(0, headEnd) : view.headSpans.slice(0, headEnd));
+        windowFragment.messages = parseElementSlices(bodyText, view.kind === "full" ? view.spans.slice(K) : view.windowSpans);
         if (!Array.isArray(headFragment.messages) || !Array.isArray(windowFragment.messages)) return miss("fragment-parse", false, tailIds);
         stripRawStage(headFragment, "openai"); // legacy convention: strip before convert; head counts stay with the seed ledger
         const windowCounts = stripRawStage(windowFragment, "openai");
@@ -348,7 +425,7 @@ export function evaluateWatermarkFastpath(
                 windowCores: rekeyedWindow as CoreMessage[],
                 systemText: headCores.systemText,
                 totalT: T,
-                fieldSpans: scan.fieldSpans,
+                fieldSpans: view.fieldSpans,
                 windowMessages: windowFragment.messages,
                 seedMultimodal: seed.multimodal || JSON.stringify(windowFragment.messages).includes('"image_url"'),
                 markerCounts: addStripCounts(seed.stripCounts, windowCounts),
@@ -357,6 +434,7 @@ export function evaluateWatermarkFastpath(
             decision: hitDecision,
             creditedMiss: false,
             receivedTailIds: tailIds,
+            tailAnchorStart: nextAnchor,
         };
     }
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
@@ -489,6 +567,7 @@ export function finalizeWatermarkTurn(
             stripCounts: outcome.hit.markerCounts,
             lastTailIds: outcome.receivedTailIds,
             multimodal: outcome.hit.seedMultimodal,
+            tailAnchorStart: outcome.tailAnchorStart,
         });
         writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds });
         headers[PF_SEQ_HEADER] = String(T);
@@ -503,6 +582,7 @@ export function finalizeWatermarkTurn(
             stripCounts: input.turnStripCounts,
             lastTailIds: outcome.receivedTailIds,
             multimodal: coresHaveImagePart(input.legacyCores),
+            tailAnchorStart: outcome.tailAnchorStart,
         });
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
@@ -520,8 +600,8 @@ export function clearWatermarkSeed(session: Session): void {
 }
 
 /** Introspection for panel/tests: whether a live prefix stash exists. */
-export function watermarkDebugState(session: Session): { seeded: boolean; stampT?: number; model?: string; missCount?: number } {
+export function watermarkDebugState(session: Session): { seeded: boolean; stampT?: number; model?: string; missCount?: number; tailAnchorStart?: number } {
     const seed = seeds.get(session);
     const saved = readSaved(session.id);
-    return { seeded: seed !== undefined, stampT: seed?.stampT, model: seed?.model, missCount: saved?.misses };
+    return { seeded: seed !== undefined, stampT: seed?.stampT, model: seed?.model, missCount: saved?.misses, tailAnchorStart: seed?.tailAnchorStart };
 }

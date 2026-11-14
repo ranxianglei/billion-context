@@ -7,6 +7,16 @@
 // the same buffer and parses those tiny fragments — the untouched middle of
 // a multi-hundred-MiB resent body is never decoded at all.
 //
+// #5654 tail-limited variant: once the previous turn stamped its body layout
+// (the seed carries the absolute offset of its LAST messages element), an
+// id-lane turn can RESUME element collection at that offset — the walker
+// then touches only the head region (first headLimit elements, re-verified
+// fresh each turn), the new tail, and the top-level fields; the large
+// unchanged middle is skipped entirely. The resume point is verified
+// byte-exactly (a value-start char must sit AT the stored offset); ANY
+// drift throws into the fail-soft null and the caller falls back to the
+// full scan.
+//
 // Contract (fail-soft, never guess):
 //  - Returns null whenever the body is malformed, truncated, outside the
 //    supported shape, or exceeds the nesting cap — callers MUST fall back
@@ -29,18 +39,57 @@ export interface FastpathScanResult {
     readonly fieldSpans: ReadonlyMap<string, RawSpan>;
 }
 
+interface FastpathTailScanResult {
+    /** Spans of the first headLimit elements, wire order. A successful
+     *  limited scan always collected exactly headLimit elements — a shorter
+     *  array cannot satisfy a resume and yields null instead. */
+    readonly headSpans: readonly RawSpan[];
+    /** Spans collected from the resume anchor through the array close —
+     *  the FIRST entry is the anchor element itself (part of the asserted
+     *  prefix), the rest are this turn's genuinely new elements. */
+    readonly tailSpans: readonly RawSpan[];
+    /** tailSpans.length (always >= 1 on success). */
+    readonly tailCount: number;
+    /** Fresh raw value spans of the requested top-level keys ("all" keeps
+     *  every top-level key, including "messages"). */
+    readonly fieldSpans: ReadonlyMap<string, RawSpan>;
+}
+
 const DEPTH_CAP = 1024;
 
-export function scanMessagesSpans(
-    bodyText: string,
-    extraKeys: readonly string[] | "all" = [],
-): FastpathScanResult | null {
-    const s = bodyText;
+/** Messages elements fully walked by SUCCESSFUL scans since the last reset —
+ *  test/diagnostic surface pinning the #5654 cost claim (full N -> head+tail). */
+let scannedElementCount = 0;
+
+export function fastpathScannedElements(): number {
+    return scannedElementCount;
+}
+
+export function resetFastpathScannedElements(): void {
+    scannedElementCount = 0;
+}
+
+interface TailLimitSpec {
+    readonly headLimit: number;
+    readonly resumeAt: number;
+}
+
+interface ScanCore {
+    readonly fieldSpans: Map<string, RawSpan>;
+    readonly messageSpans: RawSpan[];
+    readonly headSpans: RawSpan[];
+    readonly tailSpans: RawSpan[];
+}
+
+function runScan(s: string, extraKeys: readonly string[] | "all", lim: TailLimitSpec | null): ScanCore | null {
     const n = s.length;
+    const fieldSpans = new Map<string, RawSpan>();
+    const messageSpans: RawSpan[] = [];
+    const headSpans: RawSpan[] = [];
+    const tailSpans: RawSpan[] = [];
     let i = 0;
     let depth = 0;
-    const messageSpans: RawSpan[] = [];
-    const fieldSpans = new Map<string, RawSpan>();
+    let walked = 0;
     try {
         const isWs = (j: number): boolean => {
             const c = s.charCodeAt(j);
@@ -123,6 +172,29 @@ export function scanMessagesSpans(
             if (tok === "true" || tok === "false" || tok === "null") return;
             if (!/^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?$/.test(tok)) throw new Error("e");
         };
+        // Collects whole elements of the already-opened "messages" array
+        // (i sits at the first element or ']') into `into`. Returns true
+        // when the array closed, false when it paused after `stopAfter`
+        // elements (caller resumes elsewhere). Throws on malformation.
+        const collectElements = (into: RawSpan[], stopAfter?: number): boolean => {
+            if (s.charCodeAt(i) === 93) { i++; return true; }
+            for (;;) {
+                skipWs();
+                const es = i;
+                walkValue();
+                into.push({ start: es, end: i });
+                walked++;
+                if (stopAfter !== undefined && into.length >= stopAfter) return false;
+                skipWs();
+                if (i >= n) throw new Error("e");
+                const sep = s.charCodeAt(i);
+                if (sep === 44) { i++; continue; }
+                if (sep === 93) { i++; return true; }
+                throw new Error("e");
+            }
+        };
+        const isValueStart = (c: number): boolean => c === 123 || c === 91 || c === 34 || c === 45
+            || (c >= 48 && c <= 57) || c === 116 || c === 102 || c === 110;
 
         skipWs();
         if (i >= n || s.charCodeAt(i) !== 123) throw new Error("e");
@@ -143,28 +215,30 @@ export function scanMessagesSpans(
             skipWs();
             if (key === "messages") {
                 // Last-wins on duplicates, matching JSON.parse.
-                if (messagesSeen) messageSpans.length = 0;
+                if (messagesSeen) { messageSpans.length = 0; headSpans.length = 0; tailSpans.length = 0; }
                 else messagesSeen = true;
                 const arrStart = i;
                 if (i >= n || s.charCodeAt(i) !== 91) throw new Error("e");
                 i++;
                 skipWs();
-                if (i >= n) throw new Error("e");
-                if (s.charCodeAt(i) !== 93) {
-                    for (;;) {
-                        skipWs();
-                        const es = i;
-                        walkValue();
-                        messageSpans.push({ start: es, end: i });
-                        skipWs();
-                        if (i >= n) throw new Error("e");
-                        const sep = s.charCodeAt(i);
-                        if (sep === 44) { i++; continue; }
-                        if (sep === 93) { i++; break; }
-                        throw new Error("e");
-                    }
+                if (lim === null) {
+                    collectElements(messageSpans);
                 } else {
+                    const closedEarly = collectElements(headSpans, lim.headLimit);
+                    if (closedEarly) throw new Error("e");
+                    // Paused after headLimit elements, i just past the last
+                    // head element: consume the separator, then JUMP to the
+                    // stored anchor. Strict byte-exact alignment — the anchor
+                    // offset came from a PREVIOUS body buffer, so any drift
+                    // (prefix edit, whitespace re-layout, truncation) must
+                    // fail soft, never re-align heuristically.
+                    skipWs();
+                    if (i >= n || s.charCodeAt(i) !== 44) throw new Error("e");
                     i++;
+                    if (lim.resumeAt <= i) throw new Error("e");
+                    i = lim.resumeAt;
+                    if (i >= n || !isValueStart(s.charCodeAt(i))) throw new Error("e");
+                    collectElements(tailSpans);
                 }
                 // Position-only entry (the value is never re-parsed): consumers rebuild the
                 // top-level object in WIRE KEY ORDER — the key sequence is part of the byte
@@ -186,8 +260,33 @@ export function scanMessagesSpans(
         }
         skipWs();
         if (i !== n || !messagesSeen) throw new Error("e");
-        return { total: messageSpans.length, messageSpans, fieldSpans };
+        scannedElementCount += walked;
+        return { fieldSpans, messageSpans, headSpans, tailSpans };
     } catch {
         return null;
     }
+}
+
+export function scanMessagesSpans(
+    bodyText: string,
+    extraKeys: readonly string[] | "all" = [],
+): FastpathScanResult | null {
+    const r = runScan(bodyText, extraKeys, null);
+    if (r === null) return null;
+    return { total: r.messageSpans.length, messageSpans: r.messageSpans, fieldSpans: r.fieldSpans };
+}
+
+/** #5654: head + tail-resume scan (see module header). `resumeAt` is the
+ *  absolute body offset of the FIRST tail element (the seed's anchor);
+ *  headLimit is how many leading elements to re-walk fresh (the head
+ *  boundary-truth check). Null on ANY doubt — caller falls back to the full
+ *  scan. On success: headSpans.length === headLimit and tailCount >= 1. */
+export function scanMessagesSpansLimited(
+    bodyText: string,
+    extraKeys: readonly string[] | "all",
+    opts: { headLimit: number; resumeAt: number },
+): FastpathTailScanResult | null {
+    const r = runScan(bodyText, extraKeys, opts);
+    if (r === null) return null;
+    return { headSpans: r.headSpans, tailSpans: r.tailSpans, tailCount: r.tailSpans.length, fieldSpans: r.fieldSpans };
 }
