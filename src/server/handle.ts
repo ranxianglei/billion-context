@@ -2933,7 +2933,7 @@ async function handleRequest(
         // turn's reqConfig so processTurn protects the carriers now.
         // effectiveConfig() re-resolves both from the lane id at read time, so
         // /__bili/plugin/tool sees them too.
-        storeEffectiveConfig(session, reqConfig);
+        storeEffectiveConfig(session, reqConfig, opts.configSourceEpoch);
         const durableClassifier = pluginAgent ? durableMessageToolPaths[pluginAgent] : undefined;
         if (durableClassifier !== undefined) reqConfig = withDurableProtection(reqConfig, durableClassifier);
         // acquireInFlight must precede the lock so evictOldest() cannot flush

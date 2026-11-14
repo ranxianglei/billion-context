@@ -23,6 +23,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { stripOneTimeAlignment } from "./corrupt-index-child.ts";
 import { flushAllSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
+import { configFileEpoch } from "../src/config.ts";
 
 /**
  * #3325 lesson — the drive renders digests from `node_modules/acp-kernel/dist`
@@ -432,6 +433,11 @@ function goldenProxyOptions(upstreamPort: number, ctx: number): ProxyOptions {
         modelContextLimit: ctx,
         kernelConfig: defaultConfig(ctx),
         compress: { injectTool: true, injectNudge: true },
+        // #5930: mirror loadOptions — production always carries the
+        // options-generation epoch; without it storeEffectiveConfig stops
+        // stamping effectiveConfigEpoch and the persisted metadata section
+        // drifts from every committed golden.
+        configSourceEpoch: configFileEpoch(),
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
