@@ -1268,6 +1268,20 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
+// #5122/#5123: must stay byte-identical to src/agent/fork-adopt.ts
+// forkCanonicalText + forkMessageIdentityHash. Serialization/projection noise
+// must not truncate fork prefix matching on either side of the wire: a
+// reasoning cell and a text cell with the same text ARE the same history cell
+// (hosts re-project reasoning↔text), and re-stringified tool-call arguments
+// differ only in whitespace. Signed-thinking cells stay distinguished because
+// their carrier rides thinkingSignature / googleThoughtSignature below.
+function forkCanonicalText(text: unknown, contentType: unknown): unknown {
+    if (contentType === "tool-call" && typeof text === "string") {
+        try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
+    }
+    return text ?? null;
+}
+
 // Fork identity digests ONLY fields present on BOTH sides of the comparison:
 // the parent snapshot cells AND the child's replayed bytes re-projected at
 // ingress. thinkingTokens is deliberately EXCLUDED — the host projects it onto
@@ -1289,16 +1303,22 @@ function redactedPayloadDigest(message: CoreMessage): string | null {
 
 export function forkMessageIdentityHash(message: CoreMessage): string {
     const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
-    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m), redactedPayloadDigest(m)]);
+    return forkHash([m.role, forkCanonicalText(m.text, m.contentType), m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m), redactedPayloadDigest(m)]);
 }
 
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
- *  exactly the field set forkMessageIdentityHash digests, plus id. An id
- *  prefix match alone would keep a stale snapshot when a resent history flips
- *  an adapter-attached flag (toolIsError) under unchanged ids — the snapshot
- *  must track every byte fork matching can see. If an adapter ever attaches a
- *  new runtime field, it MUST be added here and to forkMessageIdentityHash
- *  together. */
+ *  the RAW fields plus id — deliberately STRICTER than forkMessageIdentityHash,
+ *  which is serialization-tolerant for fork matching (drops contentType,
+ *  JSON-canonicalizes tool-call text, excludes the thinkingTokens value, rides
+ *  signed content via thinkingSignature / googleThoughtSignature, digests the
+ *  redacted_thinking payload). Keeping this byte-exact — including contentType
+ *  and raw text — means a resent history that flips reasoning↔text or
+ *  re-whitespace-strings a tool call still forces a fresh snapshot instead of
+ *  retaining a stale one. An id prefix match alone would keep a stale snapshot
+ *  when a resent history flips an adapter-attached flag (toolIsError) under
+ *  unchanged ids — the snapshot must track every byte. If an adapter ever
+ *  attaches a new runtime field, it MUST be added here (and to
+ *  forkMessageIdentityHash if fork matching should see it). */
 // thinkingTokens compares PRESENCE only (see forkMessageIdentityHash: the
 // value itself is one-sided metering noise, re-derived every turn — comparing
 // it would stop the CoW walk at every stamped cell and replace the whole
@@ -1889,7 +1909,21 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            // #5123: inheriting zero fold state while the parent held blocks means the
+            // branch point collapsed below every block — the child will replay raw on
+            // its next turn. Flag it `degraded` in the response (server-authoritative,
+            // computed from the server's own ledger — the client need not re-derive it
+            // from a count it may not have) so the client degrades instead of claiming
+            // "adopted" (which sets publicForkReceipt and skips the #1486
+            // resume-inheritance recovery path). Old clients ignore the additive flag.
+            const forkDegraded = blocks.length === 0 && parent.state.blocks.length > 0;
+            // #5123: block-inheritance status independent of prefix-match status — an
+            // "exact" prefix can still inherit zero folds, which misleads receipt readers.
+            const blockStatus = blocks.length > 0 ? "inherited" : forkDegraded ? "none-inherited" : "nothing-to-inherit";
+            if (forkDegraded) {
+                loggerLog("warn", `fork ${request.childConversationId} from ${parent.id}: inherited 0 of ${parent.state.blocks.length} parent blocks (branch point ${request.branchPoint.messageCount}/${snapshot.orderedMessages.length}); child replays raw until resume-inheritance recovers (#5123)`);
+            }
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, blockStatus, degraded: forkDegraded, parentBlocks: parent.state.blocks.length, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);

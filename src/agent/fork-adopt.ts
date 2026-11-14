@@ -74,11 +74,30 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
-/** Byte-identical to src/plugin.ts forkMessageIdentityHash: both-sides-only
- *  field set — thinkingTokens (host-projected metering mass, never present in
- *  the client's bytes) is excluded; signed thinking content rides
- *  thinkingSignature / googleThoughtSignature; the opaque redacted_thinking
- *  payload digests itself (its projected text is a constant label). */
+// #5122/#5123: canonicalize the identity inputs so serialization/projection
+// noise cannot truncate fork prefix matching on either side of the wire. Two
+// relaxations vs the historical tuple, both owner-approved after forensics
+// showed every break on affected sessions was noise, not content loss (97.6%~
+// 99.8% of rows align once these two are applied): (1) contentType drops out
+// — a reasoning cell and a text cell with the same text ARE the same history
+// cell (hosts re-project reasoning↔text); signed-thinking cells stay
+// distinguished because their carrier rides thinkingSignature /
+// googleThoughtSignature below. (2) tool-call text is JSON-canonicalized —
+// re-stringified arguments differ only in whitespace. Must stay byte-identical
+// to src/plugin.ts forkCanonicalText + forkMessageIdentityHash.
+function forkCanonicalText(text: unknown, contentType: unknown): unknown {
+    if (contentType === "tool-call" && typeof text === "string") {
+        try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
+    }
+    return text ?? null;
+}
+
+// Both-sides-only field set — byte-identical to what src/plugin.ts
+// forkMessageIdentityHash digests: thinkingTokens (host-projected metering
+// mass, never present in the client's bytes) is excluded; signed thinking
+// content rides thinkingSignature / googleThoughtSignature; the opaque
+// redacted_thinking payload digests itself (its projected text is a constant
+// label).
 function redactedPayloadDigest(message: CoreMessage): string | null {
     const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
     if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
@@ -88,7 +107,7 @@ function redactedPayloadDigest(message: CoreMessage): string | null {
 export function forkIdentityHashOf(message: CoreMessage): string {
     const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
     const toolIsError = m.toolIsError === true;
-    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
+    return forkHash([m.role, forkCanonicalText(m.text, m.contentType), m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
@@ -465,11 +484,27 @@ export async function tryForkAdoption(opts: {
         }
         if (res.status === 201 || res.status === 200) {
             let replayed = false;
+            let degraded = false;
+            let inheritedBlocks = 0;
+            let parentBlocks: number | undefined;
             try {
-                const parsed = await res.json() as { replayed?: unknown };
+                const parsed = await res.json() as { replayed?: unknown; degraded?: unknown; inheritedBlocks?: unknown; parentBlocks?: unknown };
                 replayed = parsed.replayed === true;
+                degraded = parsed.degraded === true;
+                inheritedBlocks = Array.isArray(parsed.inheritedBlocks) ? parsed.inheritedBlocks.length : 0;
+                parentBlocks = typeof parsed.parentBlocks === "number" ? parsed.parentBlocks : undefined;
             } catch {
                 replayed = false;
+            }
+            // #5123: server-authoritative degenerate flag — zero inherited fold state while
+            // the parent held blocks (branch point collapsed below every block). Claiming
+            // "adopted" sets publicForkReceipt and skips resume-inheritance, so the child
+            // replays raw on its next turn. Degrade instead: the receipt stays unset, so
+            // the #1486 ref-overlap recovery runs. The server computes this from its own
+            // ledger, so no reliance on a count a mixed-version peer may lack (#5123).
+            if (degraded) {
+                opts.log?.(`fork child ${opts.childConversationId} from parent ${opts.parentConversationId} inherited 0 of ${parentBlocks ?? "?"} blocks (inherited ${inheritedBlocks}, branch point ${branchPoint}/${core.length}); degrading to resume-inheritance (#5123)`);
+                return { outcome: "degraded", reason: `fork inherited 0 of ${parentBlocks ?? "?"} parent blocks (branch point ${branchPoint}/${core.length})` };
             }
             opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint}${replayed ? " (replayed)" : ""} (#2399)`);
             return { outcome: "adopted", branchPoint, replayed };
