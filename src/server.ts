@@ -112,7 +112,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normali
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
-import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
 import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";

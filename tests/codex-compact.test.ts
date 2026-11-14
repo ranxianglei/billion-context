@@ -17,6 +17,9 @@ import {
     buildTriggerForgeBody,
     renderForgedSummary,
     mergeForgedSummaries,
+    normalizeForgedEntries,
+    pruneForgedEntries,
+    carriesConversationTurns,
     CODEX_COMPACT_ID_PREFIX,
     CODEX_COMPACT_SENTINEL,
 } from "../src/codex-compact.ts";
@@ -212,21 +215,128 @@ test("renderForgedSummary: kernel render format (topic, no topic, empty body)", 
     assert.equal(renderForgedSummary({ summary: "   " }), "[Compressed conversation section]");
 });
 
-test("mergeForgedSummaries: append active, skip inactive, dedup, accumulate across forges", () => {
-    const a = blockWith("SUMMARY-A", true, "Topic A");
-    const b = blockWith("SUMMARY-B", true);
-    const c = blockWith("SUMMARY-C", false);
+test("mergeForgedSummaries: append active, skip inactive, dedup, accumulate across forges (#4600 entries)", () => {
+    const mk = (blockId: string, summary: string, active: boolean, topic?: string): CompressionBlock => {
+        const b = blockWith(summary, active, topic);
+        b.blockId = blockId;
+        return b;
+    };
+    const a = mk("b_a", "SUMMARY-A", true, "Topic A");
+    const b = mk("b_b", "SUMMARY-B", true);
+    const c = mk("b_c", "SUMMARY-C", false);
     let merged = mergeForgedSummaries(undefined, [a, b, c]);
     assert.equal(merged.length, 2, "inactive block skipped");
-    assert.equal(merged[0], "[Compressed conversation section] — Topic A\nSUMMARY-A");
-    assert.equal(merged[1], "[Compressed conversation section]\nSUMMARY-B");
+    assert.deepEqual(merged[0], { text: "[Compressed conversation section] — Topic A\nSUMMARY-A", blockId: "b_a" });
+    assert.deepEqual(merged[1], { text: "[Compressed conversation section]\nSUMMARY-B", blockId: "b_b" });
     merged = mergeForgedSummaries(merged, [a, b]);
     assert.equal(merged.length, 2, "exact-text dedup on re-capture");
-    const d = blockWith("SUMMARY-D", true);
+    const d = mk("b_d", "SUMMARY-D", true);
     merged = mergeForgedSummaries(merged, [d]);
     assert.equal(merged.length, 3, "second forge accumulates");
-    assert.equal(merged[2], "[Compressed conversation section]\nSUMMARY-D");
+    assert.deepEqual(merged[2], { text: "[Compressed conversation section]\nSUMMARY-D", blockId: "b_d" });
     assert.deepEqual(mergeForgedSummaries(undefined, []), []);
+});
+
+test("normalizeForgedEntries: legacy strings, object entries, garbage (#4600)", () => {
+    assert.deepEqual(normalizeForgedEntries(undefined), []);
+    assert.deepEqual(normalizeForgedEntries("not-an-array"), []);
+    assert.deepEqual(normalizeForgedEntries(["legacy-a", "legacy-b"]), [{ text: "legacy-a" }, { text: "legacy-b" }]);
+    assert.deepEqual(normalizeForgedEntries([
+        { text: "obj-entry", blockId: "b1" },
+        { text: "obj-entry", blockId: "OTHER" },
+        "plain-string",
+        null,
+        42,
+        { blockId: "no-text" },
+        { text: 7 },
+    ]), [
+        { text: "obj-entry", blockId: "b1" },
+        { text: "plain-string" },
+    ], "duplicate text keeps first-seen provenance; non-entry garbage dropped");
+});
+
+// #4600: supersession pruning. Helper builds full blocks with explicit ids.
+function blk(blockId: string, active: boolean, effectiveMessageIds: string[]): CompressionBlock {
+    return {
+        blockId, runId: `r_${blockId}`, tier: 1, summary: `S-${blockId}`,
+        directMessageIds: [], effectiveMessageIds, directBlockIds: [],
+        compressedTokens: 10, createdAt: 0, survivedCount: 0, generation: "young", active,
+    };
+}
+
+test("pruneForgedEntries: supersession matrix (#4600)", () => {
+    // Truncation debt stays: block deactivated without any consumer folding its summary message.
+    const debt = pruneForgedEntries([{ text: "T-debt", blockId: "b_debt" }], [blk("b_debt", false, ["orig-x"])]);
+    assert.equal(debt.length, 1, "unconsumed truncation debt is load-bearing and stays");
+
+    const pruned = pruneForgedEntries(
+        [{ text: "T-old", blockId: "b_old" }, { text: "T-new", blockId: "b_new" }],
+        [blk("b_old", false, ["orig-1"]), blk("b_new", true, ["orig-1", "acp_summary_b_old"])],
+    );
+    assert.deepEqual(pruned, [{ text: "T-new", blockId: "b_new" }], "entry dropped once an ACTIVE consumer carries the content");
+
+    const viaEntry = pruneForgedEntries(
+        [{ text: "T-old", blockId: "b_old" }, { text: "T-mid", blockId: "b_mid" }],
+        [blk("b_old", false, []), blk("b_mid", false, ["acp_summary_b_old"])],
+    );
+    assert.deepEqual(viaEntry, [{ text: "T-mid", blockId: "b_mid" }], "represented-by-own-entry consumer also supersedes");
+
+    const unrep = pruneForgedEntries(
+        [{ text: "T-old", blockId: "b_old" }],
+        [blk("b_old", false, []), blk("b_mid", false, ["acp_summary_b_old"])],
+    );
+    assert.equal(unrep.length, 1, "unrepresented consumer does not transfer representation");
+
+    const chain = pruneForgedEntries(
+        [
+            { text: "T-g1", blockId: "b_g1" },
+            { text: "T-g2", blockId: "b_g2" },
+            { text: "T-g3", blockId: "b_g3" },
+        ],
+        [
+            blk("b_g1", false, []),
+            blk("b_g2", false, ["acp_summary_b_g1"]),
+            blk("b_g3", false, ["acp_summary_b_g2"]),
+            blk("b_top", true, ["acp_summary_b_g3"]),
+        ],
+    );
+    assert.deepEqual(chain, [], "chain g1→g2→g3→active top: all links redundant");
+
+    const legacy = pruneForgedEntries([{ text: "T-legacy" }], [blk("b_top", true, [])]);
+    assert.deepEqual(legacy, [{ text: "T-legacy" }], "legacy entry without provenance is never pruned");
+
+    const ghost = pruneForgedEntries([{ text: "T-ghost", blockId: "b_ghost" }], [blk("b_top", true, ["acp_summary_b_ghost"])]);
+    assert.deepEqual(ghost, [{ text: "T-ghost", blockId: "b_ghost" }], "absent block cannot be verified as superseded");
+
+    const live = pruneForgedEntries([{ text: "T-live", blockId: "b_live" }], [blk("b_live", true, []), blk("b_other", true, ["acp_summary_b_live"])]);
+    assert.deepEqual(live, [{ text: "T-live", blockId: "b_live" }], "still-active block's entry is never pruned");
+
+    const subid = pruneForgedEntries([{ text: "T-old", blockId: "b_old" }], [blk("b_old", false, []), blk("b_new", true, ["acp_summary_b_old#r0"])]);
+    assert.deepEqual(subid, [], "sub-id form of the summary id counts as coverage");
+
+    const same = [{ text: "T-debt", blockId: "b_debt" }];
+    assert.equal(pruneForgedEntries(same, [blk("b_debt", false, ["orig-x"])]), same, "no-op returns the same array reference");
+    const empty: typeof same = [];
+    assert.equal(pruneForgedEntries(empty, []), empty, "empty input returns the same reference");
+});
+
+test("carriesConversationTurns: completed-turn evidence vs context-only traffic (#4600)", () => {
+    const msg = (role: string) => ({ type: "message", role, content: "x" });
+    assert.equal(carriesConversationTurns([msg("user"), msg("assistant")]), true, "assistant message");
+    assert.equal(carriesConversationTurns([{ type: "function_call", call_id: "c1", name: "bash", arguments: "{}" }]), true, "function_call");
+    assert.equal(carriesConversationTurns([{ type: "function_call_output", call_id: "c1", output: "ok" }]), true, "function_call_output");
+    assert.equal(carriesConversationTurns([{ type: "custom_tool_call", call_id: "c2", name: "apply_patch", input: "" }]), true, "custom_tool_call");
+    assert.equal(carriesConversationTurns([{ type: "custom_tool_call_output", call_id: "c2", output: "ok" }]), true, "custom_tool_call_output");
+    assert.equal(carriesConversationTurns([{ type: "computer_call", call_id: "c3", status: "completed", actions: [] }]), true, "computer_call");
+    assert.equal(carriesConversationTurns([{ type: "mcp_call", call_id: "c4", status: "completed", server_label: "s", tool: "t", arguments: {}, result: {} }]), true, "mcp_call");
+    assert.equal(carriesConversationTurns([{ type: "reasoning", id: "rs_1", summary: [] }]), true, "reasoning item");
+    assert.equal(carriesConversationTurns([null, 42, { role: "assistant" }]), true, "type-less assistant shorthand counts (lenient by design)");
+    assert.equal(carriesConversationTurns([msg("developer"), msg("user"), { type: "additional_tools" }]), false, "context-only probe traffic");
+    assert.equal(carriesConversationTurns([{ type: "compaction", id: "cmp_1", encrypted_content: "opaque" }, msg("user")]), false, "compaction item + user context only");
+    assert.equal(carriesConversationTurns([null, 42, { type: "message", role: "user" }]), false, "non-object noise and user-only items are not evidence");
+    assert.equal(carriesConversationTurns([]), false);
+    assert.equal(carriesConversationTurns("string input"), false);
+    assert.equal(carriesConversationTurns(null), false);
 });
 
 // ---------------------------------------------------------------------------
