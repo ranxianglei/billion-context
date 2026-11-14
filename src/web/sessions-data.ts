@@ -1657,22 +1657,25 @@ type BlockSnapItem = { role: string; toolName?: string; text: string; ref?: stri
 /** Re-parse a frozen full-view snapshot into its ordered message fragments.
  *  A body line that merely LOOKS like a role header splits the message — the
  *  count/marker validation in snapshotRefIndexFor is what keeps a bad parse from
- *  ever being served. The \n\n delimiter between messages leaves one empty
- *  line at the tail of every body — stripped, since it is the separator, not
- *  message text. */
+ *  ever being served. Only the empty line before another header belongs to
+ *  the \n\n separator; leading and trailing body lines remain verbatim. */
 function parseBlockContentMessages(text: string): BlockSnapItem[] {
     const items: BlockSnapItem[] = [];
     let cur: BlockSnapItem | null = null;
-    const close = () => {
+    let bodyLines = 0;
+    let hasText = false;
+    const close = (nextHeader: boolean) => {
         if (!cur) return;
-        cur.text = cur.text.replace(/\n+$/, "");
+        if (nextHeader && cur.text.endsWith("\n")) cur.text = cur.text.slice(0, -1);
         items.push(cur);
         cur = null;
     };
     for (const line of text.split("\n")) {
         const roleM = BLOCK_ROLE_LINE_RE.exec(line);
         if (roleM) {
-            close();
+            close(true);
+            bodyLines = 0;
+            hasText = false;
             cur = {
                 role: roleM[1],
                 ...(roleM[2] !== undefined ? { toolName: roleM[2] } : {}),
@@ -1682,13 +1685,14 @@ function parseBlockContentMessages(text: string): BlockSnapItem[] {
         }
         if (!cur) continue; // one-view summary preamble — never hydrated
         const markM = ACP_REF_MARK_RE.exec(line);
-        if (markM && cur.ref === undefined && cur.text === "") {
+        if (markM && cur.ref === undefined && !hasText) {
             cur.ref = markM[1];
             continue;
         }
-        cur.text = cur.text === "" ? line : cur.text + "\n" + line;
+        cur.text += (bodyLines++ === 0 ? "" : "\n") + line;
+        if (line.length > 0) hasText = true;
     }
-    close();
+    close(false);
     return items;
 }
 
