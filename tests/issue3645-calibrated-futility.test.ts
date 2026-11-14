@@ -12,6 +12,19 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { normalizeUpstreamOrigin } from "../src/util.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "issue3645-futility-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #4185: an identified fresh session whose preflight ends in deterministic
 // exhaustion now forwards once for upstream arbitration instead of failing
@@ -303,8 +316,12 @@ test("#3645 Responses dsh plugin lane: calibrated fail-fast does not forward the
     try {
         const oldText = (tag: string) => `${tag} `.repeat(1667);
         const recText = (tag: string) => `${tag} `.repeat(2334);
-        const spanTok = defaultCountTokens(oldText("OLD_A"));
-        const recTok = defaultCountTokens(recText("REC_A"));
+        // #5738: same-length tag swap (E/F/G/H, C/D) keeps every token budget
+        // above exact while breaking byte-equality with the display scenario's
+        // transcript — the process-wide affinity resolver would otherwise read
+        // the two as an equal-depth fork pair and inherit fold state.
+        const spanTok = defaultCountTokens(oldText("OLD_E"));
+        const recTok = defaultCountTokens(recText("REC_C"));
         const sumTok = defaultCountTokens(SUMMARY_HEAVY);
         const bulkTok = 2 * defaultCountTokens(`BASH_RESULT_1_payload_`.repeat(175)) + 40;
         const poolTok = 4 * spanTok;
@@ -312,7 +329,7 @@ test("#3645 Responses dsh plugin lane: calibrated fail-fast does not forward the
         assert.ok(spanTok >= 2_000 && spanTok <= 3_000, `span sizing drifted (${spanTok})`);
         assert.ok(sumTok > spanTok, `summary must outgrow a single span so folds cannot close the gap (${sumTok} vs ${spanTok})`);
         assert.ok(K * (bulkTok + poolTok + floorTok) > WINDOW, "fixture must overflow on the calibrated scale");
-        assert.ok(bulkTok + 2 * sumTok < WINDOW, "terminal raw Responses payload must stay sub-window");
+        assert.ok(bulkTok + 2 * sumTok < WINDOW, `terminal raw Responses payload must stay sub-window`);
         assert.ok(K * (bulkTok + 2 * sumTok) > WINDOW, "terminal calibrated Responses payload must stay over-window");
 
         const sessionId = "issue3645-responses-dsh";
@@ -320,12 +337,12 @@ test("#3645 Responses dsh plugin lane: calibrated fail-fast does not forward the
         const input: Record<string, unknown>[] = [
             ...responsesBashPair(1, 175),
             ...responsesBashPair(2, 175),
-            responsesPlain("user", oldText("OLD_A")),
-            responsesPlain("assistant", oldText("OLD_B")),
-            responsesPlain("user", oldText("OLD_C")),
-            responsesPlain("assistant", oldText("OLD_D")),
-            responsesPlain("user", recText("REC_A")),
-            responsesPlain("assistant", recText("REC_B")),
+            responsesPlain("user", oldText("OLD_E")),
+            responsesPlain("assistant", oldText("OLD_F")),
+            responsesPlain("user", oldText("OLD_G")),
+            responsesPlain("assistant", oldText("OLD_H")),
+            responsesPlain("user", recText("REC_C")),
+            responsesPlain("assistant", recText("REC_D")),
         ];
         const resp = await postResponses(p, sessionId, input, true);
         const body = await resp.text();

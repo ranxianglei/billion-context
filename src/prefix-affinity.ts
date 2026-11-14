@@ -528,12 +528,21 @@ interface ResumeMissCandidate {
      *  byte-exact replay at exactly the stored depth under another id —
      *  either a duplicate conversation or a branch taken at the parent's
      *  last-request depth; content cannot tell them apart, and neither is a
-     *  resume (rejected by design #1486); "prefix-break" is
-     *  a deeper incoming history whose head-anchored progressive hash at
-     *  the stored depth differs (the shared prefix broke somewhere);
-     *  "truncated" is an incoming history SHORTER than the stored chain
-     *  (cannot be a resume — a resume adds at least one message). */
-    kind: "equal-depth" | "prefix-break" | "truncated";
+     *  RESUME (rejected by design #1486) — but both are FORK shapes,
+     *  adoptable by COPY via findForkParent (#5738); "prefix-of-chain" is
+     *  an incoming history SHORTER than the stored chain whose every
+     *  inspectable cell is byte-identical (a branch taken mid-parent-life
+     *  or a client-side-trimmed replay) — also a fork shape (#5738);
+     *  "prefix-break" is a deeper incoming history whose head-anchored
+     *  progressive hash at the stored depth differs (the shared prefix
+     *  broke somewhere); "truncated" is an incoming history shorter than
+     *  the stored chain WITHOUT a verified prefix (a break inside the
+     *  inspectable window, or zero overlap because the incoming ends
+     *  below the uninspectable head). A fork-shape kind appearing here
+     *  means the scoped/fork lookup did not adopt it (declared-parent
+     *  scoping, unloadable parent session, …) — the shape itself is
+     *  named so the operator can tell adoptable-missed from broken. */
+    kind: "equal-depth" | "prefix-of-chain" | "prefix-break" | "truncated";
     /** First cell index whose per-item hash differs from the stored chain,
      *  when verifiable from the stored trailing window. null: the whole
      *  inspectable overlap matched (the break sits before windowStart) or
@@ -576,9 +585,11 @@ export function describeResumeMiss(report: ResumeMissReport): string {
     }
     switch (b.kind) {
         case "equal-depth":
-            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} cells == incoming ${b.incomingDepth}) — rejected by design; either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish`;
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} cells == incoming ${b.incomingDepth}) — fork shape (either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish); eligible for fork inheritance (#5738)`;
+        case "prefix-of-chain":
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) receives the incoming ${b.incomingDepth} cells as a byte-exact PREFIX (visible cells ${b.windowStart}..${b.incomingDepth - 1} intact) — fork shape (branch taken mid-parent-life, or a client-side-trimmed replay); eligible for fork inheritance (#5738)`;
         case "truncated":
-            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} cells)${b.tailWindowIntact ? `, visible cells ${b.windowStart}..${b.incomingDepth - 1} intact — truncated replay` : ""}`;
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} cells)${b.firstDivergence !== null ? `, first divergence at cell ${b.firstDivergence} (stored ${b.storedCell} vs incoming ${b.incomingCell})` : " — zero inspectable overlap (the incoming ends below the uninspectable head)"}`;
         case "prefix-break": {
             let detail: string;
             if (b.firstDivergence !== null) {
@@ -1032,7 +1043,9 @@ export class PrefixAffinityResolver {
      * findResumeParent (strictly deeper than the parent, >=
      * MIN_RESUME_PREFIX). Null when the parent chain is untracked or its
      * replay does not match — the caller then falls back to the read-only
-     * derived link (#1333). */
+     * derived link (#1333). Fork SHAPES (equal-depth / prefix-of-chain) are
+     * out of scope here by design — they are covered unconditionally by the
+     * #1333 weak link + maybeAdoptDerivedFork once a parent is declared. */
     findResumeParentWithin(parentId: string, messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number } | null {
         if (parentId === selfSessionId) return null;
         const entry = this.trackedChains.get(parentId);
@@ -1049,18 +1062,94 @@ export class PrefixAffinityResolver {
         return { sessionId: parentId, sharedDepth: entry.depth };
     }
 
+    /** #5738: FORK-shape detection for identified clients. A host fork
+     *  (ZCode GUI fork, any client that starts a fresh conversation id from
+     *  an existing one without registering a parent) replays the parent's
+     *  history as a PREFIX COPY under the new id — either EQUAL-DEPTH
+     *  (branch taken at the parent's last-request state: the forked
+     *  session's first model call resends exactly what the parent last
+     *  sent) or SHORTER (branch taken mid-parent-life, or the client
+     *  trimmed its replay). Both shapes are structurally invisible to
+     *  findResumeParent, whose strictly-deeper gate models RESUME
+     *  (continuation adds messages), not FORK — so an identified fork got
+     *  zero inheritance while the anonymous lane adopted the same shape via
+     *  lineage (#629). The shapes are exactly the ones diagnoseResumeMiss
+     *  reports as kind "equal-depth" / "prefix-of-chain".
+     *
+     *  The equal-depth ambiguity #1486 rejected ("content cannot
+     *  distinguish a duplicate conversation from a branch") only holds
+     *  under MOVE semantics. Adoption downstream is COPY (planForkAdoption
+     *  judges every block by raw-id SET over the incoming, seedAllRefs
+     *  seeds only ids literally present), so a mis-guessed parent can at
+     *  most hand the child blocks whose source bytes the child already
+     *  holds — the #3925 risk image the anonymous lane already accepts.
+     *
+     *  Evidence per candidate (judged in the entry's hash domain, same
+     *  dual-domain discipline as findResumeParent): equal-depth =
+     *  progressive hash at depth-1 equals the stored tailHash (whole-prefix
+     *  cryptographic equality at ANY chain depth); prefix-of-chain = every
+     *  INSPECTABLE cell (stored trailing itemHashes window ∩ incoming) is
+     *  byte-identical — zero overlap is an honest unknown (deep chains lose
+     *  their head) and rejects. Detection only needs relatedness: the
+     *  actual copy stays per-block raw-id judged in planForkAdoption.
+     *  Floor MIN_RESUME_PREFIX, deepest chain wins (ties → most recently
+     *  seen), self excluded — identical discipline to findResumeParent. */
+    findForkParent(messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number; shape: "equal-depth" | "prefix-of-chain" } | null {
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return null;
+        const turns = neutralTurns(messages);
+        const fp2 = neutralFingerprints(turns, 0); // fused pass: hashes + itemHashes
+        const hashesV1 = chainHashes(msgs);
+        if (fp2.hashes.length < MIN_RESUME_PREFIX && hashesV1.length < MIN_RESUME_PREFIX) return null;
+        let v1Items: string[] | null = null; // lazy: paid only for hv1 truncated candidates
+        let best: { sessionId: string; sharedDepth: number; shape: "equal-depth" | "prefix-of-chain"; depth: number; lastSeen: number } | null = null;
+        for (const [id, entry] of this.trackedChains) {
+            if (id === selfSessionId || entry.depth < MIN_RESUME_PREFIX) continue;
+            const hv2 = entry.hv === 2;
+            const hashes = hv2 ? fp2.hashes : hashesV1;
+            const len = hv2 ? turns.length : msgs.length;
+            if (hashes.length < MIN_RESUME_PREFIX) continue;
+            let shape: "equal-depth" | "prefix-of-chain";
+            if (len === entry.depth) {
+                if (hashes[entry.depth - 1] !== entry.tailHash) continue;
+                shape = "equal-depth";
+            } else if (len < entry.depth) {
+                const items = hv2 ? fp2.itemHashes : (v1Items ??= perItemHashes(msgs));
+                const windowStart = Math.max(0, entry.depth - entry.itemHashes.length);
+                if (len <= windowStart) continue;
+                let intact = true;
+                for (let i = windowStart; i < len; i++) {
+                    if (items[i] !== entry.itemHashes[i - windowStart]) { intact = false; break; }
+                }
+                if (!intact) continue;
+                shape = "prefix-of-chain";
+            } else {
+                continue; // deeper than the stored chain: resume territory (findResumeParent)
+            }
+            if (!best || entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)) {
+                best = { sessionId: id, sharedDepth: len, shape, depth: entry.depth, lastSeen: entry.lastSeen };
+            }
+        }
+        return best ? { sessionId: best.sessionId, sharedDepth: best.sharedDepth, shape: best.shape } : null;
+    }
+
     /** #4264: diagnostics-only explanation of a resume-inheritance MISS
      *  (the gate passed but findResumeParent/findResumeParentWithin returned
      *  null). It re-runs the SAME gates in reporting mode and names why the
      *  closest near-miss was rejected; it never influences matching. The
-     *  three causes need completely different fixes, so they are reported
+     *  causes need completely different fixes, so they are reported
      *  distinctly: equal-depth replay (duplicate or tail-branch —
-     *  indistinguishable from content; rejected by design),
+     *  indistinguishable from content; not a RESUME but a FORK shape,
+     *  adoptable via findForkParent #5738), byte-exact prefix-of-chain
+     *  (branch taken mid-parent-life — also a fork shape, #5738),
      *  parent-chain absence (LRU eviction / never noted), head break (host
-     *  rebuild drift desynchronizes the byte-exact prefix). Cost-bounded:
-     *  the candidate scan does only O(1) progressive-hash checks per entry;
-     *  the per-item divergence scan runs ONCE on the single best near-miss,
-     *  over its stored trailing window (≤ MAX_STORED_ITEMS compares). */
+     *  rebuild drift desynchronizes the byte-exact prefix), and a shorter
+     *  replay whose verified prefix is broken or uninspectable.
+     *  Cost-bounded: the candidate scan does only O(1) progressive-hash
+     *  checks per entry; per-item window passes run once per TRUNCATED
+     *  candidate (kind classification, #5738) plus once on the winner when
+     *  it is a prefix-break — miss-only path, each bounded by
+     *  MAX_STORED_ITEMS compares. */
     diagnoseResumeMiss(messages: unknown[], selfSessionId: string, declaredParent?: string): ResumeMissReport {
         const msgs = normalizeAffinityMessages(messages);
         if (!hasUserMessage(msgs)) return { eligible: 0 };
@@ -1073,7 +1162,7 @@ export class PrefixAffinityResolver {
         const hashesV2 = fp2.hashes;
         const hashesV1 = chainHashes(msgs);
         if (hashesV2.length === 0 && hashesV1.length === 0) return { eligible: 0 };
-        type Candidate = { id: string; entry: ChainEntry; kind: ResumeMissCandidate["kind"]; rank: number };
+        type Candidate = { id: string; entry: ChainEntry; kind: ResumeMissCandidate["kind"]; rank: number; firstDivergence: number | null; tailWindowIntact: boolean };
         const cands: Candidate[] = [];
         let declaredParentState: "untracked" | "too-shallow" | undefined;
         const consider = (id: string, entry: ChainEntry): void => {
@@ -1084,10 +1173,35 @@ export class PrefixAffinityResolver {
             const len = hv2 ? turns.length : msgs.length;
             if (hashes.length < MIN_RESUME_PREFIX) return;
             let kind: ResumeMissCandidate["kind"];
-            if (len < entry.depth) kind = "truncated";
-            else if (len === entry.depth && hashes[entry.depth - 1] === entry.tailHash) kind = "equal-depth";
-            else kind = "prefix-break";
-            cands.push({ id, entry, kind, rank: kind === "equal-depth" ? 0 : kind === "prefix-break" ? 1 : 2 });
+            let firstDivergence: number | null = null;
+            let tailWindowIntact = false;
+            if (len < entry.depth) {
+                // #5738 F3: split a byte-exact PREFIX of the stored chain out
+                // of "truncated" — same depth relation, opposite evidence
+                // quality, different fate (the prefix shape is fork-adoptable
+                // via findForkParent). Zero inspectable overlap stays honest
+                // "truncated": the head of a deep chain is uninspectable.
+                const ws = Math.max(0, entry.depth - entry.itemHashes.length);
+                if (ws < len) {
+                    const items = hv2 ? fp2.itemHashes : perItemHashes(msgs);
+                    tailWindowIntact = true;
+                    for (let i = ws; i < len; i++) {
+                        if (items[i] !== entry.itemHashes[i - ws]) {
+                            firstDivergence = i;
+                            tailWindowIntact = false;
+                            break;
+                        }
+                    }
+                }
+                kind = tailWindowIntact ? "prefix-of-chain" : "truncated";
+            } else if (len === entry.depth && hashes[entry.depth - 1] === entry.tailHash) {
+                kind = "equal-depth";
+                // Progressive-hash equality proves every cell byte-identical.
+                tailWindowIntact = true;
+            } else {
+                kind = "prefix-break";
+            }
+            cands.push({ id, entry, kind, rank: kind === "equal-depth" ? 0 : kind === "prefix-of-chain" ? 1 : kind === "prefix-break" ? 2 : 3, firstDivergence, tailWindowIntact });
         };
         if (declaredParent !== undefined && declaredParent !== selfSessionId) {
             const entry = this.trackedChains.get(declaredParent);
@@ -1103,19 +1217,22 @@ export class PrefixAffinityResolver {
         const hv2 = top.entry.hv === 2;
         const depth = top.entry.depth;
         const len = hv2 ? turns.length : msgs.length;
-        // Lazy v1 per-item pass: only paid when the winner is a legacy raw-wire entry.
-        const itemIncoming = hv2 ? fp2.itemHashes : perItemHashes(msgs);
         const windowStart = Math.max(0, depth - top.entry.itemHashes.length);
-        const end = Math.min(depth, len);
-        let firstDivergence: number | null = null;
-        let tailWindowIntact = false;
-        if (windowStart < end) {
-            tailWindowIntact = true;
-            for (let i = windowStart; i < end; i++) {
-                if (itemIncoming[i] !== top.entry.itemHashes[i - windowStart]) {
-                    firstDivergence = i;
-                    tailWindowIntact = false;
-                    break;
+        let { firstDivergence, tailWindowIntact } = top;
+        if (top.kind === "prefix-break") {
+            // Lazy per-item pass: only the prefix-break winner still needs
+            // its divergence located (other kinds carried it from consider).
+            // Lazy v1 computation: only paid for legacy raw-wire entries.
+            const itemIncoming = hv2 ? fp2.itemHashes : perItemHashes(msgs);
+            const end = Math.min(depth, len);
+            if (windowStart < end) {
+                tailWindowIntact = true;
+                for (let i = windowStart; i < end; i++) {
+                    if (itemIncoming[i] !== top.entry.itemHashes[i - windowStart]) {
+                        firstDivergence = i;
+                        tailWindowIntact = false;
+                        break;
+                    }
                 }
             }
         }
@@ -1129,7 +1246,10 @@ export class PrefixAffinityResolver {
             windowStart,
             tailWindowIntact,
             ...(firstDivergence !== null
-                ? { incomingCell: itemIncoming[firstDivergence]?.slice(0, 8), storedCell: top.entry.itemHashes[firstDivergence - windowStart]?.slice(0, 8) }
+                ? (() => {
+                    const itemIncoming = hv2 ? fp2.itemHashes : perItemHashes(msgs);
+                    return { incomingCell: itemIncoming[firstDivergence!]?.slice(0, 8), storedCell: top.entry.itemHashes[firstDivergence! - windowStart]?.slice(0, 8) };
+                })()
                 : {}),
         };
         return { eligible: cands.length, ...(declaredParentState !== undefined ? { declaredParentState } : {}), best };

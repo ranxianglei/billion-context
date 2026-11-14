@@ -3,7 +3,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { PrefixAffinityResolver, stableStringify } from "../src/prefix-affinity.ts";
+import { PrefixAffinityResolver, rawChainFingerprint, stableStringify } from "../src/prefix-affinity.ts";
 
 function user(text: string): Record<string, unknown> {
     return { role: "user", content: text };
@@ -269,6 +269,95 @@ test("prefix-affinity: equal-depth replay under a different id is NOT a resume (
     const fp = r.chainFingerprint(transcript)!;
     r.note("sess-one", fp.depth, fp.tailHash, fp.itemHashes);
     assert.equal(r.findResumeParent(transcript, "sess-two"), null, "a byte-exact replay at the SAME depth under another id is a duplicate conversation, not a resume — linking it would adopt foreign blocks");
+});
+
+// #5738: fork-shape detection (findForkParent) — the shapes the strictly-
+// deeper resume gate structurally misses because a host fork replays the
+// parent's history as a PREFIX COPY under a fresh id, not as a continuation.
+
+test("prefix-affinity: fork — equal-depth replay under a fresh id is a fork shape (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const transcript = Array.from({ length: 10 }, (_, i) => user(`forked conversation turn ${i} with substance`));
+    const fp = r.chainFingerprint(transcript)!;
+    r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes);
+    assert.equal(r.findResumeParent(transcript, "sess-fork"), null, "resume gate unchanged: equal-depth is not a resume");
+    assert.deepEqual(r.findForkParent(transcript, "sess-fork"), { sessionId: "sess-parent", sharedDepth: 10, shape: "equal-depth" });
+});
+
+test("prefix-affinity: fork — shorter byte-exact prefix of the parent chain is a fork shape (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const parent = Array.from({ length: 10 }, (_, i) => user(`full parent turn ${i} with substance`));
+    const fp = r.chainFingerprint(parent)!;
+    r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes);
+    const forked = parent.slice(0, 9); // branch taken mid-parent-life
+    assert.equal(r.findResumeParent(forked, "child"), null, "trimmed history is still not a resume");
+    assert.deepEqual(r.findForkParent(forked, "child"), { sessionId: "sess-parent", sharedDepth: 9, shape: "prefix-of-chain" });
+});
+
+test("prefix-affinity: fork — equal-depth beyond the per-item cap matches via progressive hash (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const long = Array.from({ length: 130 }, (_, i) => user(`long chain message number ${i} with substance`));
+    const fp = r.chainFingerprint(long)!;
+    assert.equal(fp.itemHashes.length, 128, "per-item hashes stay capped");
+    r.note("sess-long", fp.depth, fp.tailHash, fp.itemHashes);
+    assert.deepEqual(r.findForkParent(long, "child"), { sessionId: "sess-long", sharedDepth: 130, shape: "equal-depth" }, "whole-prefix cryptographic equality works at any depth — no window needed");
+});
+
+test("prefix-affinity: fork — shorter-than-cap chain head remains honest-unknown, broken prefixes reject (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const deep = Array.from({ length: 200 }, (_, i) => user(`deep chain message number ${i} with substance`));
+    const fp = r.chainFingerprint(deep)!;
+    r.note("sess-deep", fp.depth, fp.tailHash, fp.itemHashes);
+    // Stored trailing window starts at cell 72; an incoming of 40 cells has
+    // ZERO overlap — relatedness cannot be proven, must not be claimed.
+    assert.equal(r.findForkParent(deep.slice(0, 40), "child"), null, "zero inspectable overlap stays an honest unknown");
+    // A break inside the inspectable window (cells ≥ 72 for this chain)
+    // rejects even when most cells match.
+    const broken = deep.slice(0, 100);
+    broken[80] = user("re-encoded eighty-first turn — drift inside the window");
+    assert.equal(r.findForkParent(broken, "child"), null, "a single diverging cell voids the prefix claim");
+    // A break BELOW the window is invisible to detection — the claim still
+    // fires on the verified overlap, and that is SAFE: planForkAdoption
+    // judges every block by raw-id set over the incoming, so blocks whose
+    // source cells drifted out of the child's history simply never adopt.
+    const headBroken = [...deep];
+    headBroken[0] = user("re-encoded first turn — below the uninspectable head");
+    assert.deepEqual(r.findForkParent(headBroken.slice(0, 100), "child"), { sessionId: "sess-deep", sharedDepth: 100, shape: "prefix-of-chain" }, "sub-window head drift is undetectable by design; per-block raw-id judgement keeps the copy correct");
+});
+
+test("prefix-affinity: fork — deeper candidates, self replays and sub-floor chains are rejected (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const parent = Array.from({ length: 10 }, (_, i) => user(`fork gate turn ${i} with substance`));
+    const fp = r.chainFingerprint(parent)!;
+    r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes);
+    assert.equal(r.findForkParent([...parent, user("continuation question")], "child"), null, "deeper than the stored chain is RESUME territory (findResumeParent), not a fork shape");
+    assert.equal(r.findForkParent(parent, "sess-parent"), null, "self-replay must not inherit from itself");
+    const short = Array.from({ length: 7 }, (_, i) => user(`short fork chain turn ${i} with substance`));
+    const sfp = r.chainFingerprint(short)!;
+    r.note("sess-short", sfp.depth, sfp.tailHash, sfp.itemHashes);
+    assert.equal(r.findForkParent(short, "other"), null, "below MIN_RESUME_PREFIX there is nothing to inherit");
+});
+
+test("prefix-affinity: fork — deepest matching chain wins (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const base = Array.from({ length: 10 }, (_, i) => user(`common base turn ${i} with substance`));
+    const fpA = r.chainFingerprint(base)!;
+    r.note("sess-shallow", fpA.depth, fpA.tailHash, fpA.itemHashes);
+    const extended = [...base, user("extension one"), { role: "assistant", content: "reply one" }];
+    const fpB = r.chainFingerprint(extended)!;
+    r.note("sess-deep", fpB.depth, fpB.tailHash, fpB.itemHashes);
+    // The incoming 9-cell prefix is a verified prefix of BOTH chains; the
+    // deeper one carries more inheritable state and must win.
+    assert.deepEqual(r.findForkParent(base.slice(0, 9), "child"), { sessionId: "sess-deep", sharedDepth: 9, shape: "prefix-of-chain" });
+});
+
+test("prefix-affinity: fork — legacy raw-wire (hv1) chains match in their own domain (#5738)", () => {
+    const r = new PrefixAffinityResolver();
+    const parent = Array.from({ length: 10 }, (_, i) => user(`legacy wire turn ${i} with substance`));
+    const raw = rawChainFingerprint(parent)!;
+    assert.equal(r.importSnapshot([{ sessionId: "sess-v1", depth: raw.depth, tailHash: raw.tailHash, itemHashes: raw.itemHashes, lastSeen: 1, identified: true }]), 1);
+    assert.deepEqual(r.findForkParent(parent, "child"), { sessionId: "sess-v1", sharedDepth: 10, shape: "equal-depth" });
+    assert.deepEqual(r.findForkParent(parent.slice(0, 9), "child"), { sessionId: "sess-v1", sharedDepth: 9, shape: "prefix-of-chain" });
 });
 
 test("prefix-affinity: identity hash is invariant to cache_control placement (#2188)", () => {
