@@ -87,6 +87,7 @@ import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { epochConfirmPending } from "./fold-reconcile.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -4410,6 +4411,9 @@ export async function preflightCompressIfNeeded(
         // No block landed: judge the same prepared wire with the same scoped
         // calibration used at entry, including its raw-body fallback. A fresh
         // core-only estimate can reject fitting requests or admit oversized ones.
+        // (#5223's zero-fold transform-failure case is covered here: the entry
+        // breakdown's #1498-F2 fallback measures the raw view that ships, so a
+        // doomed raw body fails this gate and falls to the fail-fast below.)
         fits = unknownBaseline ? result.fitsWindow : payloadFitsWindow;
     }
     const f = result.failure;
@@ -4509,32 +4513,46 @@ export async function preflightCompressIfNeeded(
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
     if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
-        // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
-        // MEASURED body is authoritative. If the rebuilt body itself exceeds the
-        // window on the #554 meter, "forwarding once for arbitration" is a
-        // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
-        // against a 1M window) and the log's "NOT forwarded" claim would be a
-        // lie (#5885 defect 3) — answer it 413 instead of burning the send.
-        // Bar: the NATIVE window when bili knows it (a body over the upstream's
-        // real window can never fit, on any tokenizer), the headroom limit as
-        // fallback — a meter over-count against the POLICY headroom must not
-        // swallow the #1839/#4185 "fits the native window" forwards.
-        // Images are NOT part of this comparison: an image-dominated overage is
-        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
-        // or 400 for real evidence), not a doom — #857's screenshot turn pins
-        // that. The #554 meter excludes image payloads (image_url/data/url/...),
-        // so `outboundRawTokens` is text-only by construction.
-        const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
-            const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
-            log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
-            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
-            noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        // #5223: the arbitration bet assumes a payload near the window. A rebuild
+        // whose transform failed leaves processedMessages empty and the raw body
+        // rides — at that size "let the upstream arbitrate" is a guaranteed
+        // multi-MB 400, not an arbitration. Withhold the escape past the doomed
+        // bar (#2490/#2313 byte math) and fail fast below instead (the generic
+        // verdict below carries the #3641 fold-pause context when drift-paused).
+        const shipMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        const shipDoomBytes = estimateCoreMessagesUpperBytes(shipMsgs);
+        if (shipDoomBytes <= Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+            // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
+            // MEASURED body is authoritative. If the rebuilt body itself exceeds the
+            // window on the #554 meter, "forwarding once for arbitration" is a
+            // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
+            // against a 1M window) and the log's "NOT forwarded" claim would be a
+            // lie (#5885 defect 3) — answer it 413 instead of burning the send.
+            // Bar: the NATIVE window when bili knows it (a body over the upstream's
+            // real window can never fit, on any tokenizer), the headroom limit as
+            // fallback — a meter over-count against the POLICY headroom must not
+            // swallow the #1839/#4185 "fits the native window" forwards.
+            // Images are NOT part of this comparison: an image-dominated overage is
+            // the #496/#1800 billing-arbitration domain (forward, let upstream bill
+            // or 400 for real evidence), not a doom — #857's screenshot turn pins
+            // that. The #554 meter excludes image payloads (image_url/data/url/...),
+            // so `outboundRawTokens` is text-only by construction. This tier sits
+            // INSIDE the #5223 byte bar: bodies past the bar fall through to the
+            // generic fail-fast below instead, so the drift-pause context rides the
+            // verdict rather than the "remove or trim" advice.
+            const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+            if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+                const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+                log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
+                const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+                noteLocalRefusal(session, currentOrigin, model, limit);
+                return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+            }
+            log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
+            return outbound;
         }
-        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
-        return outbound;
+        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt body's core text alone is ~${shipDoomBytes} bytes — past the doomed bar for window ${limit}; withholding the #1839 arbitration forward and failing fast instead (#5223)`);
     }
     // [#autoFold] fail-fast is an OVERFLOW concept: a growth-armed payload
     // fits the real window by definition, so a fold that could not reach the
@@ -4689,6 +4707,12 @@ export async function preflightCompressIfNeeded(
     // status-based heuristic below; every other path keeps today's mapping.
     const retryable = progressContinues ? true : f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     let ffDetail = f?.detail ?? "the payload still exceeds the window after preflight compression";
+    if (epochConfirmPending(session)) {
+        // #5223: make the drift pause actionable — a generic over-window verdict
+        // left hosts guessing why folding "could not bring it under" when
+        // folding was deliberately paused, not failing.
+        ffDetail += " Folding is currently paused for this session: the resent history shares nothing with bili's fold state (fold-drift epoch confirmation pending, #3641), so no fold could be applied this turn. Realign the conversation (or start a fresh session) and folding resumes automatically.";
+    }
     if (progressContinues) {
         const shortfall = foldedCalibratedSize !== undefined ? Math.max(0, limit - foldedCalibratedSize) : undefined;
         ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
