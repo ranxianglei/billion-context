@@ -20,7 +20,7 @@ import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
-import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSessionAsync, hasProcessedState, isCompressionDisabled, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
@@ -1757,6 +1757,22 @@ async function handleRequest(
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // #5300: per-session compression opt-out (exact session id, runtime-set
+        // via POST /__bili/session/<id>/compress). The request rides the SAME
+        // verbatim tail as global/route passthrough: no prepare (no fold-ledger
+        // update, no nudge/tool/philosophy injection), no preflight fold, no
+        // relay-loop rounds — the client's bytes go out untouched and window
+        // overflow surfaces as the upstream's own error. Placed before ANY
+        // bookkeeping below on purpose: an excluded session's record stays
+        // byte-stable except for the flag itself. The incremental lane pre-arms
+        // its canonical durability before dispatching its synthetic request
+        // (src/incremental-lane.ts), so skipping prepare* loses nothing there.
+        if (isCompressionDisabled(session)) {
+            log("info", `[session-compress-off] ${sessionId}: compression disabled for this session (#5300) — forwarding verbatim, kernel bypassed (re-enable: POST /__bili/session/${sessionId}/compress {"enabled":true})`);
+            forwarded = true;
+            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined);
+            return;
+        }
         // #5490: the first-sight warn above needs no session identity; this one
         // does — recurrence across DISTINCT sessions is what turns "a model I
         // haven't declared" into "an alias this host resolves internally that
