@@ -47,6 +47,7 @@ import { isProxyToolFor } from "./absorb.js";
 import { withSessionLock } from "./session.js";
 import { drainPendingRetrievals } from "./store.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "./upstream-throttle.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { COMPRESS_TOOL_NAME } from "./compress-tool.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
@@ -147,15 +148,25 @@ export async function compressLoopAnthropicJson(
         if (requestOptions.egress) roundBody = await requestOptions.egress(roundBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
         log(`[acp-proxy: non-stream anthropic proxy-tool round ${round}; re-requesting so the model sees the result]`);
-        const result = await fetchWithRetry(
-            requestOptions.url,
-            { method: "POST", headers: requestOptions.headers, body: roundBody, ...(options.proxyUrl ? { dispatcher: proxyDispatcher(options.proxyUrl) } : {}) },
-            undefined,
-            options.signal,
-        ).catch((e) => {
-            if (e instanceof UpstreamHttpError) log(`[acp-proxy: non-stream anthropic loop upstream error ${e.status}: ${e.body.slice(0, 200)}]`);
+        let result: Awaited<ReturnType<typeof fetchWithRetry>>;
+        try {
+            result = await fetchWithRetry(
+                requestOptions.url,
+                { method: "POST", headers: requestOptions.headers, body: roundBody, ...(options.proxyUrl ? { dispatcher: proxyDispatcher(options.proxyUrl) } : {}) },
+                undefined,
+                options.signal,
+            );
+            // #4743: the non-stream Anthropic-wire compress loop feeds the 429 governor — a settled ok response clears any hold.
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, result.response.status);
+        } catch (e) {
+            if (e instanceof UpstreamHttpError) {
+                // #4743: a terminal 429 exhausted the retry budget — arm the governor; any other settled status clears it (relay parity, #4204).
+                if (e.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+                else noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, e.status);
+                log(`[acp-proxy: non-stream anthropic loop upstream error ${e.status}: ${e.body.slice(0, 200)}]`);
+            }
             throw e;
-        });
+        }
         try {
             current = (await result.response.json()) as Record<string, unknown>;
         } finally {
