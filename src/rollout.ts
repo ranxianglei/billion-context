@@ -109,6 +109,16 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // the seam may even read local files — coupling them made opting one's
     // own install in require bumping an unrelated rollout. Default 0%.
     identityChannelHarvest: { percent: 0 },
+    // #6111 POC: render proxy-mode fold summaries as CCR placeholders on the
+    // outbound view instead of inline prose (weak models misread a wall of
+    // summary text as the current question — #6025). The full prose is stored
+    // under a stable synthetic ref for on-demand acp_retrieve; session state is
+    // untouched. EXPERIMENTAL, default off — force on with
+    // `rollout.features.foldSummaryCcrPlaceholder: true` or
+    // `BILI_ROLLOUT_FOLD_SUMMARY_CCR_PLACEHOLDER=1`. Only takes effect where CCR
+    // itself is armed (ccr.enabled), so retrieval can never point at an absent
+    // tool. Not merged until owner rules on the A/B/C experiment data.
+    foldSummaryCcrPlaceholder: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
