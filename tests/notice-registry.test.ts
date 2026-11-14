@@ -17,6 +17,11 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+// #4011 lesson: this suite asserts the pure-sqlite default notice is visible,
+// which requires the pure-sqlite SELECTION (unified "sqlite" or absent — the
+// gate is unifiedSelectionIsSqlite, not the resolved mode). The suite baseline
+// preload pins "legacy" for the broad corpus, so pin the selection explicitly.
+process.env.BILI_STORAGE_UNIFIED = "sqlite";
 
 const { NOTICES, visibleNotices, SQLITE_DEFAULT_NOTICE_ID } = await import("../src/notices.ts");
 const { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissUpgradeNotice } = await import("../src/pck-notice.ts");
