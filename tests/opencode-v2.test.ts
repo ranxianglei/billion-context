@@ -247,6 +247,30 @@ test("v2 reports: outgoing hooks exclude only generated report IDs, including af
     }
 });
 
+for (const name of ["context", "compaction", "title", "generate"]) {
+    test(`v2 reports: ${name} filters long histories in place without an argument limit`, async () => {
+        const fake = makeFakeCtx();
+        const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+        try {
+            const reportId = `msg_bili_report_${"a".repeat(32)}`;
+            const kept = Array.from({ length: 250_000 }, (_, i) => ({
+                id: `msg_${i}`, role: i % 2 === 0 ? "user" : "assistant", content: [],
+            }));
+            kept[1] = { id: reportId, role: "assistant", content: [] };
+            const report = { id: reportId, role: "user", content: [] };
+            const messages = [report, ...kept.slice(0, 125_000), report, ...kept.slice(125_000), report];
+            const event = { sessionID: "ses_long_report", messages };
+            await fake.contextHooks.get(name)!(event);
+            assert.strictEqual(event.messages, messages);
+            assert.deepStrictEqual(messages, kept);
+            assert.strictEqual(messages[0], kept[0]);
+            assert.strictEqual(messages.at(-1), kept.at(-1));
+        } finally {
+            cleanup();
+        }
+    });
+}
+
 test("v2 reports: unsupported context hooks retain the inert body", async () => {
     const fake = makeFakeCtx();
     const hook = fake.ctx.session.hook;
