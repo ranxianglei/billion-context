@@ -60,6 +60,22 @@ function withTempStore<T>(name: string, fn: (store: SessionStore, dir: string) =
     }) as unknown as Promise<T>;
 }
 
+// #4004: run a temp-store test pinned to shadow mode. Under the #3818 default
+// (storage.unified=full) reads go unified-first and the sqlite index is the
+// authoritative carrier, which BYPASSES the envelope integrity guards these
+// tests exist to pin — the intact index row is served before the guard runs.
+// Shadow keeps the JSON envelope as the read path (readsUnified=false), so the
+// guards fire deterministically again. SessionStore has no per-store mode knob;
+// the mode resolves from BILI_STORAGE_UNIFIED at construction, so we scope it.
+function withShadowTempStore<T>(name: string, fn: (store: SessionStore, dir: string) => Promise<T> | T): Promise<T> {
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "shadow";
+    return withTempStore(name, fn).finally(() => {
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
+    });
+}
+
 async function settle(ms = 30): Promise<void> {
     await new Promise((r) => setTimeout(r, ms));
 }
@@ -135,7 +151,10 @@ await withTempStore("scheduleSave debounces and eventually writes", async (store
     // land well past the 5ms debounce. Deadline covers the retry ladder
     // (~1.5s) with headroom.
     const loaded = await waitFor(() => store.loadSync("debounce-1"), 5000, "debounced write to land");
-    assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
+    // #4004: the unified sidecar drops index.db(+wal/shm) into the sessions dir
+    // under the #3818 full-mode default — count only session entries, not the db.
+    const topEntries = readdirSync(dir).filter((n) => !n.startsWith("index.db"));
+    assert.equal(topEntries.length, 1, "exactly one top-level entry (the _unknown subdir) happened");
     assert.equal(loaded!.stats.requests, 3, "latest value persisted");
 });
 
@@ -152,7 +171,9 @@ await withTempStore("flushSync writes immediately (for eviction)", async (store,
     const s = makeSession("evict-1");
     s.stats.tokensSaved = 555;
     store.flushSync(s);
-    assert.equal(readdirSync(dir).length, 1);
+    // #4004: ignore the unified sidecar's index.db(+wal/shm) — see above.
+    const topEntries = readdirSync(dir).filter((n) => !n.startsWith("index.db"));
+    assert.equal(topEntries.length, 1);
     assert.equal(store.loadSync("evict-1")!.stats.tokensSaved, 555);
 });
 
@@ -213,7 +234,7 @@ await withTempStore("flushSync returns true on success, false on failure", async
     assert.equal(store.flushSync(makeSession("flush-bool-2")), false, "returns false on write failure");
 });
 
-await withTempStore("loadSync returns null when body id does not match", async (store, dir) => {
+await withShadowTempStore("loadSync returns null when body id does not match", async (store, dir) => {
     const { writeFileSync: wf } = await import("node:fs");
     // Hand-write a file whose name hashes to "real-id" but body says "fake-id".
     const real = makeSession("real-id");
@@ -226,7 +247,24 @@ await withTempStore("loadSync returns null when body id does not match", async (
     assert.equal(store.loadSync("real-id"), null, "body id mismatch rejected");
 });
 
-await withTempStore("loadAll skips file whose filename does not match body id", async (store, dir) => {
+// #4004: the INVERSE of the shadow-mode guard above — pins the full-mode
+// authority semantic the #2671-era tests contradicted. Under the #3818 default
+// the sqlite index is authoritative and is minted key+payload together by bili,
+// so it cannot misattribute: tampering ONLY the legacy envelope must NOT reject,
+// the intact index row is served under the requested id.
+await withTempStore("loadSync serves the intact index row over a tampered envelope in full mode (#4004)", async (store, dir) => {
+    const real = makeSession("full-id");
+    await store.writeNow(real);
+    const file = jsonFilesUnder(dir)[0];
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    parsed.id = "different-id";
+    writeFileSync(file, JSON.stringify(parsed));
+    const loaded = store.loadSync("full-id");
+    assert.ok(loaded, "intact index row served despite tampered envelope");
+    assert.equal(loaded!.id, "full-id", "served under the requested id, not the tampered one");
+});
+
+await withShadowTempStore("loadAll skips file whose filename does not match body id", async (store, dir) => {
     const { renameSync: rn } = await import("node:fs");
     await store.writeNow(makeSession("legit"));
     // Rename the legit file to a name that doesn't match any body id.
@@ -323,7 +361,7 @@ await withTempStore("protocol-less session lands under _unknown/ (legacy compat)
     assert.ok(loaded && loaded.id === "legacy-1", "legacy session loads back");
 });
 
-await withTempStore("loadSync uses protocol meta to locate namespaced file", async (store, dir) => {
+await withShadowTempStore("loadSync uses protocol meta to locate namespaced file", async (store, dir) => {
     // After an LRU eviction, loadSync must find the file by protocol/host,
     // not by scanning. Passing the meta must hit the right path.
     const s = makeSession("meta-1");
