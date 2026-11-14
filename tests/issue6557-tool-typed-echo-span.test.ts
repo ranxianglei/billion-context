@@ -105,3 +105,27 @@ test("#6557 guard: a tool-typed echo inside a fenced code block still goes (no f
     const text = "```\n" + `${toolOpen()}${FABRICATED}${close}` + "\n```";
     assert.equal(stripAcpTags(text), "```\n\n```");
 });
+
+// ── self-close corner: `<acp …/>` is a complete unit, not an opening ──
+
+test("#6557: whole-text: a self-closing tool-typed echo dies in place, following prose survives", () => {
+    const selfClose = `${LT}acp type="tool:acp_cache"/${GT}`;
+    assert.equal(stripAcpTags(`x ${selfClose} rest of prose`), "x  rest of prose");
+});
+
+test("#6557: whole-text: a self-closing tool-typed echo does not pair with a later orphan close", () => {
+    const selfClose = `${LT}acp type="tool:acp_cache"/${GT}`;
+    assert.equal(stripAcpTags(`x ${selfClose} body ${close} tail`), "x  body  tail");
+});
+
+test("#6557: streaming: a self-closing tool-typed echo dies in place — and the verdict is split-invariant", () => {
+    const text = `x ${LT}acp type="tool:acp_cache"/${GT} rest of prose`;
+    for (const chunks of allChunkings(text)) {
+        assert.equal(stream(chunks), "x  rest of prose", `chunking ${JSON.stringify(chunks.map((c) => c.length))}`);
+    }
+});
+
+test("#6557 guard: a self-closing type=\"text\" echo still keeps its following prose (SELF_CLOSE semantics unchanged)", () => {
+    const selfClose = `${LT}acp type="text"/${GT}`;
+    assert.equal(stripAcpTags(`x ${selfClose} body ${close} tail`), "x  body  tail");
+});

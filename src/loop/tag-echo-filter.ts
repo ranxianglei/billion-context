@@ -259,14 +259,21 @@ const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 // (production session, #6557: the same JSON block 25 times in 23 minutes). So
 // a tool-typed span dies WHOLE — attrs through the close, or through the end
 // of the field when the imitation never closes — in the whole-text path
-// (TOOL_TYPED_PAIR) and in the streaming swallow (swallowReleases, below).
+// (TOOL_TYPED_PAIR) and in the streaming swallow (swallowReleases, below). A
+// self-closing imitation is a complete unit, not an opening — it dies in place
+// via SELF_CLOSE, prose after it surviving.
 // Case folds per #1731: an echoed type drifts casing the same way an echoed
 // name does. The quote after `type=` is part of the match, so a `type=` that
 // appears inside another attribute's VALUE (an unquoted-looking `data-x=a
 // type=tool:` run) cannot be mistaken for the attribute itself.
 const TOOL_TYPE_ATTR = "\\s+[tT][yY][pP][eE]\\s*=\\s*[\"']\\s*[tT][oO][oO][lL]:";
 const TOOL_TYPE_ATTR_RE = new RegExp(TOOL_TYPE_ATTR);
-const TOOL_TYPED_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*?)?" + TOOL_TYPE_ATTR + "[^<>]*>");
+// The `[^/<>]` before the final `>` excludes the SELF-CLOSING form
+// (`<acp …/>`): that is a complete unit, not an opening, so it must not be
+// read as one and made to own the rest of the field. It falls through to the
+// SELF_CLOSE pass (killed in place) — the same verdict the streaming path
+// reaches via candidate order, keeping both paths split-invariant (#4178/#4210).
+const TOOL_TYPED_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*?)?" + TOOL_TYPE_ATTR + "[^<>]*[^/<>]>");
 const TOOL_TYPED_PAIR = new RegExp(TOOL_TYPED_OPEN.source + "[\\s\\S]*?\x3c\\/" + NAME + ">");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
@@ -585,9 +592,10 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
  * so entry-vs-exit comparisons never false-positive on shapes one side
  * legitimately removed. Single source of truth by construction — when the
  * filter family grows, the judge's normalization grows with it. Content-
- * preserving for prose (paired shapes keep their payload; only tag bytes go),
- * and the tool-call emission span is deliberately NOT touched (args are user
- * intent, #1039). */
+ * preserving for prose (paired shapes keep their payload — except a tool-typed
+ * span, whose body is a fabricated tool result and dies with the tags, #6557;
+ * otherwise only tag bytes go), and the tool-call emission span is
+ * deliberately NOT touched (args are user intent, #1039). */
 export function normalizeEchoArtifacts(text: string): string {
     if (
         !containsRenderTagText(text) &&
