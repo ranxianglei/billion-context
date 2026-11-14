@@ -1673,9 +1673,11 @@ export class UnifiedStore {
         // #4390: a rewound message that comes back reactivates in place —
         // the tombstone clears, the original seq is reused, and the view
         // heals without a duplicate row even on completeLog-less saves.
-        for (const seq of retiredSeqs) {
-            const back = messages.some((m) => m.seq === seq);
-            if (back) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+        if (retiredSeqs.length > 0) {
+            const presentedSeqs = new Set(messages.map((m) => m.seq));
+            for (const seq of retiredSeqs) {
+                if (presentedSeqs.has(seq)) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+            }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
