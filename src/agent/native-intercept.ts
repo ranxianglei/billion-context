@@ -209,6 +209,19 @@ export interface NativeInterceptState {
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
     resignCredentialFor?: (url: string, scheme: string, inboundAk?: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    /** #5931: sticky evidence that at least one model request completed a
+     *  successful dispatch THROUGH this process's fetch chain — set by
+     *  noteDispatchMode's "proxy" arm, the single chokepoint covering every
+     *  success path. Lanes whose pre-send transform produces bytes ONLY bili
+     *  understands (the opencode incremental envelope) consult this before
+     *  mutating: a host that pinned its egress fetch before the chain was
+     *  installed (opencode 2.2.6 / effect 4.1.0's cached Fetch reference)
+     *  would hand lane-only bytes to the raw upstream and lock into a 400
+     *  retry loop. Spawn/attach targets are real loopback origins reachable
+     *  WITHOUT the chain, so their transforms never need this gate. Sticky
+     *  by design: once any request proved the chain carries traffic, later
+     *  turns must not pay a full resend for a transient miss. */
+    chainEgressSeen?: boolean;
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
@@ -1551,6 +1564,13 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         const prev = dispatchMode;
         dispatchMode = next;
         if (next === "proxy") {
+            // #5931: a successful chain-carried dispatch is the evidence the
+            // inline-mode incremental gate waits on — one chokepoint covers
+            // all five success call sites. Read the LIVE slot (#3394
+            // discipline): a respawn may have swapped the state object out
+            // from under this closure.
+            const live = g[ACTIVE_STATE] as NativeInterceptState | undefined;
+            if (live !== undefined) live.chainEgressSeen = true;
             if (prev !== undefined) logHostEvent("info", "[native-client]", `bili-native: proxy recovered — model requests resume compression (was ${prev})`);
         } else {
             logHostEvent("error", "[native-client]", detail ?? `bili-native: model requests now go ${next}`);
