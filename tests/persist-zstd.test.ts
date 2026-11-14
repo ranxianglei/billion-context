@@ -48,10 +48,6 @@ function makeSession(id: string, fill = 0, fillRandom = false): Session {
 interface Harness {
     dir: string;
     logs: LogLine[];
-
-    /** #6480: explicit dual-write opens the SQLite sidecar in this dir, so a
-     *  lingering store pins index.db and teardown hits Windows EBUSY
-     *  (deterministic since #6480; #2799/#2908 family). Close before rmrf. */
     stores: SessionStore[];
 }
 
@@ -59,14 +55,20 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
     await test(name, async () => {
         const dir = mkdtempSync(join(tmpdir(), "bili-zstd-"));
         const logs: LogLine[] = [];
-        const h = { dir, logs, stores: [] as SessionStore[] };
+        const h: Harness = { dir, logs, stores: [] };
         try {
             await fn(h);
         } finally {
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
-            for (const store of h.stores) store.closeQuietly();
+            // The dual-write pin above opens index.db in every store — Windows
+            // cannot unlink an open SQLite file, so close each sidecar before
+            // the tmp-dir teardown or the rmrf loses the EBUSY race (#5154
+            // family, resurfaced by the pure-sqlite-default test pins).
+            for (const s of h.stores) {
+                try { s.closeQuietly(); } catch { /* already closed */ }
+            }
             rmrf(dir);
         }
     });

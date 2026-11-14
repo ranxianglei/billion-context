@@ -452,6 +452,21 @@ export class StorageSecondWriterError extends Error {
     }
 }
 
+/**
+ * #2195 release-gate fix (e2e-fake-codex failure, 2026-11-13_release-v0.1.214):
+ * true when the SQLite file header already declares WAL (header bytes 18-19
+ * == 0x02). A plain file read — no database lock, so it is always safe,
+ * unlike asking the engine via `PRAGMA journal_mode`.
+ */
+function dbFileIsAlreadyWal(dbPath: string): boolean {
+    try {
+        const head = readFileSync(dbPath);
+        return head.length >= 100 && head[18] === 0x00 && head[19] === 0x02;
+    } catch {
+        return false; // file absent/unreadable → not WAL → let the pragma decide
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -496,6 +511,23 @@ export class UnifiedStore {
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
+        // The pre-migration quick_check below runs BEFORE the storagePragmas
+        // loop installs the connection's busy handler — on a bare handle the
+        // first statement throws raw SQLITE_BUSY the instant a concurrent
+        // writer holds the lock. That is a real, reachable shape, not a lab
+        // artifact: the launcher kills its proxy fire-and-forget on exit
+        // (stopProxy is a bare SIGTERM, no wait-for-exit), so the NEXT launch's
+        // opener routinely starts while the previous instance is still
+        // draining its graceful flush against the SAME shared sessions dir
+        // (one index.db per machine is the supported topology, #5082). The
+        // e2e #2195 gate hit exactly this: the fresh proxy parked on the
+        // startup-failure page ("database is locked") and the launcher burned
+        // its 60 s health budget on a child whose only problem was a missing
+        // busy handler. busy_timeout is a connection-level pragma that never
+        // touches the file, so it is safe to install before the corruption
+        // classification below; storagePragmas reapplies the same value
+        // idempotently for the remaining opens.
+        db.exec("PRAGMA busy_timeout = 5000");
         // #4175/#4609: integrity self-check, verdict-cached and size-gated.
         // An unchanged file set (index.db + -wal stats + schema version) skips
         // the rescan; a small store checks synchronously BEFORE migrations (a
@@ -604,7 +636,44 @@ export class UnifiedStore {
         }
         try {
             const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
-            for (const pragma of storagePragmas(limit)) db.exec(pragma);
+            for (const pragma of storagePragmas(limit)) {
+                if (pragma === "PRAGMA journal_mode = WAL") {
+                    // The #2195 trap: `PRAGMA journal_mode` needs exclusive
+                    // access and BYPASSES the connection's busy handler — it
+                    // throws raw SQLITE_BUSY instantly while a peer holds a
+                    // write transaction (repro: holder BEGIN IMMEDIATE +
+                    // insert, fresh handle with busy_timeout=5000 installed →
+                    // journal_mode throws at 0 ms, quick_check is fine).
+                    // That peer is the normal one: stopProxy is fire-and-
+                    // forget, so the previous proxy may still be draining its
+                    // final flush on this same machine-global file when the
+                    // next launch opens it (#5082). Two cases:
+                    if (dbFileIsAlreadyWal(path)) {
+                        // The store is ALREADY WAL (created WAL, never
+                        // switched back) — skipping the pragma is a strict
+                        // no-op and saves the exclusive acquisition entirely.
+                        continue;
+                    }
+                    try {
+                        db.exec(pragma);
+                    } catch (err) {
+                        const msg = String((err as { message?: unknown })?.message ?? err);
+                        if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
+                        // The file is still in its legacy journal mode and a
+                        // peer holds the write transaction, so the switch
+                        // cannot run right now. #5082 owner decision
+                        // 2026-10-31: a live foreign writer never blocks
+                        // startup — defer the switch to the next open (the
+                        // previous open already moved the file to WAL in the
+                        // normal case) and continue in the current journal
+                        // mode, which is safe multi-process, just less
+                        // concurrent.
+                        loggerLog("warn", `[storage] journal_mode=WAL deferred for ${path} — a peer holds the write lock (#5082); continuing in the current journal mode, switch retries on the next open`);
+                        continue;
+                    }
+                }
+                db.exec(pragma);
+            }
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
