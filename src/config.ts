@@ -382,7 +382,12 @@ export type CompressSettings = {
      *  suggested nor explicit compress ranges can cover the latest instance.
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
-     *  client-specific. */
+     *  client-specific.
+     *  The agents-md carrier is the one exception to "one identity per
+     *  carrier": its mid-session REVISIONS (instruction-file content changes,
+     *  #4921) project to `durable/agents-md-update/<path>` identities, so
+     *  latest-per-path keeps the baseline plus the newest revision of every
+     *  touched file (#2447, #4921). */
     protectedLatestTools?: string[];
     /* (durable virtual paths) dsh lanes project their durable-state TEXT
      *  carriers to `durable/<name>` identities (#2446 family: skill catalog,
@@ -413,7 +418,10 @@ export type CompressSettings = {
      *  matches within the name segment (`*` never crosses `/`).
      *  Deepest level wins (global → provider → model), whole-array replace.
      *  Default: none — opt in per client/agent, since tool names are
-     *  client-specific. */
+     *  client-specific.
+     *  Note the agents-md revisions carry their own identity, so that exact
+     *  pattern leaves them foldable; add `durable/agents-md-update/*` (or use
+     *  `durable/*`) to keep the whole family (#4921). */
     protectedTools?: string[];
     /* (durable virtual paths) any pattern whose first path segment is
      *  `durable` takes over the whole durable policy for that lane
