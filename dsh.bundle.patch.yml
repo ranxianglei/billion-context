@@ -18,11 +18,18 @@
 # disable the bili-compaction-gate entry itself: it carries the service the
 # presets wait on; to uninstall, remove billion-context from
 # dsh.profile.bundles instead.
+# #4627: the gate row must keep resolving into its OWN nested package
+# identity (dist/agent/dsh-gate/package.json, name billion-context-dsh-gate,
+# NO dsh.client declaration). dsh >= 0.2.0-rc.x refuses to boot when two
+# active Loader rows resolve to the SAME dsh.client-declaring package
+# (ClientModuleRegistry.reconcilePackage: "resolves from multiple active
+# Loader sources ... remove one entry") — pointing this row back at the
+# billion-context root or any top-level subpath of it re-bricks dsh web.
 - insert:
     - id: bili-native
       name: billion-context
     - id: bili-compaction-gate
-      name: billion-context/dsh-compaction-gate
+      name: billion-context/dsh-gate
 - id: compaction-basic
   config:
     auto: false

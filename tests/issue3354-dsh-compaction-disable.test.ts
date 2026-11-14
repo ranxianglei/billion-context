@@ -16,8 +16,11 @@ const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PRESET_ROWS = compactionDisablePatchRows();
 // #3662: both carriers must mount the always-on gate entry alongside
 // bili-native — without it the preset inject rows pend forever whenever
-// bili-native does not run.
-const GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context/dsh-compaction-gate\n`;
+// bili-native does not run. #4627: the two carriers now target different-but-
+// equivalent gate packages (bundle subpath vs own bare package), so they can
+// no longer share one byte-exact constant.
+const BUNDLE_GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context/dsh-gate\n`;
+const LAUNCHER_BARE_GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context-dsh-gate\n`;
 
 test("#3354 disableBasicCompaction: marks both compaction rows at any depth", () => {
     const rows = [
@@ -149,7 +152,7 @@ test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the
         assert.ok(bundle.includes(row), `bundle yml must carry the ${id} gate row`);
     }
     assert.ok(bundle.includes(PRESET_ROWS), "bundle yml must carry the gate rows contiguously");
-    assert.ok(bundle.includes(GATE_INSERT), "bundle yml must mount the always-on gate entry (#3662)");
+    assert.ok(bundle.includes(BUNDLE_GATE_INSERT), "bundle yml must mount the always-on gate entry (#3662)");
 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-patch-"));
     try {
@@ -157,7 +160,7 @@ test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the
         assert.ok(file, "overlay patch must be written");
         const overlay = fs.readFileSync(file!, "utf8").replaceAll("\r\n", "\n");
         assert.ok(overlay.includes(PRESET_ROWS), "launcher overlay must carry the same gate rows");
-        assert.ok(overlay.includes(GATE_INSERT), "launcher overlay must mount the same gate entry (#3662)");
+        assert.ok(overlay.includes(LAUNCHER_BARE_GATE_INSERT), "launcher overlay must mount the same gate entry (#3662)");
         // the overlay still stands down the host plane and keeps the #2605 retries
         assert.ok(overlay.includes("- id: compaction-basic\n  config:\n    auto: false\n"));
         assert.match(overlay, /retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]/);

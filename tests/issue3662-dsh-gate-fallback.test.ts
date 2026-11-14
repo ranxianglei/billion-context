@@ -16,7 +16,10 @@ import * as gate from "../src/agent/dsh-compaction-gate.ts";
 import { writeDshAcpPatch } from "../src/launcher.ts";
 
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context/dsh-compaction-gate\n`;
+// #4627: the carriers target different-but-equivalent gate packages (bundle
+// subpath vs own bare package), so they cannot share one byte-exact constant.
+const BUNDLE_GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context/dsh-gate\n`;
+const LAUNCHER_BARE_GATE_INSERT = `- insert:\n    - id: bili-native\n      name: billion-context\n    - id: bili-compaction-gate\n      name: billion-context-dsh-gate\n`;
 
 type GateHost = {
     on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
@@ -137,7 +140,7 @@ test("#3662: both patch carriers mount the gate entry alongside bili-native", ()
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3662-carrier-"));
     try {
         const bundle = fs.readFileSync(path.join(TESTS_DIR, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
-        assert.ok(bundle.includes(GATE_INSERT), "bundle patch must insert the always-on gate entry after bili-native");
+        assert.ok(bundle.includes(BUNDLE_GATE_INSERT), "bundle patch must insert the always-on gate entry after bili-native");
         for (const id of ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"]) {
             assert.ok(bundle.includes(`- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`));
         }
@@ -145,12 +148,12 @@ test("#3662: both patch carriers mount the gate entry alongside bili-native", ()
         const file = writeDshAcpPatch(home, "billion-context");
         assert.ok(file, "writeDshAcpPatch must produce the overlay file");
         const overlay = fs.readFileSync(file, "utf8").replaceAll("\r\n", "\n");
-        assert.ok(overlay.includes(GATE_INSERT));
+        assert.ok(overlay.includes(LAUNCHER_BARE_GATE_INSERT));
         // launcher overlay, URL lane (no shim): the gate rides the same dist root
         const file2 = writeDshAcpPatch(home, "file:///does/not/matter/agent/dsh-native.js");
         assert.ok(file2);
         const overlay2 = fs.readFileSync(file2, "utf8").replaceAll("\r\n", "\n");
-        assert.match(overlay2, /^ {4}- id: bili-compaction-gate\n {6}name: file:\/\/.+dsh-compaction-gate\.js$/m);
+        assert.match(overlay2, /^ {4}- id: bili-compaction-gate\n {6}name: file:\/\/.+dsh-gate\/index\.js$/m);
         assert.ok(overlay2.includes(`- id: preset-standard\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`));
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
