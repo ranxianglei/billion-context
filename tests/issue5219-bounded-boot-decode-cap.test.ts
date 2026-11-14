@@ -38,12 +38,20 @@ async function fixture(run: (dir: string, store: SessionStore) => Promise<void>)
 }
 
 async function withUnified(run: () => Promise<void>): Promise<void> {
-    const prev = process.env.BILI_STORAGE_UNIFIED;
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    const prevWriter = process.env.BILI_STORAGE_JSON_WRITER;
     process.env.BILI_STORAGE_UNIFIED = "full";
+    // The gate counts JSON-envelope decodes, which requires dual-write. A host
+    // config file with storage.jsonWriter=off (the pure-sqlite default since
+    // #6480 flips the "absent" tier off, and the file value always wins) would
+    // silently leave the disk empty and every count 0 — pin the writer on.
+    process.env.BILI_STORAGE_JSON_WRITER = "1";
     try { await run(); }
     finally {
-        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
-        else process.env.BILI_STORAGE_UNIFIED = prev;
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
+        if (prevWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+        else process.env.BILI_STORAGE_JSON_WRITER = prevWriter;
     }
 }
 
