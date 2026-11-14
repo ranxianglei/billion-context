@@ -1966,7 +1966,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const active = deps.session.state.blocks.filter((b) => b.active);
         return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
     };
-    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string };
+    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string; stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" };
     const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
         let callsUsed = 0;
         let netSaved = 0;
@@ -2178,7 +2178,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
             `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
             `Raise the model context window or restart the session.`;
-        return { recovered, callsUsed, netSaved, honestDetail };
+        return { recovered, callsUsed, netSaved, honestDetail, stopReason };
     };
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
@@ -3228,7 +3228,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const rec = await attemptTierRecovery();
             deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
             if (!rec.recovered) {
-                failure = { kind: "exhausted", detail: rec.honestDetail };
+                // #5764/#3461: only the structurally-exhausted ending (span-math proved no legal
+                // two-block span / not enough positionable blocks — e.g. oversized inline media
+                // blowing every span past TIER_DISTILL_SOURCE_CHAR_BUDGET) is deterministic →
+                // 413 not-forwarded; cap/unavailable/no-shrink are relay/budget-dependent and MUST
+                // stay 502-retryable (server.ts fail-fast contract).
+                // #6451: an overflow-armed baseline is a relay-billing artifact, not a structural
+                // doom — the upstream proved a smaller window, so the client may still recover by
+                // switching models or the upstream recovering; keep it 502-retryable.
+                const overflowArmed = deps.session.stats.lastInputTokensSource === "overflow-arm";
+                failure = { kind: "exhausted", deterministic: rec.stopReason === "exhausted" && !overflowArmed, detail: rec.honestDetail };
             }
         }
         if (currentTokens >= limit && !failure) {
