@@ -1,0 +1,173 @@
+/**
+ * Review-driven query-word diagnostics, labelled before running the fix.
+ * These are synthetic contract examples, not a held-out relevance benchmark.
+ * Keep the boundary diagnostics separate from the asserted quality cases.
+ */
+import type { PlanRetrievalCase } from "./plan-state-retrieval-cases.ts";
+
+interface PlanQueryWordCase extends Omit<PlanRetrievalCase, "category" | "language"> {
+    category: "natural-language" | "already-correct" | "literal" | "mixed-language";
+    language: "en" | "zh" | "mixed";
+    domain: "auth" | "payments" | "rag" | "agent" | "deployment" | "database";
+}
+
+function example(
+    id: string, category: PlanQueryWordCase["category"], domain: PlanQueryWordCase["domain"],
+    query: string, target: string, distractor: string, activeTask: string, rationale: string,
+    language: PlanQueryWordCase["language"] = "en",
+): PlanQueryWordCase {
+    return {
+        id, category, domain, language, query, rationale,
+        blocks: [
+            { blockId: "b1", topic: "Reference", summary: target },
+            { blockId: "b2", topic: "Current work", summary: distractor },
+            { blockId: "b3", topic: "Operations", summary: "The service is healthy. A routine maintenance window was approved." },
+            { blockId: "b4", topic: "Archive", summary: "What changed: the former backup schedule is still available." },
+            { blockId: "b5", topic: "Checklist", summary: "Where are the logs? A dashboard records routine operator activity." },
+        ],
+        planningMessages: [{
+            toolName: "TodoWrite",
+            text: JSON.stringify({ todos: [{ content: activeTask, status: "in_progress" }] }),
+        }],
+        relevantBlockIds: ["b1"],
+    };
+}
+
+export const PLAN_QUERY_WORD_CASES: readonly PlanQueryWordCase[] = [
+    example("question-jwt-issuer", "natural-language", "auth", "what is the jwt issuer",
+        "JWT issuer validation compares the claim with the configured signing authority.",
+        "What is the ratelimit policy? The ratelimit middleware counts requests.", "ratelimit",
+        "JWT issuer evidence should outrank grammatical overlap with unrelated active rate limiting."),
+    example("question-payment-refund", "natural-language", "payments", "where is the refund ledger",
+        "Refund ledger entries reverse the original debit using the charge identifier.",
+        "Where is the webhook? The webhook accepts provider events.", "webhook",
+        "The explicit refund ledger query remains historical even while webhooks are active."),
+    example("question-rag-dimension", "natural-language", "rag", "what is the embedding dimension",
+        "Embedding dimension equals 768 for the deployed encoder.",
+        "What is the ingestion schedule? The ingestion worker polls object storage.", "ingestion",
+        "Embedding dimension is the requested fact; shared question words carry no extra intent."),
+    example("question-agent-checkpoint", "natural-language", "agent", "where is a checkpoint stored",
+        "Checkpoint stored state includes completed tool results and the pending node name.",
+        "Where is a budget reserved? A budget tracks estimated model charges.", "budget",
+        "A checkpoint query must not be displaced by an active budget task's grammatical matches."),
+    example("question-deployment-artifact", "natural-language", "deployment", "what is a rollback artifact",
+        "Rollback artifact digests identify the previous production image.",
+        "What is a rollout? A rollout checks the current deployment health.", "rollout",
+        "The rollback artifact is distinct from the current rollout procedure."),
+    example("question-database-lock", "natural-language", "database", "where is the deadlock trace",
+        "Deadlock trace records both transaction identifiers and their lock acquisition order.",
+        "Where is the vacuum worker? The vacuum worker reclaims pages.", "vacuum",
+        "Deadlock evidence should survive an unrelated database maintenance plan."),
+    example("punctuated-question", "natural-language", "auth", "what, is the jwt issuer?",
+        "JWT issuer validation selects the signing authority.",
+        "What, is the ratelimit threshold? Ratelimit enforcement follows account settings.", "ratelimit",
+        "Comma-decorated question words must not provide useful query coverage."),
+    example("uppercase-and-whitespace", "natural-language", "auth", "WHAT\tIS\nTHE JWT issuer",
+        "JWT issuer signing authority.", "What is the ratelimit threshold? Ratelimit counts requests.", "ratelimit",
+        "Whitespace and case changes to an ordinary question do not change its requested fact."),
+    example("repeated-function-words", "natural-language", "auth", "the the the is a jwt issuer",
+        "JWT issuer signing authority.", "The ratelimit is a request counter.", "ratelimit",
+        "Repeated grammar words must neither gain votes nor conceal the two meaningful terms."),
+    example("correct-question-with-grammar", "already-correct", "payments", "what is the refund ledger",
+        "What is the refund ledger? Refund ledger entries reverse charges.",
+        "The webhook validates incoming provider signatures.", "webhook",
+        "Removing grammatical votes must retain the already-correct substantive answer."),
+    example("correct-natural-short-id", "already-correct", "agent", "where is the id",
+        "Where is the id? The id is stored beside each trace record.",
+        "A budget reserves estimated charges before calls.", "budget",
+        "An already-correct natural query with a two-character identifier must remain correct."),
+    example("correct-version-question", "already-correct", "deployment", "what is the v2.3 change",
+        "What is the v2.3 change? The v2.3 change enables graceful shutdown.",
+        "A rollout replaces containers in batches.", "rollout",
+        "The exact punctuated version remains searchable after function-word filtering."),
+    example("correct-keyword-pair", "already-correct", "auth", "jwt issuer",
+        "JWT issuer signing authority.", "JWT ratelimit request quota.", "ratelimit",
+        "A keyword-only query already selects the block covering both meaningful terms."),
+    example("correct-refund-recording", "already-correct", "payments", "how are refunds recorded",
+        "How are refunds recorded? Refunds recorded in the ledger reference the original charge.",
+        "The webhook retries provider notifications.", "webhook",
+        "An existing correct answer about recording refunds must remain first."),
+    example("correct-rag-citations", "already-correct", "rag", "where are the citation pages",
+        "Where are the citation pages? Citation pages preserve document page numbers.",
+        "The ingestion worker extracts PDF text.", "ingestion",
+        "A correct answer containing grammatical framing retains its content-word advantage."),
+    example("correct-agent-resume", "already-correct", "agent", "what is the resume checkpoint",
+        "What is the resume checkpoint? Resume checkpoint data identifies the pending tool node.",
+        "The budget reserves estimated model cost.", "budget",
+        "An already-correct checkpoint answer stays ahead of a different active task."),
+    example("correct-deployment-health", "already-correct", "deployment", "where is the health endpoint",
+        "Where is the health endpoint? Health endpoint requests check readiness before rollout.",
+        "The rollback uses the previous image digest.", "rollback",
+        "Filtering English framing must preserve a correct endpoint lookup."),
+    example("correct-database-timeout", "already-correct", "database", "what is a statement timeout",
+        "What is a statement timeout? Statement timeout limits database execution duration.",
+        "A vacuum worker reclaims unused pages.", "vacuum",
+        "The substantive statement-timeout answer remains first even though it also contains grammar."),
+    example("correct-mixed-field-question", "already-correct", "database", "what is the order_id 字段",
+        "What is the order_id 字段? The order_id 字段 records the purchase identifier.",
+        "The migration rebuilds database indexes.", "migration",
+        "A correct mixed-language schema answer must retain its original identifiers and Chinese phrase.", "mixed"),
+    example("short-id-with-article", "literal", "agent", "the id",
+        "id lookup uses an opaque identifier.", "The budget reserves estimated charges.", "budget",
+        "The short literal id is not a stopword and must survive filtering."),
+    example("underscore-identifier", "literal", "database", "the user_id",
+        "user_id identifies an account record.", "The user identity migration is pending.", "migration",
+        "Do not split user_id into user and id or prefer spaced lookalikes."),
+    example("dotted-version", "literal", "deployment", "the v2.3",
+        "v2.3 fixes graceful shutdown.", "The v2 release requires 3 rollout checks.", "rollout",
+        "The v2.3 literal must not degrade into unrelated v2 and 3 tokens."),
+    example("identifier-stopword-prefix", "literal", "database", "the the_user",
+        "the_user identifies the current principal.", "The user migration renames account fields.", "migration",
+        "A stopword substring inside an identifier is not removable grammar."),
+    example("domain-status", "literal", "agent", "the status",
+        "status enumerates valid tool execution outcomes.", "The budget tracks estimated charges.", "budget",
+        "status is a useful query word even though plan extraction treats it as schema noise."),
+    example("domain-update", "literal", "deployment", "the update",
+        "update verifies downloaded package signatures.", "The rollout checks deployment health.", "rollout",
+        "update remains meaningful explicit query intent and must not inherit plan stopwords."),
+    example("sql-is-null", "literal", "database", "IS NULL",
+        "IS NULL tests whether a database value is missing.", "NULL sorting during migration uses the last position.", "migration",
+        "IS is a SQL operator here; removing it would turn a precise two-token query into a tie."),
+    example("variable-a", "literal", "agent", "a variable",
+        "The a variable records the accumulator before each tool step.",
+        "The variable budget contains the reserved charge.", "budget",
+        "The single-character identifier a distinguishes the requested variable from another variable."),
+    example("quoted-is-literal", "literal", "database", '"is" operator',
+        'The "is" operator compares object identity.', "An operator migration updates stored predicates.", "migration",
+        "Quotation marks signal that a grammatical-looking word is itself the search object."),
+    example("backtick-a-literal", "literal", "agent", "`a` variable",
+        "The `a` variable stores the accumulator.", "The variable budget reserves estimated charges.", "budget",
+        "A backtick-delimited code identifier must remain literal query evidence."),
+    example("plain-stopword-query", "literal", "database", "is",
+        "is operator: identity comparison checks object identity.", "vacuum removes unused pages.", "vacuum",
+        "A standalone grammatical-looking query can be a literal lookup; deleting all evidence is unsafe."),
+    example("all-function-word-literals", "literal", "database", "the is a",
+        "The is a token sequence is retained verbatim by this parser fixture.",
+        "The vacuum worker reclaims unused pages.", "vacuum",
+        "With no substantive terms, retain original raw-coverage ranking rather than promoting the active plan."),
+    example("contiguous-cjk", "mixed-language", "auth", "the 密码管理",
+        "密码管理凭证加密后写入保险库。", "The 密 钥 码 管 理 ratelimit task is active.", "ratelimit",
+        "A contiguous Chinese phrase must not turn into a bag of separately matching characters.", "mixed"),
+    example("single-cjk", "mixed-language", "database", "the 锁",
+        "锁的获取顺序保证事务一致性。", "The vacuum worker reclaims pages.", "vacuum",
+        "A one-character Chinese query term still carries explicit intent.", "mixed"),
+    example("mixed-schema-key", "mixed-language", "database", "what is the user_id 字段",
+        "user_id 字段标识账户记录。", "What is the migration schedule? The migration renames tables.", "migration",
+        "English framing must not overshadow a literal schema key and Chinese field term.", "mixed"),
+    example("pure-chinese-keyword", "mixed-language", "deployment", "网关 超时",
+        "网关 超时后取消下游调用。", "数据库 超时后回滚事务。", "数据库",
+        "English function-word handling must leave an already-correct Chinese keyword query intact.", "zh"),
+];
+
+interface PlanQueryWordDiagnostic {
+    id: string;
+    query: string;
+    explanation: string;
+}
+
+/** Deliberately unresolved semantics: report explicitly, never hide in a success denominator. */
+export const PLAN_QUERY_WORD_DIAGNOSTICS: readonly PlanQueryWordDiagnostic[] = [
+    { id: "negation-substring", query: "the not", explanation: "not also matches note under the existing substring contract. Removing grammar cannot establish token boundaries." },
+    { id: "quoted-literal-candidate-generation", query: '"is"', explanation: "The core searches raw whitespace-delimited terms, so quoted-only queries need quoted candidate text. This change must not claim to add a new query parser." },
+    { id: "natural-language-or-code", query: "is nullable", explanation: "Without syntax or task context this can be ordinary grammar or a literal API/operator query; a word blacklist cannot infer intent perfectly." },
+];
