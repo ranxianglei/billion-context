@@ -228,6 +228,7 @@ billion-context/
 │   │   ├── conversation-recall.ts #   Fallback identity when host attribution context is missing (#4082)
 │   │   ├── dsh-compaction-disable.ts #   Load-time overlay standing dsh basic compaction down (#3354)
 │   │   ├── dsh-compaction-gate.ts #   Always-on compaction gate entry, independent of bili-native (#3662)
+│   │   ├── dsh-native-compaction.ts #   Model ownership, bounded native handoff and durable generation isolation (#6121)
 │   │   ├── fork-adopt.ts         #   Client half of fork adoption: prefix match + receipt (#2399)
 │   │   ├── host-log.ts           #   Host-safe log channel: durable record, zero terminal traffic (#2827)
 │   │   ├── incremental-client.ts #   Host-process incremental-turn client: diff, ack, resync (#3248)

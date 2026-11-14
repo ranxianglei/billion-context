@@ -506,6 +506,7 @@ function detectHostTheme(): "light" | "dark" | undefined {
 }
 
 const zh: Dict = {
+    "native_compaction": "当前模型使用 DSH 原生压缩，bili 未参与本轮上下文处理。",
     "nav": "bili设置",
     "title": "billion-context 压缩代理",
     "open": "打开 Web UI",
@@ -535,6 +536,7 @@ const zh: Dict = {
 };
 
 const en: Dict = {
+    "native_compaction": "This model uses DSH native compaction. bili is inactive for its current requests.",
     "nav": "bili",
     "title": "billion-context compression proxy",
     "open": "Open Web UI",
@@ -816,7 +818,17 @@ export function apply(ctx: ClientContext): void {
             if (origin === undefined) return;
             let cancelled = false;
             const load = (): void => {
-                void fetch(`${origin}${statusPath}`)
+                const loadStatus = async (): Promise<Response> => {
+                    const selective = (globalThis as { __BILI__?: { selectiveCompaction?: boolean } }).__BILI__?.selectiveCompaction;
+                    if (!selective || hostSessionId === undefined) return fetch(`${origin}${statusPath}`);
+                    const response = await fetch(`${winningProbeForm ?? ORIGIN_PATH}?sessionId=${encodeURIComponent(hostSessionId)}`);
+                    if (!response.ok) throw new Error(`Policy HTTP ${response.status}`);
+                    const policy = await response.json() as { conversationId?: string; nativeCompaction?: boolean };
+                    if (policy.nativeCompaction) return new Response(JSON.stringify({ ok: true, phase: "native-compaction", conversationId: hostSessionId }));
+                    if (!policy.conversationId) throw new Error("Session compaction policy is not available yet");
+                    return fetch(`${origin}/__bili/plugin/status?conversationId=${encodeURIComponent(policy.conversationId)}`);
+                };
+                void loadStatus()
                     .then((res) => {
                         // #3693: a non-ok answer carries no contract body —
                         // surface its status code instead of parsing it blind.
@@ -885,7 +897,9 @@ export function apply(ctx: ClientContext): void {
                 ? null
                 : renderProbeError(t, error, copied, () => startCopy(error));
         let middle: unknown;
-        if (origin === undefined) {
+        if (status?.phase === "native-compaction") {
+            middle = hintP("native_compaction");
+        } else if (origin === undefined) {
             middle = hintP("degraded");
         } else if (remoteBlocked) {
             middle = renderRemoteBlock(t, origin, errorBox(liveEmbedError));

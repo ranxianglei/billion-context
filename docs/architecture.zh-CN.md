@@ -1,5 +1,7 @@
 # 架构总览
 
+DSH 可选的[原生模型策略](dsh-native-compaction.zh-CN.md)在 bili HTTP/WS 改写前分流。适配器控制预设内的原生压缩后端，用宿主持久化替换代数隔离后续 bili 压缩状态；kernel 与供应商适配器保持原样。
+
 > 系统架构的唯一枢纽。本页放**整体架构图**与**模块总表**；每个模块在本目录下有独立页面（中英各一份），每页配自己的图。
 > English: [architecture.md](./architecture.md)
 > 日本語: [architecture.ja.md](./architecture.ja.md)

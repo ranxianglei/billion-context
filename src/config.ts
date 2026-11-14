@@ -1148,6 +1148,8 @@ export type ProxyOptions = {
  *  warning, and each is ignored with a once-per-process deprecation note
  *  (warnRemovedDshAllowKey). */
 interface DshFileSettings {
+    /** Explicit native-compaction models; optional trailing * matches a model family. */
+    nativeCompactionModels?: Array<{ provider?: string; model: string }>;
     /** #3723/#3901: bili-authored compaction answers (ON by default since
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
      *  restores the #1729 refusal path). */
@@ -2710,7 +2712,7 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
         // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
         // (#4237) are the LIVE keys in the section — everything else found
         // here is removed/unknown and gets named.
-        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel", "nativeCompactionModels"]);
         for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();

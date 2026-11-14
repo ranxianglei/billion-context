@@ -160,9 +160,9 @@ export function rewriteCodexResponsesWsUrl(target: string, origin: string): stri
     return `${proxyWs}/bili/${target}`;
 }
 
-function prepareWsFrames(socket: WsInstanceLike, target: string, state: NativeInterceptState, identity: Record<string, string> | undefined, origin: NativeInterceptState["wsOrigin"], generation: unknown): WsInstanceLike {
+function prepareWsFrames(socket: WsInstanceLike, target: string, state: NativeInterceptState, identity: Record<string, string> | undefined, origin: NativeInterceptState["wsOrigin"], generation: unknown, nativeCompaction = false): WsInstanceLike {
     const assertCurrent = (): void => {
-        if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation || (state.wsOrigin ?? state.origin) !== origin) {
+        if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation || (!nativeCompaction && (state.wsOrigin ?? state.origin) !== origin)) {
             throw new Error("bili-native(ws): plugin state/origin changed; reconnect before sending");
         }
     };
@@ -181,6 +181,8 @@ function prepareWsFrames(socket: WsInstanceLike, target: string, state: NativeIn
             if (failed || socket.readyState !== 1) return;
             assertCurrent();
             if (!isCreate || typeof data !== "string") return send(data);
+            if ((state.nativeCompactionBypass?.() === true) !== nativeCompaction) throw new Error("bili-native(ws): compaction owner changed; reconnect before sending");
+            if (nativeCompaction) return send(data);
             if (state.toolsReady !== undefined) await withTimeout(state.toolsReady, state.readyTimeoutMs ?? 15_000);
             assertCurrent();
             const init: RequestInit = { body: data, headers: identity === undefined ? undefined : { ...identity } };
@@ -560,6 +562,10 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // plugin → pass through direct, never hit a disposed context.
             const state = (globalThis as GlobalRecord)[ACTIVE_STATE] as NativeInterceptState | undefined;
             if (target === undefined || state === undefined) return new RoutedWebSocket(url, ...rest);
+            if (state.nativeCompactionBypass?.()) {
+                return prepareWsFrames(new RoutedWebSocket(url, ...rest), target, state, undefined,
+                    state.wsOrigin ?? state.origin, (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ], true);
+            }
             // #5838: lanes arming the per-dispatch prep hooks (dsh: async
             // takeover verdict, tools-ready gate, fork-adoption beforeSend,
             // headersFor stamps) run them INSIDE the deferred window before the

@@ -8,6 +8,26 @@ import { parseModelEndpointPatterns } from "../src/model-endpoints.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 import * as pfChannel from "../src/agent/pf-channel.ts";
 
+test("explicit native compaction bypass preserves request bytes and headers before bili gates", async () => {
+    const original = globalThis.fetch;
+    const calls: Array<{ input: string | URL | Request; init?: RequestInit }> = [];
+    const anchor: typeof fetch = async (input, init) => { calls.push({ input, init }); return new Response("ok"); };
+    _resetForTest({ anchor });
+    globalThis.fetch = anchor;
+    const no = () => { throw new Error("bili hook must not run for native compaction"); };
+    try {
+        installNativeFetchIntercept({ origin: undefined, ready: Promise.resolve(undefined), nativeCompactionBypass: () => true, takeoverGate: no, beforeSend: no, headersFor: no });
+        const init = { method: "POST", body: '{"purpose":"compaction","signed":"unchanged"}', headers: { authorization: "test-signature" } };
+        await fetch("https://provider.invalid/v1/responses", init);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].input, "https://provider.invalid/v1/responses");
+        assert.equal(calls[0].init, init);
+        await fetch("http://127.0.0.1:9999/bili/https://provider.invalid/v1/responses", init);
+        assert.equal(calls[1].input, "https://provider.invalid/v1/responses");
+        assert.equal(calls[1].init, init);
+    } finally { _resetForTest({ anchor: original }); globalThis.fetch = original; }
+});
+
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/chat/completions"), true);

@@ -133,6 +133,8 @@ export interface NativeInterceptState {
      *  A wrong model's window is worse than none: resolve per request or
      *  stay silent. */
     declaredWindowForDirect?: () => number | undefined;
+    /** Explicit host-owned compression; unlike degraded direct, no bili mutations or refusals. */
+    nativeCompactionBypass?: () => boolean;
     /** #3248 incremental turns: response hook — fired with the routed
      *  Response BEFORE it is returned to the host, so response headers are
      *  readable without consuming the stream. Native hosts use it to read
@@ -1618,6 +1620,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 }
             }
             return send(input, init);
+        }
+        if (state.nativeCompactionBypass?.()) {
+            const direct = routedBiliModelUrl(url);
+            return send(direct === undefined ? input : typeof input === "string" || input instanceof URL ? direct : new Request(direct, input), init);
         }
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
