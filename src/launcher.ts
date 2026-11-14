@@ -61,7 +61,7 @@ import { stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
-import { applyOmpFirstEventTimeout, envMillis } from "./agent/native-bootstrap.js";
+import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, envMillis } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
@@ -6503,7 +6503,10 @@ async function abortLaunchOnBusyOverlay(handle: ProxyHandle, err: OverlayBusyErr
  *  because such tokens never reach this path anymore. */
 export function quoteWinToken(token: string): string {
     if (!/\s/.test(token) || token.includes('"')) return token;
-    return `"${token}"`;
+    // The receiving program reads 2n backslashes before a quote as n (MSVCRT /
+    // CommandLineToArgvW), so a trailing run is doubled or the closing quote halves it
+    // (an even run) or swallows itself (an odd one).
+    return `"${token.replace(/(\\+)$/, "$1$1")}"`;
 }
 
 /** #679: full command line for `comspec /d /s /c <line>` — tokens quoted as
@@ -7147,6 +7150,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // hold the first SSE event well past OMP's default 300s first-parsed-event
         // watchdog — export a wider first-event budget unless the user pinned one.
         applyOmpFirstEventTimeout(env);
+        // #6088: OMP >= 18.18 message threads send only the newest message per
+        // turn, so bili would never see (or compress) the conversation — turn
+        // them off unless the user pinned a value.
+        applyOmpMessageThreadsOff(env);
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
             clientArgs = ["-e", ompExt, ...clientArgs];
