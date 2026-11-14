@@ -155,10 +155,11 @@ export async function searchBlocksAsync(
 }
 
 /**
- * Map a UTF-16 offset in text.toLowerCase() back to text. Lowercasing only
- * changes length for U+0130 (İ) and U+017F (ſ), both context-free, so
- * per-character accumulation is exact; contextual rules (Greek sigma) are
- * length-preserving. (billion-context#6493)
+ * Map a UTF-16 offset in text.toLowerCase() back to text. Per-character
+ * accumulation is exact because the only length-changing lowercase mapping
+ * is U+0130 (İ, one to two UTF-16 units) and it is context-free; the
+ * contextual rules (Greek sigma) are length-preserving.
+ * (billion-context#6493)
  */
 function originalOffsetOf(text: string, lowerOffset: number): number {
   let lower = 0;
@@ -179,7 +180,7 @@ function originalOffsetOf(text: string, lowerOffset: number): number {
  * Preview centered on the first query-term hit (case-insensitive).
  * Falls back to the head when no term hits. The hit offset is found in the
  * lowercased text and mapped back to the original before windowing, so
- * length-expanding lowercasing (İ, ſ) cannot shift the window past the hit
+ * length-expanding lowercasing (İ) cannot shift the window past the hit
  * (billion-context#6493).
  */
 function makePreview(text: string, query: string, len: number): string {
