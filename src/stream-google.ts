@@ -22,6 +22,7 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     if (!candidate || !content || !Array.isArray(parts)) return body;
     let converted = false;
     let sawReal = false;
+    let promotedSignature = "";
     const noteParts: string[] = [];
     const keptParts: GooglePart[] = [];
     // Absorb signature in whole text (m00885): drop only when the request
@@ -33,6 +34,9 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
         const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
         if (fc && typeof fc.name === "string" && isProxyToolFor(fc.name, ctx.session, ctx.config)) {
             converted = true;
+            if (promotedSignature.length === 0 && typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0) {
+                promotedSignature = part.thoughtSignature;
+            }
             const args = fc.args !== null && typeof fc.args === "object" ? (fc.args as Record<string, unknown>) : {};
             noteParts.push(yield { name: fc.name, args, id: typeof fc.id === "string" ? fc.id : undefined });
             continue;
@@ -53,10 +57,28 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
         if (typeof injection.text === "string") noteParts.push(injection.text);
     }
     if (!converted) return body;
+    // Gemini attaches thoughtSignature only to the first functionCall part in a
+    // parallel-call turn; if a stripped proxy call carried it, promote it onto
+    // the first surviving real functionCall part so client replay stays signed.
+    if (sawReal && promotedSignature.length > 0) {
+        const firstFcIdx = keptParts.findIndex((p) => p && typeof p === "object" && p.functionCall !== undefined);
+        if (firstFcIdx >= 0) {
+            const firstFc = keptParts[firstFcIdx]!;
+            if (typeof firstFc.thoughtSignature !== "string" || firstFc.thoughtSignature.length === 0) {
+                keptParts[firstFcIdx] = { ...firstFc, thoughtSignature: promotedSignature };
+            }
+        }
+    }
     // The tool result is a NEW text part: an existing text part may carry a
     // thoughtSignature the client echoes back, and appending to its text would
     // leave the signature describing a string that no longer exists.
-    content.parts = [...keptParts, { text: noteParts.join("\n") }];
+    const notePart: GooglePart =
+        !sawReal &&
+        promotedSignature.length > 0 &&
+        !keptParts.some((p) => p && typeof p === "object" && typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0)
+            ? { text: noteParts.join("\n"), thoughtSignature: promotedSignature }
+            : { text: noteParts.join("\n") };
+    content.parts = [...keptParts, notePart];
     if (!sawReal) {
         candidate.finishReason = "STOP";
     }
