@@ -126,7 +126,12 @@ test("batches and individual calls produce identical complete ledgers and report
         }
     }
     assert.deepEqual(getCacheLedger(batched), getCacheLedger(separate));
-    assert.deepEqual(buildSessionCacheReport(batched), buildSessionCacheReport(separate));
+    // generatedAt is a wall-clock marker set at report-build time; two builds
+    // 1ms apart would otherwise flake the deepEqual. Normalize before compare.
+    const reportBatched = buildSessionCacheReport(batched);
+    const reportSeparate = buildSessionCacheReport(separate);
+    reportBatched.generatedAt = reportSeparate.generatedAt = 0;
+    assert.deepEqual(reportBatched, reportSeparate);
     assert.deepEqual(getCacheLedger(batched).folds.map((fold) => fold.k), [0, 0, 2, 0, null]);
 });
 
