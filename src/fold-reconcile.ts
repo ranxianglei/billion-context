@@ -1640,29 +1640,37 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): bool
     for (const block of blocks) {
         const lists = [block.effectiveMessageIds, block.directMessageIds] as (string[] | undefined)[];
         for (const list of lists) {
-            if (list === undefined) continue;
-            for (let i = 0; i < list.length; i++) {
-                const replacement = claims.get(list[i]);
-                if (replacement === undefined || replacement.length === 0) continue;
+            if (list === undefined || !list.some((id) => (claims.get(id)?.length ?? 0) > 0)) continue;
+            // Counts include unread originals and already emitted replacements.
+            const present = new Map<string, number>();
+            for (const id of list) present.set(id, (present.get(id) ?? 0) + 1);
+            const rewritten: string[] = [];
+            for (const id of list) {
+                const replacement = claims.get(id);
+                if (replacement === undefined || replacement.length === 0) {
+                    rewritten.push(id);
+                    continue;
+                }
                 // Claims map 1→N (a merged core stands in for a reasoning+text
                 // pair) and N→1 (both pair members claim one merged witness).
-                // Splice the targets in and drop any already present — a
+                // Write the targets in order and drop any already present — a
                 // block must never list the same message id twice. When the
                 // replacement is already in the list (the second member of an
                 // N→1 collapse), the old id is removed, not kept: two covered
                 // ids collapsing onto one live id is exactly the model-switch
                 // pair→merged shape (#2636).
-                const keep = replacement.filter((t) => !list.includes(t));
-                if (keep.length === 0) {
-                    list.splice(i, 1);
-                    i--;
-                    touched = true;
-                    continue;
+                const keep = replacement.filter((target) => !present.has(target));
+                const remaining = present.get(id)! - 1;
+                if (remaining === 0) present.delete(id);
+                else present.set(id, remaining);
+                for (const target of keep) {
+                    rewritten.push(target);
+                    present.set(target, (present.get(target) ?? 0) + 1);
                 }
-                list.splice(i, 1, ...keep);
-                i += keep.length - 1;
-                touched = true;
             }
+            list.length = rewritten.length;
+            for (let i = 0; i < rewritten.length; i++) list[i] = rewritten[i];
+            touched = true;
         }
     }
     return touched;
