@@ -139,6 +139,13 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // #5241 phase-0 startup-contract stakes: both spawn children — verify-attach
+    // drives one child per lane (sequential await), latches drives the stderr
+    // flip child. No shared ports (mock bili server + spawn stubs are listen(0)
+    // or unbound), so no real zone band is needed — the entries exist for the
+    // spawn tripwire alone, like #3890's
+    "tests/contract-v2-stake-latches.test.ts",
+    "tests/contract-v2-stake-verify-attach.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
