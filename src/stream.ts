@@ -1296,11 +1296,18 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         {
             const view = ctx.compressMessages ?? ctx.messages;
             const byRaw = res.state.messageRefs?.byRaw;
+            let messagesById: Map<string, CoreMessage> | undefined;
             for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
+                if (beforeIds.has(b.blockId) || b.directMessageIds.length === 0) continue;
+                if (!messagesById) {
+                    messagesById = new Map();
+                    for (const message of view) {
+                        if (!messagesById.has(message.id)) messagesById.set(message.id, message);
+                    }
+                }
                 const notes: string[] = [];
                 for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
+                    const m = messagesById.get(id);
                     if (!m) continue;
                     notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
                 }
