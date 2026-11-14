@@ -8,6 +8,7 @@ import { runMcpStdio } from "../mcp.js";
 import { fetchManifest } from "../agent/shared.js";
 import { nativeProxyScriptPath } from "../agent/native-bootstrap.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
+import { laneWatchdogFailureLimit, laneWatchdogIntervalMs } from "../knobs.js";
 import {
     activateKimiPluginMode,
     bootstrapKimiNative,
@@ -18,9 +19,6 @@ import {
     unrouteKimi,
     type KimiRouteApplied,
 } from "./native.js";
-
-const WATCHDOG_INTERVAL_MS = 30000;
-const WATCHDOG_FAILURE_LIMIT = 3;
 
 function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: string) => void): void {
     const state = { origin: applied.origin, applied };
@@ -35,7 +33,7 @@ function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: 
         async function watchdogTick(): Promise<void> {
             if (await probeProxyHealth(state.origin)) { failures = 0; return; }
             failures += 1;
-            if (failures < WATCHDOG_FAILURE_LIMIT) return;
+            if (failures < laneWatchdogFailureLimit()) return;
             if (attached) {
                 log(`attached proxy ${state.origin} unhealthy — waiting for it to recover`);
                 return;
@@ -59,7 +57,7 @@ function startWatchdog(applied: KimiRouteApplied, attached: boolean, log: (msg: 
             }
             failures = 0;
         }
-    }, WATCHDOG_INTERVAL_MS);
+    }, laneWatchdogIntervalMs());
     timer.unref?.();
 }
 

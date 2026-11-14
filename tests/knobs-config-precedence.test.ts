@@ -496,6 +496,38 @@ test("#3619 stagger knobs: undefined default (caller composes), ms file tier, du
     clearConfig();
 });
 
+test("#4006 lane watchdog knobs: defaults 30000/3, file tier, env precedence, floors", () => {
+    clearConfig();
+    assert.equal(knobs.laneWatchdogIntervalMs(), 30_000);
+    assert.equal(knobs.laneWatchdogFailureLimit(), 3);
+
+    setConfig({ watchdog: { intervalMs: 5000, failureLimit: 2 } });
+    assert.equal(knobs.laneWatchdogIntervalMs(), 5000);
+    assert.equal(knobs.laneWatchdogFailureLimit(), 2);
+
+    withEnv({ BILI_WATCHDOG_INTERVAL_MS: "7000", BILI_WATCHDOG_FAILURE_LIMIT: "5" }, () => {
+        assert.equal(knobs.laneWatchdogIntervalMs(), 7000, "env wins over file");
+        assert.equal(knobs.laneWatchdogFailureLimit(), 5);
+    });
+
+    // garbage / out-of-range values fall back to the default and never throw
+    setConfig({ watchdog: { intervalMs: "soon", failureLimit: 0 } });
+    assert.equal(knobs.laneWatchdogIntervalMs(), 30_000);
+    assert.equal(knobs.laneWatchdogFailureLimit(), 3);
+    withEnv({ BILI_WATCHDOG_INTERVAL_MS: "junk", BILI_WATCHDOG_FAILURE_LIMIT: "-1" }, () => {
+        assert.equal(knobs.laneWatchdogIntervalMs(), 30_000);
+        assert.equal(knobs.laneWatchdogFailureLimit(), 3);
+    });
+    // sub-second intervals floor out to the default (seconds-vs-ms typo guard)
+    withEnv({ BILI_WATCHDOG_INTERVAL_MS: "5" }, () => {
+        assert.equal(knobs.laneWatchdogIntervalMs(), 30_000);
+    });
+    withEnv({ BILI_WATCHDOG_INTERVAL_MS: "1000" }, () => {
+        assert.equal(knobs.laneWatchdogIntervalMs(), 1000, "the floor itself is accepted");
+    });
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;
