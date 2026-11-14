@@ -10,22 +10,6 @@ import path from "node:path";
 // Hermetic: fresh XDG_STATE_HOME + absent BILI_CONFIG_FILE ⇒ defaults
 // (promptCache.routing disabled, no rollout override, nothing dismissed).
 
-// #6480 follow-up (#6480 regression): the sqlite-default entry asserts the NEW
-// pure-sqlite default posture, but this suite inherited
-// BILI_STORAGE_UNIFIED=legacy from tests/preload-storage-baseline.mjs, so the
-// gate went silent and the expectation failed on every CI test shard. A suite
-// whose assertions depend on a storage mode MUST pin it itself (#4011 lesson):
-// clearing the storage knobs restores the absent default the test documents.
-for (const k of [
-    "BILI_STORAGE_UNIFIED",
-    "BILI_STORAGE_JSON_WRITER",
-    "BILI_STORAGE_BACKEND",
-    "BILI_ENCRYPTION_KEY",
-    "BILI_PERSIST",
-]) {
-    delete process.env[k];
-}
-
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-state-"));
 const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-")), "absent.json");
 // Hermetic dsh home too: the iot-thinking probe must see NO profiles here, or
@@ -33,6 +17,13 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+
+// This suite asserts the PRODUCTION default storage posture. The CI corpus
+// baseline (tests/preload-storage-baseline.mjs, #2815) forces
+// BILI_STORAGE_UNIFIED=legacy for every test file, which flips the
+// pure-sqlite-default notice (#6480) off — pin our own selection per the
+// baseline's documented rule (the #4011 lesson).
+delete process.env.BILI_STORAGE_UNIFIED;
 
 const { NOTICES, visibleNotices, SQLITE_DEFAULT_NOTICE_ID } = await import("../src/notices.ts");
 const { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissUpgradeNotice } = await import("../src/pck-notice.ts");
