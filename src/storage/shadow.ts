@@ -807,6 +807,27 @@ export class UnifiedShadow {
         }
     }
 
+    /** #5599 bulk migration: one-shot digest verification of a freshly imported
+     *  session against its legacy source view — the same verifier as the
+     *  steady-state sample in record(), without the latch/freeze side effects
+     *  (the migrate tool reports, it does not heal). Null on network backends
+     *  (no sync read path); throws only when the ingest vanished its own row. */
+    verifyImported(legacy: LegacySessionLike): ReturnType<BatchedViewVerification["finish"]> | null {
+        if (this.sync === null) return null;
+        const sessionRow = this.sync.getSessionRow(legacy.id);
+        if (!sessionRow) throw new Error(`session row missing after import: ${legacy.id}`);
+        const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+        for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
+            const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
+            verifier.addBlocks(rows);
+            if (rows.length < VERIFY_BATCH_SIZE) break;
+        }
+        for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
+            verifier.addMessages(this.sync.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
+        }
+        return verifier.finish();
+    }
+
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
         if (this.sync === null) return;
@@ -1071,6 +1092,18 @@ export class UnifiedShadow {
     seqByRaw(sessionId: string): Map<string, number> | null {
         if (this.sync === null) return null;
         return this.sync.seqByRaw(sessionId);
+    }
+
+    /** #5599: row-backed msg ids (live OR retired) for the re-stamp
+     *  completeness check — same full-trust gate as seqByRaw. Null when the
+     *  store cannot answer; the caller fails safe to keeping legacy refs. */
+    backedMsgIds(sessionId: string, msgIds: string[]): Set<string> | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.backedMsgIds(sessionId, msgIds);
+        } catch {
+            return null;
+        }
     }
 
     /** #4316 PR3/3: live (non-retired) message row count. */

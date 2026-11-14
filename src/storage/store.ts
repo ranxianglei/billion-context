@@ -3089,6 +3089,29 @@ export class UnifiedStore {
         return out;
     }
 
+    /** #5599: which of these msg_ids own at least ONE row (live OR retired).
+     *  Completeness check for the one-time ledger re-stamp: an imported
+     *  collapsed ledger (folded ghosts never got rows; the tail re-based at
+     *  seq 0) must not be stamped, because the stamp evicts the ghost
+     *  bindings onto fresh numbers and re-targets saved citations at newer
+     *  bodies. Native ledgers always qualify — the historian sweep retires
+     *  covered rows instead of deleting them (#4390), so every mapped id
+     *  keeps its row. */
+    backedMsgIds(sessionId: string, msgIds: string[]): Set<string> {
+        const out = new Set<string>();
+        if (msgIds.length === 0) return out;
+        const CHUNK = 500;
+        for (let i = 0; i < msgIds.length; i += CHUNK) {
+            const chunk = msgIds.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            const rows = this.db
+                .prepare(`SELECT DISTINCT msg_id FROM messages WHERE session_id = ? AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as Record<string, unknown>[];
+            for (const r of rows) out.add(r.msg_id as string);
+        }
+        return out;
+    }
+
     /** #4316 PR3/3: fork adoption clones the parent's rows wholesale so the
      *  child's cloned kernel refs keep pointing at the same ledger positions
      *  (owner decision 2026-10-22: fork copies every number). The child
