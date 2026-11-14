@@ -394,11 +394,10 @@ async function ocRun(
       cwd: ctx.ocCwd,
       env: {
         ...cleanEnv(),
-        // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope
-        // writer OFF, but this lane asserts on the on-disk .json session
-        // file. Pin the writer ON so the envelope this test was written for
-        // is still produced regardless of the storage-mode default.
-        BILI_STORAGE_JSON_WRITER: "on",
+        // Pure-SQLite is the default storage writer now (2026-11-13): this lane
+        // asserts the JSONL session envelopes — pin dual-write so coverage does
+        // not depend on the default (pure-SQLite path: unit tests + gate).
+        BILI_STORAGE_JSON_WRITER: "1",
         HOME: ctx.homeDir,
         TMPDIR: ctx.tmdir,
         XDG_CONFIG_HOME: ctx.xdg.config,
