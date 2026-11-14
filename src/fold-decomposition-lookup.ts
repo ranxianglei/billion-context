@@ -102,9 +102,11 @@ export function resolveStoredDecompositions(
     // Latest seq per id wins (edits append rows); neighbors stay in so rc
     // pairs keep adjacency for turn-key derivation. Unparseable rows are
     // auxiliary-evidence misses, not errors — count them, don't throw.
+    // #4747: dedup through ONE per-id map, sorted at the end — an incremental
+    // splice with an index map goes stale when rows interleave by seq
+    // (A1,B1,A2,B2) and deletes the wrong element.
     let skipped = 0;
-    const latestSeq = new Map<string, number>();
-    const ordered: { seq: number; m: CoreMessage }[] = [];
+    const best = new Map<string, { seq: number; m: CoreMessage }>();
     for (const row of rows) {
         let parsed: unknown;
         try {
@@ -122,23 +124,11 @@ export function resolveStoredDecompositions(
             skipped++;
             continue;
         }
-        const prev = latestSeq.get(row.msgId);
-        if (prev !== undefined && prev >= row.seq) continue;
-        latestSeq.set(row.msgId, row.seq);
-        // Replace any earlier decomposition of the same msg id in place. The
-        // old index-bookkeeping (splice + cached indices) went stale the
-        // moment one splice shifted later entries — a second duplicate then
-        // removed the WRONG element (or none) and left both copies in.
-        for (let i = ordered.length - 1; i >= 0; i--) {
-            if (ordered[i]!.m.id === m.id) {
-                ordered.splice(i, 1);
-                break;
-            }
-        }
-        ordered.push({ seq: row.seq, m });
+        const prev = best.get(row.msgId);
+        if (prev !== undefined && prev.seq >= row.seq) continue;
+        best.set(row.msgId, { seq: row.seq, m });
     }
     if (skipped > 0) loggerLog("debug", `[fold-reconcile] stored decomposition: ${skipped} unparseable row(s) skipped`);
-    if (ordered.length === 0) return undefined;
-    ordered.sort((a, b) => a.seq - b.seq);
-    return ordered.map((o) => o.m);
+    if (best.size === 0) return undefined;
+    return [...best.values()].sort((a, b) => a.seq - b.seq).map((o) => o.m);
 }
