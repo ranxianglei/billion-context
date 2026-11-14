@@ -30,7 +30,7 @@ import { biliSpawnEnv, isolatedEnv, npmHomeEnv, npmRunSync, windowsSystemEnv } f
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
     name: string;
-    files?: string[];
+    files: string[];
     scripts?: Record<string, string>;
 };
 
