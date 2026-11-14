@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
-import { startServer } from "../src/server.ts";
+import { startServer, _disposeServedWriterForTest } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -1002,6 +1002,13 @@ for (const storageMode of ["legacy", "full"] as const) {
             const fork = await h.request("/__bili/plugin/fork", req);
             assert.equal(fork.status, 201);
             const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+            // #394/#5716: every commit stamps THIS process's writer marker, so
+            // while h lives its marker lists parent+child as actively served
+            // and the stand-in's hot-adoption guard would refuse both ids as
+            // held by a live peer. Record the graceful stop now (#4626
+            // handover semantics); the lingering-predecessor refusals stay
+            // pinned in tests/hot-adoption-guard.test.ts.
+            _disposeServedWriterForTest();
             // #5046/#5075 (2026-10-30 owner chain): two LIVE bili processes on
             // ONE sessions dir is refused — sharing a dir across lanes is the
             // supported topology, same dir is split-brain risk. Close our own

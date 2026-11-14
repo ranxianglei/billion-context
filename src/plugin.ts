@@ -22,6 +22,7 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { hotWritersOf, describeHotWriter } from "./adoption-guard.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
@@ -1541,11 +1542,29 @@ export function forkParentRevisionLegacy(session: Session): string {
 // every later getSessionAsync of the id for the process lifetime.
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (await getStore().loadAsync(id)) return getSessionAsync(id);
+    // #394/#5624: adopting a session a LIVE peer instance is actively
+    //  writing is the split-brain state (two writers, one envelope — drift,
+    //  frozen rows). Management calls WRITE (withSessionLock + scheduleSave),
+    //  so refuse the disk adoption and let callers answer their honest
+    //  404/fail-closed; the error line names the peer. After the peer exits
+    //  its marker stops contesting and the id resolves again (handoff safe).
+    if (await getStore().loadAsync(id)) {
+        const hot = hotWritersOf(id);
+        if (hot.length > 0) {
+            loggerLog("error", `[plugin] conversation ${id} exists but another live instance is writing it (${hot.map(describeHotWriter).join(", ")}) — refusing to adopt it here; compress/status calls for it fail until that instance exits (#394)`);
+            return undefined;
+        }
+        return getSessionAsync(id);
+    }
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
     if (!(await getStore().loadAsync(persistedId))) return undefined;
+    const persistedHot = hotWritersOf(persistedId);
+    if (persistedHot.length > 0) {
+        loggerLog("error", `[plugin] conversation ${id} (alias of ${persistedId}) exists but another live instance is writing it (${persistedHot.map(describeHotWriter).join(", ")}) — refusing to adopt it here; compress/status calls for it fail until that instance exits (#394)`);
+        return undefined;
+    }
     return getSessionAsync(persistedId);
 }
 
@@ -1740,6 +1759,25 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     };
     try { if (await replay()) return; }
     catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
+    // #394/#5624: a fork POST landing while a LIVE peer instance is writing
+    //  either side of the pair fails closed BEFORE the create branch. The
+    //  idempotent-retry shape (first attempt succeeded on the peer) would
+    //  otherwise re-create the child here — replay() finds no adopted
+    //  session now that hot disk adoption is refused — and
+    //  recordPluginSession + flushSync(parent) would clobber the peer's rows:
+    //  the exact last-writer-wins damage this guard exists to stop (#3923).
+    //  Sits AFTER replay(): replay is read-only-safe (early-returns on the
+    //  child's committed envelope, else rewrites only the child's own record
+    //  — never the parent), so retries keep succeeding while the parent is
+    //  hot; only the create path needs the refusal.
+    {
+        const held = [...hotWritersOf(request.parentConversationId), ...hotWritersOf(request.childConversationId)];
+        if (held.length > 0) {
+            const peers = [...new Set(held.map(describeHotWriter))].join(", ");
+            loggerLog("error", `[plugin] fork ${request.parentConversationId} → ${request.childConversationId} refused: another live instance is writing it (${peers}) — stop that instance or route this client to it, then retry (#394)`);
+            return forkReply(res, 409, { ok: false, status: "unavailable", code: "HELD_BY_PEER_INSTANCE", error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` });
+        }
+    }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
@@ -2009,6 +2047,20 @@ export async function handlePluginStatus(conversationId: string, res: import("no
         return h;
     };
     let session = await resolveForkConversation(conversationId);
+    // #394/#5716: a refused hot adoption must NOT fall through to the
+    //  fallback-latest branch below — that would answer with a DIFFERENT
+    //  session's state under the requested id (wrong-session misroute).
+    //  Name the holder instead; liveness-scoped like every other refusal.
+    if (!session) {
+        const held = hotWritersOf(conversationId);
+        if (held.length > 0) {
+            const peers = [...new Set(held.map(describeHotWriter))].join(", ");
+            loggerLog("error", `[plugin] status ${conversationId} refused: another live instance is writing it (${peers}) (#394)`);
+            res.writeHead(409, jsonHeaders());
+            res.end(JSON.stringify({ ok: false, code: "HELD_BY_PEER_INSTANCE", error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` }));
+            return;
+        }
+    }
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
@@ -2421,6 +2473,20 @@ export async function handlePluginTool(
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;
+    }
+    // #394/#5624: the session may be hot on a live peer even when it
+    //  resolved from THIS process's memory (adopted before the peer started,
+    //  or the client load-balanced its turns across instances) — executing a
+    //  proxy tool writes the session, so this is the last write-vector gate.
+    {
+        const hot = hotWritersOf(session.id);
+        if (hot.length > 0) {
+            const peers = [...new Set(hot.map(describeHotWriter))].join(", ");
+            deps.log("error", `[plugin] tool "${tool}" refused for session ${session.id}: another live instance is writing it (${peers}) — stop one instance or point this client at the writer (#394)`);
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` }));
+            return;
+        }
     }
     // Absorb/rules enablement is per-session (last resolved config), so the
     // gate needs the session — it runs after the lookup above.
