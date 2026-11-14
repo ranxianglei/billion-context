@@ -8,8 +8,9 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
 
 /**
  * Agent-side fork adoption (#2399): a host extension reads its session header
- * (parent lineage marker — dsh stamps parentSession+isSeeded, pi/omp stamp
- * parentSession alone, opencode V2 derives it from session.created), and
+ * (dsh stamps isSeeded plus parentSession on legacy forks or the adoption-only
+ * forkSource.sessionId on newer ordinary forks; pi/omp stamp parentSession
+ * alone; opencode V2 derives it from session.created), and
  * before a fork child's first model request replays into the proxy, adopts
  * the parent conversation's compression state through the plugin fork
  * protocol (docs/plugin-protocol.md §8). This module is the client half: it projects the
@@ -55,6 +56,8 @@ type SnapshotResponse = {
     parentRevision?: string;
     orderHash?: string;
     orderedMessages?: ForkIdentity[];
+    comparison?: "raw";
+    durableFork?: boolean;
 };
 
 type ForkAdoptionResult =
@@ -89,6 +92,106 @@ export function forkIdentityHashOf(message: CoreMessage): string {
     const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
     const toolIsError = m.toolIsError === true;
     return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
+}
+
+function durableResponsesPayload(message: CoreMessage & Record<string, unknown>): unknown {
+    const value = message.rawResponsesItem;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value ?? null;
+    const item = value as Record<string, unknown>;
+    const keysOnly = (keys: string[]) => Object.keys(item).every((key) => keys.includes(key));
+    if (item.type === "function_call" && message.contentType === "tool-call" && item.name === message.toolName && item.arguments === message.text && keysOnly(["type", "id", "status", "call_id", "name", "arguments"])) return null;
+    if (item.type === "function_call_output" && message.contentType === "tool-result" && typeof item.output === "string" && item.output === message.text && keysOnly(["type", "id", "status", "call_id", "output"])) return null;
+    if (item.type === "message" && item.role === message.role && message.contentType === "text" && keysOnly(["type", "id", "status", "phase", "role", "content"])) {
+        if (typeof item.content === "string" && item.content === message.text) return null;
+        if (Array.isArray(item.content) && item.content.every((part: unknown) => {
+            if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+            const p = part as Record<string, unknown>;
+            return ["input_text", "output_text", "text"].includes(String(p.type)) && typeof p.text === "string" &&
+                Object.keys(p).every((key) => ["type", "text", "annotations"].includes(key)) &&
+                (p.annotations === undefined || (Array.isArray(p.annotations) && p.annotations.length === 0));
+        }) && item.content.map((part: { text: string }) => part.text).join("") === message.text) return null;
+    }
+    return item;
+}
+
+export function forkDurableIdentityHashOf(message: CoreMessage): string {
+    const m = message as CoreMessage & Record<string, unknown>;
+    return forkHash([
+        m.role, m.contentType, m.text ?? null, m.toolName ?? null,
+        m.contentType === "tool-call" || m.contentType === "tool-result" ? null : m.toolCallId ?? null,
+        m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, m.toolIsError === true,
+        ...["rawAnthropicBlock", "rawAnthropicMessage", "rawOpenaiMessage", "rawOpenaiContent", "rawOpenaiContentParts", "rawGoogleParts", "imageBase64", "imageMediaType", "imagePart", "reasoningContent", "reasoningPresent", "originalRole"].map((key) => m[key] ?? null),
+        durableResponsesPayload(m),
+    ]);
+}
+
+function durablePairedPayload(message: CoreMessage): CoreMessage | null {
+    const m = message as CoreMessage & Record<string, unknown>;
+    const normalized = { ...m };
+    const isCall = m.contentType === "tool-call";
+    const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+    const normalizeId = (value: Record<string, unknown>, key: string): Record<string, unknown> | null => {
+        if (value[key] === undefined) return value;
+        return value[key] === m.toolCallId ? { ...value, [key]: null } : null;
+    };
+    if (record(m.rawAnthropicBlock) && m.rawAnthropicBlock.type === (isCall ? "tool_use" : "tool_result")) {
+        normalized.rawAnthropicBlock = normalizeId(m.rawAnthropicBlock, isCall ? "id" : "tool_use_id");
+        if (normalized.rawAnthropicBlock === null) return null;
+    }
+    if (record(m.rawResponsesItem) && (isCall ? ["function_call", "custom_tool_call"] : ["function_call_output", "custom_tool_call_output"]).includes(String(m.rawResponsesItem.type))) {
+        normalized.rawResponsesItem = normalizeId(m.rawResponsesItem, "call_id");
+        if (normalized.rawResponsesItem === null) return null;
+    }
+    if (Array.isArray(m.rawGoogleParts)) {
+        const parts: unknown[] = [];
+        const key = isCall ? "functionCall" : "functionResponse";
+        for (const part of m.rawGoogleParts) {
+            if (!record(part) || !record(part[key])) { parts.push(part); continue; }
+            const value = normalizeId(part[key], "id");
+            if (value === null) return null;
+            parts.push({ ...part, [key]: value });
+        }
+        normalized.rawGoogleParts = parts;
+    }
+    return normalized;
+}
+
+/** Empty hashes are unprovable tool edges, never reusable evidence. Callers
+ * sending a fork receipt omit them; server mirrors must not match empty hashes. */
+export function forkDurableIdentitiesOf(messages: CoreMessage[]): Array<{ rawId: string; identityHash: string }> {
+    const byToolId = new Map<string, number[]>();
+    const rawIdCounts = new Map<string, number>();
+    const identities = messages.map((message, index) => {
+        rawIdCounts.set(message.id, (rawIdCounts.get(message.id) ?? 0) + 1);
+        if (typeof message.toolCallId === "string" && message.toolCallId.length > 0) {
+            const indices = byToolId.get(message.toolCallId) ?? [];
+            indices.push(index);
+            byToolId.set(message.toolCallId, indices);
+        }
+        return {
+            rawId: message.id,
+            identityHash: message.contentType === "tool-call" || message.contentType === "tool-result" ? "" : forkDurableIdentityHashOf(message),
+        };
+    });
+    for (const indices of byToolId.values()) {
+        if (indices.length !== 2) continue;
+        const [callIndex, resultIndex] = indices as [number, number];
+        const call = messages[callIndex]!;
+        const result = messages[resultIndex]!;
+        if (call.contentType !== "tool-call" || call.role !== "assistant" || result.contentType !== "tool-result" || result.role !== "tool" ||
+            typeof call.id !== "string" || call.id.length === 0 || typeof result.id !== "string" || result.id.length === 0 ||
+            rawIdCounts.get(call.id) !== 1 || rawIdCounts.get(result.id) !== 1 ||
+            typeof call.toolName !== "string" || call.toolName.length === 0 ||
+            (result.toolName !== undefined && result.toolName !== call.toolName)) continue;
+        const callPayload = durablePairedPayload(call);
+        const resultPayload = durablePairedPayload(result);
+        if (callPayload === null || resultPayload === null) continue;
+        const callHash = forkDurableIdentityHashOf(callPayload);
+        const resultHash = forkDurableIdentityHashOf(resultPayload);
+        identities[callIndex]!.identityHash = forkHash([callHash, ["paired-tool-result", result.id, resultHash]]);
+        identities[resultIndex]!.identityHash = forkHash([resultHash, ["paired-tool-call", call.id, callHash]]);
+    }
+    return identities;
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
@@ -328,14 +431,31 @@ export function matchForkPrefix(core: CoreMessage[], identities: ForkIdentity[])
     return n;
 }
 
-function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[] } | null {
+/** Match an adoption-only fork coordinate by the durable raw message ids.
+ * DSH copies the inherited event objects, so these ids survive opaque/image
+ * content that cannot safely be compared by text. This is deliberately a
+ * separate mode: callers without explicit opaque permission keep the strict
+ * identity hash path above. */
+export function matchForkRawPrefix(core: CoreMessage[], identities: ForkIdentity[]): number {
+    let n = 0;
+    while (n < core.length && n < identities.length && typeof core[n]!.id === "string" && core[n]!.id === identities[n]!.rawId) n += 1;
+    return n;
+}
+
+function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[]; comparison: "text" | "raw"; durableFork: boolean } | null {
     if (raw === null || typeof raw !== "object") return null;
     const snap = raw as SnapshotResponse;
     if (typeof snap.parentRevision !== "string" || typeof snap.orderHash !== "string" || !Array.isArray(snap.orderedMessages)) return null;
     for (const identity of snap.orderedMessages) {
         if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || (identity.ref !== null && typeof identity.ref !== "string") || typeof identity.identityHash !== "string") return null;
     }
-    return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
+    return {
+        parentRevision: snap.parentRevision,
+        orderHash: snap.orderHash,
+        orderedMessages: snap.orderedMessages,
+        comparison: snap.comparison === "raw" ? "raw" : "text",
+        durableFork: snap.durableFork === true,
+    };
 }
 
 // #2469: error bodies are read BOUNDED — a hostile or misconfigured upstream
@@ -410,6 +530,8 @@ export async function tryForkAdoption(opts: {
     body: unknown;
     fetchImpl?: typeof fetch;
     log?: (line: string) => void;
+    allowOpaque?: boolean;
+    durableFork?: boolean;
 }): Promise<ForkAdoptionResult> {
     const doFetch = opts.fetchImpl ?? fetch;
     // #2469: deterministic protocol mismatch ends adoption BEFORE any network
@@ -423,15 +545,24 @@ export async function tryForkAdoption(opts: {
     const core = chatBodyToCore(opts.body);
     if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
+    let rawReferenceRequested = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
         try {
-            const res = await doFetch(snapshotUrl, { signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS) });
+            const url = rawReferenceRequested ? `${snapshotUrl}&mode=raw` : snapshotUrl;
+            const res = await doFetch(url, { signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS) });
             if (!res.ok) {
                 // #2469: surface the proxy's bounded diagnostics (e.g. 409
                 // SNAPSHOT_UNAVAILABLE + why) instead of hiding them behind a
-                // bare status code.
+                // bare status code. Verified DSH seeded children may retry an
+                // opaque snapshot through the raw-id reference view; callers
+                // without opaque permission remain text-comparison-only.
                 const detail = await readBoundedErrorBody(res);
+                if (!rawReferenceRequested && opts.allowOpaque === true && res.status === 409 && detail.code === "SNAPSHOT_UNAVAILABLE") {
+                    rawReferenceRequested = true;
+                    attempt -= 1;
+                    continue;
+                }
                 return { outcome: "degraded", reason: `snapshot http ${res.status}${detail.code ? ` ${detail.code}` : ""}${detail.error ? ` (${detail.error})` : ""}` };
             }
             snapshot = snapshotOf(await res.json());
@@ -439,12 +570,20 @@ export async function tryForkAdoption(opts: {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
-        const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
-        if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
+        const branchPoint = snapshot.comparison === "raw"
+            ? matchForkRawPrefix(core, snapshot.orderedMessages)
+            : matchForkPrefix(core, snapshot.orderedMessages);
+        const durableMessages = opts.durableFork === true && snapshot.durableFork
+            ? forkDurableIdentitiesOf(core).filter((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash))
+            : [];
+        const durableFork = durableMessages.length > 0;
+        if (branchPoint === 0 && !durableFork) return { outcome: "degraded", reason: "no prefix match" };
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
         const orderHash = branchPoint === snapshot.orderedMessages.length ? snapshot.orderHash : forkOrderHashOf(prefix);
         const payload = {
-            protocolVersion: 1,
+            protocolVersion: snapshot.comparison === "raw" || durableFork ? 2 : 1,
+            ...(snapshot.comparison === "raw" ? { comparison: "raw" as const } : {}),
+            ...(durableFork ? { durableFork: { messages: durableMessages } } : {}),
             parentConversationId: opts.parentConversationId,
             childConversationId: opts.childConversationId,
             parentRevision: snapshot.parentRevision,
@@ -513,7 +652,7 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
     }
 }
 
-export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown };
+export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown; allowOpaque?: boolean; durableFork?: boolean };
 
 /** Per-host fork-adoption coordinator (#2399 stage 2): absorbs the bookkeeping
  *  every host needs (done/attempts/single-flight keyed by child id, the
@@ -571,6 +710,8 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             body: input.body,
             fetchImpl: opts?.fetchImpl,
             log,
+            allowOpaque: input.allowOpaque,
+            durableFork: input.durableFork,
         });
         if (result.outcome === "adopted") {
             done.add(input.child);

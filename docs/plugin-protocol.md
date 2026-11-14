@@ -51,7 +51,7 @@ Fetch once at plugin startup.
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
   "capabilities": {
-    "fork": { "protocolVersion": 2, "acceptsProtocolVersions": [1, 2], "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
+    "fork": { "protocolVersion": 2, "acceptsProtocolVersions": [1, 2], "durableFork": true, "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
   }
 }
 ```
@@ -173,7 +173,7 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
 
 ```json
 {
-  "ok": true, "protocolVersion": 2, "status": "exact",
+  "ok": true, "protocolVersion": 2, "status": "exact", "durableFork": true,
   "conversationId": "parent", "sessionId": "parent",
   "parentRevision": "<opaque SHA-256 revision>",
   "orderHash": "<SHA-256 of the full orderedMessages JSON>",
@@ -183,6 +183,8 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
 ```
 
 `messages` is in exactly the same order as `orderedMessages`, describes the raw `pluginSnapshot` rather than a folded view, and includes optional `text`, `toolName`, and `toolCallId`. Compare original text and role to establish the longest matching prefix; tool identities/content type must match too. Copy the corresponding ordered identities verbatim; `identityHash` and revisions are opaque and clients do not need a content-hash algorithm. A message the kernel hard-excludes from compression (`compress.protectedTools`) carries `"ref": null` in both arrays — it participates in ordering and identity but has no addressable ref; copy it verbatim like any other prefix entry. Only `mNNNNN` strings or `null` are legal ref values. Multimodal/opaque content that cannot be verified by this text projection returns `409`, `status: unavailable`, `code: SNAPSHOT_UNAVAILABLE`, not a guessed text match. Missing raw snapshots or inconsistent raw/ref/CCR mappings likewise fail closed. Raw snapshot retention is capped (`BILI_PUBLIC_SNAPSHOT_CAP_BYTES`, default 16 MiB, `0` disables): a session whose serialized raw snapshot grows past the cap stops being forkable — snapshot/fork answer `409 SNAPSHOT_UNAVAILABLE` — instead of retaining an unbounded raw copy forever.
+
+**DSH seeded adoption:** ordinary forks, sidechats and context-inheriting subagents share the same host gate: `isSeeded` and a validated source parent (`forkSource`, or the legacy `parentSession`). A fresh subagent does not qualify merely because it has a parent. Verified seeded children may retry that specific `SNAPSHOT_UNAVAILABLE` response with `GET /__bili/plugin/snapshot?conversationId=<stable-parent-id>&mode=raw`. The response carries `"comparison": "raw"`; the client matches the inherited prefix by stable `rawId` rather than text, then submits protocol 2 with `"comparison": "raw"` and the matched `orderedMessages`. Raw mode retains revision, ordered-prefix, raw/ref/CCR and block-integrity checks; it does not make opaque content text-comparable. Callers without this host permission retain the text-comparison path.
 
 `POST /__bili/plugin/fork` body:
 
@@ -201,6 +203,20 @@ Discover `capabilities.fork` from the manifest; do not infer support from the pa
 
 The branch is an ordered prefix, including an empty prefix. Compute its existing order hash as lowercase SHA-256 of UTF-8 `JSON.stringify(orderedMessages)` with each identity object's keys in order `rawId`, `ref`, `identityHash`; for a full prefix reuse snapshot `orderHash`. Do not hash descriptors or folded text. Extra child messages, including a final model reply that has not left the proxy yet, may be appended on the child's first model request after copying the matched prefix.
 
+**Optional durable evidence:** the manifest flag describes protocol support; the snapshot flag reports whether the unified ledger is currently available. Legacy storage or an unavailable sidecar yields `durableFork: false` in the snapshot, so clients keep the existing ordered-prefix protocol. Send this extension only when the snapshot explicitly advertises `durableFork: true`, and only with protocol 2:
+
+```json
+"durableFork": {
+  "messages": [{ "rawId": "h_example", "identityHash": "<durable semantic SHA-256 identity>" }]
+}
+```
+
+These are the child's actual ordered cores, not the snapshot's legacy `identityHash` values. The DSH adapter builds them with `forkDurableIdentitiesOf`; the server mirror is `forkDurableMessageIdentities`. The digest includes opaque payloads, signatures and tool error state. Tool identities additionally bind both endpoints to the peer's stable raw id and payload after proving a complete call/result pairing; a consistent wire-id rename is allowed, swapped ownership is not. Unprovable tool edges are omitted from the evidence. Identifiers must be unique and digests must be lowercase SHA-256.
+
+The server verifies evidence against archived parent cores, stable bidirectional refs and the parent's snapshot order. It copies only complete verified block closures and their originals. A block needs a retained non-reasoning witness; only explicitly classified, unambiguous assistant reasoning covered within the verified boundary may be absent. Missing or changed text, tools or media exclude the affected blocks. Child-only inserted messages remain in the actual request. The legacy ordered-prefix fields still pass their original checks, but a zero-length prefix is allowed when durable evidence proves inherited content. DSH event seq, first-ingestion storage seq and logical snapshot order are distinct coordinates; the server derives its storage cutoff from verified rows rather than copying the parent's latest state. An unavailable ledger or unsafe selection returns `409 DURABLE_FORK_UNAVAILABLE`.
+
+The durable receipt is revalidated against every actual model request, including after cold restore. Content, tool ownership, signature, ref or order drift removes affected inherited blocks and their consuming ancestors, clears stale per-ref render/content state, and persists the actual raw view before rendering. A later model switch may omit previously verified reasoning; changed or repeated reasoning under the same raw id invalidates its blocks. Issued refs remain reserved and are never reused. Older proxies and callers without the extension retain the existing provider-prefix protocol.
+
 New success is `201`; exact payload replay is `200` with `replayed: true`, even after restart or later parent changes. Both return `status`, `parentRevision`, `childRevision`, `sessionId`, `branchPoint`, `inheritedBlocks`, and `expandedBlocks`. Reusing the child id with another parent, key or payload returns `409 CHILD_CONFLICT`. Invalid shapes/version/identifiers return `400 INVALID_REQUEST`; absent parent returns `404 PARENT_NOT_FOUND`; stale parent returns `409 PARENT_REVISION_CONFLICT`; altered order/raw/ref/identity returns `409 BRANCH_POINT_CONFLICT`. Missing nested originals return `409 PARENT_STATE_INCOMPLETE` with `status: unavailable`. Publication/persistence failure returns `503 FORK_FAILED` with `status: unavailable` and exposes no child; the same request may be retried.
 
 Boundary handling is `exact` when complete blocks fit inside the prefix, `expanded` when a block crosses it (crossing summaries are omitted, affected nested descendants are expanded, matched originals are retained), and `unavailable` when safe reconstruction is impossible. Blocks, nested caches, raw messages, issued ref namespace, token snapshots, rules and prefix CCR payloads are independent copies. Note that the child inherits the parent's ENTIRE issued-ref namespace (dead refs included): refs are never reused, so forks keep allocating fresh refs without colliding with ids a sibling may still hold. The child never reads its parent's later state as a fallback. Registration and first-request resume heuristics do not replace its copied state. With existing persistence enabled, raw snapshots, receipts, nested originals and the child's CCR payloads survive restart; with persistence disabled, durability is not promised. Atomic child publication/idempotency covers concurrent requests to one proxy process; concurrent writers sharing one state directory across processes are not supported by this protocol.
@@ -213,7 +229,7 @@ Marker divert (#3248 phase 2 — native extensions): instead of switching the pr
 
 中文增量要点（#3248）：`POST /__bili/plugin/turn`，首次/恢复用 `sinceSeq:0` 全量（种子隐含 `resync:true`，永不 409）；此后每轮只发新增（含上一轮 assistant 回复，客户端自持）。响应即上游原文，`x-bili-applied-seq` 为应用后的长度，下一轮作 `sinceSeq` 回传。409 必须按 serverSeq 对齐或全量重同步；503 表示未开 storage.unified。会话身份沿用客户端自己的 conversation id——增量与全量重发同一会话可任意切换，折叠/工具/状态栏不变。阶段 2（标记分流）：普通模型请求上盖 `x-bili-plugin-turn: 1` 头 + 增量形状 body（顶层 conversationId/sinceSeq/messages、无顶层 model）即可，增量形状 turn 属 lane 流量，与直连 turn 端点同信任级（#3343）：非回环/隧道/不可信源一律 403（其探针本就 403，正常宿主不会远程发增量）；管理前缀（`/__bili/`、`/__acp/`）永不走分流。lane 按原始 URL 转发；探针 `GET /__bili/plugin/turn`；开关 rollout `pluginIncrementalTurns`（默认 0%=零变化，`BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1` 或配置强制开）。客户端状态机在 src/agent/incremental-client.ts，新宿主复用勿重写。已接宿主：pi/pi-native（同一扩展工厂，后者零代码继承）、dsh-native（fetch 补丁 beforeSend/headersFor/onResponse）、opencode（http.request 钩子 incremental 适配回调换 body+盖章）、omp（无头事件通道，读 body 里 prompt_cache_key 当会话 id，直接在 init 上盖章）；OpenAI 工具形状（tool_calls/role:tool）自动回退全量重发；每 URL 单飞行+30s 过期。
 
-中文集成要点：fork 协议现为 2(服务端同时接受 1)；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。被 `compress.protectedTools` 硬排除的消息在两个数组中均为 `"ref": null`（参与顺序与身份、无地址 ref），与其他前缀条目一样逐字提交；ref 合法值仅 `mNNNNN` 字符串或 `null`。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
+中文集成要点：fork 协议现为 2(服务端同时接受 1)；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。DSH 的普通 fork、侧聊与继承上下文子代理共用 `isSeeded` 和有效继承来源校验；全新子代理不继承。只有 snapshot 明确宣告 `durableFork: true` 时，才附加子会话实际有序消息的 durable 身份证明（包括不透明载荷、签名、工具错误与完整配对关系），可处理侧聊插入导致的零长度前缀。服务端按父原文、双向 ref 与父快照逻辑顺序选择完整块闭包，只特许省略边界内已证实的 assistant 思考消息；缺正文、工具、媒体或配对改变仍排除相关块。每轮及冷恢复核验实际请求，漂移时先移除受影响块和消费者再渲染，不复用已发出的 ref。统一账本不可用时，snapshot 返回 `durableFork: false`，客户端与旧代理一样继续原前缀协议。被 `compress.protectedTools` 硬排除的消息在两个数组中均为 `"ref": null`（参与顺序与身份、无地址 ref），与其他前缀条目一样逐字提交；ref 合法值仅 `mNNNNN` 字符串或 `null`。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
 
 ### Incremental cache-mark updates
 

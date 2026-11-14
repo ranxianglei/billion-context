@@ -184,7 +184,7 @@ billion-context/
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
 │   ├── toml-integer.ts           # Shared strict TOML integer reader for model token limits
-│   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)
+│   ├── plugin.ts                 # Cooperative protocol + verified durable-fork selection/revalidation
 │   ├── plugin-install.ts         # `bili plugin install` driving host channels
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)
 │   ├── pi-channel.ts             # pi npm-copy self-refresh spec form

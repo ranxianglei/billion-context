@@ -444,6 +444,7 @@
         1,
         2
       ],
+      "durableFork": true,
       "endpoint": "/__bili/plugin/fork",
       "snapshotEndpoint": "/__bili/plugin/snapshot"
     }

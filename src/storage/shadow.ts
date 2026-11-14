@@ -1424,17 +1424,21 @@ export class UnifiedShadow {
         });
     }
 
+    forkMessageRowsAsync(sessionId: string): Promise<{ seq: number; msgId: string; content: string }[]> {
+        return this.viaAsync([], () => this.sync!.getMessages(sessionId, { includeRetired: true }), () => this.backend!.getMessages(sessionId, { includeRetired: true }));
+    }
+
     /** Fork publication is strict: clone and initial state land together, or
      * nothing lands. Unlike shadow mirrors, an error cannot mean success. */
-    createForkAsync(parentId: string, child: LegacySessionLike): Promise<boolean> {
+    createForkAsync(parentId: string, child: LegacySessionLike, throughSeq?: number): Promise<boolean> {
         const initial = planIngest(child);
         if (this.sync !== null) {
-            const throughSeq = this.sync.lastLiveSeq(parentId);
-            return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial));
+            const bound = throughSeq ?? this.sync.lastLiveSeq(parentId) ?? -1;
+            return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, bound, initial));
         }
         return this.enqueue(async () => {
-            const throughSeq = await this.backend!.lastLiveSeq(parentId);
-            return this.backend!.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial);
+            const bound = throughSeq ?? await this.backend!.lastLiveSeq(parentId) ?? -1;
+            return this.backend!.cloneSessionRows(parentId, child.id, bound, initial);
         });
     }
 

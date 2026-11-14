@@ -10,11 +10,11 @@ import { defaultConfig, type CoreMessage } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, forkMessageIdentityHash } from "../src/plugin.ts";
+import { _resetPluginStateForTest, forkMessageIdentityHash, forkDurableMessageIdentityHash } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { chatBodyToCore, createForkAdopter, forkDurableIdentitiesOf, forkDurableIdentityHashOf, forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, matchForkRawPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
@@ -44,6 +44,188 @@ test("forkIdentityHashOf stays byte-identical to plugin.ts forkMessageIdentityHa
     ];
     for (const message of identityMatrix) {
         assert.equal(forkIdentityHashOf(message), forkMessageIdentityHash(message), JSON.stringify(message));
+    }
+});
+
+test("durable fork identity includes opaque payloads and remains client/server identical", () => {
+    const first = openaiBodyToCore({ messages: [{ role: "user", content: [{ type: "text", text: "inspect file" }, { type: "file", file_id: "file-A" }] }] })![0]!;
+    const changed = openaiBodyToCore({ messages: [{ role: "user", content: [{ type: "text", text: "inspect file" }, { type: "file", file_id: "file-B" }] }] })![0]!;
+    assert.equal(first.id, changed.id);
+    assert.equal(forkIdentityHashOf(first), forkIdentityHashOf(changed));
+    assert.notEqual(forkDurableIdentityHashOf(first), forkDurableIdentityHashOf(changed));
+    for (const message of [first, changed, ...seedCore]) {
+        assert.equal(forkDurableIdentityHashOf(message), forkDurableMessageIdentityHash(message));
+        assert.equal(forkDurableIdentityHashOf({ ...message, thinkingTokens: 999, ts: 1234 }), forkDurableIdentityHashOf(message));
+    }
+});
+
+test("durable fork identity ignores only redundant Responses wrappers and tool renumbering", () => {
+    const chat = chatBodyToCore({ messages: [
+        { role: "user", content: "run the check" },
+        { role: "assistant", tool_calls: [{ id: "chat-call", type: "function", function: { name: "bash", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "chat-call", content: "check passed" },
+    ] })!;
+    const responses = chatBodyToCore({ input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "run the check" }] },
+        { type: "function_call", id: "fc_item", call_id: "responses-call", name: "bash", arguments: "{}" },
+        { type: "function_call_output", call_id: "responses-call", output: "check passed" },
+    ] })!;
+    assert.equal(chat.length, responses.length);
+    for (let index = 0; index < chat.length; index++) {
+        assert.equal(chat[index]!.id, responses[index]!.id);
+        assert.equal(forkDurableIdentityHashOf(chat[index]!), forkDurableIdentityHashOf(responses[index]!));
+        assert.equal(forkDurableIdentityHashOf(responses[index]!), forkDurableMessageIdentityHash(responses[index]!));
+    }
+    const result = chat[2]!;
+    const failedResult = { ...result, toolIsError: true };
+    assert.notEqual(forkDurableIdentityHashOf(result), forkDurableIdentityHashOf(failedResult));
+    const text = chat[0]!;
+    const filePayload = { ...text, rawResponsesItem: { type: "message", role: "user", content: [{ type: "input_file", file_id: "file-A" }] } };
+    assert.notEqual(forkDurableIdentityHashOf(text), forkDurableIdentityHashOf(filePayload));
+    const signed = { ...text, rawAnthropicBlock: { type: "thinking", thinking: "same thought", signature: "sig-A" } };
+    const changedSignature = { ...signed, rawAnthropicBlock: { ...signed.rawAnthropicBlock, signature: "sig-B" } };
+    assert.notEqual(forkDurableIdentityHashOf(signed), forkDurableIdentityHashOf(changedSignature));
+});
+
+test("durable fork payload detects rawOpenaiMessage changes without changing legacy identity", () => {
+    const body = (name: string) => ({ messages: [
+        { role: "user", content: "question" },
+        { role: "system", content: [{ type: "text", text: "tool configuration" }, { type: "tool_addition", tools: [{ name }] }] },
+    ] });
+    const first = openaiBodyToCore(body("read-A"))![1]!;
+    const changed = openaiBodyToCore(body("read-B"))![1]!;
+    assert.equal(first.id, changed.id);
+    assert.equal(forkIdentityHashOf(first), forkIdentityHashOf(changed));
+    assert.notEqual(forkDurableIdentityHashOf(first), forkDurableIdentityHashOf(changed));
+    assert.notEqual(forkDurableIdentitiesOf([first])[0]!.identityHash, forkDurableIdentitiesOf([changed])[0]!.identityHash);
+    for (const message of [first, changed]) assert.equal(forkDurableIdentityHashOf(message), forkDurableMessageIdentityHash(message));
+});
+
+function parallelToolBody(callA = "id-A", callB = "id-B") {
+    return { messages: [
+        { role: "user", content: "inspect two files" },
+        { role: "assistant", tool_calls: [
+            { id: callA, type: "function", function: { name: "read", arguments: '{"path":"A"}' } },
+            { id: callB, type: "function", function: { name: "read", arguments: '{"path":"B"}' } },
+        ] },
+        { role: "tool", tool_call_id: callA, content: "X" },
+        { role: "tool", tool_call_id: callB, content: "Y" },
+    ] };
+}
+
+test("forkDurableIdentitiesOf accepts complete parallel tool ID renames across wires", () => {
+    const original = chatBodyToCore(parallelToolBody())!;
+    const before = structuredClone(original);
+    const renamed = chatBodyToCore(parallelToolBody("renamed-A", "renamed-B"))!;
+    const responses = chatBodyToCore({ input: [
+        { type: "message", role: "user", content: "inspect two files" },
+        { type: "function_call", id: "fc-A", call_id: "responses-A", name: "read", arguments: '{"path":"A"}' },
+        { type: "function_call", id: "fc-B", call_id: "responses-B", name: "read", arguments: '{"path":"B"}' },
+        { type: "function_call_output", call_id: "responses-A", output: "X" },
+        { type: "function_call_output", call_id: "responses-B", output: "Y" },
+    ] })!;
+    const identities = forkDurableIdentitiesOf(original);
+    assert.deepEqual(identities, forkDurableIdentitiesOf(renamed));
+    assert.deepEqual(identities, forkDurableIdentitiesOf(responses));
+    assert.ok(identities.every((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash)));
+    for (let index = 1; index < original.length; index++) assert.notEqual(identities[index]!.identityHash, forkDurableIdentityHashOf(original[index]!));
+    assert.deepEqual(original, before, "identity projection must not rewrite wire payloads");
+});
+
+test("forkDurableIdentitiesOf rejects parallel result ownership swaps on both endpoints", () => {
+    const original = chatBodyToCore(parallelToolBody())!;
+    const swapped = original.map((message) => message.contentType === "tool-result"
+        ? { ...message, toolCallId: message.toolCallId === "id-A" ? "id-B" : "id-A" }
+        : message);
+    assert.deepEqual(original.map(forkDurableIdentityHashOf), swapped.map(forkDurableIdentityHashOf), "per-cell ID erasure cannot prove call ownership");
+    const before = forkDurableIdentitiesOf(original);
+    const after = forkDurableIdentitiesOf(swapped);
+    assert.deepEqual(after[0], before[0]);
+    for (let index = 1; index < original.length; index++) {
+        assert.equal(after[index]!.rawId, before[index]!.rawId);
+        assert.notEqual(after[index]!.identityHash, before[index]!.identityHash);
+    }
+});
+
+test("forkDurableIdentitiesOf binds both endpoints to peer raw IDs and payloads", () => {
+    const original = chatBodyToCore(parallelToolBody())!;
+    const pair = [original[1]!, original[3]!];
+    const identities = forkDurableIdentitiesOf(pair);
+    for (const index of [0, 1]) {
+        for (const changed of [{ ...pair[index]!, id: "replacement-raw-id" }, { ...pair[index]!, text: "changed payload" }]) {
+            const messages = pair.map((message, i) => i === index ? changed : message);
+            const after = forkDurableIdentitiesOf(messages);
+            assert.notEqual(after[1 - index]!.identityHash, identities[1 - index]!.identityHash);
+        }
+    }
+});
+
+test("forkDurableIdentitiesOf fails closed on missing duplicate or ambiguous tool IDs", () => {
+    const original = chatBodyToCore(parallelToolBody())!;
+    const call = original[1]!;
+    const result = original[3]!;
+    const cases: Array<{ name: string; messages: CoreMessage[] }> = [
+        { name: "missing call", messages: [result] },
+        { name: "missing result", messages: [call] },
+        { name: "duplicate calls", messages: [call, { ...call, id: "other-call" }, result] },
+        { name: "duplicate results", messages: [call, result, { ...result, id: "other-result" }] },
+        { name: "reused ID in later pair", messages: [call, result, { ...call, id: "later-call" }, { ...result, id: "later-result" }] },
+        { name: "result before call", messages: [result, call] },
+        { name: "empty IDs", messages: [{ ...call, toolCallId: "" }, { ...result, toolCallId: "" }] },
+        { name: "absent IDs", messages: [{ ...call, toolCallId: undefined }, { ...result, toolCallId: undefined }] },
+        { name: "name conflict", messages: [call, { ...result, toolName: "write" }] },
+        { name: "missing call name", messages: [{ ...call, toolName: undefined }, result] },
+        { name: "wrong call role", messages: [{ ...call, role: "user" }, result] },
+        { name: "wrong result role", messages: [call, { ...result, role: "assistant" }] },
+        { name: "duplicate raw call ID", messages: [call, { ...result, id: call.id }] },
+        { name: "empty raw call ID", messages: [{ ...call, id: "" }, result] },
+        { name: "ID on non-tool cell", messages: [call, { ...original[0]!, toolCallId: call.toolCallId }, result] },
+        { name: "raw ID shared with non-tool cell", messages: [call, { ...original[0]!, id: call.id }, result] },
+    ];
+    for (const { name, messages } of cases) {
+        const identities = forkDurableIdentitiesOf(messages);
+        assert.equal(identities.length, messages.length, name);
+        for (let index = 0; index < messages.length; index++) {
+            if (messages[index]!.contentType === "tool-call" || messages[index]!.contentType === "tool-result") assert.equal(identities[index]!.identityHash, "", name);
+        }
+    }
+    assert.deepEqual(forkDurableIdentitiesOf([]), []);
+    assert.ok(forkDurableIdentitiesOf([call, { ...result, toolName: undefined }]).every((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash)));
+});
+
+test("forkDurableIdentitiesOf isolates duplicate tool IDs from unrelated valid evidence", () => {
+    const original = chatBodyToCore(parallelToolBody())!;
+    const identities = forkDurableIdentitiesOf([...original, { ...original[1]!, id: "duplicate-call-A" }]);
+    const before = forkDurableIdentitiesOf(original);
+    for (const index of [0, 2, 4]) assert.deepEqual(identities[index], before[index]);
+    for (const index of [1, 3, 5]) assert.equal(identities[index]!.identityHash, "");
+});
+
+test("forkDurableIdentitiesOf normalizes only proven opaque tool edge IDs", () => {
+    type PairFactory = (id: string, payload: string) => Array<CoreMessage & Record<string, unknown>>;
+    const call: CoreMessage = { id: "call-raw", role: "assistant", contentType: "tool-call", toolName: "read", text: "{}" };
+    const result: CoreMessage = { id: "result-raw", role: "tool", contentType: "tool-result", toolName: "read", text: "X" };
+    const factories: PairFactory[] = [
+        (id, payload) => [{ ...call, toolCallId: id, rawAnthropicBlock: { type: "tool_use", id, name: "read", input: {} } },
+            { ...result, toolCallId: id, rawAnthropicBlock: { type: "tool_result", tool_use_id: id, content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: payload } }] } }],
+        (id, payload) => [{ ...call, toolCallId: id },
+            { ...result, toolCallId: id, rawResponsesItem: { type: "function_call_output", call_id: id, output: [{ type: "input_text", text: "X" }, { type: "input_image", image_url: `data:image/png;base64,${payload}` }] } }],
+        (id, payload) => [{ ...call, toolCallId: id, rawResponsesItem: { type: "custom_tool_call", call_id: id, name: "read", input: "{}" } },
+            { ...result, toolCallId: id, rawResponsesItem: { type: "custom_tool_call_output", call_id: id, output: "X", opaque: payload } }],
+        (id, payload) => [{ ...call, toolCallId: id, rawGoogleParts: [{ functionCall: { id, name: "read", args: {} } }] },
+            { ...result, toolCallId: id, rawGoogleParts: [{ functionResponse: { id, name: "read", response: { output: "X", opaque: payload } } }] }],
+    ];
+    for (const factory of factories) {
+        const messages = factory("original-ID", "AAAA");
+        const before = structuredClone(messages);
+        const identities = forkDurableIdentitiesOf(messages);
+        assert.ok(identities.every((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash)));
+        assert.deepEqual(identities, forkDurableIdentitiesOf(factory("renamed-ID", "AAAA")));
+        const changed = forkDurableIdentitiesOf(factory("renamed-ID", "BBBB"));
+        for (let index = 0; index < identities.length; index++) assert.notEqual(identities[index]!.identityHash, changed[index]!.identityHash);
+        const mismatched = messages.map((message) => ({ ...message, toolCallId: "unmatched-core-ID" }));
+        assert.ok(forkDurableIdentitiesOf(mismatched).every((identity) => identity.identityHash === ""));
+        assert.deepEqual(messages, before);
     }
 });
 
@@ -113,6 +295,13 @@ test("matchForkPrefix returns the longest hash-equal prefix", () => {
     const unrelated: CoreMessage[] = [{ id: "q", role: "user", contentType: "text", text: "unrelated" }];
     assert.equal(matchForkPrefix(unrelated, identities), 0);
     assert.equal(matchForkPrefix([], identities), 0);
+});
+
+test("matchForkRawPrefix uses durable raw ids for opaque content", () => {
+    const identities = identitiesOf(seedCore).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    assert.equal(matchForkRawPrefix(seedCore, identities), 3);
+    assert.equal(matchForkRawPrefix([{ ...seedCore[0]!, id: "different" }], identities), 0);
+    assert.equal(matchForkRawPrefix([{ ...seedCore[0]!, id: "a" }, { ...seedCore[1]!, id: "b" }], identities), 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -188,6 +377,38 @@ test("tryForkAdoption adopts a full prefix and reuses the snapshot orderHash", a
     assert.equal(payload.branchPoint.orderHash, (snapshot as { orderHash: string }).orderHash);
     assert.deepEqual(payload.orderedMessages, (snapshot as { orderedMessages: unknown[] }).orderedMessages);
     assert.equal(payload.idempotencyKey, "fork:child");
+    assert.equal((payload as { durableFork?: boolean }).durableFork, undefined);
+});
+
+test("tryForkAdoption forwards child identity evidence only to a durable-capable proxy", async () => {
+    for (const supported of [true, false]) {
+        const calls: Recorded[] = [];
+        const snapshot = { ...snapshotFixture(seedCore) as Record<string, unknown>, ...(supported ? { durableFork: true } : {}) };
+        const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshot), fork: () => jsonRes({ ok: true }, 201) }, calls);
+        const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, durableFork: true, fetchImpl });
+        assert.deepEqual(result, { outcome: "adopted", branchPoint: 3, replayed: false });
+        const payload = calls.find((c) => c.url.includes("/__bili/plugin/fork"))!.body as { protocolVersion: number; durableFork?: { messages: { rawId: string; identityHash: string }[] } };
+        assert.equal(payload.protocolVersion, supported ? 2 : 1);
+        assert.deepEqual(payload.durableFork, supported ? { messages: forkDurableIdentitiesOf(openaiBodyToCore(parentBody)!).filter((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash)) } : undefined);
+    }
+});
+
+test("tryForkAdoption posts contextual tool identities and skips unprovable tool evidence", async () => {
+    for (const duplicate of [false, true]) {
+        const body = parallelToolBody();
+        if (duplicate) body.messages[1]!.tool_calls!.push({ ...body.messages[1]!.tool_calls![0]! });
+        const core = chatBodyToCore(body)!;
+        const calls: Recorded[] = [];
+        const snapshot = { ...snapshotFixture(core) as Record<string, unknown>, durableFork: true };
+        const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshot), fork: () => jsonRes({ ok: true }, 201) }, calls);
+        const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body, durableFork: true, fetchImpl });
+        assert.deepEqual(result, { outcome: "adopted", branchPoint: core.length, replayed: false });
+        const payload = calls.find((entry) => entry.url.includes("/__bili/plugin/fork"))!.body as { durableFork: { messages: Array<{ rawId: string; identityHash: string }> } };
+        const expected = forkDurableIdentitiesOf(core).filter((identity) => /^[a-f0-9]{64}$/.test(identity.identityHash));
+        assert.deepEqual(payload.durableFork.messages, expected);
+        assert.equal(expected.length, duplicate ? 3 : 5);
+        assert.equal(expected.some((identity) => identity.rawId === core[0]!.id), true, "ordinary messages survive an ambiguous tool edge");
+    }
 });
 
 test("tryForkAdoption hashes a partial prefix locally", async () => {
@@ -215,6 +436,26 @@ test("tryForkAdoption never posts a fork when the prefix does not match", async 
     assert.equal(calls.some((c) => c.url.includes("/__bili/plugin/fork")), false);
 });
 
+test("tryForkAdoption uses durable evidence after an inserted first message only when advertised", async () => {
+    for (const supported of [true, false]) {
+        const calls: Recorded[] = [];
+        const snapshot = { ...snapshotFixture(seedCore) as Record<string, unknown>, ...(supported ? { durableFork: true } : {}) };
+        const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshot), fork: () => jsonRes({ ok: true }, 201) }, calls);
+        const body = bodyFor([{ role: "user", content: "new sidechat instruction" }, { role: "user", content: "question one" }, { role: "assistant", content: "answer one" }]);
+        const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body, durableFork: true, fetchImpl });
+        assert.deepEqual(result, supported ? { outcome: "adopted", branchPoint: 0, replayed: false } : { outcome: "degraded", reason: "no prefix match" });
+        const fork = calls.find((call) => call.url.includes("/__bili/plugin/fork"));
+        assert.equal(fork !== undefined, supported);
+        if (fork) {
+            const payload = fork.body as { protocolVersion: number; branchPoint: { messageCount: number; orderHash: string }; orderedMessages: unknown[]; durableFork: { messages: unknown[] } };
+            assert.equal(payload.protocolVersion, 2);
+            assert.deepEqual(payload.branchPoint, { messageCount: 0, orderHash: forkOrderHashOf([]) });
+            assert.deepEqual(payload.orderedMessages, []);
+            assert.deepEqual(payload.durableFork.messages, forkDurableIdentitiesOf(chatBodyToCore(body)!));
+        }
+    }
+});
+
 test("tryForkAdoption degrades on snapshot failures without posting", async () => {
     const calls: Recorded[] = [];
     const notFound = routerFetch({ snapshot: () => new Response("{}", { status: 404 }) }, calls);
@@ -235,6 +476,68 @@ test("tryForkAdoption surfaces bounded snapshot diagnostics instead of a bare st
     assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (Error: multimodal or opaque content cannot be compared by text)" });
     assert.equal(calls.length, 1, "one snapshot attempt, no fork POST");
     assert.equal(calls.every((c) => !c.url.includes("/__bili/plugin/fork")), true);
+});
+
+test("tryForkAdoption uses raw snapshot fallback only for adoption coordinates", async () => {
+    const body = bodyFor([
+        { role: "user", content: "opaque question" },
+        { role: "assistant", content: "opaque answer", audio: { id: "audio_fixture" } },
+        { role: "user", content: "continue" },
+    ]);
+    const core = openaiBodyToCore(body)!;
+    const orderedMessages = identitiesOf(core).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    const snapshot = { ok: true, protocolVersion: 2, comparison: "raw", status: "exact", sessionId: "parent", parentRevision: "raw-rev", orderHash: hash(orderedMessages), orderedMessages };
+    const calls: Recorded[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const raw = init?.body;
+        const bodyValue = typeof raw === "string" ? JSON.parse(raw) as unknown : undefined;
+        calls.push({ url, method: init?.method ?? "GET", body: bodyValue });
+        if (url.includes("mode=raw")) return jsonRes(snapshot);
+        if (url.includes("/__bili/plugin/snapshot")) return new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE", error: "multimodal or opaque content cannot be compared by text" }), { status: 409, headers: { "content-type": "application/json" } });
+        if (url.includes("/__bili/plugin/fork")) return jsonRes({ ok: true }, 201);
+        return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body, allowOpaque: true, fetchImpl });
+    assert.deepEqual(result, { outcome: "adopted", branchPoint: core.length, replayed: false });
+    assert.equal(calls.filter((call) => call.url.includes("mode=raw")).length, 1);
+    const fork = calls.find((call) => call.url.includes("/__bili/plugin/fork"))!.body as { protocolVersion: number; comparison?: string };
+    assert.equal(fork.protocolVersion, 2);
+    assert.equal(fork.comparison, "raw");
+    const strictCalls: Recorded[] = [];
+    const strictFetch = routerFetch({ snapshot: () => new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE" }), { status: 409 }) }, strictCalls);
+    const strict = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "strict-child", body, fetchImpl: strictFetch });
+    assert.deepEqual(strict, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE" });
+    assert.equal(strictCalls.length, 1);
+});
+
+test("createForkAdopter forwards adoption-only opaque permission", async () => {
+    const body = bodyFor([
+        { role: "user", content: "opaque question" },
+        { role: "assistant", content: "opaque answer", audio: { id: "audio_fixture" } },
+        { role: "user", content: "continue" },
+    ]);
+    const core = openaiBodyToCore(body)!;
+    const orderedMessages = identitiesOf(core).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    const snapshot = { ok: true, protocolVersion: 2, comparison: "raw", status: "exact", sessionId: "parent", parentRevision: "raw-rev", orderHash: hash(orderedMessages), orderedMessages };
+    const calls: Recorded[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const raw = init?.body;
+        const bodyValue = typeof raw === "string" ? JSON.parse(raw) as unknown : undefined;
+        calls.push({ url, method: init?.method ?? "GET", body: bodyValue });
+        if (url.includes("/__bili/plugin/manifest")) return jsonRes({ capabilities: { fork: { protocolVersion: 2 } } });
+        if (url.includes("mode=raw")) return jsonRes(snapshot);
+        if (url.includes("/__bili/plugin/snapshot")) return new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE" }), { status: 409 });
+        if (url.includes("/__bili/plugin/fork")) return jsonRes({ ok: true }, 201);
+        return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+    const logs: string[] = [];
+    const adopter = createForkAdopter((line) => logs.push(line), { fetchImpl });
+    await adopter.maybeAdopt({ base: "http://proxy", parent: "parent", child: "child", body, allowOpaque: true });
+    assert.equal(calls.some((call) => call.url.includes("mode=raw")), true);
+    assert.equal(calls.some((call) => call.url.includes("/__bili/plugin/fork")), true);
+    assert.deepEqual(logs, ["fork child child adopted parent parent at branch point 3 (#2399)"]);
 });
 
 test("tryForkAdoption sanitizes control characters out of snapshot diagnostics (#2469)", async () => {

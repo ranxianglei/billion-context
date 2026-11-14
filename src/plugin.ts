@@ -1106,7 +1106,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         // #2652: maxToolDurationMs = the budget's totalTimeoutMs ceiling, so agent-side
         // bridges size their compress-call HTTP wait to the real server bound instead of a
         // fixed constant. Absent when the chain is off (classic summaries commit locally).
-        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], durableFork: true, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
     }));
 }
 
@@ -1189,6 +1189,8 @@ function comparableHistory(value: unknown): boolean {
 }
 type ForkRequest = {
     protocolVersion: 1 | 2;
+    comparison?: "raw";
+    durableFork?: { messages: { rawId: string; identityHash: string }[] };
     parentConversationId: string;
     childConversationId: string;
     parentRevision: string;
@@ -1242,6 +1244,106 @@ export function forkMessageIdentityHash(message: CoreMessage): string {
     return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m), redactedPayloadDigest(m)]);
 }
 
+function durableResponsesPayload(message: CoreMessage & Record<string, unknown>): unknown {
+    const value = message.rawResponsesItem;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value ?? null;
+    const item = value as Record<string, unknown>;
+    const keysOnly = (keys: string[]) => Object.keys(item).every((key) => keys.includes(key));
+    if (item.type === "function_call" && message.contentType === "tool-call" && item.name === message.toolName && item.arguments === message.text && keysOnly(["type", "id", "status", "call_id", "name", "arguments"])) return null;
+    if (item.type === "function_call_output" && message.contentType === "tool-result" && typeof item.output === "string" && item.output === message.text && keysOnly(["type", "id", "status", "call_id", "output"])) return null;
+    if (item.type === "message" && item.role === message.role && message.contentType === "text" && keysOnly(["type", "id", "status", "phase", "role", "content"])) {
+        if (typeof item.content === "string" && item.content === message.text) return null;
+        if (Array.isArray(item.content) && item.content.every((part: unknown) => {
+            if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+            const p = part as Record<string, unknown>;
+            return ["input_text", "output_text", "text"].includes(String(p.type)) && typeof p.text === "string" &&
+                Object.keys(p).every((key) => ["type", "text", "annotations"].includes(key)) &&
+                (p.annotations === undefined || (Array.isArray(p.annotations) && p.annotations.length === 0));
+        }) && item.content.map((part: { text: string }) => part.text).join("") === message.text) return null;
+    }
+    return item;
+}
+
+export function forkDurableMessageIdentityHash(message: CoreMessage): string {
+    const m = message as CoreMessage & Record<string, unknown>;
+    return forkHash([
+        m.role, m.contentType, m.text ?? null, m.toolName ?? null,
+        m.contentType === "tool-call" || m.contentType === "tool-result" ? null : m.toolCallId ?? null,
+        m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, m.toolIsError === true,
+        ...["rawAnthropicBlock", "rawAnthropicMessage", "rawOpenaiMessage", "rawOpenaiContent", "rawOpenaiContentParts", "rawGoogleParts", "imageBase64", "imageMediaType", "imagePart", "reasoningContent", "reasoningPresent", "originalRole"].map((key) => m[key] ?? null),
+        durableResponsesPayload(m),
+    ]);
+}
+
+function durablePairedPayload(message: CoreMessage): CoreMessage | null {
+    const m = message as CoreMessage & Record<string, unknown>;
+    const normalized = { ...m };
+    const isCall = m.contentType === "tool-call";
+    const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+    const normalizeId = (value: Record<string, unknown>, key: string): Record<string, unknown> | null => {
+        if (value[key] === undefined) return value;
+        return value[key] === m.toolCallId ? { ...value, [key]: null } : null;
+    };
+    if (record(m.rawAnthropicBlock) && m.rawAnthropicBlock.type === (isCall ? "tool_use" : "tool_result")) {
+        normalized.rawAnthropicBlock = normalizeId(m.rawAnthropicBlock, isCall ? "id" : "tool_use_id");
+        if (normalized.rawAnthropicBlock === null) return null;
+    }
+    if (record(m.rawResponsesItem) && (isCall ? ["function_call", "custom_tool_call"] : ["function_call_output", "custom_tool_call_output"]).includes(String(m.rawResponsesItem.type))) {
+        normalized.rawResponsesItem = normalizeId(m.rawResponsesItem, "call_id");
+        if (normalized.rawResponsesItem === null) return null;
+    }
+    if (Array.isArray(m.rawGoogleParts)) {
+        const parts: unknown[] = [];
+        const key = isCall ? "functionCall" : "functionResponse";
+        for (const part of m.rawGoogleParts) {
+            if (!record(part) || !record(part[key])) { parts.push(part); continue; }
+            const value = normalizeId(part[key], "id");
+            if (value === null) return null;
+            parts.push({ ...part, [key]: value });
+        }
+        normalized.rawGoogleParts = parts;
+    }
+    return normalized;
+}
+
+/** Empty hashes are unprovable tool edges, never reusable evidence. Callers
+ * sending a fork receipt omit them; server mirrors must not match empty hashes. */
+function forkDurableMessageIdentities(messages: CoreMessage[]): Array<{ rawId: string; identityHash: string }> {
+    const byToolId = new Map<string, number[]>();
+    const rawIdCounts = new Map<string, number>();
+    const identities = messages.map((message, index) => {
+        rawIdCounts.set(message.id, (rawIdCounts.get(message.id) ?? 0) + 1);
+        if (typeof message.toolCallId === "string" && message.toolCallId.length > 0) {
+            const indices = byToolId.get(message.toolCallId) ?? [];
+            indices.push(index);
+            byToolId.set(message.toolCallId, indices);
+        }
+        return {
+            rawId: message.id,
+            identityHash: message.contentType === "tool-call" || message.contentType === "tool-result" ? "" : forkDurableMessageIdentityHash(message),
+        };
+    });
+    for (const indices of byToolId.values()) {
+        if (indices.length !== 2) continue;
+        const [callIndex, resultIndex] = indices as [number, number];
+        const call = messages[callIndex]!;
+        const result = messages[resultIndex]!;
+        if (call.contentType !== "tool-call" || call.role !== "assistant" || result.contentType !== "tool-result" || result.role !== "tool" ||
+            typeof call.id !== "string" || call.id.length === 0 || typeof result.id !== "string" || result.id.length === 0 ||
+            rawIdCounts.get(call.id) !== 1 || rawIdCounts.get(result.id) !== 1 ||
+            typeof call.toolName !== "string" || call.toolName.length === 0 ||
+            (result.toolName !== undefined && result.toolName !== call.toolName)) continue;
+        const callPayload = durablePairedPayload(call);
+        const resultPayload = durablePairedPayload(result);
+        if (callPayload === null || resultPayload === null) continue;
+        const callHash = forkDurableMessageIdentityHash(callPayload);
+        const resultHash = forkDurableMessageIdentityHash(resultPayload);
+        identities[callIndex]!.identityHash = forkHash([callHash, ["paired-tool-result", result.id, resultHash]]);
+        identities[resultIndex]!.identityHash = forkHash([resultHash, ["paired-tool-call", call.id, callHash]]);
+    }
+    return identities;
+}
+
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
  *  exactly the field set forkMessageIdentityHash digests, plus id. An id
  *  prefix match alone would keep a stale snapshot when a resent history flips
@@ -1289,6 +1391,82 @@ function forkPrefixPreview(value: string): string {
  *  flags like toolIsError flipped under unchanged bytes), and structural shape
  *  changes (shorter replay, unmappable body). Any unexpected error stays
  *  fail-closed exactly as before. */
+export async function reconcilePublicForkInput(session: Session, protocol: WireProtocol, parsed: unknown): Promise<PublicForkPrefixVerdict | undefined> {
+    const receipt = session.metadata.publicForkReceipt as { durableInput?: { rawId: string; identityHash: string }[]; reasoningInput?: { rawId: string; identityHash: string }[] } | undefined;
+    if (!Array.isArray(receipt?.durableInput)) return undefined;
+    const incoming = incomingCoreMessages(protocol, parsed);
+    const identities = incoming ? forkDurableMessageIdentities(incoming) : [];
+    const seen = new Set<string>();
+    const repeated = new Set<string>();
+    for (const identity of identities) {
+        if (seen.has(identity.rawId)) repeated.add(identity.rawId);
+        seen.add(identity.rawId);
+    }
+    const actual = new Map(identities.map((m, index) => [m.rawId, { ...m, index }]));
+    const expected = new Map(receipt.durableInput.map((m, index) => [m.rawId, { ...m, index }]));
+    const reasoning = new Map(receipt.reasoningInput?.map((m) => [m.rawId, m.identityHash]));
+    const invalid = new Set(receipt.durableInput.filter((m) => {
+        const ref = session.state.messageRefs.byRaw[m.rawId];
+        const omittedReasoning = !actual.has(m.rawId) && reasoning.get(m.rawId) === m.identityHash;
+        return repeated.has(m.rawId) || !m.identityHash || (!omittedReasoning && actual.get(m.rawId)?.identityHash !== m.identityHash) || ref === undefined || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.rawId);
+    }).map((m) => m.rawId));
+    for (const omitted of receipt.reasoningInput ?? []) {
+        const ref = session.state.messageRefs.byRaw[omitted.rawId];
+        if (ref === undefined || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== omitted.rawId) ||
+            (actual.has(omitted.rawId) && (repeated.has(omitted.rawId) || actual.get(omitted.rawId)?.identityHash !== omitted.identityHash))) invalid.add(omitted.rawId);
+    }
+    const discarded = new Set<string>();
+    for (const block of session.state.blocks) {
+        const ordered = block.effectiveMessageIds.filter((id) => expected.has(id) && actual.has(id)).sort((a, b) => expected.get(a)!.index - expected.get(b)!.index);
+        if (block.effectiveMessageIds.some((id) => invalid.has(id)) || ordered.some((id, index) => index > 0 && actual.get(ordered[index - 1]!)!.index >= actual.get(id)!.index)) discarded.add(block.blockId);
+    }
+    for (let changed = true; changed;) {
+        changed = false;
+        for (const block of session.state.blocks) {
+            if (!discarded.has(block.blockId) && block.directBlockIds.some((id) => discarded.has(id))) {
+                discarded.add(block.blockId);
+                changed = true;
+            }
+        }
+    }
+    if (invalid.size === 0 && discarded.size === 0) return { ok: true };
+    session.state.blocks = session.state.blocks.filter((b) => !discarded.has(b.blockId));
+    for (const blockId of discarded) session.blockContents.delete(blockId);
+    const refs = new Set([...invalid].flatMap((id) => {
+        const ref = session.state.messageRefs.byRaw[id];
+        return ref && ref !== BLOCKED_REF ? [ref] : [];
+    }));
+    session.state.hiddenOrphanRefs = session.state.hiddenOrphanRefs?.filter((ref) => !refs.has(ref));
+    session.state.emergencyTruncateLatch = session.state.emergencyTruncateLatch?.filter((entry) => !refs.has(entry.ref));
+    session.state.renderDeferredRefs = session.state.renderDeferredRefs?.filter((ref) => !refs.has(ref));
+    session.state.deadRefs = session.state.deadRefs?.filter((ref) => !refs.has(ref));
+    if (session.state.viewLatches) session.state.viewLatches = Object.fromEntries(Object.entries(session.state.viewLatches).filter(([ref]) => !refs.has(ref)));
+    for (const ref of refs) delete session.state.tokenSnapshot[ref];
+    session.state.absorbed = session.state.absorbed?.filter((entry) => !invalid.has(entry.callMessageId) && !invalid.has(entry.resultMessageId) && (
+        (entry.absorbCallId !== undefined && incoming?.some((m) => m.contentType === "tool-call" && m.toolCallId === entry.absorbCallId)) ||
+        session.state.blocks.some((b) => b.active && !b.expanded && entry.summary.length > 0 && b.summary.includes(entry.summary))
+    ));
+    const store = contentStoreOf(session);
+    session.contentStore = cloneStoreForRefs(store, Object.keys(store.byRef).filter((ref) => !refs.has(ref))) ?? undefined;
+    session.contentStoreDirty = true;
+    session.metadata.publicSnapshotStoredRefs = Object.keys(session.contentStore?.byRef ?? {});
+    receipt.durableInput = receipt.durableInput.filter((m) => !invalid.has(m.rawId));
+    receipt.reasoningInput = receipt.reasoningInput?.filter((m) => !invalid.has(m.rawId));
+    session.pluginSnapshot = structuredClone(incoming ?? []);
+    session.lastMessages = structuredClone(session.pluginSnapshot);
+    session.lastMessagesFolded = false;
+    session.state.lastPassIds = session.pluginSnapshot.map((m) => m.id);
+    (session.transient ??= {}).pluginMessages = { processed: structuredClone(session.pluginSnapshot), original: structuredClone(session.pluginSnapshot) };
+    session.state.stats.tokensCompressed = session.state.blocks.filter((b) => b.active && !b.expanded).reduce((sum, b) => sum + b.compressedTokens, 0);
+    session.stats.contextTokens = prune(session.pluginSnapshot, session.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof session.metadata.systemPromptTokens === "number" ? session.metadata.systemPromptTokens : 0);
+    session.stats.contextTokensSource = "estimate";
+    session.stats.localInputEstimate = session.stats.contextTokens;
+    markDirty(session);
+    await getStore().writeNow(session);
+    loggerLog("warn", `[fork-durable] ${session.id}: discarded ${discarded.size} inherited block(s) after input drift (${invalid.size} changed/missing identities)`);
+    return { ok: false, reason: `durable-input-drift (messages=${invalid.size} blocks=${discarded.size})` };
+}
+
 export function publicForkInputCheck(session: Session, protocol: WireProtocol, parsed: unknown): PublicForkPrefixVerdict {
     const prefix = session.pluginSnapshot;
     if (session.metadata.publicForkReceipt === undefined) return { ok: false, reason: "receipt-missing" };
@@ -1415,7 +1593,8 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
-function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
+function forkSnapshot(session: Session, source?: CoreMessage[] | null, opts?: { comparison?: "raw" }) {
+    const rawComparison = opts?.comparison === "raw";
     const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
@@ -1434,8 +1613,9 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // flag every stamped cell as spurious drift on the child's first request.
     // Signed content rides thinkingSignature/googleThoughtSignature inside the
     // identity hash, so only genuinely uncomparable content (images, audio,
-    // publicSnapshotTextComparable === false) still refuses.
-    if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
+    // publicSnapshotTextComparable === false) still refuses. Raw comparison is
+    // an explicit verified DSH seeded-child path for otherwise opaque messages.
+    if (!rawComparison && session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
@@ -1464,7 +1644,7 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // the revision is only the cheap early-exit token.
     const activeBlockSet = session.state.blocks.filter((b) => b.active).map((b) => b.blockId).sort();
     const parentRevision = forkHash({ sessionId: session.id, seq: orderedMessages.length, blockSet: activeBlockSet });
-    return { protocolVersion: 2, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+    return { protocolVersion: 2, status: "exact", durableFork: getStore().replicasAvailable(), ...(rawComparison ? { comparison: "raw" as const } : {}), sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
 }
 
 /** #2671 Phase 2b transition digest: fork protocol v1 hashed the ENTIRE
@@ -1625,19 +1805,170 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
     res.end(JSON.stringify(body));
 }
 
-export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
+export async function handlePluginSnapshot(conversationId: string, res: ServerResponse, comparison?: "raw"): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
     const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
         await waitForReconstructionReplicas(session); // #5188 round 3: don't race self-recovery into a 409
-        await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
+        await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session, undefined, comparison ? { comparison } : undefined) }));
     } catch (err) {
         forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
     } finally {
         releaseInFlight(session);
     }
+}
+
+type DurableForkSelection = {
+    rawIds: Set<string>;
+    refs: Set<string>;
+    messages: CoreMessage[];
+    throughSeq: number;
+    reasoningInput: { rawId: string; identityHash: string }[];
+    blockIds: Set<string>;
+};
+
+function unresolvedForkMedia(message: CoreMessage): boolean {
+    const media = message as CoreMessage & Record<string, unknown>;
+    return (media.imageBase64 !== undefined && typeof media.imageBase64 !== "string") ||
+        ["rawAnthropicBlock", "rawAnthropicMessage", "rawOpenaiMessage", "rawOpenaiContent", "rawOpenaiContentParts", "rawResponsesItem", "rawGoogleParts"]
+            .some((key) => JSON.stringify(media[key])?.includes("{$media:"));
+}
+
+async function durableForkSelection(parent: Session, source: CoreMessage[], incoming: NonNullable<ForkRequest["durableFork"]>): Promise<DurableForkSelection | null> {
+    const wanted = new Map(incoming.messages.map((m) => [m.rawId, m.identityHash]));
+    const candidates = new Map<string, { message: CoreMessage; seq: number }>();
+    const generations = new Map<string, string>();
+    const ambiguous = new Set<string>();
+    const rows = await getStore().forkMessageRowsAsync(parent.id);
+    if (rows === null) return null;
+    const archived: { message: CoreMessage; seq: number }[] = [];
+    try {
+        for (const row of rows) {
+            const message = JSON.parse(row.content) as CoreMessage;
+            if (message.id !== row.msgId || typeof message.role !== "string") return null;
+            archived.push({ message, seq: row.seq });
+        }
+    } catch { return null; }
+    const remember = (message: CoreMessage, seq: number, digest: string) => {
+        if (!digest) { ambiguous.add(message.id); return; }
+        const previous = generations.get(message.id);
+        if (previous !== undefined && previous !== digest) ambiguous.add(message.id);
+        generations.set(message.id, digest);
+        if (wanted.get(message.id) !== digest) return;
+        const previousCandidate = candidates.get(message.id);
+        candidates.set(message.id, { message, seq: Math.min(previousCandidate?.seq ?? seq, seq) });
+    };
+    const tools = new Map<string, typeof archived>();
+    for (const row of archived) {
+        const message = row.message;
+        if (message.contentType !== "tool-call" && message.contentType !== "tool-result") {
+            remember(message, row.seq, forkDurableMessageIdentityHash(message));
+            continue;
+        }
+        if (!message.toolCallId) { ambiguous.add(message.id); continue; }
+        const group = tools.get(message.toolCallId) ?? [];
+        group.push(row);
+        tools.set(message.toolCallId, group);
+    }
+    for (const group of tools.values()) {
+        const pairs: { calls: typeof archived; results: typeof archived }[] = [];
+        let pair: typeof pairs[number] | undefined;
+        let valid = true;
+        for (const row of group) {
+            if (row.message.contentType === "tool-call") {
+                if (!pair || pair.results.length > 0) {
+                    pair = { calls: [], results: [] };
+                    pairs.push(pair);
+                }
+                if (pair.calls.length > 0 && pair.calls[0]!.message.id !== row.message.id) valid = false;
+                pair.calls.push(row);
+            } else {
+                if (!pair || pair.calls.length === 0) { valid = false; continue; }
+                if (pair.results.length > 0 && pair.results[0]!.message.id !== row.message.id) valid = false;
+                pair.results.push(row);
+            }
+        }
+        if (!valid || pairs.some((entry) => entry.results.length === 0)) {
+            for (const row of group) ambiguous.add(row.message.id);
+            continue;
+        }
+        for (const entry of pairs) {
+            for (const call of entry.calls) for (const result of entry.results) {
+                const identities = forkDurableMessageIdentities([call.message, result.message]);
+                remember(call.message, call.seq, identities[0]!.identityHash);
+                remember(result.message, result.seq, identities[1]!.identityHash);
+            }
+        }
+    }
+    const sourceIdentities = forkDurableMessageIdentities(source);
+    source.forEach((message, index) => {
+        const candidate = candidates.get(message.id);
+        const digest = sourceIdentities[index]!.identityHash;
+        if (wanted.has(message.id)) remember(message, candidate?.seq ?? -1, digest);
+        if (candidate && digest && wanted.get(message.id) === digest) candidates.set(message.id, { message, seq: candidate.seq });
+    });
+    const rawIds = new Set<string>();
+    const refs = new Set<string>();
+    const messages: CoreMessage[] = [];
+    let throughSeq = -1;
+    const includeRef = (rawId: string): boolean => {
+        const ref = parent.state.messageRefs.byRaw[rawId];
+        if (ref === undefined || (ref !== BLOCKED_REF && parent.state.messageRefs.byRef[ref] !== rawId)) return false;
+        rawIds.add(rawId);
+        if (ref !== BLOCKED_REF) refs.add(ref);
+        return true;
+    };
+    for (const { rawId } of incoming.messages) {
+        const candidate = candidates.get(rawId);
+        if (!candidate || candidate.seq < 0 || ambiguous.has(rawId)) continue;
+        if (unresolvedForkMedia(candidate.message) || !includeRef(rawId)) return null;
+        messages.push(candidate.message);
+        throughSeq = Math.max(throughSeq, candidate.seq);
+    }
+    const coveredIds = new Set(parent.state.blocks.flatMap((block) => block.effectiveMessageIds));
+    const reasoning = new Map<string, { message: CoreMessage; seq: number }>();
+    for (const row of archived) {
+        if (row.seq > throughSeq || (wanted.has(row.message.id) && !rawIds.has(row.message.id)) || !coveredIds.has(row.message.id)) continue;
+        if (row.message.role === "assistant" && row.message.contentType === "reasoning" && !row.message.summaryOfBlockId) reasoning.set(row.message.id, row);
+    }
+    const reasoningInput: DurableForkSelection["reasoningInput"] = [];
+    for (const [rawId, row] of reasoning) {
+        if (ambiguous.has(rawId) || !includeRef(rawId)) continue;
+        reasoningInput.push({ rawId, identityHash: forkDurableMessageIdentityHash(row.message) });
+    }
+    const incomingOrder = new Map(incoming.messages.map((message, index) => [message.rawId, index]));
+    const sourceOrder = new Map(source.map((message, index) => [message.id, index]));
+    const completeBlocks = new Set<string>();
+    const witnessedBlocks = new Set<string>();
+    for (const block of parent.state.blocks) {
+        if (block.effectiveMessageIds.length === 0 || !block.effectiveMessageIds.every((id) => rawIds.has(id))) continue;
+        const witnesses = block.effectiveMessageIds.filter((id) => candidates.has(id) && rawIds.has(id));
+        if (witnesses.some((id) => !sourceOrder.has(id))) continue;
+        witnesses.sort((a, b) => sourceOrder.get(a)! - sourceOrder.get(b)!);
+        if (witnesses.some((id, index) => index > 0 && incomingOrder.get(witnesses[index - 1]!)! >= incomingOrder.get(id)!)) continue;
+        completeBlocks.add(block.blockId);
+        if (witnesses.some((id) => candidates.get(id)!.message.contentType !== "reasoning")) witnessedBlocks.add(block.blockId);
+    }
+    for (let changed = true; changed;) {
+        changed = false;
+        for (const block of parent.state.blocks) {
+            if (completeBlocks.has(block.blockId) && block.directBlockIds.some((id) => !completeBlocks.has(id))) {
+                completeBlocks.delete(block.blockId);
+                changed = true;
+            }
+        }
+    }
+    const byBlockId = new Map(parent.state.blocks.map((block) => [block.blockId, block]));
+    const blockIds = new Set<string>();
+    const includeBlock = (blockId: string): void => {
+        if (blockIds.has(blockId)) return;
+        blockIds.add(blockId);
+        for (const childId of byBlockId.get(blockId)!.directBlockIds) includeBlock(childId);
+    };
+    for (const blockId of witnessedBlocks) if (completeBlocks.has(blockId)) includeBlock(blockId);
+    return messages.length > 0 ? { rawIds, refs, messages, throughSeq, reasoningInput, blockIds } : null;
 }
 
 function parseForkRequest(payload: string): ForkRequest {
@@ -1647,6 +1978,23 @@ function parseForkRequest(payload: string): ForkRequest {
     const identifier = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 256 && v.trim() === v && !/[\x00-\x1f\x7f]/.test(v);
     const hash = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
     if (b.protocolVersion !== 1 && b.protocolVersion !== 2) throw new Error("unsupported fork protocolVersion (expected 1 or 2)");
+    if (b.comparison !== undefined && b.comparison !== "raw") throw new Error("unsupported fork comparison (expected raw)");
+    let durableFork: ForkRequest["durableFork"];
+    if (b.durableFork !== undefined) {
+        if (!b.durableFork || typeof b.durableFork !== "object" || Array.isArray(b.durableFork)) throw new Error("invalid durableFork");
+        const raw = b.durableFork as Record<string, unknown>;
+        if (!Array.isArray(raw.messages) || raw.messages.length === 0) throw new Error("invalid durableFork.messages");
+        const seen = new Set<string>();
+        const messages = raw.messages.map((v: unknown) => {
+            if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("invalid durable fork identity");
+            const item = v as Record<string, unknown>;
+            if (!identifier(item.rawId) || !hash(item.identityHash) || seen.has(item.rawId)) throw new Error("invalid or duplicate durable fork identity");
+            seen.add(item.rawId);
+            return { rawId: item.rawId, identityHash: item.identityHash };
+        });
+        durableFork = { messages };
+    }
+    if ((b.comparison === "raw" || durableFork) && b.protocolVersion !== 2) throw new Error("raw/durable fork comparison requires protocolVersion 2");
     if (!identifier(b.parentConversationId) || !identifier(b.childConversationId) || !identifier(b.idempotencyKey) || !hash(b.parentRevision)) throw new Error("invalid fork identity/revision");
     if (b.parentConversationId === b.childConversationId) throw new Error("parent and child must differ");
     const point = b.branchPoint as Record<string, unknown> | null;
@@ -1658,7 +2006,7 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    return { protocolVersion: b.protocolVersion, ...(b.comparison === "raw" ? { comparison: "raw" as const } : {}), ...(durableFork ? { durableFork } : {}), parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1706,7 +2054,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // stand in with the verified unified raw tail (no fresh model call).
             const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
-            try { snapshot = forkSnapshot(parent, source); }
+            try { snapshot = forkSnapshot(parent, source, request.comparison === "raw" ? { comparison: "raw" } : undefined); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
             if (snapshot.parentRevision !== request.parentRevision) {
                 // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
@@ -1718,10 +2066,17 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
-            const rawIds = new Set(prefix.map((m) => m.rawId));
+            const durable = request.durableFork ? await durableForkSelection(parent, source!, request.durableFork) : null;
+            if (request.durableFork && durable === null) return forkReply(res, 409, { ok: false, status: "unavailable", code: "DURABLE_FORK_UNAVAILABLE", error: "durable fork ledger is unavailable or incomplete" });
+            const rawIds = durable?.rawIds ?? new Set(prefix.map((m) => m.rawId));
+            const forkRefs = durable?.refs ?? new Set(prefix.flatMap((m) => m.ref === null ? [] : [m.ref]));
+            const forkMessageRefs = durable
+                ? [...rawIds].map((rawId) => ({ rawId, ref: parent.state.messageRefs.byRaw[rawId]! }))
+                : prefix;
             const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
-            const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
-            const blocks = parent.state.blocks.filter((b) => b.effectiveMessageIds.length > 0 && b.effectiveMessageIds.every((id) => rawIds.has(id)));
+            const eligible = (block: Session["state"]["blocks"][number]): boolean => durable ? durable.blockIds.has(block.blockId) : block.effectiveMessageIds.length > 0 && block.effectiveMessageIds.every((id) => rawIds.has(id));
+            const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !eligible(b));
+            const blocks = parent.state.blocks.filter(eligible);
             const blockIds = new Set(blocks.map((b) => b.blockId));
             const expandedChildren = new Set(crossing.flatMap((b) => b.directBlockIds));
             for (const b of [...blocks, ...crossing]) {
@@ -1735,32 +2090,31 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             // Keep the issued ref namespace reserved, including dead refs, to prevent reuse.
             child.state.messageRefs = structuredClone(parent.state.messageRefs);
-            for (const { rawId, ref } of prefix) {
+            for (const { rawId, ref } of forkMessageRefs) {
                 // #2620: ref null = intentionally unaddressable; keep the raw id reserved under
                 // the kernel sentinel exactly as the parent holds it. byRef/tokenSnapshot are
                 // numeric-ref spaces and never see the sentinel.
                 child.state.messageRefs.byRaw[rawId] = ref ?? BLOCKED_REF;
-                if (ref !== null) {
+                if (ref !== null && ref !== BLOCKED_REF) {
                     child.state.messageRefs.byRef[ref] = rawId;
                     if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
                 }
             }
             child.state.nextBlockId = parent.state.nextBlockId;
             child.state.nextRunId = parent.state.nextRunId;
-            child.state.lastPassIds = prefix.map((m) => m.rawId);
+            child.state.lastPassIds = [...rawIds];
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
-            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => forkRefs.has(ref));
             // #3939 ③: only latch entries whose messages rode the forked
             // prefix — the child never sees the others, so their entries
             // would be dead weight (and retire on the next latch pass anyway).
-            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
+            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => forkRefs.has(e.ref));
             // #3939 ②: deferred refs are content-keyed (byRaw ids) — keep only
             // the ones whose carrier rode the forked prefix.
-            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => prefix.some((m) => m.ref === r));
+            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => forkRefs.has(r));
             // #3939 ⑤: view-latch entries are ref-keyed — keep only the
             // carriers that rode the forked prefix.
-            const forkRefs = new Set(prefix.map((m) => m.ref));
             if (parent.state.viewLatches) {
                 child.state.viewLatches = Object.fromEntries(
                     Object.entries(parent.state.viewLatches).filter(([r]) => forkRefs.has(r)),
@@ -1785,11 +2139,12 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).
-            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
+            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !forkRefs.has(ref));
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
-            if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(source!.slice(0, request.branchPoint.messageCount));
+            const fullFork = durable ? source!.every((m) => rawIds.has(m.id)) : prefix.length === snapshot.orderedMessages.length;
+            if (fullFork) child.state.nudge = structuredClone(parent.state.nudge);
+            child.pluginSnapshot = structuredClone(durable?.messages ?? source!.slice(0, request.branchPoint.messageCount));
             const forkView = prune(child.pluginSnapshot, child.state);
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
@@ -1800,13 +2155,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.lastMessages = structuredClone(child.pluginSnapshot);
             child.lastMessagesFolded = false;
             const parentStore = contentStoreOf(parent);
-            for (const { ref, rawId } of prefix) {
-                if (ref === null) continue;
+            for (const { ref, rawId } of forkMessageRefs) {
+                if (ref === null || ref === BLOCKED_REF) continue;
                 const entry = parentStore.byRef[ref];
                 if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
             }
-            child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
-            child.metadata.publicSnapshotTextComparable = true;
+            child.contentStore = cloneStoreForRefs(parentStore, forkRefs) ?? undefined;
+            child.metadata.publicSnapshotTextComparable = request.durableFork || request.comparison === "raw" ? false : true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
             for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
@@ -1835,13 +2190,13 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // cold-start (an auxiliary persona striking the fork child first
             // would sail through an unplanted needle and pollute the fresh
             // anchor before any guard has evidence).
-            if (parent.transient?.latestKnownMsgId) {
+            if (parent.transient?.latestKnownMsgId && rawIds.has(parent.transient.latestKnownMsgId)) {
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
-            child.metadata.publicForkReceipt = { requestHash, response };
-            await publishForkSession(child, parent.id);
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child, undefined, request.comparison === "raw" || request.durableFork ? { comparison: "raw" } : undefined).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            child.metadata.publicForkReceipt = { requestHash, response, ...(durable ? { durableInput: request.durableFork!.messages.filter((m) => rawIds.has(m.rawId)), reasoningInput: durable.reasoningInput } : {}) };
+            await publishForkSession(child, parent.id, durable?.throughSeq);
             recordPluginSession(request.childConversationId, child.id);
             // [#2399 stage 2] the host's session_start identity register claimed
             // this id with the same parent (see forkChildHeldBySameParent) — the

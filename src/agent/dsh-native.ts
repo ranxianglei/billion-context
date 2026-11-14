@@ -117,8 +117,14 @@ type AgentLike = {
         // #2399: dsh fork children (commands.ts fork()) persist the parent
         // SessionId + isSeeded on the child's SessionHeader; isSeeded gates the
         // adoption (subagent children also carry parentSession but start from
-        // a fresh task context — no replay to adopt).
-        header?: { parentSession?: unknown; isSeeded?: unknown } | undefined;
+        // a fresh task context — no replay to adopt). Newer DSH builds expose
+        // an adoption-only forkSource coordinate instead of overloading
+        // parentSession for ordinary forks; use its sessionId when present.
+        header?: {
+            parentSession?: unknown;
+            forkSource?: { sessionId?: unknown; boundary?: unknown } | undefined;
+            isSeeded?: unknown;
+        } | undefined;
     } | undefined;
 };
 // #1677: DSH's command executor hands the invoking agent to the handler via the
@@ -1300,14 +1306,14 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
 }
 
 // #2399: dsh fork-child adoption. A dsh fork child (header.isSeeded === true
-// with a parentSession) replays its parent's event prefix; without adoption
-// the replay lands as a brand-new conversation and preflight refolds the whole
-// inherited history from scratch (#2383). The beforeSend hook below adopts the
-// parent's compression state via the plugin fork protocol BEFORE the child's
-// first stamped model request, so the very request that carries the replay
-// already rides the inherited folds. The bookkeeping (once per sid, transient
-// retry cap, single-flight) lives in the shared createForkAdopter coordinator
-// (src/agent/fork-adopt.ts).
+// with parentSession or the adoption-only forkSource coordinate) replays its
+// parent's event prefix; without adoption the replay lands as a brand-new
+// conversation and preflight refolds the whole inherited history from scratch
+// (#2383). The beforeSend hook below adopts the parent's compression state via
+// the plugin fork protocol BEFORE the child's first stamped model request, so
+// the very request that carries the replay already rides the inherited folds.
+// The bookkeeping (once per sid, transient retry cap, single-flight) lives in
+// the shared createForkAdopter coordinator (src/agent/fork-adopt.ts).
 const dshForkAdopter = createForkAdopter((line) => {
     persistClientEvent(`bili-native-dsh: ${line}`);
 });
@@ -1333,14 +1339,35 @@ export type ForkChildSkipReason =
     | "parent-is-self";
 
 export type ForkChildVerdict =
-    | { ok: true; sid: string; parent: string }
+    | { ok: true; sid: string; parent: string; forkSource?: { boundary: number | null } }
     | { ok: false; reason: ForkChildSkipReason; sid?: string; detail?: string };
+
+/** Resolve the conversation id used by the fork protocol without changing
+ *  DSH's ownership semantics. `forkSource.sessionId` is the adoption-only
+ *  coordinate emitted by newer DSH ordinary forks; legacy dsh builds and
+ *  other hosts continue to use parentSession. */
+function forkSourceOf(header: NonNullable<AgentLike["session"]>["header"]): { sessionId: string; boundary: number | null } | undefined {
+    const source = header?.forkSource;
+    if (source === null || typeof source !== "object" || typeof source.sessionId !== "string" || source.sessionId.length === 0) return undefined;
+    const boundary = source.boundary;
+    if (boundary === null) return { sessionId: source.sessionId, boundary: null };
+    if (typeof boundary === "number" && Number.isSafeInteger(boundary) && boundary >= 0 && !Object.is(boundary, -0)) return { sessionId: source.sessionId, boundary };
+    return undefined;
+}
+
+function forkParentSessionOf(header: NonNullable<AgentLike["session"]>["header"]): string | undefined {
+    const source = forkSourceOf(header);
+    if (source !== undefined) return source.sessionId;
+    const parent = header?.parentSession;
+    return typeof parent === "string" && parent.length > 0 ? parent : undefined;
+}
 
 /** A seeded fork child of the current initiator, or the named reason it is
  *  not (or cannot be determined). The fork gate is header.isSeeded === true
- *  (set only by dsh's fork seed path): subagent sessions carry parentSession
- *  WITHOUT isSeeded — they run fresh task contexts, never replay the parent
- *  history, and must NOT inherit ("not-seeded" is intentional and stays
+ *  (set only by dsh's fork seed path). Newer dsh ordinary forks identify the
+ *  adoption parent through forkSource; legacy hosts use parentSession. A
+ *  parentSession-only subagent without isSeeded still runs a fresh task
+ *  context and must not inherit ("not-seeded" is intentional and stays
  *  silent — it is the documented majority of all traffic). */
 export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
     let init: AgentLike | undefined;
@@ -1376,11 +1403,12 @@ export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
     const sid = typeof session.id === "string" && session.id.length > 0 ? session.id : undefined;
     if (sid === undefined) return { ok: false, reason: "sid-missing" };
     if (session.header === undefined) return { ok: false, reason: "header-missing", sid };
-    const parent = session.header.parentSession;
+    const parent = forkParentSessionOf(session.header);
     if (session.header.isSeeded !== true) return { ok: false, reason: "not-seeded", sid };
-    if (typeof parent !== "string" || parent.length === 0) return { ok: false, reason: "parent-missing", sid };
+    if (parent === undefined) return { ok: false, reason: "parent-missing", sid };
     if (parent === sid) return { ok: false, reason: "parent-is-self", sid };
-    return { ok: true, sid, parent };
+    const forkSource = forkSourceOf(session.header);
+    return { ok: true, sid, parent, ...(forkSource ? { forkSource: { boundary: forkSource.boundary } } : {}) };
 }
 
 const forkGateNoted = new Set<string>();
@@ -1398,7 +1426,7 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
             return; // intentional non-inheritance — see forkChildVerdict
         case "parent-missing":
             noteForkGateOnce(`lineage:${verdict.sid}`, "warn",
-                `bili-native-dsh: fork adoption for ${verdict.sid} skipped — the session header says isSeeded but carries no usable parentSession; the child starts without inherited compression state (#4215)`);
+                `bili-native-dsh: fork adoption for ${verdict.sid} skipped — the session header says isSeeded but carries no usable parentSession or forkSource; the child starts without inherited compression state (#4215)`);
             return;
         case "parent-is-self":
             noteForkGateOnce(`lineage:${verdict.sid}`, "warn",
@@ -1600,7 +1628,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
         return;
     }
-    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, allowOpaque: true, durableFork: true });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed
