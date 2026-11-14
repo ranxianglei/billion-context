@@ -1824,6 +1824,13 @@ To make the first compaction fire earlier (and save tokens), in this order:
 
 Measure actual boot/context usage with `/acp` or the web UI before tuning.
 
+That implies a rule of thumb: **don't treat the nudge as a water level.** It
+measures *how much new compressible content has grown*, not *how much of the
+window is left* — in long sessions it reappears repeatedly, unrelated to window
+size or remaining space. To judge real headroom, use the absolute numbers on
+the `/acp` panel (the `Nudge:` line reports readings like `max compressible X <
+threshold Y`) or the usage percentage on the web panel.
+
 ### Soft target with elastic headroom (#1122)
 
 Autonomous agents often want two things at once: keep the *active* context small (cost/latency), while allowing a single task to burst well past that target when it genuinely needs to (e.g., reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — one field plays two roles at once (the usage-ratio denominator **and** the hard preflight wall), so any payload above it gets folded mid-task or fails fast (#1122).
