@@ -20,6 +20,7 @@ const PROXY_TOOL_SET = new Set([
     // here or their chunks raw-replay to the client as "real" calls. acp_cache
     // had the same gap before this change.
     "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
+    "acp_retrieve", "acp_rule", "acp_read_original_image",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
@@ -101,35 +102,53 @@ interface FunctionCallBuffer {
 }
 
 // A decision per buffered chunk that carried functionCall parts: "keep" = every
-// call in it is real (replay verbatim, preserving signatures/ids/order), null =
-// only proxy calls (drop — the proxy executes them server-side), or a rewritten
-// copy keeping the chunk's other parts plus its real calls.
+// call in it is real and needs no signature promotion (replay verbatim,
+// preserving signatures/ids/order), null = only proxy calls (drop — the proxy
+// executes them server-side), or a rewritten copy keeping the chunk's other
+// parts plus its real calls (promoting a stripped proxy call's thoughtSignature
+// onto the first surviving real functionCall part when Gemini placed the turn
+// signature on the leading proxy call).
 function filterRealCallChunk(
     parsed: Record<string, unknown>,
     realIndexes: Set<number>,
     callIndexes: number[],
+    promoteSig?: { callIndex: number; signature: string },
 ): "keep" | null | Record<string, unknown> {
     const candidates = parsed.candidates as Array<Record<string, unknown>> | undefined;
     const parts = (candidates?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
     if (!Array.isArray(parts)) return "keep";
     let anyReal = false;
     let anyProxy = false;
-    const keep: boolean[] = [];
+    let sigPromoted = false;
+    const outParts: GooglePart[] = [];
     let call = 0;
     for (const part of parts) {
         if (part && typeof part === "object" && part.functionCall) {
-            const real = realIndexes.has(callIndexes[call] ?? -1);
+            const callIdx = callIndexes[call] ?? -1;
+            const real = realIndexes.has(callIdx);
             call += 1;
-            keep.push(real);
-            if (real) anyReal = true;
-            else anyProxy = true;
+            if (real) {
+                anyReal = true;
+                if (
+                    promoteSig &&
+                    callIdx === promoteSig.callIndex &&
+                    (typeof part.thoughtSignature !== "string" || part.thoughtSignature.length === 0)
+                ) {
+                    outParts.push({ ...part, thoughtSignature: promoteSig.signature });
+                    sigPromoted = true;
+                } else {
+                    outParts.push(part);
+                }
+            } else {
+                anyProxy = true;
+            }
         } else {
-            keep.push(true);
+            outParts.push(part);
         }
     }
-    if (!anyProxy) return "keep";
+    if (!anyProxy && !sigPromoted) return "keep";
     if (!anyReal) return null;
-    return cloneChunk(parsed, { parts: parts.filter((_, i) => keep[i]) });
+    return cloneChunk(parsed, { parts: outParts });
 }
 
 function dataLine(frame: string): string | null {
@@ -440,21 +459,43 @@ export function createGoogleAdapter(
                     }
                     return;
                 }
+                // Gemini attaches thoughtSignature only to the FIRST functionCall
+                // part in a parallel-call turn. When a stripped proxy call (e.g.
+                // compress) led the turn and carried that signature, the first
+                // surviving real functionCall part becomes the turn's leading call
+                // on client replay and must inherit the signature or Gemini 3/4
+                // rejects the next turn with 400 INVALID_ARGUMENT (missing
+                // thought_signature).
+                let firstRealIdx: number | undefined;
+                let firstProxySig = "";
+                for (const [idx, tc] of pending) {
+                    if (realIndexes.has(idx)) {
+                        if (firstRealIdx === undefined && tc.name.length > 0) firstRealIdx = idx;
+                    } else if (firstProxySig.length === 0 && tc.signature.length > 0) {
+                        firstProxySig = tc.signature;
+                    }
+                }
+                const firstRealTc = firstRealIdx !== undefined ? pending.get(firstRealIdx) : undefined;
+                const promoteSig =
+                    firstRealIdx !== undefined && firstRealTc && firstRealTc.signature.length === 0 && firstProxySig.length > 0
+                        ? { callIndex: firstRealIdx, signature: firstProxySig }
+                        : undefined;
                 for (const [idx, tc] of pending) {
                     if (realIndexes.has(idx) && tc.name.length > 0) {
                         toolCallsEmitted++;
+                        const sig = tc.signature || (promoteSig?.callIndex === idx ? promoteSig.signature : "");
                         yield {
                             kind: "tool_call",
                             name: tc.name,
                             callId: tc.id,
                             arguments: tc.args,
                             passthrough: true,
-                            ...(tc.signature ? { signature: tc.signature } : {}),
+                            ...(sig ? { signature: sig } : {}),
                         } as ParsedStreamEvent;
                     }
                 }
                 for (const { json, parsed, callIndexes } of rawCallChunks) {
-                    const filtered = filterRealCallChunk(parsed, realIndexes, callIndexes);
+                    const filtered = filterRealCallChunk(parsed, realIndexes, callIndexes, promoteSig);
                     if (filtered === "keep") {
                         yield { kind: "meta", chunk: Buffer.from(`data: ${json}\n\n`, "utf8") } as ParsedStreamEvent;
                     } else if (filtered !== null) {
