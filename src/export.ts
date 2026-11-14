@@ -5,7 +5,6 @@ import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 import { SqliteBackend, backendSelectionNotice, listBackendNames, openBackend, resolveBackendName, resolveMysqlDsn, selectedBackendRaw, type StorageBackend } from "./storage/backend.js";
 import { fileStorageBackend, fileStorageMysqlDsn } from "./knobs.js";
-import { UnifiedStore } from "./storage/store.js";
 
 interface ExportOptions {
     dir?: string;
@@ -253,8 +252,19 @@ function blockSummariesSection(s: Session, includeOriginals: boolean, priorDoc: 
     return lines.join("\n");
 }
 
-function matchSession(sessions: Session[], selector: string): Session[] {
-    return matchSessionKernel(sessions, selector, (s) => s.meta.label);
+/** Canonical selector resolution shared by the summary-row leg and the legacy
+ *  walk leg (#5062): one definition keeps both legs' error surfaces
+ *  byte-identical (no-match message, ambiguous-prefix message). */
+function selectSession<T extends { id: string }>(candidates: T[], selector: string, labelOf: (c: T) => string | undefined): T {
+    const matches = matchSessionKernel(candidates, selector, labelOf);
+    if (matches.length === 0) {
+        throw new Error(`no session matches "${selector}" (run "bili export" to list sessions)`);
+    }
+    if (matches.length > 1) {
+        const ids = matches.map((m) => m.id).join(", ");
+        throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
+    }
+    return matches[0]!;
 }
 
 function safeJson(raw: string | null | undefined): unknown {
@@ -408,6 +418,15 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
     return `${lines.join("\n")}\n`;
 }
 
+const EMPTY_STORE_MESSAGE = "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
+
+function renderSessionListing(list: SessionSummary[]): string {
+    const rows = list.map((s) =>
+        `${s.id}${s.label ? `  label=${s.label}` : ""}${s.protocol ? `  [${s.protocol}]` : ""}  blocks=${s.blocks}${s.contextTokens ? `  ctx~${s.contextTokens}` : ""}  ${s.title ?? ""}`
+    );
+    return ["Persisted sessions:", "", ...rows.map((r) => `  ${r}`), "", "Usage: bili export <session-id|label> [--output handoff.md] [--full]"].join("\n");
+}
+
 async function renderSelectedSessionJsonl(store: SessionStore, session: Session, full: boolean): Promise<string> {
     // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
     // exports straight from MySQL; everything else (and every fallback)
@@ -486,28 +505,34 @@ async function renderSelectedSessionJsonl(store: SessionStore, session: Session,
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
     try {
-    const all = [...(await store.loadAll()).values()];
-    if (all.length === 0) {
-        return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
+    // #5062: selecting ONE session must not decode EVERY persisted session —
+    // a machine holding several long-lived sessions OOMed in loadAll before
+    // the documented bad-session→handoff workaround ran (#5026). Resolve the
+    // selector from summary rows — the same SQL authority listSessions uses
+    // (#2960 R2.1; id + label is all matching needs) — then hydrate only the
+    // winner via loadSync (the web panel / fork-adoption path). Rows absent
+    // (legacy/shadow mode, degraded sidecar) or empty (fresh mode flip or a
+    // deleted index.db — files may exist the index never saw) fall through to
+    // the historical full walk below, which keeps those states byte-for-byte.
+    let target: Session | undefined;
+    const rows = store.unifiedSessionSummaries();
+    if (rows && rows.length > 0) {
+        if (!selector) return renderSessionListing(await listSessions(opts));
+        const hit = selectSession(rows.map((r) => ({ id: r.sessionId, label: r.label, protocol: r.protocol, origin: r.origin })), selector, (c) => c.label);
+        target = store.loadSync(hit.id, { protocol: hit.protocol, upstreamOrigin: hit.origin }) ?? undefined;
+        if (!target) {
+            process.stderr.write(`[export] unified index lists ${hit.id} but its state will not decode — falling back to the full scan\n`);
+        }
     }
-    if (!selector) {
-        const list = await listSessions(opts);
-        const rows = list.map((s) =>
-            `${s.id}${s.label ? `  label=${s.label}` : ""}${s.protocol ? `  [${s.protocol}]` : ""}  blocks=${s.blocks}${s.contextTokens ? `  ctx~${s.contextTokens}` : ""}  ${s.title ?? ""}`
-        );
-        return ["Persisted sessions:", "", ...rows.map((r) => `  ${r}`), "", "Usage: bili export <session-id|label> [--output handoff.md] [--full]"].join("\n");
-    }
-    const matches = matchSession(all, selector);
-    if (matches.length === 0) {
-        throw new Error(`no session matches "${selector}" (run "bili export" to list sessions)`);
-    }
-    if (matches.length > 1) {
-        const ids = matches.map((s) => s.id).join(", ");
-        throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
+    if (!target) {
+        const all = [...(await store.loadAll()).values()];
+        if (all.length === 0) return EMPTY_STORE_MESSAGE;
+        if (!selector) return renderSessionListing(await listSessions(opts));
+        target = selectSession(all, selector, (s) => s.meta.label);
     }
     const content = opts.jsonl
-        ? await renderSelectedSessionJsonl(store, matches[0]!, opts.full ?? false)
-        : renderHandoff(matches[0]!, opts.full ?? false);
+        ? await renderSelectedSessionJsonl(store, target, opts.full ?? false)
+        : renderHandoff(target, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
         writeFileSync(opts.output, content, "utf8");
