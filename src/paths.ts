@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -60,6 +61,27 @@ export function stateDir(): string {
 /** Default log file path. */
 export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");
+}
+
+/** Directory NAME (not path) for a session-scoped subtree under retrieve/.
+ *  mNNNNN refs are PER-SESSION sequence numbers, so the session id must be part
+ *  of the path — a flat layout lets two sessions' same-numbered refs silently
+ *  overwrite each other's artifacts (#4699; the img-spill tree hit the same
+ *  collision class first). The salt keeps id -> name injective for ids that
+ *  sanitize to the same form ("a/b" vs "a-b", >100-char truncation); ids that
+ *  need no sanitizing keep their historical unsalted name. */
+export function retrieveSessionDirName(sessionId: string): string {
+    const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100);
+    return safe === sessionId
+        ? (safe || "session")
+        : `${safe || "session"}-${createHash("sha256").update(sessionId).digest("hex").slice(0, 8)}`;
+}
+
+/** Per-session CCR text-export dir: <stateDir>/retrieve/<sessionId>/.
+ *  Retrieval exports are pure cache — a re-retrieve regenerates the file — so
+ *  they share the session's lifecycle (co-deleted and age-swept by GC, #4699). */
+export function retrievalExportDir(sessionId: string): string {
+    return path.join(stateDir(), "retrieve", retrieveSessionDirName(sessionId));
 }
 
 /** Last-detected routing bypass for the claude lane (#2290): written by the
