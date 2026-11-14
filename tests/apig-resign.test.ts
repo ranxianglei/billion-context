@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
+import { verifySdkHmac } from "./wire-contract-fakes.ts";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -69,49 +70,6 @@ function sha256Hex(data: Uint8Array | string): string {
     return createHash("sha256").update(data).digest("hex");
 }
 
-/** Independent verifier: recompute the SDK-HMAC-SHA256 signature from what a
- * server ACTUALLY received (method / full URL / lowercased headers / raw
- * body). Written from the wire format on purpose — the signer must round-trip
- * through an implementation that does not share its code. */
-function verifySdkHmac(req: {
-    method: string;
-    url: string;
-    headers: Record<string, string | string[] | undefined>;
-    body: Buffer;
-    sk: string;
-    ak?: string;
-}): { ok: boolean; reason?: string; signedHeaders?: string } {
-    const auth = String(req.headers["authorization"] ?? "");
-    const m = /^SDK-HMAC-SHA256 Access=([^,]+),SignedHeaders=([^,]+),Signature=([0-9a-f]{64})$/.exec(auth);
-    if (m === null) return { ok: false, reason: `authorization shape: ${auth}` };
-    const [, ak, signedHeaders, sig] = m;
-    if (req.ak !== undefined && ak !== req.ak) return { ok: false, reason: "access key mismatch" };
-    const names = signedHeaders.split(";");
-    if (names.length === 0 || new Set(names).size !== names.length) return { ok: false, reason: "duplicate/empty signed headers" };
-    if ([...names].sort().join(";") !== signedHeaders) return { ok: false, reason: "signed headers not sorted" };
-    const u = new URL(req.url);
-    let uri = u.pathname;
-    if (!uri.endsWith("/")) uri += "/";
-    const headerVal = (n: string): string => {
-        const v = req.headers[n];
-        return Array.isArray(v) ? v.join(",") : String(v ?? "");
-    };
-    const payloadHash = sha256Hex(req.body);
-    if (headerVal("x-sdk-content-sha256") !== payloadHash) return { ok: false, reason: "declared payload hash != sha256(body)" };
-    const canonical = [
-        req.method.toUpperCase(),
-        uri,
-        u.search.slice(1),
-        names.map((n) => `${n}:${headerVal(n)}`).join("\n"),
-        "",
-        names.join(";"),
-        payloadHash,
-    ].join("\n");
-    const stringToSign = `SDK-HMAC-SHA256\n${headerVal("x-sdk-date")}\n${sha256Hex(canonical)}`;
-    const expect = createHmac("sha256", req.sk).update(stringToSign).digest("hex");
-    if (expect !== sig) return { ok: false, reason: "signature mismatch", signedHeaders };
-    return { ok: true, signedHeaders };
-}
 
 async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
     const saved = new Map<string, string | undefined>();
@@ -153,6 +111,88 @@ test("#1884 signer: deterministic golden shape and independent verification", ()
 
     const verdict = verifySdkHmac({ method: "POST", url, headers: a, body, sk: CRED.sk });
     assert.deepEqual([verdict.ok, verdict.reason], [true, undefined], "independent verifier accepts the signature");
+});
+
+
+// Huawei SDK fea8a3150325831fd3a1e277e6c89b20f699bd05
+// https://github.com/huaweicloud/huaweicloud-sdk-python-v3/blob/fea8a3150325831fd3a1e277e6c89b20f699bd05/huaweicloud-sdk-core/huaweicloudsdkcore/signer/signer.py
+// The AgentCenter GET pair also matches dsh-providers-hub's signer at
+// https://github.com/iJetLi/dsh-providers-hub/blob/99b09c59d52b92076b7a249310e219bf0bb21b16/src/sign.ts
+const SDK_QUERY_VECTORS = [
+    {
+        "url": "https://api.example.com/v1/chat/completions",
+        "signature": "90c5e7175734e0c57810003947e6666f3286a01e3eaa5e6d91ebbc51b9a393b2"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?z=last&a=first",
+        "signature": "ee0e7a8c7e61f8124ca194fdb1a5ad464a26bcd333a6a761a8cfa20839712d84"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?tag=z&tag=a",
+        "signature": "6c3769f1f2e39371dfaf6a655ff884f0438166f7441dfb5e19db35606e9f5505"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?q=hello+world",
+        "signature": "1f16a15e60d63997c56dab6216bee67bb18069713089b5a1abcf3e0aacfc048d"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?q=%7e%2f",
+        "signature": "34d994831dc5720590e29d0b7231261ce8245c81f49b5fed3bfac47402e0e872"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?flag&empty=",
+        "signature": "ff909519788f82e993819ff96b9dd9e2987c1b5063c92b6cdd92271ebe863326"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?q=!*%27()",
+        "signature": "be29af9afc6a955ad7e46cb819b94a52c62f06ed6e3e88c9319c273991743a1d"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?q=%E4%B8%AD%E6%96%87&a=1",
+        "signature": "65c8639b8d0b5795d34ceb998e0a6a29fb6fa6fafad0c68996ef871b8ff804be"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?%F0%9F%98%80=astral&%EF%BC%A1=bmp",
+        "signature": "f57e5c06726bcefa5ea0bc1acdb845e2fc9031e0eb9114d6d745f7987022d17f"
+    },
+    {
+        "url": "https://api.example.com/v1/chat/completions?tag=%F0%9F%98%80&tag=%EF%BC%A1",
+        "signature": "c49b892c255ee47d04128e9b6190147af49abf4c2386497d23c80b9d102d48b0"
+    },
+    {
+        "url": "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?offset=0&limit=100",
+        "method": "GET",
+        "body": "",
+        "signature": "c9dd0d0b4d2d082fda4ca1d31690049fc44a5d4eedb864fbb73bcedee2b96477"
+    },
+    {
+        "url": "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?limit=100&offset=0",
+        "method": "GET",
+        "body": "",
+        "signature": "c9dd0d0b4d2d082fda4ca1d31690049fc44a5d4eedb864fbb73bcedee2b96477"
+    }
+];
+
+for (const vector of SDK_QUERY_VECTORS) {
+    test(`APIG query signature matches the official SDK: ${new URL(vector.url).search || "no query"}`, () => {
+        const headers: Record<string, string> = {};
+        const method = vector.method ?? "POST";
+        const body = Buffer.from(vector.body ?? '{"model":"example"}');
+        signApigHeaders(headers, CRED, method, vector.url, body, { now: NOW });
+        assert.equal(headers["authorization"].split("Signature=")[1], vector.signature);
+        assert.equal(verifySdkHmac({ method, url: vector.url, headers, body, sk: CRED.sk }).ok, true);
+    });
+}
+
+test("APIG verifier rejects signatures calculated from the raw query bytes", () => {
+    const vector = SDK_QUERY_VECTORS[1];
+    const body = Buffer.from('{"model":"example"}');
+    const headers: Record<string, string> = {};
+    signApigHeaders(headers, CRED, "POST", vector.url, body, { now: NOW });
+    headers["authorization"] = headers["authorization"].replace(/Signature=.*/, "Signature=5638073a95a6ec0083cb0267b3eab3bf1ef07bbd1e553cfc1cc47f4e9ec69f62");
+    const verdict = verifySdkHmac({ method: "POST", url: vector.url, headers, body, sk: CRED.sk });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason ?? "", /WC-025 signature mismatch/);
 });
 
 test("#1884 signer: body byte flip changes the signature", () => {
@@ -732,6 +772,33 @@ test("e2e #1884: armed tunnel — every egress body is re-signed, markers never 
         assert.equal(up.headers[APIG_RESIGN_CREDENTIAL_HEADER], undefined, "credential marker NEVER reaches the wire");
         assert.equal(up.headers["maas_type"], "benefit", "benefit model carries the signed maas_type");
         assert.match(String(up.headers["authorization"]), /Access=AKTEST123/, "re-signed with the tunneled credential");
+    } finally {
+        proxy.close();
+        (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+        upstream.close();
+        upstream.closeAllConnections?.();
+    }
+});
+
+test("e2e APIG: query canonicalization preserves the original upstream URL", async () => {
+    const { server: upstream, port: upstreamPort, calls } = await startVerifyingUpstream(CRED.sk);
+    const { proxy, port: proxyPort } = await startResignProxy(upstreamPort);
+    const upstreamPath = "/v1/chat/completions?z=last&tag=z&tag=a&q=hello+world&empty&literal=%7e%2f";
+    try {
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}${upstreamPath}`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
+                [APIG_RESIGN_CREDENTIAL_HEADER]: encodeApigCredential(CRED),
+                "x-acp-session": "resign-e2e-query",
+            },
+            body: chatBody("glm-5.3-flash", "resign-e2e-query"),
+        });
+        assert.equal(response.status, 200, await response.text());
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].url, upstreamPath);
+        assert.equal(calls[0].headers[APIG_RESIGN_CREDENTIAL_HEADER], undefined);
     } finally {
         proxy.close();
         (proxy as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();

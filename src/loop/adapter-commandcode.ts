@@ -19,6 +19,8 @@ import type {
 
 const PROXY_TOOL_SET = new Set([
     "compress", "decompress", "search_context", "acp_status",
+    // Keep function-only proxy calls inside the loop, as on the OpenAI wire.
+    "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 

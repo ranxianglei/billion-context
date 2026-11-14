@@ -1296,11 +1296,18 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         {
             const view = ctx.compressMessages ?? ctx.messages;
             const byRaw = res.state.messageRefs?.byRaw;
+            let messagesById: Map<string, CoreMessage> | undefined;
             for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
+                if (beforeIds.has(b.blockId) || b.directMessageIds.length === 0) continue;
+                if (!messagesById) {
+                    messagesById = new Map();
+                    for (const message of view) {
+                        if (!messagesById.has(message.id)) messagesById.set(message.id, message);
+                    }
+                }
                 const notes: string[] = [];
                 for (const id of b.directMessageIds) {
-                    const m = view.find((msg) => msg.id === id);
+                    const m = messagesById.get(id);
                     if (!m) continue;
                     notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
                 }
@@ -1761,12 +1768,12 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
     // actually instructed the model about absorb — the shape check alone
     // cannot tell an emission from a user-quoted fragment.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
-    const requestText = JSON.stringify(ctx.messages);
+    let requestText: string | undefined;
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;
         if (typeof t === "string" && (containsRenderTagText(t) || containsMarkerLineText(t) || containsBiliInternalText(t) || (absorbArmed && containsToolCallEmissionText(t)))) {
             ctx.log(`[tag-echo] stripped: non-stream model output ACP echo (render tags/markers/internal artifacts): ${t.slice(0, 120).replace(/\n/g, " ")}`);
-            (blk as { text?: string }).text = stripAcpTags(t, absorbArmed, requestText);
+            (blk as { text?: string }).text = stripAcpTags(t, absorbArmed, absorbArmed ? (requestText ??= JSON.stringify(ctx.messages)) : undefined);
         }
     }
     return body;

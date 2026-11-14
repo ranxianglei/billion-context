@@ -413,12 +413,14 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
             factory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
             clientFactory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
         };
-        // #3776: trust the merged CA bundle for end-to-end TLS to the target through the tunnel.
+        // ProxyAgent builds separate connectors for the proxy and the tunneled
+        // target; its internal connector replaces a top-level connect option.
+        // Apply the configured merged trust to both TLS legs (#3776).
         const ca = upstreamExtraCa();
-        const withConnect = ca ? { ...base, connect: { ca } } : base;
+        const withTls = ca ? { ...base, requestTls: { ca }, proxyTls: { ca } } : base;
         agent = ka > 0
-            ? new ProxyAgent({ ...withConnect, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
-            : new ProxyAgent(withConnect);
+            ? new ProxyAgent({ ...withTls, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
+            : new ProxyAgent(withTls);
         dispatcherCache.set(key, agent);
     }
     return agent;
@@ -434,7 +436,9 @@ export function resetProxyCache(): void {
 
 function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
     if (proxy.protocol === "https:") {
-        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host });
+        const ca = upstreamExtraCa();
+        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host,
+            ...(ca ? { ca } : {}) });
     }
     return net.connect(proxy.port, proxy.host);
 }
@@ -486,15 +490,20 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
     return new Promise((resolve, reject) => {
         const socket = openProxySocket(proxy);
         let settled = false;
+        const closedBeforeHeaders = () => finishError(new Error(`upstream proxy CONNECT ${host}:${port} closed before response headers`));
         const finishError = (error: Error) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            socket.removeListener("end", closedBeforeHeaders);
+            socket.removeListener("close", closedBeforeHeaders);
             socket.destroy();
             reject(error);
         };
         const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), CONNECT_TIMEOUT_MS);
         socket.once("error", finishError);
+        socket.once("end", closedBeforeHeaders);
+        socket.once("close", closedBeforeHeaders);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
             const authority = `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
@@ -508,14 +517,18 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
             ];
             socket.write(headers.join("\r\n"));
             let buffer = Buffer.alloc(0);
-            const onData = (chunk: Buffer) => {
+            // Keep the socket out of flowing mode until its tunnel owner
+            // attaches a reader, including bytes following the HTTP headers.
+            const onReadable = () => {
+                const chunk: Buffer | null = socket.read();
+                if (chunk === null) return;
                 buffer = Buffer.concat([buffer, chunk]);
                 const end = buffer.indexOf("\r\n\r\n");
                 if (end < 0) {
                     if (buffer.length > 64 * 1024) finishError(new Error("upstream proxy CONNECT response header is too large"));
                     return;
                 }
-                socket.removeListener("data", onData);
+                socket.removeListener("readable", onReadable);
                 const head = buffer.subarray(0, end).toString("latin1");
                 const statusLine = head.split("\r\n", 1)[0] ?? "";
                 if (!/^HTTP\/1\.[01]\s+2\d\d(?:\s|$)/.test(statusLine)) {
@@ -525,11 +538,13 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
                 settled = true;
                 clearTimeout(timer);
                 socket.removeListener("error", finishError);
+                socket.removeListener("end", closedBeforeHeaders);
+                socket.removeListener("close", closedBeforeHeaders);
                 const rest = buffer.subarray(end + 4);
                 if (rest.length > 0) socket.unshift(rest);
                 resolve(socket);
             };
-            socket.on("data", onData);
+            socket.on("readable", onReadable);
         });
     });
 }
