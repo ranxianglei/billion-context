@@ -61,7 +61,12 @@ async function fixture(run: () => Promise<void>): Promise<void> {
 /** Grow `big-sess` past what BUDGET can hold alongside `peer-sess`, then run
  * one request cycle over it: releaseInFlight's discharge evicts the oldest
  * idle session (big, touched first) and stamps its live weight. Returns the
- * evicted object — alive in JS, out of the pool, refs intact on its state. */
+ * evicted object — alive in JS, out of the pool, refs intact on its state.
+ *
+ * #5806 adds a 60-second RECENT-TOUCH shield over byte-budget eviction, so
+ * the fixture ages big past it explicitly to keep pinning that original
+ * "oldest idle goes" behavior; freshly touched sessions are now protected by
+ * design (tests/issue5806-pool-hot-exemption.test.ts pins that side). */
 function growAndEvictBig(): RewriteCtx["session"] {
     const big = getSession("big-sess");
     const peer = getSession("peer-sess");
@@ -70,6 +75,7 @@ function growAndEvictBig(): RewriteCtx["session"] {
     peer.metadata.blob = "y".repeat(60_000);
     markDirty(big);
     markDirty(peer);
+    big.lastSeen = Date.now() - 180_000;
     acquireInFlight(big);
     releaseInFlight(big);
     return big;
