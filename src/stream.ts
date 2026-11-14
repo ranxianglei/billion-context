@@ -1643,10 +1643,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return prev === undefined || prev !== b.summary;
         });
         syncSubagentSessions(ctx.session, changedBlocks, ctx.compressMessages ?? ctx.messages);
-        // #4313 toggle (PR #5236): the [start – end] coverage span rides the
-        // same flag as the wire tags — default OFF keeps receipts byte-identical
-        // to pre-feature master. Storage still stamps unconditionally; this only
-        // gates the display span.
+        // #4313 toggle (PR #5236; default-on follow-up): the [start – end]
+        // coverage span rides the same flag as the wire tags — default ON; the
+        // opt-out (file `compress.messageTimestamps: false` or env "0") keeps
+        // receipts byte-identical to pre-feature master. Storage still stamps
+        // unconditionally; this only gates the display span.
         const messageTimestampsOn = resolveMessageTimestamps(loadConfigFile().compress);
         const subagentMap = subagentSessionsOf(ctx.session);
         for (const b of changedBlocks) {
