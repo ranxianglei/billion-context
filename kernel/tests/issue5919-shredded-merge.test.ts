@@ -15,10 +15,15 @@
  *   1. Foldable stranded partner OUTSIDE the merge span → the merge extends
  *      the fold to that partner (rung 2), creates the merged block, deactivates
  *      the consumed block, and warns exactly what it extended.
- *   2. Protected (BLOCKED-ref) stranded partner → the merge is skipped as an
- *      idempotent NO-OP SUCCESS: no errors, no block, the consumed block stays
- *      ACTIVE, and the warning names the protected refs, says the merge cannot
- *      be closed now, and tells the model NOT to retry.
+ *   2. Protected (BLOCKED-ref) stranded partner → pre-#6709 the merge was
+ *      skipped as an idempotent NO-OP SUCCESS: no errors, no block, the
+ *      consumed block stays ACTIVE, and the warning names the protected refs,
+ *      says the merge cannot be closed now, and tells the model NOT to retry.
+ *      #6709 SUPERSEDES this for BLOCKED: a BLOCKED partner carries no
+ *      content, so it cannot strand a turn — the merge extends to it (rung 2)
+ *      and closes the turn instead of no-opping forever. The no-op below now
+ *      applies only to protected-tool / unrecoverable-media / recent-zone
+ *      partners (see 5919-3, unchanged).
  *   3. Foldable stranded partner INSIDE the span (the pre-fix working case) →
  *      unchanged: clean merge.
  *   4. The #5789 pinned suite (issue5789-tier2-merge-ladder.test.ts) stays
@@ -172,7 +177,7 @@ test("5919-1: foldable stranded partner outside the span → merge extends and r
   );
 });
 
-test("5919-2: protected (BLOCKED) stranded partner → no-op success, not a retryable error", () => {
+test("5919-2: BLOCKED stranded partner → merge proceeds (billion-context#6709 supersedes the #5919 no-op for BLOCKED)", () => {
   const { core, messages, state } = build("BLOCKED", "Read");
   const res = core.applyCompression({
     messages,
@@ -180,21 +185,30 @@ test("5919-2: protected (BLOCKED) stranded partner → no-op success, not a retr
     config,
     ranges: [{ startRef: "b2", endRef: "b3", summary: SUMMARY }],
   });
-  // idempotent no-op success (#4521): zero errors, zero blocks
+  // #6709: the #5919 no-op was a permanent deadlock for BLOCKED partners —
+  // their bodies are gone for good, so they can never age into foldability.
+  // The merge extends to the BLOCKED partner and closes the turn instead.
   assert.deepEqual(res.result.errors, []);
-  assert.equal(res.result.blocksCreated, 0);
-  // b3 stays ACTIVE — nothing was consumed
-  assert.equal(res.state.blocks.find((b) => b.blockId === "b3")!.active, true);
-  const skip = res.result.warnings.find((w) =>
-    w.startsWith("Merge of b3 skipped"),
-  );
+  assert.equal(res.result.blocksCreated, 1);
+  const merged = res.state.blocks.find((b) => b.blockId === "b4");
+  assert.ok(merged, "the merged block b4 must be created");
   assert.ok(
-    skip,
-    `expected the skip warning naming the blocked merge, got: ${res.result.warnings.join(" | ")}`,
+    merged!.effectiveMessageIds.includes("l"),
+    "b4 coverage must include the BLOCKED stranded result l",
   );
-  assert.ok(skip!.includes("cannot be closed now"));
-  assert.ok(skip!.includes("Do not retry this merge"));
-  assert.ok(skip!.includes("BLOCKED"));
+  assert.ok(merged!.effectiveMessageIds.includes("t"));
+  assert.ok(merged!.effectiveMessageIds.includes("k"));
+  // the consumed block deactivates; the surviving tier-2 block stays
+  assert.equal(res.state.blocks.find((b) => b.blockId === "b3")!.active, false);
+  assert.equal(res.state.blocks.find((b) => b.blockId === "b2")!.active, true);
+  assert.ok(
+    res.result.warnings.some(
+      (w) =>
+        w.startsWith("Extended this merge to fold stranded partner(s)") &&
+        w.includes("BLOCKED"),
+    ),
+    `expected the extension warning naming BLOCKED, got: ${res.result.warnings.join(" | ")}`,
+  );
   // the old false promise must be gone
   assert.ok(
     !res.result.warnings.some((w) => w.includes("age into coverage")),

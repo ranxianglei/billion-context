@@ -573,7 +573,25 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
             const visibleStranded = [...current].filter(
               (id) => !survivingCoverage.has(id) && !consumedCoverage.has(id),
             );
-            const doomedStranded = visibleStranded.filter(isNeverFoldable5919);
+            // #6709: a BLOCKED stranded partner carries no content — its body
+            // was removed by native compression, so there is nothing
+            // turn-integrity protects by keeping it visible, and it can never
+            // age into foldability (the body is gone permanently, its seq
+            // frozen). Letting it doom the merge converts the #5919 no-op
+            // into a permanent deadlock: the merge can never proceed, the
+            // blocks can never consolidate, and the session stays stuck at
+            // its context ceiling (billion-context#6709, session-ad47cd30,
+            // 6,115 BLOCKED messages). The #5919 comment above still names
+            // BLOCKED among the never-foldable classes; #6709 carves it out
+            // here because never-foldable is not the same as merge-blocking
+            // for a content-free partner. BLOCKED partners therefore do not
+            // doom a merge — they flow to rung 2 like any other stranded
+            // partner and are folded into the merged block, closing the turn.
+            // Every other never-foldable class (protected tool, recent-zone,
+            // unrecoverable media) still dooms it, exactly as before.
+            const doomedStranded = visibleStranded.filter(
+              (id) => refOf5919(id) !== "BLOCKED" && isNeverFoldable5919(id),
+            );
             if (doomedStranded.length > 0) {
               const foldablePartners = visibleStranded.filter(
                 (id) => !isNeverFoldable5919(id),
