@@ -53,13 +53,21 @@ async function startReceiver(dir: string): Promise<Receiver> {
     const portFile = `${log}.port`;
     const child = spawn(process.execPath, [RECEIVER, log], { stdio: "ignore", detached: true });
     child.unref();
+    // Poll for a VALID port, not mere file existence: the receiver creates the
+    // file before its write lands, so existsSync can win that race on a loaded
+    // runner and read back an empty file (Number("") === 0).
+    let port = 0;
+    let portText = "";
     const deadline = Date.now() + 15_000;
-    while (!existsSync(portFile) && Date.now() < deadline) {
+    while (port === 0 && Date.now() < deadline) {
+        if (existsSync(portFile)) {
+            portText = readFileSync(portFile, "utf8").trim();
+            const parsed = Number(portText);
+            if (Number.isInteger(parsed) && parsed > 0) port = parsed;
+        }
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
-    assert.ok(existsSync(portFile), "receiver must publish its port");
-    const port = Number(readFileSync(portFile, "utf8").trim());
-    assert.ok(Number.isInteger(port) && port > 0, `receiver port must be a number, got ${port}`);
+    assert.ok(port > 0, `receiver must publish its port (file held "${portText}")`);
     return {
         port,
         beats: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(Number) : []),
