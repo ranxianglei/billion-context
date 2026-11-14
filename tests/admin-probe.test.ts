@@ -113,6 +113,40 @@ function absoluteGet(port: number, targetUrl: string, hostHeader: string): Promi
     return promise;
 }
 
+/** #6334: send an ORIGIN-form request (the browser-fetch shape) with an
+ *  explicit Host header over a fresh loopback socket — the DNS-rebinding
+ *  topology: the socket arrives from 127.0.0.1 but the Host names the
+ *  attacker's rebound domain. */
+function originGet(port: number, reqPath: string, hostHeader: string): Promise<{ status: number; body: string }> {
+    const { promise, resolve, reject } = Promise.withResolvers<{ status: number; body: string }>();
+    const sock = net.connect(port, "127.0.0.1");
+    let data = "";
+    sock.on("data", (c: Buffer) => { data += c.toString("utf8"); });
+    sock.on("end", () => {
+        const i = data.indexOf("\r\n\r\n");
+        if (i < 0) return reject(new Error(`no response headers: ${data.slice(0, 200)}`));
+        const status = Number(data.split(" ", 2)[1]);
+        let body = data.slice(i + 4);
+        if (/^[0-9a-f]+\r\n/i.test(body)) {
+            const out: string[] = [];
+            let rest = body;
+            for (;;) {
+                const nl = rest.indexOf("\r\n");
+                const size = parseInt(rest.slice(0, nl).split(";")[0], 16);
+                if (!Number.isFinite(size)) break;
+                if (size === 0) break;
+                out.push(rest.slice(nl + 2, nl + 2 + size));
+                rest = rest.slice(nl + 2 + size + 2);
+            }
+            body = out.join("");
+        }
+        resolve({ status, body });
+    });
+    sock.once("error", reject);
+    sock.write(`GET ${reqPath} HTTP/1.1\r\nhost: ${hostHeader}\r\nconnection: close\r\n\r\n`);
+    return promise;
+}
+
 async function makeBili(): Promise<http.Server> {
     const opts: ProxyOptions = {
         port: 0,
@@ -191,6 +225,26 @@ test("integration: absolute-form management probes answer with real health state
         const byName = await absoluteGet(port1, `http://localhost:${port2}/__bili/health`, `localhost:${port2}`);
         assert.equal(byName.status, 403, "hostname-targeted cross-instance probe keeps the tunnel marker");
         assert.match(byName.body, /management endpoints are not reachable through the bili tunnel/);
+
+        // #6334 REBINDING shape: the DNS-rebinding browser — evil.com → 127.0.0.1.
+        // The socket arrives from loopback (the victim's own machine) and the
+        // /bili/ target is a loopback IP literal on a management path, so all
+        // three #1073 conditions hold. But the INBOUND Host names the attacker's
+        // rebound domain (non-loopback) — the rebinding signature. Pre-fix the
+        // socket-only check let this slip through the exemption with the marker
+        // stripped, reaching P2's /__bili/ plane and bypassing its Host-based
+        // anti-rebinding gate. Post-fix the marker stays stamped → P2 403s.
+        const rebind = await originGet(port1, `/bili/http://127.0.0.1:${port2}/__bili/health`, `evil.com:${port1}`);
+        assert.equal(rebind.status, 403, `rebinding-shape tunnel request must keep the marker (got ${rebind.status}: ${rebind.body})`);
+        assert.match(rebind.body, /management endpoints are not reachable through the bili tunnel/);
+
+        // #6334 control: the SAME loopback-socket + loopback-literal-target +
+        // admin-path shape, but with a loopback Host (the legitimate
+        // inter-instance probe) → the exemption still applies → P2 serves it.
+        // This pins that the tightening did not over-suppress the sibling probe.
+        const legitProbe = await originGet(port1, `/bili/http://127.0.0.1:${port2}/__bili/health`, `127.0.0.1:${port1}`);
+        assert.equal(legitProbe.status, 200, `loopback-Host inter-instance probe must stay unmarked (got ${legitProbe.status}: ${legitProbe.body})`);
+        assert.equal(JSON.parse(legitProbe.body).instanceId, id2, "reached the TARGET instance, not the relay");
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         p1.closeAllConnections?.();

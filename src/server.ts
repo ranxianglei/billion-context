@@ -127,7 +127,7 @@ import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from 
 import type { BiliMessage } from "acp-kernel/wire";
 import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
 
-import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
+import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, isLoopbackHostHeader, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
 import { dropCompatFieldsJson } from "./compat-drop.js";
@@ -3162,6 +3162,13 @@ export function buildForwardTarget(
     // it 403s legitimate inter-instance probes (health checks between sibling
     // instances). Remote peers and non-literal hostnames keep the marker
     // unconditionally (NAT-hairpin / DNS-rebinding protection intact).
+    // #6334: the exemption additionally requires the INBOUND Host to be
+    // loopback-form. A DNS-rebinding browser (evil.com → 127.0.0.1) presents a
+    // non-loopback Host while its socket still arrives from loopback, so the
+    // socket-only check let the rebinding request slip through the exemption
+    // and reach a sibling's /__bili/ plane with the marker stripped — bypassing
+    // the target's Host-based anti-rebinding gate (isTrustedAdminOrigin).
+    // Legitimate inter-instance probes use loopback names, so they keep it.
     if (route?.tunnel) {
         let destLoopback = false;
         let destAdminPath = false;
@@ -3174,7 +3181,7 @@ export function buildForwardTarget(
         } catch {
             // unparseable upstream URL — stamp defensively
         }
-        if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
+        if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath && isLoopbackHostHeader(req.headers.host))) headers[BILI_TUNNEL_HEADER] = "1";
     }
     headers["host"] = new URL(upstreamUrl).host;
     // #3073: shared with the WS lane's final egress so probe and turn carry

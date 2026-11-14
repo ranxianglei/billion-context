@@ -118,6 +118,36 @@ export function classifyIp(ip: string): IpClass {
     return "public";
 }
 
+/** #6334: does a Host-header value name a loopback identity (localhost / 127/8
+ *  / ::1)? The tunnel-marker exemption (#1073) requires the INBOUND Host to be
+ *  loopback-form, not just the socket: a DNS-rebinding browser (evil.com →
+ *  127.0.0.1) presents a non-loopback Host while its socket still arrives from
+ *  loopback, so a socket-only check let the rebinding request slip through the
+ *  exemption and reach a sibling's /__bili/ plane with the marker stripped —
+ *  bypassing the target's Host-based anti-rebinding gate (isTrustedAdminOrigin).
+ *  Legitimate inter-instance probes use loopback names, so they keep the
+ *  exemption. Hostname normalization mirrors the admin gate (port + [..]
+ *  brackets stripped, lowercase). */
+export function isLoopbackHostHeader(host: string | string[] | undefined): boolean {
+    if (typeof host !== "string") return false;
+    const v = host.trim().toLowerCase();
+    if (!v) return false;
+    let hn: string;
+    if (v.startsWith("[")) {
+        const end = v.indexOf("]");
+        if (end === -1) return false;
+        hn = v.slice(1, end);
+    } else if ((v.match(/:/g) ?? []).length > 1) {
+        hn = v; // bare v6 literal (no brackets)
+    } else {
+        const idx = v.lastIndexOf(":");
+        hn = idx !== -1 ? v.slice(0, idx) : v;
+    }
+    if (hn === "localhost") return true;
+    const lit = parseIpLiteral(hn);
+    return lit !== null && classifyIp(lit) === "loopback";
+}
+
 export type ResolveHost = (host: string) => Promise<string[]>;
 
 // The native lookup({timeout}) option exists at runtime (Node ≥ 15.3) but is
