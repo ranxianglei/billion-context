@@ -230,8 +230,11 @@ test("preflight marks TLS trust failures client-retryable without in-loop retry 
     const originalFetch = globalThis.fetch;
     try {
         for (const [code, withHint] of [
+            // #4403: CERT_HAS_EXPIRED no longer carries CA-install advice — trusting
+            // more CAs cannot fix an expired leaf (upstream lapse or local clock
+            // skew are the causes), so the hint names those instead.
             ["DEPTH_ZERO_SELF_SIGNED_CERT", true],
-            ["CERT_HAS_EXPIRED", true],
+            ["CERT_HAS_EXPIRED", false],
             ["EPROTO", false],
         ] as Array<[string, boolean]>) {
             let attempts = 0;
@@ -247,6 +250,9 @@ test("preflight marks TLS trust failures client-retryable without in-loop retry 
             if (withHint) {
                 assert.match(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
                 assert.match(result.failure?.detail ?? "", /security software/);
+            } else if (code === "CERT_HAS_EXPIRED") {
+                assert.match(result.failure?.detail ?? "", /EXPIRED/);
+                assert.match(result.failure?.detail ?? "", /nothing to install locally/);
             } else {
                 assert.doesNotMatch(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
             }
