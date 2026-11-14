@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseEventLine, activityLines, extractContentText, newPortion, ThinkingCollector } from "../src/delegate-events.js";
+import { parseEventLine, activityLines, extractContentText, newPortion, ThinkingCollector, extractAssistantTerminal } from "../src/delegate-events.js";
 
 test("parses text_delta and text_end from message_update", () => {
   const delta = parseEventLine('{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello "}}');
@@ -129,20 +129,21 @@ test("activityLines formats retry events", () => {
 });
 
 test("parses message_end with usage data (returns UsageUpdateEvent)", () => {
-  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230,"cost":{"input":0.0015,"output":0.0008,"cacheRead":0,"cacheWrite":0,"total":0.0023}}}}') as { kind: "usage-update"; usage: Record<string, unknown> };
-  assert.equal(ev.kind, "usage-update");
-  assert.equal(ev.usage.input, 150);
-  assert.equal(ev.usage.output, 80);
-  assert.equal(ev.usage.cacheRead, 0);
-  assert.equal(ev.usage.cacheWrite, 0);
-  assert.equal(ev.usage.totalTokens, 230);
-  assert.deepEqual(ev.usage.cost, { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 });
+  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230,"cost":{"input":0.0015,"output":0.0008,"cacheRead":0,"cacheWrite":0,"total":0.0023}}}}');
+  assert.ok(ev && ev.kind === "usage-update");
+  assert.equal(ev.usage?.input, 150);
+  assert.equal(ev.usage?.output, 80);
+  assert.equal(ev.usage?.cacheRead, 0);
+  assert.equal(ev.usage?.cacheWrite, 0);
+  assert.equal(ev.usage?.totalTokens, 230);
+  assert.deepEqual(ev.usage?.cost, { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 });
 });
 
 test("message_end with optional fields returns UsageUpdateEvent with undefined", () => {
-  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230,"cost":{"input":0.0015,"output":0.0008,"cacheRead":0,"cacheWrite":0,"total":0.0023}}}}') as { kind: "usage-update"; usage: Record<string, unknown> };
-  assert.equal(ev.usage.cacheWrite1h, undefined);
-  assert.equal(ev.usage.reasoning, undefined);
+  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230,"cost":{"input":0.0015,"output":0.0008,"cacheRead":0,"cacheWrite":0,"total":0.0023}}}}');
+  assert.ok(ev && ev.kind === "usage-update");
+  assert.equal(ev.usage?.cacheWrite1h, undefined);
+  assert.equal(ev.usage?.reasoning, undefined);
 });
 
 test("message_end with no usage object returns null", () => {
@@ -151,8 +152,9 @@ test("message_end with no usage object returns null", () => {
 });
 
 test("message_end with no cost object defaults cost to zeros", () => {
-  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230}}}') as { kind: "usage-update"; usage: Record<string, unknown> };
-  assert.deepEqual(ev.usage.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"output":80,"cacheRead":0,"cacheWrite":0,"totalTokens":230}}}');
+  assert.ok(ev && ev.kind === "usage-update");
+  assert.deepEqual(ev.usage?.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
 });
 
 test("message_end with non-finite number returns null when all fields invalid", () => {
@@ -220,12 +222,78 @@ test("parseEventLine tolerates trailing CR (CRLF line endings)", () => {
 });
 
 test("message_end with partial usage fills missing numeric fields with 0", () => {
-  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"totalTokens":150}}}') as { kind: "usage-update"; usage: Record<string, unknown> };
-  assert.equal(ev.kind, "usage-update");
-  assert.equal(ev.usage.input, 150);
-  assert.equal(ev.usage.output, 0);
-  assert.equal(ev.usage.cacheRead, 0);
-  assert.equal(ev.usage.cacheWrite, 0);
-  assert.equal(ev.usage.totalTokens, 150);
-  assert.deepEqual(ev.usage.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+  const ev = parseEventLine('{"type":"message_end","message":{"role":"assistant","usage":{"input":150,"totalTokens":150}}}');
+  assert.equal(ev?.kind, "usage-update");
+  assert.equal(ev?.usage?.input, 150);
+  assert.equal(ev?.usage?.output, 0);
+  assert.equal(ev?.usage?.cacheRead, 0);
+  assert.equal(ev?.usage?.cacheWrite, 0);
+  assert.equal(ev?.usage?.totalTokens, 150);
+  assert.deepEqual(ev?.usage?.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+});
+
+// #4359: terminal-state extraction for empty-reply diagnostics. The A/B/C
+// shapes below mirror the real session records from the issue.
+test("extractAssistantTerminal: upstream error/incomplete stop (issue case A)", () => {
+  const t = extractAssistantTerminal({
+    role: "assistant",
+    content: [],
+    stopReason: "error",
+    rawStopReason: "incomplete",
+    errorMessage: "Response incomplete without a provider reason",
+  });
+  assert.deepEqual(t, {
+    stopReason: "error",
+    rawStopReason: "incomplete",
+    errorMessage: "Response incomplete without a provider reason",
+    textBlocks: 0,
+    thinkingBlocks: 0,
+  });
+});
+
+test("extractAssistantTerminal: completed-but-empty response (issue cases B/C)", () => {
+  const t = extractAssistantTerminal({ role: "assistant", content: [], stopReason: "stop", rawStopReason: "completed" });
+  assert.deepEqual(t, { stopReason: "stop", rawStopReason: "completed", errorMessage: undefined, textBlocks: 0, thinkingBlocks: 0 });
+});
+
+test("extractAssistantTerminal: counts text/thinking/reasoning blocks, passes through error string field", () => {
+  const t = extractAssistantTerminal({
+    role: "assistant",
+    content: [{ type: "text", text: "hi" }, { type: "thinking", thinking: "hmm" }, { type: "reasoning", summary: [] }, { type: "toolCall", id: "c1" }],
+    stopReason: "stop",
+    error: "provider said no",
+  });
+  assert.equal(t?.textBlocks, 1);
+  assert.equal(t?.thinkingBlocks, 2, "thinking and reasoning both count as thinking-family");
+  assert.equal(t?.errorMessage, "provider said no", "string `error` field is the errorMessage fallback");
+});
+
+test("extractAssistantTerminal: nothing known returns undefined (renders as unknown downstream)", () => {
+  assert.equal(extractAssistantTerminal({ role: "assistant" }), undefined);
+  assert.equal(extractAssistantTerminal({}), undefined);
+});
+
+test("parseEventLine: message_end carries terminal state alongside usage", () => {
+  const ev = parseEventLine(
+    '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","rawStopReason":"incomplete","errorMessage":"boom","usage":{"input":18928,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":18928,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}}',
+  );
+  assert.ok(ev && ev.kind === "usage-update");
+  assert.equal(ev.usage?.input, 18928);
+  assert.equal(ev.terminal?.stopReason, "error");
+  assert.equal(ev.terminal?.textBlocks, 0);
+});
+
+test("parseEventLine: message_end with terminal state but NO usage still yields the event", () => {
+  const ev = parseEventLine(
+    '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","rawStopReason":"incomplete"}}',
+  );
+  assert.deepEqual(ev, {
+    kind: "usage-update",
+    terminal: { stopReason: "error", rawStopReason: "incomplete", errorMessage: undefined, textBlocks: 0, thinkingBlocks: 0 },
+  });
+});
+
+test("parseEventLine: non-assistant message_end with stop fields is skipped", () => {
+  const ev = parseEventLine('{"type":"message_end","message":{"role":"user","content":[],"stopReason":"error"}}');
+  assert.equal(ev, null);
 });
