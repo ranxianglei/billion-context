@@ -143,6 +143,59 @@ test("#4846: index-inject carries contextTab=false even before the origin is bou
     }
 });
 
+// #6436: dsh.settingsTab=false must reach the page through BOTH carriers, and
+// the default-config payload must stay byte-identical to #4237 (no new key).
+test("#6436: dsh.settingsTab=false rides the boot snapshot and /bili/origin; default omits it", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ dsh: { settingsTab: false } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true, settingsTab: false } }]);
+            // The live route agrees with the boot snapshot (last known origin wins).
+            const routes: RouteRow[] = [];
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: true, settingsTab: false });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+// #6436: the default-config payload must stay byte-identical to #4237 — no
+// settingsTab key at all (the host half only emits the field when OFF, so an
+// older host half that predates settingsTab keeps failing open on the absent
+// field). Pins the "default omits it" half of the gate (#3617 both directions).
+test("#6436: default config omits settingsTab from the __BILI__ payload (byte-identical to #4237)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({}));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
+            const routes: RouteRow[] = [];
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: true });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
 type RouteRow = { kind: string; path: string; handler: (req: unknown, res: FakeRes) => void | Promise<void> };
 
 class FakeRes {
@@ -2025,6 +2078,28 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
     // and #3862 tests above, which mount without the field).
     const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: true } });
     assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    shown.runCleanups();
+});
+
+// #6436: dsh.settingsTab=false drops ONLY the settings.section registration —
+// the plugin bundle config face (the remaining in-DSH entry point), the
+// Context tab and the availability pill stay registered.
+test("#6436: settingsTab=false hides the DSH settings entry; absent field fails open", async () => {
+    const baseExtra = (): Record<string, unknown> => ({
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", settingsTab: false } }, "plugins.bundle.config");
+    assert.deepEqual(hidden.slotsOrder, ["plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    assert.ok(!hidden.optionsBySlot.has("settings.section"), "hidden settings entry registers nothing");
+    assert.ok(hidden.optionsBySlot.has("plugins.bundle.config"), "the plugin detail page stays the in-DSH entry point");
+    hidden.runCleanups();
+    // Explicit on keeps it; (absent-field fail-open is pinned by the
+    // #1590/#2125 test above, which mounts without the field).
+    const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", settingsTab: true } });
+    assert.ok(shown.optionsBySlot.has("settings.section"), "explicit on keeps the entry");
     shown.runCleanups();
 });
 

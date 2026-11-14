@@ -4293,6 +4293,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
             const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
             dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshSetRow.inp.checked = ds ? ds.settingsTab !== false : true;
             dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
@@ -4366,6 +4367,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         dshCtxHint.className = "dim small";
         dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
         dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshSetRow = row("quick-dsh-settingstab", t("cfg.q_dsh_settingstab"));
+        qCtrls.push(dshSetRow.inp);
+        dshSetRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshSetRow.inp.checked) delete ds.settingsTab; else ds.settingsTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshSetHint = document.createElement("span");
+        dshSetHint.className = "dim small";
+        dshSetHint.textContent = t("cfg.q_dsh_settingstab_hint");
+        dshSetRow.ctl.appendChild(dshSetHint);
         const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
         qCtrls.push(dshLblInp);
         dshLblInp.addEventListener("change", () => commit((d) => {
