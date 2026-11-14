@@ -279,6 +279,7 @@ billion-context/
 │   ├── incremental-lane.ts       # Incremental-turn server lane: delta acks via x-bili-applied-seq (#3248)
 │   ├── inline-engine.ts          # In-process compression engine behind the pseudo-origin (#3278)
 │   ├── inline-ws.ts              # Loopback-only WS bridge for the inline engine (#3278)
+│   ├── instructions-guard.ts     # OpenAI Responses instructions size guard: overflow detect + keep-latest dedup rescue (#6258)
 │   ├── integrity-label.ts        # NTFS mandatory integrity label check for EPERM startup failures (#5154)
 │   ├── invariant-judge.ts        # Outbound-invariant judge: did bili rewrite client history this request (#3842)
 │   ├── lane-credentials.ts       # Per-lane upstream credential override (apiKeyEnv/credentialRef) (#2336)
