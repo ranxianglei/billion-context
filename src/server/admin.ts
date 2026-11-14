@@ -16,12 +16,12 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginBypass, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
-import { getUnrecognizedPathStats } from "./observability.js";
+import { getUnrecognizedPathStats, getUnroutedModelEndpointStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
@@ -869,6 +869,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/plugin/bypass") {
+        // #6641: client-side bypass report from a host plugin (dsh lane) — a
+        // model request whose URL is not a recognized model endpoint was sent
+        // DIRECT (uncompressed), so the proxy never saw it.
+        try {
+            const body = await readBody(req);
+            handlePluginBypass(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/compact") {
         try {
             const body = await readBody(req);
@@ -1246,7 +1260,7 @@ function sendStats(res: http.ServerResponse): void {
         };
     });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), unroutedModelEndpoints: getUnroutedModelEndpointStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
 /** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —

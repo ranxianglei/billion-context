@@ -67,7 +67,7 @@ import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEnd
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, reportUnroutedModelEndpoint, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
@@ -2449,6 +2449,13 @@ export async function apply(ctx: PluginContext): Promise<void> {
         unroutedEndpoints.add(key);
         const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …) or endpoints declared via modelEndpointPatterns in the global config.`;
         persistClientEvent(line);
+        // #6641: report the bypass to the proxy so acp_status can surface
+        // "lane bypassed, compression inactive" instead of the misleading
+        // "0 messages / nothing compressible". Fire-and-forget.
+        const base = register.base ?? state.origin;
+        if (base !== undefined) {
+            void reportUnroutedModelEndpoint(base, key).catch(() => undefined);
+        }
     };
 
     // #1884 re-sign arm: bind the host's credential service (dynamic inject —
