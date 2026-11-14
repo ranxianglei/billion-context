@@ -266,6 +266,15 @@ function safeJson(raw: string | null | undefined): unknown {
     }
 }
 
+function ccrOriginals(store: MessageContentStore | null): Map<string, string> {
+    const originals = new Map<string, string>();
+    if (store) for (const [ref, entry] of Object.entries(store.byRef)) {
+        const payload = typeof entry?.hash === "string" ? store.byHash[entry.hash] : undefined;
+        if (typeof payload === "string") originals.set(ref, payload);
+    }
+    return originals;
+}
+
 /** JSONL dump rendered from the unified tables (#2671 Phase 2c). One JSON
  * record per line: a session header, then messages ordered by seq (CCR
  * placeholders dereferenced to their stored originals when `full`; retired
@@ -298,10 +307,9 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
             tail: safeJson(row.tailJson),
         }),
     );
-    // Index entries first (fork receipts carry them); the on-disk content
-    // store fills the gaps for normal sessions — the record itself omits the
-    // store by design (multi-MB rewrite cost, see session.ts contentStore).
-    const ccr = new Map((await backend.getCcrEntries(sessionId)).map((e) => [e.key, e.content] as const));
+    // CCR entries contain reference metadata; originals live in byHash.
+    // The on-disk store fills gaps in the indexed mirror.
+    const ccr = ccrOriginals(full ? await backend.getCcr(sessionId) : null);
     if (extraCcr) for (const [k, v] of extraCcr) if (!ccr.has(k)) ccr.set(k, v);
     // #4664: historian read — include retired (tombstoned) rows so a rewound
     // session exports its full history; live rows omit `retiredAt`.
@@ -470,7 +478,7 @@ async function renderSelectedSessionJsonl(store: SessionStore, session: Session,
             try {
                 if (await backend.getSessionRow(session.id)) {
                     const disk = store.loadContentStore(session);
-                    const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
+                    const extra = disk ? ccrOriginals(disk) : undefined;
                     return await renderSessionJsonlFromTables(backend, session.id, full, extra);
                 }
             } finally {
