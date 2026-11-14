@@ -374,7 +374,7 @@ def write_dist(base_dir):
     p = os.path.join(d, "index.js")
     with open(p, "w") as f:
         f.write("// dummy bili dist entry point\n")
-    os.chmod(p, 0o755)  # npm chmods the bin it links onto; `bili` must be executable on PATH
+    os.chmod(p, 0o755)  # npm chmods the bin it links onto; \`bili\` must be executable on PATH
     return p
 
 def stub_bili(bin_dir, target):
@@ -515,7 +515,7 @@ elif SCENARIO.startswith("gate-"):
     os.environ[envvar] = "http://127.0.0.1:1" if envvar == "BILLION_CONTEXT_PROXY" else "0"
     mod.register(ctx)
 elif SCENARIO == "no-sidecar":
-    # Hermetic: a `bili` on the machine's own PATH must not turn "no dist anywhere" into a
+    # Hermetic: a \`bili\` on the machine's own PATH must not turn "no dist anywhere" into a
     # resolution — the ladder's last rung is asserted against a PATH that holds node only.
     os.environ["PATH"] = os.path.dirname(os.environ["BC_NODE"])
     mod.register(ctx)
