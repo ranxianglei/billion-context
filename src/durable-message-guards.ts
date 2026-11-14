@@ -11,9 +11,11 @@
 // contents — changes), and the agent-loop runtime-context snapshot (#2481:
 // sandbox/approval policy state, self-declared "supersedes earlier
 // runtime-context snapshots" — resent only when the runtime context CHANGES,
-// not every turn) — plus a FOURTH carrier from the dsh PLUGIN ecosystem
+// not every turn) — plus TWO carriers from the dsh PLUGIN ecosystem
 // (#2446: dsh-skill-mcp-manager's \x3cmcp_catalog\x3e block, the first entry
-// whose emitter is not dsh core). ACP compression treats every history
+// whose emitter is not dsh core; #4495: dsh-mnemon's runtime memory snapshot
+// — the user profile + working reference, re-injected only when the rendered
+// text CHANGES). ACP compression treats every history
 // message as consumable, so one fold of any carrier silently kills its
 // guidance forever (the host will not resend what it believes is already
 // present). The structured source.kind these hosts stamp internally never
@@ -154,6 +156,29 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
     return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Current runtime context")
         ? "durable/runtime-context"
+        : undefined;
+}
+
+/** dsh mnemon memory-snapshot identity (#4495): the durable runtime memory
+ *  snapshot injected by the THIRD-PARTY plugin dsh-mnemon — the user's
+ *  always-on persona context (USER.md user profile + MEMORY.md working
+ *  reference) carried as ONE plain user/text message whose body starts with
+ *  the header line "MNEMON RUNTIME MEMORY SNAPSHOT" followed by a Revision
+ *  line and \x3cruntime-memory-file name=…\x3e sections (source:
+ *  dsh-mnemon/lib/index.js memorySnapshotMessage(); author-reported shape,
+ *  verified against a live session in the #4495 report). The plugin gates
+ *  re-injection on exact-text equality (injectedMemoryText), so a stable
+ *  profile is injected ONCE and never again — one fold silently kills the
+ *  session's persona forever (same fingerprint-gate contract as #2419;
+ *  second entry whose emitter is the dsh plugin ecosystem rather than dsh
+ *  core, cf. #2446). The marker matches the header line rather than any
+ *  inner section tag so a layout change cannot silently disarm the
+ *  classifier; matching stays narrow on purpose (a false positive is benign
+ *  — a matching message simply stays visible). #2766: assistant-role
+ *  messages are never carriers (see dshSkillCatalogPath). */
+export function dshMnemonMemoryPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("MNEMON RUNTIME MEMORY SNAPSHOT")
+        ? "durable/mnemon-memory"
         : undefined;
 }
 
@@ -353,8 +378,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the twelve evidence-backed identities → its
- *  canonical path (four durable carriers + eight foldable one-shot injections).
+/** dsh lane classifier: any of the thirteen evidence-backed identities → its
+ *  canonical path (five durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -365,6 +390,7 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
         dshMcpCatalogPath(msg) ??
+        dshMnemonMemoryPath(msg) ??
         dshTimeContextPath(msg) ??
         dshPastedImagePath(msg) ??
         dshToolJobNoticePath(msg) ??
@@ -424,6 +450,7 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
         dshMcpCatalogPath(msg) ??
+        dshMnemonMemoryPath(msg) ??
         dshTimeContextPath(msg) ??
         dshPastedImagePath(msg) ??
         dshToolJobNoticePath(msg) ??
@@ -435,8 +462,8 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (fourteen markers:
- *  the mnemon family contributes two, the image-offload family contributes
+ *  exact marker strings of the thirteen dsh classifiers above (fifteen markers:
+ *  the mnemon family contributes three, the image-offload family contributes
  *  two), so a unified-store
  *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
  *  may carry megabytes of base64 media). Lockstep with the classifiers is
@@ -451,6 +478,7 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "background job",
     "[MNEMON] ",
     "[MNEMON RUNTIME MEMORY",
+    "MNEMON RUNTIME MEMORY SNAPSHOT",
     "Background subagent ",
     " sent a message: ",
     "; request preview ",
