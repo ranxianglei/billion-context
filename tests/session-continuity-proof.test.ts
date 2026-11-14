@@ -265,10 +265,12 @@ for (const wire of WIRES) test(`scenario B (${wire}): a fork with context COPIES
         assert.equal(snap.status, 200, snap.body.error ?? JSON.stringify(snap1Error(snap.body)));
         const refs = snap.body.orderedMessages.map((m) => m.ref);
         assert.equal(refs.length, history.length, "conversation messages (the system rides outside the ref space)");
-        // #2676 lane: the durable guard message is protected — unaddressable
-        // on the wire (null ref; the kernel BLOCKED sentinel itself never
-        // crosses it — #2620 final contract).
-        assert.equal(refs[1], null, `guard must be a null ref, got ${JSON.stringify(refs)}`);
+        // #2676 lane: the durable guard is protected from folding (carved out at
+        // projection time). Post-#3999 it is NUMBERED at birth instead of carrying
+        // the unaddressable BLOCKED sentinel, so it rides the wire as a live mNNNNN
+        // ref — while the literal "BLOCKED" string still never crosses it (#2620
+        // final contract).
+        assert.ok(/^m\d+$/.test(refs[1] ?? ""), `guard is numbered at birth, got ${JSON.stringify(refs)}`);
         assert.ok(!refs.includes("BLOCKED"), "the sentinel must never cross the wire");
         const foldFrom = refs[3]!;
         const foldTo = refs[8]!;
@@ -290,15 +292,19 @@ for (const wire of WIRES) test(`scenario B (${wire}): a fork with context COPIES
 
         const childSession = resolveConversation(child).session!;
         assert.notEqual(childSession.id, getSession(parent).id, "the child is a NEW session");
-        assert.deepEqual(childSession.state.messageRefs.byRef["BLOCKED"], undefined, "#2620: BLOCKED never enters byRef");
-        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"), "#2620: BLOCKED stays addressable by raw");
-        // Seeded refs: the child's mapping for every inherited raw id must
-        // equal the parent's exact ref (#629 copy-on-fork).
         const parentSession = getSession(parent);
+        // #2620 ref-space invariant stands on its own: BLOCKED can never become a
+        // byRef key (keys are minted mNNNNN). Post-#3999 this all-text fixture
+        // carries no permanently-pinned message, so the durable guard is a live
+        // numeric ref rather than a BLOCKED entry — the full-map copy below proves
+        // the entire ref space travels to the child.
+        assert.deepEqual(childSession.state.messageRefs.byRef["BLOCKED"], undefined, "#2620: BLOCKED never enters byRef");
+        // Seeded refs: the child reproduces the parent's ENTIRE raw→ref map exactly
+        // (#629 copy-on-fork) — every message, not just the folded block's ids.
+        for (const [raw, ref] of Object.entries(parentSession.state.messageRefs.byRaw)) {
+            assert.equal(childSession.state.messageRefs.byRaw[raw], ref, `child ref for ${raw} must equal the parent's seeded ref ${ref}`);
+        }
         for (const b of childSession.state.blocks.filter((x) => x.active)) {
-            for (const raw of b.effectiveMessageIds) {
-                assert.equal(childSession.state.messageRefs.byRaw[raw], parentSession.state.messageRefs.byRaw[raw], `child ref for ${raw} must equal the parent's seeded ref`);
-            }
             assert.ok(childSession.blockContents.has(b.blockId), `child must carry the summary for ${b.blockId}`);
         }
 
