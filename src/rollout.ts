@@ -109,6 +109,14 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // the seam may even read local files — coupling them made opting one's
     // own install in require bumping an unrelated rollout. Default 0%.
     identityChannelHarvest: { percent: 0 },
+    // #6111 POC (#6025): carry rendered fold summaries out as CCR placeholders
+    // (`[acp-stored #mNNNNN · compressed history]`) instead of inline prose in
+    // proxy mode, so weak models can't misread a user-voiced summary as the
+    // current question; retrieval returns to the model via acp_retrieve.
+    // Egress-view only, session state untouched. EXPERIMENTAL — default off;
+    // force on with `rollout.features.foldSummaryCcr: true` or
+    // `BILI_ROLLOUT_FOLD_SUMMARY_CCR=1`.
+    foldSummaryCcr: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

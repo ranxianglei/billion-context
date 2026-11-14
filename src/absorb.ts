@@ -16,6 +16,7 @@ import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, RULE_TOOL_NAME } from 
 import { effectiveBlockOpsConfig } from "./acp-block-ops.js";
 import { effectiveRulesEnabled } from "./rules-feature.js";
 import { ccrEnabled, retrieveToolName } from "./store.js";
+import { featureEnabled } from "./rollout.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -59,7 +60,7 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     // #5765: opt-in block ops (config.blockOps.enabled) — same adjudication
     // pattern as absorb above.
     if (effectiveBlockOpsConfig(session, config)?.enabled === true && BLOCK_OP_TOOL_NAMES.has(name)) return true;
-    if (ccrEnabled(session) && name === retrieveToolName(session)) return true;
+    if ((ccrEnabled(session) || featureEnabled("foldSummaryCcr")) && name === retrieveToolName(session)) return true;
     return effectiveRulesEnabled(session, config) && name === RULE_TOOL_NAME;
 }
 

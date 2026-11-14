@@ -27,6 +27,7 @@ import {
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, imageRescaleToolArmed, retrieveToolName } from "../store.js";
+import { featureEnabled } from "../rollout.js";
 import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescale.js";
 import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
@@ -497,7 +498,7 @@ export function executeProxyTool(
     if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
     }
-    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+    if ((ccrEnabled(ctx.session) || featureEnabled("foldSummaryCcr")) && toolName === retrieveToolName(ctx.session)) {
         return executeRetrieve(args, ctx.session);
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
