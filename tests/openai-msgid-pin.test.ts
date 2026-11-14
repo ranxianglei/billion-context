@@ -126,7 +126,8 @@ test("openai wire: biliMsgIds never reach the upstream; rows carry client ids on
             assert.deepEqual(idsA.sort(), ["open-a-1", "open-u-1", "open-u-2"].sort(), "rows carry the CLIENT ids (pin)");
 
             // Turn B: rollout OFF — same channel, stripped, NOT pinned.
-            delete process.env[ROLLOUT_ENV];
+            // Force off explicitly (the default is now GA-on, #6525).
+            process.env[ROLLOUT_ENV] = "0";
             await post("conv-openai-nopin");
             const bodyB = JSON.parse(forwardedOf("question-two conv-openai-nopin")) as Record<string, unknown>;
             assert.equal(bodyB.biliMsgIds, undefined, "strip is unconditional even when rollout is off");

@@ -1,6 +1,6 @@
 # Message-ID lane infrastructure: the sessionid+msgid production/consumption map
 
-> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in message-identity.md (kernel) and session-identity.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its five consumers, and its declared trust boundaries. Read this before touching any of it.
+> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in message-identity.md (kernel) and session-identity.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its six consumers, and its declared trust boundaries. Read this before touching any of it.
 
 ## 1. What it is
 
@@ -21,7 +21,7 @@ Discipline: collectors only "obtain and pre-screen"; they hold NO identity-adjud
 
 Four carriers, **ALL stripped before forwarding to the model upstream** — the model wire still carries no message-level ids (#2821 doctrine):
 
-1. **Envelope field** `biliMsgIds`: parallel array on full-resend model bodies, length-locked to messages, same lifecycle (stripped at ingress, src/server/prepare-anthropic.ts et al.).
+1. **Envelope field** `biliMsgIds`: parallel array on full-resend model bodies, length-locked to the **post-hoist core count** (not the wire element count) — clients prove core-alignment via the kernel's own #3642 `wireIndex` back-pointer before stamping (src/agent/pi-msgids.ts `coreAlignEnvelopeIds`; every non-leading wire element must own exactly one core; any unprovable shape bails the whole request to content-derived ids — never guessed, never partial, request ships byte-identical). Wired: dsh full-resend (src/agent/dsh-native.ts `resolveEnvelopeMsgIds`, openai + anthropic wire, #6525) and pi + omp full-resend (src/agent/pi.ts `stampMsgIdEnvelope`, reuse the same already-validated walker output), the latter gated by `destinationRoutedThroughProxy` — a blind tunnel never gets stamped (#1403). Same lifecycle (stripped at ingress, src/server/prepare-anthropic.ts et al.).
 2. **Incremental turn payload** `msgIds`: envelope on `POST /__bili/plugin/turn` (src/agent/incremental-client.ts); server re-stamps `biliMsgIds` (src/incremental-lane.ts).
 3. **Watermark headers** `x-bili-pf-tail-ids` (v2-v4, #5403/#5418): window segment only = last anchor element + all elements added since K, percent-encoded per segment, comma-separated (commas inside ids travel as `%2C`, separators stay literal); sibling `x-bili-pf-count` count stamp. pf-* headers are **protocol headers, not hop headers**: stripped before upstream via `UPSTREAM_HOP_HEADERS`.
 4. **Ledger-seq sibling** `biliLedgerSeqs` / `ledgerSeq` stamps (#4316 L3 PR2/3): 1-based positive-int parallel arrays, validated by `validateMsgSeqs`, same strict-validate-then-degrade lifecycle.
@@ -48,7 +48,7 @@ One-off closure from the review: `parseTailIds` alone lacked the reserved-prefix
 
 The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins validated ids into rows (T5 ruling: no parallel ledger; skeleton rows carry no ids). Ledger primary key `(session_id, msg_id, content_hash)`; canonical rows key on **MSGID, not content hash** (#4491); fork clones preserve numbers (#4316 L3 PR3/3 `cloneSessionRows`).
 
-## 6. Consumers (five; what question each one asks of the ids)
+## 6. Consumers (six; what question each one asks of the ids)
 
 | Consumer | Location | Question answered | Id-usage boundary |
 |---|---|---|---|
