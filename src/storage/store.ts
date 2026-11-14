@@ -2745,6 +2745,13 @@ export class UnifiedStore {
         return row?.updated_at ?? null;
     }
 
+    sessionIdentity(sessionId: string): { protocol?: string; origin?: string } | null {
+        const row = this.db
+            .prepare("SELECT protocol, origin FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { protocol: string | null; origin: string | null } | undefined;
+        return row ? { protocol: row.protocol ?? undefined, origin: row.origin ?? undefined } : null;
+    }
+
     getCheckpoint(cpId: string): CheckpointRow | undefined {
         return this.db
             .prepare("SELECT cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label FROM checkpoints WHERE cp_id = ?")
