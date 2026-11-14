@@ -154,6 +154,25 @@ function messageBreakpoints(body: Record<string, unknown>): number {
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
 
+test('timestamp-free side requests may acknowledge without journal publication', async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    try {
+        h.failJournal(true);
+        const seed = { conversationId: CONV, path: '/v1/messages', sinceSeq: 0, resync: true,
+            request: { model: 'claude-test', max_tokens: 16 }, messages: [{ role: 'user', content: 'small side request' }] };
+        const response = await h.post('/__bili/plugin/turn', JSON.stringify(seed), laneHeaders);
+        assert.equal(response.status, 200);
+        assert.equal(response.appliedSeq, 1);
+        assert.equal(h.forwarded.length, 1);
+        for (const session of listSessions()) assert.deepEqual(session.state.tsStamps ?? {}, {}, 'the side lane must not add kernel timestamps');
+    } finally {
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
 test('journal failure exposes neither a response ACK nor a polling receipt; retry may acknowledge', async () => {
     const before = process.env.BILI_MESSAGE_TIMESTAMPS;
     process.env.BILI_MESSAGE_TIMESTAMPS = '1';
