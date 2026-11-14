@@ -205,6 +205,10 @@ function cleanEnv(): NodeJS.ProcessEnv {
     )
       delete env[key];
   }
+  // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+  // off) — this suite asserts the legacy JSON persistence surface, so pin
+  // the dual-write writer explicitly.
+  env.BILI_STORAGE_JSON_WRITER = "on";
   // NODE_TEST_CONTEXT: set by the node:test runner and inherited by the spawned
   // pi — pi-native.ts deliberately stands down inside node:test (unit-test
   // guard), which would silently disable the very bootstrap this suite

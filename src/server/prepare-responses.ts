@@ -16,11 +16,15 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
+import type { DeltaState } from "../snapshot/delta.js";
+import { FoundationRejectError } from "../snapshot/plane.js";
+import { runStage0 } from "../snapshot/stage0.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -43,6 +47,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -104,6 +109,14 @@ export async function prepareResponses(
     }
 
     let processedMessages: CoreMessage[] = [];
+    // #6181 2×2: the msgid + ledger-seq dual-channel the plugin host rides
+    // on the body (src/msgid-pin.ts) — read and STRIPPED before any
+    // projection so the real upstream never sees a field it does not know.
+    // (Same discipline as the openai twin.)
+    const incomingMsgIds = (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // #564/#2627: the ordering separators THIS turn's repair actually inserted,
     // recorded by the producer so provenance never has to be inferred from item
     // text later. Empty on the overwhelming majority of turns.
@@ -117,6 +130,39 @@ export async function prepareResponses(
     let toolsOut = parsed.tools;
     let transformOk = false;
     let responsesDevContent: string | undefined;
+    // 2×2 Part B: true when this round's outbound is a PLANE DELTA (the
+    // provider's retained chain carries the rest) — gates the developer
+    // message re-injection and the previous_response_id strip below.
+    let deltaServed = false;
+    // 2×2 Part B (review-round-2 Residual 1a): a chained round whose plane
+    // frontier is ALREADY at the top of the world — nothing new to send.
+    // The outbound is an EMPTY input with the chain id KEPT and no developer
+    // message: the provider's retained chain holds the whole world. Without
+    // this classification the no-op read as "no delta" → id stripped + dev
+    // injected + empty input = a BLIND response the host would chain from.
+    let noopServed = false;
+    // 2×2 Part B: a persisted delta frontier existed BEFORE this round's
+    // outbound selection (the provider's retained context equals exactly the
+    // elements sent up to it) — see the strip site below for the contract.
+    let hadFrontier = false;
+    // 2×2 Part B (B4): hoisted so the return literal can hand the selected
+    // frontier to the relay (committed only after the upstream accepts).
+    let deltaState: DeltaState | null | undefined;
+    let selectionFired = false;
+    let pendingDelta: { state: { frontierPos: number; servedAnchors: string[] }; kind: "full" | "noop" | "partial" } | null = null;
+    // #6181 B0: a chained turn that cannot be addressed against the plane
+    // (non-cohort — its kernel view is a delta, not the world) skips BOTH
+    // the plane write for this turn's flush and the plane egress — see the
+    // flag set site below the processTurn block.
+    let planeBypass = false;
+    // #6181 round 2, Residual 2 hardening: the plane max pos the provider
+    // chain will hold once THIS forward is accepted — the relay pairs it
+    // with the response id it observes on the outbound stream (see
+    // relay.ts). Set after the in-request flush: the plane then holds
+    // exactly this round's world (or, for a planeBypass round, the
+    // previous world — which is precisely the boundary the chain already
+    // holds, since the bypass skips the flush).
+    let mintFrontierPos: number | undefined;
     let sysNotes: string[] = [];
     // #3713: billed tokens of the #1638-masked mid-history sys/dev items — they
     // ride the rebuilt input verbatim yet enter neither projection.msgs nor
@@ -173,6 +219,9 @@ export async function prepareResponses(
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -242,8 +291,37 @@ export async function prepareResponses(
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
         }
-        const { msgs } = projection;
+        let { msgs } = projection;
         originalMessages = msgs;
+        // #6181 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to input; malformed/absent → null → the M2 fast path is
+        // disabled, the full-resend world-match path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
+        // #6181 2×2 stage 0 (brief 19544722): the SHARED pin + world-match
+        // + kernel-input assembly (src/snapshot/stage0.ts — the SAME helper
+        // as the openai lane, same red gate). Before processTurn, so an R3
+        // FoundationRejectError carries zero kernel side effects.
+        const s0 = runStage0({
+            sessionId,
+            lane: "responses",
+            msgs,
+            incomingMsgIds,
+            incomingSeqs,
+            pluginMode,
+            log,
+        });
+        if (s0.pinned !== null) {
+            msgs = s0.pinned;
+            originalMessages = msgs;
+        }
+        // #6181 M6: a stage-0 resync re-issues the pos space — a stale delta
+        // frontier against the re-issued pos is a dead loop (empty delta
+        // forever); clear it so the next chained round reseeds.
+        if (s0.resynced) session.responsesDelta = null;
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
@@ -266,7 +344,10 @@ export async function prepareResponses(
             noteAnchoredRender(session, log);
             renderMsgs = anchored.view;
         } else {
-            renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+            // #6181 2×2: the stage-0 assembly outranks the D-lane view for
+            // cohort turns (the plane IS the kernel-input authority); the
+            // D lane keeps serving everyone else unchanged.
+            renderMsgs = s0.kernelInput ?? maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         }
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -374,6 +455,66 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 mapEgress (owner ruling 2026-11-11): the plane persists the
+        // kernel's OWN tagged processTurn output (invariant v: post_json is
+        // the post-rewrite core form, never wire bytes). Deep-copy — the lane
+        // mutates turn.messages in place later (absorb view, subagent attach)
+        // and the egress transform re-applies exactly those passes, so the
+        // stored rows must stay the pre-mutation bytes. The anchor rows ride
+        // the copy too: they are processTurn output.
+        session.lastPlaneMessages = JSON.parse(JSON.stringify(turn.messages));
+        // #6181 B0: set BEFORE the in-request flush below — a chained turn
+        // that was not assembled from the plane (non-cohort: its kernel view
+        // is a delta, not the world) must not flush its collapsed view into
+        // the plane (snapViewEvents is a final-state diff — it would DELETE
+        // every row the view does not contain). One-shot: cleared right
+        // after the flush; the plane egress below gets the same verdict as
+        // `bypass` (the plane is one turn stale — serving it would drop the
+        // new input).
+        const isChained = typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
+        planeBypass = isChained && !s0.cohortRan && !wsAnchored;
+        if (planeBypass) {
+            session.skipPlaneFlush = true;
+            // #5901 review fix (2026-11-13, review round 2): the view just
+            // captured is a DELTA, not the world — it must not outlive this
+            // round. The one-shot skipPlaneFlush above only protects the
+            // in-request flush; the relay success path re-arms the debounced
+            // save (relay markDirty) and that save would ride this delta as a
+            // TAGGED world (persist guardedBuild → shadow.record livePlane →
+            // snapShadowSync tagged path, B4 guard untagged-only) —
+            // snapViewEvents would DELETE every plane row the delta lacks.
+            // Untag: the later save derives from the DB final state instead
+            // (append-only rows for this exchange — correct).
+            session.lastPlaneMessages = undefined;
+        }
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages — and it stays the RAW client resend (never
+        // the D-lane view: its synthetic acp_summary anchor is not a
+        // transcript message). The plane rows have a separate source:
+        // session.lastPlaneMessages above (the kernel's tagged output).
+        // Never fatal — a failed flush leaves the round on the legacy egress
+        // path.
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
+        // #6181 B0: the in-request flush above either skipped the plane
+        // write (flag consumed) or ran it — either way the one-shot flag is
+        // done for this turn.
+        session.skipPlaneFlush = false;
+        // #6181 round 2, Residual 2 hardening: record the frontier this
+        // ACCEPTED round leaves the provider chain holding (post-flush
+        // plane max pos — see the declaration). Best-effort: a store error
+        // just leaves the mint unset (no verifiable chain → re-seeds, the
+        // status quo, never a loss).
+        try {
+            const s = getStore();
+            if (s !== null && s !== undefined) mintFrontierPos = s.snapPlaneMaxPos(session.id);
+        } catch {
+            /* no mint record for this round */
+        }
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -443,6 +584,139 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         processedMessages = ordered.messages;
         separatorSlots = ordered.slots;
+        // #5874 P2 (mapEgress) direct-authority plane egress. 2×2 Part B
+        // (出站增量): the Responses protocol is the only cohort with
+        // provider-side retention (previous_response_id chaining), so this is
+        // the only lane with an incremental outbound mode. Delta mode requires
+        // the client to chain (previous_response_id present) AND the owner to
+        // opt in via the EXISTING keepResponseId knob (PR config-surface
+        // section: no new field — the knob's documented "diagnostic only"
+        // status is what this upgrades to: keep + delta input).
+        // state===null = no persisted frontier (first round / resync / lost
+        // state) → reseed (full send, frontier reset).
+        const chains = knobKeepResponseId() && typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
+        deltaState = chains ? (session.responsesDelta ?? null) : undefined;
+        // #6181 review round 2, Residual 2: the first CHAINED round of a
+        // keepResponseId chain carries a previous_response_id but NO committed
+        // frontier — round 1 carried no id, so no selection fired and B4 had
+        // nothing to commit. A plain re-seed would resend the WHOLE world that
+        // the provider's chain already holds from this proxy's own round-1
+        // full view (2× the world's tokens, the conversation twice). Stage 0
+        // can PROVE the safe case: the current world is a strict extension of
+        // the world the plane last held (probe, nothing gone, new elements).
+        // The chain was built from the client's own resends of exactly that
+        // world, so initialize the frontier at the stored-world boundary and
+        // serve the new elements only. Every other shape (scatter / issue /
+        // resync / degraded stage 0 / no chain) falls through to the plain
+        // re-seed — worst case there is the one-time duplication the re-seed
+        // always had, never a loss. Gated on !responsesChainBroken: a rejected
+        // selection (B4) means the provider never ran that round, so the plane
+        // holds more than the provider's chain — the stored-world boundary is
+        // NOT safe and the round must re-seed the full view.
+        if (
+            deltaState === null && chains
+            && !session.responsesChainBroken
+            && s0.kernelInput !== undefined && s0.storedFrontierPos !== null
+            && session.lastMintedResponse !== null && session.lastMintedResponse !== undefined
+            && session.lastMintedResponse.id === parsed.previous_response_id
+            && session.lastMintedResponse.frontierPos === s0.storedFrontierPos
+        ) {
+            deltaState = { frontierPos: s0.storedFrontierPos, servedAnchors: [] };
+            log("info", `[${sessionId}] [snaplane] frontier seeded at the stored-world boundary (pos ${s0.storedFrontierPos}) — the provider chain from this proxy's own prior round holds the stored world; serving the new elements only instead of re-seeding (Residual 2)`);
+        }
+        // True once THIS proxy has established a delta chain with the provider
+        // (a persisted frontier exists). Only then may a non-delta round strip
+        // the id: the provider's retained context equals exactly the elements
+        // up to the frontier, so a full replay would duplicate it. Before the
+        // first frontier the native #1954 KEEP=1 contract holds (id forwarded
+        // intact, whatever the outbound is).
+        hadFrontier = deltaState !== undefined && deltaState !== null;
+        // #6181 round 2, Residual 2 hardening: a persisted frontier is a
+        // claim about the PROVIDER's chain, not just the plane — and
+        // previous_response_id is OPAQUE. A host can fork/rewind to an older
+        // response id (or carry an id another proxy minted); the strict-
+        // extension proof bounds only the plane, so a delta built from a
+        // frontier the chain never provably holds loses the gap. Trust the
+        // frontier ONLY when the host continues from an id THIS proxy minted
+        // last for this session; any other chained round drops it (the egress
+        // then does a plain re-seed: full view, id kept — the status quo,
+        // at-least-once, never a loss) and the persisted state is cleared so
+        // the next round re-establishes verifiability from a fresh seed.
+        // (planeBypass rounds never reach the delta machinery — the egress
+        // serves the legacy bytes — so this is inert there.)
+        if (
+            deltaState !== undefined && deltaState !== null
+            && !(session.lastMintedResponse !== null && session.lastMintedResponse !== undefined
+                && session.lastMintedResponse.id === parsed.previous_response_id)
+        ) {
+            log("info", `[${sessionId}] [snaplane] chained round carries a previous_response_id this proxy did not mint last (${session.lastMintedResponse === null || session.lastMintedResponse === undefined ? "no mint record" : "id mismatch / fork / rewind"}) — dropping the persisted frontier and re-seeding the full view (Residual 2 hardening)`);
+            deltaState = null;
+            session.responsesDelta = null;
+            // The re-seed is a "no frontier" round for the strip/dev gates
+            // too: id kept (native #1954), developer message injected (the
+            // full view is self-contained) — exactly the pre-seed status quo.
+            hadFrontier = false;
+        }
+        // #6181 B0 (decided at the flush site, above): a CHAINED turn that was
+        // NOT assembled from the plane (non-cohort — no msgids — or a cohort
+        // turn whose stage 0 did not run) cannot be addressed against the
+        // plane: its kernel view is a DELTA, not the world. It must touch
+        // neither the plane write (deriving events from the collapsed view
+        // would DELETE every row the view does not contain) nor the plane
+        // egress (the plane is one turn stale — serving it would drop the
+        // new input). Outbound = the legacy bytes verbatim, exactly what
+        // master serves for this turn; the plane stays stale-but-intact
+        // until the next full/cohort turn re-syncs it (one-round
+        // convergence).
+        // #5874 P2 (mapEgress): the plane view is the outbound source;
+        // the lane's exact chain (strip → drop → repair) is reapplied to it.
+        processedMessages = applySnapEgress(turn.state, processedMessages, {
+            sessionId,
+            protocol: "responses",
+            log,
+            isCompressTool: loopConfig.isCompressTool,
+            transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
+            ...(deltaState !== undefined ? {
+                deltaState,
+                onSelection: (sel, totalElements) => {
+                    selectionFired = true;
+                    // kind (review round 2, Residual 2 companion): the relay
+                    // needs to know WHAT went out to maintain responsesChainBroken.
+                    // full = reseed/full-resend (the provider now provably holds
+                    // the whole world) · noop = nothing new requested (the chain
+                    // is intact) · partial = the held world extended by the new
+                    // suffix only.
+                    pendingDelta = {
+                        state: sel.nextState,
+                        kind: sel.reseed || sel.delta.length >= totalElements ? "full" : sel.delta.length === 0 ? "noop" : "partial",
+                    };
+                    // deltaServed = a PARTIAL delta went out: new content only.
+                    // A reseed (state lost / first round) and a full-resend
+                    // (delta grew to the whole view — isFullResend) both send
+                    // the FULL view, which must read as "no delta" for the id
+                    // handling below.
+                    // noopServed = the frontier already covers the whole world
+                    // (Residual 1a: same-body retry of an M1/M2 turn) — empty
+                    // input goes out WITH the chain id kept and NO developer
+                    // message: pure chain continuation.
+                    noopServed = !sel.reseed && sel.delta.length === 0;
+                    deltaServed = !sel.reseed && sel.delta.length > 0 && sel.delta.length < totalElements;
+                },
+            } : {}),
+            ...(planeBypass ? { bypass: true } : {}),
+        });
+        if (deltaState !== undefined && !selectionFired) {
+            // Delta was requested but the plane degraded to legacy this round
+            // (the legacy bytes are the FULL replay). With an established
+            // frontier the id is stripped below and the provider's chain no
+            // longer matches the stored frontier → forget it: the next chained
+            // round re-seeds. Without one (native KEEP=1 client, plane never
+            // seeded) nothing to forget — the native contract stays intact.
+            session.responsesDelta = null;
+        }
+        if (deltaServed) {
+            log("info", `[${sessionId}] [snaplane] outbound=delta frontier=${(pendingDelta as { state: { frontierPos: number } } | null)?.state.frontierPos} — input carries only the unsent suffix; the retained chain carries the rest (re-injected developer message / forged summaries skipped to avoid duplicating what the provider keeps)`);
+        }
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
@@ -484,7 +758,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            // 2×2 Part B: on a delta round the provider KEEPS the seed round's
+            // developer message — re-injecting would duplicate it. On a no-op
+            // round (Residual 1a) there is NO new content at all — the provider
+            // chain holds everything, so injecting dev + sending an empty input
+            // would be a BLIND response.
+            if (!deltaServed && !noopServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
@@ -498,7 +777,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            // Residual 1a: a no-op round sends an EMPTY input — injecting the
+            // developer message there would make the provider answer from the
+            // dev prompt alone (a blind response the host would chain from).
+            if (!deltaServed && !noopServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -599,6 +881,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         }
         transformOk = true;
     } catch (err) {
+        // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
+        // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
+        // BEFORE the generic 503; zero kernel side effects by construction
+        // (it throws before processTurn).
+        if (err instanceof FoundationRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
@@ -679,7 +966,15 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // #1954: stripping is only lossless when input already holds the full
     // conversation. Warn when we strip a non-empty id so a native-chaining
     // (delta) continuation that loses its history is visible, not silent 200s.
-    if (!knobKeepResponseId()) {
+    // 2×2 Part B: the id is governed by the delta chain this proxy established
+    // (hadFrontier). NO prior frontier → native #1954 semantics: KEEP=1
+    // forwards the id intact regardless of what the outbound is (seed / full
+    // view / legacy — the pinned contract). WITH a prior frontier the provider
+    // retains exactly the sent elements, so only a PARTIAL delta keeps the id;
+    // a reseed / full-resend / degraded-legacy round STRIPS it (the chain
+    // breaks, the client re-chains from this round's fresh response id and the
+    // frontier re-seeds — one-round convergence, acceptance #7).
+    if (!knobKeepResponseId() || (hadFrontier && !deltaServed && !noopServed)) {
         const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;
@@ -735,10 +1030,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims
     // can never be attributed to a body that differs by even one byte.
@@ -757,6 +1054,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         judgeBaseline,
         ...(separatorManifest !== undefined ? { separatorManifest } : {}),
         responsesProjection,
+        // #6181 B4: commit the selected frontier only after the upstream
+        // accepts the request (relay.ts); a failed forward drops it.
+        ...(deltaState !== undefined && selectionFired ? { pendingResponsesDelta: pendingDelta } : {}),
+        // #6181 round 2, Residual 2 hardening: the relay pairs this with
+        // the response id observed on the outbound stream (accepted forwards
+        // only) and records session.lastMintedResponse.
+        ...(mintFrontierPos !== undefined ? { mintFrontierPos } : {}),
         systemNotes: sysNotes,
         protocol: "responses",
         stream,

@@ -257,6 +257,10 @@ function cleanEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     for (const key of Object.keys(env)) {
         if (key.startsWith("BILI") || key.startsWith("BILLION_CONTEXT") || key.startsWith("ACP_")) delete env[key];
     }
+    // #6480 flipped the absent-default to pure-sqlite (JSON envelope writer
+    // off) — this suite asserts the legacy JSON persistence surface, so pin
+    // the dual-write writer explicitly.
+    env.BILI_STORAGE_JSON_WRITER = "on";
     // NODE_TEST_CONTEXT stands down pi-native inside node:test; the spawned pi
     // is a real client, not a test context (same rationale as e2e-native-pi).
     for (const key of ["NODE_EXTRA_CA_CERTS", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "NODE_OPTIONS", "NODE_TEST_CONTEXT"]) delete env[key];

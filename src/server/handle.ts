@@ -3071,11 +3071,39 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
+                    // #6181 B3: a PLUGIN-lane chained round whose input
+                    // carries no ARRAY content (absent or empty — a
+                    // bare-string input is admitted too: the provider
+                    // concatenates it to its retained chain, the same
+                    // outcome the kernel path would produce, with none of
+                    // its side effects) is a pure chain continuation — the
+                    // provider
+                    // already has the full world via its retained chain. The
+                    // kernel path for such a round is HARMFUL: it injects the
+                    // standing dev message into an otherwise-empty input and
+                    // (on the no-delta egress path) strips the chain id, so
+                    // the provider answers from nothing and the host then
+                    // chains from that BLIND response → permanent context
+                    // loss. Forward the client's bytes verbatim instead (the
+                    // same passthrough the /responses/compact endpoint
+                    // already owns: no kernel, no dev injection, no plane
+                    // side effects — the response-side ingest still updates
+                    // the session from the answer).
+                    const pureChainContinuation =
+                        protocol === "responses" &&
+                        !responsesCompact &&
+                        !wsLaneEnvelope &&
+                        pluginMode &&
+                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
+                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
+                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
-                          : responsesCompact
+                          : pureChainContinuation
+                            ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
@@ -3085,6 +3113,17 @@ async function handleRequest(
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    // #6181 B3: the compact-passthrough base hard-codes
+                    // resetAfterSuccess — which schedules a native-compaction
+                    // REBASE for the next Responses turn (reconcileNative-
+                    // CompactionBoundary → resetSessionCompression). A pure
+                    // chain-continuation round compacts nothing: honoring the
+                    // marker would wipe this session's compression state on
+                    // the next turn with no compaction ever having happened.
+                    // Drop it for the B3 route (the next turn's stage-0
+                    // resync already converges the plane when the host
+                    // resends a genuinely-compact world).
+                    if (pureChainContinuation) preparedOut.resetAfterSuccess = false;
                     return preparedOut;
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this

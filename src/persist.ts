@@ -20,6 +20,7 @@ import {
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
+    fileSnapBase,
     fileStorageJsonWriter,
     fileStorageArchiveAfterDays,
     fileStorageWalJournalSizeLimit,
@@ -716,7 +717,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -2449,6 +2450,75 @@ export class SessionStore {
         }
     }
 
+    /** #5874: snapshot-plane status for /__bili/status. Null when the
+     *  unified store is unavailable (legacy-only lanes) — the status wire
+     *  then reports the flags with zeroed counters. */
+    snapplaneStatus(): import("./storage/snap.js").SnapPlaneStatusWire | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().snapplaneStatus();
+        } catch {
+            return null; // sidecar degraded mid-call
+        }
+    }
+
+    /** #5874 P2 (mapEgress): the S4-verified plane view for egress assembly.
+     *  null when the unified store is unavailable or the sid has no plane
+     *  yet — callers keep the legacy egress bytes. */
+    snapEgressView(sessionId: string): import("./storage/snap.js").SnapView | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().snapEgressView(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call — degrade, never fail the turn
+        }
+    }
+
+    // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
+    // R3 reject to a hard 400 and any other fault to the legacy full path) —
+    // the egress-view swallow above must not be copied here.
+
+    /** Stage 0 (element world match) for one turn. null when the unified
+     *  store is unavailable — the lane keeps the legacy path. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("./snapshot/plane.js").Stage0Result | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The plane's ACTIVE cores, pos-ordered (the "old cores from the
+     *  table" half of the kernel-input assembly). */
+    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0Cores(sessionId);
+    }
+
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
+     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
+    snapPlaneMaxPos(sessionId: string): number {
+        if (!this.replicasAvailable()) return -1;
+        return this.liveShadow().snapPlaneMaxPos(sessionId);
+    }
+
+    /** The stage-0 resync (R4 / table behind): reset the session plane so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapStage0Reset(sessionId);
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch persisted from a
+     *  previous process (a restart must not re-arm a misbehaving host). */
+    snapR3Latched(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapR3Latch(sessionId);
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check
@@ -3054,7 +3124,11 @@ export class SessionStore {
                 this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                     tail && tail.length > 0
                         ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                        : undefined, session.contentStore ?? undefined,
+                    // #5874 mapEgress: the kernel's tagged turn view rides the
+                    // save live (the envelope record never serializes it) so
+                    // the snapshot plane persists the tagged forms.
+                    session.lastPlaneMessages);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3542,6 +3616,61 @@ export class SessionStore {
         this.drainFlushWaiters(session.id, true);
     }
 
+    /** #5874 P2-final: the IN-REQUEST snapshot application — persist the
+     *  session's current canonical state right now (single store transaction
+     *  through writeNow: legacy tables AND the snapshot plane via
+     *  snapShadowSync), so the egress stage of the SAME request reads a plane
+     *  that already contains this turn (chain: raw → wire→core → kernel
+     *  rewrite → snapshot write → egress rewrite → egress). Before this the
+     *  plane write waited for the post-response debounce, so egress always
+     *  saw the plane one tick behind and re-stitched the live tail from the
+     *  client resend at the seam.
+     *
+     *  Never throws — a failed flush leaves the round on the legacy egress
+     *  path (the seam walk carries it) and the debounced retry is untouched.
+     *  On success the armed debounce is settled: our live build already
+     *  covers every mutation up to the epoch it captured, so the pending
+     *  timer is dropped (its build would be a byte-identical no-op); a
+     *  mutation that landed DURING the write's chain-run window re-arms via
+     *  the caller's end-of-prepare markDirty (the returned epoch lets it
+     *  distinguish "already saved" from "new state since").
+     *  @returns { ok: write landed, epoch: revisionEpoch captured BEFORE the
+     *  write (compare against session.revisionEpoch afterwards). */
+    async flushSessionNow(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const epoch = session.revisionEpoch;
+        try {
+            await this.writeNow(session);
+        } catch (err) {
+            this.log("warn", `[persist] ${session.id}: in-request snapshot flush failed (round stays on the legacy egress path): ${String(err).slice(0, 200)}`);
+            return { ok: false, epoch };
+        }
+        if ((session.revisionEpoch ?? 0) !== (epoch ?? 0)) {
+            // Newer mutation landed during the chain-run window — keep the
+            // debounce alive for it (re-arm; the pending timer already covers
+            // it when the timer still exists).
+            this.scheduleSave(session);
+        } else {
+            const t = this.saveTimers.get(session.id);
+            if (t) {
+                clearTimeout(t);
+                this.saveTimers.delete(session.id);
+            }
+            this.saveBuilders.delete(session.id);
+            this.writerOffPending.delete(session.id);
+            this.runIdleSpillIfIdle(session.id);
+        }
+        return { ok: true, epoch };
+    }
+
+    /** #5874 P2-final: lane-facing wrapper — a missing or PARTIAL store (test
+     *  stubs that answer only the accessors under test) degrades to "not
+     *  flushed" instead of throwing into the lane's kernel-fail catch. */
+    static async flushOrSkip(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const st = getStore();
+        if (!st || typeof st.flushSessionNow !== "function") return { ok: false, epoch: session.revisionEpoch };
+        return st.flushSessionNow(session);
+    }
+
     /** #4739: where this id's record lives RIGHT NOW — the one build-scoped
      *  source decision shared by both lazy-field restores after a save.
      *  Mirrors loadSync's routing exactly: no readable unified index (never
@@ -3786,7 +3915,7 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):

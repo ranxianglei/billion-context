@@ -280,7 +280,9 @@ export class UnifiedShadow {
             : { name: "mysql", source: "network" };
     }
 
-    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
+    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
+     *  fileSnapBase (#5874): the two-level plane flags from the config file
+     *  (knobs.fileSnapBase — already master⊃lane resolved). */
     static maybeOpen(
         dir: string,
         env: NodeJS.ProcessEnv = process.env,
@@ -288,6 +290,7 @@ export class UnifiedShadow {
         fileUnified?: string,
         fileWalLimit?: number,
         fileBackend?: string,
+        fileSnapBase?: { enabled: boolean; shadowWrite: boolean },
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
@@ -307,7 +310,10 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, {
+                    walJournalSizeLimitBytes: walLimit,
+                    snapBase: fileSnapBase,
+                });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -394,9 +400,11 @@ export class UnifiedShadow {
         fileWalLimit?: number,
         fileBackend?: string,
         fileMysqlDsn?: string,
+        fileSnapBase?: { enabled: boolean; shadowWrite: boolean },
     ): Promise<UnifiedShadow | null> {
         const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
+        if (backendName !== "mysql")
+            return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend, fileSnapBase);
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
@@ -446,11 +454,11 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, livePlane?: CoreMessage[]): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
-            this.enqueueAsyncRecord(record, rawTail, liveCcr);
+            this.enqueueAsyncRecord(record, rawTail, liveCcr, livePlane);
             return;
         }
         // #5627: which stage is running — the failure forensics must name
@@ -480,6 +488,12 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
+            // #5874 mapEgress: the live kernel turn view (tagged processTurn
+            // output) rides the save the same way — the envelope record never
+            // serializes it, so without this override the plane would never
+            // see the tagged forms and every save would fall back to the
+            // legacy CAS bytes.
+            if (livePlane && livePlane.length > 0) legacy = { ...legacy, lastPlaneMessages: livePlane };
             // #3133 watermark: pay the full O(log) ingest only when the
             // trusted-prefix probe cannot vouch for the stored prefix —
             // steady-state saves stringify+hash+INSERT just the NEW tail.
@@ -960,6 +974,64 @@ export class UnifiedShadow {
         return this.sync.sessionStorageStats(sessionId);
     }
 
+    /** #5874: snapshot-plane status (flag state + counters + dead latches).
+     *  null when there is no sync store (async backend). */
+    snapplaneStatus(): import("./snap.js").SnapPlaneStatusWire | null {
+        if (this.sync === null) return null;
+        return this.sync.snapplaneStatus();
+    }
+
+    /** #5874 P2 (mapEgress): S4-verified plane view for egress assembly.
+     *  null when there is no sync store (async backend) — callers keep the
+     *  legacy egress bytes. */
+    snapEgressView(sessionId: string): import("./snap.js").SnapView | null {
+        if (this.sync === null) return null;
+        return this.sync.snapEgressView(sessionId);
+    }
+
+    // #5874 2×2 stage 0 (brief 19544722): the element world-match accessors.
+    // Errors propagate (the lane maps the R3 reject to a hard 400 and every
+    // other fault to the legacy full path) — unlike snapEgressView these may
+    // NOT swallow.
+
+    /** Stage 0 for one turn (see UnifiedStore.snapStage0). null when there
+     *  is no sync store. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("../snapshot/plane.js").Stage0Result | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The plane's ACTIVE cores, pos-ordered (old cores from the table). */
+    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0Cores(sessionId);
+    }
+
+    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
+     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
+    snapPlaneMaxPos(sessionId: string): number {
+        if (this.sync === null) return -1;
+        return this.sync.snapPlaneMaxPos(sessionId);
+    }
+
+    /** The stage-0 resync (R4 / table-behind): reset the session plane. */
+    snapStage0Reset(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapStage0Reset(sessionId);
+    }
+
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);
@@ -1169,7 +1241,7 @@ export class UnifiedShadow {
      *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
      *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
-    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, livePlane?: CoreMessage[]): void {
         void this.enqueue(async () => {
             // #5627: same failing-stage forensics as the sync record() above.
             let phase = "legacy-load";
@@ -1186,7 +1258,7 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
+                if (livePlane && livePlane.length > 0) legacy = { ...legacy, lastPlaneMessages: livePlane };
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.

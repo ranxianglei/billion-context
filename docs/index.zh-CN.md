@@ -13,6 +13,7 @@
 | [clients](clients.zh-CN.md) / [English](clients.md) / [日本語](clients.ja.md) | 各客户端接入深潜：launcher / `/bili/` / 原生插件三种模式如何接线 |
 | [how-it-works](how-it-works.zh-CN.svg) / [English](how-it-works.en.svg) | 一张图：请求流转 + 注入的上下文工具 |
 | [README](README.zh-CN.md) / [English](README.md) / [日本語](README.ja.md) | 目录落地页：分区地图 + 保持本目录不再变乱的规则 |
+| [storage-relations](storage-relations.zh.svg) / [English](storage-relations.en.svg) | 一张图：存储关系——每张表存什么、何时写/读、对接哪个功能（快照表底座 #5901） |
 
 ## 身份与协议
 
@@ -35,3 +36,4 @@
 | [lifecycle](lifecycle.md) | 过渡开关台账 / 退役模块盘点 / 卫生记录（CI 强制 `BILI_*` 覆盖） |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | `AGENTS.md` §7 背后的证据附录（AI 自动开发评审史） |
 | [unified-loop-spec](unified-loop-spec.md) | 历史设计：统一压缩循环规格（已落地，以代码为准） |
+| [快照表底座](proposals/snapshot-compression-foundation/README.zh-CN.md) / [EN](proposals/snapshot-compression-foundation/README.md) | 设计记录：六段固定链、单一存储真源（#5874）。P0+P1+P2 已在 #5901 落地；P2 = 带 tripwire 保护的 mapEgress 出站切换 |

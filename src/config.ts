@@ -2279,6 +2279,26 @@ type FileConfig = {
          *  the file/default tier. Applied when the store opens (lane boot) —
          *  hot edits apply on the next restart. */
         walJournalSizeLimitBytes?: number;
+        /** #5874: snapshot-table compression foundation — two-level
+         *  rollout flags (config-file only; no env tier by design, #2030).
+         *  `enabled` = master (the plane may exist); `shadowWrite` = lane
+         *  (the shadow write hook runs after each ingest, read side still
+         *  never serves). The lane only counts with the master on. Both
+         *  default OFF: the four v12 tables stay empty and the hook is a
+         *  no-op — rollback is DROP tables + user_version rewind. */
+        snapBase?: {
+            enabled?: boolean;
+            shadowWrite?: boolean;
+            /** #5874 P2 (mapEgress): serve the outbound compressed context
+             *  from the verified snap plane — DIRECT authority (the plane
+             *  stores the kernel's own tagged processTurn output; any plane
+             *  gap/exception degrades to the legacy bytes for one round).
+             *  Opt-in: default OFF when unset (#5874 §9). */
+            egress?: boolean;
+            /** Protocol cohorts allowed to cut over (subset of
+             *  openai|anthropic|google|responses). Default: all four. */
+            egressCohorts?: string[];
+        };
         /** #3901/#3463: session retention window in days for the GC age
          *  sweep (archive + tombstone + CAS release). 0 disables; env
          *  BILI_STORAGE_ARCHIVE_AFTER_DAYS wins. Default 365. */
