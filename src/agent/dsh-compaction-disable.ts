@@ -32,6 +32,15 @@
 // bili-native can surface which entries the overlay actually covered (the
 // bundle-patch gate rows may target ids a profile does not ship — their miss
 // is otherwise visible only in the host loader log).
+// #4872: the overlay SCOPE is knob-gated. With dsh.keepCommandCompact ON
+// (env BILI_DSH_KEEP_COMMAND_COMPACT), bili-native declares the verdict with
+// keepCommandCompact and the transform disables ONLY compaction-basic,
+// leaving the explicit /compact command (command-compact) armed so third-party
+// plugins bridging through the DSH-official ctx.commands.find(agent, "compact")
+// path keep working. A /compact-triggered compaction call still passes the
+// #1729 wire guard — answered locally by #3733 authored compaction when the
+// session holds active blocks, refused otherwise — so no checkpoint lands
+// outside bili's knowledge. Default OFF = the original both-packages rule.
 
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
@@ -76,13 +85,36 @@ export function compactionDisablePatchRows(): string {
 // refusal guard (#1729) as backstop.
 const DSH_COMPACTION_VERDICT_KEY = "__BILI_DSH_COMPACTION_VERDICT__";
 
-/** bili-native calls this from apply() when its plan keeps the lane owned. */
-export function declareDshCompactionActive(): void {
-    (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] = "active";
+type DshCompactionVerdict = { active: true; keepCommandCompact?: boolean };
+
+/** bili-native calls this from apply() when its plan keeps the lane owned.
+ *  #4872: options.keepCommandCompact narrows the overlay to compaction-basic
+ *  only (the explicit /compact command stays armed); absent/false keeps the
+ *  original both-packages rule. */
+export function declareDshCompactionActive(options?: { keepCommandCompact?: boolean }): void {
+    const verdict: DshCompactionVerdict = { active: true };
+    if (options?.keepCommandCompact === true) verdict.keepCommandCompact = true;
+    (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] = verdict;
+}
+
+function readDshCompactionVerdict(): DshCompactionVerdict | null {
+    const v = (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY];
+    // Tolerate the pre-#4872 string form so a mixed-version process mid-update
+    // degrades to the original both-packages rule instead of losing the gate.
+    if (v === "active") return { active: true };
+    if (v !== null && typeof v === "object" && (v as { active?: unknown }).active === true) {
+        return v as DshCompactionVerdict;
+    }
+    return null;
 }
 
 export function isDshCompactionActive(): boolean {
-    return (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] === "active";
+    return readDshCompactionVerdict() !== null;
+}
+
+/** #4872: the active verdict carries the keep-command-compact scope option. */
+export function dshCompactionKeepCommandCompact(): boolean {
+    return readDshCompactionVerdict()?.keepCommandCompact === true;
 }
 
 /** Test hook: forget any declaration (back to "bili-native never ran"). */
@@ -137,30 +169,34 @@ type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
 /** Count compaction-basic/command-compact rows the disable walk would mark
  *  (recursing through group rows with the SAME shape gate as
  *  disableBasicCompaction, so telemetry counts never drift from what the
- *  rewrite actually did). Zero = nothing to rewrite here. */
-function countCompactionRows(rows: readonly unknown[]): number {
+ *  rewrite actually did). Zero = nothing to rewrite here. #4872: honors the
+ *  verdict scope — keepCommandCompact counts compaction-basic rows only. */
+function countCompactionRows(rows: readonly unknown[], keepCommandCompact: boolean): number {
     let n = 0;
     for (const row of rows) {
         if (row === null || typeof row !== "object") continue;
         const r = row as PresetRow;
-        if (r.name === DSH_COMPACTION_BASIC_PACKAGE || r.name === DSH_COMMAND_COMPACT_PACKAGE) n += 1;
-        else if (r.group && Array.isArray(r.config)) n += countCompactionRows(r.config);
+        if (r.name === DSH_COMPACTION_BASIC_PACKAGE || (!keepCommandCompact && r.name === DSH_COMMAND_COMPACT_PACKAGE)) n += 1;
+        else if (r.group && Array.isArray(r.config)) n += countCompactionRows(r.config, keepCommandCompact);
     }
     return n;
 }
 
 /** Mark every compaction row of a preset plugins tree disabled. Pure: returns
  *  detached copies and never mutates the input rows (the resolved config may
- *  be shared with other consumers). */
-export function disableBasicCompaction(rows: readonly unknown[]): unknown[] {
+ *  be shared with other consumers). #4872: opts.keepCommandCompact leaves the
+ *  explicit /compact command (command-compact) armed — only compaction-basic
+ *  rows get marked, untouched rows pass through by identity. */
+export function disableBasicCompaction(rows: readonly unknown[], opts?: { keepCommandCompact?: boolean }): unknown[] {
+    const keep = opts?.keepCommandCompact === true;
     return rows.map((row) => {
         if (row === null || typeof row !== "object") return row;
         const r = row as PresetRow & Record<string, unknown>;
-        if (r.name === DSH_COMPACTION_BASIC_PACKAGE || r.name === DSH_COMMAND_COMPACT_PACKAGE) {
+        if (r.name === DSH_COMPACTION_BASIC_PACKAGE || (!keep && r.name === DSH_COMMAND_COMPACT_PACKAGE)) {
             return { ...r, disabled: true };
         }
         if (r.group && Array.isArray(r.config)) {
-            return { ...r, config: disableBasicCompaction(r.config) };
+            return { ...r, config: disableBasicCompaction(r.config, opts) };
         }
         return row;
     });
@@ -195,12 +231,15 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // their resolved config object identity.
             const config = (resolved ?? {}) as { plugins?: unknown };
             if (!Array.isArray(config.plugins)) return resolved;
-            const compactionRows = countCompactionRows(config.plugins);
+            // #4872: honor the verdict's scope option — keepCommandCompact
+            // narrows the rewrite to compaction-basic rows only.
+            const keepCommandCompact = dshCompactionKeepCommandCompact();
+            const compactionRows = countCompactionRows(config.plugins, keepCommandCompact);
             if (compactionRows === 0) return resolved;
             const rawName = this?.entry?.options?.name;
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
             noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
-            return { ...config, plugins: disableBasicCompaction(config.plugins) };
+            return { ...config, plugins: disableBasicCompaction(config.plugins, { keepCommandCompact }) };
         }, { global: true });
     }
     // Publish only after the middleware is registered; the host owns both lifetimes.
