@@ -16,6 +16,7 @@ import { configFile } from "./paths.js";
 import { rolloutInstallId } from "./rollout.js";
 import { dismissedUpgradeNotices } from "./pck-notice.js";
 import { visibleNotices } from "./notices.js";
+import { scanClientPlugins, SCAN_CLIENTS, type ScanClient } from "./thirdparty-scan.js";
 
 const KINDS = new Set(["new-feature", "upgrade-advisory", "warning", "suggestion", "incident", "deprecation", "other"]);
 const TONES = new Set(["ok", "warn", "info"]);
@@ -41,6 +42,14 @@ export interface NoticeRecord {
     ctaUrl?: string;
     versions?: string[];
     percent?: number;
+    /** Optional live conflict-scan gate (#5984): the record is visible only
+     *  while the read-only scan of `client` reports a finding — any finding,
+     *  or one with the matching `knownId`. A broadcast about a machine-
+     *  specific conflict then shows exactly on the machines where the
+     *  conflict exists and disappears once the offending plugin is removed.
+     *  Unknown/absent plugin registries scan empty ⇒ the record stays hidden
+     *  (fails closed, never forces user action). */
+    requiresScan?: { client: ScanClient; knownId?: string };
     dismiss: "persistent" | "instance" | "always";
     priority: number;
     since?: string;
@@ -132,7 +141,7 @@ export function noticeBucket(announcementId: string, identity: string): number {
     return ((h[h.length - 2] << 8) | h[h.length - 1]) % 100;
 }
 
-const CANON_ORDER = ["id", "kind", "title", "desc", "hint", "ctaLabel", "ctaUrl", "versions", "percent", "dismiss", "priority", "since", "until", "publishedAt"] as const;
+const CANON_ORDER = ["id", "kind", "title", "desc", "hint", "ctaLabel", "ctaUrl", "versions", "percent", "requiresScan", "dismiss", "priority", "since", "until", "publishedAt"] as const;
 
 /** Content digest for dismissal keys: fixed key order so file/key order never
  *  changes the hash; only whitelisted fields count. */
@@ -202,6 +211,19 @@ export function validateRecord(raw: unknown): NoticeRecord | null {
         if (typeof p !== "number" || !Number.isInteger(p) || p < 0 || p > 100) return null;
         rec.percent = p;
     }
+    if (doc["requiresScan"] !== undefined) {
+        const rs = doc["requiresScan"];
+        if (!rs || typeof rs !== "object" || Array.isArray(rs)) return null;
+        const rsDoc = rs as Record<string, unknown>;
+        const client = rsDoc["client"];
+        if (typeof client !== "string" || !(SCAN_CLIENTS as readonly string[]).includes(client)) return null;
+        let knownId: string | undefined;
+        if (rsDoc["knownId"] !== undefined) {
+            if (typeof rsDoc["knownId"] !== "string" || rsDoc["knownId"].length === 0 || rsDoc["knownId"].length > 80) return null;
+            knownId = rsDoc["knownId"];
+        }
+        rec.requiresScan = knownId === undefined ? { client: client as ScanClient } : { client: client as ScanClient, knownId };
+    }
     if (doc["dismiss"] !== undefined) {
         if (typeof doc["dismiss"] !== "string" || !DISMISS_MODES.has(doc["dismiss"])) return null;
         rec.dismiss = doc["dismiss"] as NoticeRecord["dismiss"];
@@ -260,8 +282,8 @@ function loadLocalRecords(): NoticeRecord[] {
     return out;
 }
 
-/** The three gates every external (B/C) record must pass; shared verbatim by
- *  the local loader and the remote watcher so the two sources cannot drift. */
+/** The gates every external (B/C) record must pass; shared verbatim by the
+ *  local loader and the remote watcher so the two sources cannot drift. */
 export function noticePassesGates(record: NoticeRecord, now: Date, env: NodeJS.ProcessEnv): boolean {
     if (record.versions) {
         const cur = parseTriple(VERSION);
@@ -269,6 +291,15 @@ export function noticePassesGates(record: NoticeRecord, now: Date, env: NodeJS.P
         for (const spec of record.versions) if (!matchesVersion(spec, cur.join("."))) return false;
     }
     if (record.percent !== undefined && noticeBucket(record.id, rolloutInstallId()) >= record.percent) return false;
+    // Live-scan gate (#5984): hidden unless the client's plugin registry
+    // actually reports the flagged plugin. scanClientPlugins never throws and
+    // caches per client+cwd for 5 min, so this stays cheap on hot poll paths.
+    if (record.requiresScan) {
+        const scan = scanClientPlugins(record.requiresScan.client, { env });
+        const wantId = record.requiresScan.knownId;
+        const hit = wantId === undefined ? scan.findings.length > 0 : scan.findings.some((f) => f.knownId === wantId);
+        if (!hit) return false;
+    }
     if (record.since && now.getTime() < Date.parse(record.since)) return false;
     if (record.until && now.getTime() > Date.parse(record.until)) return false;
     if (record.dismiss === "always") return true;

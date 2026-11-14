@@ -8,6 +8,12 @@ import { SessionStore } from "../src/persist.ts";
 import { isDroppedMetadata, type Session } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
 
+// This suite exercises the legacy envelope fold gate — the storage default
+// flipped to pure-sqlite (index-only, no envelope); pin explicit dual-write
+// so the on-disk JSON record these assertions read keeps being written.
+process.env.BILI_STORAGE_UNIFIED = "full";
+process.env.BILI_STORAGE_JSON_WRITER = "1";
+
 // #5506: the post-settle resident-metadata fold (runIdleSpillIfIdle →
 // dropResidentMetadata) replaced the live metadata object with a fresh
 // disk-backed lazy proxy even when the live object carried mutations that NO
