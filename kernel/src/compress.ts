@@ -923,6 +923,20 @@ export function createCore(ports: Ports = {}): CompressionCore {
           state.pendingOrphanSweepMinRef === undefined
             ? foldStartRef
             : Math.min(state.pendingOrphanSweepMinRef, foldStartRef);
+        // #6116: upper bound of the same window. Every message in history at
+        // apply time carries a ref <= this frontier; the successful call and
+        // any later same-turn calls only get refs on the next assignRefs pass,
+        // so they land strictly above it and survive the sweep with their
+        // failure feedback intact (under-sweep is safe; over-sweep is not).
+        // Running MAX mirrors the min side's running MIN across folds that
+        // commit before one consuming turn.
+        const frontier = highestUsedIndex(state.messageRefs);
+        if (frontier > 0) {
+          state.pendingOrphanSweepMaxRef =
+            state.pendingOrphanSweepMaxRef === undefined
+              ? frontier
+              : Math.max(state.pendingOrphanSweepMaxRef, frontier);
+        }
       }
       // Compress succeeded: clear the growth baseline so the next turn
       // re-establishes it at the new (lower) token count. Without this the
@@ -1444,6 +1458,8 @@ const hideCompressCallsNode: PipelineNode = {
     const patch: Partial<CompressionState> = {
       hiddenOrphanRefs: hidden.hiddenOrphanRefs,
       pendingOrphanSweepMinRef: undefined,
+      // #6116: the window bound is one-shot with the marker it bounds.
+      pendingOrphanSweepMaxRef: undefined,
     };
     if (hidden.newlySweptCallIds.length > 0) {
       patch.sweptOrphanCallIds = [
@@ -2631,6 +2647,7 @@ function cloneState(state: CompressionState): CompressionState {
       ? [...state.sweptOrphanCallIds]
       : undefined,
     pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
+    pendingOrphanSweepMaxRef: state.pendingOrphanSweepMaxRef, // #6116 (sweep window upper bound)
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
     lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
     // #4797: the one-time ledger-alignment gate must survive the fold clone
