@@ -205,12 +205,9 @@ function textOffsetAtByte(body: Buffer, offset: number): number {
 
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
 // plus some common suffix — i.e. its middle residual is EMPTY — while `cur`
-// carries extra bytes in that middle. That is a SEMANTIC append: no prior byte
-// moved or changed, only new bytes landed between a stable head and a stable
-// trailer (e.g. a single giant message whose interior container grows, with a
-// fixed trailer shifting right). A genuine rewrite leaves a non-empty residual
-// on the shorter side, so it is never matched here — this cannot mask a real
-// mid-history break.
+// carries extra bytes in that middle. The caller must also check that the
+// insertion is inside one existing message: adding a whole message to the
+// middle of history has this byte shape too, but breaks the shared prefix.
 function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
     if (cur.length <= prev.length || lcp >= prev.length) return false;
     const room = prev.length - lcp;
@@ -307,6 +304,7 @@ function elementSpans(text: string, arrStart: number): Array<[number, number]> {
             while (i < len && text[i] !== "," && text[i] !== "]") i++;
         }
         spans.push([s, i]);
+        while (i < len && " \t\n\r".includes(text[i]!)) i++;
         if (text[i] === ",") i++;
         else break;
     }
@@ -414,13 +412,33 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
     // logical unit extending in place (auto-review FILTERED_HISTORY + fixed
     // PENDING_ACTION trailer). Byte-wise a mid-body insertion; semantically an
     // append. Recognize it instead of flagging a rewrite.
-    if (isMidInsertionAppend(aBody, bBody, O)) {
-        return {
-            rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
-            append: { kind: "mid-insert", countA: ia?.items.length ?? 0, countB: ib?.items.length ?? 0 },
-        };
+    if (ia && ib && ia.key === ib.key && isMidInsertionAppend(aBody, bBody, O)) {
+        const added = bText.length - aText.length;
+        if (ia.items.length === ib.items.length && ia.spans.some(([start, end], index) => {
+            const current = ib.spans[index];
+            return textOffset > start && textOffset < end
+                && current?.[0] === start && current[1] === end + added;
+        })) {
+            return {
+                rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+                append: { kind: "mid-insert", countA: ia.items.length, countB: ib.items.length },
+            };
+        }
+        // An empty history has no existing element to extend. Inserting at
+        // its closing bracket is still an ordinary first tail append.
+        if (ia.items.length === 0) {
+            const start = rootArrayStart(aText, ia.key);
+            const close = aText.indexOf("]", start + 1);
+            if (textOffset > start && textOffset <= close && rootArrayStart(bText, ib.key) === start) {
+                return {
+                    rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+                    append: { kind: "json-tail", countA: 0, countB: ib.items.length },
+                };
+            }
+        }
     }
-    return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: false };
+    const arrayStart = ib ? rootArrayStart(bText, ib.key) : -1;
+    return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: arrayStart >= 0 && textOffset < arrayStart };
 }
 
 export interface UsageSample { ts: number; input: number; cached: number; }
