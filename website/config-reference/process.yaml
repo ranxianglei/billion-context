@@ -455,6 +455,7 @@ entries:
     group: process
     desc_en: "Master flag for the snapshot-table compression plane (#5874, schema v12): arms the four plane tables (l1_world / snap_rows / snap_log / snap_ckpt), the single-transaction commit primitive, and the read-side checksum rebuild (a mismatch permanently wedges that session's plane). Off by default — zero behavior change until set; config-file only, no env tier (#2030 discipline). Wired on the sqlite path only — the mysql backend ignores the flag."
     desc_zh: "快照表压缩平面的主开关（#5874，schema v12）：启用四张平面表（l1_world / snap_rows / snap_log / snap_ckpt）、单事务提交原语与读侧校验和重建（对不上会永久关死该会话的平面）。默认关闭 —— 不设置时零行为变化；仅配置文件层，无环境变量档（#2030 纪律）。目前只接 sqlite 路径 —— mysql 后端忽略该旗。"
+    desc_ja: "スナップショットテーブル圧縮プレーンのマスターフラグ (#5874, schema v12): 4 つのプレーンテーブル (l1_world / snap_rows / snap_log / snap_ckpt)、単一事務コミット原語、読み出し側のチェックサム再構築を有効化する (不一致はそのセッションのプレーンを永続的に固着させる)。デフォルトオフ — 設定するまで挙動は不変; 設定ファイルのみ、環境変数階層なし (#2030 の規律)。sqlite パスにのみ配線 — mysql バックエンドはこのフラグを無視する。"
   - key: storage.snapBase.shadowWrite
     type: boolean
     default: "false"
@@ -463,6 +464,7 @@ entries:
     group: process
     desc_en: "Lane flag for the plane's shadow write, nested under storage.snapBase.enabled (#5874): with both set, every ingest commit additionally derives the plane in its own transaction within the same tick (steady-state delta fast path, otherwise final-state diff; rounds yielding no derivable event write nothing, a crash-dropped round self-heals on the next save). The read side only compares against the legacy rows and never serves them — outbound bytes are unchanged. The lane alone has no effect; rollback = unset (or DROP the four tables + revert user_version)."
     desc_zh: "平面影子写的车道开关，嵌套在 storage.snapBase.enabled 之下（#5874）：两者都设置后，每次 ingest 提交在同一 tick 内用独立事务推导平面（稳态 delta 走快路，其余走最终态 diff；推导不出事件的轮次不写，crash 丢掉的轮次由下一轮保存自愈）。读侧只与 legacy 行比对、永不对外提供服务 —— 出站字节一个都不变。只开车道不生效；回滚 = 去掉开关（或 DROP 四张表 + user_version 退回）。"
+    desc_ja: "プレーンのシャドウライト用のレーンフラグ、storage.snapBase.enabled にネスト (#5874): 両方が設定されると、各 ingest コミットが同一 tick 内で独立した事務所でプレーンを追加導出する (定常状態は delta 高速パス、それ以外は最終状態 diff; 導出可能なイベントのないラウンドは何も書かず、クラッシュで失われたラウンドは次の保存時に自己修復)。読み出し側は legacy 行との比較のみを行い、決して提供しない — 送信バイトは不変。レーン単独では無効; ロールバック = 解除 (または 4 テーブルの DROP + user_version の復元)。"
   - key: storage.snapBase.egress
     type: boolean
     default: "false"
