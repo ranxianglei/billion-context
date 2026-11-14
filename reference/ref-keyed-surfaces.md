@@ -33,9 +33,9 @@ Losing it re-arms the restamp every turn; the re-stamp is a numbering no-op afte
 
 `restampRefsToLedger` vacates an old number and records it in `superseded` — but the SAME pass hands vacated numbers to other messages as `seq+1` targets. Post-pass, a number can be **simultaneously live (byRaw/byRef) and a superseded key**. Any consumer that consults `superseded` before the live map misclassifies live refs.
 
-**Contract (enforced by kernel post-pass prune + host guard priority):**
-1. Kernel: after the pass, drop `superseded` entries whose key resolves in the final live map.
-2. Host guard (`supersededRefRejection`, src/stream.ts): a ref that resolves LIVE is never superseded — liveness first; only genuinely-dead numbers consult the map; translation `oldRef→rawId→live ref` is identity-preserving and mandatory for model-cited pre-restamp refs (the model may cite any number it has ever seen — kernel contract).
+**Contract:**
+1. Kernel: after the pass, drop `superseded` entries whose key resolves in the final live map. **DRAFTED in #4807, then REVERTED** (storage-engine shadow-digest constraint — see 暂缓 section): until it lands, dual-identity numbers exist on EVERY restamped session (#5199).
+2. Host guard (`supersededRefRejection`, src/stream.ts): a ref that resolves LIVE is never superseded — liveness first; only genuinely-dead numbers consult the map; translation `oldRef→rawId→live ref` is identity-preserving and mandatory for model-cited pre-restamp refs (the model may cite any number it has ever seen — kernel contract). Cited numbers that are BOTH live and superseded resolve to the current owner and are logged prominently by callers (#5199).
 
 ## Inbound/outbound ref surfaces (verified all-live 2026-10-26, phase C audit)
 
@@ -55,4 +55,4 @@ Outbound emitters all derive from live `state.messageRefs` via the kernel render
 
 ## 已评估、暂缓（需要 storage 影子层配合，单独立项）
 
-- **kernel superseded 活键剪枝 + block startRef/endRef / deadRefs 迁移**：实现过并验证过单测，但 storage-engine 的重启不可见契约（wire-parity proofs + 影子摘要对比）依赖重排结果的确定性形状——迁移后影子层报 `DIGEST DRIFT [diverged: state]`，full 模式回退 legacy 信封，wire 漂移 4 项红。正确落地需要影子层把「对齐态」纳入摘要口径；在此之前 host 活表优先已消除其全部用户可见危害。剪枝与迁移的完整实现见 PR 历史（revert 前的 kernel/src/refs.ts）。
+- **kernel superseded 活键剪枝 + block startRef/endRef / deadRefs 迁移**：实现过并验证过单测，但 storage-engine 的重启不可见契约（wire-parity proofs + 影子摘要对比）依赖重排结果的确定性形状——迁移后影子层报 `DIGEST DRIFT [diverged: state]`，full 模式回退 legacy 信封，wire 漂移 4 项红。正确落地需要影子层把「对齐态」纳入摘要口径；⚠️ **2026-10-30 更正(#5199)**：此前「host 活表优先已消除其全部用户可见危害」不成立——隔离 fixture 复现了最坏形态：重启前引用被静默应用到新持有者（成功返回、块只覆盖错误消息）。活表优先只消除了 #4797 死循环；双身份应用现已有醒目日志（host 侧，tests/issue5199-dual-identity-log.test.ts），方向裁决（接受+文档化 vs kernel 不复用已发放号）见 decision request #5204。剪枝与迁移的完整实现见 PR 历史（revert 前的 kernel/src/refs.ts）。

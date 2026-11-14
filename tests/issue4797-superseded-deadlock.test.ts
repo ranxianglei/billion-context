@@ -26,7 +26,9 @@ import { applyRanges, supersededRefRejection, type RewriteCtx } from "../src/str
 // Post-restamp (#5196 slot-retirement): b→m2, e→m5; f's target m6 was retired
 // by e's move within the same pass, so f parks on a fresh number (m8, above
 // the pre-pass cursor) instead of re-occupying it. Superseded: {m3→b, m6→e,
-// m7→f} — no number is live for one message and an alias of another.
+// m7→f} — no number is live for one message and an alias of another. The
+// pre-#5196 dual-identity shape (a number live for one msg yet another's old
+// label) is pinned separately in tests/issue5199-dual-identity-log.test.ts.
 function restampedSession(): { session: RewriteCtx["session"]; messages: CoreMessage[] } {
     const state: CompressionState = createInitialState();
     const map = emptyRefMap();

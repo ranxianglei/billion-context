@@ -914,18 +914,26 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
  *  Refusal only when an endpoint is a superseded key whose translation
  *  dead-ends (the message lost its mapping entirely — an honest stale cite).
  *
- *  Transitional honesty: sessions whose restamp predates kernel #5196's
- *  slot-retirement may still carry an ambiguity — a number restamped over a
- *  live occupant, so case 1 can in principle swallow a resent pre-restart
- *  call's intent. #4807 (#4797) traded that seconds-long replay window
- *  against a permanent deadlock; live-first keeps that trade. Kernels from
- *  #5196 onward retire every seat a mover vacates into its own seq+1, so no
- *  freshly stamped number ever names two messages and case 1 can never
- *  mis-engage on such data. */
+ *  Residual hazard (#5199): kernels from #5196 onward retire every seat a
+ *  mover vacates into its own seq+1 (slot retirement), so no FRESHLY stamped
+ *  number ever names two messages. Sessions whose restamp PREDATES #5196,
+ *  however, still carry the ambiguity in their persisted superseded map — a
+ *  number that is live for one message yet the recorded old label of another.
+ *  For those, case 1 applies a resent pre-restart call to the CURRENT owner
+ *  while the model meant the old one, returning success. Live-first stays the
+ *  accepted resolution (rejecting dead-loops like #4797; translating to the
+ *  old owner would mistranslate legitimate post-restamp cites). Until such
+ *  legacy sessions are re-aligned the application is no longer silent:
+ *  dualIdentity below names every such ref so callers log it. */
 interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
     translated: number;
+    /** #5199: refs that are LIVE for one message while still the recorded old
+     *  label of ANOTHER (the restamp re-issued an already-issued number). The
+     *  live-first resolution applies to the current owner — callers log these
+     *  so a replayed pre-restart citation is diagnosable instead of silent. */
+    dualIdentity: string[];
 }
 
 export function supersededRefRejection<T extends { startRef: string; endRef: string }>(
@@ -933,7 +941,7 @@ export function supersededRefRejection<T extends { startRef: string; endRef: str
     session: Session,
 ): SupersededResolution<T> {
     const superseded = session.restampSuperseded;
-    const out: SupersededResolution<T> = { rejection: null, translatedRanges: [], translated: 0 };
+    const out: SupersededResolution<T> = { rejection: null, translatedRanges: [], translated: 0, dualIdentity: [] };
     if (!superseded || superseded.size === 0) {
         out.translatedRanges = ranges.map((r) => ({ ...r }));
         return out;
@@ -941,8 +949,17 @@ export function supersededRefRejection<T extends { startRef: string; endRef: str
     const byRef = session.state.messageRefs?.byRef ?? {};
     const byRaw = session.state.messageRefs?.byRaw ?? {};
     const dead: string[] = [];
+    const dualIdentity = new Set<string>();
     const resolveEndpoint = (ref: string): string => {
-        if (byRef[ref] !== undefined) return ref;
+        const liveOwner = byRef[ref];
+        if (liveOwner !== undefined) {
+            // #5199: live AND still the recorded old label of another message —
+            // the restamp issued this number twice. Live-first wins (the
+            // accepted trade); record it so the caller can log the application.
+            const oldOwner = superseded.get(ref);
+            if (oldOwner !== undefined && oldOwner !== liveOwner) dualIdentity.add(ref);
+            return ref;
+        }
         const rawId = superseded.get(ref);
         if (rawId === undefined) return ref;
         const next = byRaw[rawId];
@@ -958,6 +975,7 @@ export function supersededRefRejection<T extends { startRef: string; endRef: str
         startRef: resolveEndpoint(range.startRef),
         endRef: resolveEndpoint(range.endRef),
     }));
+    out.dualIdentity = [...dualIdentity];
     if (dead.length === 0) return out;
     const listed = dead.slice(0, 5).join(", ");
     const more = dead.length > 5 ? ` (+${dead.length - 5} more)` : "";
@@ -1222,6 +1240,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
             return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.]`, "refused", 0, "out-of-recommendation");
         }
+    }
+    if (supersededRes.dualIdentity.length > 0) {
+        // #5199: cited number(s) that are live for their CURRENT owner while
+        // still the recorded pre-restamp label of a DIFFERENT message. A
+        // replayed pre-restart call may have meant the old owner — the fold
+        // proceeds against the current one (the live-first trade), but the
+        // application must be visible. Salted ids only (#1454 pattern).
+        const detail = supersededRes.dualIdentity.map((ref) => {
+            const owners = [ctx.session.state.messageRefs?.byRef?.[ref], ctx.session.restampSuperseded?.get(ref)]
+                .filter((o): o is string => typeof o === "string")
+                .map((o) => saltedMsgIdForLog(o))
+                .join("/");
+            return `${ref}=${owners}`;
+        }).join(", ");
+        ctx.log(`[acp-proxy: ⚠️ compress applied onto reused ref number(s): ${detail} — each is live for its current owner yet was issued to a different message before the ledger alignment; a replayed pre-restart citation may have intended the old owner (#5199; direction decision #5204)]`);
     }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
