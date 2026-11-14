@@ -73,6 +73,60 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
     return false;
 }
 
+// #6548: the Responses-wire analogue of isServerToolUtilityCall. pi-web-access
+// sends its xAI web-search backend as a deliberately minimal single-shot
+// Responses body — `{ model, input, tools: [{type:"web_search"},
+// {type:"x_search"}] }` — string input, no message history, no
+// prompt_cache_key, and it exposes no config knob for extra headers or a
+// session id, so the client cannot carry an identity here. That shape is NOT
+// a conversation turn: it has no history to fingerprint and creates no
+// session state, so the #286 refusal's rationale (content-fingerprint
+// sessions would silently orphan state) does not apply to it — the refusal
+// branch forwards it verbatim instead of hard-400ing.
+// Decisive conditions (all must hold):
+//   - `input` is a plain string (the single-shot prompt); an array input is
+//     message history, and a missing input is degenerate;
+//   - non-empty tools where EVERY entry's type is a Responses server-executed
+//     search type (`web_search`, `web_search_preview`, `x_search`) — mixing
+//     ANY client-side tool (`function`, `mcp`, ...) vetoes;
+//   - no identity/history signal in the body: `previous_response_id`,
+//     `session_id` or `prompt_cache_key` present means the call chains onto
+//     a conversation (or carries an identity the #286 path already honors);
+//   - tool_choice absent, "auto" or "required", or an object forcing a
+//     DECLARED server tool; "none" vetoes (a request that forbids tool use
+//     is not a tool call), as does forcing a client tool or an unrecognized
+//     shape.
+// Deliberately proto-safe by shape alone: the Anthropic detector above
+// requires `messages`, so a Responses body can never match it — and this one
+// requires string `input`, so an Anthropic body can never match it either.
+const RESPONSES_SERVER_SEARCH_TOOL_TYPES: ReadonlySet<string> = new Set(["web_search", "web_search_preview", "x_search"]);
+
+export function isResponsesServerToolSingleShot(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (typeof p.input !== "string") return false;
+    if (typeof p.previous_response_id === "string" && p.previous_response_id !== "") return false;
+    if (typeof p.session_id === "string" && p.session_id !== "") return false;
+    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key !== "") return false;
+    const tools = p.tools;
+    if (!Array.isArray(tools) || tools.length === 0) return false;
+    const declared = new Set<string>();
+    for (const t of tools) {
+        if (t === null || typeof t !== "object") return false;
+        const type = (t as { type?: unknown }).type;
+        if (typeof type !== "string" || !RESPONSES_SERVER_SEARCH_TOOL_TYPES.has(type)) return false;
+        declared.add(type);
+    }
+    const choice = p.tool_choice;
+    if (choice === undefined) return true;
+    if (choice === "auto" || choice === "required") return true;
+    if (choice !== null && typeof choice === "object") {
+        const c = choice as { type?: unknown };
+        if (typeof c.type === "string" && declared.has(c.type)) return true;
+    }
+    return false;
+}
+
 const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
 
 /** #5073: structural identification of a tool-less structured-output utility
