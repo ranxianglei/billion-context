@@ -50,14 +50,21 @@ export function installInlineTransport(): boolean {
                 if (err instanceof Error && err.name === "AbortError") throw err;
                 const msg = err instanceof Error ? err.message : String(err);
                 if (url.startsWith(MODEL_PREFIX)) {
-                    // Engine down → degrade exactly like a spawn-mode bootstrap
-                    // failure: strip the pseudo-origin prefix (the embedded
+                    // Startup or dispatch failed: try the direct fallback by
+                    // stripping the pseudo-origin prefix (the embedded
                     // upstream URL is absolute) and send direct, uncompressed.
                     if (!degradeWarned) {
                         degradeWarned = true;
-                        logHostEvent("error", "[native-client]", `[bili-native] inline engine unavailable — model traffic goes direct (uncompressed): ${msg}`);
+                        logHostEvent("error", "[native-client]", `[bili-native] inline request failed — attempting direct model fallback (uncompressed): ${msg}`);
                     }
-                    return await send(url.slice(MODEL_PREFIX.length), init);
+                    const target = url.slice(MODEL_PREFIX.length);
+                    if (input instanceof Request) {
+                        const direct = new Request(target, new Request(input, init));
+                        // Keep transport-specific init fields without serializing the body twice
+                        // (a second FormData serialization would choose a different boundary).
+                        return await send(direct, init && { ...init, headers: undefined, body: undefined });
+                    }
+                    return await send(target, init);
                 }
                 throw err;
             }
