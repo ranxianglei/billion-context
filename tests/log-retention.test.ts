@@ -22,6 +22,7 @@ import {
     stampNewLog,
 } from "../src/log-retention.ts";
 import { continuityOf, formatWindow, oldestLogLineMs } from "../src/log-retention-coverage.ts";
+import { logTimestamp } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const HOUR = 60 * 60 * 1000;
@@ -41,7 +42,11 @@ function writeGeneration(logPath: string, at: number, bytes: number, counter: st
     const dir = path.join(archiveOf(logPath), `${generationStamp(at)}-${pid}-${counter}`);
     fs.mkdirSync(dir, { recursive: true, mode: LOG_DIR_MODE });
     const file = path.join(dir, "bili.log");
-    const head = `${new Date(at).toISOString().slice(0, 23)} [info] [v=0] seal ${counter}\n`;
+    // Stamp the head line the way the real logger does (local wall-clock, no
+    // zone suffix, logTimestamp): the coverage reader parses a zone-less stamp
+    // as local time, so a UTC string read back in a non-UTC zone shifts the
+    // measured span by the offset (the 40h/48h boundary test flipped in UTC+8).
+    const head = `${logTimestamp(new Date(at))} [info] [v=0] seal ${counter}\n`;
     fs.writeFileSync(file, head + "x".repeat(Math.max(0, bytes - head.length)));
     return file;
 }
