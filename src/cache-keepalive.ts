@@ -293,7 +293,7 @@ function armInternal(inp: KeepaliveArmInput): void {
     const prev = registry.get(inp.sessionId);
     // Credential rotated since the snapshot (#2131): the old body was signed
     // for another key — drop it before deciding about the new one.
-    if (prev && prev.credFp !== credFp) registry.delete(inp.sessionId);
+    if (prev && prev.credFp !== credFp) disarm(inp.sessionId, "credential-rotated");
 
     const breakpointTier = detectKeepaliveTier(parsed);
     let cadenceMs: number;
