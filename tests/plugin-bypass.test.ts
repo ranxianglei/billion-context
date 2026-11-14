@@ -114,3 +114,99 @@ describe("plugin bypass header (#920)", () => {
         assert.ok(names.includes("compress"), `expected compress in ${JSON.stringify(names)}`);
     });
 });
+
+// #6220: BILI_PLUGIN_BYPASS operator override of the bypass decision.
+// The knob is read per-request (live), so each test sets the env and the
+// afterEach clears it. Covers both force directions and both spellings
+// ("on"/"off" and "1"/"0"), plus the unrecognized-value fallback to auto;
+// the default (unset) direction is the two tests above.
+describe("BILI_PLUGIN_BYPASS override (#6220)", () => {
+    beforeEach(() => {
+        delete process.env.BILI_PLUGIN_BYPASS;
+    });
+    afterEach(() => {
+        delete process.env.BILI_PLUGIN_BYPASS;
+    });
+
+    it("force-on, no header → bypassed verbatim (no tool injection)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "on";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "forced bypass" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        assert.equal(h!.captured.length, 1);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[]; messages: unknown[] };
+        assert.equal(seen.tools, undefined);
+        assert.deepEqual(seen.messages, body.messages);
+    });
+
+    it("force-off, header present → NOT bypassed (compress tool injected)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "off";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "forced no-bypass" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-bypass": "1" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: { function?: { name?: string } }[] };
+        const names = (seen.tools ?? []).map((t) => t.function?.name);
+        assert.ok(names.includes("compress"), `expected compress in ${JSON.stringify(names)}`);
+    });
+
+    it("force-on (\"1\"), no header → bypassed verbatim", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "1";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "forced bypass 1" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[] };
+        assert.equal(seen.tools, undefined);
+    });
+
+    it("force-off (\"0\"), header present → NOT bypassed (compress tool injected)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "0";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "forced no-bypass 0" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-bypass": "1" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: { function?: { name?: string } }[] };
+        const names = (seen.tools ?? []).map((t) => t.function?.name);
+        assert.ok(names.includes("compress"), `expected compress in ${JSON.stringify(names)}`);
+    });
+
+    it("explicit \"auto\" → auto (header present → bypassed verbatim)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "auto";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "explicit auto" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-bypass": "1" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[] };
+        assert.equal(seen.tools, undefined);
+    });
+
+    it("unrecognized value → auto (header present → bypassed verbatim)", { timeout: 60_000 }, async () => {
+        process.env.BILI_PLUGIN_BYPASS = "banana";
+        const body = { model: "test-model", stream: false, messages: [{ role: "user", content: "fallback to auto" }] };
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin-bypass": "1" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(resp.status, 200);
+        const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[] };
+        assert.equal(seen.tools, undefined);
+    });
+});

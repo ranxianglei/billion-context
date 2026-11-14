@@ -32,7 +32,7 @@ process.env.NODE_ENV = "test";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const TMO = Number(process.env.E2E_TMO ?? 180_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
 fs.mkdirSync(WORK_ROOT, { recursive: true });
@@ -52,7 +52,7 @@ function piAvailable(): boolean {
 const skipReason = !run
     ? "set ACP_TEST_E2E_PI_WS=1 (real pi + local mock WS upstream; deterministic, zero tokens)"
     : !fs.existsSync(PI_NATIVE_ENTRY)
-        ? "dist/agent/pi-native.js missing — run `npm run build` first"
+        ? "dist/agent/billion-context.js missing — run `npm run build` first"
         : !piAvailable()
             ? `pi binary "${PI_BIN}" not found on PATH`
             : undefined;
