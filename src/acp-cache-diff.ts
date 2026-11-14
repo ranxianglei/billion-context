@@ -443,7 +443,9 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
 
 export interface UsageSample { ts: number; input: number; cached: number; }
 
-const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] ((?:\[[^\]]+\] )+)\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LOG_TAGS_RE = /^(?:\[sess=[^\]]+\] )?\[v=[^\]]+\] /;
+const USAGE_SESSION_RE = /^\[([^\]]+)\] (?:\[plugin\] )?$/;
 
 export async function parseUsageLog(file: string): Promise<Map<string, UsageSample[]>> {
     const bySession = new Map<string, UsageSample[]>();
@@ -455,9 +457,14 @@ export async function parseUsageLog(file: string): Promise<Map<string, UsageSamp
     for await (const line of readLogLines([file], { onError: (_f, e) => { readError ??= e; } })) {
         const m = USAGE_LINE_RE.exec(line);
         if (!m) continue;
+        // Current logger attribution precedes the explicit usage session.
+        // Strip it before parsing that session, so a missing id cannot fall
+        // back to the version tag and a request scope cannot steal attribution.
+        const session = USAGE_SESSION_RE.exec(m[2]!.replace(USAGE_LOG_TAGS_RE, ""));
+        if (!session) continue;
         const ts = Date.parse(m[1]!);
         if (Number.isNaN(ts)) continue;
-        const sid = safeSessionId(m[2]!);
+        const sid = safeSessionId(session[1]!);
         const list = bySession.get(sid) ?? [];
         list.push({ ts, input: Number(m[3]), cached: Number(m[4]) });
         bySession.set(sid, list);
