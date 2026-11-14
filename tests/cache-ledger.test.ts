@@ -47,11 +47,17 @@ test("incremental ledger closes the same identity as kernel batch", () => {
     // initial content (#1891), not a prefix re-pay.
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     // t=1500: fold b1 removes 5000 tok, summary 2048 tok, diverges at m00010 (X=4500).
-    recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 5000, 8192, "m00010")], { V: 10000, Vp: 5000 });
+    // Production shape (#5646): the kernel writes the block into state BEFORE the
+    // ledger records it, so the fold's liveness gate sees an ALIVE block.
+    const fb1 = block("b1", T0 + 1500, 5000, 8192, "m00010");
+    session.state.blocks.push(fb1);
+    recordCacheFoldsFromBlocks(session, [fb1], { V: 10000, Vp: 5000 });
     // t=2000: post-fold cliff: 6000 billed, only 1000 cached.
     recordCacheSample(session, { at: T0 + 2000, input: 6000, cached: 1000 });
     // t=2500: fold b2 removes 2000 tok, diverges at m00015 (X=7000 — near the tail).
-    recordCacheFoldsFromBlocks(session, [block("b2", T0 + 2500, 2000, 4096, "m00015")], { V: 6000, Vp: 4000 });
+    const fb2 = block("b2", T0 + 2500, 2000, 4096, "m00015");
+    session.state.blocks.push(fb2);
+    recordCacheFoldsFromBlocks(session, [fb2], { V: 6000, Vp: 4000 });
     // t=3000: growth 1000 + a miss beyond it with no structural excess.
     recordCacheSample(session, { at: T0 + 3000, input: 7000, cached: 2000 });
     // t=4000: warm append, fully explained by growth.
@@ -128,11 +134,16 @@ test("incremental k spans ALL intermediate samples (parity with batch, #1286)", 
     withView20(session);
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 0 });
     // F1: S=12140, σ=1000 → breakevenTurns ≈ 2.5009 at the default {w:1,r:0.1,q:4}.
-    recordCacheFoldsFromBlocks(session, [block("b1", T0 + 1500, 12140, 4000, "m00010")], { V: 10000, Vp: 5000 });
+    // Production shape (#5646): block lands in state before the ledger records it.
+    const fb1 = block("b1", T0 + 1500, 12140, 4000, "m00010");
+    session.state.blocks.push(fb1);
+    recordCacheFoldsFromBlocks(session, [fb1], { V: 10000, Vp: 5000 });
     recordCacheSample(session, { at: T0 + 2000, input: 10000, cached: 10000 });
     recordCacheSample(session, { at: T0 + 2600, input: 10000, cached: 10000 });
     recordCacheSample(session, { at: T0 + 3200, input: 10000, cached: 10000 });
-    recordCacheFoldsFromBlocks(session, [block("b2", T0 + 4000, 2000, 4000, "m00015")], { V: 10000, Vp: 8000 });
+    const fb2 = block("b2", T0 + 4000, 2000, 4000, "m00015");
+    session.state.blocks.push(fb2);
+    recordCacheFoldsFromBlocks(session, [fb2], { V: 10000, Vp: 8000 });
 
     const rawSamples: CacheSample[] = [
         { at: T0 + 1000, input: 10000, cached: 0 },

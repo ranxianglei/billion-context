@@ -6,7 +6,7 @@ import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPath
 import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
-import { buildSessionCacheReport } from "../cache-ledger.js";
+import { buildSessionCacheReport, liveBlockIds, type BlockLivenessView } from "../cache-ledger.js";
 import { resolveBillingPrice, savedUsdFromFolds, validCostUsd } from "../billing.js";
 
 /** Shape of a resolved price row — taken via ReturnType so this module never
@@ -175,6 +175,15 @@ interface WebSessionSummary {
     /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
      *  grossSaved that is frozen rather than accruing. */
     coverageLostFrozenTokens?: number;
+    /** #5646: folds whose kernel block is no longer alive in the session's
+     *  compression state (reaped / host-dropped / orphaned under a dead
+     *  ancestor) — their avoided-token accrual froze when the block died;
+     *  count + frozen share below. Mutually exclusive with coverageLostFolds
+     *  (dead takes precedence — a dead block has no wire presence to verify). */
+    blockDeadFolds?: number;
+    /** #5646: Σ (S−σ)×requestsAfter over block-dead folds — the part of
+     *  grossSaved frozen at the block's death rather than accruing. */
+    blockDeadFrozenTokens?: number;
     /** #3376: idle prompt-cache keepalive snapshot state — live sessions only
      *  (the snapshot lives in memory and dies with the process). */
     keepalive?: KeepaliveStatus;
@@ -197,6 +206,13 @@ interface WebOverview {
     netSavedTotal: number;
     /** true when at least one session had ledger folds (else net/repay are meaningless). */
     hasFoldData: boolean;
+    /** #5646: true whenever grossSavedTotal carries a value — those figures
+     *  (grossSavedTotal / netSavedTotal / savedUsd*) are counterfactual
+     *  ESTIMATES by kernel definition (EconomicsSummary: "estimate, not part
+     *  of the closure"), never a metered billing delta. Consumers must not
+     *  render them as measured savings. NOTE: distinct from `savedEstimated`
+     *  below, which is the pre-tagging local-estimate share of tokensSaved. */
+    savingsEstimated?: boolean;
     /** Σ measured compression re-pay tokens across ledger sessions. */
     repayTotal: number;
     /** Σ summary generation cost (output tokens) across ledger sessions. */
@@ -207,6 +223,13 @@ interface WebOverview {
      *  grossSavedTotal whose accrual has stopped (host shadowed the covered
      *  bytes outside bili's knowledge, #2193/#2202). 0 when none. */
     coverageLostFrozenTotal: number;
+    /** #5646: Σ block-dead fold count across sessions (0 when none). */
+    blockDeadFoldTotal: number;
+    /** #5646: Σ frozen avoided tokens over block-dead folds — a subset of
+     *  grossSavedTotal whose accrual stopped because the fold's kernel block
+     *  left the compression state (reaped / host-dropped / orphaned under a
+     *  dead ancestor, #5646). 0 when none. */
+    blockDeadFrozenTotal: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
     /** #4899: Σ per-session USD spend (only priced sessions contribute). */
@@ -826,6 +849,19 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // "compressed away" (gross) from "net saving after re-pay & summary cost".
     let hasFolds = false, grossSaved = 0, netSaved = 0, repayCost = 0, summaryCost = 0, foldCount = 0;
     let coverageLostFolds = 0, coverageLostFrozenTokens = 0;
+    let blockDeadFolds = 0, blockDeadFrozenTokens = 0;
+    // #5646: dead-fold classification at read time — a fold whose kernel block
+    // is no longer alive in this state (reaped / host-dropped / orphaned under
+    // a dead ancestor) froze its avoided-token accrual when it died; counting
+    // that frozen share here keeps the panel's frozen total reconcilable
+    // against grossSaved. An EMPTY block list is a real state (every fold's
+    // block is gone → all bid-linked folds dead); only lists that HAVE blocks
+    // but none carries a kernel blockId (the synthetic unified-index row shape)
+    // are unverifiable → no dead marking (same discipline as the ledger side).
+    const blocksView = s.state.blocks as ReadonlyArray<BlockLivenessView>;
+    const aliveBlocks = blocksView.length === 0 || blocksView.some((b) => typeof b.blockId === "string")
+        ? liveBlockIds(blocksView)
+        : null;
     for (const f of led?.folds ?? []) {
         hasFolds = true;
         foldCount += 1;
@@ -836,7 +872,11 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         repayCost += rep;
         summaryCost += sig;
         const cov = f.bid !== undefined ? covAll?.[f.bid] : undefined;
-        if (cov !== undefined && cov.e === 1 && (cov.p ?? 0) + (cov.r ?? 0) === 0) {
+        const dead = f.bid !== undefined && aliveBlocks !== null && !aliveBlocks.has(f.bid);
+        if (dead) {
+            blockDeadFolds += 1;
+            blockDeadFrozenTokens += Math.max(0, avoided);
+        } else if (cov !== undefined && cov.e === 1 && (cov.p ?? 0) + (cov.r ?? 0) === 0) {
             coverageLostFolds += 1;
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
@@ -1007,6 +1047,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             ? { missSplitUsd: { n: Math.round(missUsd.n * 1e4) / 1e4, c: Math.round(missUsd.c * 1e4) / 1e4, x: Math.round(missUsd.x * 1e4) / 1e4 } }
             : {}),
         ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
+        ...(hasFolds && blockDeadFolds > 0 ? { blockDeadFolds, blockDeadFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
             ? {
@@ -1147,6 +1188,7 @@ export async function buildOverview(): Promise<WebOverview> {
     let foldsTotal = 0, mrSeen = false, mrMulti = false, mW = 0, mR = 0, mQ = 0;
     let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
+    let blockDeadFoldTotal = 0, blockDeadFrozenTotal = 0;
     let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number; savedUsd: number; hasSavedUsd: boolean }>();
@@ -1226,6 +1268,8 @@ export async function buildOverview(): Promise<WebOverview> {
             summaryCostTotal += s.summaryCost ?? 0;
             coverageLostFoldTotal += s.coverageLostFolds ?? 0;
             coverageLostFrozenTotal += s.coverageLostFrozenTokens ?? 0;
+            blockDeadFoldTotal += s.blockDeadFolds ?? 0;
+            blockDeadFrozenTotal += s.blockDeadFrozenTokens ?? 0;
         } else if (s.tokensSaved > 0) {
             // Pre-tagging sessions: their local estimate counts toward the compressed side only.
             grossSavedTotal += s.tokensSaved;
@@ -1247,6 +1291,9 @@ export async function buildOverview(): Promise<WebOverview> {
         summaryCostTotal,
         coverageLostFoldTotal,
         coverageLostFrozenTotal,
+        blockDeadFoldTotal,
+        blockDeadFrozenTotal,
+        ...(grossSavedTotal > 0 ? { savingsEstimated: true } : {}),
         costUsdTotal,
         ...(hasMoneyData && costUsdTotal > 0
             ? { costUsdSplitTotal: { i: Math.round(cuI * 1e4) / 1e4, r: Math.round(cuR * 1e4) / 1e4, w: Math.round(cuW * 1e4) / 1e4, o: Math.round(cuO * 1e4) / 1e4 } }

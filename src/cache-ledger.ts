@@ -48,6 +48,14 @@ const SIZE_BUCKET_TOK = 20000;
 // dropped again when coverage returns (a flapping client logs once per flip).
 const LOST_LOGGED_KEY = "foldCoverageLostLogged";
 
+// #5646: blockIds whose dead-block transition was already logged — one warn per
+// block id instead of one per usage sample. Unlike coverage loss there is no
+// restore entry to delete (liveness re-derives from the state every sample and
+// a recovered block resumes accruing silently), so a block that dies, returns
+// and dies again stays quiet after its first warn; the map persists with the
+// session metadata, so this holds across daemon restarts too.
+const DEAD_LOGGED_KEY = "foldBlockDeadLogged";
+
 function median(xs: number[]): number | null {
     if (xs.length === 0) return null;
     const s = [...xs].sort((x, y) => x - y);
@@ -1323,6 +1331,55 @@ function detectOrphanSweeps(session: Session, led: CacheLedger): void {
     led.sweepThisSample = delta > 0 ? delta : 0;
 }
 
+/** #5646: block ids still ALIVE in the session's compression state. A block
+ *  is alive iff it is active, or reachable downward from an active root
+ *  through directBlockIds (a parent lists the child blocks its summary
+ *  consumed). A consumed child's raw content is still spared via its
+ *  ancestor's summary — the telescoping identity that keeps nested tiers
+ *  counting once — so superseded-but-anchored blocks stay alive and keep
+ *  accruing. Reaped blocks (#2695 zombie-streak reap removes them from
+ *  state.blocks), host-dropped blocks, and subtrees orphaned under a dead
+ *  ancestor are NOT alive: no summary represents their content on the wire
+ *  anymore, so booking further requests against their folds bills savings
+ *  that stopped happening (#5646: grossSaved climbed past any physical bound
+ *  in marathon plugin sessions). This is the one liveness signal verifiable
+ *  in plugin mode, where #2202's wire-coverage evidence is structurally
+ *  absent (the agent prunes locally, so resends never carry raw originals).
+ *  Liveness is only claimed from what the list actually says: an ABSENT list
+ *  is UNVERIFIABLE (status quo, same discipline as #2202 legacy entries); an
+ *  EMPTY list is a real "no live blocks" verdict that freezes every bid-linked
+ *  fold; web read paths additionally treat a non-empty list carrying no string
+ *  blockId (sparse unified-index rows) as UNVERIFIABLE. Takes the minimal
+ *  structural view (not the full CompressionBlock) so read-only summary paths
+ *  over sparse block shapes can share the same traversal. */
+export type BlockLivenessView = { blockId?: unknown; active?: boolean; directBlockIds?: readonly string[] };
+
+export function liveBlockIds(blocks: readonly BlockLivenessView[]): Set<string> {
+    const byId = new Map<string, BlockLivenessView>();
+    for (const b of blocks) if (typeof b.blockId === "string") byId.set(b.blockId, b);
+    const alive = new Set<string>();
+    const stack: BlockLivenessView[] = [];
+    for (const b of blocks) {
+        if (b.active !== false && typeof b.blockId === "string" && !alive.has(b.blockId)) {
+            alive.add(b.blockId);
+            stack.push(b);
+        }
+    }
+    while (stack.length > 0) {
+        const cur = stack.pop()!;
+        for (const cid of cur.directBlockIds ?? []) {
+            if (!alive.has(cid)) {
+                const child = byId.get(cid);
+                if (child !== undefined) {
+                    alive.add(cid);
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    return alive;
+}
+
 /** Record one provider usage report into the session ledger. `input` must be
  *  NORMALIZED (cached included — promptInputTotal semantics). `cached === null`
  *  means the provider reported NO cache-hit tokens (unmeasurable): such samples
@@ -1504,19 +1561,38 @@ export function recordCacheSample(
     const covAll = session.metadata[METADATA_FOLD_COVERAGE] as Record<string, { p?: number; r?: number; t?: number; e?: 1 }> | undefined;
     const lostLogged = (session.metadata[LOST_LOGGED_KEY] as Record<string, true> | undefined) ?? {};
     let lostDirty = false;
+    // #5646: dead-fold freeze — a fold whose kernel block left the compression
+    // state (reaped / host-dropped / orphaned under a dead ancestor) stops
+    // accruing here: no summary represents its content anymore, so further
+    // requests bill savings that stopped happening. Liveness is re-derived
+    // from THIS sample's state every time (see liveBlockIds), so a block that
+    // returns to state (host resync / rebuild) resumes accruing — same
+    // self-heal shape as #2202 coverage restore. Absent state (no block list
+    // at all) is UNVERIFIABLE → status quo, never a freeze.
+    const stateBlocks = session.state?.blocks;
+    const aliveBlocks = Array.isArray(stateBlocks) ? liveBlockIds(stateBlocks) : null;
+    const deadLogged = (session.metadata[DEAD_LOGGED_KEY] as Record<string, true> | undefined) ?? {};
+    let deadDirty = false;
     for (const f of led.folds) {
         if (f.at <= s.at) {
             const cov = f.bid !== undefined ? covAll?.[f.bid] : undefined;
+            const dead = f.bid !== undefined && aliveBlocks !== null && !aliveBlocks.has(f.bid);
             let frac = 1;
             let lost: boolean | null = null;
-            if (cov !== undefined && cov.e === 1 && typeof cov.t === "number" && cov.t > 0) {
+            if (!dead && cov !== undefined && cov.e === 1 && typeof cov.t === "number" && cov.t > 0) {
                 const present = (cov.p ?? 0) + (cov.r ?? 0);
                 frac = Math.min(1, present / cov.t);
                 lost = present === 0;
             }
-            f.requestsAfter += frac;
+            if (!dead) f.requestsAfter += frac;
             if (known && f.hPct === null) f.hPct = hitPct;
-            if (lost !== null && f.bid !== undefined) {
+            if (dead) {
+                if (f.bid !== undefined && deadLogged[f.bid] !== true) {
+                    deadLogged[f.bid] = true;
+                    deadDirty = true;
+                    loggerLog("warn", `[${session.id}] [cache-ledger] fold seq ${f.seq} (block ${f.bid}) block dead: no longer alive in the compression state — avoided-token accrual frozen at requestsAfter=${f.requestsAfter.toFixed(1)} (#5646)`);
+                }
+            } else if (lost !== null && f.bid !== undefined) {
                 if (lost && lostLogged[f.bid] !== true) {
                     lostLogged[f.bid] = true;
                     lostDirty = true;
@@ -1530,6 +1606,7 @@ export function recordCacheSample(
         }
     }
     if (lostDirty) session.metadata[LOST_LOGGED_KEY] = lostLogged;
+    if (deadDirty) session.metadata[DEAD_LOGGED_KEY] = deadLogged;
     if (foldSeq !== null) {
         const owner = led.folds.find((f) => f.seq === foldSeq);
         if (owner) owner.T += dec.compRepay;
