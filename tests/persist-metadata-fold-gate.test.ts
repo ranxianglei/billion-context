@@ -62,6 +62,7 @@ test("metadata fold is refused while live metadata diverges from the last commit
         foldGate(store).dropResidentMetadata(s);
         assert.equal(isDroppedMetadata(s.metadata), false, "fold must be refused while live metadata diverges from committed bytes");
         assert.equal((s.metadata as Record<string, unknown>).lateStamp, "unsaved", "the unsaved mutation must stay resident");
+        store.closeQuietly(); // dual-write pin opens index.db — close before teardown (Windows cannot unlink an open SQLite file; see persist-zstd.test.ts for the family)
     } finally {
         rmrf(dir);
     }
@@ -85,6 +86,8 @@ test("metadata fold proceeds once the divergent mutation has been committed (#55
         assert.ok(back, "session reloaded");
         assert.equal((back?.metadata as Record<string, unknown>).lateStamp, "unsaved", "committed mutation survives the round trip");
         await reloaded.flushAll([]);
+        store.closeQuietly();
+        reloaded.closeQuietly();
     } finally {
         rmrf(dir);
     }
@@ -99,6 +102,7 @@ test("metadata fold stays closed for a session with no committed save yet (#5506
         foldGate(store).dropResidentMetadata(s);
         assert.equal(isDroppedMetadata(s.metadata), false, "no commit proof yet ⇒ fold must stay closed");
         assert.equal((s.metadata as Record<string, unknown>).onlyInMemory, true);
+        store.closeQuietly();
     } finally {
         rmrf(dir);
     }

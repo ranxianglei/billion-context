@@ -57,6 +57,9 @@ export const LIVE_FILES = [
     // both spawn the corrupt-index-child helper (unified-store cold-load
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
+    // lock-holder CHILD process parks on a hermetic mkdtemp index.db (#2195
+    // release-gate pin); binds no ports — zone slot is a formality
+    "tests/storage-open-busy-lock.test.ts",
     "tests/web-storage-banner.test.ts",
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
