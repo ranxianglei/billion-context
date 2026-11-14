@@ -2261,7 +2261,7 @@ test("#4406: the Context tab marks the conversation scroll container and hides t
     assert.equal(scrollAttrs.has("data-bili-surface"), false, "leaving the tab drops the marker");
 });
 
-test("#6587: both dark palettes bind color-scheme so native controls follow the theme", () => {
+test("#6588: both dark palettes bind color-scheme so native controls follow the theme", () => {
     // `color-scheme` is what the UA paints native control chrome from: a
     // <select>'s option popup, checkbox/radio glyphs, scrollbars. The base
     // :root carries `light dark` (#2473, canvas/ground coupling), but the

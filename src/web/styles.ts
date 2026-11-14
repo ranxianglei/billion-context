@@ -58,7 +58,7 @@ export const WEB_STYLES = String.raw`
    signal, so the media query below is narrowed to documents WITHOUT one;
    the pinned palette repeats the same list (CSS cannot share declarations
    across media boundaries — keep the two lists in sync).
-   #6587: each dark palette declares color-scheme: dark. The UA paints native
+   #6588: each dark palette declares color-scheme: dark. The UA paints native
    control chrome (a select's option popup, checkbox/radio glyphs, scrollbars)
    from color-scheme rather than from the CSS vars, so the declaration keeps
    those controls on the dark ground the palette establishes. */
