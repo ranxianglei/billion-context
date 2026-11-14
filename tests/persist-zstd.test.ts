@@ -66,6 +66,13 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
+            // The dual-write pin above opens index.db in every store — Windows
+            // cannot unlink an open SQLite file, so close each sidecar before
+            // the tmp-dir teardown or the rmrf loses the EBUSY race (#5154
+            // family, resurfaced by the pure-sqlite-default test pins).
+            for (const s of h.stores) {
+                try { s.closeQuietly(); } catch { /* already closed */ }
+            }
             rmrf(dir);
         }
     });
