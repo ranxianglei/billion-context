@@ -327,6 +327,39 @@ withSessionsDir("session detail exposes decompress usage counters (#3671 directi
     assert.equal(dz.rangeRestores, 0);
 });
 
+withSessionsDir("credited tokensSaved survives full deactivation (#4700)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const mk = (blockId: string, compressedTokens: number, active: boolean): CompressionBlock => ({
+        blockId,
+        runId: "r1",
+        tier: 1,
+        topic: "T",
+        summary: "S",
+        directMessageIds: [],
+        effectiveMessageIds: [],
+        directBlockIds: [],
+        compressedTokens,
+        createdAt: Date.now(),
+        survivedCount: 1,
+        generation: "young",
+        active,
+    });
+    // Post-#4700 state: the tool-driven folds credited the lifetime total
+    // (12789+8214 shape from the issue), then a client-side /compact
+    // deactivated every block. The column must keep showing the total.
+    const s = makeSession("det-save-4700", { protocol: "anthropic" }, { requests: 107, tokensSaved: 21003, contextTokens: 100 });
+    s.state.blocks.push(mk("b1", 12789, false), mk("b2", 8214, false));
+    await store.writeNow(s);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("det-save-4700");
+    assert.ok(d);
+    assert.equal(d.tokensSaved, 21003, "counter floor keeps SAVED alive when every block is inactive");
+    const row = (await buildSessionList()).find((x) => x.id === "det-save-4700");
+    assert.equal(row?.tokensSaved, 21003, "list rows derive the same value");
+});
+
 withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
     const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
     const setEnv = (unified: string | undefined, key: string | undefined) => {
