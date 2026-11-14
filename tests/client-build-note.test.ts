@@ -171,3 +171,15 @@ test("isDshGoHost: the runtime-root stamp decides, blank counts as absent (#6588
     assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "/data/user/0/io.github.ccch1mneyyy.dsh_app/files/runtime/rootfs" }), true);
     assert.equal(isDshGoHost({ DSH_GO_RUNTIME_ROOT: "  /opt/rootfs  " }), true, "surrounding whitespace still stamps the host");
 });
+
+test("isDshGoHost: the argument-less default reads the live process.env (#6588)", () => {
+    const prev = process.env.DSH_GO_RUNTIME_ROOT;
+    try {
+        delete process.env.DSH_GO_RUNTIME_ROOT;
+        assert.equal(isDshGoHost(), false, "unset in the live env: not the dsh-go host");
+        process.env.DSH_GO_RUNTIME_ROOT = "/data/user/0/io.github.ccch1mneyyy.dsh_app/files/runtime/rootfs";
+        assert.equal(isDshGoHost(), true, "the production call site passes no argument");
+    } finally {
+        if (prev === undefined) delete process.env.DSH_GO_RUNTIME_ROOT; else process.env.DSH_GO_RUNTIME_ROOT = prev;
+    }
+});
