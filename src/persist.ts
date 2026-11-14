@@ -39,6 +39,7 @@ import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { perfTelemetryInit, perfTelemetryReleaseIfBound } from "./perf-telemetry.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
@@ -696,6 +697,10 @@ export class SessionStore {
                 fileStorageMysqlDsn(),
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
+                // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
+                // Pure-JSON ("legacy") mode stays frozen even when it rides this
+                // branch (a mysql backend with storage.unified=legacy) — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "mysql", { dir: this.sessionsDir, log: baseLog });
             });
             // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
             // (no degradation in any case). Boot awaits ready() and exits
@@ -717,8 +722,14 @@ export class SessionStore {
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
                 this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                // #5460 P1: DB-backed mode → telemetry armed (local perf.sqlite).
+                // Pure-JSON ("legacy") mode flows through this branch too
+                // (maybeOpen returns null for it) but stays frozen — zero footprint.
+                perfTelemetryInit(storageMode === "legacy" ? "json" : "sqlite", { dir: this.sessionsDir, log: baseLog });
             } else {
+                // #5460: pure-JSON storage mode is frozen — telemetry stays off there.
                 this.shadow = undefined;
+                perfTelemetryInit("json", { log: baseLog });
             }
         }
         this.store = new StateStore<PersistedSession>({
@@ -3920,6 +3931,7 @@ export class SessionStore {
         await this.flushScheduledSaves();
         await this.store.flushAll();
         this.shadow?.close();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** #3406: drain the host-owned debounced saves before the kernel store's
@@ -3960,11 +3972,12 @@ export class SessionStore {
     /** Close the unified sidecar without flushing pending writes. Intended for
      *  short-lived stores (CLI export, one-shot loaders): cancels debounced
      *  writes first so nothing builds against a closed handle. Windows cannot
-     *  delete a directory while index.db is open, so leaking the handle pins
-     *  the caller's cleanup. Never throws. */
+     *  delete a directory while index.db (or perf.sqlite, #5460) is open, so
+     *  leaking the handle pins the caller's cleanup. Never throws. */
     closeQuietly(): void {
         this.cancelAll();
         this.shadow?.close();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** #3931 step 3: async twin of closeQuietly for network backends —
@@ -3976,6 +3989,7 @@ export class SessionStore {
         await this.ready();
         this.cancelAll();
         await this.shadow?.closeAsync();
+        perfTelemetryReleaseIfBound(this.sessionsDir);
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
