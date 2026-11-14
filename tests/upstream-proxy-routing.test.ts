@@ -442,7 +442,8 @@ test("upstream failures expand nested causes with redacted proxy context", () =>
         "https://chatgpt.com/backend-api/codex/responses",
         "http://user:secret@proxy.example:8080",
     );
-    for (const expected of ["code=UND_ERR_CONNECT_TIMEOUT", "errno=-4039", "syscall=connect", "address=203.0.113.7", "port=443", "message=fetch failed <- connect timed out", "url=https://chatgpt.com/backend-api/codex/responses", "proxy=http://***:***@proxy.example:8080/"]) {
+    for (const expected of ["code=UND_ERR_CONNECT_TIMEOUT", "errno=-4039", "syscall=connect", "address=<private-host>", "port=443", "message=fetch failed <- connect timed out", "url=https://chatgpt.com/backend-api/codex/responses", "proxy=http://***:***@proxy.example:8080/"]) {
         assert.ok(detail.includes(expected), expected);
     }
+    assert.ok(!detail.includes("203.0.113.7"), "nested addresses are masked before reaching client-facing diagnostics");
 });
