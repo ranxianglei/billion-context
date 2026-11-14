@@ -120,7 +120,11 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
  *  raw chars/4 est ~137K vs provider-billed ~81K) used to win the max() raw
  *  and starve the output clamp (32768 -> 3357 with ample actual headroom).
  *  The usage-grade baseline is already provider-measured and is NEVER scaled. */
-export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string, kFactor?: number, kOrigin?: string, origin?: string, loadedToolTokens = 0, imageTokens = 0): number {
+export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string, kFactor?: number, kOrigin?: string, origin?: string, loadedToolTokens = 0, imageTokens = 0, inputEstBaseTokens = 0): number {
+    // #5664: inputEstBaseTokens — additive frozen-prefix basis for the
+    // render-snapshot lane, where processedMessages holds only the bounded
+    // tail; priced inside the calibration like every other local-est term.
+    // #2558: price the image reserve onto the LOCAL-EST arm only.
     // #2558: price the image reserve onto the LOCAL-EST arm only. A usage-grade
     // baseline is the provider-reported input total, which already bills those
     // same images (#488) — adding the reserve to it double-counts every image and
@@ -129,7 +133,7 @@ export function estimateInputTokens(processedMessages: CoreMessage[], systemText
     // reserve). Applied after calibration so the text k̂ never deflates the
     // separately-learned image cost (#1843 L1). #2391's deferred-tool tokens ride
     // INSIDE the calibrated arm instead — they are JSON payload text.
-    const est = applyEstimateCalibration(estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools) + loadedToolTokens, kFactor, kOrigin, origin) + imageTokens;
+    const est = applyEstimateCalibration(inputEstBaseTokens + estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools) + loadedToolTokens, kFactor, kOrigin, origin) + imageTokens;
     const baseline = lastInputTokens > 0 && lastInputTokensSource === "usage" ? lastInputTokens : 0;
     return Math.max(baseline, est);
 }
@@ -492,7 +496,11 @@ export function clampOutgoingOutput(
         *  same source chain as the #546 restore floor). Binds the clamp's cap so an
         *  outgoing max_tokens never exceeds it even when window headroom allows more
         *  — the hard upstream bound strict providers enforce with a 400. Absent →
-        *  byte-identical legacy window-only cap. */ knownOutputCeiling?: number },
+        *  byte-identical legacy window-only cap. */ knownOutputCeiling?: number;
+      /** #5664 render-snapshot lane: additive FROZEN-ROW basis for the local
+       *  est side when ctx.processedMessages holds only the bounded tail
+       *  (cumulative Σ estimateCoreMessages over the stored rows). Absent →
+       *  byte-identical legacy behavior. */ inputEstBaseTokens?: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
     /** #3148: optional visibility hook — invoked with the exact clamp event when
@@ -508,7 +516,7 @@ export function clampOutgoingOutput(
     // already bills them), so the clamp judges the payload on the same max(baseline, est +
     // reserve) caliber as preflight/metering instead of double-counting every image.
     const loadedToolTokens = field === "max_output_tokens" ? countLoadedToolTokens(rebuilt) : 0;
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin, loadedToolTokens, ctx.imageTokens);
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin, loadedToolTokens, ctx.imageTokens, typeof ctx.inputEstBaseTokens === "number" ? ctx.inputEstBaseTokens : 0);
     // #2490: judge headroom against the larger of the folded view and the refused
     // raw ledger — see ctx.ledgerFloorTokens. Keeps the shape of estimateInputTokens'
     // internal max() (usage baseline never scales DOWN), so all three calibers stay
