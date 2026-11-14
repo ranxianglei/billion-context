@@ -50,6 +50,7 @@ import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
+import { ECHOED_TOOL_RESULT_TEXT, isRenderTagToolName } from "./tag-echo-filter.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -1426,6 +1427,18 @@ export async function* runCompressLoop(
                     // synthetic frame for it guarantees AI_InvalidResponseDataError at assembly.
                     ctx.log(`[acp-loop] round ${round}: dropping nameless tool call (id=${call.callId || "-"}, argsLen=${call.arguments.length}) — upstream sent no function.name (#1484)`);
                     loggerLog("warn", `[acp-loop] round ${round}: dropping nameless tool call (session ${ctx.session.id}, id=${call.callId || "-"}, argsLen=${call.arguments.length}) (#1484)`);
+                    continue;
+                }
+                if (isRenderTagToolName(call.name)) {
+                    // #5440: the model echoed a render tag into the tool call's NAME
+                    // (e.g. `acp tokens=`). No host has such a tool — forwarding it
+                    // guarantees an UNKNOWN_TOOL failure and a full-context recovery
+                    // step. Answer it in-proxy with a canned result and re-request,
+                    // exactly like a proxy tool: the client never sees the bogus call,
+                    // and the model keeps its chance to continue.
+                    ctx.log(`[acp-loop] round ${round}: answering echoed render-tag tool name "${call.name}" in-proxy (id=${call.callId || "-"}) — no host tool by that name (#5440)`);
+                    loggerLog("warn", `[acp-loop] round ${round}: echoed render-tag tool name "${call.name}" (session ${ctx.session.id}, id=${call.callId || "-"}) answered in-proxy (#5440)`);
+                    proxyResults.push({ name: call.name, callId: call.callId, result: ECHOED_TOOL_RESULT_TEXT, arguments: call.arguments, wireArguments: call.arguments });
                     continue;
                 }
                 if (isProxyToolFor(call.name, ctx.session, ctx.config)) {

@@ -78,3 +78,30 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
     }
     return JSON.stringify(obj);
 }
+
+/** Append a verbatim assistant turn + its tool-result turn(s) to the wire's
+ *  request body — the #5440 echoed-tool continuation. Unlike
+ *  appendTrailingUserText this must NOT merge into an existing turn: the
+ *  assistant message (carrying the echoed tool call) and the tool result are
+ *  two separate turns in a fixed order. Returns null when the body is
+ *  unparseable or carries no turn array; the responses wire has no echo
+ *  continuation on this lane (#5440) and returns null up front. */
+export function appendEchoedToolExchange(
+    protocol: WireProtocol,
+    body: string | Buffer,
+    assistantMessages: Record<string, unknown>[],
+    toolResultMessages: Record<string, unknown>[],
+): string | null {
+    if (protocol === "responses") return null;
+    const raw = typeof body === "string" ? body : body.toString("utf8");
+    let obj: Record<string, unknown>;
+    try {
+        obj = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+    const turns = obj[protocol === "google" ? "contents" : "messages"];
+    if (!Array.isArray(turns)) return null;
+    (turns as unknown[]).push(...assistantMessages, ...toolResultMessages);
+    return JSON.stringify(obj);
+}
