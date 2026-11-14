@@ -285,3 +285,41 @@ test("e2e #2313 d: probe 400 without a parseable window arms the fallback shrink
         await close();
     }
 });
+
+test("e2e #2313 e: a probe 400 stating only an input-length RANGE arms the shrink — the DashScope livelock recovers", async () => {
+    // DashScope compatible-mode rejects an over-long input as "Range of input
+    // length should be [1, 20000]" — no token/length-subject phrase, so while it
+    // was unrecognized as an overflow the arm never fired, the probe gate
+    // re-forwarded the same raw body on every attempt and the session could
+    // only 400 (each turn burning the client's ~300s stream idle).
+    const rejectBody = JSON.stringify({
+        error: {
+            message: "<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 20000]",
+            type: "invalid_request_error",
+            param: null,
+            code: "invalid_parameter_error",
+        },
+        id: "chatcmpl-55bbf071-1040-9261-8cd4-76088d25ee5c",
+        request_id: "55bbf071-1040-9261-8cd4-76088d25ee5c",
+    });
+    const { ctx, calls, close } = await setup(rejectBody);
+    try {
+        await seedStuckMeter(ctx, "i2313-e");
+
+        const r = await post(ctx, bigMessages());
+        assert.equal(r.status, 200, "the stated range is an overflow on the probe path, and the in-request refold recovers");
+        await r.text();
+
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 3, "turn 1 + raw probe forward + one folded retry");
+        assert.ok(calls.some((c) => c.summary), "the refold made summarization call(s)");
+        assert.ok(forwards[2]!.contentChars < forwards[1]!.contentChars, "the retry carries the folded payload");
+
+        const s = getSession("i2313-e");
+        assert.ok(s);
+        assert.equal(s.stats.overflowArmTokens, undefined, "the successful retry's usage report retires the one-shot arm (#1110)");
+        assert.equal(s.stats.lastInputTokensSource, "usage", "the folded retry settles the final baseline");
+    } finally {
+        await close();
+    }
+});
