@@ -14,6 +14,7 @@ import { assignRefs, createCore, createInitialState, defaultConfig } from "acp-k
 import type { CoreMessage } from "acp-kernel";
 import {
     dshAgentRelayPath,
+    dshImageOffloadPlaceholderPath,
     dshMnemonPath,
     dshSubagentSettledPath,
     durableMessageToolPaths,
@@ -53,10 +54,26 @@ describe("#5173 new dsh injection classifiers", () => {
         assert.equal(dshAgentRelayPath(mk("r4", "user", "I sent a message: hello there")), undefined, "no Agent lead-in → plain prose");
         assert.equal(dshAgentRelayPath(mk("r5", "user", "Agent X sent a message:no-space joint")), undefined, "the wrapper joint always carries the space");
     });
+
+    test("dshImageOffloadPlaceholderPath: limits + text-only placeholders, mid-text user words (#6021)", () => {
+        // #6021: the placeholder replaces the live handle in the slot and
+        // keeps the user's original words after it — `includes`, not a
+        // prefix match, because the marker may sit mid-text.
+        const placeholder = "[image omitted to fit request image limits; \"image.png\" (sha256:0e596a186ab8). Normalized copy (read-only; may be resized or re-encoded): \"normalized/image.png\" (1584x892px, image/png).] these unknown keys are controller keys, not counted";
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", placeholder)), "oneshot/image-offload-placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "[image omitted because this model accepts text only; attachment sha256:2e896b95dec003df (1600x900px, image/png).]")), "oneshot/image-offload-placeholder");
+        // A [text, image] original keeps its prose BEFORE the "[" bracket, so the marker can sit mid-text: substring match, not prefix.
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", `please look again ${placeholder}`)), "oneshot/image-offload-placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "assistant", placeholder)), undefined, "assistant echo must never classify (#2766)");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "Image \"x.png\" (sha256:2e896b95dec003df); request preview 1600x900px.")), undefined, "the live handle is not a placeholder");
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "")), undefined);
+        const tool = { id: "u1", role: "tool", contentType: "tool-result", text: placeholder } as CoreMessage;
+        assert.equal(dshImageOffloadPlaceholderPath(tool), undefined);
+    });
 });
 
 describe("#5173 registry wiring", () => {
-    test("all eleven dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
+    test("all twelve dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
             ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
@@ -68,6 +85,7 @@ describe("#5173 registry wiring", () => {
             ["[MNEMON] recall note", "oneshot/mnemon"],
             ["Background subagent session-x finished and will do no further work unless you send it more.", "oneshot/subagent-settled"],
             ["Agent session-y sent a message: over there", "oneshot/agent-relay"],
+            ["[image omitted to fit request image limits; \"x.png\" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): \"normalized/x.png\" (1600x900px, image/png).] user words after the placeholder", "oneshot/image-offload-placeholder"],
             ['Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). Source dimensions, format, and byte size may differ.', "oneshot/image-handle"],
         ];
         for (const [text, expected] of samples) {
@@ -97,7 +115,11 @@ describe("#5173 end-to-end anchor geometry", () => {
             mk("p9", "user", `\x3cpath\x3ex.png\x3c/path\x3e \x3ctype\x3eimage\x3c/type\x3e \x3ccontent\x3epng bytes\x3c/content\x3e ${PAD}`),
             mk("p10", "user", `background job bash-ef01 (bash: "echo ok") finished [status: completed, exit code: 0]. Read its output with job_output. ${PAD}`),
             mk("p11", "user", `Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). ${PAD}`),
-            mk("p12", "assistant", `working on the migration ${PAD}`),
+            // #6021: the slot later holds the offload placeholder instead of
+            // the handle, with the user's original words after it. It must
+            // not become the anchor — the live request (p3) stays pinned.
+            mk("p12", "user", `[image omitted to fit request image limits; "x.png" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png).] these keys are controller keys ${PAD}`),
+            mk("p13", "assistant", `working on the migration ${PAD}`),
         ];
         const core = createCore();
         const state = createInitialState();

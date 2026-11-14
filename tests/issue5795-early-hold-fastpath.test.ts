@@ -461,3 +461,39 @@ test("#5795 e2e: model-scoped hold — other models egress, matching model held"
         }
     });
 });
+
+test("#5898 review: the early-hold requestModel supplier is lazy — sub-threshold and unknown-wire bodies are never scanned", () => {
+    withKnobs(KNOWN_KNOBS, () => {
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_EMPTY, null, T0);
+        const logs: string[] = [];
+        let scans = 0;
+        const supplier = () => { scans += 1; return "model-x"; };
+        const big = EARLY_HOLD_GATE_MIN_BYTES + 1;
+
+        // Sub-threshold body: the function bails out before the model is ever
+        // needed — the full-document scan must not run (hot-path tax).
+        const small = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big - 2, requestModel: supplier, res: small }), false);
+        assert.equal(scans, 0, "sub-threshold body never scans");
+
+        // Unknown wire: bails out before the model is needed — no scan.
+        const pnull = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", protocol: null, bodyBytes: big, requestModel: supplier, res: pnull }), false);
+        assert.equal(scans, 0, "unknown wire never scans");
+
+        // At threshold with a hold active: the model IS needed — the supplier
+        // runs exactly once and the local 429 lands.
+        const held = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: supplier, now: T0 + 100, res: held }), true);
+        assert.equal(scans, 1, "consulted exactly once when actually used");
+        assert.equal(held.headStatus, 429);
+
+        // The plain-string form still works unchanged.
+        const strRes = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: "model-x", now: T0 + 100, res: strRes }), true);
+        assert.equal(strRes.headStatus, 429);
+
+        _resetUpstreamThrottleForTest();
+    });
+});

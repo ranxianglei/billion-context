@@ -36,10 +36,10 @@
  */
 
 import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs } from "./store.js";
+import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -820,8 +820,12 @@ export class MysqlBackend implements StorageBackend {
                 [s.sessionId],
             )) as unknown as StoredBlockRow[][];
             for (const row of storedBlockRows[0]) storedBlocks.set(str(row.block_id), row);
+            // #5898 review (P3, mirror of store.ts): O(1) membership set
+            // instead of a per-stored-block Array.some over the incoming
+            // blocks (O(stored×incoming) on the record() hot path).
+            const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
             for (const [blockId, stale] of storedBlocks) {
-                if (input.blocks.some((b) => b.blockId === blockId)) continue;
+                if (incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [s.sessionId, blockId]);
                 await this.releaseContent(c, str(stale.summary_hash));
@@ -1773,7 +1777,7 @@ export class MysqlBackend implements StorageBackend {
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
         const deadRefs = await q("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord");
         const ccr = await q("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
-        const ext = await q("SELECT ext_key AS `key`, value_json FROM session_ext WHERE session_id = ?");
+        const ext = await q("SELECT ext_key AS `key`, value_json, updated_at FROM session_ext WHERE session_id = ?");
         const checkpoints = await q("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?");
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(str(m.content_hash));
@@ -1790,7 +1794,10 @@ export class MysqlBackend implements StorageBackend {
             if (c !== null) content[hash] = c;
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        // sqlite twin: appended as the last step inside the sweep
+        // transaction, so a failed sweep leaves no line for a session that
+        // is still active.
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
             const rel: string[] = [];
@@ -1819,6 +1826,7 @@ export class MysqlBackend implements StorageBackend {
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
             contentRowsDeleted = await this.collectZeroRefIn(c, rel);
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#3931] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1838,19 +1846,20 @@ export class MysqlBackend implements StorageBackend {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
+        // sqlite twin: newest matching line wins.
         let lineNo = -1;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
-            for (let i = 0; i < rawLines.length; i++) {
+            for (let i = rawLines.length - 1; i >= 0; i--) {
                 if (!rawLines[i].trim()) continue;
-                let candidate: { sessionId?: string };
+                let candidate: unknown;
                 try {
-                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                    candidate = JSON.parse(rawLines[i]) as unknown;
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) {
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) {
                     lineNo = i;
                     break;
                 }
@@ -1867,7 +1876,29 @@ export class MysqlBackend implements StorageBackend {
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
         const sess = dump.session;
         await this.tx(async (c) => {
-            for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
+            const references = new Map<string, number>();
+            const addRef = (hash: unknown): void => {
+                if (typeof hash === "string") references.set(hash, (references.get(hash) ?? 0) + 1);
+            };
+            for (const m of dump.messages) addRef(m.content_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) addRef(mm.media_hash);
+            for (const b of dump.blocks) {
+                const [twins] = await c.query("SELECT 1 FROM blocks WHERE session_id = ? AND block_id = ?", [sessionId, b.block_id]);
+                if ((twins as Row[]).length > 0) continue;
+                addRef(b.summary_hash);
+                addRef(b.one_hash);
+            }
+            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const cp of dump.checkpoints) {
+                const [twins] = await c.query("SELECT 1 FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
+                if ((twins as Row[]).length === 0) addRef(cp.state_hash);
+            }
+            for (const [hash, count] of references) {
+                const body = dump.content[hash] ?? await this.getContent(c, hash);
+                if (body === null || body === undefined) throw new Error(`archive content missing: ${hash}`);
+                await this.putContent(c, body, hash);
+                if (count > 1) await c.query("UPDATE content SET refcount = refcount + ? WHERE hash = ?", [count - 1, hash]);
+            }
             for (const m of dump.messages) {
                 // #4665: pre-fix dumps lack both fields — recompute identity
                 // from the CAS body (same formula as the v8 migration
@@ -1903,7 +1934,7 @@ export class MysqlBackend implements StorageBackend {
                 await c.query(
                     "INSERT INTO session_ext (session_id, ext_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                         "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
-                    [sessionId, x.key, x.value_json, Date.now()],
+                    [sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now()],
                 );
             }
             for (const cp of dump.checkpoints) {
@@ -1925,17 +1956,21 @@ export class MysqlBackend implements StorageBackend {
             );
         });
         const kept: string[] = [];
+        let ownLines = 0;
         for (const l of rawLines) {
             if (!l.trim()) continue;
             try {
                 const head = JSON.parse(l) as { sessionId?: string };
-                if (head.sessionId === sessionId) continue;
+                if (head.sessionId === sessionId) {
+                    if (++ownLines === 2) loggerLog("warn", `[storage] archive log holds more than one line for session ${sessionId}: the newest was restored, older ones are dropped`);
+                    continue;
+                }
             } catch {
                 continue;
             }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#3931] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
         return { ok: true };
     }
@@ -2111,7 +2146,9 @@ export class MysqlBackend implements StorageBackend {
     // --- session_ext / kv --------------------------------------------------
 
     async setSessionExt(sessionId: string, key: string, value: unknown): Promise<void> {
-        const valueJson = JSON.stringify(value);
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
         await this.pool.query(
             "INSERT INTO session_ext (session_id, ext_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
@@ -2120,6 +2157,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getSessionExt(sessionId: string, key: string): Promise<unknown> {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
         const [rows] = (await this.pool.query(
             "SELECT value_json FROM session_ext WHERE session_id = ? AND ext_key = ?",
             [sessionId, key],
@@ -2128,6 +2167,7 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async listSessionExt(sessionId: string): Promise<{ key: string; value: unknown; updatedAt: number }[]> {
+        validateExtKey(sessionId, "session id");
         const [rows] = (await this.pool.query(
             "SELECT ext_key, value_json, updated_at FROM session_ext WHERE session_id = ? ORDER BY ext_key",
             [sessionId],
@@ -2136,6 +2176,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async deleteSessionExt(sessionId: string, key?: string): Promise<number> {
+        validateExtKey(sessionId, "session id");
+        if (key !== undefined) validateExtKey(key, "key");
         if (key === undefined) {
             const [r] = (await this.pool.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId])) as unknown as [{ affectedRows: number }, unknown];
             return r.affectedRows;
@@ -2145,7 +2187,9 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async setKv(namespace: string, key: string, value: unknown): Promise<void> {
-        const valueJson = JSON.stringify(value);
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
         await this.pool.query(
             "INSERT INTO kv_store (namespace, kv_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
@@ -2154,6 +2198,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getKv(namespace: string, key: string): Promise<unknown> {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
         const [rows] = (await this.pool.query(
             "SELECT value_json FROM kv_store WHERE namespace = ? AND kv_key = ?",
             [namespace, key],
@@ -2165,12 +2211,14 @@ export class MysqlBackend implements StorageBackend {
         const where: string[] = [];
         const args: unknown[] = [];
         if (namespace !== undefined) {
+            validateExtKey(namespace, "namespace");
             where.push("namespace = ?");
             args.push(namespace);
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
-            where.push("kv_key LIKE CONCAT(?, '%')");
-            args.push(keyPrefix.replace(/[\\%_]/g, (ch) => "\\" + ch));
+            validateExtKey(keyPrefix, "key prefix");
+            where.push("kv_key LIKE CONCAT(?, '%') AND LOCATE(CAST(? AS BINARY), CAST(kv_key AS BINARY)) = 1");
+            args.push(keyPrefix.replace(/[\\%_]/g, (ch) => "\\" + ch), keyPrefix);
         }
         const sql =
             "SELECT namespace, kv_key, value_json, updated_at FROM kv_store" +
@@ -2181,6 +2229,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async deleteKv(namespace: string, key?: string): Promise<number> {
+        validateExtKey(namespace, "namespace");
+        if (key !== undefined) validateExtKey(key, "key");
         if (key === undefined) {
             const [r] = (await this.pool.query("DELETE FROM kv_store WHERE namespace = ?", [namespace])) as unknown as [{ affectedRows: number }, unknown];
             return r.affectedRows;

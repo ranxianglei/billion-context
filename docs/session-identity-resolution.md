@@ -2,8 +2,8 @@
 
 Design record for how billion-context decides **which conversation** a request
 belongs to once its session id (client-minted conversation identifier) is known.
-Companion pages: `SESSION-IDENTITY.md` (repo root — the *anonymous* lane: what to
-do when the request carries no id at all), `MESSAGE-IDENTITY.md` (message-level
+Companion pages: `session-identity.md` (sibling — the *anonymous* lane: what to
+do when the request carries no id at all), `message-identity.md` (message-level
 identity doctrine), and `docs/identity-channels.md` (who carries the ids into
 bili in the first place). Normative statements: AGENTS.md KDD #11 (identity
 hierarchy) and KDD #18 (channel wiring law).
@@ -131,8 +131,12 @@ reasons): `docs/identity-channels.md`.
   pinned (first-sight claim rules, #316; #1916 aux branch).
 - **Reachability caveat on the #5719 rung.** Whether review/aux dispatches ever
   ride stamped ids overlapping the parent's rows is conditional on host
-  behavior not yet evidenced in production logs — tracked as a one-line trace
-  log follow-up (PR #5826 review finding P1), deliberately NOT closed by guess.
+  behavior — tracked as a one-line trace log follow-up (PR #5826 review
+  finding P1), deliberately NOT closed by guess. The promised trace line now
+  exists: every firing logs `[session-resolve][msgid-rescue] <rawId>
+  hits=N/M exit=<tag-changed|diverged-order|shorter-divergent>` at warn
+  (`src/session-resolve.ts`, #5865 review P2) — the ≥2-vs-≥1 threshold
+  decision is to be made from that field evidence, not by guess.
 
 ## Change checklist
 

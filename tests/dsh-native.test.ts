@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -2148,14 +2150,14 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             // only 400 upstream.
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /attribution threw and body est ~1140002 tok \(the optimistic floor alone already exceeds the window\) vs window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /attribution threw and body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
             // #5613 calibrated tier: 4,000,000 B / 4 = 1M tok sits exactly ON
             // the bar in floor terms (not provably over), but ×1.14 →
             // 1,140,000 est > 1M — the measured billing bias says upstream
             // will reject it: refuse locally instead of riding #1117 into a
             // guaranteed 400.
             assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized");
-            assert.match(localLines()[1]!, /est ~1140000 tok \(calibrated estimate over; the optimistic floor 1000000 tok still sits under it\)/);
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
             // Calibrated boundary pins (bytes/4 floor × 1.14 against the 1M
             // bar): 3,508,768 B → floor 877,192 → est 999,999 ≤ 1M → still
             // DIRECT; 3,508,772 B → floor 877,193 → est 1,000,001 > 1M →
@@ -2168,8 +2170,15 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
-            // No window resolvable → the size arm disarms entirely → direct.
+            // #5907: no window resolvable (a custom provider the host never
+            // resolved) no longer disarms the arm — the bar falls back to the
+            // 1M floor, so a provably-oversized body refuses LOCALLY instead
+            // of riding DIRECT into a guaranteed upstream 400.
             _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
+            assert.match(localLines()[3]!, /vs window 1,000,000 \(no window declared; assuming the 1,000,000 floor\)/);
+            // Under the assumed floor (4004 B/4 = 1001 tok ≤ 1M) the arm stays
+            // disarmed → #1117 direct, exactly as before.
             assert.equal(await gate(url, { bytes: 4004 }), false);
         });
     } finally {
@@ -2214,13 +2223,13 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             // (#4068's 6.16M-token send).
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /unattributed body est ~1140002 tok \(the optimistic floor alone already exceeds the window\) vs window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /unattributed body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
             // #5613 calibrated tier, unattributed arm: floor exactly on the
             // bar, ×1.14 → 1,140,000 est over it → refused locally (this is
             // the exact class of send that bricked sessions in the field
             // while passing every old floor-only check).
             assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized-unattributed");
-            assert.match(localLines()[1]!, /est ~1140000 tok \(calibrated estimate over; the optimistic floor 1000000 tok still sits under it\)/);
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
             // Calibrated boundary pins (see the threw-arm twin above).
             assert.equal(await gate(url, { bytes: 3_508_768 }), false, "under the calibrated bar keeps #1117 direct semantics");
             assert.equal(await gate(url, { bytes: 3_508_772 }), "refuse-oversized-unattributed", "one more byte trips the calibrated bar");
@@ -2230,8 +2239,13 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
-            // No window resolvable → the size arm disarms entirely → direct.
+            // #5907: unknown window falls back to the 1M floor instead of
+            // disarming — a provably-oversized UNATTRIBUTED body refuses
+            // locally instead of riding #1117 DIRECT into a guaranteed 4xx.
             _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
+            assert.match(localLines()[3]!, /vs window 1,000,000 \(no window declared; assuming the 1,000,000 floor\)/);
+            // Under the assumed floor the arm stays disarmed → #1117 direct.
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Attributed traffic is untouched by the arm (#3617 both-ways):
             // a claimed oversized body goes to the proxy, where preflight's
@@ -3426,5 +3440,34 @@ test("#5792: dsh pre-send chain parses the request body once per request", async
         proxy.close();
         rmrf(home);
         rmrf(stateHome);
+    }
+});
+
+// #5838: installDshIntercepts must arm BOTH egress legs — with only the fetch
+// leg installed, a successful codex-responses WebSocket exchange never calls
+// fetch and the whole conversation bypasses the proxy.
+test("#5838: installDshIntercepts arms both egress legs (fetch + codex-responses WebSocket)", () => {
+    const g = globalThis as Record<PropertyKey, unknown>;
+    const savedFetch = g.fetch;
+    const savedWsDesc = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+    const FakeWs = class {};
+    const restore = (): void => {
+        _resetFetchInterceptForTest();
+        _resetWsInterceptForTest();
+        if (savedWsDesc !== undefined) Object.defineProperty(globalThis, "WebSocket", savedWsDesc);
+        else delete g.WebSocket;
+        g.fetch = savedFetch;
+    };
+    try {
+        restore();
+        g.WebSocket = FakeWs;
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:8787", ready: Promise.resolve("http://127.0.0.1:8787") };
+        installDshIntercepts(state);
+        assert.equal(nativeInterceptInstalled(), true, "fetch leg installed");
+        assert.equal(nativeWebSocketInterceptInstalled(), true, "WebSocket leg installed");
+        assert.notEqual(g.fetch, savedFetch, "global fetch wrapped");
+        assert.notEqual(g.WebSocket, FakeWs, "global WebSocket wrapped");
+    } finally {
+        restore();
     }
 });
