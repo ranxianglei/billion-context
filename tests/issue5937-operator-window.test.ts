@@ -206,18 +206,18 @@ test("#5937 egress fuse both-ways: an explicit cap replaces the 1M anti-guess fl
         assert.equal(parsed.error?.type, "request_too_large");
         assert.equal(parsed.error?.code, "egress_window_fuse");
         assert.equal(parsed.error?.retryable, false);
-        assert.match(parsed.error?.message ?? "", /that is ≥ ~\d+ tokens vs the operator-declared model window 450000/, "the token math names the operator wall");
+        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens.*vs the operator-declared model window 450,000/, "the measured-body fuse names the operator wall");
         assert.match(parsed.error?.message ?? "", /compress\.modelContextLimit, #5937/, "the refusal names the setting");
         assert.match(parsed.error?.message ?? "", /raise\/remove compress\.modelContextLimit/, "the remedy names how to release it");
         assert.equal(calls.length, 1, "only the warm-up reached the upstream");
 
-        // Negative direction: ~2.98MB sits UNDER the operator bar (and over the
-        // 2MB absolute floor) — it must forward despite dwarfing most windows'
-        // naive ratio bars.
+        // Negative direction: ~341K measured tokens sits UNDER the operator
+        // token cap (450K) — the measured-body fuse must let it forward even
+        // though it dwarfs most windows' naive ratio bars.
         const under = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ stream: true, messages: bigMessages(670, 4_450) }),
+            body: JSON.stringify({ stream: true, messages: bigMessages(300, 4_450) }),
         });
         assert.equal(under.status, 200, "under-bar bodies forward");
         await under.text();

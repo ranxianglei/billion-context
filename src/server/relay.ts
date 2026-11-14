@@ -1014,7 +1014,13 @@ async function forwardCaptured(
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
                 log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                const fuseWallClause = operatorDeclared
+                    ? `vs the operator-declared model window ${declaredWindow.toLocaleString("en-US")} (compress.modelContextLimit, #5937)`
+                    : `vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079)`;
+                const fuseRemedy = operatorDeclared
+                    ? ", or raise/remove compress.modelContextLimit if the upstream actually serves the larger window, and retry."
+                    : " and retry.";
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) ${fuseWallClause} (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas)${fuseRemedy}`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
                 else {
