@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
@@ -748,6 +749,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         separatorSlots,
         sentBodyStr,
     );
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return {
         body: sentBodyStr,
         parsedBody: rebuilt,

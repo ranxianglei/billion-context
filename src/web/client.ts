@@ -2067,7 +2067,59 @@ function changelogCatOf(rawLine) {
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
         return xt + xtTime;
     }
-    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
+    // #6729: nudge-recommended vs actually-folded recovery bars (#6720 ratchet).
+    // Each nudge arm draws a hollow PENDING outline; each nudge-attributed fold
+    // fills its FOLDED portion inside the same outline geometry (green/yellow/
+    // red by recovery rate); active folds stand alone in blue. A nudge whose arm
+    // never produced a fold keeps its hollow bar + red top marker — the ratchet
+    // made visible. Bars are token-scaled on the input axis like everything else.
+    function recoveryMarkLines(recovery, lines, x, PT, ih, maxY) {
+        if (!recovery || !(recovery.events && recovery.events.length)) return { marks: "", head: "" };
+        const bw = 7;
+        const base = PT + ih;
+        const idxAt = (at) => {
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= at) return i; }
+            return lines.length - 1;
+        };
+        const colFor = (ev) => ev.mode === "a" ? "#0969da" : (ev.pct == null ? "#6e7781" : (ev.pct >= 80 ? "#2da44e" : ev.pct >= 40 ? "#bf8700" : "#cf222e"));
+        let marks = "";
+        recovery.events.forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            const fx = x(idxAt(ev.at));
+            if (ev.kind === "n") {
+                const pending = ev.pending || 0;
+                const hP = Math.min(ih, (pending / maxY) * ih);
+                const unpaired = !ev.paired;
+                marks += '<rect x="' + (fx - 3).toFixed(1) + '" y="' + (PT + 4).toFixed(1) + '" width="6" height="6" fill="none" stroke="' + (unpaired ? "#cf222e" : "#6e7781") + '" stroke-width="1.2"><title>'
+                    + escapeHtml(t("det.rec_nudge_tip", { tier: ev.tier != null ? ev.tier : "?", at: fmtDT(ev.at), p: fmtW(pending) })) + (unpaired ? "\\n" + t("det.rec_unfolded") : "") + "</title></rect>";
+                if (unpaired && hP > 2) {
+                    marks += '<rect x="' + (fx - bw / 2).toFixed(1) + '" y="' + (base - hP).toFixed(1) + '" width="' + bw + '" height="' + hP.toFixed(1) + '" fill="none" stroke="#cf222e" stroke-width="1" stroke-dasharray="2 2" opacity="0.8"/>';
+                }
+                return;
+            }
+            const S = ev.folded || 0;
+            const pending = ev.pending || 0;
+            const hS = Math.min(ih, (S / maxY) * ih);
+            const hP = Math.min(ih, (pending / maxY) * ih);
+            const col = colFor(ev);
+            if (ev.mode === "n" && hP > hS + 0.5 && hP > 2) {
+                marks += '<rect x="' + (fx - bw / 2).toFixed(1) + '" y="' + (base - hP).toFixed(1) + '" width="' + bw + '" height="' + hP.toFixed(1) + '" fill="none" stroke="' + col + '" stroke-width="1" stroke-dasharray="2 2" opacity="0.8"/>';
+            }
+            if (hS > 0.5) {
+                const tip = ev.mode === "n"
+                    ? t("det.rec_fold_n_tip", { seq: ev.foldSeq != null ? ev.foldSeq : "?", at: fmtDT(ev.at), s: fmtW(S), p: fmtW(pending), pct: ev.pct != null ? ev.pct.toFixed(1) : "?" })
+                    : t("det.rec_fold_a_tip", { seq: ev.foldSeq != null ? ev.foldSeq : "?", at: fmtDT(ev.at), s: fmtW(S) });
+                marks += '<rect x="' + (fx - bw / 2).toFixed(1) + '" y="' + (base - hS).toFixed(1) + '" width="' + bw + '" height="' + hS.toFixed(1) + '" fill="' + col + '" opacity="0.75" rx="1"><title>' + escapeHtml(tip) + "</title></rect>";
+            }
+        });
+        const s = recovery.summary;
+        let head = "";
+        if (s && s.nudges > 0 && s.pct != null) {
+            head = '<text x="' + TRAJ_PL + '" y="' + (PT + 12).toFixed(1) + '" font-size="10" fill="#6e7781">' + escapeHtml(t("det.rec_head", { pct: s.pct.toFixed(1), n: s.nudges, a: s.activeFolds })) + "</text>";
+        }
+        return { marks, head };
+    }
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents, recovery) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
         const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
@@ -2119,6 +2171,7 @@ function changelogCatOf(rawLine) {
         });
         const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
         const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
+        const rec = recoveryMarkLines(recovery, lines, x, PT, ih, maxY);
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -2146,7 +2199,7 @@ function changelogCatOf(rawLine) {
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + "</svg>";
+            + foldMarks + seamMarks + rec.marks + ceiling + baseline + rec.head + ticks + xt + "</svg>";
     }
     // #3484: per-request cache hit-rate line — the trend view the numeric cards lack
     // (overview/list/card show one aggregate; this shows which rounds dipped and how far).
@@ -2255,13 +2308,18 @@ function changelogCatOf(rawLine) {
             // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
             // the byte-parity acceptance criterion pins). Time-filtering only applies to a
             // ZOOMED window, where a foreign mark would land on the wrong sample.
-            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], recovery: z.state.recovery || null, offset: a };
             const t0 = lines[0] ? (lines[0].at || 0) : 0;
             const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
             return {
                 lines,
                 folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
                 seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                // #6729: events follow the same zoom filter; the session-wide summary
+                // stays global so the recovery rate never lies about a zoomed window.
+                recovery: (z.state.recovery && z.state.recovery.events.length)
+                    ? { events: z.state.recovery.events.filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1), summary: z.state.recovery.summary }
+                    : null,
                 offset: a,
             };
         };
@@ -2284,7 +2342,7 @@ function changelogCatOf(rawLine) {
             const wrap = $(cfg.elId);
             const v = z.visible();
             if (!wrap || !v) return;
-            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams, v.recovery) : "";
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
@@ -2369,7 +2427,7 @@ function changelogCatOf(rawLine) {
     // #4317: both detail charts plot the SAME request timeline in two projections —
     // one shared brush window keeps them in lockstep (select on either, both follow).
     const detailChartLink = { members: [] };
-    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams, recovery) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams, recovery) });
     const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
@@ -2377,7 +2435,8 @@ function changelogCatOf(rawLine) {
         const seam = detailSeam(ledger);
         trajAux.win = d.contextWindow || 0;
         trajAux.baseIn = d.systemPromptTokens || 0;
-        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+        const rec = ledger.recovery && ledger.recovery.events && ledger.recovery.events.length ? ledger.recovery : null;
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [], recovery: rec });
     }
     function bindHitRateChart(d) {
         const ledger = d.ledger || {};

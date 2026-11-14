@@ -47,6 +47,11 @@ interface ReportData {
         };
         stability?: { paired?: number; equal?: number; diverged?: number; head?: number; append?: number; mid?: number; unknownOffset?: number };
         folds?: Array<{ seq?: number | null; at?: number; S?: number; sigma?: number; hPct?: number | null; T?: number }>;
+        /** #6729: nudge-recommended vs actually-folded recovery events + summary. */
+        recovery?: {
+            events?: Array<{ at?: number; kind?: "n" | "f"; tier?: number | null; pending?: number; folded?: number | null; foldSeq?: number | null; mode?: "n" | "a" | null; pct?: number | null; paired?: boolean }>;
+            summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
+        };
         lines?: Array<{ input?: number; cached?: number }>;
     }) | null;
 }
@@ -128,11 +133,13 @@ function readLedger(d: ReportData) {
     const seam = led.seam && typeof led.seam === "object" ? led.seam : null;
     const st = led.stability && typeof led.stability === "object" ? led.stability : null;
     const folds = Array.isArray(led.folds) ? led.folds : [];
+    // #6729: sparse on pre-upgrade ledgers.
+    const rec = led.recovery && Array.isArray(led.recovery.events) && led.recovery.events.length ? led.recovery : null;
     const lines = Array.isArray(led.lines) ? led.lines : [];
     const seamEvents = seam && Array.isArray(seam.events) ? seam.events.filter((e) => e && (e.at ?? 0) > 0) : [];
     const ctxBest = (d.contextBest && d.contextBest.tokens) ? d.contextBest.tokens : (Number(d.contextTokens) || 0);
     const win = Number(d.contextWindow) || 0;
-    return { led, tot, seam, st, folds, lines, seamEvents, ctxBest, win };
+    return { led, tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec };
 }
 
 export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): string {
@@ -140,7 +147,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
     const lang = opts.lang === "en" ? "en" : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
-    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
     const NL = String.fromCharCode(10);
     const L: string[] = [];
     L.push("# billion-context session report");
@@ -233,6 +240,23 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         L.push("|---|---|---|---|---|---|");
         folds.forEach((fd, i) => { L.push("| " + (fd.seq != null ? fd.seq : i + 1) + " | " + (fd.at ? f.DT(fd.at) : "-") + " | " + f.W(fd.S) + " | " + f.W(fd.sigma) + " | " + (fd.hPct == null ? "-" : fd.hPct.toFixed(1) + "%") + " | " + f.W(fd.T) + " |"); });
     }
+    if (rec) {
+        const s = rec.summary || {};
+        const evs = rec.events || [];
+        L.push("");
+        L.push("### " + t("det.rec_title"));
+        L.push("");
+        L.push("- " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none) + " · " + t("det.rec_nudge") + " " + (s.nudges || 0) + " · " + t("det.rec_active") + " " + (s.activeFolds || 0) + " · " + t("det.rec_rec_total") + " " + f.W(s.totalPending || 0) + " · " + t("det.rec_fold_total") + " " + f.W(s.totalFolded || 0));
+        L.push("");
+        L.push("| # | " + t("det.fold_time") + " | " + t("det.rec_kind") + " | " + t("det.rec_rec") + " | " + t("det.rec_folded") + " | " + t("det.rec_pct") + " |");
+        L.push("|---|---|---|---|---|---|");
+        evs.slice(-30).forEach((ev, i) => {
+            const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");
+            const pct = ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-";
+            L.push("| " + (i + 1) + " | " + (ev.at ? f.DT(ev.at) : "-") + " | " + kind + " | " + f.W(ev.pending || 0) + " | " + (ev.folded != null ? f.W(ev.folded) : "-") + " | " + pct + " |");
+        });
+        if (evs.length > 30) L.push("… +" + (evs.length - 30) + " earlier events");
+    }
     return L.join(NL);
 }
 
@@ -241,7 +265,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     const lang = opts.lang === "en" ? "en" : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
-    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
     const W = 920, PAD = 28;
     const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa";
     const SANS = "ui-sans-serif,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
@@ -398,6 +422,25 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             if (folds.length > 15) noteLine("… +" + (folds.length - 15) + " earlier folds (see .md)");
         }
     } else noteLine(t("common.empty"));
+    if (rec) {
+        section(t("det.rec_title"));
+        const s = rec.summary || {};
+        statRow([
+            [t("det.rec_rate"), s.pct != null ? s.pct.toFixed(1) + "%" : f.none, s.pct == null ? MUT : s.pct >= 80 ? "#2da44e" : s.pct >= 40 ? AMB : RED],
+            [t("det.rec_nudge"), String(s.nudges || 0)],
+            [t("det.rec_active"), String(s.activeFolds || 0)],
+            [t("det.rec_rec_total"), f.W(s.totalPending || 0)],
+            [t("det.rec_fold_total"), f.W(s.totalFolded || 0)]
+        ]);
+        const revs = (rec.events || []).slice(-10);
+        const rcols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rec_kind"), w: 150 }, { t: t("det.rec_rec"), w: 120 }, { t: t("det.rec_folded"), w: 120 }, { t: t("det.rec_pct"), w: W - PAD * 2 - 558 }];
+        tableHead(rcols);
+        revs.forEach((ev, i) => {
+            const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");
+            tableRow([String(i + 1), ev.at ? f.DT(ev.at) : "-", kind, f.W(ev.pending || 0), ev.folded != null ? f.W(ev.folded) : "-", ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-"], [rcols[0].w, rcols[1].w, rcols[2].w, rcols[3].w, rcols[4].w, rcols[5].w]);
+        });
+        if ((rec.events || []).length > 10) noteLine("… +" + ((rec.events || []).length - 10) + " earlier events (see .md)");
+    }
     y += 24;
     const H = Math.ceil(y);
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">'
