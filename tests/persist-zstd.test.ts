@@ -59,6 +59,10 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
         try {
             await fn(h);
         } finally {
+            // #6547: full mode opens index.db (+shm/wal) in dir; Windows
+            // refuses to delete open files, so close every store this
+            // harness created before rmrf.
+            for (const s of h.stores) s.closeQuietly();
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
