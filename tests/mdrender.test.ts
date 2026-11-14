@@ -61,6 +61,50 @@ test("makeMdRender is self-contained (IIFE inlining contract)", async () => {
     assert.equal(det.highlight('{"a": 1}', "json"), md.highlight('{"a": 1}', "json"));
 });
 
+const literalCodeSamples = [
+    "*literal* **also literal**",
+    "[guide](https://example.test/docs)",
+    "![diagram](https://example.test/image.png)",
+    "[blocked](javascript:alert(1))",
+    '<img src=x onerror=alert(1)> & "quotes"',
+    "plain_code",
+];
+
+function assertLiteralCode(html: string, expected: string): void {
+    const inner = /<code>([\s\S]*?)<\/code>/.exec(html)?.[1];
+    assert.notEqual(inner, undefined);
+    assert.ok(!inner!.includes("<"), "code contains text rather than nested markup");
+    const entities: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"' };
+    const text = inner!.replace(/&#(\d+);|&#x([a-f\d]+);|&(amp|lt|gt|quot);/gi, (_match, decimal, hex, named) =>
+        decimal ? String.fromCodePoint(Number(decimal)) : hex ? String.fromCodePoint(Number.parseInt(hex, 16)) : entities[named.toLowerCase()]!);
+    assert.equal(text, expected);
+}
+
+for (const sample of literalCodeSamples) {
+    test(`server Markdown preserves inline code literally: ${sample}`, () => {
+        assertLiteralCode(markdownToHtml(`\`${sample}\``), sample);
+    });
+}
+
+test("detached browser renderer keeps inline code literal", async () => {
+    const detached = await makeDetached();
+    for (const sample of literalCodeSamples) assertLiteralCode(detached.render(`\`${sample}\``), sample);
+});
+
+test("inline code keeps its literal content inside a link label", () => {
+    const html = md.render("[read `**literal**`](https://example.test/docs)");
+    assert.match(html, /<a href="https:\/\/example.test\/docs"/);
+    assertLiteralCode(html, "**literal**");
+});
+
+test("protecting inline code keeps surrounding emphasis and links active", () => {
+    const html = md.render("**bold** and `*literal*` and *italic* and [link](https://example.test/docs)");
+    assertLiteralCode(html, "*literal*");
+    assert.match(html, /<strong>bold<\/strong>/);
+    assert.match(html, /<em>italic<\/em>/);
+    assert.equal((html.match(/<a /g) ?? []).length, 1);
+});
+
 // --- escaping / XSS ---
 
 test("escape turns & < > \" into entities (single quote passes through, as in the old renderer)", () => {
