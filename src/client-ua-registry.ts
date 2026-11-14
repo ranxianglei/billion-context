@@ -18,7 +18,7 @@
 // at ingest (UA_MAX_CHARS) so one hostile UA cannot bloat the pasteable blob.
 
 import { isCodexClient } from "./codex-compact.js";
-import { sniffScanClient } from "./thirdparty-scan.js";
+import { isAntigravityClient, sniffScanClient } from "./thirdparty-scan.js";
 
 // Read directly (wire literal) instead of via plugin.ts — same discipline as
 // codex-compact.ts / session-id.ts: importing plugin.ts back into the request
@@ -43,9 +43,9 @@ function headerString(headers: Record<string, string | string[] | undefined>, na
 }
 
 /** Client family for UA bookkeeping — mirrors conflictClientOf's resolution
- * ladder (declared plugin agent > header sniff > codex UA shape) keyed off
- * the raw request headers. "mcp" is not a client name (MCP evidence flip,
- * #760b), so it falls through like in conflict-watch. */
+ *  ladder (declared plugin agent > header sniff > codex/antigravity UA shape)
+ *  keyed off the raw request headers. "mcp" is not a client name (MCP evidence
+ *  flip, #760b), so it falls through like in conflict-watch. */
 export function clientFamilyOf(headers: Record<string, string | string[] | undefined>): string {
     const agent = headerString(headers, BILI_PLUGIN_MARKER);
     if (agent && agent !== "mcp") return agent;
@@ -53,6 +53,7 @@ export function clientFamilyOf(headers: Record<string, string | string[] | undef
     if (sniffed) return sniffed;
     const ua = headerString(headers, "user-agent");
     if (ua && isCodexClient({ "user-agent": ua })) return "codex";
+    if (ua && isAntigravityClient({ "user-agent": ua })) return "antigravity";
     return OTHER_FAMILY;
 }
 
