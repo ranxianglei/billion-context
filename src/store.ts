@@ -58,23 +58,27 @@ export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }
 
-// #3400: per-request stamp of the acp_read_original_image TOOL registration gate.
-// The rescale PASS itself runs on every lane (governed by the BILI_IMAGE_RESCALE
-// knob); only the manifest registration and the annotation's invocation entry
-// follow this stamp — codex/plugin lanes get size-only notes.
+// #3400: the acp_read_original_image TOOL registration gate. The rescale PASS
+// itself runs on every lane (governed by the BILI_IMAGE_RESCALE knob); only the
+// manifest registration and the annotation's invocation entry follow this stamp —
+// codex/plugin lanes get size-only notes.
 const EFFECTIVE_IMAGE_RESCALE_KEY = "effectiveImageRescale";
 
-/** Stamp whether acp_read_original_image may be registered for this session's
- *  lane (per-request; mirrors the storeEffectiveCcr site). */
+/** Decide whether acp_read_original_image is registered for this session — ONCE,
+ *  on the first request — and pin it for the session's life (#4789). Tool
+ *  definitions render ahead of system + messages, so a mid-session flip of this
+ *  flag re-prices the whole prefix cache; the first request's decision is
+ *  authoritative and no later request may change it (a mid-session feature toggle
+ *  used to rewrite it per request and drop/re-add the tool). Stored in
+ *  session.metadata on purpose: the pin must survive LRU eviction+reload and the
+ *  post-save lazy swap. Shape note (#4789): a decided-not-armed session now stores
+ *  an explicit `false` (previously omitted); storage-render goldens regenerated. */
 export function storeEffectiveImageRescale(session: Session, armed: boolean | undefined): void {
-    // Absent == not armed (imageRescaleToolArmed reads === true). Writing only the
-    // armed state keeps non-armed lanes' metadata byte-identical to pre-#3400
-    // (storage-render digests pin that shape).
-    if (armed === true) session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] = true;
-    else delete session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY];
+    if (EFFECTIVE_IMAGE_RESCALE_KEY in session.metadata) return;
+    session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] = armed === true;
 }
 
-/** Read back the #3400 tool-registration stamp. */
+/** Read back the #3400 tool-registration stamp (pinned per session, #4789). */
 export function imageRescaleToolArmed(session: Session | undefined): boolean {
     return session?.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] === true;
 }
