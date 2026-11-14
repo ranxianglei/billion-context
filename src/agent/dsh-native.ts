@@ -70,7 +70,7 @@ import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { detectWireFormat } from "acp-kernel/wire";
-import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForWire } from "./pi-msgids.js";
+import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire } from "./pi-msgids.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
@@ -1293,8 +1293,8 @@ function dshFpContent(content: unknown): unknown {
  */
 function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: unknown): string[] | undefined {
     const fmt = detectWireFormat(parsed);
-    if (fmt !== "openai" && fmt !== "anthropic") return undefined; // google/responses stay content-derived (#6525 v1)
-    const wire = parsed.messages;
+    if (fmt !== "openai" && fmt !== "anthropic" && fmt !== "responses") return undefined; // google stays content-derived (#6525 v1)
+    const wire = fmt === "responses" ? parsed.input : parsed.messages;
     if (!Array.isArray(wire)) return undefined;
     if (!Array.isArray(hostMessages) || hostMessages.length === 0) return undefined;
     // pi-shaped entries: dsh's flat host messages share the pi-ai message
@@ -1311,7 +1311,11 @@ function resolveEnvelopeMsgIds(parsed: Record<string, unknown>, hostMessages: un
         if (mm.role === "system" || mm.role === "developer") continue;
         entries.push({ type: "message", id: mm.id, message: { role: dshFpRole(mm.role), content: dshFpContent(mm.content), toolCallId: mm.toolCallId } });
     }
-    const wireAligned = fmt === "anthropic" ? laneMsgIdsForWire(wire, entries) : laneMsgIdsForOpenAiWire(wire, entries);
+    const wireAligned = fmt === "anthropic"
+        ? laneMsgIdsForWire(wire, entries)
+        : fmt === "responses"
+        ? laneMsgIdsForResponsesWire(wire, entries)
+        : laneMsgIdsForOpenAiWire(wire, entries);
     if (wireAligned === undefined) return undefined; // pairing not provable — degrade
     // Shared core-alignment proof (pi-msgids.ts) — the SAME function the pi/omp
     // lanes stamp with (review M1: the inline copy was a cherry-pick artifact;

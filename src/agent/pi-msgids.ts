@@ -47,7 +47,7 @@
 // #6525: the core-alignment proof below runs the KERNEL's own wire→core
 // projection (the same one the proxy runs before pinning), so a stamp that
 // passes it is guaranteed to be the exact array the server will validate.
-import { anthropicToCore, openaiToCore } from "acp-kernel/wire";
+import { anthropicToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 
 type FpPart = { t: "text" | "img" | "tooluse" | "toolres" | "think" | "redact"; v: string };
 
@@ -471,19 +471,129 @@ export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[
     return leftover === "exhausted" ? ids : undefined;
 }
 
+/** Fingerprint of a responses-wire USER content (string | input_text/
+ *  output_text / input_image parts). undefined = unprovable shape; [] = the
+ *  conversion provably drops the message. */
+function respUserParts(content: unknown): FpPart[] | undefined {
+    if (content === null || content === undefined) return [];
+    if (typeof content === "string") {
+        const p = textPart(content);
+        return p === undefined ? [] : [p];
+    }
+    if (!Array.isArray(content)) return undefined;
+    const parts: FpPart[] = [];
+    for (const raw of content) {
+        if (raw === null || typeof raw !== "object") return undefined;
+        const part = raw as Record<string, unknown>;
+        if (part.type === "input_text" || part.type === "output_text") {
+            const p = textPart(part.text);
+            if (p !== undefined) parts.push(p);
+        } else if (part.type === "input_image") {
+            if (typeof part.image_url !== "string") return undefined;
+            parts.push({ t: "img", v: part.image_url });
+        } else {
+            return undefined; // unknown part type — refuse
+        }
+    }
+    return parts;
+}
+
+/** Fingerprint of one OUTGOING responses-wire input item. undefined =
+ *  unprovable (opaque / reasoning / unknown item type — the caller bails).
+ *  system|developer message items are handled by the caller (leading run →
+ *  hoist slots, mid-history → bail) and return undefined here. */
+function respWireFingerprint(item: unknown): FpPart[] | undefined {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) return undefined;
+    const it = item as Record<string, unknown>;
+    switch (it.type) {
+        case "message": {
+            const msg = it as { role?: string; content?: unknown };
+            if (msg.role === "user") return respUserParts(msg.content);
+            if (msg.role === "assistant") {
+                // Text only — tool calls ride as SEPARATE function_call items,
+                // so an assistant message item that would split (text + a call)
+                // never appears here; anything but plain text is unprovable.
+                if (typeof msg.content === "string") {
+                    const p = textPart(msg.content);
+                    return p === undefined ? undefined : [p];
+                }
+                if (!Array.isArray(msg.content)) return undefined;
+                const parts: FpPart[] = [];
+                for (const raw of msg.content) {
+                    if (raw === null || typeof raw !== "object") return undefined;
+                    const part = raw as Record<string, unknown>;
+                    if (part.type === "input_text" || part.type === "output_text") {
+                        const p = textPart(part.text);
+                        if (p !== undefined) parts.push(p);
+                    } else {
+                        return undefined;
+                    }
+                }
+                return parts.length > 0 ? parts : undefined;
+            }
+            return undefined; // system / developer — caller's job
+        }
+        case "function_call":
+            if (typeof it.call_id !== "string" || it.call_id.length === 0) return undefined;
+            return [{ t: "tooluse", v: it.call_id }];
+        case "function_call_output":
+            if (typeof it.call_id !== "string" || it.call_id.length === 0) return undefined;
+            return [{ t: "toolres", v: it.call_id }];
+        default:
+            return undefined; // reasoning / additional_tools / item_reference / … — bail
+    }
+}
+
+/** Resolve the branch-entry id for EVERY item of a responses-wire outgoing
+ *  request — 1:1 with the INPUT-ITEM COUNT — or undefined when the alignment
+ *  cannot be proven end-to-end (all-or-nothing). The LEADING run of
+ *  system|developer message items takes position-pinned bili-ps-N slots (==
+ *  the kernel's hoisted head, responsesToCore sysDevHead). ANY non-leading
+ *  system|developer item, reasoning item, or opaque item bails: those
+ *  placements are not statically provable here, and an absent list costs one
+ *  count-mode turn. Every other item walks the SHARED entry iterator with
+ *  the same order-preserving proof (never similarity, never position alone).
+ *  All-or-nothing: undefined ⇒ the caller sends nothing. */
+export function laneMsgIdsForResponsesWire(input: unknown, branch: unknown): string[] | undefined {
+    if (!Array.isArray(input) || !Array.isArray(branch)) return undefined;
+    const items = input as Array<Record<string, unknown> | null>;
+    const isSysDev = (it: unknown): boolean => {
+        if (it === null || typeof it !== "object") return false;
+        const o = it as Record<string, unknown>;
+        return o.type === "message" && (o.role === "system" || o.role === "developer");
+    };
+    let lead = 0;
+    while (lead < items.length && isSysDev(items[lead])) lead += 1;
+    const take = makeEntryTake(branch);
+    const ids: string[] = [];
+    for (let i = 0; i < lead; i++) ids.push(`bili-ps-${i}`);
+    for (let i = lead; i < items.length; i++) {
+        if (isSysDev(items[i])) return undefined; // mid-history system/dev — ambiguous placement
+        const wParts = respWireFingerprint(items[i]);
+        if (wParts === undefined || wParts.length === 0) return undefined;
+        const n = take();
+        if (typeof n === "string") return undefined;
+        if (!partsLowerThrough(n.parts, wParts)) return undefined;
+        ids.push(n.id);
+    }
+    const leftover = take();
+    return leftover === "exhausted" ? ids : undefined;
+}
+
 // #6525 (send): CORE-alignment proof shared by every client's full-resend
 // msgid envelope stamp (dsh #6532 inlines the same logic; pi/omp call this).
-// Input = the WALKER's wire-aligned output (openai wire keeps its leading
-// bili-ps-N hoist slots) + the wire messages + the full payload. Returns the
-// core-aligned id array — == the POST-hoist core count the server validates
-// — or undefined when a 1:1 host pin is not provable; the caller must then
-// send NO envelope (byte-identical to before, never a misaligned array).
+// Input = the WALKER's wire-aligned output (openai/responses wires keep their
+// leading bili-ps-N hoist slots) + the wire elements + the full payload.
+// Returns the core-aligned id array — == the POST-hoist core count the server
+// validates — or undefined when a 1:1 host pin is not provable; the caller
+// must then send NO envelope (byte-identical to before, never a misaligned
+// array).
 // The kernel's wireIndex is the alignment authority: a wire element that
 // splits into N cores (or vanishes) has no 1:1 host id, so the whole stamp
 // bails. Duplicates are refused here too (validateMsgIds would reject them
 // server-side anyway — refusing locally skips the one-time warn path).
 export function coreAlignEnvelopeIds(
-    fmt: "openai" | "anthropic",
+    fmt: "openai" | "anthropic" | "responses",
     wireAligned: string[],
     wire: unknown,
     parsed: Record<string, unknown>,
@@ -492,7 +602,7 @@ export function coreAlignEnvelopeIds(
     // The walk's contract is 1:1 with the element count — a mismatched pair
     // here would silently misalign the envelope, so refuse it outright.
     if (wireAligned.length !== wire.length) return undefined;
-    // OpenAI wire only: the leading system/developer run becomes synthetic
+    // OpenAI/Responses wire only: the leading system/developer run becomes synthetic
     // bili-ps-N slots (== the kernel's hoisted prefix) — drop them; the
     // envelope must be CORE-aligned (the server validates against the
     // post-hoist core count). Anthropic has no hoist (system is a separate
@@ -507,6 +617,8 @@ export function coreAlignEnvelopeIds(
     if (coreAligned.length === 0) return undefined;
     const flat = fmt === "anthropic"
         ? anthropicToCore(parsed as Parameters<typeof anthropicToCore>[0])
+        : fmt === "responses"
+        ? responsesToCore(parsed as Parameters<typeof responsesToCore>[0])
         : openaiToCore(parsed as Parameters<typeof openaiToCore>[0]);
     const perEl = new Map<number, number>();
     for (const c of flat.msgs) {

@@ -11,7 +11,7 @@
  *  pairing reuses the lane walkers; the server re-validates at pin time. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { coreAlignEnvelopeIds } from "../src/agent/pi-msgids.ts";
+import { coreAlignEnvelopeIds, laneMsgIdsForResponsesWire } from "../src/agent/pi-msgids.ts";
 import {
     _bodyProxyVisibleForTest,
     _resolveEnvelopeIdsForFullResendForTest,
@@ -241,4 +241,95 @@ test("stamp: unpairable resolver result → undefined (the request ships as-is)"
 test("stamp: non-object payload → undefined without throwing", () => {
     assert.equal(_stampMsgIdEnvelopeForTest({ payload: "garbage" }, ctxWithBranch(pairBranch()), "pi", undefined), undefined);
     assert.equal(_stampMsgIdEnvelopeForTest({}, ctxWithBranch(pairBranch()), "pi", undefined), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// E. responses wire — the OpenAI /responses dialect (#6539: all protocols)
+// ---------------------------------------------------------------------------
+
+/** A pi branch that pairs 1:1 onto RESP_WIRE_1TO1 (the responses-wire
+ *  walker's lockstep contract): entry id is the host msgid the envelope must
+ *  carry. Tool call = assistant toolCall entry; tool result = toolResult. */
+function respBranch() {
+    return [
+        { type: "message", id: "u1", message: { role: "user", content: "q" } },
+        { type: "message", id: "a2", message: { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "t", arguments: {} }] } },
+        { type: "message", id: "t3", message: { role: "toolResult", toolCallId: "call_1", content: [{ type: "text", text: "result" }] } },
+        { type: "message", id: "a4", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+    ];
+}
+
+const RESP_WIRE_1TO1 = [
+    { type: "message", role: "user", content: "q" },
+    { type: "function_call", call_id: "call_1", name: "t", arguments: "{}" },
+    { type: "function_call_output", call_id: "call_1", output: "result" },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] },
+];
+
+test("laneMsgIdsForResponsesWire: 1:1 tool round → entry ids", () => {
+    assert.deepEqual(laneMsgIdsForResponsesWire(RESP_WIRE_1TO1, respBranch()), ["u1", "a2", "t3", "a4"]);
+});
+
+test("laneMsgIdsForResponsesWire: leading system run → position-pinned bili-ps slots", () => {
+    const wire = [{ type: "message", role: "system", content: "you are a test" }, { type: "message", role: "user", content: "q" }, { type: "message", role: "assistant", content: "a" }];
+    // explicit minimal branch: user + final assistant (system rides the hoist)
+    const minimal = [
+        { type: "message", id: "u1", message: { role: "user", content: "q" } },
+        { type: "message", id: "a2", message: { role: "assistant", content: [{ type: "text", text: "a" }] } },
+    ];
+    assert.deepEqual(laneMsgIdsForResponsesWire(wire, minimal), ["bili-ps-0", "u1", "a2"]);
+});
+
+test("laneMsgIdsForResponsesWire: multi-part user (kernel splits it) → bail", () => {
+    const wire = [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }, { type: "input_text", text: "b" }] }];
+    const branch = [{ type: "message", id: "u1", message: { role: "user", content: "a b" } }];
+    assert.equal(laneMsgIdsForResponsesWire(wire, branch), undefined);
+});
+
+test("laneMsgIdsForResponsesWire: mid-history system item → bail (ambiguous sidecar placement)", () => {
+    const wire = [{ type: "message", role: "user", content: "q" }, { type: "message", role: "system", content: "mid" }];
+    const branch = [{ type: "message", id: "u1", message: { role: "user", content: "q" } }];
+    assert.equal(laneMsgIdsForResponsesWire(wire, branch), undefined);
+});
+
+test("laneMsgIdsForResponsesWire: opaque item (additional_tools) → bail", () => {
+    const wire = [{ type: "additional_tools", tools: [] }, { type: "message", role: "user", content: "q" }];
+    const branch = [{ type: "message", id: "u1", message: { role: "user", content: "q" } }];
+    assert.equal(laneMsgIdsForResponsesWire(wire, branch), undefined);
+});
+
+test("laneMsgIdsForResponsesWire: reasoning item → bail (conservative)", () => {
+    const wire = [{ type: "reasoning", summary: [{ type: "summary_text", text: "hmm" }] }];
+    const branch = [{ type: "message", id: "a1", message: { role: "assistant", content: [{ type: "text", text: "hmm" }] } }];
+    assert.equal(laneMsgIdsForResponsesWire(wire, branch), undefined);
+});
+
+test("coreAlignEnvelopeIds: responses 1:1 with lead system → core ids (lead dropped)", () => {
+    const wire = [{ type: "message", role: "system", content: "sys" }, { type: "message", role: "user", content: "q" }, { type: "message", role: "assistant", content: "a" }];
+    const parsed = { input: wire, model: "m" };
+    assert.deepEqual(coreAlignEnvelopeIds("responses", ["bili-ps-0", "u1", "a1"], wire, parsed), ["u1", "a1"]);
+});
+
+test("coreAlignEnvelopeIds: responses multi-part user splits into N cores → bail", () => {
+    const wire = [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }, { type: "input_text", text: "b" }] }];
+    const parsed = { input: wire, model: "m" };
+    assert.equal(coreAlignEnvelopeIds("responses", ["u0"], wire, parsed), undefined);
+});
+
+test("coreAlignEnvelopeIds: responses duplicate id in the tail → bail (no mis-pin)", () => {
+    const wire = [{ type: "message", role: "user", content: "q" }, { type: "message", role: "user", content: "r" }];
+    const parsed = { input: wire, model: "m" };
+    assert.equal(coreAlignEnvelopeIds("responses", ["u1", "u1"], wire, parsed), undefined);
+});
+
+test("resolveEnvelopeIds: responses full-resend pairs the branch → core-aligned host ids", () => {
+    const wire = RESP_WIRE_1TO1;
+    const parsed = { input: wire, model: "m" };
+    assert.deepEqual(_resolveEnvelopeIdsForFullResendForTest(parsed, ctxWithBranch(respBranch())), ["u1", "a2", "t3", "a4"]);
+});
+
+test("resolveEnvelopeIds: responses + lead system → hoisted slot dropped, host ids kept", () => {
+    const wire = [{ type: "message", role: "system", content: "sys" }, ...RESP_WIRE_1TO1];
+    const parsed = { input: wire, model: "m" };
+    assert.deepEqual(_resolveEnvelopeIdsForFullResendForTest(parsed, ctxWithBranch(respBranch())), ["u1", "a2", "t3", "a4"]);
 });

@@ -17,7 +17,7 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
-import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
 import { detectWireFormat } from "acp-kernel/wire";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
@@ -585,8 +585,8 @@ function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
 function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: Ctx): string[] | undefined {
     try {
         const fmt = detectWireFormat(parsed);
-        if (fmt !== "openai" && fmt !== "anthropic") return undefined; // google/responses stay content-derived (#6525 v1)
-        const wire = parsed.messages;
+        if (fmt !== "openai" && fmt !== "anthropic" && fmt !== "responses") return undefined; // google stays content-derived (#6525 v1)
+        const wire = fmt === "responses" ? parsed.input : parsed.messages;
         if (!Array.isArray(wire) || wire.length === 0) return undefined;
         let branch: unknown;
         try {
@@ -597,6 +597,8 @@ function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: C
         if (branch === null || branch === undefined) return undefined;
         const wireAligned = fmt === "anthropic"
             ? laneMsgIdsForWire(wire, branch)
+            : fmt === "responses"
+            ? laneMsgIdsForResponsesWire(wire, branch)
             : laneMsgIdsForOpenAiWire(wire, branch);
         if (wireAligned === undefined) return undefined; // pairing not provable — degrade
         return coreAlignEnvelopeIds(fmt, wireAligned, wire, parsed);
