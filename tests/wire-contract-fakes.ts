@@ -220,6 +220,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #5998 production report (DSH self-compression rewrote session messages and the rebuilt request carried signature-less thinking blocks; an opus→sonnet mid-session switch amplifies the failure because signatures are bound to the producing model). Mechanism verified in code: kernel anthropicToCore stamps thinkingSignature only when the inbound block carries one, while coreToAnthropic re-emits EVERY reasoning core as a thinking block — unsigned cores therefore produce signature-less blocks on the wire, which Anthropic proper rejects ("thinking.signature: Field required", #2501). The two affected upstream personalities are byte-indistinguishable on the inbound wire — never-signing relays (DeepSeek /anthropic, #5495) require the unsigned blocks back verbatim — so the repair is learn-on-failure at bili\'s relay egress seam (src/server/thinking-posture.ts): first "Field required" 400 ⇒ one strip-and-resend probe; accepted ⇒ the session drops unsigned thinking proactively for the rest of its life. Constraint source: Anthropic Messages API extended-thinking contract (preserved thinking must be replayed verbatim); the kernel round-trip suite pins the positive half ("signature reattached — Anthropic rejects thinking without it").',
     },
+    {
+        id: "WC-025",
+        wire: "openai-chat",
+        summary:
+            'a TTS-shaped chat-completions request (a top-level `audio` object — voice/format for audio output) must not carry a leading role:"system" message — TTS models behind OpenAI-compatible endpoints reject it with 400 ("messages[0] system role is not allowed for TTS model"); bili must never inject its ACP system prompt into such a request, and the per-message <acp> tags must never be stamped onto text that will be read aloud',
+        provenance:
+            'bili #6636 production 400 (dsh-fish-soul TTS through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts over an OpenAI-compatible /chat/completions endpoint): the plugin sends {model, messages:[user, assistant], audio:{format:"mp3",voice:"mimo_default"}, stream:false} with no tools; bili injected the FUNCTION_ACP_TAGS_TIMESTAMPED system prompt as messages[0] plus an <acp> prefix on every message, and the upstream answered 400 "messages[0] system role is not allowed for TTS model". Control experiment in the issue: the same messages undecorated return 200 with audio. Repair: isAudioOutputCall (src/server/side-request.ts) routes tool-less audio requests through the #388 verbatim side passthrough, so neither the system prompt nor the tags are ever injected. The validator keys on the `audio` field, not the model name — the shape, not the spelling, is what makes the call a TTS request.',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -422,10 +430,25 @@ function validateAnthropicBody(body: unknown): string[] {
     return out;
 }
 
-/** WC-004 on an OpenAI chat/completions body (only function-typed entries). */
+/** WC-004 + WC-025 on an OpenAI chat/completions body (only function-typed entries for WC-004). */
 export function validateOpenAiChatBody(body: unknown): string[] {
     const out: string[] = [];
-    if (!isPlainObject(body) || !Array.isArray(body.tools)) return out;
+    if (!isPlainObject(body)) return out;
+    // WC-025 (#6636): runs before the tools early-return — a TTS-shaped
+    // request (top-level `audio` object, no tools) must never carry a leading
+    // system message: TTS models behind OpenAI-compatible endpoints 400 it
+    // ("messages[0] system role is not allowed for TTS model"). The tripwire
+    // keys on the audio shape, not the model name. The no-tools veto mirrors
+    // isAudioOutputCall: a tool-carrying request is a main turn (its model
+    // has an action surface, is not a TTS model, and accepts a leading
+    // system), so bili's ACP decoration there is legal.
+    const wc025NoTools = !Array.isArray(body.tools) || body.tools.length === 0;
+    if (wc025NoTools
+        && isPlainObject(body.audio) && Object.keys(body.audio).length > 0
+        && Array.isArray(body.messages) && body.messages.length > 0
+        && isPlainObject(body.messages[0]) && body.messages[0].role === "system")
+        out.push(`WC-025 messages[0]: leading role:"system" message on a TTS-shaped request (top-level audio object) — TTS models reject a system message with 400 (#6636)`);
+    if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
         const fn = t.function;

@@ -101,6 +101,35 @@ export function isStructuredOutputCall(parsed: unknown): boolean {
     return typeof type === "string" && STRUCTURED_FORMAT_TYPES.has(type);
 }
 
+/** #6636: structural identification of a tool-less audio-output utility
+ *  call — a TTS request on the chat wire carries a top-level `audio` object
+ *  (`{voice, format}`, OpenAI chat-completions audio output) and no tools.
+ *  It is a one-shot media side call, not an agent turn: agent turns always
+ *  carry an action surface (#546), and a TTS model behind an
+ *  OpenAI-compatible endpoint rejects the ACP decoration outright — the
+ *  injected leading system prompt 400s ("messages[0] system role is not
+ *  allowed for TTS model", Xiaomi MiMo mimo-v2.5-tts) and the per-message
+ *  <acp> prefixes would be read aloud as text. Routed through the #388 side
+ *  passthrough like the #2500/#5073 utility shapes above, so the request
+ *  leaves the machine exactly as the client wrote it.
+ *  The no-tools veto is part of the predicate (same discipline as
+ *  isStructuredOutputCall): a tool-carrying request is a main turn even
+ *  when it asks for audio output. An empty `audio` object does not count —
+ *  it carries no media request. Residual, accepted: a tool-less plain chat
+ *  turn that asks for audio output (voice-mode chat with no tools) also
+ *  rides the side lane for that one turn — it forwards verbatim and its
+ *  fold state simply does not advance; the ACP decoration is never needed
+ *  for the reply to work, and the next tool-carrying turn rejoins the full
+ *  pipeline. */
+export function isAudioOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const audio = p.audio;
+    if (audio === null || typeof audio !== "object" || Array.isArray(audio)) return false;
+    return Object.keys(audio).length > 0;
+}
+
 export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
@@ -120,6 +149,12 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // pair with a 400. Routed through the #388 side passthrough like the #2500
     // server-tool shape above.
     if (isStructuredOutputCall(parsed)) return true;
+    // #6636: a tool-less request asking for audio output (top-level `audio`
+    // object — TTS on the chat wire) is a one-shot media side call, not an
+    // agent turn. The ACP decoration 400s it (leading system prompt) and
+    // would corrupt the spoken text (per-message tags), so it rides the
+    // #388 side passthrough verbatim like the utility shapes above.
+    if (isAudioOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
