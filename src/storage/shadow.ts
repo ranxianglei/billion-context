@@ -1684,7 +1684,7 @@ function missingSlot(): DriftSlotFingerprint {
     return { id: "-", role: "-", length: 0, sha8: "-" };
 }
 
-/** #6351: the two legs hold the same message in DIFFERENT media representations.
+/** #6356: the two legs hold the same message in DIFFERENT media representations.
  *
  *  Rows are written media-SPLIT (`planIngest` -> `splitMediaContent`: an
  *  `imageBase64` payload and every >=2 KiB data URL become `{"$media":hash}`
