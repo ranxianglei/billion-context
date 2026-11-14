@@ -17,6 +17,13 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+// The suite-wide storage baseline (tests/preload-storage-baseline.mjs) pins
+// BILI_STORAGE_UNIFIED ??= "legacy" for the legacy-written corpus; this suite
+// asserts the FRESH-INSTALL default posture — exactly the #6480 pure-sqlite
+// flip the notice advertises — so drop the inherited pin and let the
+// production default apply. (Preload contract: suites whose assertions depend
+// on a specific storage mode MUST pin BILI_STORAGE_UNIFIED themselves.)
+delete process.env.BILI_STORAGE_UNIFIED;
 
 // This suite asserts the PRODUCTION default storage posture. The CI corpus
 // baseline (tests/preload-storage-baseline.mjs, #2815) forces
