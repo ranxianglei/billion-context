@@ -1,0 +1,271 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1124" viewBox="0 0 1560 1124">
+  <style>
+    html,body { margin:0; padding:0; background:#fff; }
+    text { font-family: 'Noto Sans CJK SC','Droid Sans Fallback',sans-serif; }
+    .tt { font-size: 22px; font-weight: 700; fill: #0f172a; }
+    .sub { font-size: 13px; fill: #475569; }
+    .stage { font-size: 15px; font-weight: 700; fill: #0f172a; }
+    .stagenum { font-size: 13px; font-weight: 700; fill: #ffffff; }
+    .b  { font-size: 12px; fill: #1e293b; }
+    .s  { font-size: 11px; fill: #475569; }
+    .chipn { font-size: 10.5px; fill: #334155; }
+    .warn { font-size: 12.5px; font-weight: 700; fill: #7f1d1d; }
+    .warnb { font-size: 11px; fill: #991b1b; }
+    .ok  { font-size: 12px; font-weight: 700; fill: #14532d; }
+    .okb { font-size: 11px; fill: #166534; }
+    .leg { font-size: 11px; fill: #334155; }
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#334155"/></marker>
+    <marker id="arra" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#b91c1c"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1560" height="1124" fill="#ffffff"/>
+  <text x="30" y="42" class="tt">目标架构 · 快照表式压缩底座（六段固定链，单一存储真源）</text>
+  <text x="30" y="68" class="sub">每轮全走完：原始字节 → 协议转换 → 改写(压缩) → 快照表应用 → 出站映射 → 出站 ｜ 内核零改动 ｜ 任何疑点该轮回落 legacy 路径（降级，不猜）</text>
+  <!-- ingress band: host lanes + routing (unchanged) -->
+  <g>
+    <rect x="30" y="88" width="1500" height="150" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="50" y="112" class="stage" fill="#0f172a">入站 · 宿主车道与分轨（零改动 —— #5842 msgid 采集已就位；分轨走既有 lane-decisions）</text>
+    <rect x="50" y="124" width="196" height="30" rx="6" fill="#ffffff" stroke="#94a3b8"/><text x="148" y="144" class="chipn" text-anchor="middle">dsh shim</text>
+    <rect x="262" y="124" width="196" height="30" rx="6" fill="#ffffff" stroke="#94a3b8"/><text x="360" y="144" class="chipn" text-anchor="middle">pi entry-walker</text>
+    <rect x="474" y="124" width="196" height="30" rx="6" fill="#ffffff" stroke="#94a3b8"/><text x="572" y="144" class="chipn" text-anchor="middle">opencode transform 钩子</text>
+    <rect x="686" y="124" width="196" height="30" rx="6" fill="#ffffff" stroke="#94a3b8"/><text x="784" y="144" class="chipn" text-anchor="middle">codex responses 车道</text>
+    <rect x="898" y="124" width="196" height="30" rx="6" fill="#ffffff" stroke="#94a3b8"/><text x="996" y="144" class="chipn" text-anchor="middle">其他裸代理客户端</text>
+    <text x="1120" y="144" class="s">prepare-* 适配器（wire 矩阵，现成）</text>
+    <line x1="148" y1="154" x2="1295" y2="154" stroke="#94a3b8"/>
+    <path d="M350,154 V166" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+    <path d="M862,154 V166" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+    <path d="M1295,154 V166" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#ar)"/>
+    <rect x="50" y="168" width="600" height="58" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="64" y="190" class="ok">底座命中的请求 ⇒ 进入下方六段固定链</text>
+    <text x="64" y="210" class="okb">cohort：双信道身份(sess_raw+msgid[]) · 非 cohort：顺序 &gt; hash 粘滞降级，同表写入(见第 0 段)</text>
+    <rect x="672" y="168" width="380" height="58" rx="6" fill="#f8fafc" stroke="#64748b"/>
+    <text x="686" y="190" class="b" font-weight="700">增量 plugin-turn 形状回合</text>
+    <text x="686" y="210" class="s">anthropic wire divert · 维持原职（见下方共存带）</text>
+    <rect x="1074" y="168" width="442" height="58" rx="6" fill="#fef3c7" stroke="#b45309"/>
+    <text x="1088" y="190" class="b" font-weight="700" fill="#78350f">其余流量（v5 形状会话 / 底座灰度关）</text>
+    <text x="1088" y="210" class="s" fill="#92400e">watermark 快路径或 legacy 全量路径 · 现状机制不变</text>
+    <text x="50" y="234" class="s">分轨判定函数不新增：提案只在 lane-decisions 加一行「底座命中」正负成对断言行(#3617)；任何红门命中 ⇒ 该轮回落 legacy 全量并重新盖戳。</text>
+  </g>
+
+
+  <!-- column 1: stage 0 -->
+  <g>
+    <circle cx="48" cy="273" r="13" fill="#0e7490"/><text x="48" y="278" class="stagenum" text-anchor="middle">0</text>
+    <text x="70" y="271" class="stage">入站 · 身份入册</text>
+    <text x="70" y="287" class="s">新增段（现状不存在）</text>
+    <rect x="30" y="303" width="233" height="366" rx="8" fill="#ecfeff" stroke="#0e7490"/>
+    <text x="44" y="329" class="b">原始字节体（全量重发历史）</text>
+    <text x="44" y="357" class="b">双信道身份：</text>
+    <text x="44" y="375" class="s">请求头 sess_raw +</text>
+    <text x="44" y="393" class="s">逐元素 msgid[] 信封</text>
+    <text x="44" y="411" class="s">#5842 载体 resolver 采集复用</text>
+    <line x1="44" y1="427" x2="249" y2="427" stroke="#a5f3fc"/>
+    <text x="44" y="449" class="b">L1 世界匹配（新薄表）</text>
+    <text x="44" y="467" class="s">l1_world: sess_raw ↔ ledger_id</text>
+    <text x="44" y="485" class="s">全局复合索引，原值禁截断(P9)</text>
+    <text x="44" y="511" class="b">裁决三分支：</text>
+    <text x="44" y="529" class="s">echo 直中 + 抽验</text>
+    <text x="44" y="547" class="s">复合探测</text>
+    <text x="44" y="565" class="s">发放新身份(+一轮武装)</text>
+    <line x1="44" y1="581" x2="249" y2="581" stroke="#a5f3fc"/>
+    <text x="44" y="603" class="b">非 cohort 宿主：</text>
+    <text x="44" y="621" class="s">顺序 &gt; hash 粘滞降级，同表写入</text>
+    <text x="44" y="639" class="s">(pos 由序位发号；换模式=resync)</text>
+    <text x="44" y="661" class="s">P8 id 永生：首见即记、跨重启恒可答</text>
+  </g>
+
+  <!-- column 2: stage 1 -->
+  <g>
+    <circle cx="301" cy="273" r="13" fill="#64748b"/><text x="301" y="278" class="stagenum" text-anchor="middle">1</text>
+    <text x="323" y="271" class="stage">协议转换 → 通用核</text>
+    <text x="323" y="287" class="s">现成复用（master 已有）</text>
+    <rect x="283" y="303" width="233" height="332" rx="8" fill="#f8fafc" stroke="#64748b"/>
+    <text x="297" y="329" class="b">wire 矩阵 *ToCore</text>
+    <text x="297" y="347" class="s">openai/anthropic/responses/google</text>
+    <text x="297" y="365" class="s">+ 跨线稳定规范 id(#3642)</text>
+    <line x1="297" y1="381" x2="502" y2="381" stroke="#e2e8f0"/>
+    <text x="297" y="405" class="b">span 解析仅 NEW 元素</text>
+    <text x="297" y="423" class="s">身份差集散布任意体位</text>
+    <text x="297" y="441" class="s">(客户端压缩后摘要可能在 pos 0)</text>
+    <line x1="297" y1="457" x2="502" y2="457" stroke="#e2e8f0"/>
+    <text x="297" y="481" class="b">ClusterCounter 复现钉</text>
+    <text x="297" y="499" class="s">散布子集解析必须复现整数组</text>
+    <text x="297" y="517" class="s">调用的 _N 编号上下文</text>
+    <text x="297" y="535" class="s">⇒ 字节级回归钉(P2 准入)</text>
+    <line x1="297" y1="551" x2="502" y2="551" stroke="#e2e8f0"/>
+    <text x="297" y="575" class="b">媒体格 → CAS 引用</text>
+    <text x="297" y="593" class="s">base64 不进行表(message_media)</text>
+    <line x1="297" y1="609" x2="502" y2="609" stroke="#e2e8f0"/>
+    <text x="297" y="633" class="b">合法入口恰两个：</text>
+    <text x="297" y="651" class="s">全新会话 / 新身份发放轮</text>
+    <text x="297" y="669" class="s">(P5 禁全量重解析)</text>
+  </g>
+
+  <!-- column 3: stage 2 -->
+  <g>
+    <circle cx="554" cy="273" r="13" fill="#16a34a"/><text x="554" y="278" class="stagenum" text-anchor="middle">2</text>
+    <text x="576" y="271" class="stage">改写 / 压缩</text>
+    <text x="576" y="287" class="s">内核零改动</text>
+    <rect x="536" y="303" width="233" height="332" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+    <text x="550" y="329" class="b">acp-kernel（不动一行）</text>
+    <text x="550" y="347" class="s">projectUnit 共享投影判定</text>
+    <text x="550" y="365" class="s">摘要 prompts / nudge flat-50K</text>
+    <text x="550" y="383" class="s">ref/msgid 账本 id 永不复用</text>
+    <line x1="550" y1="399" x2="755" y2="399" stroke="#bbf7d0"/>
+    <text x="550" y="423" class="b">产出 = 结构化事件</text>
+    <text x="550" y="441" class="s">append / update / delete / compact</text>
+    <text x="550" y="459" class="s">按内核管道证据寻址(block 覆盖/</text>
+    <text x="550" y="477" class="s">ledgerSeq/帧边界)，禁模糊相似</text>
+    <line x1="550" y1="493" x2="755" y2="493" stroke="#bbf7d0"/>
+    <text x="550" y="517" class="b">时序(附录二)</text>
+    <text x="550" y="535" class="s">第一现场 POST /__bili/plugin/tool</text>
+    <text x="550" y="553" class="s">当次请求内同步单事务落表</text>
+    <text x="550" y="571" class="s">下一轮模型请求只做核对</text>
+    <text x="550" y="599" class="s">绕过宿主(dsh native compaction)</text>
+    <text x="550" y="617" class="s">⇒ checkpoint 帧签名+rebase 检测</text>
+    <text x="550" y="635" class="s">喂同一例程兜底</text>
+    <line x1="550" y1="651" x2="755" y2="651" stroke="#bbf7d0"/>
+    <text x="550" y="671" class="warnb">窗口期挂 structural-pending 红门</text>
+  </g>
+
+  <!-- column 4: stage 3 -->
+  <g>
+    <circle cx="807" cy="273" r="13" fill="#4f46e5"/><text x="807" y="278" class="stagenum" text-anchor="middle">3</text>
+    <text x="829" y="271" class="stage">快照表应用</text>
+    <text x="829" y="287" class="s">新增核心（本提案主体）</text>
+    <rect x="789" y="303" width="233" height="332" rx="8" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+    <text x="803" y="329" class="b">提交原语 = 单事务</text>
+    <text x="803" y="347" class="s">upsert snap_rows → 追加 snap_log</text>
+    <text x="803" y="365" class="s">(seq 严格 &gt; max(log.max_seq,</text>
+    <text x="803" y="383" class="s">ckpt_seq)) → 可选折 ckpt</text>
+    <text x="803" y="401" class="s">抛错 = 整轮放弃，不落半态</text>
+    <line x1="803" y1="417" x2="1008" y2="417" stroke="#c7d2fe"/>
+    <rect x="803" y="429" width="100" height="26" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="853" y="447" class="chipn" text-anchor="middle">snap_rows</text>
+    <rect x="913" y="429" width="95" height="26" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="960" y="447" class="chipn" text-anchor="middle">snap_log</text>
+    <rect x="803" y="463" width="100" height="26" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="853" y="481" class="chipn" text-anchor="middle">snap_ckpt</text>
+    <rect x="913" y="463" width="95" height="26" rx="5" fill="#cffafe" stroke="#0e7490"/><text x="960" y="481" class="chipn" text-anchor="middle">l1_world(L1)</text>
+    <line x1="803" y1="505" x2="1008" y2="505" stroke="#c7d2fe"/>
+    <text x="803" y="527" class="b">行键 = ledger 绝对 pos</text>
+    <text x="803" y="545" class="s">append-only 永不复用</text>
+    <text x="803" y="567" class="b">ckpt.meta_json 三件套</text>
+    <text x="803" y="585" class="s">内核态序列化(F) + 覆盖映射(C)</text>
+    <text x="803" y="603" class="s">+ S4 校验和</text>
+    <line x1="803" y1="619" x2="1008" y2="619" stroke="#c7d2fe"/>
+    <text x="803" y="641" class="b">失效行 lifecycle(B)</text>
+    <text x="803" y="659" class="s">inactive 保留双形态供 decompress；</text>
+    <text x="803" y="677" class="s">物理清绑覆盖块生命周期(#3752 红线)</text>
+  </g>
+
+  <!-- column 5: stage 4 -->
+  <g>
+    <circle cx="1060" cy="273" r="13" fill="#0e7490"/><text x="1060" y="278" class="stagenum" text-anchor="middle">4</text>
+    <text x="1082" y="271" class="stage">出站映射</text>
+    <text x="1082" y="287" class="s">mapEgress（读侧重建）</text>
+    <rect x="1042" y="303" width="233" height="332" rx="8" fill="#ecfeff" stroke="#0e7490"/>
+    <text x="1056" y="329" class="b">存活行按 pos 排序</text>
+    <text x="1056" y="347" class="s">++ 尾窗 [K..T) 本轮新解析</text>
+    <text x="1056" y="373" class="b">前缀跨轮字节稳定</text>
+    <text x="1056" y="391" class="s">⇒ 前缀缓存友好(目标函数)</text>
+    <line x1="1056" y1="407" x2="1261" y2="407" stroke="#a5f3fc"/>
+    <text x="1056" y="431" class="b">双 carrier 分支(粘滞)</text>
+    <text x="1056" y="449" class="s">pluginMode：抑制 tool+nudge 注入</text>
+    <text x="1056" y="467" class="s">(agent 本地执行压缩)</text>
+    <text x="1056" y="485" class="s">proxy 模式：acp_summary</text>
+    <text x="1056" y="503" class="s">revoice 为 user 消息</text>
+    <line x1="1056" y1="519" x2="1261" y2="519" stroke="#a5f3fc"/>
+    <text x="1056" y="543" class="b">不是红条件的变化：</text>
+    <text x="1056" y="561" class="s">跨协议族切模型 / maxDim 变 /</text>
+    <text x="1056" y="579" class="s">toolArmed 变 = 只动映射输入</text>
+    <text x="1056" y="597" class="s">(快照只存改写右侧通用核形态)</text>
+    <line x1="1056" y1="613" x2="1261" y2="613" stroke="#a5f3fc"/>
+    <text x="1056" y="637" class="b">失步处理</text>
+    <text x="1056" y="655" class="s">链断/join 不上 ⇒ 该轮整条走</text>
+    <text x="1056" y="673" class="s">legacy 全量路径并重新盖戳</text>
+  </g>
+
+  <!-- column 6: stage 5 -->
+  <g>
+    <circle cx="1313" cy="273" r="13" fill="#334155"/><text x="1313" y="278" class="stagenum" text-anchor="middle">5</text>
+    <text x="1335" y="271" class="stage">出站</text>
+    <text x="1335" y="287" class="s">tripwire 守卫</text>
+    <rect x="1295" y="303" width="233" height="332" rx="8" fill="#f8fafc" stroke="#334155" stroke-width="2"/>
+    <text x="1309" y="329" class="b">tripwire 抽样比对</text>
+    <text x="1309" y="347" class="s">出站字节 vs legacy 全量产物</text>
+    <text x="1309" y="365" class="s">(除 time attr)，低比例运行期采样</text>
+    <text x="1309" y="391" class="ok">一致 → 放行上游</text>
+    <line x1="1309" y1="407" x2="1514" y2="407" stroke="#e2e8f0"/>
+    <text x="1309" y="431" class="warn">不一致(J)：</text>
+    <text x="1309" y="449" class="warnb">该会话立即摘回 legacy + 告警</text>
+    <text x="1309" y="467" class="warnb">防漂移状态供出陈旧前缀=缓存投毒</text>
+    <line x1="1309" y1="483" x2="1514" y2="483" stroke="#fecaca"/>
+    <rect x="1309" y="497" width="205" height="54" rx="6" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="1411" y="517" class="b" text-anchor="middle">模型端点</text>
+    <text x="1411" y="535" class="s" text-anchor="middle">sglang / openai·responses</text>
+    <text x="1411" y="547" class="s" text-anchor="middle">anthropic / google</text>
+    <line x1="1309" y1="569" x2="1514" y2="569" stroke="#e2e8f0"/>
+    <text x="1309" y="593" class="b">协议卫生</text>
+    <text x="1309" y="611" class="s">pf-*/信封握手头永不出到模型端点</text>
+    <text x="1309" y="629" class="s">(UPSTREAM_HOP_HEADERS 白名单纪律)</text>
+    <line x1="1309" y1="645" x2="1514" y2="645" stroke="#e2e8f0"/>
+    <text x="1309" y="667" class="s">灰度期全程 A/B 字节钉在场</text>
+  </g>
+
+  <!-- main flow arrows -->
+  <g stroke="#334155" fill="none" stroke-width="2">
+    <path d="M263,469 H283" marker-end="url(#ar)"/>
+    <path d="M516,469 H536" marker-end="url(#ar)"/>
+    <path d="M769,469 H789" marker-end="url(#ar)"/>
+    <path d="M1022,469 H1042" marker-end="url(#ar)"/>
+    <path d="M1275,469 H1295" marker-end="url(#ar)"/>
+  </g>
+
+  <!-- red gate band -->
+  <rect x="30" y="692" width="1500" height="128" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="50" y="720" class="warn">降级红门枚举（任一命中 ⇒ 该轮/该会话整体回落 legacy 全量路径并重新盖戳 —— 降级不猜）</text>
+  <rect x="50" y="734" width="330" height="66" rx="6" fill="#ffffff" stroke="#ef4444"/>
+  <text x="64" y="756" class="warnb" font-weight="700">R1  S4 / 校验和坏</text>
+  <text x="64" y="774" class="warnb">该 sid 平面永久关死，整体回落旧路</text>
+  <text x="64" y="790" class="warnb">(底材损坏不可恢复，红线不变)</text>
+  <rect x="400" y="734" width="300" height="66" rx="6" fill="#ffffff" stroke="#ef4444"/>
+  <text x="414" y="756" class="warnb" font-weight="700">R2  出站 join 链断</text>
+  <text x="414" y="774" class="warnb">core_ids ↔ 行对不上(链回溯失败)</text>
+  <text x="414" y="790" class="warnb">⇒ 该轮不产事件，整轮 legacy</text>
+  <rect x="720" y="734" width="352" height="66" rx="6" fill="#ffffff" stroke="#ef4444"/>
+  <text x="734" y="756" class="warnb" font-weight="700">R3  cohort 宿主身份门故障(I)</text>
+  <text x="734" y="774" class="warnb">声称有双信道的宿主某轮收不齐 id</text>
+  <text x="734" y="790" class="warnb">⇒ 硬拒绝 + 零副作用 + 喂 breaker</text>
+  <rect x="1092" y="734" width="424" height="66" rx="6" fill="#ffffff" stroke="#ef4444"/>
+  <text x="1106" y="756" class="warnb" font-weight="700">R4  structural-pending 未消费</text>
+  <text x="1106" y="774" class="warnb">压缩事件到落表之间窗口未闭合；重启丢失</text>
+  <text x="1106" y="790" class="warnb">标记 = 保守判死(fail-safe 方向)</text>
+  <text x="50" y="813" class="okb">注：跨协议族切模型 / maxDim / toolArmed 变化【不是】红条件 —— 它们是每轮映射输入。</text>
+
+  <!-- coexistence + rollback band -->
+  <rect x="30" y="836" width="1500" height="150" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="864" class="stage" fill="#0f172a">共存路由（每种流量只有一个家，互不双处理）</text>
+  <text x="50" y="890" class="b">v5 watermark 快路径 → 继续服务非 cohort(无 msgid)流量；与本底座同表不同车道，旗位独立。</text>
+  <text x="50" y="912" class="b">增量 plugin-turn 车道 → anthropic wire divert 回合维持原职(dsh shim 逐回合二选一)。</text>
+  <text x="50" y="934" class="b">绕过宿主(dsh native compaction 等) → checkpoint 帧签名 + rebase 检测喂第 2 段同一事件例程。</text>
+  <text x="50" y="956" class="b">#3756 D-lane → 新底座就绪的车道让位退役(旗互斥，待裁定 K)；lane-decisions 矩阵每组合配正负成对断言。</text>
+  <line x1="905" y1="852" x2="905" y2="968" stroke="#cbd5e1"/>
+  <text x="930" y="864" class="stage" fill="#0f172a">回滚与灰度</text>
+  <rect x="930" y="876" width="570" height="30" rx="6" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="944" y="896" class="okb">回滚 = DROP 四表 + 关旗 = 逐字节回到今天（无迁移负担，老库升级纯 CREATE IF NOT EXISTS）</text>
+  <text x="930" y="930" class="b">rollout：master ⊃ lane 两级嵌套开关(config-file key，knobs env&gt;file&gt;default，</text>
+  <text x="930" y="948" class="s">不新增 env 旋钮)；cohort carrier 名单配置级声明；Web「配置」页三态开关同步出厂。</text>
+  <text x="930" y="970" class="s">默认 OFF，按会话分桶；P2 单车道灰度起 A/B 钉常开。</text>
+
+  <!-- legend -->
+  <g>
+    <circle cx="38" cy="1032" r="9" fill="#0e7490"/><text x="54" y="1036" class="leg">新增段</text>
+    <circle cx="130" cy="1032" r="9" fill="#64748b"/><text x="146" y="1036" class="leg">现成复用</text>
+    <circle cx="230" cy="1032" r="9" fill="#16a34a"/><text x="246" y="1036" class="leg">内核(零改动)</text>
+    <circle cx="350" cy="1032" r="9" fill="#4f46e5"/><text x="366" y="1036" class="leg">存储(三表+L1)</text>
+    <rect x="480" y="1024" width="14" height="14" rx="3" fill="#fee2e2" stroke="#ef4444"/><text x="500" y="1036" class="leg">红门/降级</text>
+    <rect x="590" y="1024" width="14" height="14" rx="3" fill="#dcfce7" stroke="#16a34a"/><text x="610" y="1036" class="leg">回滚保证</text>
+  </g>
+  <text x="30" y="1052" class="s">基线不变量：P5 禁全量重解析(合法入口恰两个) · P6 持久不重建(重启只水合，无武装轮) · P8 (sess_raw,ledger_id) 首见即记、永不删改 · P9 身份层原值禁截断(sig/fingerprint 只进诊断流) · tripwire/S4/见证/审计抽验四件套保护。</text>
+  <text x="30" y="1072" class="s">目标函数排序：稳定性 / 扩展性 / 通用性优先，性能是副产品 —— 先问流转对不对，不问快不快。</text>
+</svg>

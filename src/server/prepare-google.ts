@@ -3,6 +3,8 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { featureEnabled } from "../rollout.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
@@ -12,6 +14,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -33,6 +36,7 @@ import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
@@ -88,6 +92,12 @@ export async function prepareGoogle(
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
+    // #6525: the client may stamp the envelope (`biliMsgIds`) on plugin-wire
+    // full-resend turns. Read + strip it before anything can reach the real
+    // upstream, then pin behind the rollout gate (same contract as the openai/
+    // anthropic twins). Nothing extra is ever forwarded either way.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     const inboundMessageCount = Array.isArray(parsed.contents) ? parsed.contents.length : 1;
     let googleClientSystem = "";
     let sysNotes: string[] = [];
@@ -122,8 +132,13 @@ export async function prepareGoogle(
     const markerCounts = stripRawStage(parsed, "google");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
-        const { msgs, systemText } = googleToCore(parsed);
+        const coreOut = googleToCore(parsed);
+        let msgs = coreOut.msgs;
+        const systemText = coreOut.systemText;
         googleClientSystem = systemText;
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
@@ -133,6 +148,23 @@ export async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
+        // #6525/#4491 parity: pin identity to client-supplied ids (plugin lanes
+        // only — pure proxy traffic has no msgid channel), the SAME gated
+        // contract as the openai/anthropic twins. No watermark fast-path on
+        // this wire, so there is no `wpHit` skip.
+        if (pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] google-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#6525)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] google-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#6525)`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -208,6 +240,27 @@ export async function prepareGoogle(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 mapEgress (owner ruling 2026-11-11): the plane persists the
+        // kernel's OWN tagged processTurn output (invariant v: post_json is
+        // the post-rewrite core form, never wire bytes). Deep-copy — the lane
+        // mutates turn.messages in place later (absorb view, subagent attach)
+        // and the egress transform re-applies exactly those passes, so the
+        // stored rows must stay the pre-mutation bytes. The anchor rows ride
+        // the copy too: they are processTurn output.
+        session.lastPlaneMessages = JSON.parse(JSON.stringify(turn.messages));
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages — and it stays the RAW client resend (never
+        // the D-lane view: its synthetic acp_summary anchor is not a
+        // transcript message). The plane rows have a separate source:
+        // session.lastPlaneMessages above (the kernel's tagged output).
+        // Never fatal — a failed flush leaves the round on the legacy egress
+        // path.
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -273,6 +326,16 @@ export async function prepareGoogle(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        // #5874 P2 (mapEgress): tripwire-guarded plane egress. Google's lane
+        // applies NO reasoning drop (#651: thoughtSignature rides verbatim),
+        // so the plane transform is strip-only — same chain, same guard.
+        processedMessages = applySnapEgress(turn.state, processedMessages, {
+            sessionId,
+            protocol: "google",
+            log,
+            isCompressTool: loopConfig.isCompressTool,
+            transform: (m) => stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state),
+        });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context.
@@ -415,10 +478,12 @@ export async function prepareGoogle(
             + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin);
         if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 

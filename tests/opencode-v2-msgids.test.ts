@@ -34,6 +34,52 @@ test("v2 extraction: non-message-array inputs degrade", () => {
     assert.equal(opencodeV2MsgIdList(["not-an-object" as unknown as { id?: string; role?: string }]), undefined);
 });
 
+// #6525/#6539 core alignment: the header must align to the POST-HOIST core
+// count the server pins against, so the contiguous leading system/developer
+// run (which openaiToCore hoists out of the fold space) is excluded.
+const lead = (roles: string[], id = (i: number) => `msg_lead${i}`) =>
+    roles.map((role, i) => ({ id: id(i), role }));
+
+test("v2 core-align: leading system run is skipped (openai wire case)", () => {
+    // [system, user, assistant] → only [user, assistant] ids ride.
+    assert.deepEqual(
+        opencodeV2MsgIdList(lead(["system", "user", "assistant"])),
+        ["msg_lead1", "msg_lead2"],
+    );
+    // multiple leading systems + developer all hoist out.
+    assert.deepEqual(
+        opencodeV2MsgIdList(lead(["system", "system", "developer", "user", "assistant"])),
+        ["msg_lead3", "msg_lead4"],
+    );
+});
+
+test("v2 core-align: no leading system is a no-op (anthropic wire case)", () => {
+    // anthropic keeps system as a separate field, never inside messages → all ride.
+    assert.deepEqual(
+        opencodeV2MsgIdList(lead(["user", "assistant", "user"])),
+        ["msg_lead0", "msg_lead1", "msg_lead2"],
+    );
+});
+
+test("v2 core-align: mid-conversation system keeps its id", () => {
+    // A system message that is NOT part of the leading run is a real core.
+    assert.deepEqual(
+        opencodeV2MsgIdList(lead(["user", "system", "assistant"])),
+        ["msg_lead0", "msg_lead1", "msg_lead2"],
+    );
+});
+
+test("v2 core-align: only a leading system run → nothing to pin", () => {
+    assert.equal(opencodeV2MsgIdList(lead(["system"])), undefined);
+    assert.equal(opencodeV2MsgIdList(lead(["system", "developer"])), undefined);
+    assert.equal(stampedMsgIdsHeaderFromMessages(lead(["system"])), undefined);
+});
+
+test("v2 core-align: a poison entry after the leading run still kills the stamp", () => {
+    // system is skipped, but the missing id on the user message poisons.
+    assert.equal(opencodeV2MsgIdList([{ id: "msg_s", role: "system" }, { role: "user" }]), undefined);
+});
+
 test("v2 stamp budget: >4096 ids or >16KiB joined degrades without riding", () => {
     const big = Array.from({ length: 4097 }, (_, i) => ({ id: `msg_x${i}`, role: "user" }));
     assert.equal(opencodeV2MsgIdList(big), undefined, "per-turn id cap");

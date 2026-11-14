@@ -53,6 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD } from "./msgid-pin.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -165,6 +166,7 @@ import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
+import { FoundationRejectError } from "./snapshot/plane.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -780,6 +782,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // The rethrow rides ONLY the request the WS session stamped
             // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
             if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
+            // #6181 B1/B2: an R3 identity fault (the client declared a
+            // snapshot envelope that fails the identity gates) is a HARD 400
+            // with the identity marker — NOT the generic 503, NOT a silent
+            // raw forward: the host must learn that the envelope is broken.
+            // Both lanes rethrow FoundationRejectError into this funnel; it
+            // throws before processTurn, so the session is untouched.
+            if (err instanceof FoundationRejectError) {
+                if (!res.headersSent) {
+                    res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
+                    res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
+                } else {
+                    res.end();
+                }
+                return;
+            }
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
@@ -2001,6 +2018,21 @@ export type Prepared = {
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
+    /** #6181 B4: the delta frontier selected for THIS turn's outbound —
+     *  COMMITTED to the session only AFTER the upstream ACCEPTS the request
+     *  (relay.ts, first forward, status < 400). A failed/4xx forward drops
+     *  it (null) so the next round RE-SEEDS (at-least-once: over-serving is
+     *  safe, under-serving is the context loss). Absent (undefined) = no
+     *  delta was selected this turn. */
+    pendingResponsesDelta?: { state: { frontierPos: number; servedAnchors: string[] }; kind: "full" | "noop" | "partial" } | null;
+    /** #6181 round 2, Residual 2 hardening: the plane max pos (post
+     *  in-request flush) the provider chain will hold once THIS forward is
+     *  accepted — the relay pairs it with the response id it observes on
+     *  the outbound stream and records session.lastMintedResponse (accepted
+     *  forwards only; a refused round mints nothing). Set by the responses
+     *  lane on every round whose accepted forward leaves the provider
+     *  holding the full world. */
+    mintFrontierPos?: number;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND
      *  anthropic system (pre-anchor). Preflight summary calls must carry it —
@@ -3012,6 +3044,35 @@ export function scrubAnthropicPck(protocol: WireProtocol | null, bodyBuffer: Buf
     return Buffer.from(JSON.stringify(p), "utf8");
 }
 
+// #6539: protocol-neutral egress scrub for the bili-owned msgid transport
+// fields (biliMsgIds / biliLedgerSeqs, src/msgid-pin.ts). Same contract as
+// prompt_cache_key (#1403): the four fully-processed prepares strip them
+// unconditionally, but every VERBATIM forward branch (side-request passthrough,
+// hop-marker chain, bypass/passthrough marks, route/global passthrough #661,
+// decode-fail fallback, count_tokens) bypasses the prepares — a stamped
+// full-resend body would otherwise ship biliMsgIds to a real model endpoint
+// (strict-schema upstreams 400 'Extra inputs are not permitted'; #661 body
+// fingerprinting breaks). A body WITHOUT the fields passes back
+// byte-identical, so #661's contract is untouched in the normal case.
+export function scrubMsgIdFields(bodyBuffer: Buffer, log: (level: string, msg: string) => void): Buffer {
+    if (bodyBuffer.length === 0) return bodyBuffer;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(bodyBuffer.toString("utf8"));
+    } catch {
+        return bodyBuffer;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyBuffer;
+    const p = parsed as Record<string, unknown>;
+    const hasIds = Object.prototype.hasOwnProperty.call(p, MSG_IDS_BODY_FIELD);
+    const hasSeqs = Object.prototype.hasOwnProperty.call(p, MSG_SEQS_BODY_FIELD);
+    if (!hasIds && !hasSeqs) return bodyBuffer;
+    if (hasIds) delete p[MSG_IDS_BODY_FIELD];
+    if (hasSeqs) delete p[MSG_SEQS_BODY_FIELD];
+    log("debug", "stripped biliMsgIds/biliLedgerSeqs from verbatim forward (#6539)");
+    return Buffer.from(JSON.stringify(p), "utf8");
+}
+
 // #1757: protocol-neutral companion to scrubAnthropicPck for opt-in
 // compat.dropFields — client-fixed fields some strict-schema gateways reject
 // (SenseNova Responses 400 'json: unknown field "summary"' on pi-ai's fixed
@@ -3060,6 +3121,8 @@ export function prepareCountTokens(
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages };
         delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+        delete (rebuilt as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (rebuilt as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(rebuilt),
             session,
@@ -3073,6 +3136,8 @@ export function prepareCountTokens(
         log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
         const fallback: AnthropicRequestBody = { ...parsed };
         delete (fallback as Record<string, unknown>).prompt_cache_key;
+        delete (fallback as Record<string, unknown>)[MSG_IDS_BODY_FIELD]; // #6539: egress hygiene
+        delete (fallback as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
         return {
             body: JSON.stringify(fallback),
             session,
