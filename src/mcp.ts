@@ -278,6 +278,60 @@ export function _resetMcpBindingForTest(nextConversationId?: string): void {
     conversationId = nextConversationId;
 }
 
+// #6361: claude /clear (or /new) starts a NEW session id but keeps this stdio
+// child running — the spawn-time CLAUDE_CODE_SESSION_ID env (CONVERSATION_FROM_ENV)
+// goes stale and NEITHER recovery path fires: the #656 404 adoption needs the
+// bound id to be unknown (it is still registered + active, so calls succeed
+// against it) and the #4168 409 re-bind needs a witness conflict (none occurs).
+// The host's CURRENT session id lives in <CLAUDE_CONFIG_DIR|~/.claude>/sessions/
+// <host-pid>.json (rewritten on /clear; the host pid is stable for this child's
+// lifetime). The claude entry (claude-mcp-entry.ts) injects a resolver that reads
+// it; on each tools/call we re-read it and, when it differs from the bound id,
+// re-bind + re-register so the new session enters plugin mode. Identity-bound
+// hosts only (the resolver is injected solely by the claude entry); a per-call /
+// native override still wins for the current call — it never touches this global.
+let claudeSessionResolver: (() => string | undefined) | undefined;
+
+export function setClaudeSessionResolver(fn: (() => string | undefined) | undefined): void {
+    claudeSessionResolver = fn;
+}
+
+/** Re-point the default binding at the host's current session id when it has
+ *  changed under a live shim (claude /clear). Returns the new id when a re-bind
+ *  happened, else undefined. The register is fire-and-forget (identity binding
+ *  survives any arrival order, same as initialize); the binding update is
+ *  synchronous so the in-flight forward already carries the new id. */
+export function maybeRebindConversation(): string | undefined {
+    if (!IDENTITY_BINDING || claudeSessionResolver === undefined) return undefined;
+    let current: string | undefined;
+    try {
+        current = claudeSessionResolver();
+    } catch {
+        current = undefined;
+    }
+    if (!current || current === conversationId) return undefined;
+    const previous = conversationId;
+    conversationId = current;
+    process.stderr.write(
+        `[bili-mcp] host session id changed ${previous ?? "(none)"} → ${current} (claude /clear?); re-binding\n`,
+    );
+    if (!registeredConversations.has(current)) {
+        registeredConversations.add(current);
+        void fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: current, agent: "mcp", identity: true }),
+            signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+    }
+    return current;
+}
+
+// Test seam: clear the injected resolver between cases (it is module state).
+export function _resetClaudeSessionResolverForTest(): void {
+    claudeSessionResolver = undefined;
+}
+
 const ERR_TOOL = -32602;
 
 async function handleMessage(msg: {
@@ -404,6 +458,10 @@ async function handleMessage(msg: {
             const args = { ...rawArgs };
             if (!keepForSearch) delete args.conversation_id;
             const routeOverride = nativeThreadId ?? (keepForSearch ? undefined : perCall || undefined);
+            // #6361: before forwarding, re-point the default binding at the
+            // host's current session id if claude /clear moved it (identity
+            // hosts only; a routeOverride above still wins for THIS call).
+            maybeRebindConversation();
             // #1685: with no binding and no per-call id, forward anyway — the
             // proxy routes the id-less POST itself (outbound tool_use witness,
             // else single-active arbitration) and answers a loud 400 when it
