@@ -207,7 +207,7 @@ export function makeMdRender(): MdRenderApi {
                 html.push(`<pre><code>${escape(buf.map((l) => l.slice(cut)).join("\n"))}</code></pre>`);
                 continue;
             }
-            if (/^\s*&gt;\s?/.test(line) || /^\s*>\s?/.test(line)) {
+            if (/^\s*>\s?/.test(line)) {
                 const buf: string[] = [];
                 while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, "")); i += 1; }
                 html.push(`<blockquote><p>${inlineMd(buf.join(" "))}</p></blockquote>`);
