@@ -306,13 +306,13 @@ export async function renderSessionJsonlFromTables(backend: StorageBackend, sess
     // #4664: historian read — include retired (tombstoned) rows so a rewound
     // session exports its full history; live rows omit `retiredAt`.
     for (const m of await backend.getMessages(sessionId, { includeRetired: true })) {
-        let message: Record<string, unknown>;
+        let message: unknown;
         try {
-            message = JSON.parse(m.content) as Record<string, unknown>;
+            message = JSON.parse(m.content);
         } catch {
             message = { raw: m.content };
         }
-        if (full && typeof message.text === "string") {
+        if (full && message !== null && typeof message === "object" && "text" in message && typeof message.text === "string") {
             const ph = parseStoredPlaceholder(message.text);
             const payload = ph ? ccr.get(ph.ref) : undefined;
             if (payload !== undefined) message = { ...message, text: payload, dereferencedFrom: ph!.ref };
