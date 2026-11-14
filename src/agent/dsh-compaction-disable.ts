@@ -10,10 +10,12 @@
 // Why it exists: when bili carries a dsh conversation it owns compression
 // (#1729); a dsh compaction checkpoint landing outside bili's knowledge
 // durably shadows the raw history and destroys the compression substrate.
-// Non-web profiles already stand down the host-plane row via the bundle patch
-// (auto:false); web profiles run their instance INSIDE an agent preset whose
-// nested rows no patch layer can address by id (#1772/#2360) — this module is
-// what reaches them.
+// Non-web profiles stand down the host-plane row via the bundle patch
+// (auto:false) WHILE bili owns the lane — and since #5248 the transform below
+// undoes exactly that line when bili-native never declares itself active, so a
+// market disable fully reverses to stock. Web profiles run their instance
+// INSIDE an agent preset whose nested rows no patch layer can address by id
+// (#1772/#2360) — this module is what reaches them.
 // #3662: the overlay lives in its OWN always-on entry (dsh-compaction-gate.ts)
 // rather than in bili-native — disabling or kill-switching bili-native must
 // leave the gate service alive so the presets fall back to STOCK dsh
@@ -187,7 +189,23 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             const resolved = next();
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
-            if (!isDshCompactionActive()) return resolved;
+            if (!isDshCompactionActive()) {
+                // #5248: the bundle patch's static `compaction-basic → auto:false`
+                // line applies whenever the bundle is mounted — including while
+                // bili-native is disabled or dead — which left non-web profiles'
+                // native auto-compaction permanently off after a market disable.
+                // Undo exactly that line: only the host-plane compaction-basic
+                // entry, only when the patch armed it (auto === false). A user's
+                // own manual auto:false is indistinguishable at this layer and is
+                // restored too (documented edge); if a build never fires this
+                // hook for that entry, this degrades to the old behavior.
+                const rawName = this?.entry?.options?.name;
+                if (rawName === DSH_COMPACTION_BASIC_PACKAGE && resolved !== null && typeof resolved === "object" && !Array.isArray(resolved)) {
+                    const cfg = resolved as Record<string, unknown>;
+                    if (cfg.auto === false) return { ...cfg, auto: true };
+                }
+                return resolved;
+            }
             // #4147: match STRUCTURALLY, not by entry name — custom presets run
             // their compaction inside nested rows under their own entry, and a
             // name filter leaves exactly those armed. Rewrite only when the
