@@ -463,6 +463,10 @@ function dshRun(
     cwd: ctx.dshCwd,
     env: {
       ...cleanEnv(),
+      // Pure-SQLite is the default storage writer now (2026-11-13): this lane
+      // asserts the JSONL session envelopes — pin dual-write so coverage does
+      // not depend on the default (pure-SQLite path: unit tests + gate).
+      BILI_STORAGE_JSON_WRITER: "1",
       HOME: ctx.homeDir,
       TMPDIR: ctx.tmpDir,
       DSH_HOME: ctx.dshHome,

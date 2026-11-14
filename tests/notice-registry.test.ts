@@ -17,6 +17,14 @@ const cfgPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-cfg-
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "notice-reg-dsh-"));
 process.env.XDG_STATE_HOME = stateDir;
 process.env.BILI_CONFIG_FILE = cfgPath;
+// The CI baseline preload (tests/preload-storage-baseline.mjs) pins
+// BILI_STORAGE_UNIFIED=legacy for the legacy-default corpus. This suite
+// asserts the PRODUCTION default (absent spelling ⇒ pure-sqlite ⇒ the
+// sqlite-default notice is active), so both storage-selection knobs must be
+// unpinned explicitly — relying on the ambient default passes locally (no
+// preload) but reds CI (the #4011 lesson written into that baseline file).
+delete process.env.BILI_STORAGE_UNIFIED;
+delete process.env.BILI_STORAGE_JSON_WRITER;
 
 // This suite asserts the PRODUCTION default storage posture. The CI corpus
 // baseline (tests/preload-storage-baseline.mjs, #2815) forces
