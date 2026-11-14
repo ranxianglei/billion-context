@@ -229,6 +229,35 @@ test("searchBlocks: preview centers on the matched term", () => {
   assert.ok(!r[0].preview.startsWith("padding padding"));
 });
 
+test("preview: length-expanding lowercase (İ) does not shift the window past the hit (billion-context#6493)", () => {
+  const text = "İ".repeat(400) + " needle-target original evidence";
+  const r = searchBlocks(
+    messageDocs([{ ref: "m1", role: "assistant", text, blockId: "b1" }]),
+    "needle-target",
+    { previewLength: 40 },
+  );
+  const preview = r[0].preview;
+  assert.ok(
+    preview.includes("needle-target"),
+    `400 expanding İ prefixes must not push the window past the hit: ${preview}`,
+  );
+});
+
+test("preview: expanding prefix before a mid-text hit keeps the hit in-window (billion-context#6493)", () => {
+  const text =
+    "İ".repeat(50) + "x".repeat(100) + " needle-target " + "y".repeat(100);
+  const r = searchBlocks(
+    messageDocs([{ ref: "m1", role: "assistant", text, blockId: "b1" }]),
+    "needle-target",
+    { previewLength: 60 },
+  );
+  const preview = r[0].preview;
+  assert.ok(
+    preview.includes("needle-target"),
+    `expanding prefix must not shift the window off the hit: ${preview}`,
+  );
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // Generic behavior + algorithm selection
 // ─────────────────────────────────────────────────────────────────────────
