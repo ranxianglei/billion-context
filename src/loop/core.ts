@@ -48,7 +48,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -186,6 +186,13 @@ function isThinkingModifiedError(e: unknown): boolean {
 // guarantees a second 400 plus a swapped error; propagate the original instead.
 function isReasoningRequiredError(e: unknown): boolean {
     return e instanceof UpstreamHttpError && /must be passed back/i.test(e.body);
+}
+
+function proxyToolResultFailed(result: string): boolean {
+    // A successful compression receipt embeds the model-authored summary in later fingerprint
+    // lines. That summary may legitimately quote an earlier FAILED tool result; only the status
+    // line is authoritative for whether this tool call itself failed.
+    return (result.trimStart().split("\n", 1)[0] ?? "").includes("FAILED");
 }
 
 // #1453 client-facing labels for transport failures that end the turn in-band.
@@ -1268,6 +1275,18 @@ export async function* runCompressLoop(
                     }
                 }
 
+                // #2303 / #3905: classify the terminal tail shape. Both shapes are
+                // non-converged handoffs — visible prose with no tool call — and share
+                // the budget, the openai/anthropic framing boundary and the #2612
+                // exemption below.
+                const stalledTail: "draft" | "announce" | null =
+                    assistantText.length === 0 || calls.length > 0
+                        ? null
+                        : endsWithDraftClose(assistantText)
+                          ? "draft"
+                          : endsWithAnnouncement(assistantText)
+                            ? "announce"
+                            : null;
                 // #2303: a terminal turn that DID deliver visible prose but ends with a
                 // compression-draft closing tag (summary/analysis close forms) and no
                 // tool call — the model wrote a handoff/compression draft in prose
@@ -1293,7 +1312,7 @@ export async function* runCompressLoop(
                     !ctx.textProtocol &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
-                    endsWithDraftClose(assistantText) &&
+                    (stalledTail === "draft" || stalledTail === "announce") &&
                     // #2612: the client's own compaction request instructs the
                     // model to answer with a plain-text summary block and no
                     // tool call — that compliant reply is a draft tail by
@@ -1303,8 +1322,13 @@ export async function* runCompressLoop(
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
-                    loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    if (stalledTail === "announce") {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn is a bare announcement (ends mid-promise, no tool call); retrying once with continuation nudge (#3905)`);
+                        loggerLog("warn", `[acp-loop] announcement-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    } else {
+                        ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
+                        loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
+                    }
                     const nudge: CoreMessage = {
                         id: `acp_draft_tail_retry_r${round}`,
                         role: "user",
@@ -1324,11 +1348,11 @@ export async function* runCompressLoop(
                         continue;
                     } catch (e) {
                         if (e instanceof UpstreamHttpError) {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (upstream error ${e.status}: ${e.body.slice(0, 200)}); passing the turn through`);
                         } else {
-                            ctx.log(`[acp-loop] round ${round}: draft-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
+                            ctx.log(`[acp-loop] round ${round}: stalled-tail retry failed (${e instanceof Error ? e.message : String(e)}); passing the turn through`);
                         }
-                        loggerLog("warn", `[acp-loop] draft-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
+                        loggerLog("warn", `[acp-loop] stalled-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
                 }
                 break;
@@ -1529,8 +1553,13 @@ export async function* runCompressLoop(
                         coreMessages.push(redactedMsg);
                     }
                 }
+                const roundProxySignature =
+                    ctx.protocol === "google"
+                        ? proxyResults.find((p) => typeof p.signature === "string" && p.signature.length > 0)?.signature
+                        : undefined;
                 for (const pr of proxyResults) {
                     if (functionCallIds.has(pr.callId)) {
+                        const sig = pr.signature || roundProxySignature;
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -1539,7 +1568,7 @@ export async function* runCompressLoop(
                             toolCallId: pr.callId,
                             // #3661: guaranteed-valid-JSON replay (see wireArguments); raw model bytes stay in pr.arguments for #156 signatures.
                             text: pr.wireArguments,
-                            ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
+                            ...(ctx.protocol === "google" && sig ? { googleThoughtSignature: sig } : {}),
                         });
                         const toolResultMsg: CoreMessage = {
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
@@ -1601,7 +1630,7 @@ export async function* runCompressLoop(
                     if (threadContinue) threadDelta.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
-                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
                 );
                 if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
@@ -1622,7 +1651,7 @@ export async function* runCompressLoop(
                 const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !proxyToolResultFailed(pr.result))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1712,7 +1741,7 @@ export async function* runCompressLoop(
             // carry server-invisible bytes upstream — exactly the seam #4186
             // forbids.
             const failedMutating = proxyResults.filter(
-                (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
             );
 
             if (!probeWarned) {
@@ -1830,14 +1859,14 @@ export async function* runCompressLoop(
                         let committedTokens = 0;
                         let committedBlocks = 0;
                         for (const pr of proxyResults) {
-                            if (pr.name === "compress" && !pr.result.includes("FAILED")) {
+                            if (pr.name === "compress" && !proxyToolResultFailed(pr.result)) {
                                 const saved = /~(\d[\d,]*) tokens saved/.exec(pr.result);
                                 if (saved) committedTokens += Number(saved[1]!.replace(/,/g, ""));
                                 const blocks = /(\d+) block\(s\)/.exec(pr.result);
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
-                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !pr.result.includes("FAILED"));
+                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !proxyToolResultFailed(pr.result));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
                             : absorbed ? "context work committed; " : "";

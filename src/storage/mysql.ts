@@ -1848,6 +1848,7 @@ export class MysqlBackend implements StorageBackend {
         };
         // sqlite twin: newest matching line wins.
         let lineNo = -1;
+        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
@@ -1859,9 +1860,12 @@ export class MysqlBackend implements StorageBackend {
                 } catch {
                     continue;
                 }
+                // #6317: count ALL entries for this session. The reverse scan
+                // meets the NEWEST line first — keep that; a plain
+                // `lineNo = i` without break would end on the OLDEST.
                 if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) {
-                    lineNo = i;
-                    break;
+                    if (lineNo === -1) lineNo = i;
+                    matchCount += 1;
                 }
             }
         } catch {
@@ -1874,6 +1878,9 @@ export class MysqlBackend implements StorageBackend {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        if (matchCount > 1) {
+            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
+        }
         const sess = dump.session;
         await this.tx(async (c) => {
             const references = new Map<string, number>();

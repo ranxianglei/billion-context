@@ -1079,10 +1079,10 @@ export class UnifiedStore {
                        next_run_id = excluded.next_run_id,
                        meta_json = excluded.meta_json,
                        stats_json = excluded.stats_json,
-                        metadata_json = CASE WHEN @metadataChanged THEN excluded.metadata_json ELSE sessions.metadata_json END,
-                        kstate_json = CASE WHEN @kstateChanged THEN excluded.kstate_json ELSE sessions.kstate_json END,
-                        tail_json = CASE WHEN @tailChanged THEN excluded.tail_json ELSE sessions.tail_json END,
-                        ccr_json = CASE WHEN @ccrChanged THEN excluded.ccr_json ELSE sessions.ccr_json END,
+                         metadata_json = CASE WHEN @metadataChanged THEN excluded.metadata_json ELSE sessions.metadata_json END,
+                         kstate_json = CASE WHEN @kstateChanged THEN excluded.kstate_json ELSE sessions.kstate_json END,
+                         tail_json = CASE WHEN @tailChanged THEN excluded.tail_json ELSE sessions.tail_json END,
+                         ccr_json = CASE WHEN @ccrChanged THEN excluded.ccr_json ELSE sessions.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
                        orphans_json = excluded.orphans_json`,
                 )
@@ -2214,13 +2214,16 @@ export class UnifiedStore {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
-        // Scan the JSONL for the session's line (skip malformed/truncated
+        // Scan the JSONL for the session's NEWEST line (#6317: a pre-fix
+        // failed archive can leave stale lines behind; a later successful
+        // archive appends the newest dump). Skip malformed/truncated
         // trailing lines — an archive append interrupted by a crash must not
         // block restoring OTHER sessions). Newest first: when the log holds
         // more than one line for this session (an archive whose sweep never
         // committed, then a later successful one), the last line appended is
         // the state the session was actually archived in.
         let lineNo = -1;
+        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
@@ -2232,7 +2235,10 @@ export class UnifiedStore {
                 } catch {
                     continue;
                 }
-                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) { lineNo = i; break; }
+                // #6317: count ALL entries for this session. The reverse scan
+                // meets the NEWEST line first — keep that; a plain
+                // `lineNo = i` without break would end on the OLDEST.
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) { if (lineNo === -1) lineNo = i; matchCount += 1; }
             }
         } catch {
             return { ok: false, reason: "export-corrupt" };
@@ -2244,6 +2250,9 @@ export class UnifiedStore {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        if (matchCount > 1) {
+            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
+        }
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
             const references = new Map<string, number>();
@@ -2312,9 +2321,10 @@ export class UnifiedStore {
         // restored (archived) bytes in place. Clear the entry so the next save
         // conservatively full-writes every column, same as the drift-heal path.
         this.clearLastWrittenColumns(sessionId);
-        // Drop the restored session's line(s) from the JSONL (a same-session
-        // archive can theoretically appear more than once across reinstalls;
-        // rewrite removes them all). Other sessions' lines are untouched.
+        // Drop the restored session's line(s) from the JSONL. #6317: a
+        // pre-fix failed archive can leave more than one line; restore now
+        // already used the newest match and removes all matches, warning when
+        // stale lines were present so the loss pattern is diagnosable.
         const kept: string[] = [];
         let ownLines = 0;
         for (const l of rawLines) {
