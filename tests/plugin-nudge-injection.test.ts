@@ -49,7 +49,9 @@ function turn2Messages(): Record<string, unknown>[] {
     ];
 }
 
-async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>): Promise<{ count: number; messages: Record<string, unknown>[] }> {
+const openaiTools = (names: string[]) => names.map((name) => ({ type: "function", function: { name, description: "d", parameters: { type: "object", properties: {} } } }));
+
+async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>, toolNames?: string[]): Promise<{ count: number; messages: Record<string, unknown>[] }> {
     const received: unknown[][] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -98,7 +100,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         const r1 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: [{ role: "user", content: "hello" }] }),
+            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, ...(toolNames ? { tools: openaiTools(toolNames) } : {}), messages: [{ role: "user", content: "hello" }] }),
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -108,7 +110,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         const r2 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: turn2Messages() }),
+            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, ...(toolNames ? { tools: openaiTools(toolNames) } : {}), messages: turn2Messages() }),
         });
         assert.equal(r2.status, 200);
         await r2.text();
@@ -132,7 +134,10 @@ test("#451 control: nudge injected in PROXY mode when armed", async () => {
 });
 
 test("#451: nudge ALSO injected in PLUGIN mode when armed (regression)", async () => {
-    const { count } = await forwardedTurn2("nudge-plugin", { "x-bili-plugin": "omp" });
+    // #4998: reachability is now observed per request — a healthy plugin round
+    // declares its tools on the wire; the host tool keeps the body off #1897's
+    // bili-only side-request demotion.
+    const { count } = await forwardedTurn2("nudge-plugin", { "x-bili-plugin": "omp" }, ["compress", "read_file"]);
     assert.equal(count, 31, "plugin mode must append the nudge too — before the fix the !pluginMode gate suppressed it and this would be 30");
 });
 
@@ -140,18 +145,19 @@ test("#451: nudge ALSO injected in PLUGIN mode when armed (regression)", async (
 // (0 of 3939 request headers carried them), so model-driven compression is
 // structurally unreachable there. The proxy must drop the whole model-side compress
 // surface for DSH plugin sessions — otherwise the standing prompt + nudge tell the
-// model to call a tool it can never reach ("unknown tool \"compress\""). pi/omp keep
-// the surface (their extensions expose the tools visibly), so the differential below
-// pins the fix without touching their behavior.
+// model to call a tool it can never reach ("unknown tool \"compress\""). #4998 made
+// reachability purely observational, so the differential below pins DECLARED vs
+// UNDECLARED on the wire: a healthy tools-declared omp round keeps the surface,
+// a toolless dsh round drops it.
 test("#3177: DSH plugin session drops the compress nudge (regression)", async () => {
     const { count, messages } = await forwardedTurn2("dsh-nudge", { "x-bili-plugin": "dsh" });
-    assert.equal(count, 30, "DSH drops the nudge — an omp plugin session is 31, pre-fix DSH was 31 too");
+    assert.equal(count, 30, "DSH drops the nudge — a healthy (tools-declared) omp plugin session is 31, pre-fix DSH was 31 too");
     const last = messages[messages.length - 1];
     assert.ok(String(last?.["content"]).includes("now summarize"), "the client's own final turn is last — no nudge user message appended after it");
 });
 
 test("#3177: DSH plugin session also drops the standing compress system prompt (regression)", async () => {
-    const omp = await forwardedTurn2("dsh-sys-omp", { "x-bili-plugin": "omp" });
+    const omp = await forwardedTurn2("dsh-sys-omp", { "x-bili-plugin": "omp" }, ["compress", "read_file"]);
     const dsh = await forwardedTurn2("dsh-sys-dsh", { "x-bili-plugin": "dsh" });
     const ompSys = String((omp.messages[0] ?? {})["content"] ?? "");
     const dshSys = String((dsh.messages[0] ?? {})["content"] ?? "");
