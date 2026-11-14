@@ -37,6 +37,12 @@ test("launch client registry includes antigravity (#2115)", () => {
     assert.ok(LAUNCH_CLIENTS.includes("antigravity"));
 });
 
+test("launch client registry includes antigravity-desktop alias → antigravity base (#4675)", () => {
+    assert.equal(isLaunchClient("antigravity-desktop"), true);
+    assert.equal(baseClientName("antigravity-desktop"), "antigravity");
+    assert.ok(LAUNCH_CLIENTS.includes("antigravity-desktop"));
+});
+
 test("discoverRoutes: gemini default → GOOGLE_GEMINI_BASE_URL /bili/ rewrite of generativelanguage", () => {
     assert.deepEqual(discoverRoutes("gemini", {}), {
         ...EMPTY_ROUTES,
