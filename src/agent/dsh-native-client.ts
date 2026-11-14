@@ -529,6 +529,7 @@ const zh: Dict = {
     "upstreams_down_one": "1 个上游不可用",
     "upstreams_down_many": "{n} 个上游不可用",
     "upstream_retry_hint": "约 {s}s 后重试",
+    "upstreams_dismiss": "关闭横幅（故障集合变化时重新出现）",
     "probe_error": "连接 bili 代理失败——最近一次探测报出的错误（可复制，便于反馈）：",
     "copy": "复制",
     "copied": "已复制",
@@ -558,6 +559,7 @@ const en: Dict = {
     "upstreams_down_one": "1 upstream unavailable",
     "upstreams_down_many": "{n} upstreams unavailable",
     "upstream_retry_hint": "~{s}s until retry",
+    "upstreams_dismiss": "Dismiss banner (reappears when the failing set changes)",
     "probe_error": "Failed to reach the bili proxy — last probe error (copyable for reporting):",
     "copy": "Copy",
     "copied": "Copied",
@@ -1108,9 +1110,15 @@ export function apply(ctx: ClientContext): void {
     // Purely additive UI — no request path changes. Display identity is the
     // forwarded host:port (bili is a transparent pipe); provider/model reverse
     // lookup stays host-side.
+    // #5701: the ✕ dismisses until the FAILING SET changes (host+kind+code per
+    // row). Count ticks and retry-ETA churn of the same set do NOT re-show it,
+    // so an acknowledged ongoing outage stays quiet while any new or changed
+    // failure surfaces again. The chrome is deliberately low-saturation and the
+    // text keeps inheriting the host's own color tokens.
     const upstreamBanner = (): ((props?: Record<string, unknown>) => unknown) => () => {
         const [origin, setOrigin] = useState<string | undefined>(readOrigin());
         const [rows, setRows] = useState<UpstreamRow[]>([]);
+        const [dismissedSig, setDismissedSig] = useState<string | undefined>(undefined);
         useEffect(() => probeOrigin((o) => setOrigin(o)), []);
         useEffect(() => {
             if (origin === undefined) return;
@@ -1126,11 +1134,19 @@ export function apply(ctx: ClientContext): void {
             return () => { cancelled = true; clearInterval(timer); };
         }, [origin]);
         if (rows.length === 0) return null;
+        const sig = rows.map((r) => `${r.host}\u0000${r.kind}\u0000${r.code ?? ""}`).sort().join("\u0001");
+        if (dismissedSig === sig) return null;
         const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
         return createElement(
             "div",
-            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(217,63,11,0.5)", background: "rgba(217,63,11,0.1)" } },
-            createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
+            // #5701: the overlay slot sits above host chrome; the banner body must stay
+            // click-through (pointerEvents none) or it blocks the controls underneath —
+            // only the ✕ button re-enables pointer events for itself.
+            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(217,63,11,0.35)", background: "rgba(217,63,11,0.08)", boxShadow: "0 2px 8px rgba(0,0,0,0.15)", pointerEvents: "none" } },
+            createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+                createElement("div", { style: { flex: 1, fontSize: 13, fontWeight: 600 } }, header),
+                createElement("button", { type: "button", title: t("upstreams_dismiss"), "aria-label": t("upstreams_dismiss"), onClick: () => setDismissedSig(sig), style: { cursor: "pointer", border: "none", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 14, lineHeight: 1, padding: 0, opacity: 0.6, pointerEvents: "auto" } }, "✕"),
+            ),
             ...rows.map((r) => {
                 const code = r.code !== undefined ? ` ${r.code}` : "";
                 // #6026: 0 means fail-fast already lifted (probe-eligible, and probes are
