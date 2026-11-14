@@ -24,6 +24,7 @@ concurrency:
 jobs:
   sync-discussions:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
