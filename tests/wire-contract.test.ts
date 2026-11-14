@@ -210,6 +210,20 @@ test("WC-025 TTS-shaped requests must not carry a leading system message (#6636)
         audio: {},
         stream: false,
     }), []);
+    // Legal: a tool-carrying audio request is a main turn, not a TTS call —
+    // its model has an action surface and accepts a leading system message,
+    // so bili's ACP decoration there is legal (no-tools veto, mirrors
+    // isAudioOutputCall).
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "voice-chat",
+        messages: [
+            { role: "system", content: "ACP TAGS" },
+            { role: "user", content: "hello" },
+        ],
+        audio: { format: "wav", voice: "alloy" },
+        tools: [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } }],
+        stream: false,
+    }), []);
 });
 
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {

@@ -435,11 +435,16 @@ export function validateOpenAiChatBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     // WC-025 (#6636): runs before the tools early-return — a TTS-shaped
-    // request (top-level `audio` object) must never carry a leading system
-    // message: TTS models behind OpenAI-compatible endpoints 400 it
+    // request (top-level `audio` object, no tools) must never carry a leading
+    // system message: TTS models behind OpenAI-compatible endpoints 400 it
     // ("messages[0] system role is not allowed for TTS model"). The tripwire
-    // keys on the audio shape, not the model name.
-    if (isPlainObject(body.audio) && Object.keys(body.audio).length > 0
+    // keys on the audio shape, not the model name. The no-tools veto mirrors
+    // isAudioOutputCall: a tool-carrying request is a main turn (its model
+    // has an action surface, is not a TTS model, and accepts a leading
+    // system), so bili's ACP decoration there is legal.
+    const wc025NoTools = !Array.isArray(body.tools) || body.tools.length === 0;
+    if (wc025NoTools
+        && isPlainObject(body.audio) && Object.keys(body.audio).length > 0
         && Array.isArray(body.messages) && body.messages.length > 0
         && isPlainObject(body.messages[0]) && body.messages[0].role === "system")
         out.push(`WC-025 messages[0]: leading role:"system" message on a TTS-shaped request (top-level audio object) — TTS models reject a system message with 400 (#6636)`);
