@@ -1347,9 +1347,27 @@ export interface WebSessionTreeNode {
     endRef?: string;
     parentBlockId?: string;
     directBlockIds: string[];
+    // #5941: pre-computed display title (explicit topic, else the summary
+    // lead-line, ≤48 chars). Without it the 5s live re-poll repaints every node
+    // through blockTopic(), which falls back to the raw block id — topics vanish
+    // ~5s after the detail page opens. Omitted when it would just echo the id.
+    topic?: string;
 }
 
 const TREE_MAX_BLOCKS = 5000;
+
+// #5941: server-side twin of the client's blockTopic() (src/web/client.ts).
+// Mirrors its precedence byte-for-byte — explicit topic (trimmed, untruncated)
+// → summary lead-line (heading/bullet markers stripped, truncated to 48 + …)
+// → the block id — so the compact /tree feed carries a ready-made title and the
+// 5s repaint never falls back to the raw id. tests/web-blocks-tree.test.ts pins
+// this against the real client function so the two cannot drift apart.
+export function webBlockTopic(blockId: string, topic?: string, summary?: string): string {
+    if (topic && String(topic).trim()) return String(topic).trim();
+    const lead = String(summary ?? "").split("\n").map((s) => s.trim()).find(Boolean) ?? "";
+    const plain = lead.replace(/^#{1,6}\s*/, "").replace(/^[*>-]+\s*/, "");
+    return plain.length > 48 ? plain.slice(0, 48) + "…" : plain || blockId;
+}
 
 export async function buildSessionTree(id: string): Promise<{ blocks: WebSessionTreeNode[] } | null> {
     const found = await loadSessionById(id);
@@ -1366,6 +1384,7 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
             b.startRef !== undefined && b.endRef !== undefined
                 ? orderedRefPair(b.startRef, b.endRef)
                 : null;
+        const topic = webBlockTopic(b.blockId, b.topic, b.summary);
         return {
             blockId: b.blockId,
             tier: b.tier,
@@ -1373,6 +1392,7 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
             ...(span ? { startRef: span[0], endRef: span[1] } : {}),
             ...(parentOf.get(b.blockId) !== undefined ? { parentBlockId: parentOf.get(b.blockId)! } : {}),
             directBlockIds: (b.directBlockIds || []).slice(),
+            ...(topic !== b.blockId ? { topic } : {}),
         };
     });
     return { blocks };

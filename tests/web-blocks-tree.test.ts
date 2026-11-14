@@ -8,7 +8,7 @@ import { createInitialState, defaultCountTokens } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { LazyBlockContents, _resetSessionsForTest, getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
+import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree, webBlockTopic } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { WEB_STYLES } from "../src/web/styles.ts";
@@ -30,6 +30,7 @@ function mkBlock(
     effective: string[],
     kids: string[] = [],
     span?: [string, string],
+    topic?: string,
 ): CompressionBlock {
     return {
         blockId,
@@ -45,6 +46,7 @@ function mkBlock(
         generation: "young",
         active: true,
         ...(span ? { startRef: span[0], endRef: span[1] } : {}),
+        ...(topic !== undefined ? { topic } : {}),
     };
 }
 
@@ -354,9 +356,12 @@ test("frozen-snapshot hydration: a marker proving neither anchor rejects the who
     assert.deepEqual(await buildMessageContent("tree-snap-foreign", "m90001"), { ok: false, reason: "unknown-message" });
 });
 
-test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries", async () => {
+test("#4173/#5941: the live tree endpoint ships ids/tiers/edges/spans + a short title — no summary body", async () => {
     // #4173 review: nodes label their covered message span; non-monotonic
     // stored spans are canonicalized ascending before leaving the server.
+    // #5941: each node also carries a pre-computed display title (explicit topic
+    // or the summary LEAD line) so the client's 5s repaint doesn't fall back to
+    // the raw block id — but never the summary BODY (the ~6KB feed stays lean).
     const t1 = mkBlock("b1", 1, "## T1 summary\n- point one", ["rm1"], ["rm1"], [], ["m00010", "m00005"]);
     const t2 = mkBlock("b2", 2, "T2 summary", ["rm3"], ["rm1", "rm3"], ["b1"], ["m00001", "m00030"]);
     seedSession("tree-live", [t1, t2]);
@@ -364,12 +369,79 @@ test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries
     assert.ok(tree);
     assert.equal(tree.blocks.length, 2);
     const byId = new Map(tree.blocks.map((b) => [b.blockId, b]));
-    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, startRef: "m00005", endRef: "m00010", parentBlockId: "b2", directBlockIds: [] }, "the child names its fold parent AND its message span");
-    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, startRef: "m00001", endRef: "m00030", directBlockIds: ["b1"] }, "the root has no parent field at all");
-    // The whole point of the compact feed: no summary bytes on the wire.
-    assert.ok(!JSON.stringify(tree).includes("point one"), "summaries never leave the server");
+    assert.deepEqual(byId.get("b1"), { blockId: "b1", tier: 1, active: true, startRef: "m00005", endRef: "m00010", parentBlockId: "b2", directBlockIds: [], topic: "T1 summary" }, "the child names its fold parent, its message span AND its derived title");
+    assert.deepEqual(byId.get("b2"), { blockId: "b2", tier: 2, active: true, startRef: "m00001", endRef: "m00030", directBlockIds: ["b1"], topic: "T2 summary" }, "the root has no parent field but still carries a title");
+    // The whole point of the compact feed: no summary BODY bytes on the wire.
+    assert.ok(!JSON.stringify(tree).includes("point one"), "summary bodies never leave the server");
+    assert.ok(JSON.stringify(tree).includes("T1 summary"), "but the short display title does ship");
     assert.equal(await buildSessionTree("no-such-session"), null, "unknown session resolves to a 404 payload");
 });
+
+test("#5941: the /tree feed carries a display title so the 5s repaint keeps topics", async () => {
+    const explicit = mkBlock("bExp", 1, "long summary body that must not ship", ["r1"], ["r1"], [], undefined, "  My Explicit Topic  ");
+    const derived = mkBlock("bDer", 2, "## Derived Heading\n- body detail stays server-side", ["r2"], ["r2"]);
+    const bare = mkBlock("bNone", 3, "", ["r3"], ["r3"]);
+    seedSession("tree-topics", [explicit, derived, bare]);
+    const tree = await buildSessionTree("tree-topics");
+    assert.ok(tree);
+    const byId = new Map(tree.blocks.map((b) => [b.blockId, b]));
+    assert.equal(byId.get("bExp")!.topic, "My Explicit Topic", "explicit topic wins, trimmed, untruncated");
+    assert.equal(byId.get("bDer")!.topic, "Derived Heading", "summary lead line (heading stripped) becomes the title");
+    assert.ok(!("topic" in (byId.get("bNone") as object)), "no topic and no summary -> no redundant id echo on the wire");
+    // The original bug: feeding these nodes straight into the client's blockTopic
+    // must NOT collapse them back to the raw block id.
+    const client = extractClientBlockTopic();
+    assert.equal(client(byId.get("bExp")!), "My Explicit Topic", "client repaint keeps the explicit title");
+    assert.equal(client(byId.get("bDer")!), "Derived Heading", "client repaint keeps the derived title");
+    const wire = JSON.stringify(tree);
+    assert.ok(!wire.includes("must not ship") && !wire.includes("body detail"), "summary bodies stay server-side");
+});
+
+test("#5941: webBlockTopic mirrors the client blockTopic byte-for-byte (parity)", () => {
+    const client = extractClientBlockTopic();
+    const cases: Array<[string, string | undefined, string | undefined]> = [
+        ["bx", "explicit wins", "## ignored\nbody"],
+        ["bx", undefined, "## T1 summary\n- point one"],
+        ["bx", undefined, "- bullet lead\nsecond"],
+        ["bx", undefined, "> quoted lead"],
+        ["bx", undefined, "a".repeat(60)],
+        ["bx", "   ", "fallback summary"],
+        ["bx", "", ""],
+        ["bx", undefined, ""],
+        ["bx", "  spaced  ", ""],
+        ["bx", undefined, "\n\n   spaced lead   "],
+    ];
+    for (const [id, topic, summary] of cases) {
+        const server = webBlockTopic(id, topic, summary);
+        const clientOut = client({ blockId: id, topic, summary });
+        assert.equal(server, clientOut, `parity for topic=${JSON.stringify(topic)} summary=${JSON.stringify(summary)} -> ${JSON.stringify(server)}`);
+    }
+    // spot-check the derivations land where intended
+    assert.equal(webBlockTopic("bx", undefined, "- bullet lead\nsecond"), "bullet lead");
+    assert.equal(webBlockTopic("bx", undefined, "> quoted lead"), "quoted lead");
+    assert.equal(webBlockTopic("bx", undefined, "a".repeat(60)), "a".repeat(48) + "…");
+    assert.equal(webBlockTopic("bx", undefined, ""), "bx", "nothing to derive -> the id itself");
+});
+
+// Pulls the REAL client blockTopic out of the WEB_CLIENT bundle source so the
+// parity test compares against what actually ships to the browser, not a stub.
+function extractClientBlockTopic(): (b: { blockId: string; topic?: string; summary?: string }) => string {
+    const src = WEB_CLIENT;
+    const start = src.indexOf("function blockTopic(");
+    assert.ok(start >= 0, "client bundle defines blockTopic");
+    const open = src.indexOf("{", start);
+    let depth = 0;
+    let end = -1;
+    for (let i = open; i < src.length; i++) {
+        if (src[i] === "{") depth++;
+        else if (src[i] === "}") {
+            depth--;
+            if (depth === 0) { end = i + 1; break; }
+        }
+    }
+    assert.ok(end > open, "blockTopic body bounded");
+    return vm.runInNewContext(`${src.slice(start, end)}; blockTopic;`) as (b: { blockId: string; topic?: string; summary?: string }) => string;
+}
 
 test("#4608: the pane's strings exist in both locales with identical placeholders", () => {
     const keys = [
@@ -548,6 +620,29 @@ test("#5417: the treemap node fills follow the theme instead of pinning light hu
     const darkPin = WEB_STYLES.match(/:root\[data-theme="dark"\] \{[\s\S]*?\n\}/)?.[0] ?? "";
     assert.ok(darkMedia.length > 0 && darkPin.length > 0, "both dark palettes located");
     for (const v of tmVars) {
+        assert.ok(darkMedia.includes(v + ":"), `OS-dark palette defines ${v}`);
+        assert.ok(darkPin.includes(v + ":"), `pinned-dark palette defines ${v}`);
+    }
+});
+
+test("#5941: the treemap tier strokes follow the theme instead of pinning light hues", () => {
+    // Dark mode: the low-luminance tier fills (#5417) need brighter borders to
+    // stay legible; the old hardcoded #7a5af8/#bf8700/#8a8f99 read faint on them.
+    // tier-1 already rides var(--accent); t2/t3/n must ride --tm-*-stroke vars.
+    const strokeRules = [".g-node.tier-2 rect", ".g-node.tier-3 rect", ".g-node.tier-n rect"];
+    for (const sel of strokeRules) {
+        const rule = WEB_STYLES.match(new RegExp("^" + sel.replace(/\./g, "\\.") + " \\{[^}]*}", "m"))?.[0];
+        assert.ok(rule, `rule present: ${sel}`);
+        assert.match(rule, /stroke:\s*var\(--tm-[a-z0-9-]+-stroke\)/, `${sel}: stroke must be a themed --tm-*-stroke var`);
+        assert.ok(!/stroke:\s*#[0-9a-fA-F]{3,8}\b/i.test(rule), `${sel}: no hardcoded stroke hex (breaks dark mode)`);
+    }
+    const strokeVars = ["--tm-t2-stroke", "--tm-t3-stroke", "--tm-tn-stroke"];
+    const lightRoot = WEB_STYLES.match(/^:root \{[\s\S]*?\n\}/m)?.[0] ?? "";
+    const darkMedia = WEB_STYLES.match(/@media \(prefers-color-scheme: dark\) \{[\s\S]*?\n    \}/)?.[0] ?? "";
+    const darkPin = WEB_STYLES.match(/:root\[data-theme="dark"\] \{[\s\S]*?\n\}/)?.[0] ?? "";
+    assert.ok(lightRoot.length > 0 && darkMedia.length > 0 && darkPin.length > 0, "all three palettes located");
+    for (const v of strokeVars) {
+        assert.ok(lightRoot.includes(v + ":"), `light palette defines ${v} (zero-drift baseline)`);
         assert.ok(darkMedia.includes(v + ":"), `OS-dark palette defines ${v}`);
         assert.ok(darkPin.includes(v + ":"), `pinned-dark palette defines ${v}`);
     }
