@@ -11,8 +11,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { alignTailIds, HARVEST_TAIL_BYTES, findProjectJsonlFiles, headerFirst, harvestIdentity, readJsonlTail, registerIdentitySource, resetIdentityHarvestForTest, type IdentityHarvestCtx } from "../src/identity-harvest.js";
-import { claudeVisibleRows, registerClaudeIdentitySource } from "../src/identity-claude.js";
+import { alignTailIds, fingerprintText, HARVEST_TAIL_BYTES, findProjectJsonlFiles, headerFirst, harvestIdentity, readJsonlTail, registerIdentitySource, resetIdentityHarvestForTest, type IdentityHarvestCtx } from "../src/identity-harvest.js";
+import { claudeSidechainRows, claudeVisibleRows, registerClaudeIdentitySource, sidechainChains } from "../src/identity-claude.js";
 import { codebuddyVisibleRows, registerCodebuddyIdentitySource } from "../src/identity-codebuddy.js";
 import { registerGooseIdentitySource } from "../src/identity-goose.js";
 import { registerMcodeIdentitySource } from "../src/identity-mcode.js";
@@ -82,6 +82,23 @@ test("harvest registry: loopback boundary + env scoping", () => {
         const ok = harvestIdentity(ctx());
         assert.deepEqual(ok, { ids: ["a-1", "a-2"], sourceId: "fake" });
         assert.equal(snapshotCalls, 1);
+    });
+});
+
+test("#6011 review: fingerprint provider runs only after ALL gates pass", () => {
+    resetIdentityHarvestForTest();
+    registerClaudeIdentitySource();
+    const base = { "x-claude-code-session-id": CLAUDE_ID };
+    let invoked = 0;
+    const provider = () => { invoked++; return []; };
+    // Gates off (no env scope, rollout 0%) → inert: the join key alone must
+    // NOT trigger the provider — eagerly hashing every client-provided-id
+    // request while harvesting is off everywhere is the regression this pins
+    // (#6011 review). Positive direction (provider runs when needed) is
+    // pinned by the sidechain binding tests below.
+    withEnv({ [ENV]: undefined, [ROLLOUT_ENV]: undefined }, () => {
+        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: provider })), null);
+        assert.equal(invoked, 0, "provider never runs while gates are off");
     });
 });
 
@@ -172,19 +189,189 @@ test("claude adapter: sidechain/summary rows excluded, tail alignment, role spot
     resetIdentityHarvestForTest();
     registerClaudeIdentitySource();
     const base = { "x-claude-code-session-id": CLAUDE_ID };
+    // #6011: this fixture CONTAINS a sidechain row, so every request now also
+    // demands content verification. The fixture rows carry no content, so the
+    // matching empty-text fingerprints verify the main tail.
+    const emptyFp = fingerprintText("");
     withEnv({ CLAUDE_CONFIG_DIR: configDir, [ENV]: "claude", [ROLLOUT_ENV]: "1" }, () => {
         assert.equal(headerFirst(ctx({ sessionId: CLAUDE_ID, headers: base }), "x-claude-code-session-id"), CLAUDE_ID);
         // full-tail match, stored roles agree at the exposed boundary positions
-        const ok = harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"] }));
+        const ok = harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: () => [emptyFp, emptyFp, emptyFp] }));
         assert.deepEqual(ok?.ids, ["u2", "a2", "u3"]);
         // boundary role spot-check: wire claims user,user but stored tail ends assistant → whole-turn null
-        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 2, headers: base, messageRoles: ["user", "user"] })), null);
+        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 2, headers: base, messageRoles: ["user", "user"], computeMessageFingerprints: () => [emptyFp, emptyFp] })), null);
         // fewer visible rows than requested → null
-        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 99, headers: base })), null);
+        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 99, headers: base, computeMessageFingerprints: () => Array.from({ length: 99 }, () => emptyFp) })), null);
+        // #6011 strictness: no fingerprints while sidechains exist → never guess
+        assert.equal(harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"] })), null);
         // wrong join key → source never matched
         assert.equal(harvestIdentity(ctx({ sessionId: "other", expectedLen: 3, headers: base })), null);
         // non-UUID header value → not a claude lane
         assert.equal(harvestIdentity(ctx({ sessionId: "abc", expectedLen: 3, headers: { "x-claude-code-session-id": "abc" } })), null);
+    });
+});
+
+/* ---------------- claude sidechain attribution (#6011) ---------------- */
+
+function scRow(uuid: string, role: "user" | "assistant", content: string, opts: { side?: boolean; parent?: string } = {}): unknown {
+    return {
+        uuid,
+        type: role,
+        ...(opts.side ? { isSidechain: true } : {}),
+        ...(opts.parent !== undefined ? { parentUuid: opts.parent } : {}),
+        message: { role, content },
+    };
+}
+
+// One session file: the main conversation plus TWO parallel Task-subagent
+// threads (X and Y) interleaved in file order — exactly the on-disk shape of
+// the #6011 storm. Every subagent tail is role-pattern-identical to the main
+// tail, so only content fingerprints can attribute the request.
+const SIDECHAIN_FIXTURE = [
+    scRow("m-u1", "user", "main one"),
+    scRow("x-1", "user", "X task prompt", { side: true, parent: "m-a1" }),
+    scRow("m-a1", "assistant", "main answer one"),
+    scRow("y-1", "user", "Y task prompt", { side: true, parent: "m-a1" }),
+    scRow("x-2", "assistant", "X working", { side: true, parent: "x-1" }),
+    scRow("m-u2", "user", "main two"),
+    scRow("y-2", "assistant", "Y working", { side: true, parent: "y-1" }),
+    scRow("x-3", "user", "X tool result", { side: true, parent: "x-2" }),
+    scRow("m-a2", "assistant", "main answer two"),
+    scRow("y-3", "user", "Y tool result", { side: true, parent: "y-2" }),
+    scRow("m-u3", "user", "main three"),
+];
+
+test("#6011 sidechainChains: link structure groups interleaved threads; unstructured rows yield none", () => {
+    const lines = SIDECHAIN_FIXTURE.map((r) => JSON.stringify(r));
+    const chains = sidechainChains(claudeSidechainRows(lines));
+    assert.deepEqual(chains.map((c) => c.map((r) => r.id)), [
+        ["x-1", "x-2", "x-3"],
+        ["y-1", "y-2", "y-3"],
+    ], "each tail back-walks its own thread through the interleaving");
+    // older clients: no parentUuid anywhere → no chain evidence at all
+    const unstructured = ["x-1", "x-2", "x-3"].map((id, i) => scRow(id, i % 2 === 0 ? "user" : "assistant", `u ${id}`, { side: true }));
+    assert.deepEqual(sidechainChains(claudeSidechainRows(unstructured.map((r) => JSON.stringify(r)))), []);
+    assert.deepEqual(sidechainChains([]), []);
+});
+
+test("#6011 claude sidechain: parallel Task threads bind by content fingerprint, main regression intact", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-sc-"));
+    writeFixture(configDir, CLAUDE_ID, SIDECHAIN_FIXTURE);
+    resetIdentityHarvestForTest();
+    registerClaudeIdentitySource();
+    const base = { "x-claude-code-session-id": CLAUDE_ID };
+    withEnv({ CLAUDE_CONFIG_DIR: configDir, [ENV]: "claude", [ROLLOUT_ENV]: "1" }, () => {
+        const subCtx = (fps: string[]) => ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: () => fps });
+        // Thread X's request: only X's tail text verifies → X's ids.
+        assert.deepEqual(
+            harvestIdentity(subCtx(["X task prompt", "X working", "X tool result"].map(fingerprintText)))?.ids,
+            ["x-1", "x-2", "x-3"],
+        );
+        // Thread Y's request verifies against Y only — same file, same round.
+        assert.deepEqual(
+            harvestIdentity(subCtx(["Y task prompt", "Y working", "Y tool result"].map(fingerprintText)))?.ids,
+            ["y-1", "y-2", "y-3"],
+        );
+        // Main conversation request: main tail verifies, no thread does → legacy main pass.
+        assert.deepEqual(
+            harvestIdentity(subCtx(["main two", "main answer two", "main three"].map(fingerprintText)))?.ids,
+            ["m-u2", "m-a2", "m-u3"],
+        );
+        // Subagent-SHAPED roles but drifted content: no candidate verifies and
+        // the main tail fails content check → whole-turn null. Pre-fix this
+        // exact shape returned the MAIN conversation's tail ids (the misbind).
+        assert.equal(harvestIdentity(subCtx(["WRONG one", "wrong two", "wrong three"].map(fingerprintText))), null);
+        // No fingerprints supplied while sidechains exist → attribution impossible.
+        assert.equal(
+            harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"] })),
+            null,
+        );
+    });
+});
+
+test("#6011 claude sidechain: identical-text parallel threads are ambiguous → whole-turn null", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-scamb-"));
+    writeFixture(configDir, CLAUDE_ID, [
+        ...SIDECHAIN_FIXTURE.slice(0, 3),
+        scRow("z-1", "user", "X task prompt", { side: true, parent: "m-a1" }),
+        ...SIDECHAIN_FIXTURE.slice(3, 8),
+        scRow("z-2", "assistant", "X working", { side: true, parent: "z-1" }),
+        scRow("z-3", "user", "X tool result", { side: true, parent: "z-2" }),
+        ...SIDECHAIN_FIXTURE.slice(8),
+    ]);
+    resetIdentityHarvestForTest();
+    registerClaudeIdentitySource();
+    const base = { "x-claude-code-session-id": CLAUDE_ID };
+    withEnv({ CLAUDE_CONFIG_DIR: configDir, [ENV]: "claude", [ROLLOUT_ENV]: "1" }, () => {
+        // Two threads verify against the same content fingerprints — never guess.
+        assert.equal(
+            harvestIdentity(ctx({
+                sessionId: CLAUDE_ID,
+                expectedLen: 3,
+                headers: base,
+                messageRoles: ["user", "assistant", "user"],
+                computeMessageFingerprints: () => ["X task prompt", "X working", "X tool result"].map(fingerprintText),
+            })),
+            null,
+        );
+    });
+});
+
+test("#6011 claude sidechain: unstructured sidechain rows degrade subagent requests but keep the main pass", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-scuns-"));
+    // NO parentUuid anywhere in the file (older client): no chain evidence.
+    writeFixture(configDir, CLAUDE_ID, [
+        scRow("m-u1", "user", "main one"),
+        scRow("x-1", "user", "X task prompt", { side: true }),
+        scRow("m-a1", "assistant", "main answer one"),
+        scRow("x-2", "assistant", "X working", { side: true }),
+        scRow("m-u2", "user", "main two"),
+        scRow("x-3", "user", "X tool result", { side: true }),
+        scRow("m-a2", "assistant", "main answer two"),
+        scRow("m-u3", "user", "main three"),
+    ]);
+    resetIdentityHarvestForTest();
+    registerClaudeIdentitySource();
+    const base = { "x-claude-code-session-id": CLAUDE_ID };
+    withEnv({ CLAUDE_CONFIG_DIR: configDir, [ENV]: "claude", [ROLLOUT_ENV]: "1" }, () => {
+        const fps = (texts: string[]): string[] => texts.map(fingerprintText);
+        // No parentUuid links → no thread evidence → subagent request degrades.
+        assert.equal(
+            harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: () => fps(["X task prompt", "X working", "X tool result"]) })),
+            null,
+        );
+        // The main conversation still binds byte-for-byte the legacy way.
+        assert.deepEqual(
+            harvestIdentity(ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: () => fps(["main two", "main answer two", "main three"]) }))?.ids,
+            ["m-u2", "m-a2", "m-u3"],
+        );
+    });
+});
+
+test("#6011 claude sidechain: per-thread continuity survives growth and catches a store rewrite", () => {
+    const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-scgrow-"));
+    writeFixture(configDir, CLAUDE_ID, SIDECHAIN_FIXTURE);
+    resetIdentityHarvestForTest();
+    registerClaudeIdentitySource();
+    const base = { "x-claude-code-session-id": CLAUDE_ID };
+    withEnv({ CLAUDE_CONFIG_DIR: configDir, [ENV]: "claude", [ROLLOUT_ENV]: "1" }, () => {
+        const subCtx = (fps: string[]) => ctx({ sessionId: CLAUDE_ID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "user"], computeMessageFingerprints: () => fps });
+        // Round one pins thread X's current tail.
+        assert.deepEqual(harvestIdentity(subCtx(["X task prompt", "X working", "X tool result"].map(fingerprintText)))?.ids, ["x-1", "x-2", "x-3"]);
+        // Thread X grows by one exchange: the overlap window still agrees id-for-id.
+        fs.appendFileSync(path.join(configDir, "projects", "-home-dog-ws", `${CLAUDE_ID}.jsonl`), [
+            JSON.stringify(scRow("x-4", "assistant", "X more work", { side: true, parent: "x-3" })),
+            JSON.stringify(scRow("x-5", "user", "X next step", { side: true, parent: "x-4" })),
+        ].join("\n") + "\n");
+        assert.deepEqual(harvestIdentity(subCtx(["X tool result", "X more work", "X next step"].map(fingerprintText)))?.ids, ["x-3", "x-4", "x-5"]);
+        // A rewrite moving a pinned row into the overlap degrades the turn.
+        writeFixture(configDir, CLAUDE_ID, [
+            ...SIDECHAIN_FIXTURE,
+            scRow("x-4", "assistant", "X more work", { side: true, parent: "x-3r" }),
+            scRow("x-3r", "user", "X tool result", { side: true, parent: "x-2" }),
+            scRow("x-5", "user", "X next step", { side: true, parent: "x-4" }),
+        ]);
+        assert.equal(harvestIdentity(subCtx(["X tool result", "X more work", "X next step"].map(fingerprintText))), null);
     });
 });
 

@@ -38,6 +38,7 @@
 // prepare runs, so the anthropic-lane pin (#4491), the resolve-stage
 // last-resort rung (#5719) and membership probing all see one shape.
 
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { validateMsgIds } from "./msgid-pin.js";
@@ -82,6 +83,55 @@ export interface IdentityHarvestCtx {
     /** Wire roles of the outbound messages, for cheap boundary verification
      *  when an adapter can map its stored rows onto wire roles. */
     messageRoles?: readonly string[] | undefined;
+    /** #6011: LAZY per-message content fingerprints (fingerprintText of the
+     *  extracted plain text, wire order) for adapters that must attribute a
+     *  request to ONE of several same-shaped stored threads — role patterns
+     *  alone cannot tell parallel subagent runs apart. The provider is
+     *  invoked only after every registry gate has passed and this source's
+     *  matches() agreed, so requests that will not be harvested pay no
+     *  hashing at all (#6011 review). Optional: a source that needs them
+     *  degrades the turn when they are absent (whole-turn contract); sources
+     *  that don't need them never invoke it. */
+    computeMessageFingerprints?: (() => readonly string[] | undefined) | undefined;
+}
+
+/** #6011: the comparable plain text of one wire message's content, across
+ *  all four wire shapes (string content; parts/blocks arrays with .text
+ *  items), trimmed. BOTH sides of a harvest match must apply this exact
+ *  projection (wire side via fingerprintMessageTexts, transcript side in the
+ *  adapter) so the comparison stays byte-faithful where the two agree. */
+export function plainTextOfContent(c: unknown): string {
+    if (typeof c === "string") return c.trim();
+    if (!Array.isArray(c)) return "";
+    let text = "";
+    for (const p of c) {
+        if (p !== null && typeof p === "object" && typeof (p as { text?: unknown }).text === "string") {
+            text += (p as { text: string }).text;
+        }
+    }
+    return text.trim();
+}
+
+/** #6011: one message's fingerprint — sha256 hex of its plain text ("" for a
+ *  text-less message, e.g. tool_use-only turns; both sides hash "" alike). */
+function fingerprintMessage(m: unknown): string {
+    if (m === null || typeof m !== "object") return fingerprintText("");
+    const msg = m as { content?: unknown; parts?: unknown };
+    return fingerprintText(plainTextOfContent(msg.content !== undefined ? msg.content : msg.parts));
+}
+
+/** #6011: per-message fingerprints in wire order; null when the input is not
+ *  an array at all (the caller then omits the field — whole-turn degrade on
+ *  the consumer side). */
+export function fingerprintMessageTexts(messages: unknown): string[] | null {
+    if (!Array.isArray(messages)) return null;
+    return (messages as unknown[]).map((m) => fingerprintMessage(m));
+}
+
+/** #6011: sha256 hex of a text blob — the single hash both sides of a
+ *  content check must use. */
+export function fingerprintText(text: string): string {
+    return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 interface IdentitySource {
@@ -140,17 +190,26 @@ export function resetIdentityHarvestForTest(): void {
  *  per-session id-continuity check (see lastAligned). Either side lacking a
  *  role at a position skips that position — schemas differ per client. ids
  *  in wire order. */
-export function alignTailIds(ctx: IdentityHarvestCtx, rows: Array<{ id: string; role?: string }>): string[] | null {
-    if (rows.length < ctx.expectedLen) return null;
-    const tail = rows.slice(-ctx.expectedLen);
-    if (ctx.messageRoles && ctx.messageRoles.length === ctx.expectedLen) {
+/** #6011: the FULL role-sequence check over a candidate tail — every
+ *  position where both sides expose a role must agree; either side lacking a
+ *  role at a position skips it (schemas differ per client). Shared by
+ *  alignTailIds and the sidechain thread matcher so both judge identically. */
+export function rolesAlign(ctx: IdentityHarvestCtx, tail: Array<{ id: string; role?: string }>): boolean {
+    if (ctx.messageRoles && ctx.messageRoles.length === tail.length) {
         for (let i = 0; i < tail.length; i++) {
             const want = String(ctx.messageRoles[i] ?? "").toLowerCase();
             const have = tail[i].role?.toLowerCase();
             if (!want || !have) continue;
-            if (want !== have) return null;
+            if (want !== have) return false;
         }
     }
+    return true;
+}
+
+export function alignTailIds(ctx: IdentityHarvestCtx, rows: Array<{ id: string; role?: string }>): string[] | null {
+    if (rows.length < ctx.expectedLen) return null;
+    const tail = rows.slice(-ctx.expectedLen);
+    if (!rolesAlign(ctx, tail)) return null;
     const ids = tail.map((r) => r.id);
     const prev = lastAligned.get(ctx.sessionId);
     if (prev !== undefined) {

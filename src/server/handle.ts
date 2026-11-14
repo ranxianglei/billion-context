@@ -78,7 +78,7 @@ import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
 import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
-import { harvestIdentity } from "../identity-harvest.js";
+import { fingerprintMessageTexts, harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
@@ -1321,6 +1321,12 @@ async function handleRequest(
             ? incomingMsgIdsHeader(req.headers["x-bili-msg-ids"])
             : undefined;
         let inboundMsgIds = stampedInboundMsgIds ?? headerStampedMsgIds;
+        // #6011: provenance of the ids — the pin gate (prepare-anthropic /
+        // prepare-openai) pins HARVEST-sourced ids without the pluginMode ×
+        // cohort double gate because the harvest registry already enforced
+        // rollout-or-env + loopback + full content verification upstream.
+        let msgIdSource: "body" | "header" | "harvest" | undefined =
+            stampedInboundMsgIds !== undefined ? "body" : headerStampedMsgIds !== undefined ? "header" : undefined;
         if (inboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
             const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
             if (Array.isArray(openaiLike) && openaiLike.length > 0) {
@@ -1331,9 +1337,16 @@ async function handleRequest(
                     remoteAddress: req.socket.remoteAddress,
                     headers: req.headers as Record<string, string | string[] | undefined>,
                     messageRoles,
+                    // #6011: LAZY — the registry invokes this only after every
+                    // gate passed and the claude adapter matched a file that
+                    // contains sidechain rows (same text projection the JSONL
+                    // side applies to its rows); unharvested requests pay no
+                    // sha256 at all.
+                    computeMessageFingerprints: () => fingerprintMessageTexts(openaiLike) ?? undefined,
                 });
                 if (harvested !== null) {
                     inboundMsgIds = [...harvested.ids];
+                    msgIdSource = "harvest";
                 }
             }
         }
@@ -1358,6 +1371,12 @@ async function handleRequest(
         // ids; null = store unavailable → byte-evidence-only path.
         const storedMsgIdsOf = (rawKey: string): readonly string[] | null =>
             getStore().unifiedAllMessageIds(rawKey);
+        // #6011: sibling-rung candidate discovery — the store's session-key
+        // list, prefix-filtered by the resolver to `<raw>|sub:`. Same lazy
+        // contract as storedMsgIdsOf (fork exits with non-empty ids only);
+        // null = store unavailable → skeleton-table candidates only.
+        const listStoredSessions = (): string[] | null =>
+            getStore().unifiedListSessionIds();
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
@@ -1377,14 +1396,15 @@ async function handleRequest(
                       ? (googleIdentity?.value ?? googleSignal)
                       : personaConversationOrder(
                           googleIdentity?.value ?? googleSignal,
-                          (parsed as GoogleRequestBody).contents,
-                          personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
-                          undefined,
-                          onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
+                           (parsed as GoogleRequestBody).contents,
+                           personaSystemText,
+                           pluginReportedModel(req.headers),
+                           undefined,
+                           undefined,
+                           onSessionResolveEvent,
+                           inboundMsgIds,
+                           storedMsgIdsOf,
+                           listStoredSessions,
                       ))
                   : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1411,15 +1431,16 @@ async function handleRequest(
                            ? (anthropicIdentity?.value ?? anthropicSignal)
                            : personaConversationOrder(
                                anthropicIdentity?.value ?? anthropicSignal,
-                               (parsed as AnthropicRequestBody).messages,
-                               personaSystemText,
-                               pluginReportedModel(req.headers),
-                               undefined,
-                               undefined,
-                               onSessionResolveEvent,
-                               inboundMsgIds,
-                               storedMsgIdsOf,
-                           ))
+                                (parsed as AnthropicRequestBody).messages,
+                                personaSystemText,
+                                pluginReportedModel(req.headers),
+                                undefined,
+                                undefined,
+                                onSessionResolveEvent,
+                                inboundMsgIds,
+                                storedMsgIdsOf,
+                                listStoredSessions,
+                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
                        // #4352: header-less claude code subagents (VS Code
@@ -1447,26 +1468,28 @@ async function handleRequest(
                            (parsed as AnthropicRequestBody).messages,
                            personaSystemText,
                            pluginReportedModel(req.headers),
-                           claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
-                           anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
-                           onSessionResolveEvent,
-                           inboundMsgIds,
-                           storedMsgIdsOf,
-                         )
+                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
+                            anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
+                            onSessionResolveEvent,
+                            inboundMsgIds,
+                            storedMsgIdsOf,
+                            listStoredSessions,
+                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
-                          (parsed as OpenAIRequestBody).messages,
-                          personaSystemText,
-                          pluginReportedModel(req.headers),
-                          undefined,
-                          undefined,
-                          onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
-                      )
+                           (parsed as OpenAIRequestBody).messages,
+                           personaSystemText,
+                           pluginReportedModel(req.headers),
+                           undefined,
+                           undefined,
+                           onSessionResolveEvent,
+                           inboundMsgIds,
+                           storedMsgIdsOf,
+                           listStoredSessions,
+                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain
@@ -1483,17 +1506,18 @@ async function handleRequest(
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
-                    ? personaConversationOrder(
-                          responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).input,
-                          (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
-                          undefined,
-                          undefined,
-                          onSessionResolveEvent,
-                          inboundMsgIds,
-                          storedMsgIdsOf,
-                      )
+                     ? personaConversationOrder(
+                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                           (parsed as ResponsesRequestBody).input,
+                           (parsed as ResponsesRequestBody).instructions ?? "",
+                           pluginReportedModel(req.headers),
+                           undefined,
+                           undefined,
+                           onSessionResolveEvent,
+                           inboundMsgIds,
+                           storedMsgIdsOf,
+                           listStoredSessions,
+                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
                    // prepare* gates), instruction drift is the expected event —
@@ -1528,17 +1552,18 @@ async function handleRequest(
                             // verbatim id (codex turn-1 / metadata-less roots).
                             ((parsed as ResponsesRequestBody).instructions ?? "") === ""
                               ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                              : personaConversationOrder(
-                                responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                                (parsed as ResponsesRequestBody).input,
-                                (parsed as ResponsesRequestBody).instructions ?? "",
-                                pluginReportedModel(req.headers),
-                                undefined,
-                                undefined,
-                                onSessionResolveEvent,
-                                inboundMsgIds,
-                                storedMsgIdsOf,
-                          )
+                               : personaConversationOrder(
+                                 responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                                 (parsed as ResponsesRequestBody).input,
+                                 (parsed as ResponsesRequestBody).instructions ?? "",
+                                 pluginReportedModel(req.headers),
+                                 undefined,
+                                 undefined,
+                                 onSessionResolveEvent,
+                                 inboundMsgIds,
+                                 storedMsgIdsOf,
+                                 listStoredSessions,
+                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
         // #1916/#1307: true when the dsh persona fingerprint actually split
@@ -3072,9 +3097,9 @@ async function handleRequest(
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide, msgIdSource)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, msgIdSource)
                           : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —

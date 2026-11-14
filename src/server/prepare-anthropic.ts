@@ -68,6 +68,7 @@ export async function prepareAnthropic(
      *  `model`, so the diag line below would otherwise print `undefined`. */
     resolvedModel?: string,
     decide?: DecideConfig,
+    msgIdSource?: "body" | "header" | "harvest",
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -227,8 +228,16 @@ export async function prepareAnthropic(
         // proxy traffic has no msgid channel and stays on snapshot render D).
         // Everything downstream keys off these ids: kernel ref assignment,
         // fold coverage, and the unified-table rows the rawTail ingest writes.
-        if (pluginMode && (incomingMsgIds !== undefined || incomingMsgSeqs !== undefined)) {
-            if (featureEnabled("pluginLaneServerHistory")) {
+        // #6011: HARVEST-sourced ids are pinned without the pluginMode × cohort
+        // double gate — the harvest registry already enforced rollout-or-env +
+        // loopback + full content verification upstream, so a verified harvest
+        // id is as trustworthy as a stamped one. Without this, CC-standalone
+        // subagent lanes would never accumulate pinned rows and the #5719/#6011
+        // store-overlap rungs could never fire for them.
+        if ((pluginMode || msgIdSource === "harvest") && (incomingMsgIds !== undefined || incomingMsgSeqs !== undefined)) {
+            if (pluginMode && !featureEnabled("pluginLaneServerHistory")) {
+                log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
+            } else {
                 const v = incomingMsgIds === undefined ? undefined : validateMsgIds(incomingMsgIds, msgs.length);
                 if (v !== undefined && v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
@@ -248,8 +257,6 @@ export async function prepareAnthropic(
                 } else if (sv !== undefined) {
                     log("warn", `[${sessionId}] [msgid] ledger seq stamps rejected (${sv.reason}) — folding back to unstamped messages (#4316)`);
                 }
-            } else {
-                log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
             }
         }
         // #3756 snapshot render: outbound prefix from the unified transcript
