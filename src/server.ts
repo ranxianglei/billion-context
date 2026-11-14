@@ -3731,6 +3731,31 @@ export function buildWindowShrinkNote(args: {
     return head + `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`;
 }
 
+/** #3663: label the wall the preflight fail-fast headline cites. When bili's own
+ *  output-headroom reservation (handle.ts rewrites modelContextLimit in place and
+ *  records NO shrink reason) is what sits between the cited wall and the model's
+ *  native window, name it as the effective INPUT budget and point at the setting
+ *  that controls it — calling that budget "the model window" made readers chase
+ *  model metadata instead of compress.outputHeadroomMaxPct / max_tokens. Every
+ *  other shape keeps today's wording byte-identical: operator/codex shrink reasons
+ *  carry their own notes (#736), and a wall strictly below config.modelContextLimit
+ *  means the stated-wall overflow arm (#3450) bound, not headroom. */
+export function buildEffectiveWallClause(args: {
+    limit: number;
+    configuredLimit: number;
+    nativeWindow?: number;
+    shrinkReason: "operator" | "codex" | undefined;
+}): string {
+    const { limit, configuredLimit, nativeWindow, shrinkReason } = args;
+    const headroomShrunk = shrinkReason === undefined
+        && nativeWindow !== undefined
+        && limit === configuredLimit
+        && configuredLimit < nativeWindow;
+    return headroomShrunk
+        ? `the effective input budget ${limit} (model window ${nativeWindow}, ${nativeWindow - configuredLimit} tokens reserved for model output via compress.outputHeadroomMaxPct)`
+        : `the model window ${limit}`;
+}
+
 // #5000/#4543: the core-text byte floor (estimateCoreMessagesUpperBytes) prices
 // only m.text — tools[], tool_calls[].function.arguments, the system prompt and
 // the JSON envelope are invisible to it, so a body can ride multi-MB over the
@@ -4141,9 +4166,12 @@ export async function preflightCompressIfNeeded(
         const imageNote = remainingImageTokens >= limit
             ? ` Images alone account for ~${remainingImageTokens} estimated tokens (≥ window ${limit}); reduce the remaining image payload or raise the window.`
             : "";
+        // #3663: label the cited wall by what actually set it (native window vs
+        // headroom-reserved effective input budget) instead of always "model window".
+        const wallClause = buildEffectiveWallClause({ limit, configuredLimit: config.modelContextLimit, nativeWindow: resolvedNativeWindow, shrinkReason: windowShrinkReason });
         const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
-            ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
-            : `context ~${tokenCount} tokens exceeds the model window ${limit}`;
+            ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds ${wallClause}`
+            : `context ~${tokenCount} tokens exceeds ${wallClause}`;
         const rangesClause = rangesLeft !== undefined ? `, with ${rangesLeft} compressible range(s) still visible` : "";
         // #736: when the wall is bili's own shrunken window, say so — "raise the
         // model context window" otherwise sends operators to the upstream when
