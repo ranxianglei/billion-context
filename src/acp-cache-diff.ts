@@ -194,6 +194,15 @@ function prefixCompare(a: Buffer, b: Buffer): { rel: "append" | "diverge"; offse
     return { rel: "diverge", offset: n, extra: b.length - a.length };
 }
 
+// Wire offsets are UTF-8 bytes; JSON spans and string slices use UTF-16.
+// A differing byte can be inside a multibyte code point, so begin evidence at
+// its leading byte instead of decoding a partial prefix as a replacement char.
+function textOffsetAtByte(body: Buffer, offset: number): number {
+    let start = offset;
+    while (start > 0 && start < body.length && (body[start]! & 0xc0) === 0x80) start--;
+    return body.subarray(0, start).toString("utf8").length;
+}
+
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
 // plus some common suffix — i.e. its middle residual is EMPTY — while `cur`
 // carries extra bytes in that middle. That is a SEMANTIC append: no prior byte
@@ -341,6 +350,7 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
         };
     }
     const O = byteRel.offset;
+    const textOffset = textOffsetAtByte(bBody, O);
     const ia = msgArrayInfo(aText);
     const ib = msgArrayInfo(bText);
     if (ia && ib && ia.key === ib.key && ia.items.length > 0 && ib.items.length >= ia.items.length) {
@@ -354,20 +364,20 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
             }
             if (sharedOk) {
                 const lastEnd = ib.spans[n - 1]![1];
-                if (O >= lastEnd) {
+                if (textOffset >= lastEnd) {
                     return {
                         rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
                         append: { kind: ib.items.length > ia.items.length ? "json-tail" : "tail-fields", countA: ia.items.length, countB: ib.items.length },
                     };
                 }
-                if (O < ib.spans[0]![0]) {
+                if (textOffset < ib.spans[0]![0]) {
                     return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: true };
                 }
                 // O sits in the glue between two shared elements: tolerate
                 // whitespace/comma-only reshaping (pretty vs compact).
                 let gi = -1;
                 for (let i = 0; i < n - 1; i++) {
-                    if (O >= ib.spans[i]![1] && O <= ib.spans[i + 1]![0]) { gi = i; break; }
+                    if (textOffset >= ib.spans[i]![1] && textOffset <= ib.spans[i + 1]![0]) { gi = i; break; }
                 }
                 if (gi >= 0) {
                     const strip = (s: string) => s.replace(/[,\s]/g, "");
@@ -487,8 +497,9 @@ function classifyPair(index: number, tsA: number, tsB: number, aOut: DumpContent
             : passthroughPair ? "client" : "both";
         const bText = bOut.body.toString("utf8");
         const info = msgArrayInfo(bText);
-        const loc = info ? locateMessage(info.items, info.spans, outRel.byteOffset) : { index: null, roleType: null };
-        const snip = snippetAround(bText, outRel.byteOffset);
+        const textOffset = textOffsetAtByte(bOut.body, outRel.byteOffset);
+        const loc = info ? locateMessage(info.items, info.spans, textOffset) : { index: null, roleType: null };
+        const snip = snippetAround(bText, textOffset);
         divergence = { offset: outRel.byteOffset, messageIndex: loc.index, roleType: loc.roleType, before: snip.before, after: snip.after };
         if (outRel.preArray) notes.push("divergence before the message array (field-level change)");
         if (inRel && inRel.rel === "diverge") incomingDivergenceOffset = inRel.byteOffset;
