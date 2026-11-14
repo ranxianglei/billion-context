@@ -1653,6 +1653,17 @@ export function isMcpBiliCompress(toolName: string): boolean {
             toolName.slice(MCP_BILI_TOOL_PREFIX.length) === "compress");
 }
 
+// #5864: twin of server.ts hasSignedThinkingBlock (#1658/#1960 doctrine) — a
+// signed Anthropic thinking/redacted_thinking core must never be stranded as
+// the final block of its assistant message. hideConsumedCompressCalls uses it
+// to keep a preceding compress pair visible instead of hiding it. Structural
+// param (only the two wire fields it reads) so it stays assignable to the
+// kernel's (msg: CoreMessage) => boolean Config field.
+export function isStrandedProtectedPredecessor(m: { contentType?: string; thinkingSignature?: string; rawAnthropicBlock?: unknown }): boolean {
+  if (m.contentType === "reasoning") return typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0;
+  return (m.rawAnthropicBlock as { type?: unknown } | undefined)?.type === "redacted_thinking";
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1782,7 +1793,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         // #2578: host-side extension of the kernel's bare-name hard protection
         // to the MCP-prefixed forms of bili's own tools.
-        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected, isCompressTool: isMcpBiliCompress },
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected, isCompressTool: isMcpBiliCompress, strandedProtectedPredecessor: isStrandedProtectedPredecessor },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",

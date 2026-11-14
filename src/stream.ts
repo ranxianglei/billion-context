@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
-import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
+import { isMcpBiliCompress, isStrandedProtectedPredecessor, loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
@@ -844,19 +844,22 @@ function formatMiB(bytes: number | undefined): string {
 // variant: re-folding the same block silently SHRINKS its canonical summary).
 // The stub set is harvested from the kernel's OWN outbound rewrite of the
 // current messages rather than mirrored from constants: whatever fragments the
-// model can actually see right now are exactly what gets rejected. Exact match
+// model can actually see right now are exactly what gets rejected. The scan
+// mirrors the outbound hide decision (#2970 MCP-name recognition + #5864
+// strand guard) so a pair the outbound path keeps visible is scanned here too.
+// Exact match
 // only — legitimate prose (summaries containing an ellipsis, short summaries,
 // ±1-char transcription drift) can never trip it.
 export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionState): Set<string> {
     let hidden: { messages: CoreMessage[] };
     try {
-        hidden = hideConsumedCompressCalls(state, messages);
+        hidden = hideConsumedCompressCalls(state, messages, isMcpBiliCompress, isStrandedProtectedPredecessor);
     } catch {
         return new Set();
     }
     const stubs = new Set<string>();
     for (const m of hidden.messages) {
-        if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
+        if (m.contentType !== "tool-call" || !m.toolName || !isMcpBiliCompress(m.toolName) || typeof m.text !== "string") continue;
         let parsed: ReturnType<typeof parseCompressInput>;
         try {
             // #5161: quiet — this scan re-parses past calls on every fold; in
