@@ -105,7 +105,7 @@ export interface StorageBackend {
     // --- archive / GC (#3463) ------------------------------------------------
     archiveSession(sessionId: string, opts: { archiveDir: string }): Promise<{ ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number }>;
     restoreArchived(sessionId: string, opts: { archiveDir: string }): Promise<{ ok: boolean; reason?: string }>;
-    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number }>;
+    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number; skipped: number }>;
 
     // --- refcount introspection (GC + doctor) --------------------------------
     contentRefCountOfBody(needle: string): Promise<number>;
@@ -256,7 +256,7 @@ export class SqliteBackend implements StorageBackend {
     restoreArchived(sessionId: string, opts: { archiveDir: string }): Promise<{ ok: boolean; reason?: string }> {
         return Promise.resolve(this.store.restoreArchived(sessionId, opts));
     }
-    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number }> {
+    gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): Promise<{ archived: number; contentRowsDeleted: number; skipped: number }> {
         return Promise.resolve(this.store.gc(opts));
     }
     contentRefCountOfBody(needle: string): Promise<number> {

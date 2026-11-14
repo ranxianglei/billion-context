@@ -237,10 +237,12 @@ async function runGc(store: SessionStore, days: number | undefined, vacuum: "ful
     data.result = result;
     data.indexDbBefore = dbBefore;
     data.indexDbAfter = dbAfter;
-    if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
-    text += `\nexecuted:\n  archived sessions:    ${result.archived}\n  content rows deleted: ${result.contentRowsDeleted}`;
+    const code = result.skipped > 0 ? 1 : 0;
+    if (json) return { code, text: `${JSON.stringify(data, null, 2)}\n` };
+    text += `\nexecuted:\n  archived sessions:    ${result.archived}\n  content rows deleted: ${result.contentRowsDeleted}\n  skipped (concurrent change): ${result.skipped}`;
     if (dbBefore !== undefined && dbAfter !== undefined) text += `\n  index.db size:        ${formatBytes(dbBefore)} -> ${formatBytes(dbAfter)}`;
-    return { code: 0, text: `${text}\n` };
+    if (result.skipped > 0) text += `\nwarning: ${result.skipped} stale candidate(s) did not archive (see log) — re-run to confirm the sweep completed`;
+    return { code, text: `${text}\n` };
 }
 
 function renderForeignPlan(plan: ForeignBlockPlan): string {
