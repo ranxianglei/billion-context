@@ -51,6 +51,25 @@ export function isForeignMembership(m: RequestMembership | null | undefined): bo
     return m?.member === false;
 }
 
+/** #5925: settle-side admission for a request's scale samples. The anchor
+ *  family and the outbound estimate channel are ONE defense — both are the
+ *  session's "how big is this conversation" state, and effectiveTokenCount's
+ *  fallback reads min(localInputEstimate, raw), so poisoning either one pins
+ *  the meter. Proven members admit; proven foreigners refuse; an ABSENT
+ *  verdict (the request carried no ids at all) admits only while no needle is
+ *  planted — bootstrap, where nothing is known yet. Once the conversation's id
+ *  family is known, a sample that cannot prove membership must not read as a
+ *  member: a tiny side-lane request under a shared session id carries no ids
+ *  and used to fail open here, settling its billing over the main
+ *  conversation's anchor (#4805 residual). */
+export function membershipBlocksSettlement(session: Session): boolean {
+    const t = session.transient;
+    if (!t) return false;
+    const m = t.requestMembership;
+    if (m !== undefined && m !== null) return !m.member;
+    return t.latestKnownMsgId !== undefined && t.latestKnownMsgId !== null;
+}
+
 export function probeRequestMembership(session: Session, ids: string[], payloadUpper: number): RequestMembership | null {
     const t = session.transient;
     if (!t) return null;
