@@ -5,7 +5,7 @@ import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputIt
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
-import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
+import { currentCalibrationFactor, hardenResponsesFunctionCallArguments, strippedResponseIdWarning } from "../util.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
 import { recordNudgeObservation } from "../context-analysis.js";
@@ -544,9 +544,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // Mirror the post-try strict-echo repair on the stable prefix so
                 // the side call's bytes match the main request's cache line.
-                const stableItems: ResponseInputItem[] = typeof rebuiltInput === "string"
+                const normalizedItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                     ? [{ type: "message", role: "user", content: rebuiltInput }]
                     : normalizeStrictEchoResponsesInput([...rebuiltInput], isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+                // #5534: the main-body args guard below runs AFTER this branch —
+                // repair the side call's prefix here too, or a poisoned prefix
+                // 500s every decide round-trip on strict-JSON upstreams.
+                const stableItems: ResponseInputItem[] = hardenResponsesFunctionCallArguments(normalizedItems, log, sessionId);
                 const sideBody: Record<string, unknown> = { ...parsed, input: [...stableItems, { type: "message", role: "user", content: buildDecisionPrompt(ranges) }], tools: toolsOut, stream: false, max_output_tokens: decide.maxTokens };
                 stripDecisionReasoningFields("responses", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "responses", sideBody, session, log });
@@ -646,6 +650,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // can leave a tool-call run without its reasoning item. Repair BEFORE the
     // sentinel sees the array (a normalized body must not fire its own canary).
     if (Array.isArray(rebuiltInput)) rebuiltInput = normalizeStrictEchoResponsesInput(rebuiltInput, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
+    // #5534: Responses-wire twin — function_call.arguments carries the same
+    // tool-call core text; custom_tool_call.input stays free-form.
+    if (Array.isArray(rebuiltInput)) rebuiltInput = hardenResponsesFunctionCallArguments(rebuiltInput, log, sessionId);
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     warnResponsesReasoningPairs(Array.isArray(rebuiltInput) ? rebuiltInput : [], log, sessionId);
     if (!isCompactionTrigger) {
