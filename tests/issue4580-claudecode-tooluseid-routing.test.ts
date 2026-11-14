@@ -156,9 +156,7 @@ describe("#4580 recording: response pipes ring tool_use ids per lane", () => {
     });
 
     test("capacity eviction drops the least-recently-seen id, not the first-inserted", () => {
-        // A re-record keeps its insertion slot but refreshes its timestamp —
-        // the first-inserted id can be the FRESHEST entry, so eviction must
-        // order by time, never by map position.
+        // Re-recording an old ID makes it recent regardless of its first insertion.
         let clock = 2_000_000;
         _setToolRingClockForTest(() => clock);
         try {
@@ -170,11 +168,30 @@ describe("#4580 recording: response pipes ring tool_use ids per lane", () => {
                 clock += 1;
             }
             clock += 1000;
-            recordToolUseId(anchor, "lane-anchor"); // re-record: newest by time, still slot 1
+            recordToolUseId(anchor, "lane-anchor"); // re-record: newest observation
             recordToolUseId("toolu_newest", "lane-newest"); // overflows the cap → one eviction
             assert.equal(lookupToolUseIdSession(anchor), "lane-anchor", "re-recorded anchor survives: it is the newest by time");
             assert.equal(lookupToolUseIdSession("toolu_fill_0"), undefined, "true oldest entry (by time) is evicted");
             assert.equal(lookupToolUseIdSession("toolu_newest"), "lane-newest");
+        } finally {
+            _setToolRingClockForTest(undefined);
+        }
+    });
+
+    test("capacity remains bounded while the wall clock moves backwards", () => {
+        let clock = 3_000_000;
+        _setToolRingClockForTest(() => clock);
+        try {
+            for (let i = 0; i < 2048; i++) {
+                clock--;
+                recordToolUseId(`clock-${i}`, "lane-clock");
+            }
+            const retained = Array.from({ length: 2048 }, (_, i) => lookupToolUseIdSession(`clock-${i}`))
+                .filter(id => id !== undefined);
+            assert.equal(retained.length, 1024);
+            assert.equal(lookupToolUseIdSession("clock-1023"), undefined);
+            assert.equal(lookupToolUseIdSession("clock-1024"), "lane-clock");
+            assert.equal(lookupToolUseIdSession("clock-2047"), "lane-clock");
         } finally {
             _setToolRingClockForTest(undefined);
         }
@@ -221,6 +238,29 @@ describe("#4580 routing: host-stamped toolCallId routes to the witnessing lane",
         assert.equal(r.status, 200);
         assert.deepEqual(executedOn(), [sub.id]);
         assert.ok(logs.some((m) => m.includes("routed by host call id (#4580)") && m.includes(sub.id)), "must log the id-routed lane");
+    });
+
+    for (const rollback of [false, true]) test(`refreshed host ID still routes to its subagent after ring overflow (clock rollback=${rollback})`, async () => {
+        const parent = getSession("recency-parent");
+        const sub = getSession("recency-sub");
+        parent.lastSeen = sub.lastSeen = Date.now();
+        let clock = 4_000_000;
+        _setToolRingClockForTest(() => clock);
+        try {
+            recordToolUseId("recent-sub-call", sub.id);
+            for (let i = 0; i < 1023; i++) recordToolUseId(`fill-${i}`, parent.id);
+            if (rollback) clock -= 10_000;
+            recordToolUseId("recent-sub-call", sub.id);
+            if (rollback) clock++;
+            recordToolUseId("another-call", parent.id);
+            const result = await post({ conversationId: parent.id, tool: "acp_status", args: {}, toolCallId: "recent-sub-call" });
+            assert.equal(result.status, 200);
+            assert.deepEqual(executedOn(), [sub.id]);
+            assert.equal(lookupToolUseIdSession("fill-0"), undefined);
+            assert.equal(lookupToolUseIdSession("another-call"), parent.id);
+        } finally {
+            _setToolRingClockForTest(undefined);
+        }
     });
 
     test("id ring miss: identical POST without a known id keeps the legacy ladder (no silent fallback)", async () => {
