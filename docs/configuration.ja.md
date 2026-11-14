@@ -446,6 +446,7 @@
 | `BILI_LAUNCH_TOKEN` | string | unset (generated per launch) | — | ランチャーとそのスポンされたプロキシ間のレーン内部エンドポイントを認証するランチャートークン（シークレット）。 |
 | `BILI_MCP_DEFAULT_ORIGIN` | string | http://127.0.0.1:8787 | — | MCP エントリポイント用のフォールバックプロキシオリジン候補。 |
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | 複数のホストセッションが 1 つのプロキシを共有する場合、再開セッションの孤児採用を無効にする。 |
+| `BILI_MCP_NO_STALE_ADOPT` | boolean-ish | off (=1 disables stale-binding adoption) | — | #4661 の証拠ベースの stale バインド自動再バインドを無効にする。プロキシがバインドされたセッションに最近モデルトラフィックがないことを証明した場合に限り、MCP シムはプロキシが指定したライブ会話に再バインドする。 |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | ランチャーチャネル: スポンされたプロキシに渡す MITM ホワイトリストホスト（設定ファイルの双子 BILI_MITM_DOMAINS とは別物）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | スポンチャネル: プラグインエージェントプロセスを示す。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | エグレス画像のダウンスケールパスのトリガー閾値（px）（#3400）; 数値でない場合または 128 未満の場合は無視される（デフォルトが適用される）。設計上、環境変数のみ。 |

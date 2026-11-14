@@ -139,6 +139,9 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // #4661: spawns real MCP shim children over stdio; the canned mock proxy
+    // is listen(0), so no zone band is needed — the entry is for the tripwire
+    "tests/issue4661-stale-binding.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

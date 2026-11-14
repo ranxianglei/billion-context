@@ -1757,6 +1757,9 @@ async function handleRequest(
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // #4661: runtime traffic evidence for stale-binding diagnosis — only
+        // real requests refresh it (tool calls / disk reloads must not).
+        session.lastModelRequestAt = Date.now();
         // #5490: the first-sight warn above needs no session identity; this one
         // does — recurrence across DISTINCT sessions is what turns "a model I
         // haven't declared" into "an alias this host resolves internally that
