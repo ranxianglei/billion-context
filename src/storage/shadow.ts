@@ -779,7 +779,7 @@ export class UnifiedShadow {
     activeBlockCount(id: string): number | null {
         if (this.sync === null) return null;
         try {
-            return this.sync.getBlocks(id).filter((b) => b.active).length;
+            return this.sync.activeBlockCount(id);
         } catch {
             return null;
         }
@@ -856,6 +856,11 @@ export class UnifiedShadow {
     sessionUpdatedAt(sessionId: string): number | null {
         if (this.sync === null) return null;
         return this.sync.sessionUpdatedAt(sessionId);
+    }
+
+    sessionIdentity(sessionId: string): { protocol?: string; origin?: string } | null {
+        if (this.sync === null) return null;
+        return this.sync.sessionIdentity(sessionId);
     }
 
     /** Absolute-seq tip of the session's message log (+1 = next free seq).

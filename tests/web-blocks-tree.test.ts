@@ -156,6 +156,31 @@ test("#3917: message leaves name each folded message and serve its text lazily",
     assert.deepEqual(await buildMessageContent("no-such-session", "m00001"), { ok: false, reason: "unknown-session" });
 });
 
+for (const [name, text, preview] of [
+    ["empty text", "", ""],
+    ["short ASCII", "x".repeat(109), "x".repeat(109)],
+    ["exact ASCII limit", "x".repeat(110), "x".repeat(110)],
+    ["over ASCII limit", "x".repeat(111), "x".repeat(110) + "…"],
+    ["exact astral limit", "😀".repeat(110), "😀".repeat(110)],
+    ["over astral limit", "😀".repeat(111), "😀".repeat(110) + "…"],
+    ["astral boundary", "x".repeat(109) + "😀tail", "x".repeat(109) + "😀…"],
+    ["combining code points", "e\u0301".repeat(56), "e\u0301".repeat(55) + "…"],
+    ["Unicode whitespace", " \talpha\r\n\u00a0beta\u2028\u2029gamma\ufeff ", "alpha beta gamma"],
+    ["whitespace-only tail", "x".repeat(110) + "\r\n\t ", "x".repeat(110)],
+    ["collapsed boundary", "x".repeat(109) + "\r\n\t tail", "x".repeat(109) + " …"],
+    ["existing lone surrogate", "x".repeat(109) + "\ud800tail", "x".repeat(109) + "\ud800…"],
+] as const) {
+    test(`message preview preserves ${name}`, async () => {
+        const s = seedSession("preview-boundary", [mkBlock("b1", 1, "summary", ["rm1"], ["rm1"])]);
+        s.state.messageRefs = { byRaw: { rm1: "m00001" }, byRef: { m00001: "rm1" } };
+        s.lastMessages = [{ id: "rm1", role: "tool", contentType: "text", text }];
+        const detail = await buildSessionDetail(s.id);
+        assert.ok(detail);
+        assert.deepEqual(detail.blockDetails[0].directMessages, [{ ref: "m00001", role: "tool", preview }]);
+        assert.equal(s.lastMessages?.[0]?.text, text, "rendering must not modify the retained message");
+    });
+}
+
 test("#3917: a folded message the host pruned reports a miss instead of a guess", async () => {
     const s = seedSession("tree-pruned", [mkBlock("b1", 1, "s", ["rm1"], ["rm1"])]);
     s.state.messageRefs = { byRaw: { rm1: "m00001" }, byRef: { m00001: "rm1" } };

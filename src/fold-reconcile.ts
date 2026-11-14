@@ -1004,7 +1004,8 @@ export function planReconciliation(
     // claimed. A gap cell is bracketed when verified claims exist on both
     // sides — order ownership that the tiers below may corroborate.
     const gapPairs: { oldIdx: number; oldId: string; newId: string }[] = [];
-    const claimedIdx: number[] = [];
+    let minClaimed = Infinity;
+    let maxClaimed = -Infinity;
     const recordGap = (oldIdx: number, oldId: string, newId: string): void => {
         if (oldId !== newId && missingSet.has(oldId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
             gapPairs.push({ oldIdx, oldId, newId });
@@ -1034,7 +1035,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(i);
+            minClaimed = Math.min(minClaimed, i);
+            maxClaimed = Math.max(maxClaimed, i);
             i++;
         }
         const tail = Math.min(oldOrder.length, newOrder.length) - prefix;
@@ -1064,7 +1066,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(iOld);
+            minClaimed = Math.min(minClaimed, iOld);
+            maxClaimed = Math.max(maxClaimed, iOld);
             j++;
         }
     }
@@ -1387,8 +1390,6 @@ export function planReconciliation(
     //   when something verified it.
     if (gapPairs.length > 0) {
         const fenced = plan.byPos > 0 || plan.resyncs > 0;
-        const minClaimed = claimedIdx.length > 0 ? Math.min(...claimedIdx) : -1;
-        const maxClaimed = claimedIdx.length > 0 ? Math.max(...claimedIdx) : -1;
         for (const gap of gapPairs) {
             if (plan.claims.has(gap.oldId) || claimedCandidates.has(gap.newId)) continue;
             const anchor = anchors[gap.oldId];

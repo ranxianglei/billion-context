@@ -421,8 +421,8 @@ function stableMessageKey(m: Record<string, unknown>): string {
  *  handful of fresh rows instead of walking the whole table every turn.
  *  Any miss → leave the previous pointers untouched (never a partial list);
  *  with the debounced save this is the common case right after a turn — a
- *  later settled turn records them. */
-function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
+ *  later settled turn records them. Exposed for unit tests (#6490). */
+export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
     try {
         const store = getStore();
         const prevPtrs = readCanonicalPointers(sessionId);
@@ -430,7 +430,10 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
         let rows: { seq: number; content: string; ts: number | null }[] | null;
         if (prevPtrs !== null && prevPtrs.length <= msgs.length) {
             ptrs = [...prevPtrs];
-            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? Math.max(...ptrs) : -1);
+            // reduce, not Math.max(...spread): a long session's pointer list
+            // outgrows V8's argument-spread limit (~65K-125K depending on
+            // build; measured 125K ok / 130K throws on Node 22 x64) → RangeError (#6490).
+            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? ptrs.reduce((m, p) => (p > m ? p : m), 0) : -1);
         } else {
             ptrs = [];
             rows = store.unifiedRawMessages(sessionId);

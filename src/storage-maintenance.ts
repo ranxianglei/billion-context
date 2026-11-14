@@ -140,7 +140,12 @@ async function runRm(store: SessionStore, target: string | undefined, json: bool
         }
     }
     const dbAfter = indexDbSize(store.dir);
-    const dbRowsReleased = stats ? Object.values(stats.rows).reduce((a, b) => a + b, 0) : null;
+    let dbRowsReleased: number | null = null;
+    if (stats) {
+        // pinnedCheckpoints is a subset of checkpoints, and those rows survive.
+        const { pinnedCheckpoints, ...rowCounts } = stats.rows;
+        dbRowsReleased = Object.values(rowCounts).reduce((a, b) => a + b, 0) - pinnedCheckpoints + stats.casExclusiveBlobs;
+    }
     const dbBytesReleased = stats ? stats.inlineBytes + stats.casExclusiveBytes : null;
     const data = { id: target, filesRemoved: files, dbRowsReleased, dbBytesReleased, indexDbBefore: dbBefore, indexDbAfter: dbAfter, vacuumed, vacuumNote };
     if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
@@ -287,7 +292,8 @@ async function runForeignBlocks(store: SessionStore, json: boolean, apply: boole
     const result = applyForeignBlockSweep(store, plan);
     if (!result) return fail("foreign-block sweep failed mid-run (see log)", json, data);
     data.result = result;
-    if (json) return { code: 0, text: `${JSON.stringify(data, null, 2)}\n` };
+    const code = result.failed.length > 0 ? 1 : 0;
+    if (json) return { code, text: `${JSON.stringify(data, null, 2)}\n` };
     text += `\nexecuted:\n  archived blocks:      ${result.archived.length}`;
     for (const f of result.archived) text += `\n    ${f.sessionId} / ${f.blockId} (tier ${f.tier}, covered ${f.coveredCount})`;
     if (result.failed.length > 0) {
@@ -295,7 +301,7 @@ async function runForeignBlocks(store: SessionStore, json: boolean, apply: boole
         for (const f of result.failed) text += `\n    ${f.finding.sessionId} / ${f.finding.blockId}: ${f.reason ?? "unknown"}`;
     }
     text += "\nnote: takes effect on next session load/restart — a running host keeps its in-memory copy until reload";
-    return { code: 0, text: `${text}\n` };
+    return { code, text: `${text}\n` };
 }
 
 export async function runSessionsCommand(opts: {

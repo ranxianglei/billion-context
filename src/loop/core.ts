@@ -330,14 +330,17 @@ type RoundPart =
     | { kind: "standalone_signature"; signature: string };
 
 export type ParsedStreamEvent =
-    | { kind: "text"; delta: string; raw?: Buffer }
+    // rawHandled: the adapter carries this delta in another event's complete
+    // frame (or buffers that frame until tool settlement). Keep accounting it,
+    // but do not synthesize a second client frame in continuation rounds.
+    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean }
     // round2-hold: withheld marks a reasoning PAYLOAD the adapter kept off the
     // client wire (bili-owned round ≥ 2 on a signing upstream — see
     // ParseStreamOpts.upstreamSignsThinking). It still feeds the loop's
     // accounting (re-request rebuild, stats) but must NEVER be forwarded: the
     // adapter releases the real bytes itself, together with the signature, in
     // one burst — so a truncation before that signature leaves no client state.
-    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean; withheld?: boolean }
+    | { kind: "reasoning"; delta: string; raw?: Buffer; rawHandled?: boolean; signature?: string; blockEnd?: boolean; withheld?: boolean }
     // #1960: Anthropic redacted_thinking arrives whole in content_block_start
     // (opaque base64 `data`). The loop must rebuild it byte-exact in position
     // on re-request — Anthropic rejects modified thinking-family blocks — so
@@ -965,9 +968,9 @@ export async function* runCompressLoop(
                             roundParts.push(tp);
                         }
                         tp.text += ev.delta;
-                        if (!ctx.textProtocol && ev.raw) {
+                        if (!ctx.textProtocol && (ev.raw || ev.rawHandled)) {
                             recordReplyText("text", ev.delta);
-                            yield fwd(ev.raw, true);
+                            if (ev.raw) yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
                             recordReplyText("text", ev.delta);
                             yield fwd(adapter.emitText(ev.delta), true);
@@ -997,9 +1000,9 @@ export async function* runCompressLoop(
                         // re-create one block per delta and, worse, hand the client an
                         // unsigned block a truncation can poison (#2501).
                         if (!ctx.textProtocol && !ev.withheld) {
-                            if (ev.raw) {
+                            if (ev.raw || ev.rawHandled) {
                                 recordReplyText("reasoning", ev.delta);
-                                yield fwd(ev.raw);
+                                if (ev.raw) yield fwd(ev.raw);
                             } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
                                 recordReplyText("reasoning", ev.delta);
                                 yield fwd(adapter.emitReasoning(ev.delta));
@@ -1051,6 +1054,11 @@ export async function* runCompressLoop(
                         }
                     }
                 }
+
+                // Parsing may stop on an in-band error before HTTP EOF. Release
+                // this attempt before a retry replaces currentUpstream. A dump
+                // tee can still own its sibling, so do not await cancellation.
+                void currentUpstream.cancel().catch(() => {});
 
                 // #2701: threads acceptance. This round's response started ⇔
                 // the tail advanced past the id the sent body continued from ⇔
@@ -1916,6 +1924,9 @@ export async function* runCompressLoop(
             roundBody = newBody;
         }
     } finally {
+        // Consumer return or a parser throw can bypass the per-attempt cleanup.
+        // Adapters have released their readers; cancelling a closed body is a no-op.
+        void currentUpstream.cancel().catch(() => {});
         // #2701: anthropic Threads — persist every response id observed this
         // turn (round 1's message_start id first, then one per internal
         // round) so an inbound continue targeting an id the PROXY itself
