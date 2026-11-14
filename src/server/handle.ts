@@ -9,7 +9,7 @@ import { defaultPrompts, type CompressionCore, type Config, type PackSurface, ty
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, refreshRouteTablesIfFileChanged, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
@@ -184,6 +184,14 @@ export async function handle(
     const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
     res.on("close", close);
     try {
+        // #6644: pick up direct edits to the config file's providers.* (incl.
+        // per-route proxy) on every request, so the route/proxy table the request
+        // resolves against matches what GET /__bili/config already echoes. Cheap
+        // no-op (one page-cache read + string compare) unless the file actually
+        // changed; a failed refresh must never break the request — fall through
+        // to the (possibly stale) table rather than erroring.
+        try { refreshRouteTablesIfFileChanged(opts, log); }
+        catch (err) { log("warn", `[acp-config] route-table refresh failed, continuing with current table: ${String(err)}`); }
         // #3248 incremental lane: intercept BEFORE handleAdminRoute — the turn
         // endpoint re-enters this same pipeline with a synthetic anthropic
         // request, which requires module-local access to handleRequest. The
