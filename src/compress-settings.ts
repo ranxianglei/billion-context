@@ -83,6 +83,8 @@ export function mergeCompress(
         requireRecommendation: pick("requireRecommendation"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
+        preserveRecentTurns: pick("preserveRecentTurns"),
+        protectUserMessages: pick("protectUserMessages"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         maxSummaryLength: pick("maxSummaryLength"),
         minSummaryLength: pick("minSummaryLength"),
@@ -380,6 +382,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         tiers,
         preserveRecentMessages: s.preserveRecentMessages ?? base.preserveRecentMessages,
         preserveRecentTokens: s.preserveRecentTokens ?? base.preserveRecentTokens,
+        // #4593: `??` (not `||`) — an explicit 0 / false at a deeper level is
+        // meaningful (off) and must override an enabled shallower level.
+        preserveRecentTurns: s.preserveRecentTurns ?? base.preserveRecentTurns,
+        protectUserMessages: s.protectUserMessages ?? base.protectUserMessages,
         compress: {
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
