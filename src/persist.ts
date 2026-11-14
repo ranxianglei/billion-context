@@ -1025,11 +1025,13 @@ export class SessionStore {
         const filesByRoot = new Map<string, string[]>();
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             const files = existsSync(root) ? await walkJsonFiles(root) : [];
+            const rootFiles: string[] = [];
             for (const file of files) {
                 if (path.basename(file).endsWith(".content-store.json")) continue;
                 this.diskFiles.push(file);
-                filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
+                rootFiles.push(file);
             }
+            filesByRoot.set(root, rootFiles);
         }
         // #3199: unified mode (shadow or full) — the listener must not wait
         // for the whole corpus to parse. Two stages: (1) parse a bounded
