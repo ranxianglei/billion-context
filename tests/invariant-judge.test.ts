@@ -5,8 +5,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
-import { judgeInboundOutbound, maybeRunInvariantJudge, maybeJudgeContinuity, _setInvariantJudgeForTest, type JudgeVerdict } from "../src/invariant-judge.js";
+import { judgeInboundOutbound, maybeRunInvariantJudge, maybeJudgeContinuity, _setInvariantJudgeForTest, activeBlockCoveredIds, type JudgeVerdict } from "../src/invariant-judge.js";
 import { setLogCapture } from "../src/logger.js";
+import { createInitialState, type CompressionBlock } from "acp-kernel";
 
 let n = 0;
 function mk(role: CoreMessage["role"], contentType: CoreMessage["contentType"], text?: string, extra: Partial<CoreMessage> = {}): CoreMessage {
@@ -485,6 +486,308 @@ test("#4241 wiring: maybeRunInvariantJudge honors renderTailStart (green on rend
   } finally {
     _setInvariantJudgeForTest(false);
   }
+});
+
+// --- #4401: plugin carrier regime (KDD#7/#1567 steady state) ----------------
+// Long-lived plugin-lane sessions fold repeatedly via the plugin tool API; the
+// client re-sends its full history INCLUDING every riding compress pair, and
+// stripKernelSummaries removes the kernel anchor while that pair rides — so
+// the outbound carries ZERO acp_summary markers. The judge must read that as
+// a clean fold (covered cells excused via host state), not a mass drop.
+
+const COMPRESS_ARGS = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: "folded old stuff" }] });
+const COMPRESS_RECEIPT = "[Compressed 2 messages → 1 block(s), ~42 tokens saved.]";
+function compressPair(callId: string): CoreMessage[] {
+  return [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "compress", toolCallId: callId }),
+    mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId }),
+  ];
+}
+
+test("#4401 steady-state plugin fold: covered cells absent + pair riding -> green (the 1104-warns-per-day shape)", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const k1 = mk("user", "text", "keep-1");
+  const k2 = mk("assistant", "text", "keep-2");
+  const tail = mk("user", "text", "new question");
+  const entry = [head, c1, c2, k1, k2, ...compressPair("call_c1"), tail];
+  // anchor stripped (#1567): exit = head + uncovered + riding pair + tail
+  const exit = [head, k1, k2, ...compressPair("call_c1"), tail];
+  const v = judgeInboundOutbound(entry, exit, { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.covered, 2);
+  // matched stops where the walk hits the fold point (the receipt twin itself
+  // lives inside the free fold region, like everything behind an anchor).
+  assert.equal(v.matched, 4);
+});
+
+test("#4401 negative control: same shape WITHOUT host coverage state -> red (the verdict rides on real state, not on the receipt alone)", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const entry = [head, c1, c2, ...compressPair("call_c1")];
+  const exit = [head, ...compressPair("call_c1")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop" || x.kind === "mid-history-rewrite"));
+});
+
+test("#4401 teeth: an UNCOVERED drop still fires while receipts ride", () => {
+  const head = mk("user", "text", "preamble");
+  const covered = mk("assistant", "text", "old-1");
+  const victim = mk("user", "text", "the current question");
+  const keep = mk("user", "text", "keep");
+  const entry = [head, covered, victim, keep, ...compressPair("call_c1")];
+  const exit = [head, keep, ...compressPair("call_c1")];
+  const v = judgeInboundOutbound(entry, exit, { coveredIds: new Set([covered.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop" || x.kind === "mid-history-rewrite"));
+});
+
+test("#4401 zero-carrier anomaly: covered cells missing AND no anchor AND no pair -> stays red (fold left no evidence)", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const keep = mk("user", "text", "keep");
+  const entry = [head, c1, c2, keep];
+  const exit = [head, keep];
+  const v = judgeInboundOutbound(entry, exit, { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.equal(v.folded, false);
+  assert.ok(v.violations.length >= 2);
+});
+
+test("#4401 refused compress call does NOT mark the folded regime (it folded nothing)", () => {
+  const head = mk("user", "text", "preamble");
+  const victim = mk("user", "text", "the current question");
+  const q = mk("user", "text", "later question");
+  const refused: CoreMessage[] = [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "compress", toolCallId: "call_r" }),
+    mk("tool", "tool-result", "[Compression refused: Range truncated at that boundary — so no summary can land above the question it answers (#3953)]", { toolName: "compress", toolCallId: "call_r" }),
+  ];
+  const entry = [head, victim, q];
+  const exit = [head, ...refused, q];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.folded, false);
+  assert.equal(v.ok, false);
+  // and the same pair with nothing missing is clean exempt volume, not a defect
+  const intact = [head, ...refused, q];
+  assert.equal(judgeInboundOutbound(intact, intact).ok, true, JSON.stringify(judgeInboundOutbound(intact, intact).violations));
+});
+
+test("#4401 success receipt counts as exempt carrier volume in the ledger", () => {
+  const v = judgeInboundOutbound([], compressPair("call_ledger"));
+  assert.equal(v.ok, true);
+  assert.equal(v.folded, true);
+  assert.equal(v.exempt?.carrier, 2);
+});
+
+test("#4401 multi-fold steady state: several riding pairs, each span covered -> green", () => {
+  const head = mk("user", "text", "preamble");
+  const a1 = mk("assistant", "text", "a-old-1");
+  const a2 = mk("user", "text", "a-old-2");
+  const mid = mk("user", "text", "between folds");
+  const b1 = mk("assistant", "text", "b-old-1");
+  const b2 = mk("user", "text", "b-old-2");
+  const tail = mk("user", "text", "new question");
+  const entry = [head, a1, a2, ...compressPair("call_A"), mid, b1, b2, ...compressPair("call_B"), tail];
+  const exit = [head, ...compressPair("call_A"), mid, ...compressPair("call_B"), tail];
+  const v = judgeInboundOutbound(entry, exit, { coveredIds: new Set([a1.id, a2.id, b1.id, b2.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  // only the cells BEFORE the first fold point are walked; everything behind it
+  // (incl. fold B's span) is free I2 territory, so covered counts A's span only.
+  assert.equal(v.covered, 2);
+});
+
+test("activeBlockCoveredIds: union of ACTIVE blocks only; undefined when nothing covered", () => {
+  const blk = (ids: string[], active: boolean): CompressionBlock => ({
+    blockId: `b${ids.join("")}`, runId: "r", tier: 1, summary: "s", directMessageIds: [], effectiveMessageIds: ids,
+    directBlockIds: [], compressedTokens: 1, createdAt: 0, survivedCount: 0, generation: "young", active,
+  });
+  assert.equal(activeBlockCoveredIds(undefined), undefined);
+  const s0 = createInitialState();
+  assert.equal(activeBlockCoveredIds(s0), undefined);
+  const s1 = createInitialState();
+  s1.blocks = [blk(["x", "y"], true), blk(["z"], false)];
+  const set = activeBlockCoveredIds(s1);
+  assert.deepEqual([...(set ?? [])].sort(), ["x", "y"]);
+});
+
+// --- #4401 review follow-ups: cap bounding + MCP-dialect name parity --------
+// The exemption ledger counts every riding pair (2 msgs) as carrier volume; a
+// steady session with >64 active blocks legally exceeds the raw cap of 128 and
+// must stay green via the host-state ceiling, while unbounded fake-carrier
+// volume must still trip it. Name recognition must cover the MCP-dialect form
+// (mcp__bili__compress) exactly like I3 does, or that lane keeps the same storm.
+
+test("#4401 follow-up: 86-pair steady state (reporter's session shape) stays green under the cap", () => {
+  const head = mk("user", "text", "preamble");
+  const tail = mk("user", "text", "new question");
+  const entry: CoreMessage[] = [head];
+  const exit: CoreMessage[] = [head];
+  const coveredIds = new Set<string>();
+  for (let k = 0; k < 86; k++) {
+    const c1 = mk("assistant", "text", `covered-a ${k} lorem padding`);
+    const c2 = mk("user", "text", `covered-b ${k} lorem padding`);
+    entry.push(c1, c2, ...compressPair(`call_k${k}`));
+    coveredIds.add(c1.id);
+    coveredIds.add(c2.id);
+    exit.push(...compressPair(`call_k${k}`));
+  }
+  entry.push(tail);
+  exit.push(tail);
+  const v = judgeInboundOutbound(entry, exit, { coveredIds });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  // 86 pairs x 2 halves ride as carrier volume — far past the old raw cap of
+  // 128; only the two cells ahead of the first riding call are walked (both
+  // excused), everything behind the first fold point is free I2 territory.
+  assert.equal(v.exempt?.carrier, 172);
+  assert.equal(v.covered, 2);
+});
+
+test("#4401 follow-up teeth: unbounded fake-carrier volume still trips with host state present", () => {
+  const head = mk("user", "text", "preamble");
+  const tail = mk("user", "text", "new question");
+  const entry: CoreMessage[] = [head];
+  const exit: CoreMessage[] = [head];
+  const coveredIds = new Set<string>();
+  for (let k = 0; k < 64; k++) {
+    const c1 = mk("assistant", "text", `covered ${k} lorem padding`);
+    entry.push(c1, ...compressPair(`call_f${k}`));
+    coveredIds.add(c1.id);
+    exit.push(...compressPair(`call_f${k}`));
+  }
+  for (let k = 0; k < 130; k++) {
+    exit.push(mk("user", "text", `\x3cbili-chain n=${k}\x3e`));
+  }
+  entry.push(tail);
+  exit.push(tail);
+  const v = judgeInboundOutbound(entry, exit, { coveredIds });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "exemption-overflow"));
+});
+
+test("#4401 follow-up: MCP-dialect pair (mcp__bili__compress) marks the regime like the bare form", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const pair = [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "mcp__bili__compress", toolCallId: "call_d1" }),
+    mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "mcp__bili__compress", toolCallId: "call_d1" }),
+  ];
+  const v = judgeInboundOutbound([head, c1, ...pair], [head, ...pair], { coveredIds: new Set([c1.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.covered, 1);
+});
+
+test("#4401 follow-up: refused dialect receipt folds nothing (regime NOT marked)", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const pair = [
+    mk("assistant", "tool-call", COMPRESS_ARGS, { toolName: "mcp__bili__compress", toolCallId: "call_r1" }),
+    mk("tool", "tool-result", "[Compression FAILED: range outside the compressible window]", { toolName: "mcp__bili__compress", toolCallId: "call_r1" }),
+  ];
+  const v = judgeInboundOutbound([head, c1, ...pair], [head, ...pair], { coveredIds: new Set([c1.id]) });
+  assert.equal(v.ok, false);
+  assert.equal(v.folded, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop"));
+});
+
+// --- #4401/#5866 premise fix: the stubbed call half --------------------------
+// While the pair rides, hideConsumedCompressCalls rewrites the OUTBOUND call
+// half: every content entry whose summary exceeds 200 chars becomes the exact
+// leading stub (kernel/src/hide-consumed.ts compactEntry: clampPrefix(summary,
+// 199) + U+2026), and on id-matched lanes entries whose range is no longer live
+// are dropped (rewriteCompressText). The inbound twin still carries the full
+// text, so plain byte equality never holds for long summaries — without a
+// sanctioned-twin proof the stub reads as a mid-history rewrite and #4401's
+// storm persists for exactly that population. All fixtures here use >200-char
+// summaries on purpose (the earlier ones sit at 15–197 chars, below the stub
+// threshold, which is why the asymmetry was never exercised).
+
+const LONG_SUMMARY = "folded old stuff ".repeat(13); // 221 chars > SUMMARY_STUB_CHARS
+const LONG_SUMMARY_B = "collapsed older span ".repeat(12); // 252 chars
+const STUB_ELLIPSIS = "\u2026";
+function stubOf(s: string): string { return `${s.slice(0, 199)}${STUB_ELLIPSIS}`; }
+
+test("#4401/#5866 POS: >200-char summary — outbound call half is the kernel's exact stub while inbound carries the full text -> green", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub1";
+  const fullArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] });
+  const stubArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) }] });
+  assert.notEqual(stubArgs, fullArgs); // sanity: the asymmetry really exists
+  const pairIn = [mk("assistant", "tool-call", fullArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", stubArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.covered, 2);
+});
+
+test("#4401/#5866 POS: multi-range call with a dead range — outbound drops the dead entry and stubs the live one -> green", () => {
+  const head = mk("user", "text", "preamble");
+  const cells = [mk("assistant", "text", "old-1"), mk("user", "text", "old-2"), mk("assistant", "text", "old-3"), mk("user", "text", "old-4")];
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub2";
+  const fullArgs = JSON.stringify({ content: [
+    { startId: "m00002", endId: "m00003", summary: LONG_SUMMARY },
+    { startId: "m00005", endId: "m00006", summary: LONG_SUMMARY_B },
+  ] });
+  const stubArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) }] });
+  const pairIn = [mk("assistant", "tool-call", fullArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", stubArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, ...cells, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set(cells.map((c) => c.id)) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: same-length clip that is NOT the kernel's exact stub form stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub3";
+  const fakeStub = `${LONG_SUMMARY.slice(0, 196)}...`; // ASCII dots, not the kernel's U+2026 form
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: fakeStub }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: rewritten long summary (different text, similar length class) stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub4";
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: "REWRITTEN ".repeat(28) }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: exit call quoting a range the inbound call never had stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub5";
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [
+    { startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) },
+    { startId: "m00099", endId: "m00100", summary: "planted range" },
+  ] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
 });
 
 // --- #564/#2627 producer-owned separator provenance --------------------

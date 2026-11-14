@@ -1,7 +1,7 @@
 import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catalog-cache.js";
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
-import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { activeBlockCoveredIds, maybeRunInvariantJudge } from "../invariant-judge.js";
 import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
@@ -1218,6 +1218,9 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // which would accuse the client of an insertion bili itself made.
             ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            // #4401: active-block coverage — in the plugin carrier regime the
+            // covered cells' absence is the fold itself, not a drop.
+            coveredIds: activeBlockCoveredIds(prepared.session.state),
         });
         const sentSlot = lastForwardedBody(prepared.session);
         if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
