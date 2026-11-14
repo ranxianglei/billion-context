@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { resetProxyCache, validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap, type WireProtocol } from "./util.js";
 import { DEFAULT_MITM_DOMAINS, matchesAnyMitmDomain } from "./mitm-domains.js";
@@ -1518,6 +1518,72 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
     return routes;
 }
 
+// #6644: the route/proxy table (opts.routes + opts.namedProviders) is a startup
+// snapshot; a direct edit to the config file's `providers.*` (incl. per-route
+// `proxy`) stays inert until an explicit POST /__bili/config/reload or web Apply,
+// while GET /__bili/config ALREADY reads the file — so "shown" and "applied"
+// silently disagree (the new lane is ignored, egress goes proxy=direct, and the
+// per-host circuit opens and reads like a network fault). Track the config file's
+// raw text and re-apply the route tables in place when it changes, so providers.*
+// take effect on the next request, matching what GET already echoes.
+//
+// Content-based (raw text), NOT mtime/size: back-to-back rewrites can land on the
+// same sub-ms mtime on common filesystems (#2078), so a stat-keyed check would
+// serve stale routes right after an edit. The per-request read is a page-cache
+// hit (~µs) — the file is already re-read 5-10×/request by the knob tier — and the
+// expensive re-parse + re-normalization runs only on an actual change.
+let lastAppliedRouteConfigRaw: string | null = null;
+
+/** Raw text of the main config file right now ("" when missing) — the same
+ *  bytes loadConfigFile() parses, BOM-stripped. */
+export function currentConfigRawText(): string {
+    try { return readFileSync(configFile(), "utf8").replace(/^\uFEFF/, ""); }
+    catch { return ""; }
+}
+
+/** Re-read the route/proxy tables from the config file and swap them into `opts`
+ *  in place (the SAME object references the in-flight handle() closures captured,
+ *  so resolveUpstream/resolveProxyDecision see the new entries without
+ *  reassignment), then refresh the change tracker. Returns the applied provider
+ *  names (for caller logging / responses). Does NOT reset the proxy dispatcher
+ *  cache — the caller does that (a changed proxy URL must not keep a stale
+ *  cached agent). */
+export function applyRouteTables(opts: ProxyOptions): string[] {
+    const fresh = loadRoutes();
+    for (const k of Object.keys(opts.routes)) delete opts.routes[k];
+    Object.assign(opts.routes, fresh);
+    opts.namedProviders ??= {};
+    for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
+    Object.assign(opts.namedProviders, loadNamedProviders());
+    lastAppliedRouteConfigRaw = currentConfigRawText();
+    return Object.keys(fresh);
+}
+
+/** Per-request hook: re-apply the route tables only when the config file's
+ *  content changed since the last apply. Returns true when it re-applied (the
+ *  caller then resets the proxy dispatcher cache). Cheap no-op on the common
+ *  unchanged path: one page-cache readFileSync + a string compare.
+ *
+ *  A null tracker means the tables were NOT loaded from the file (e.g. a caller
+ *  that builds ProxyOptions by hand, as the e2e suites do) — those opts are
+ *  authoritative as-is and must never be clobbered by a file re-read. */
+export function refreshRouteTablesIfFileChanged(opts: ProxyOptions, log: (level: string, msg: string) => void): boolean {
+    if (lastAppliedRouteConfigRaw === null) return false;
+    const raw = currentConfigRawText();
+    if (raw === lastAppliedRouteConfigRaw) return false;
+    const names = applyRouteTables(opts);
+    resetProxyCache();
+    log("info", `[acp-config] route tables applied from config file (${names.length} providers): ${names.join(", ") || "(none)"}`);
+    return true;
+}
+
+/** Test seam: stamp the tracker with a sentinel that matches no real file, so
+ *  the next refresh re-applies (a null tracker means "not file-loaded" and is
+ *  deliberately skipped). */
+export function _resetRouteRefreshTrackerForTest(): void {
+    lastAppliedRouteConfigRaw = "\u0000__bili_route_refresh_forced__\u0000";
+}
+
 /** Resolved passthrough state shared by loadOptions and the web config API
  *  (single source of truth — the GET handler must not re-derive it). */
 export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
@@ -1686,6 +1752,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
     const namedProviders = loadNamedProviders(env);
+    // #6644: stamp the change tracker with the file state these routes were
+    // resolved from, so the per-request refresh (refreshRouteTablesIfFileChanged)
+    // treats the just-loaded table as current and only re-applies on a real edit.
+    lastAppliedRouteConfigRaw = currentConfigRawText();
     warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const modelEndpoints = parseModelEndpointPatterns(fileConfig.modelEndpointPatterns);
