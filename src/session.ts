@@ -584,11 +584,27 @@ export type Session = {
           *  Absent on factors published before this field existed → reads
           *  treat it as compatible and retire it through normal rollover. */
          calibratedEstimateModel?: string;
+         /** #5952: provenance of the published calibratedEstimate —
+          *  "text-only-v1" when every sample in calibrationRing came from a
+          *  text-only final wire estimate (per-request capture pair); absent
+          *  for factors trained on the legacy shared prepare slot, whose
+          *  evidence may include image-billed usage. The read gate
+          *  (currentCalibrationFactor) only applies a factor carrying this
+          *  stamp. Persisted so a restart doesn't silently re-arm a stale
+          *  mixed-modal multiplier; reset at native-compaction boundaries
+          *  with the rest of the baseline stats. */
+         calibratedEstimateProvenance?: string;
          /** #1933 F1 / #2117 B: evidence ring behind calibratedEstimate —
           *  the recent admitted raw samples for ONE origin+model (max 3).
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
-          *  native-compaction boundaries with the rest of the baseline stats. */
-         calibrationRing?: { origin: string; model?: string; values: number[] };
+          *  native-compaction boundaries with the rest of the baseline stats.
+          *  #5952: provenances[i] is the provenance of values[i] —
+          *  "text-only-v1" for a sample from a text-only final wire
+          *  estimate, undefined for a legacy shared-slot sample. The
+          *  published factor's provenance is "text-only-v1" only when every
+          *  value in the window carries it; one legacy sample in the window
+          *  keeps the factor inert until the window flushes it out. */
+         calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate;
@@ -1769,6 +1785,8 @@ export function resetSessionCompression(session: Session): void {
     delete session.stats.calibratedEstimateOrigin;
     // #2117 B: same boundary — the factor's model provenance dies with it.
     delete session.stats.calibratedEstimateModel;
+    // #5952: same boundary — the factor's text-only provenance dies with it.
+    delete session.stats.calibratedEstimateProvenance;
     delete session.stats.calibrationRing;
     delete session.stats.lastLocalTextEstimate;
     delete session.stats.lastLocalTextEstimateOrigin;

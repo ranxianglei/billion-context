@@ -44,7 +44,7 @@ import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
-import type { WireProtocol } from "./util.js";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY, type WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
 /**
@@ -222,7 +222,8 @@ interface PersistedSession {
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
-        calibrationRing?: { origin: string; values: number[] };
+        calibratedEstimateProvenance?: string;
+        calibrationRing?: { origin: string; values: number[]; provenances?: (string | undefined)[] };
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -4104,14 +4105,24 @@ function restoreCalibratedEstimate(v: unknown): number | undefined {
 // itself would admit (finite, within the plausibility band) and only the newest
 // window-size entries; anything else drops the ring wholesale so a malformed
 // file can neither teach a factor nor mask a fresh learning run on restart.
-function restoreCalibrationRing(v: unknown): { origin: string; values: number[] } | undefined {
+// #5952: (value, provenance) pairs stay aligned through the filter + window
+// slice, so a restored ring's provenance verdict matches its values; a stored
+// provenance entry counts only on an exact "text-only-v1" match, and the key
+// is omitted entirely when no entry survives (legacy files keep their exact
+// restored shape).
+function restoreCalibrationRing(v: unknown): { origin: string; values: number[]; provenances?: (string | undefined)[] } | undefined {
     if (!v || typeof v !== "object") return undefined;
-    const ring = v as { origin?: unknown; values?: unknown };
+    const ring = v as { origin?: unknown; values?: unknown; provenances?: unknown };
     if (typeof ring.origin !== "string" || ring.origin.length === 0) return undefined;
     if (!Array.isArray(ring.values)) return undefined;
-    const values = ring.values.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= CALIBRATION_SAMPLE_MIN && x <= CALIBRATION_SAMPLE_MAX);
-    const recent = values.slice(-CALIBRATION_SAMPLE_WINDOW);
-    return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
+    const storedProvenances = Array.isArray(ring.provenances) ? ring.provenances : undefined;
+    const kept = ring.values
+        .map((x, i) => ({ value: x, provenance: storedProvenances?.[i] }))
+        .filter((e): e is { value: number; provenance: unknown } => typeof e.value === "number" && Number.isFinite(e.value) && e.value >= CALIBRATION_SAMPLE_MIN && e.value <= CALIBRATION_SAMPLE_MAX);
+    const recent = kept.slice(-CALIBRATION_SAMPLE_WINDOW);
+    if (recent.length === 0) return undefined;
+    const provenances = recent.map((e) => (e.provenance === CALIBRATION_PROVENANCE_TEXT_ONLY ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined));
+    return { origin: ring.origin, values: recent.map((e) => e.value), ...(provenances.some((p) => p !== undefined) ? { provenances } : {}) };
 }
 
 function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
@@ -4197,6 +4208,10 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
+            // #5952: restored on an exact "text-only-v1" match only, like the
+            // ring's provenance entries — a stale mixed-modal multiplier must
+            // not survive a restart wearing a provenance it never earned.
+            calibratedEstimateProvenance: stats.calibratedEstimateProvenance === CALIBRATION_PROVENANCE_TEXT_ONLY ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the

@@ -13,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteCalibrationPair, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { rewrapCommandcodeBody } from "../commandcode-wire.js";
@@ -1161,6 +1161,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             scaledText,
             imageTokens: est.imageTokens,
             calibrated: scaledText !== est.textOverhead,
+        });
+        // #5952: the calibration pair for THIS send — the final wire text
+        // estimate (no image reserve) + the image reserve of the same body,
+        // so the settle that bills this body trains the text multiplier only
+        // from text-only evidence, even when a concurrent request overwrote
+        // the shared prepare slot in between.
+        noteCalibrationPair(prepared.session, {
+            estimate: est.textOverhead,
+            imageTokens: est.imageTokens,
+            origin: normalizeUpstreamOrigin(upstreamUrl),
+            model: typeof sentParsed?.model === "string" && sentParsed.model !== "" ? sentParsed.model : (prepared.model ?? prepared.google?.model),
         });
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").

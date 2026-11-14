@@ -11,7 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { settleUsageReport } from "../src/cache-ledger.ts";
-import { currentCalibrationFactor } from "../src/util.ts";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY, currentCalibrationFactor } from "../src/util.ts";
 import { displayContextBest, getSession, listSessions, resetSessionCompression, zeroStats, type Session } from "../src/session.ts";
 
 // #2117: the admin bar showed the char-count UPPER BOUND of the in-flight send
@@ -46,9 +46,11 @@ test("currentCalibrationFactor: invalid factors degrade to absent", () => {
 });
 
 test("currentCalibrationFactor: cross-model factors act as absent, missing info keeps them", () => {
-    const st = { calibratedEstimate: 0.5 };
+    const st = { calibratedEstimate: 0.5, calibratedEstimateProvenance: CALIBRATION_PROVENANCE_TEXT_ONLY };
     // Legacy factor (never recorded a model) or unknown current model — missing
     // information must NOT invalidate evidence; rollover retires it naturally.
+    // (#5952: the provenance stamp is the exception — a factor without a
+    // text-only stamp never decides, however well it matches on model.)
     assert.equal(currentCalibrationFactor(st, "gpt-x"), 0.5);
     assert.equal(currentCalibrationFactor(st, undefined), 0.5);
     assert.equal(currentCalibrationFactor({ ...st, calibratedEstimateModel: "gpt-x" }, undefined), 0.5);
@@ -234,11 +236,13 @@ test("resetSessionCompression drops the new provenance/display fields at the bou
     st.calibratedEstimate = 0.7;
     st.calibratedEstimateOrigin = "http://a";
     st.calibratedEstimateModel = "gpt-x";
+    st.calibratedEstimateProvenance = CALIBRATION_PROVENANCE_TEXT_ONLY;
     st.calibrationRing = { origin: "http://a", model: "gpt-x", values: [0.7] };
     st.contextEstimateTokens = 12_000;
     st.contextEstimateCalibrated = true;
     resetSessionCompression(s);
     assert.equal(st.calibratedEstimateModel, undefined);
+    assert.equal(st.calibratedEstimateProvenance, undefined);
     assert.equal(st.calibrationRing, undefined);
     assert.equal(st.contextEstimateTokens, undefined);
     assert.equal(st.contextEstimateCalibrated, undefined);
