@@ -759,20 +759,60 @@ class ResponsesWsResponse extends http.ServerResponse {
 
 export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
+    // #6172: ONE marked transport instance shared by probe and turns — the
+    // egress-shed tag (#3701) must cover the probe too, and per-call wrapping
+    // churned WeakSet entries for no reason.
+    private readonly upstreamFetch;
     private readonly history = new ResponsesWsHistory();
     private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
+    // #6172: admission state machine made observable. Every rejection must
+    // answer "which request holds the lane, since when, how did we get here"
+    // — ids/counts/bytes/ages only, NEVER message bodies.
+    private gen = 0;
+    private activeMeta?: { gen: number; kind: "probe" | "turn"; startedAt: number; prevId?: string; items: number; bytes: number };
+    private readonly transitions: string[] = [];
+    private readonly bornAt = Date.now();
 
     constructor(private readonly context: WsBridgeContext) {
         this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
+        this.upstreamFetch = markWsLaneTransport((url, options) => this.transport.fetch(url, options));
         context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 
     onMessage(data: Buffer, binary: boolean): void {
         const peer = this.context.peer;
         if (binary) { peer.close(1003, "Responses requires text frames"); return; }
-        if (this.busy) { this.context.log("warn", "client rejected reason=response-in-progress"); peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409)); return; }
+        if (this.busy) {
+            // #6172: the bare reason hid whether the lane holder was still
+            // executing or a wedged prewarm probe — correlate the REJECTED
+            // frame against the ACTIVE admission. Best-effort identifiers: a
+            // busy-lane frame is normally well-formed JSON; on parse failure
+            // the req_* fields are simply omitted and the reject still happens.
+            let reqPrevId: string | undefined;
+            let reqItems: number | undefined;
+            try {
+                const rawFrame: unknown = JSON.parse(data.toString());
+                if (object(rawFrame)) {
+                    if (typeof rawFrame.previous_response_id === "string") reqPrevId = rawFrame.previous_response_id;
+                    if (Array.isArray(rawFrame.input)) reqItems = rawFrame.input.length;
+                }
+            } catch { /* unparseable frame while busy — identifiers omitted */ }
+            const meta = this.activeMeta;
+            const fields: string[] = [`req_bytes=${data.length}`];
+            if (reqPrevId !== undefined) fields.push(`req_prev_id=${reqPrevId}`);
+            if (reqItems !== undefined) fields.push(`req_items=${reqItems}`);
+            if (meta !== undefined) {
+                fields.push(`active_gen=${meta.gen}`, `active_kind=${meta.kind}`, `active_age_ms=${Date.now() - meta.startedAt}`, `active_prev_id=${meta.prevId ?? "none"}`, `active_items=${meta.items}`);
+                if (meta.kind === "turn") fields.push(`active_terminal=${this.active?.terminal ?? false}`);
+            }
+            fields.push(`admitted=${this.gen}`);
+            if (this.transitions.length > 0) fields.push(`transitions=[${this.transitions.join(" ")}]`);
+            this.context.log("warn", `client rejected reason=response-in-progress ${fields.join(" ")}`);
+            peer.send(errorFrame("response_in_progress", "Only one active response is supported", 409));
+            return;
+        }
         // Each admission failure names its own branch on the wire AND in the log:
         // the old shared "invalid_request" / "Invalid or oversized" bucket (#2126)
         // hid whether the client sent an unsupported event, an unsupported
@@ -845,6 +885,17 @@ export class ResponsesWsSession implements WsBridgeSession {
             return;
         }
         this.busy = true;
+        this.gen += 1;
+        const probe = Array.isArray(body.input) && body.input.length === 0 && body.generate === false;
+        this.activeMeta = {
+            gen: this.gen,
+            kind: probe ? "probe" : "turn",
+            startedAt: Date.now(),
+            prevId: typeof body.previous_response_id === "string" ? body.previous_response_id : undefined,
+            items: Array.isArray(body.input) ? body.input.length : 0,
+            bytes: Buffer.byteLength(wire),
+        };
+        this.note(`${probe ? "probe" : "turn"}-admit#${this.gen}`);
         const source = this.context.source;
         const handshakeHeaders: Record<string, string> = {};
         const connectionHeaders = connectionNamedHeaders(source.headers.connection);
@@ -859,12 +910,22 @@ export class ResponsesWsSession implements WsBridgeSession {
         // kernel's ref sequence, shifting every later fold anchor; injecting
         // tools and compression prompts into a no-generation request is pure
         // byte inflation. Forward verbatim on the upstream transport.
-        if (Array.isArray(body.input) && body.input.length === 0 && body.generate === false) {
+        if (probe) {
             void (async () => {
                 const sendFrame = (payload: string): void => { if (peer.readyState === WebSocket.OPEN) peer.send(payload); };
                 let sawTerminal = false;
+                let probeOutcome = "failed";
+                let clearProbeTimer: (() => void) | undefined;
                 try {
-                    const response = await this.transport.fetch(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body) });
+                    // #6172: the probe used to be the ONLY unbounded upstream call on this
+                    // session — no signal, no watchdog — so a wedged handshake or a silent
+                    // first event pinned busy=true forever and 409'd every later turn until
+                    // the client disconnected. Same bounded discipline as turns now: the
+                    // first-byte budget covers handshake+first event, the idle budget the
+                    // mid-stream silence; an abort lands in the catch below as an explicit
+                    // error frame, and settle() releases the lane either way.
+                    const { response, clearTimer } = await withFetchTransport(this.upstreamFetch, () => fetchWithTimeout(this.context.upstreamUrl, { method: "POST", headers: { ...handshakeHeaders, "content-type": "application/json" }, body: JSON.stringify(body) }));
+                    clearProbeTimer = clearTimer;
                     if (response.body === null) {
                         const text = await response.text();
                         if (!response.ok) {
@@ -872,6 +933,7 @@ export class ResponsesWsSession implements WsBridgeSession {
                             sendFrame(text || errorFrame("probe_failed", "Warmup failed", response.status >= 400 ? response.status : 502));
                             return;
                         }
+                        probeOutcome = "completed";
                         sendFrame(text);
                         return;
                     }
@@ -905,19 +967,21 @@ export class ResponsesWsSession implements WsBridgeSession {
                             }
                         }
                     }
+                    probeOutcome = sawTerminal ? "completed" : "incomplete";
                     if (!sawTerminal) {
                         this.history.clear();
                         sendFrame(response.ok
                             ? errorFrame("incomplete_response", "Warmup ended without a terminal event", 502)
                             : errorFrame("probe_failed", "Warmup failed", response.status >= 400 ? response.status : 502));
                     }
-                } catch {
+                } catch (error) {
                     this.history.clear();
-                    this.context.log("warn", "probe relay failed");
+                    probeOutcome = error instanceof Error && error.name === "AbortError" ? "aborted" : "failed";
+                    this.context.log("warn", `probe relay failed error=${error instanceof Error ? error.name : "unknown"}`);
                     sendFrame(errorFrame("invalid_request", "Probe relay failed", 502));
                 } finally {
-                    this.active = undefined;
-                    this.busy = false;
+                    clearProbeTimer?.();
+                    this.settle("probe", probeOutcome);
                 }
             })();
             return;
@@ -936,9 +1000,11 @@ export class ResponsesWsSession implements WsBridgeSession {
         const res = new ResponsesWsResponse(req, peer);
         res.on("error", () => {});
         this.active = res;
-        // markWsLaneTransport (#3701 Finding 1): the egress-shed byte budget keys on
-        // this tag — managed HTTP transports (dsh-inline) stay out of the shed.
-        void withFetchTransport(markWsLaneTransport((url, options) => this.transport.fetch(url, options)), async () => {
+        // #3701 Finding 1: the egress-shed byte budget keys on the ws-lane tag
+        // carried by this.upstreamFetch — managed HTTP transports (dsh-inline)
+        // stay out of the shed.
+        let turnOutcome: string | undefined;
+        void withFetchTransport(this.upstreamFetch, async () => {
             try {
                 await this.context.dispatch(req, res);
                 if (res.response) {
@@ -948,6 +1014,7 @@ export class ResponsesWsSession implements WsBridgeSession {
                         tail: deltaContinuation?.tail,
                     });
                     if (res.restoredOutputItems > 0) this.context.log("debug", `checkpoint restored ${res.restoredOutputItems} streamed output item(s) absent from terminal output`);
+                    if (typeof res.response.status === "string") turnOutcome = String(res.response.status);
                 }
             } catch (error) {
                 if (error instanceof SnapshotAnchorFallbackError) {
@@ -959,19 +1026,42 @@ export class ResponsesWsSession implements WsBridgeSession {
                     this.context.log("warn", `delta continuation rejected reason=${error.reason} — requesting full replay`);
                     this.active?.destroy();
                     if (peer.readyState === WebSocket.OPEN) peer.send(errorFrame("previous_response_not_found", "Send full input without previous_response_id", 400));
+                    turnOutcome = "anchor-fallback";
                     return;
                 }
                 this.context.log("warn", `exchange failed phase=dispatch terminal=${res.terminal}`);
                 if (!res.writableEnded) res.end();
+                turnOutcome = error instanceof Error ? error.name : "error";
             } finally {
-                this.active = undefined;
-                this.busy = false;
+                this.settle("turn", turnOutcome ?? (res.statusCode >= 400 ? `http-${res.statusCode}` : res.terminal ? "ended" : "no-terminal"));
             }
         });
     }
 
+    // #6172: every admission releases EXACTLY its own lane state in one place.
+    // The old duplicated finally blocks were correct only because nothing else
+    // touched the active/busy pair; centralizing keeps that invariant auditable
+    // and gives every settle a single observable line.
+    private settle(kind: "probe" | "turn", outcome: string): void {
+        const meta = this.activeMeta;
+        const ageMs = meta !== undefined ? Date.now() - meta.startedAt : -1;
+        this.active = undefined;
+        this.busy = false;
+        this.activeMeta = undefined;
+        this.note(`${kind}-settle#${meta?.gen ?? "?"}(${outcome})`);
+        this.context.log("debug", `exchange settled kind=${kind} gen=${meta?.gen ?? "?"} outcome=${outcome} duration_ms=${ageMs}`);
+    }
+
+    /** Ring buffer (last 8) of labeled state transitions at session-relative seconds. */
+    private note(label: string): void {
+        this.transitions.push(`${label}@${Math.round((Date.now() - this.bornAt) / 1000)}s`);
+        if (this.transitions.length > 8) this.transitions.shift();
+    }
+
     onClose(code: number): void {
-        this.context.log("debug", `client closed phase=${this.busy ? "active" : "idle"} close_code=${code}`);
+        const meta = this.activeMeta;
+        this.context.log("debug", `client closed phase=${this.busy ? "active" : "idle"} close_code=${code}${meta !== undefined ? ` active_kind=${meta.kind} active_gen=${meta.gen} active_age_ms=${Date.now() - meta.startedAt}` : ""}`);
+        this.note(`client-close(${code})`);
         this.active?.destroy();
         this.transport.close("client-close");
         this.history.clear();
