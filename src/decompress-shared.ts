@@ -22,7 +22,19 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { historyGenerationsOf, markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import {
+    archivedBlockHeader,
+    archivedBlockView,
+    archivedMessageHits,
+    archivedOriginalTexts,
+    archivedRefText,
+    findArchivedBlock,
+    findArchivedRef,
+    refIndex,
+    type FoundArchivedBlock,
+    type HistoryGeneration,
+} from "./history-generations.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
@@ -145,6 +157,88 @@ function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header:
     }
 }
 
+/** Deliver read-only archived text through the same channels a live restore
+ *  uses (toFile pointer, large-body temp file, or inline result) without
+ *  touching session state: history generations are immutable by contract. */
+function deliverArchived(ctx: ProxyToolCtx, args: Record<string, unknown>, header: string, body: string, hint: string): ProxyToolResult {
+    const toFileOut = toFilePointer(args, ctx, header, body);
+    if (toFileOut !== null) return toFileOut;
+    if (body.length > 10000) {
+        const safe = hint.replace(/[^a-zA-Z0-9_-]/g, "-");
+        const outPath = join(tmpdir(), `acp-decompress-${safe}-${Date.now()}.txt`);
+        try {
+            mkdirSync(dirname(outPath), { recursive: true });
+            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
+            reapTempFiles();
+            return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
+        } catch (e) {
+            return exportFailureReceipt(outPath, e, body);
+        }
+    }
+    return toolOk(`${header}\n${body}`);
+}
+
+function restoreArchivedBlock(
+    args: Record<string, unknown>,
+    ctx: ProxyToolCtx,
+    found: FoundArchivedBlock,
+    full: boolean,
+): ProxyToolResult {
+    const view = archivedBlockView(found, full);
+    const header = `${archivedBlockHeader(found)}${full ? " — full" : ""}`;
+    if (!view) {
+        return toolFail(`[decompress FAILED: block ${found.block.blockId} is archived in history generation ${found.generation.generation} but its original content was not captured (summary only): ${found.block.summary.slice(0, 400)}]`);
+    }
+    return deliverArchived(ctx, args, header, view.body, `${found.block.blockId}-g${found.generation.generation}`);
+}
+
+/** Ref-range restore inside a closed generation: per-ref originals from the
+ *  frozen CCR slice, falling back to the archived raw messages. Read-only, so
+ *  nothing is queued for injection. */
+function restoreArchivedRange(
+    args: Record<string, unknown>,
+    ctx: ProxyToolCtx,
+    generations: readonly HistoryGeneration[],
+): ProxyToolResult | null {
+    const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
+    const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
+    if (!startRaw || !endRaw) return null;
+    const sb = parseBoundary(startRaw);
+    const eb = parseBoundary(endRaw);
+    if (!sb || sb.kind !== "message" || !eb || eb.kind !== "message") return null;
+    if (sb.numericId > eb.numericId) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
+    const byRef = new Map<string, { text: string; role: string; generation: number }>();
+    for (const gen of generations) {
+        for (const hit of archivedMessageHits([gen])) {
+            const idx = refIndex(hit.ref);
+            if (idx < sb.numericId || idx > eb.numericId) continue;
+            const current = byRef.get(hit.ref);
+            if (!current || hit.generation > current.generation) byRef.set(hit.ref, { text: hit.text, role: hit.role, generation: hit.generation });
+        }
+    }
+    for (const gen of generations) {
+        for (let idx = sb.numericId; idx <= eb.numericId; idx += 1) {
+            const ref = `m${String(idx).padStart(5, "0")}`;
+            if (byRef.has(ref)) continue;
+            const found = findArchivedRef([gen], ref);
+            if (!found) continue;
+            const text = archivedRefText(found);
+            if (text === null) continue;
+            byRef.set(ref, { text, role: "stored", generation: gen.generation });
+        }
+    }
+    if (byRef.size === 0) {
+        return toolFail(`[decompress FAILED: ${startRaw}–${endRaw} is not covered by any live block or closed history generation — nothing to restore for that span]`);
+    }
+    const parts = [...byRef.entries()]
+        .sort((a, b) => refIndex(a[0]) - refIndex(b[0]))
+        .map(([ref, hit]) => `${ref} (${hit.role}, generation ${hit.generation})\n${hit.text}`);
+    const generation = Math.max(...[...byRef.values()].map((v) => v.generation));
+    const header = `[History generation ${generation} — ${startRaw}–${endRaw} — ${parts.length} item(s), read-only]`;
+    return deliverArchived(ctx, args, header, parts.join("\n\n"), `range-g${generation}`);
+}
+
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
@@ -194,21 +288,38 @@ export function resolveDecompress(
         return toolFail("[decompress FAILED: blockId is required]");
     }
     const blockId = rawBlockId.trim();
+    const generations = historyGenerationsOf(ctx.session);
+    const fullRequested = args.full === true || args.full === "true";
     const block = ctx.core.decompress(blockId, ctx.session.state);
     if (!block) {
-        // Removed-from-state blocks (the #2695 reap path, or a future archive
-        // that drops blocks) still carry their preCompactionArchive entry: fail
-        // with the real reason instead of the misleading "not found" — the
-        // model got here by citing a ref from a summary it legitimately saw.
+        // Removed-from-state blocks resolve from the durable generation that
+        // closed over them — the archived copy IS the original, so a ref the
+        // model still remembers never degrades to "gone".
+        const archivedBlock = findArchivedBlock(generations, blockId);
+        if (archivedBlock) {
+            if (hasRangeArgs(args)) {
+                const ranged = restoreArchivedRange(args, ctx, generations);
+                if (ranged) return ranged;
+            }
+            return restoreArchivedBlock(args, ctx, archivedBlock, fullRequested);
+        }
+        if (hasRangeArgs(args)) {
+            const ranged = restoreArchivedRange(args, ctx, generations);
+            if (ranged) return ranged;
+        }
+        // The #2695 reap path may have dropped a block without a generation
+        // (pre-archive sessions): report the real reason, not "not found".
         const selfArchived = preCompactionArchiveOf(ctx.session)[blockId];
         if (selfArchived !== undefined) {
-            return toolFail(`[decompress FAILED: block ${blockId} is an archived block (${selfArchived.reason}) — it was removed from live state along with its covered substrate and cannot be restored.]`);
+            return toolFail(`[decompress FAILED: block ${blockId} is an archived block (${selfArchived.reason}) — it was removed from live state before a durable history generation existed and cannot be restored.]`);
         }
         return resolveDerivedDecompress(args, ctx, blockId);
     }
     const archived = preCompactionArchiveOf(ctx.session);
     if (archived[blockId] !== undefined) {
-        return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`);
+        const archivedBlock = findArchivedBlock(generations, blockId);
+        if (archivedBlock) return restoreArchivedBlock(args, ctx, archivedBlock, fullRequested);
+        return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and no durable generation was captured for it, so decompress cannot restore it.]`);
     }
     // #1712: blank/whitespace range fields mean "unspecified" — hosts and models
     // emit "" for optional fields, and treating that as a range request produced
@@ -339,8 +450,7 @@ function refNum(ref: string): number | null {
     return b && b.kind === "message" ? b.numericId : null;
 }
 
-function coveredMessages(state: CompressionState, block: CompressionBlock): CoveredRefs | null {
-    const byRaw = state.messageRefs.byRaw;
+function coveredMessages(byRaw: Record<string, string>, block: CompressionBlock): CoveredRefs | null {
     const raws: Array<{ raw: string; num: number }> = [];
     for (const raw of block.effectiveMessageIds) {
         const ref = byRaw[raw];
@@ -368,7 +478,13 @@ function coveredMessages(state: CompressionState, block: CompressionBlock): Cove
  *  ("m00044–m00097") plus count — or null when no individual refs are
  *  resolvable (older blocks whose raw ids left the map). */
 export function coveredRefSpan(state: CompressionState, block: CompressionBlock): { text: string; count: number } | null {
-    const cov = coveredMessages(state, block);
+    return coveredRefSpanFromRefs(state.messageRefs.byRaw, block);
+}
+
+/** Same span, resolved against an explicit ref map — a closed generation keeps
+ *  its own map, which the live session no longer carries. */
+function coveredRefSpanFromRefs(byRaw: Record<string, string>, block: CompressionBlock): { text: string; count: number } | null {
+    const cov = coveredMessages(byRaw, block);
     return cov ? { text: cov.text, count: cov.raws.length } : null;
 }
 
@@ -400,7 +516,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     }
     if (sb.numericId > eb.numericId) return toolFail(`[decompress FAILED: startId ${startRaw} is after endId ${endRaw} — swap them]`);
     const state = ctx.session.state;
-    const cov = coveredMessages(state, block);
+    const cov = coveredMessages(state.messageRefs.byRaw, block);
     if (!cov) return toolFail(`[decompress FAILED: ${block.blockId} has no per-message coverage recorded (older block) — use plain decompress {blockId} for the whole block]`);
     const pickedSet = new Set(cov.raws.filter(({ num }) => num >= sb.numericId && num <= eb.numericId).map(({ raw }) => raw));
     if (pickedSet.size === 0) return toolFail(`[decompress FAILED: ${block.blockId} covers no messages in ${startRaw}–${endRaw} (its coverage is ${cov.text})]`);
@@ -675,7 +791,7 @@ function buildSteering(
         const seen = new Set<string>();
         const hints: string[] = [];
         outer: for (const s of scored.slice(0, 5)) {
-            const cov = coveredMessages(state, s.block);
+            const cov = coveredMessages(state.messageRefs.byRaw, s.block);
             if (!cov) continue;
             for (const { num } of cov.raws) {
                 const ref = `m${String(num).padStart(5, "0")}`;
@@ -819,6 +935,98 @@ function originalTextsOf(session: Session): OriginalTextProvider {
     };
 }
 
+type ArchivedSearchHits = {
+    blockLines: string[];
+    messageLines: string[];
+    originalLines: string[];
+    total: number;
+    generations: number;
+    newest: number;
+};
+
+/** Lexical search over closed generations. Each generation is searched in
+ *  its own namespace (block ids are never merged: the generation tag is what
+ *  keeps a bN from one era from being mistaken for a bN from another). */
+function searchArchivedHistory(generations: readonly HistoryGeneration[], query: string, limit: number): ArchivedSearchHits {
+    const blockOwner = new Map<string, { gen: HistoryGeneration; block: CompressionBlock; tier: number }>();
+    const blockDocsIn: SearchDoc[] = [];
+    for (const gen of generations) {
+        for (const block of gen.blocks) {
+            const key = `${gen.generation}:${block.blockId}`;
+            blockOwner.set(key, { gen, block, tier: block.tier ?? 1 });
+            blockDocsIn.push({
+                kind: "block",
+                ref: key,
+                text: `${block.topic ?? ""} ${block.summary ?? ""}`,
+                title: block.topic ?? block.blockId,
+                blockId: key,
+                tier: block.tier ?? 1,
+                tokens: block.compressedTokens,
+            });
+        }
+    }
+    const blockHits = searchBlocks(blockDocsIn, query, { limit: blockDocsIn.length, algorithm: "substring", minScore: 1e-9 });
+    const blockLines: string[] = [];
+    const covered = new Set<string>();
+    for (const hit of blockHits) {
+        const owner = blockOwner.get(hit.ref);
+        if (!owner) continue;
+        const span = coveredRefSpanFromRefs(owner.gen.messageRefs.byRaw, owner.block);
+        const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";
+        blockLines.push(`${owner.block.blockId} (T${owner.tier}, generation ${owner.gen.generation}) "${owner.block.topic ?? "(no topic)"}"${spanNote}${owner.block.active ? "" : " [archived — read-only]"}\n  ${hit.preview}`);
+        covered.add(`${owner.gen.generation}:${owner.block.blockId}`);
+        if (blockLines.length >= limit) break;
+    }
+    const messageLines: string[] = [];
+    const messageHits = archivedMessageHits(generations);
+    if (messageHits.length > 0 && blockLines.length < limit) {
+        const docs: SearchDoc[] = messageHits.map((hit) => ({
+            kind: "message",
+            ref: `${hit.generation}:${hit.ref}`,
+            text: hit.text,
+            title: `${hit.ref} (${hit.role})`,
+            role: hit.role === "user" || hit.role === "assistant" || hit.role === "tool" ? hit.role : undefined,
+        }));
+        const owner = new Map(messageHits.map((hit) => [`${hit.generation}:${hit.ref}`, hit]));
+        for (const hit of searchBlocks(docs, query, { limit: docs.length, algorithm: "substring", minScore: 1e-9 })) {
+            const source = owner.get(hit.ref);
+            if (!source) continue;
+            messageLines.push(`${source.ref} (${source.role}, generation ${source.generation}${source.blockId ? `, folded into ${source.blockId}` : ""})\n  ${hit.preview}`);
+            if (blockLines.length + messageLines.length >= limit) break;
+        }
+    }
+    const originalLines: string[] = [];
+    if (blockLines.length + messageLines.length < limit) {
+        const originals = archivedOriginalTexts(generations);
+        if (originals.length > 0) {
+            const docs: SearchDoc[] = originals.map((orig) => ({
+                kind: "block",
+                ref: `${orig.generation}:${orig.blockId}!orig`,
+                text: orig.text,
+                title: `original content of ${orig.blockId} (generation ${orig.generation})`,
+                blockId: `${orig.generation}:${orig.blockId}`,
+                tier: 1,
+            }));
+            const owner = new Map(originals.map((orig) => [`${orig.generation}:${orig.blockId}!orig`, orig]));
+            for (const hit of searchBlocks(docs, query, { limit: docs.length, algorithm: "substring", minScore: 1e-9 })) {
+                const source = owner.get(hit.ref);
+                if (!source) continue;
+                if (covered.has(`${source.generation}:${source.blockId}`)) continue;
+                originalLines.push(`${source.blockId} (original text, generation ${source.generation})\n  ${hit.preview}`);
+                if (blockLines.length + messageLines.length + originalLines.length >= limit) break;
+            }
+        }
+    }
+    return {
+        blockLines,
+        messageLines,
+        originalLines,
+        total: blockLines.length + messageLines.length + originalLines.length,
+        generations: generations.length,
+        newest: generations[generations.length - 1]?.generation ?? 0,
+    };
+}
+
 export function executeSearchContext(
     args: Record<string, unknown>,
     _core: CompressionCore,
@@ -826,6 +1034,7 @@ export function executeSearchContext(
     foreignSessionId?: string,
     plan?: SearchPlanOpts,
     originals?: OriginalTextProvider,
+    archives?: readonly HistoryGeneration[],
 ): ProxyToolResult {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
@@ -895,9 +1104,23 @@ export function executeSearchContext(
             // originals are best-effort; never fail the search
         }
     }
-    if (blocks.length === 0 && origHits.length === 0) {
+    const archivedHits = archives && archives.length > 0 && !foreignSessionId
+        ? searchArchivedHistory(archives, query, limit)
+        : null;
+    const archivedSection = archivedHits && archivedHits.total > 0
+        ? [
+            `\n\nClosed history generation(s) — ${archivedHits.generations} read-only generation(s), newest generation ${archivedHits.newest}; decompress by block id and the retrieve tool resolve them:`,
+            ...archivedHits.blockLines,
+            ...archivedHits.messageLines,
+            ...archivedHits.originalLines,
+        ].join("\n")
+        : "";
+    if (blocks.length === 0 && origHits.length === 0 && (archivedHits?.total ?? 0) === 0) {
         // #1875: an empty result is a valid answer to a query, not a failure.
-        if (state.blocks.length === 0) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
+        if (state.blocks.length === 0 && (archives?.length ?? 0) === 0) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
+        if (state.blocks.length === 0) {
+            return toolOk(`[No blocks matched "${query}" among ${archives?.length ?? 0} closed history generation(s)${scope}. Scope = compressed summaries, archived block originals and archived message text — NOT visible messages; absence here ≠ never-discussed.]`);
+        }
         const origNote = originals ? " + the folded original text" : "";
         return toolOk(`[No blocks matched "${query}" among ${state.blocks.length} block(s)${scope}. Scope = compressed topics/summaries (active + folded-away)${origNote} — NOT visible messages or other sessions; absence here ≠ never-discussed.]`);
     }
@@ -933,10 +1156,11 @@ export function executeSearchContext(
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
-    const header = blocks.length === 0
-        ? `Found 0 summary block(s) for "${query}"${scope} — but ${origHits.length} folded original(s) match:`
+    const foundLive = blocks.length + origHits.length;
+    const header = foundLive === 0
+        ? `Found 0 live summary block(s) for "${query}"${scope} — ${archivedHits?.total ?? 0} closed-generation hit(s):`
         : `Found ${blocks.length} block(s) for "${query}"${scope}:`;
-    return toolOk(`${header}\n\n${lines.join("\n\n")}${truncNote}${steering}${tipNote}${origSection}${note}`);
+    return toolOk(`${header}\n\n${lines.join("\n\n")}${truncNote}${steering}${tipNote}${origSection}${archivedSection}${note}`);
 }
 
 // #841: resolve a requested session id to its compression state without
@@ -968,7 +1192,7 @@ export function executeSearchContextTarget(
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
     if (!requested || requested === sessionId || requested.toLowerCase() === "current") {
-        const local = executeSearchContext(args, core, state, undefined, plan, ownOriginals);
+        const local = executeSearchContext(args, core, state, undefined, plan, ownOriginals, ctx ? historyGenerationsOf(ctx.session) : undefined);
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".

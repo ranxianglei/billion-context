@@ -12,6 +12,18 @@ import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
+import {
+    HISTORY_GENERATIONS_KEY,
+    buildHistoryGeneration,
+    generationContentStore,
+    historyIndex,
+    maxBlockIdNumber,
+    metaOf,
+    type HistoryArchive,
+    type HistoryGeneration,
+    type HistoryGenerationMeta,
+} from "./history-generations.js";
+import { CODEX_CHECKPOINT_METADATA_KEY, readCodexCheckpoint } from "./codex-checkpoint.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
 import type { UnpromptedGateState } from "./unprompted-gate.js";
 
@@ -1786,6 +1798,163 @@ export function resetSessionCompression(session: Session): void {
     markDirty(session);
 }
 
+/** Durable, read-only archive of the live history. Payloads go to the
+ *  session's generation sidecar first (atomic, encrypted); the metadata index
+ *  is the cheap gate that keeps tool-call lookups off the disk. */
+function closeHistoryGeneration(
+    session: Session,
+    input: { cause: string; source?: string; checkpointId?: string; messages?: readonly unknown[] },
+): HistoryGeneration | null {
+    const messages = input.messages ?? session.lastMessages ?? [];
+    if (session.state.blocks.length === 0 && messages.length === 0) return null;
+    let store: ReturnType<typeof generationContentStore>;
+    try {
+        let live: MessageContentStore | null = null;
+        try {
+            live = getStore().unifiedCcrFor(session.id) ?? session.contentStore ?? getStore().loadContentStore(session);
+        } catch (err) {
+            loggerLog("warn", `[${session.id}] history generation: live CCR store unreadable (${err instanceof Error ? err.message : String(err)})`);
+        }
+        store = generationContentStore(
+            live,
+            session.state.messageRefs,
+            highestUsedIndex(session.state.messageRefs),
+        );
+    } catch (err) {
+        loggerLog("warn", `[${session.id}] history generation: CCR slice unavailable (${err instanceof Error ? err.message : String(err)})`);
+        store = undefined;
+    }
+    let gen: HistoryGeneration | null = null;
+    try {
+        gen = buildHistoryGeneration(session, {
+            cause: input.cause,
+            source: input.source,
+            checkpointId: input.checkpointId,
+            messages,
+            contentStore: store ?? null,
+        });
+    } catch (err) {
+        loggerLog("warn", `[${session.id}] history generation: snapshot failed (${err instanceof Error ? err.message : String(err)}); live state left untouched`);
+        return null;
+    }
+    if (!gen) return null;
+    const top = maxBlockIdNumber(session.state.blocks);
+    if (top >= session.state.nextBlockId) session.state.nextBlockId = top + 1;
+    const archive = getStore().loadHistoryGenerations(session) ?? memoryHistoryArchive(session.id) ?? { version: 1 as const, sessionId: session.id, generations: [] };
+    archive.generations = [...archive.generations.filter((g) => g.generation !== gen.generation), gen];
+    if (!getStore().saveHistoryGenerations(session, archive)) {
+        if (getStore().enabled) {
+            loggerLog("warn", `[${session.id}] history generation ${gen.generation} could not be persisted; live state left untouched`);
+            return null;
+        }
+        // Persistence off (ephemeral/persist=0 sessions): keep the generation in
+        // process memory. It dies with the process, exactly like the session.
+        rememberMemoryHistory(session.id, archive);
+    }
+    session.metadata[HISTORY_GENERATIONS_KEY] = archive.generations.map(metaOf);
+    markDirty(session);
+    return gen;
+}
+
+// Sessions running with persistence OFF still need a generation to survive the
+// rebase (otherwise the reset would delete the only copy of the history). Keep
+// a bounded, process-local archive for them; the sidecar stays authoritative
+// whenever the store is enabled.
+const MEMORY_HISTORY_SESSIONS = 32;
+const memoryHistory = new Map<string, HistoryArchive>();
+
+function memoryHistoryArchive(sessionId: string): HistoryArchive | null {
+    return memoryHistory.get(sessionId) ?? null;
+}
+
+function rememberMemoryHistory(sessionId: string, archive: HistoryArchive): void {
+    memoryHistory.delete(sessionId);
+    memoryHistory.set(sessionId, archive);
+    while (memoryHistory.size > MEMORY_HISTORY_SESSIONS) {
+        const oldest = memoryHistory.keys().next().value;
+        if (oldest === undefined) break;
+        memoryHistory.delete(oldest);
+    }
+}
+
+/** One-entry cache for the last decoded archive. A turn touches the same
+ *  session's generations several times (search + decompress + retrieve), and
+ *  re-reading/decrypting a multi-megabyte sidecar for each is pure waste. The
+ *  signature is the metadata index, so a newly closed generation invalidates
+ *  it; a different session replaces it. */
+let generationCache: { sessionId: string; signature: string; archive: HistoryArchive } | null = null;
+
+function generationSignature(session: Session, index: readonly HistoryGenerationMeta[]): string {
+    const last = index[index.length - 1];
+    const stat = getStore().historyGenerationsStat(session);
+    const sidecar = stat ? `${stat.size}:${stat.mtimeMs}` : "none";
+    return `${index.length}:${last?.generation ?? 0}:${last?.at ?? 0}:${sidecar}`;
+}
+
+/** All closed generations with their payloads. The metadata index gates the
+ *  sidecar read: a session that never compacted pays nothing. */
+export function historyGenerationsOf(session: Session): HistoryGeneration[] {
+    const inMemory = memoryHistoryArchive(session.id);
+    if (inMemory) return inMemory.generations;
+    const index = historyIndex(session);
+    if (index.length === 0) {
+        // Crash between the sidecar write and the session-record write leaves
+        // the payload on disk but the index missing — recover it instead of
+        // hiding the archive. The stat is the only cost for sessions that
+        // never compacted.
+        if (!getStore().hasHistoryGenerations(session)) return [];
+        const recovered = getStore().loadHistoryGenerations(session);
+        if (!recovered) return [];
+        session.metadata[HISTORY_GENERATIONS_KEY] = recovered.generations.map(metaOf);
+        markDirty(session);
+        return recovered.generations;
+    }
+    const signature = generationSignature(session, index);
+    if (generationCache && generationCache.sessionId === session.id && generationCache.signature === signature) {
+        return generationCache.archive.generations;
+    }
+    const archive = getStore().loadHistoryGenerations(session);
+    if (!archive) return [];
+    generationCache = { sessionId: session.id, signature, archive };
+    const byNumber = new Map(archive.generations.map((g) => [g.generation, g]));
+    const out: HistoryGeneration[] = [];
+    for (const meta of index) {
+        const gen = byNumber.get(meta.generation);
+        if (gen) out.push(gen);
+    }
+    return out;
+}
+
+/** A cloud compaction item arrived in the RESPONSE we are streaming. The
+ *  client opted into server-side compaction on that very request, so the
+ *  history it replaced is closed now instead of at the next request: the
+ *  boundary lands on the turn that caused it and survives a client that never
+ *  comes back. The ordinal advances by one and is recorded, so the replay
+ *  (header or input item) on the following request is recognized as the same
+ *  event and never rebases twice. */
+export function closeCodexResponseCompaction(session: Session, opts: { itemIds: readonly string[]; messages?: readonly CoreMessage[] | null }): boolean {
+    const record = readCodexCheckpoint(session);
+    const seq = (record?.seq ?? 0) + 1;
+    const checkpointId = opts.itemIds.at(-1) ?? `response-compaction-${seq}`;
+    markNativeCompactionBoundary(session);
+    const rebased = reconcileNativeCompactionBoundary(session, {
+        messages: opts.messages && opts.messages.length > 0 ? [...opts.messages] : undefined,
+        cause: "codex-cloud-compaction",
+        source: "codex-response-item",
+        checkpointId,
+    });
+    if (!rebased) return false;
+    session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = {
+        id: checkpointId,
+        seq,
+        at: Date.now(),
+        covered: record?.covered ?? 0,
+        digest: record?.digest,
+    };
+    markDirty(session);
+    return true;
+}
+
 export function markNativeCompactionBoundary(session: Session): void {
     session.metadata.nativeCompactionBoundary = {
         at: Date.now(),
@@ -1794,7 +1963,20 @@ export function markNativeCompactionBoundary(session: Session): void {
     markDirty(session);
 }
 
-export function reconcileNativeCompactionBoundary(session: Session): boolean {
+type NativeCompactionArchiveInput = {
+    messages?: readonly unknown[];
+    cause?: string;
+    source?: string;
+    checkpointId?: string;
+};
+
+/** Close the live history into a read-only generation, then rebase.
+ *
+ *  Ordering is load-bearing: the archive snapshots state, block contents, the
+ *  ref maps and the CCR slice BEFORE resetSessionCompression clears them; the
+ *  ref floor and the block-id counter are raised so neither numbers nor block
+ *  ids are ever re-issued onto different content. */
+export function reconcileNativeCompactionBoundary(session: Session, opts: NativeCompactionArchiveInput = {}): boolean {
     const boundary = session.metadata.nativeCompactionBoundary;
     if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
         return false;
@@ -1806,7 +1988,36 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     // raw content (silent misattribution; refs are never reused within a
     // session, same pin as applyCompactionArchive / fork adoption).
     const highestBefore = highestUsedIndex(session.state.messageRefs);
+    const highestBlockBefore = maxBlockIdNumber(session.state.blocks);
+    const messagesBefore = opts.messages ?? session.lastMessages ?? [];
+    const generation = closeHistoryGeneration(session, {
+        cause: opts.cause ?? "client-native-compaction",
+        source: opts.source,
+        checkpointId: opts.checkpointId,
+        messages: messagesBefore,
+    });
+    // Availability over destruction: if this session HAD history and it could
+    // not be closed into a durable generation, leave the live state intact and
+    // KEEP THE BOUNDARY PENDING so the next request retries the close. Resetting
+    // anyway would delete the only copy; consuming the boundary instead would
+    // strand this checkpoint forever — the dedupe record never re-fires the same
+    // id/seq, so a cleared boundary can only re-enter through the weaker text
+    // heuristics this mechanism exists to replace.
+    if (!generation && (session.state.blocks.length > 0 || messagesBefore.length > 0)) {
+        session.metadata.nativeCompactionBoundary = {
+            ...(boundary as Record<string, unknown>),
+            archiveFailedAt: Date.now(),
+        };
+        markDirty(session);
+        loggerLog("warn", `[${session.id}] native compaction boundary NOT rebased yet: history generation could not be persisted; retrying on the next request`);
+        return false;
+    }
     resetSessionCompression(session);
+    // Block ids restart at b1 in the fresh state; pin the cursor above every
+    // id this session ever issued so a new bN never aliases an archived bN.
+    if (highestBlockBefore > 0) {
+        session.state.nextBlockId = Math.max(session.state.nextBlockId, highestBlockBefore + 1);
+    }
     if (highestBefore > 0 && reserveRefsThrough(session, highestBefore)) {
         markDirty(session);
     }
@@ -1824,10 +2035,16 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
  *  reuses the same key with stale state. Consumed by the NEXT processTurn via
  *  applyCompactionArchive (#395). Distinct from nativeCompactionBoundary
  *  (Responses/codex, which rebases by resetting state). */
-export function markCompactionBoundary(session: Session): void {
+export function markCompactionBoundary(
+    session: Session,
+    info: { cause?: string; source?: string; checkpointId?: string } = {},
+): void {
     session.metadata.compactionBoundary = {
         at: Date.now(),
         pending: true,
+        ...(info.cause ? { cause: info.cause } : {}),
+        ...(info.source ? { source: info.source } : {}),
+        ...(info.checkpointId ? { checkpointId: info.checkpointId } : {}),
     };
     markDirty(session);
 }
@@ -1880,6 +2097,18 @@ export function applyCompactionArchive(
     }
     const activeAfter = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
     const deactivated = [...activeBefore].filter((id) => !activeAfter.has(id));
+    closeHistoryGeneration(session, {
+        cause: typeof (boundary as Record<string, unknown>).cause === "string"
+            ? (boundary as Record<string, unknown>).cause as string
+            : "client-native-compaction",
+        source: typeof (boundary as Record<string, unknown>).source === "string"
+            ? (boundary as Record<string, unknown>).source as string
+            : undefined,
+        checkpointId: typeof (boundary as Record<string, unknown>).checkpointId === "string"
+            ? (boundary as Record<string, unknown>).checkpointId as string
+            : undefined,
+        messages: session.lastMessages ?? [],
+    });
     if (deactivated.length > 0) {
         const archive = readPreCompactionArchive(session);
         const at = Date.now();

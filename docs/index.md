@@ -24,6 +24,7 @@
 | [identity-channels](identity-channels.md) / [中文](identity-channels.zh-CN.md) / [日本語](identity-channels.ja.md) | Cross-client stable conversation+message id wiring (#5825): who carries identity in, where it is consumed |
 | [msgid-infrastructure](msgid-infrastructure.md) / [中文](msgid-infrastructure.zh-CN.md) / [日本語](msgid-infrastructure.ja.md) | Where sessionid+msgid is produced, validated (six copies), pinned, and consumed |
 | [opencode-responses-websocket](opencode-responses-websocket.md) / [中文](opencode-responses-websocket.zh-CN.md) / [日本語](opencode-responses-websocket.ja.md) | OpenCode V2 Responses-over-WebSocket integration (#1844) |
+| [codex-cloud-compaction](codex-cloud-compaction.md) / [中文](codex-cloud-compaction.zh-CN.md) | Codex cloud checkpoints ↔ ACP history generations: announced boundary, read-only archive, ref/block-id continuity, cross-generation tools |
 | [plugin-protocol](plugin-protocol.md) | Cooperative plugin protocol v2 (experimental) |
 | [wire-contracts](wire-contracts.md) / [中文](wire-contracts.zh-CN.md) | WC ledger: permanent upstream wire constraints behind the declared custom-wire endpoints (#1295); entries are never deleted, only superseded |
 

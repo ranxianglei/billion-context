@@ -19,7 +19,8 @@ import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAncho
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, historyGenerationsOf, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { historyIndex } from "../history-generations.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
@@ -32,6 +33,8 @@ import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { CODEX_CHECKPOINT_METADATA_KEY, codexCheckpointLane, codexCheckpointRecord, codexCompactionItems, codexCompactionRequested, isNewCodexBoundary, parseCodexCheckpointSignal, readCodexCheckpoint } from "../codex-checkpoint.js";
+import { historyNavNote } from "../history-generations.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -69,12 +72,88 @@ export async function prepareResponses(
     decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
+    // Announced back to a cooperating client so its own cloud-compaction
+    // threshold can account for what the proxy currently folds out of the wire
+    // (#cloud-double). Sum of active blocks' covered tokens: prepare-time
+    // known, stable across retries, and zero once the history is rebased.
+    const foldedOnWire = session.state.blocks.reduce(
+        (sum, block) => (block.active && Number.isFinite(block.compressedTokens) ? sum + block.compressedTokens : sum),
+        0,
+    );
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
+    // Codex cloud compaction: the DSH codex adapter names the checkpoint it
+    // installed, so the boundary is wire truth instead of a text guess. A
+    // `reuse` signal (or a repeated fresh id/seq after a crash) never rebases
+    // twice; a new id or a higher seq is a real consecutive compaction.
+    const checkpointSignal = parseCodexCheckpointSignal(req.headers);
+    const checkpointRecord = readCodexCheckpoint(session);
+    const checkpointHost = isCodexHost(req.headers) || codexCheckpointLane(req.headers);
+    const triggerTurn = hasCompactionTrigger(parsed.input);
+    // Two independent wire-truth channels name the same boundary:
+    //  - the header, when dsh-codex-subscription announces the checkpoint;
+    //  - the replayed compaction items, which any codex client sends once the
+    //    server compacted (real Codex CLI included).
+    // Both are keyed on a monotonic ordinal (the announcement seq / the number
+    // of replayed items), so a retry, a restart, or the response-side close
+    // repeating the same event never rebases twice.
+    const inputCompactions = codexCompactionItems(parsed.input);
+    // The replayed-item channel names an event, but only a REPLACED history is
+    // a boundary: a client that still resends every covered message (an older
+    // checkpoint observed for the first time after an upgrade) keeps its folds.
+    const inputCovered = coveredRealHistoryIds(session.state.blocks);
+    const inputGap = foldCoverage(inputCovered, responsesToCore(parsed).msgs.map((message) => message.id));
+    const inputReplaced = inputCovered.size === 0 || inputGap !== null;
+    const headerBoundary = checkpointSignal !== null
+        && checkpointHost
+        && !triggerTurn
+        && isNewCodexBoundary(checkpointRecord, checkpointSignal);
+    const inputBoundary = checkpointHost
+        && !triggerTurn
+        && inputCompactions.count > (checkpointRecord?.seq ?? 0)
+        && inputReplaced;
+    const codexCheckpointBoundary = headerBoundary || inputBoundary;
+    // The generation covers the history the checkpoint REPLACED, not the
+    // truncated tail the client resends: keep the previous full turn view so
+    // every ref in it stays restorable. Also hand it to the relay so a
+    // compaction item in THIS response can close on the same view.
+    const codexBoundaryMessages = session.lastMessages && session.lastMessages.length > 0
+        ? [...session.lastMessages]
+        : Array.isArray(parsed.input) ? [...parsed.input] as unknown as CoreMessage[] : [];
+    const codexBoundaryRequested = checkpointHost && codexCompactionRequested(parsed);
+    if (checkpointHost && codexCheckpointBoundary) {
+        const seq = Math.max(inputCompactions.count, checkpointSignal?.seq ?? 0);
+        const checkpointId = (inputBoundary ? inputCompactions.ids.at(-1) : undefined)
+            ?? checkpointSignal?.checkpointId
+            ?? `compaction-${seq}`;
+        const source = headerBoundary ? "dsh-codex-subscription" : "codex-input-item";
+        recordConflict(session, "native-compaction", `codex cloud checkpoint ${checkpointId} seq ${seq} via ${source}`);
+        markNativeCompactionBoundary(session);
+        const rebased = reconcileNativeCompactionBoundary(session, {
+            messages: codexBoundaryMessages,
+            cause: "codex-cloud-compaction",
+            source,
+            checkpointId,
+        });
+        if (rebased) {
+            session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = {
+                id: checkpointId,
+                seq,
+                at: checkpointRecord?.at ?? Date.now(),
+                covered: checkpointSignal?.covered ?? inputCompactions.count,
+                digest: checkpointSignal?.digest,
+            };
+            markDirty(session);
+        }
+        log("info", `[${sessionId}] codex cloud checkpoint ${checkpointId} seq ${seq} (${source}): rebased=${rebased}`);
+    } else if (checkpointSignal !== null && checkpointHost && (!checkpointRecord || checkpointSignal.seq >= checkpointRecord.seq)) {
+        session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = codexCheckpointRecord(checkpointSignal, checkpointRecord?.at ?? Date.now());
+        markDirty(session);
+    }
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -215,19 +294,29 @@ export async function prepareResponses(
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
-            const covered = coveredRealHistoryIds(session.state.blocks);
-            const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
-            // A checkpoint may predate this process's first observation (for
-            // example after an upgrade). Keep folds whose entire source still
-            // exists; only missing coverage or an empty substrate needs rebasing.
-            const rebase = covered.size === 0 || gap !== null;
-            if (rebase) {
-                markNativeCompactionBoundary(session);
-                reconcileNativeCompactionBoundary(session);
+            if (codexCheckpointBoundary) {
+                // The codex checkpoint channels above (header / replayed items)
+                // already closed this exact epoch on this request; rebasing
+                // again there would open a second, empty generation for one
+                // compaction. Only advance the opaque-key bookmark.
+                session.metadata.codexNativeCompactionKey = checkpoint;
+                markDirty(session);
+                log("info", `[${sessionId}] native opaque Responses checkpoint observed; already rebased by the codex checkpoint channel`);
+            } else {
+                const covered = coveredRealHistoryIds(session.state.blocks);
+                const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
+                // A checkpoint may predate this process's first observation (for
+                // example after an upgrade). Keep folds whose entire source still
+                // exists; only missing coverage or an empty substrate needs rebasing.
+                const rebase = covered.size === 0 || gap !== null;
+                if (rebase) {
+                    markNativeCompactionBoundary(session);
+                    reconcileNativeCompactionBoundary(session);
+                }
+                session.metadata.codexNativeCompactionKey = checkpoint;
+                markDirty(session);
+                log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
             }
-            session.metadata.codexNativeCompactionKey = checkpoint;
-            markDirty(session);
-            log("info", `[${sessionId}] native opaque Responses checkpoint observed; ACP state ${rebase ? "rebased" : "retained (coverage intact)"}`);
         }
         responsesProjection = projection;
         // Client's own system text captured BEFORE the anchor reconciliation
@@ -453,6 +542,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         }
         reapOrphansLogged(session, msgs, log, sessionId);
+        // Standing navigation index for closed generations: byte-stable
+        // between boundaries, names refs/blocks without carrying payload.
+        const historyNav = isCompactionTrigger
+            ? null
+            : historyNavNote(session, historyIndex(session).length > 1 ? historyGenerationsOf(session) : []);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // #3400: the Responses steady path rebuilds items from the RAW parsed
@@ -500,11 +594,15 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
-        if (sysNotes.length > 0) {
+        // The closed-history navigation index is an EPHEMERAL tail note, not
+        // part of the developer layer: the developer/system prefix must stay
+        // byte-identical across turns so the provider cache survives (#2596).
+        const notes = historyNav === null ? sysNotes : [...sysNotes, historyNav];
+        if (notes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                 ? [{ type: "message", role: "user", content: rebuiltInput }]
                 : rebuiltInput;
-            for (const text of sysNotes) {
+            for (const text of notes) {
                 inputItems.push({ type: "message", role: "user", content: text });
             }
             rebuiltInput = inputItems;
@@ -770,6 +868,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         surface,
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
+        ...(codexBoundaryRequested ? { codexBoundary: { requested: true, messages: codexBoundaryMessages } } : {}),
+        ...(foldedOnWire > 0 ? { responseExtraHeaders: { "x-bili-plugin-compressed": String(foldedOnWire) } } : {}),
         codexForge,
         dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId),
     };
