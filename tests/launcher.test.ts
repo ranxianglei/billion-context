@@ -7707,9 +7707,13 @@ test("resolveClientCommand: antigravity-desktop probes standard desktop install 
         );
         // darwin: /Applications/Antigravity.app/Contents/MacOS/Antigravity (the
         // bare first candidate is returned when the app is not installed).
+        // Expected value built with path.join (same as the #2260 test) so the
+        // host-independent platform injection holds on Windows runners too —
+        // the production darwin branch path.joins, which yields backslashes
+        // on a win32 host.
         assert.deepEqual(
             resolveClientCommand("antigravity", { PATH: "/nonexistent-dir-zzz" }, "darwin", { desktop: true }),
-            { command: "/Applications/Antigravity.app/Contents/MacOS/Antigravity", prefixArgs: [] },
+            { command: path.join("/Applications", "Antigravity.app", "Contents", "MacOS", "Antigravity"), prefixArgs: [] },
         );
         // linux: /usr/bin/antigravity is the first candidate (returned when absent).
         assert.deepEqual(
