@@ -623,6 +623,12 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.sync.clearIngestWatermark(legacy.id);
+                    // #6325: the per-column "unchanged" cache is now
+                    // untrustworthy too — without clearing it the heal's full
+                    // re-ingest would skip the diverged columns and the drift
+                    // would persist. Re-arm the full write alongside the
+                    // watermark clear.
+                    this.sync.clearLastWrittenColumns(legacy.id);
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
