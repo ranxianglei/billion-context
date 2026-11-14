@@ -42,20 +42,6 @@ const OUTPUT_CLAMP_ESTIMATE_SAFETY = 1.12;
 const OUTPUT_CLAMP_FLOOR = 1024;
 // #3071/#2490: capability floor for the clamped budget — see clampOutputBudget.
 const OUTPUT_CLAMP_MIN_OUTPUT = 4096;
-// #3384: giant-request line for applying the refused-dsh-ledger planning floor
-// (#2490). A requested output budget at or above this fraction of the native
-// window can push a near-wall raw ledger past the window in ONE turn — the
-// #2490 shape (384K requested against a 1M window / ~900K ledger produced the
-// 7.5MB un-foldable turn). Below the line no single-turn output can overflow
-// the ledger, so applying the floor there only reserves output budget against
-// bytes bili never sends (its folds keep the wire small while the client's raw
-// ledger grows because compaction is refused) — the #3384 starvation: folded
-// wire at 8–11% of a 1M window, budget clamped 50670 -> 5909, every byte eaten
-// by thinking on an onlyReasoning model -> stopReason=length -> blank turns.
-// Aligned with the #896 default outputHeadroomMaxPct (0.25) and the #2096 note
-// below ("when max_tokens > 25% of the window the overflow boundary lies BELOW
-// the headroom target").
-const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // #453 mitigation: host-side escalation line. The kernel already force-injects
 // every turn once usage >= nudge.maxContextLimitPct (its pressure branch has no
 // cadence gate), so the only cadence-silent zone is BELOW that line. Force the
@@ -283,13 +269,13 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  undefined when no reduction is needed (requested already fits, or the cap
  *  drops below OUTPUT_CLAMP_FLOOR — i.e. input alone nearly fills the window,
  *  which is preflight/self-heal territory, not output starvation).
- *  #2490 ledger regime: when the planning basis is the refused dsh raw ledger
- *  (dshLedgerFloorTokens), cap < 1024 means the HOST's own counter already
- *  sits at the window wall — bili's folds cannot shrink it (refused
- *  checkpoints never land), so no output budget recovers the session; a
- *  sub-floor clamp would only starve a terminal turn. That surrender is
- *  deliberate, not a gap (pinned in
- *  tests/issue2490-ledger-floor-doomed-probe.test.ts).
+ *  #5596: the planning basis is the MEASURED input of this request only. The
+ *  refused-dsh-replay ledger floor that #2490 used to feed it was dropped:
+ *  those bytes are refused and never forwarded, so they are not a future
+ *  input — planning against them pinned healthy lanes onto the 4096 capability
+ *  floor for the session's life (the #5596 field incident). Future requests
+ *  measure their own input; un-foldable overflow is owned by the per-request
+ *  defenses (preflight / egress fuse, #4079/#4185).
  *  #3071: where a clamp DOES fire (cap >= OUTPUT_CLAMP_FLOOR), the 5% margin drags
  *  cap into the low thousands near the window (observed 1479/2623), starving the
  *  reply to an empty finish=length turn even though raw headroom still fits a normal
@@ -329,7 +315,7 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     if (safe !== undefined) return safe;
     // The inflated estimate dropped the cap below the capability floor (input alone
     // nearly fills the window — preflight/self-heal territory) while the raw formula
-    // would still clamp (the #2490/#3071 pinned ledger shapes). Re-run on the raw
+    // would still clamp (the #3071 pinned near-wall shapes). Re-run on the raw
     // estimate so we never surrender a clamp the raw formula applies — those regimes
     // stay byte-identical. Every other safe-path no-op implies the same no-op on the
     // raw path: a looser estimate only raises every term.
@@ -337,22 +323,19 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
 }
 
 /** #2490: translate the refused dsh compaction replay size (recorded on the
- *  session by the guard in handle.ts) into a token floor for the clamp's
- *  planning basis. bytes/4 mirrors the default estimator's chars/4 caliber
- *  (the replay is JSON text riding the same wires). 0 when nothing was
- *  recorded — legacy behavior.
+ *  session by the guard in handle.ts) into a token count. bytes/4 mirrors the
+ *  default estimator's chars/4 caliber (the replay is JSON text riding the
+ *  same wires). 0 when nothing was recorded — legacy behavior.
  *  STICKY BY DESIGN: the guard records a high-water mark and nothing decays
- *  or clears it while the session lives. While compaction stays refused the
- *  raw ledger only grows (refused checkpoints never land), so the max bounds
- *  every future re-send; decaying the floor would re-open the #2490 kill
- *  chain. Lifetime ends with the session (metadata eviction). Known
- *  conservative residue: if a checkpoint lands anyway (direct-bypass path;
- *  the #2028 opt-out was removed, #3666) and shrinks the ledger, the floor
- *  stays at its old high until eviction — fail-closed over-tightening,
- *  accepted.
- *  Note (#3384): recording stays sticky; what changed is APPLICATION — the
- *  clamp gates where this floor may drive planning (see clampOutgoingOutput),
- *  so a stale high-water mark can no longer starve a healthy session. */
+ *  or clears it while the session lives. It is a DIAGNOSTIC watermark of the
+ *  host's raw-ledger scale (acp_status, refusal-storm logs), not a planning
+ *  input: #5596 removed the one consumer that treated it as such — the output
+ *  clamp now plans against the measured input of each request, because the
+ *  refused bytes never leave bili's door and therefore are never a future
+ *  forwarded input (the #2490 floor built on them pinned healthy lanes onto
+ *  the 4096 budget floor for the session's life; #3384's gate did not catch
+ *  it because the giant-request ground passes for any max_tokens >= 25% of
+ *  the window). Lifetime ends with the session (metadata eviction). */
 export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefined | null): number {
     const bytes = metadata?.["dshCompactionRefusedBytes"];
     if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return 0;
@@ -472,19 +455,6 @@ export function clampOutgoingOutput(
      *  window the overflow boundary lies BELOW the headroom target, so capping
       *  against it would no-op exactly when post-compression turns need the
       *  guarantee most (#453). */ headroomWindow?: number;
-      /** #2490: floor for the PLANNING input when the host (dsh native compaction)
-      *  keeps a raw ledger bili's folded view cannot see. The guard's refusals
-      *  record the replayed envelope size on the session; that ledger will be
-      *  re-sent whole after this turn (and after every turn — the compaction
-      *  never lands), so a turn planned only against the folded input invites
-      *  output-sized overhang the next raw replay cannot survive. Raising the
-      *  planning basis only ever tightens the cap (fail-closed direction).
-      *  #3384: APPLIED ONLY WHEN GATED — the floor engages iff the folded view
-      *  already sits at the enforced headroom target OR the requested budget is
-      *  giant (>= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT of the window); below
-      *  both lines it would reserve output budget against bytes never sent and
-      *  starve healthy sessions (see clampOutgoingOutput). */
-    ledgerFloorTokens?: number;
       /** #2122/#1933 F1: per-route estimator calibration — scales the local-est
         *  side of estimateInputTokens so the clamp judges the payload on the same
         *  provider-billed scale as preflight/nudge. Absent → legacy raw behavior. */ kFactor?: number; kOrigin?: string; origin?: string;
@@ -498,7 +468,7 @@ export function clampOutgoingOutput(
     /** #3148: optional visibility hook — invoked with the exact clamp event when
      *  a cap is applied (callers record it on session.stats for acp_status).
      *  Never affects the wire decision. */
-    onClamped?: (info: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number }) => void,
+    onClamped?: (info: { raw: number; capped: number; window: number; planningInput: number }) => void,
 ): void {
     const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
@@ -509,38 +479,23 @@ export function clampOutgoingOutput(
     // reserve) caliber as preflight/metering instead of double-counting every image.
     const loadedToolTokens = field === "max_output_tokens" ? countLoadedToolTokens(rebuilt) : 0;
     const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource, ctx.kFactor, ctx.kOrigin, ctx.origin, loadedToolTokens, ctx.imageTokens);
-    // #2490: judge headroom against the larger of the folded view and the refused
-    // raw ledger — see ctx.ledgerFloorTokens. Keeps the shape of estimateInputTokens'
-    // internal max() (usage baseline never scales DOWN), so all three calibers stay
-    // conservative in the same direction.
-    const ledgerFloor = typeof ctx.ledgerFloorTokens === "number" && Number.isFinite(ctx.ledgerFloorTokens) ? Math.max(0, Math.floor(ctx.ledgerFloorTokens)) : 0;
-    // #3384: the floor only applies where it can still defend something — two
-    // independent grounds, either suffices:
-    //   - viewAtEnforcedTarget: bili's OWN folded view has reached the
-    //     headroom-adjusted target nudge/preflight enforce — the session really
-    //     is at the wall, so planning against the worst-case ledger is right;
-    //   - giantRequestedBudget: the requested output alone can push a near-wall
-    //     ledger past the window in one turn (the #2490 shape).
-    // Otherwise the floor is pure over-reservation: the client's raw ledger only
-    // grows because bili refuses compaction, while the wire bili actually sends
-    // stays small via its folds — reserving output budget against bytes never
-    // sent starves the session's own replies (#3384: folded wire 8–11% of a 1M
-    // window, budget clamped to 5909, all eaten by thinking -> blank turns).
-    // Both pinned protection regimes survive: the #2490 incident request (384K
-    // >= 25% of 1M) takes giantRequestedBudget; near-wall sessions take
-    // viewAtEnforcedTarget.
-    const viewAtEnforcedTarget = typeof ctx.headroomWindow === "number" && Number.isFinite(ctx.headroomWindow) && ctx.headroomWindow > 0 && inputEstimate >= ctx.headroomWindow;
-    const giantRequestedBudget = ctx.nativeWindow > 0 && raw >= OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT * ctx.nativeWindow;
-    const planningInput = viewAtEnforcedTarget || giantRequestedBudget ? Math.max(inputEstimate, ledgerFloor) : inputEstimate;
-    const capped = clampOutputBudget(raw, planningInput, ctx.nativeWindow, ctx.knownOutputCeiling);
+    // #5596: plan against the MEASURED input of THIS request only. The refused
+    // dsh compaction replay size (session.metadata.dshCompactionRefusedBytes,
+    // dshLedgerFloorTokens) used to raise this basis (#2490, gated since
+    // #3384) — but those bytes are refused and never forwarded, so they are
+    // not a future input; the sticky high-water pinned healthy lanes onto the
+    // 4096 capability floor for the session's life (the #5596 field incident).
+    // Future requests measure their own input; un-foldable overflow is owned
+    // by the per-request defenses (preflight / egress fuse, #4079/#4185).
+    const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow, ctx.knownOutputCeiling);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);
         // #2096: in the band (headroom target, native window) the clamp can only
         // guarantee native-window fit — preflight/compression is what can pull
         // the input back under the enforced target. Say so instead of advertising
         // rescue right before the turn dies.
-        const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && planningInput >= ctx.headroomWindow;
-        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}${ledgerFloor > inputEstimate ? `, planning floor ${ledgerFloor} from the refused dsh compaction replay (#2490)` : ""}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
-        onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput, ledgerFloor });
+        const overTarget = ctx.headroomWindow !== undefined && ctx.headroomWindow < ctx.nativeWindow && inputEstimate >= ctx.headroomWindow;
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)${overTarget ? `; input already exceeds the headroom-adjusted target ~${ctx.headroomWindow} that nudge/preflight enforce — only compression can recover it, this clamp guarantees native-window fit only (#2096)` : ""}`);
+        onClamped?.({ raw, capped, window: ctx.nativeWindow, planningInput: inputEstimate });
     }
 }
