@@ -7,7 +7,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData, replaceSseEventData } from "../sse-util.js";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -76,26 +76,24 @@ function parseAnthropicSse(eventStr: string): { type: string; data: Record<strin
 }
 
 function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    let touched = false;
-    for (const l of lines) {
-        if (!touched && l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    touched = true;
-                    continue;
-                }
-            } catch {
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        return true;
+    });
+}
+
+function rewriteEventData(eventStr: string, edit: (obj: Record<string, unknown>) => boolean): Buffer {
+    const data = sseEventData(eventStr);
+    if (data !== null) {
+        try {
+            const obj = JSON.parse(data) as unknown;
+            if (typeof obj === "object" && obj !== null && !Array.isArray(obj) && edit(obj as Record<string, unknown>)) {
+                return Buffer.from(replaceSseEventData(eventStr, JSON.stringify(obj)) + "\n\n", "utf8");
             }
-        }
-        rebuilt.push(l);
+        } catch { /* malformed events keep their original bytes */ }
     }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return Buffer.from(eventStr + "\n\n", "utf8");
 }
 
 /** #1310: zero the usage object of a forwarded `message_start`. The real
@@ -108,49 +106,23 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
  *  Neutralizing the start makes the synthetic terminal the SOLE usage
  *  authority on the wire; a zeroed usage object stays schema-valid. */
 function neutralizeStartUsage(eventStr: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && obj.type === "message_start") {
-                    const msg = obj.message as Record<string, unknown> | undefined;
-                    if (msg && typeof msg === "object") {
-                        msg.usage = { input_tokens: 0, output_tokens: 0 };
-                        rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                        continue;
-                    }
-                }
-            } catch { /* fall through to verbatim */ }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (obj.type !== "message_start") return false;
+        const msg = obj.message as Record<string, unknown> | undefined;
+        if (!msg || typeof msg !== "object") return false;
+        msg.usage = { input_tokens: 0, output_tokens: 0 };
+        return true;
+    });
 }
 
 function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    const d = obj.delta as Record<string, unknown> | undefined;
-                    if (d && typeof d.text === "string") d.text = newText;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    continue;
-                }
-            } catch {
-            }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        const d = obj.delta as Record<string, unknown> | undefined;
+        if (d && typeof d.text === "string") d.text = newText;
+        return true;
+    });
 }
 
 // The loop's own early ends say "length", OpenAI's word; Anthropic has no
