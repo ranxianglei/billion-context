@@ -235,6 +235,7 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
             tools: Record<string, Array<Record<string, unknown>>>;
             headers: { agent: string; conversation: string };
             toolEndpoint: string;
+            capabilities?: { hostIdChannel?: { bodyField?: unknown; maxUnits?: unknown } };
         };
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
@@ -264,6 +265,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");
+        // #2938: the host-stable tool-unit id side channel is advertised so plugins
+        // capability-gate their stamping — proxies predating it forward unknown
+        // top-level fields verbatim, so an un-gated plugin would leak its id list.
+        assert.equal(manifest.capabilities?.hostIdChannel?.bodyField, "_bili_toolcall_ids");
+        assert.equal(manifest.capabilities?.hostIdChannel?.maxUnits, 10_000);
     } finally {
         await h.close();
     }
