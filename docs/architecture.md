@@ -2,8 +2,9 @@
 
 DSH's opt-in [native model policy](dsh-native-compaction.md) branches before bili's HTTP/WS transforms. Its adapter owns the preset-local native backend; host replacement generations isolate later bili folds. The kernel and provider adapters are unchanged.
 
-> One hub for the system's architecture. This page holds the **overall diagram** and the **module ledger**; each module gets its own page (en + `.zh-CN`) in this directory, each with its own diagram.
+> One hub for the system's architecture. This page holds the **overall diagram** and the **module ledger**; each module gets its own page (en + `.zh-CN` + `.ja`) in this directory, each with its own diagram.
 > 中文: [architecture.zh-CN.md](./architecture.zh-CN.md)
+> 日本語: [architecture.ja.md](./architecture.ja.md)
 >
 > **Live document (owner ruling 2026-11-08).** A PR that changes a module boundary, a depicted data flow, a table, a lane, or a wire path MUST update the affected page(s), diagram(s), and this hub table in the same PR. CI enforces the mechanical parts (`tools/check-architecture-docs.mjs`); the rule text lives in [AGENTS.md](../AGENTS.md) "Documentation Layout".
 
@@ -22,14 +23,14 @@ How to read it:
 
 | Module | One line | Pages | Status |
 |---|---|---|---|
-| `storage` | Unified SQLite: table family, kstate, checkpoints, GC | [storage.md](./architecture/storage.md) · [zh](./architecture/storage.zh-CN.md) | ✅ |
-| `pipeline` | Request pipeline (handle / prepare-* / relay / inject) | [pipeline.md](./architecture/pipeline.md) · [zh](./architecture/pipeline.zh-CN.md) | ✅ |
-| `lanes` | Host lanes (dsh / pi / opencode / codex / bare proxy + lane-decisions) | [lanes.md](./architecture/lanes.md) · [zh](./architecture/lanes.zh-CN.md) | ✅ |
-| `kernel` | Compression engine (acp-kernel: folds, summaries, ref ledger) | [kernel.md](./architecture/kernel.md) · [zh](./architecture/kernel.zh-CN.md) | ✅ |
-| `identity` | Session & message identity (session id, persona fork, msgid channels) | [identity.md](./architecture/identity.md) · [zh](./architecture/identity.zh-CN.md) | ✅ |
-| `fastpaths` | Fastpaths (incremental lane, v5 watermark, D-lane snapshot render) | [fastpaths.md](./architecture/fastpaths.md) · [zh](./architecture/fastpaths.zh-CN.md) | ✅ |
-| `webui` | Web panel & admin surface | [webui.md](./architecture/webui.md) · [zh](./architecture/webui.zh-CN.md) | ✅ |
-| `update` | Self-update, advisory, plugin install | [update.md](./architecture/update.md) · [zh](./architecture/update.zh-CN.md) | ✅ |
+| `storage` | Unified SQLite: table family, kstate, checkpoints, GC | [storage.md](./architecture/storage.md) · [zh](./architecture/storage.zh-CN.md) · [ja](./architecture/storage.ja.md) | ✅ |
+| `pipeline` | Request pipeline (handle / prepare-* / relay / inject) | [pipeline.md](./architecture/pipeline.md) · [zh](./architecture/pipeline.zh-CN.md) · [ja](./architecture/pipeline.ja.md) | ✅ |
+| `lanes` | Host lanes (dsh / pi / opencode / codex / bare proxy + lane-decisions) | [lanes.md](./architecture/lanes.md) · [zh](./architecture/lanes.zh-CN.md) · [ja](./architecture/lanes.ja.md) | ✅ |
+| `kernel` | Compression engine (acp-kernel: folds, summaries, ref ledger) | [kernel.md](./architecture/kernel.md) · [zh](./architecture/kernel.zh-CN.md) · [ja](./architecture/kernel.ja.md) | ✅ |
+| `identity` | Session & message identity (session id, persona fork, msgid channels) | [identity.md](./architecture/identity.md) · [zh](./architecture/identity.zh-CN.md) · [ja](./architecture/identity.ja.md) | ✅ |
+| `fastpaths` | Fastpaths (incremental lane, v5 watermark, D-lane snapshot render) | [fastpaths.md](./architecture/fastpaths.md) · [zh](./architecture/fastpaths.zh-CN.md) · [ja](./architecture/fastpaths.ja.md) | ✅ |
+| `webui` | Web panel & admin surface | [webui.md](./architecture/webui.md) · [zh](./architecture/webui.zh-CN.md) · [ja](./architecture/webui.ja.md) | ✅ |
+| `update` | Self-update, advisory, plugin install | [update.md](./architecture/update.md) · [zh](./architecture/update.zh-CN.md) · [ja](./architecture/update.ja.md) | ✅ |
 
 The hub table above is the single ledger — CI checks that `✅` rows have their page pairs and no extra pages exist.
 

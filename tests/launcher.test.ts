@@ -734,6 +734,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     const prevUserProfile = process.env.USERPROFILE;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    const prevThreads = process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+    delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
@@ -750,9 +752,11 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     if (distExisted) fs.renameSync(distAgent, distBackup);
 
     const clientArgsSeen: string[][] = [];
-    const spawnImpl: SpawnFn = (cmd, args) => {
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === process.env.BILI_CLIENT_BIN) {
             clientArgsSeen.push([...args]);
+            childEnv = options.env;
             const child = makeFakeChild(0);
             const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -793,6 +797,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
         assert.equal(fs.existsSync(`${ompHome}-bili`), false, "still no overlay dir");
         assert.deepEqual(exitCalls, [0]);
+        // #6088: OMP message threads would send only the newest message per turn
+        assert.equal(childEnv?.PI_ANTHROPIC_MESSAGE_THREADS, "0", "omp message threads defaulted off");
     } finally {
         process.exit = prevExit;
         if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
@@ -802,6 +808,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         else process.env.USERPROFILE = prevUserProfile;
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (prevThreads === undefined) delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+        else process.env.PI_ANTHROPIC_MESSAGE_THREADS = prevThreads;
         if (distExisted) fs.renameSync(distBackup, distAgent);
         rmrf(home);
     }
