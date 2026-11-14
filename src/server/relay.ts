@@ -1057,7 +1057,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // small. Log the measurement as evidence and forward; the
                 // upstream answers with its own real numbers (annotated in
                 // the upstream size-error branch below, same issue).
-                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
+                const fuseWallClause = operatorDeclared
+                    ? `vs the operator-declared model window ${declaredWindow.toLocaleString("en-US")} (compress.modelContextLimit, #5937)`
+                    : `vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079)`;
+                log("warn", `[${prepared.session.id}] egress window fuse profile: outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; the #554 meter) ${fuseWallClause} (model=${prepared.model ?? "unknown"}) — forwarding per #7537 (no local estimate-refusal); the upstream's own size verdict is authoritative`);
                 log("info", `[${prepared.session.id}] egress window fuse profile (duplication): ${describeCoreTextDuplication(fuseMsgs)}`);
             }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
