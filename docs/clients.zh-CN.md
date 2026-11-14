@@ -24,6 +24,8 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 technical-notes.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**dsh-go 宿主(第三方安卓 App):** 该 App(`ccch1mneyyy/dsh-Go`)自带一套 dsh 运行时 —— proot rootfs 里的 dsh `0.2.2-rc.1` / node 24.22.1 / Ubuntu 24.04.5,每次 App 更新替换约 135 个 dsh 文件。上面的 profile 泳道在这里原样可用:在它的 Linux 环境里执行 `dsh plugin --profile <name> add billion-context`,引擎即挂载该 bundle 并把代理拉成自己的子进程。已在 Redmi K80 / Android 16 / arm64-v8a 上验证:首次对话经代理转发(`[window] source=plugin`、`effective window 1048576 -> 792576 (reserved 256000)`、`forward POST → api.deepseek.com/anthropic/v1/messages`),`GET /__bili/plugin/status` 的 `contextTokens` 取自 usage。该宿主的客户端是原生实现,因此只带 `dsh.client.platform: web` 的 bundle(本插件的 Context 标签页与设置页)在那里没有落点 —— 宿主面、工具与 HTTP 面板不受影响,原生界面经 `dshGo` 槽另行接入(dsh-Go 的 `docs/plugins/native-for-free.md`)。它还定义了 `preset-dsh-go-companion` 与 `preset-dsh-go-companion-full`,其内嵌的 `compaction-basic` 行应由 #4147 的结构化遍历覆盖。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:
