@@ -219,6 +219,62 @@ test("session cap evicts the coldest session (LRU)", () => {
     });
 });
 
+test("init snapshot keeps a bounded top-100 (descending, earlier-index tie-break) over a long history", () => {
+    resetContextAnalysisForTest();
+    const N = 300;
+    const v = (i: number) => 1 + (i % 150); // estTokens 1..150, each value appears twice
+    const messages = Array.from({ length: N }, (_, i) => ({
+        id: `m${i}`,
+        role: (i % 2 ? "assistant" : "user") as "assistant" | "user",
+        contentType: "text" as const,
+        text: "x".repeat(4 * v(i)), // estTokens = ceil(4*v/4) = v
+        toolName: `t${i}`, // free string: encodes the index, does NOT affect estTokens
+    }));
+    recordNudgeObservation("s-topk", { nudge: null, messages }, 50_000, 750_000, false);
+    recordNudgeObservation("s-topk", { nudge: null }, 52_000, 750_000, false);
+    const init = contextAnalysisView("s-topk")!.init!;
+
+    // Reference: the unbounded "sort everything" top-100 (estTokens desc, index asc).
+    const ref = messages
+        .map((m, i) => ({ estTokens: v(i), toolName: m.toolName, index: i }))
+        .sort((a, b) => b.estTokens - a.estTokens || a.index - b.index)
+        .slice(0, 100);
+
+    if (init.perMessage.length !== 100) throw new Error(`sample size ${init.perMessage.length}`);
+    for (let k = 0; k < 100; k++) {
+        const got = init.perMessage[k]!;
+        const want = ref[k]!;
+        if (got.estTokens !== want.estTokens) throw new Error(`pos ${k}: estTokens ${got.estTokens} != ${want.estTokens}`);
+        if (got.toolName !== want.toolName) throw new Error(`pos ${k}: tie-break ${got.toolName} != ${want.toolName}`);
+    }
+    // Boundary pins (catch a tie-break or off-by-one in the bounded scan):
+    // v=150 lives at index 149 and 299 → earlier index first; v=101 at 100 and 250.
+    if (init.perMessage[0]!.estTokens !== 150 || init.perMessage[0]!.toolName !== "t149") throw new Error(`top: ${JSON.stringify(init.perMessage[0])}`);
+    if (init.perMessage[1]!.toolName !== "t299") throw new Error(`tie-break: ${JSON.stringify(init.perMessage[1])}`);
+    if (init.perMessage[99]!.estTokens !== 101 || init.perMessage[99]!.toolName !== "t250") throw new Error(`bottom: ${JSON.stringify(init.perMessage[99])}`);
+    // Aggregates cover ALL messages, not just the 100 kept.
+    const wantChars = messages.reduce((s, m) => s + (m.text ?? "").length + (m.toolName ? m.toolName.length : 0), 0);
+    const wantTokens = messages.reduce((s, _, i) => s + v(i), 0);
+    if (init.totalChars !== wantChars) throw new Error(`totalChars ${init.totalChars} != ${wantChars}`);
+    if (init.estTokens !== wantTokens) throw new Error(`estTokens ${init.estTokens} != ${wantTokens}`);
+    if (init.messageCount !== N) throw new Error(`messageCount ${init.messageCount}`);
+});
+
+test("init ranking includes thinking tokens (metered size, not just visible text)", () => {
+    resetContextAnalysisForTest();
+    // A: 1 visible token + 1000 thinking tokens = 1001; B: 1000 visible tokens.
+    // Thinking tokens must rank A above B's larger visible text.
+    const messages = [
+        { id: "mA", role: "assistant" as const, contentType: "text" as const, text: "x".repeat(4), toolName: "think", thinkingTokens: 1000 },
+        { id: "mB", role: "user" as const, contentType: "text" as const, text: "x".repeat(4000), toolName: "plain" },
+    ];
+    recordNudgeObservation("s-think", { nudge: null, messages }, 50_000, 750_000, false);
+    recordNudgeObservation("s-think", { nudge: null }, 52_000, 750_000, false);
+    const init = contextAnalysisView("s-think")!.init!;
+    if (init.perMessage[0]!.estTokens !== 1001 || init.perMessage[0]!.toolName !== "think") throw new Error(`thinking not ranked: ${JSON.stringify(init.perMessage[0])}`);
+    if (init.perMessage[1]!.estTokens !== 1000 || init.perMessage[1]!.toolName !== "plain") throw new Error(JSON.stringify(init.perMessage[1]));
+});
+
 test("digest line format: label, usage, report joined; idle stays quiet except every 60th gate", () => {
     resetContextAnalysisForTest();
     recordNudgeObservation("s-f", { nudge: null, messages: [msg("1", 1000)] }, 300_000, 750_000, false);

@@ -27,6 +27,25 @@ interface InitMessageEntry {
     estTokens: number;
 }
 
+/** A node in the bounded top-K scan: the output entry plus the original
+ *  message index, which breaks estTokens ties toward the earlier message
+ *  (matching the order the old whole-array stable sort produced). */
+interface InitScanNode {
+    role: string;
+    contentType: string;
+    toolName?: string;
+    estTokens: number;
+    index: number;
+}
+
+/** Is `a` the one to KEEP over `b`? Higher estTokens wins; on a tie the
+ *  earlier message (lower index) wins. A total order (indices are unique),
+ *  so `a` keeps over `b` iff `b` does NOT keep over `a`. */
+function initNodeKeeps(a: InitScanNode, b: InitScanNode): boolean {
+    if (a.estTokens !== b.estTokens) return a.estTokens > b.estTokens;
+    return a.index < b.index;
+}
+
 interface InitProfile {
     ts: number;
     messageCount: number;
@@ -147,23 +166,60 @@ function touch(id: string): ContextAnalysis {
 }
 
 function snapshotInit(messages: CoreMessage[]): InitProfile {
-    const entries: InitMessageEntry[] = [];
     let totalChars = 0;
     let estTokens = 0;
-    for (const m of messages) {
+    // Bounded top-K: a min-heap (worst entry at the root) keeps only the
+    // INIT_PER_MSG_CAP largest entries in memory while scanning, so a long
+    // history never allocates one entry per message nor sorts the whole
+    // array. Aggregate counts (totalChars/estTokens) still cover every message.
+    const heap: InitScanNode[] = [];
+    const worse = (a: InitScanNode, b: InitScanNode) => initNodeKeeps(b, a);
+    const siftDown = (i: number) => {
+        for (;;) {
+            const l = 2 * i + 1;
+            const r = 2 * i + 2;
+            let m = i;
+            if (l < heap.length && worse(heap[l]!, heap[m]!)) m = l;
+            if (r < heap.length && worse(heap[r]!, heap[m]!)) m = r;
+            if (m === i) break;
+            const t = heap[i]!; heap[i] = heap[m]!; heap[m] = t;
+            i = m;
+        }
+    };
+    const siftUp = (j: number) => {
+        while (j > 0) {
+            const p = (j - 1) >> 1;
+            if (worse(heap[j]!, heap[p]!)) {
+                const t = heap[j]!; heap[j] = heap[p]!; heap[p] = t;
+                j = p;
+            } else break;
+        }
+    };
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i]!;
         const chars = (m.text ?? "").length + (m.toolName ? m.toolName.length : 0);
         totalChars += chars;
         const tok = countMessageTokens(m, defaultCountTokens);
         estTokens += tok;
-        entries.push({ role: m.role, contentType: m.contentType, toolName: m.toolName, estTokens: tok });
+        const node: InitScanNode = { role: m.role, contentType: m.contentType, toolName: m.toolName, estTokens: tok, index: i };
+        if (heap.length < INIT_PER_MSG_CAP) {
+            heap.push(node);
+            siftUp(heap.length - 1);
+        } else if (initNodeKeeps(node, heap[0]!)) {
+            heap[0] = node;
+            siftDown(0);
+        }
     }
-    entries.sort((x, y) => y.estTokens - x.estTokens);
+    heap.sort((x, y) => y.estTokens - x.estTokens || x.index - y.index);
+    const perMessage: InitMessageEntry[] = heap.map(({ role, contentType, toolName, estTokens: tok }) => ({
+        role, contentType, toolName, estTokens: tok,
+    }));
     return {
         ts: Date.now(),
         messageCount: messages.length,
         totalChars,
         estTokens,
-        perMessage: entries.slice(0, INIT_PER_MSG_CAP),
+        perMessage,
     };
 }
 
