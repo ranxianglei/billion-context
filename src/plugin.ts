@@ -5214,6 +5214,10 @@ export async function pipePluginJson(
     // m00885: echoed (user-requested verbatim) emission spans survive.
     requestText?: string,
     reply?: HandoffReply,
+    // #6433: session id for witness recording only — lets the non-plugin JSON
+    // lane ring-record outbound tool calls (mirroring the SSE pipes) without
+    // passing the full session (which would turn on usage accounting).
+    witnessSessionId?: string,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -5279,7 +5283,11 @@ export async function pipePluginJson(
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).
-        if (session) recordJsonToolWitnesses(session.id, json, protocol);
+        // #6433: the non-plugin JSON lane passes no session (usage accounting
+        // stays off) but still ring-records via witnessSessionId, mirroring
+        // the SSE pipes, so the unbound shim's witness route can match.
+        const witnessSid = witnessSessionId ?? session?.id;
+        if (witnessSid) recordJsonToolWitnesses(witnessSid, json, protocol);
     } catch { /* non-JSON body — forward verbatim */ }
         // #2190: degenerate-close residue never trips RENDER_TAG_DETECT — check its shape too.
         // m00885: an absorb-instructed turn may answer with a whole-field

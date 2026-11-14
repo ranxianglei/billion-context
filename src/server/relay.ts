@@ -2617,7 +2617,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
+            // #6433: pass the session id (not the full session) so the pipe can
+            // ring-record outbound tool calls for the unbound shim's witness
+            // route, mirroring the SSE branch above.
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply, prepared.session?.id);
         } else {
             await pipeThrough(responseBody, res);
         }
