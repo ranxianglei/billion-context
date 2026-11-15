@@ -364,6 +364,38 @@ CREATE TABLE IF NOT EXISTS l1_world (
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
 `;
 
+/** #5874 v2 (pure-incremental): the append-only FOLD JOURNAL — one row per
+ *  compression fold decision (a block that first lands in the ledger).
+ *  kind stays 'fold': UNPIN is DERIVED state, not stored state — a fold is
+ *  unpinned iff its block died or a covered id re-emerged live past the
+ *  fold's end_seq (the pure predicate src/storage/snap.ts foldUnpins), so
+ *  there is nothing extra to persist. input_hash is the sha256 aggregate
+ *  over the covered LIVE message rows (seq, msg_id, content_hash) at fold
+ *  time — the "poor-man's S4": the egress read re-derives the same
+ *  aggregate and any mismatch (content rewrite, rewind crossing the fold,
+ *  row loss) degrades the round to the legacy derive path instead of
+ *  serving a stale view. covered_ids pins the id set the hash ran over
+ *  (re-derivation needs it; a fold whose ids all retired keeps its row —
+ *  the journal is append-only and rows are never rewritten or deleted
+ *  except by the session cascade). Probed separately from l1_world: a db
+ *  already at v12 with l1_world but no fold_journal (a dev window between
+ *  the two landings) upgrades with this one CREATE, no version bump. */
+const FOLD_JOURNAL_DDL = `-- #5874 v2: append-only fold journal (fold decisions + input aggregate hash).
+CREATE TABLE IF NOT EXISTS fold_journal (
+    session_id TEXT NOT NULL,
+    jseq INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'fold' CHECK (kind IN ('fold')),
+    block_id TEXT NOT NULL,
+    start_seq INTEGER NOT NULL,
+    end_seq INTEGER NOT NULL,
+    covered_ids TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, jseq),
+    UNIQUE (session_id, block_id)
+);
+`; 
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -387,6 +419,14 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
     if (!hasL1World) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
+    // #5874 v2: the fold journal is its OWN probe — a v12 db written before
+    // it landed has l1_world but not fold_journal and must pick it up here
+    // (same probe-first discipline; the CREATE is IF NOT EXISTS, so a fresh
+    // db that got both tables from the DDL above passes through untouched).
+    const hasFoldJournal = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fold_journal'")
+        .get();
+    if (!hasFoldJournal) db.exec(FOLD_JOURNAL_DDL);
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev

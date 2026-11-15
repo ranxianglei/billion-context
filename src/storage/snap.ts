@@ -19,6 +19,8 @@
  * compression work and never serves bytes — it decides identity only.
  */
 
+import { createHash } from "node:crypto";
+
 /** Minimal db surface so the identity ledger stays type-coupled to the
  *  storage driver without importing it (same contract as the driver's
  *  prepared-statement API). */
@@ -183,4 +185,141 @@ export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): vo
     // latch before any store call), so the placeholder can never hit the
     // "red" ledger-conflict path of snapL1Record.
     db.prepare("INSERT INTO l1_world (sess_raw, ledger_id, witness_probe, issued_at, r3_latched_at) VALUES (?, ?, '', ?, ?) ON CONFLICT(sess_raw) DO UPDATE SET r3_latched_at = excluded.r3_latched_at, ledger_id = COALESCE(l1_world.ledger_id, excluded.ledger_id), witness_probe = COALESCE(NULLIF(l1_world.witness_probe, ''), excluded.witness_probe)").run(sessRaw, sessRaw, nowMs, nowMs);
+}
+
+// ---------------------------------------------------------------------------
+// Fold journal — append-only fold decisions with an input aggregate hash.
+//
+// One row per compression fold (a block that first lands in the ledger).
+// The row pins: the seq interval the fold covers, the id set it was
+// computed over, and input_hash — sha256 over the covered message rows
+// (seq, msg_id, content_hash), ALL generations (live AND retired — the
+// fold's own ingest retires its covered rows in the same transaction, so a
+// live-only aggregate would be empty at fold time), in seq order. The
+// egress read re-derives the same aggregate from the current rows; a
+// mismatch means the fold's source moved (content rewrite, a new-generation
+// row, row loss) and the round degrades to the legacy derive path — 降级不猜.
+//
+// UNPIN is not a row kind, it is DERIVED state: foldUnpins below is the
+// single pure predicate. Derived, not stored — the journal stays
+// append-only and there is no second write to drift from the first.
+// ---------------------------------------------------------------------------
+
+export interface FoldJournalRow {
+    sessionId: string;
+    jseq: number;
+    blockId: string;
+    startSeq: number;
+    endSeq: number;
+    coveredIds: string[];
+    inputHash: string;
+    createdAt: number;
+}
+
+/** Re-derive the fold input aggregate over the covered ids' rows — ALL
+ *  generations (no retired filter: the fold's own ingest retires the
+ *  covered rows in the same transaction, so the aggregate must survive
+ *  retirement to verify against later). Order-stable (ORDER BY seq) and
+ *  covers seq too, so any source movement changes the digest — a new
+ *  generation row (edit/rewind re-issue), an in-place content swap, or row
+ *  loss. null when the id set is empty or no rows exist at all. */
+export function foldInputHash(
+    db: DbLike,
+    sessionId: string,
+    coveredIds: readonly string[],
+): string | null {
+    if (coveredIds.length === 0) return null;
+    const rows = db
+        .prepare(`SELECT seq, msg_id, content_hash FROM messages
+                  WHERE session_id = ? AND msg_id IN (${coveredIds.map(() => "?").join(", ")})
+                  ORDER BY seq`)
+        .all(sessionId, ...coveredIds) as Array<{ seq: number; msg_id: string; content_hash: string }>;
+    if (rows.length === 0) return null;
+    const h = createHash("sha256");
+    for (const r of rows) h.update(`${r.seq}\u0000${r.msg_id}\u0000${r.content_hash}\n`);
+    return h.digest("hex");
+}
+
+/** Append a fold row for a block that first landed (idempotent on
+ *  (session_id, block_id) — a re-ingest of the same block is a no-op, and
+ *  a replaced block keeps its FIRST fold row: the journal records the
+ *  decision point, not the latest bytes, and the hash check is what
+ *  notices a replacement). inputHash null is stored as the empty string —
+ *  the column is NOT NULL and empty is the "unverifiable" sentinel the
+ *  read side treats as a mismatch. */
+export function appendFoldJournal(
+    db: DbLike,
+    sessionId: string,
+    blockId: string,
+    startSeq: number,
+    endSeq: number,
+    coveredIds: readonly string[],
+    inputHash: string | null,
+    nowMs: number,
+): void {
+    db.prepare(
+        `INSERT OR IGNORE INTO fold_journal (session_id, jseq, kind, block_id, start_seq, end_seq, covered_ids, input_hash, created_at)
+         VALUES (?, (SELECT COALESCE(MAX(jseq), 0) + 1 FROM fold_journal WHERE session_id = ?), 'fold', ?, ?, ?, ?, ?, ?)`,
+    ).run(sessionId, sessionId, blockId, startSeq, endSeq, JSON.stringify(coveredIds), inputHash ?? "", nowMs);
+}
+
+/** All fold rows for a session, jseq order (the journal IS the order). */
+export function foldJournalRows(db: DbLike, sessionId: string): FoldJournalRow[] {
+    const rows = db
+        .prepare("SELECT session_id, jseq, block_id, start_seq, end_seq, covered_ids, input_hash, created_at FROM fold_journal WHERE session_id = ? ORDER BY jseq")
+        .all(sessionId) as Array<{ session_id: string; jseq: number; block_id: string; start_seq: number; end_seq: number; covered_ids: string; input_hash: string; created_at: number }>;
+    return rows.map((r) => ({
+        sessionId: r.session_id,
+        jseq: r.jseq,
+        blockId: r.block_id,
+        startSeq: r.start_seq,
+        endSeq: r.end_seq,
+        coveredIds: JSON.parse(r.covered_ids) as string[],
+        inputHash: r.input_hash,
+        createdAt: r.created_at,
+    }));
+}
+
+/** The unpin predicate — the single place a fold is judged dead. A fold is
+ *  UNPINNED iff any of:
+ *   1. its block is not currently active (deactivated, superseded, or the
+ *      row is gone — compaction cleanup, session prune);
+ *   2. a covered id has a LIVE row at ANY seq — the steady state of an
+ *      ACTIVE fold is that every covered row is RETIRED (the fold's own
+ *      ingest retires them: the presented history carries the summary, not
+ *      the originals), so any covered row live again means the fold's
+ *      summary anchor no longer exclusively owns that id's history — either
+ *      a RE-EMERGENCE past end_seq (new generation: the old one was
+ *      tombstoned and the id re-issued further down the log — an edit or a
+ *      rewind re-covering the id beyond the fold) or an IN-INTERVAL live
+ *      row (a #4390 in-place reactivation: a rewind unwound the fold and
+ *      the D-lane's tail authority now carries those messages, not the
+ *      summary). A host shape that legitimately keeps a covered row live
+ *      after the fold degrades such sessions to the derive path (safe
+ *      direction, no byte risk — it is exactly today's flag-off behavior).
+ *  Pure: no db, no writes — callers feed it the live rows (session-wide is
+ *  fine; the predicate intersects with the covered ids) and the active
+ *  block ids they already loaded. Returns the set of UNPINNED block ids
+ *  (empty = everything still pinned). */
+export function foldUnpins(
+    journal: readonly FoldJournalRow[],
+    liveRows: readonly { msgId: string; seq: number }[],
+    activeBlocks: ReadonlySet<string>,
+): Set<string> {
+    const unpinned = new Set<string>();
+    const liveMsgIds = new Set<string>();
+    for (const r of liveRows) liveMsgIds.add(r.msgId);
+    for (const f of journal) {
+        if (!activeBlocks.has(f.blockId)) {
+            unpinned.add(f.blockId);
+            continue;
+        }
+        for (const id of f.coveredIds) {
+            if (liveMsgIds.has(id)) {
+                unpinned.add(f.blockId);
+                break;
+            }
+        }
+    }
+    return unpinned;
 }

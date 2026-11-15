@@ -24,6 +24,8 @@ import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type Sq
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import {
+    appendFoldJournal,
+    foldInputHash,
     snapL1EnvelopeRead,
     snapL1Record,
     snapR3LatchedRead,
@@ -1412,6 +1414,26 @@ export class UnifiedStore {
                 }
             }
 
+            // #5874 v2: fold journal — one append-only row per NEW compression
+            // block (the fold decision point). A re-ingest of the same block
+            // is a no-op (the UNIQUE(session_id, block_id) constraint), and
+            // the input hash over the covered live rows is the anchor the
+            // egress read re-derives (foldInputHash). Blocks that arrived via
+            // a dump import have no row: the read side derives them lazily
+            // (journal absence is "derive", never an error).
+            for (const b of input.blocks) {
+                if (storedBlocks.get(b.blockId) !== undefined) continue;
+                if (!b.active) continue;
+                const [fStart, fEnd] = boundsForCovered(b.payloadJson);
+                if (fStart < 0) continue;
+                let ids: string[] = [];
+                try {
+                    const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    ids = [...new Set([...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])])];
+                } catch { /* malformed payload: empty id set, hash null → unverifiable sentinel */ }
+                appendFoldJournal(this.db, s.sessionId, b.blockId, fStart, fEnd, ids, foldInputHash(this.db, s.sessionId, ids), b.createdAt);
+            }
+
             // dead_refs: tombstones can be LIFTED (backing message
             // reappears) — the array is authoritative, so rows at ords the
             // incoming set no longer covers are stale and must go.
@@ -2087,6 +2109,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
@@ -2329,6 +2352,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
