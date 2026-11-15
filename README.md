@@ -45,7 +45,7 @@
 
 ---
 
-> **Cache health at a glance:** a healthy session keeps a **95–97%** prefix-cache hit rate — compression itself costs ≤2%. Sustained lower? Check attribution with `/acp` or `/acp-cache` (see [FAQ](#faq)); usual causes, in order: upstream cache TTL expiry · model switch · a bili bug (please report) · other/unknown.
+> **Cache health at a glance:** a healthy session keeps a **96–99%** prefix-cache hit rate — compression itself costs ≤2%. Sustained lower? Check attribution with `/acp` or `/acp-cache` (see [FAQ](#faq)); usual causes, in order: upstream cache TTL expiry · model switch · a bili bug (please report) · other/unknown.
 
 ## Community
 
@@ -360,7 +360,7 @@ an explicit `HEALTHY` verdict; misses decomposed into new content /
 compress re-pay / upstream-ttl-or-client-rewrite) · **FOLD ECONOMICS** (per-fold
 economics: net tokens saved, paid-back verdicts) · **LINE ITEMS** (anomalies
 only: hit<85% or miss≥5000). Rule of thumb: **compression itself costs ≤2%** —
-a healthy session sits at **95–97%**. When you see less, the attribution tells
+a healthy session sits at **96–99%**. When you see less, the attribution tells
 you which of the usual suspects it was, in this order: ① upstream cache TTL
 expiry (shows up as stable-prefix misses — the top-spikes line names idle
 times), ② a model switch, ③ a bili bug (report it with the page attached),
