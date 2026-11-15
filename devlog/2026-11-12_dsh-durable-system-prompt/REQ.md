@@ -36,6 +36,7 @@
 
 - [x] dsh lane: newest plain-text in-history system is excluded from every fold; the superseded copy folds.
 - [x] A tool-delta system after the prompt neither folds nor takes the prompt's latest slot.
+- [x] An empty system node after the prompt does not take the prompt's latest slot, on each of the three wires that carry an in-history system, in the raw view and in a view rendered with ref tags.
 - [x] Unregistered lane: the same message still folds (both wires tested).
 - [x] The twelve existing dsh identities resolve as before for user-role carriers; assistant echoes still never project.
 - [x] Rule-3 last-user anchor unchanged.

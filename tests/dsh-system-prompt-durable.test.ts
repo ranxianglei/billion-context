@@ -112,6 +112,17 @@ describe("dshSystemPromptPath units", () => {
         ] } as never).msgs.filter((m) => m.role === "system");
         assert.equal(rspDev.length, 1);
         assert.equal(dshSystemPromptPath(rspDev[0]!), "durable/system-prompt", "responses wire, developer item with string content");
+
+        // The empty-node exclusion reads the host's bytes: it is not a comparison
+        // against the placeholder text the Messages codec gives an empty system
+        // message (see the negatives), and one blank block next to the prompt
+        // text does not make the message empty.
+        const placeholder = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: "" }] }).msgs[1]!.text ?? "";
+        assert.match(placeholder, /\S/, "precondition: the codec gives an empty system message non-blank text");
+        const literal = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: placeholder }] }).msgs[1]!;
+        assert.equal(dshSystemPromptPath(literal), "durable/system-prompt", "host text that happens to equal the codec's placeholder is still host text");
+        const padded = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: [{ type: "text", text: "" }, { type: "text", text: PROMPT_V2 }] }] }).msgs[1]!;
+        assert.equal(dshSystemPromptPath(padded), "durable/system-prompt", "Messages wire, an empty text block next to the prompt text");
     });
 
     test("negatives: other roles, non-text, empty, structured systems, bili's own summary carrier", () => {
@@ -123,6 +134,38 @@ describe("dshSystemPromptPath units", () => {
         assert.equal(dshSystemPromptPath({ id: "s2", role: "system", contentType: "text" } as CoreMessage), undefined, "missing text is safe");
         assert.equal(dshSystemPromptPath(mk("s3", "system", "")), undefined, "an empty system node supplies no prompt");
         assert.equal(dshSystemPromptPath(mk("s4", "system", " \n\t")), undefined, "whitespace-only likewise");
+
+        // Through the real codecs. The Messages codec gives an empty system
+        // message a placeholder `text` (the same value seeds its id), so `text`
+        // alone cannot tell an empty node from a prompt on that wire; the
+        // verbatim sidecar can.
+        const antBlank = (content: unknown): CoreMessage =>
+            anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content } as unknown as AnthropicWireMessage] }).msgs[1]!;
+        for (const [content, why] of [
+            ["", "empty string content"],
+            [[{ type: "text", text: "" }], "one empty text block"],
+            [[{ type: "text" }], "one text block without a text key"],
+        ] as Array<[unknown, string]>) {
+            const blank = antBlank(content);
+            assert.equal(blank.role, "system");
+            assert.match(blank.text ?? "", /\S/, `precondition (${why}): the codec's placeholder makes the text non-blank`);
+            assert.equal(hasUnrecoverableMediaPayload(blank), false, `precondition (${why}): plain text, the kernel's structured-system pin does not own it`);
+            assert.equal(dshSystemPromptPath(blank), undefined, `Messages wire, ${why}`);
+        }
+        // The next four resolved to undefined before the sidecar was read as
+        // well (their `text` is blank on its own); pinned so they stay that way.
+        assert.equal(dshSystemPromptPath(antBlank(" \n\t")), undefined, "Messages wire, whitespace-only string");
+        assert.equal(dshSystemPromptPath(antBlank([{ type: "text", text: "" }, { type: "text", text: "\t" }])), undefined, "Messages wire, several blank text blocks");
+        const oaiBlank = openaiToCore({ model: "m", messages: [{ role: "user", content: "hi" }, { role: "system", content: "" }] }).msgs.filter((m) => m.role === "system");
+        assert.equal(oaiBlank.length, 1, "the codec keeps an empty in-history system as a core");
+        assert.equal(dshSystemPromptPath(oaiBlank[0]!), undefined, "chat-completions wire, empty system");
+        const rspBlank = responsesToCore({ model: "m", input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+            { type: "message", role: "system", content: [{ type: "input_text", text: "" }] },
+        ] } as never).msgs.filter((m) => m.role === "system");
+        assert.equal(rspBlank.length, 1);
+        assert.equal(dshSystemPromptPath(rspBlank[0]!), undefined, "responses wire, empty system item");
+
         assert.equal(dshSystemPromptPath(mk("s5", "system", `${SUMMARY_HEADER}\nearlier work, folded`)), undefined, "the kernel renders its own summary carrier role system — never a host prompt");
         assert.equal(dshSystemPromptPath(mk("s6", "system", `${SUMMARY_HEADER} — topic\nearlier work, folded`)), undefined);
 
@@ -136,6 +179,9 @@ describe("dshSystemPromptPath units", () => {
         assert.equal(dshSystemPromptPath(mixed), undefined, "text + tool delta in one system message is still structured");
         const directive = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: [], output_config: { effort: "low" } }] }).msgs[1]!;
         assert.equal(dshSystemPromptPath(directive), undefined, "directive-only system");
+        const noBlocks = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: [] }] }).msgs[1]!;
+        assert.equal(hasUnrecoverableMediaPayload(noBlocks), true, "precondition: an empty block list is not plain text, the kernel's structured-system pin owns it");
+        assert.equal(dshSystemPromptPath(noBlocks), undefined, "empty block list (anthropic wire)");
         const oaiDelta = openaiToCore({ model: "m", messages: [{ role: "user", content: "hi" }, { role: "system", content: [{ type: "text", text: "tools changed" }, { type: "tool_addition", name: "search" }] }] } as never).msgs.find((m) => m.role === "system")!;
         assert.equal(hasUnrecoverableMediaPayload(oaiDelta), true);
         assert.equal(dshSystemPromptPath(oaiDelta), undefined, "structured system (chat-completions wire)");
@@ -249,6 +295,83 @@ describe("fold geometry through the wire codec (latest-per-identity)", () => {
         const latest2 = collectLatestProtected(msgs2, config);
         assert.equal(isMessageLatestProtected(msgs2.at(-1)!, latest2), true, "the appended update takes the identity over");
         assert.equal(isMessageLatestProtected(msgs2[IDX.v3]!, latest2), false, "the copy it supersedes becomes foldable — exactly one live instance");
+    });
+
+    test("an empty system node after the prompt does not take its identity", () => {
+        const config = dshConfig();
+        const b = body();
+        // A system message with no text at all, in the text-block shape of an
+        // in-history update (llm-deepseek itself refuses to send an empty one
+        // today), inserted after V3 and the tool delta. Its core `text` is the
+        // Messages codec's placeholder, not blank.
+        const at = IDX.lastAssistant;
+        b.messages.splice(at, 0, sys(""));
+        const msgs = anthropicToCore(b).msgs;
+        assert.equal(msgs.length, 11);
+        const blank = msgs[at]!;
+        assert.match(blank.text ?? "", /\S/, "precondition: the codec's placeholder makes the text non-blank");
+
+        const latest = collectLatestProtected(msgs, config);
+        assert.equal(isMessageLatestProtected(msgs[IDX.v3]!, latest), true, "V3 is still the live instance: an empty node supersedes nothing");
+        assert.equal(isMessageLatestProtected(blank, latest), false);
+
+        const { res, folded } = fold(msgs, config, "m00001", "m00010");
+        assert.ok(res.result.blocksCreated >= 1, `the fold must happen, got errors=${JSON.stringify(res.result.errors)} warnings=${JSON.stringify(res.result.warnings)}`);
+        assert.ok(!folded.has(msgs[IDX.v3]!.id), "the prompt in force stays out of every block");
+        assert.ok(folded.has(msgs[IDX.v2]!.id), "the superseded copy still folds");
+        assert.ok(folded.has(blank.id), "the empty node itself is ordinary history, as on every other lane");
+        assert.ok(folded.has(msgs[at + 1]!.id), "the assistant after it folds");
+        assert.ok(!folded.has(msgs.at(-1)!.id), "the live request stays visible");
+    });
+
+    test("a view rendered with ref tags classifies like the raw view, on each wire", () => {
+        // processTurn's rendered messages carry a ref tag in front of a
+        // numbered message's `text`, so an empty system node reads as non-blank
+        // there whatever the codec. The sidecar still says the host sent
+        // nothing, and the prompt before it keeps the latest slot.
+        const config = dshConfig();
+        const wires: Array<[string, CoreMessage[]]> = [
+            ["Messages", anthropicToCore({ messages: [
+                { role: "user", content: `first question ${PAD}` },
+                sys(PROMPT_V2),
+                { role: "assistant", content: `first answer ${PAD}` },
+                { role: "user", content: `second question ${PAD}` },
+                sys(""),
+                { role: "assistant", content: `second answer ${PAD}` },
+                { role: "user", content: LIVE },
+            ] }).msgs],
+            ["chat-completions", openaiToCore({ model: "m", messages: [
+                { role: "system", content: PROMPT_V1 },
+                { role: "user", content: `first question ${PAD}` },
+                { role: "system", content: PROMPT_V2 },
+                { role: "assistant", content: `first answer ${PAD}` },
+                { role: "user", content: `second question ${PAD}` },
+                { role: "system", content: "" },
+                { role: "assistant", content: `second answer ${PAD}` },
+                { role: "user", content: LIVE },
+            ] }).msgs],
+            ["responses", responsesToCore({ model: "m", input: [
+                { type: "message", role: "user", content: [{ type: "input_text", text: `first question ${PAD}` }] },
+                { type: "message", role: "system", content: [{ type: "input_text", text: PROMPT_V2 }] },
+                { type: "message", role: "assistant", content: [{ type: "output_text", text: `first answer ${PAD}` }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: `second question ${PAD}` }] },
+                { type: "message", role: "system", content: "" },
+                { type: "message", role: "assistant", content: [{ type: "output_text", text: `second answer ${PAD}` }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: LIVE }] },
+            ] } as never).msgs],
+        ];
+        for (const [wire, raw] of wires) {
+            const turn = createCore().processTurn({ messages: raw, state: createInitialState(), config, tokenCount: 9999, renderTags: "text-only" });
+            const systems = turn.messages.filter((m) => m.role === "system");
+            assert.equal(raw.length, 7, `${wire}: one core per wire message (the leading system is hoisted)`);
+            assert.equal(systems.length, 2, `${wire}: the prompt and the empty node are both cores`);
+            const prompt = systems[0]!;
+            const blank = systems[1]!;
+            assert.match(blank.text ?? "", /\S/, `${wire} precondition: the rendered text of the empty node is non-blank`);
+            assert.equal(dshSystemPromptPath(blank), undefined, `${wire}: the empty node in the rendered view`);
+            assert.equal(dshSystemPromptPath(prompt), "durable/system-prompt", `${wire}: the prompt in the rendered view`);
+            assert.equal(isMessageLatestProtected(prompt, collectLatestProtected(turn.messages, config)), true, `${wire}: the prompt keeps the latest slot in the rendered view`);
+        }
     });
 
     test("the four durable carriers keep their own latest slot next to the prompt", () => {

@@ -191,17 +191,46 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
  *  two rules are disjoint by construction, and a tool delta arriving after
  *  the prompt cannot take its latest slot. (2) bili's own summary carrier is
  *  rendered role system (KDD #7) and is never host state. (3) An empty node
- *  supplies no prompt. dsh core has no other plain-text system producer: its
- *  only developer-role emitter (agent-loop tool-registry updates) carries
- *  tool blocks exclusively. A developer message WITH text would share this
- *  identity where the serializer splits the text off the tool blocks
- *  (llm-pi-ai on chat-completions and responses: its own plain system /
- *  developer item); no such emitter is evidenced. */
+ *  supplies no prompt — decided on the host's bytes where the core carries
+ *  its wire sidecar (hostSentSystemText). dsh core has no other plain-text
+ *  system producer: its only developer-role emitter (agent-loop tool-registry
+ *  updates) carries tool blocks exclusively. A developer message WITH text
+ *  would share this identity where the serializer splits the text off the
+ *  tool blocks (llm-pi-ai on chat-completions and responses: its own plain
+ *  system / developer item); no such emitter is evidenced. */
 export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
     return msg.role === "system" && msg.contentType === "text" && typeof msg.text === "string" &&
-        /\S/.test(msg.text) && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
+        hostSentSystemText(msg, msg.text) && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
         ? "durable/system-prompt"
         : undefined;
+}
+
+/** Whether the host put any non-whitespace text in this system message,
+ *  read off the verbatim wire sidecar that the Messages, chat-completions
+ *  and responses codecs attach to an in-history system (rawAnthropicMessage,
+ *  rawOpenaiMessage, rawResponsesItem; the field names follow the kernel's
+ *  MediaSidecar) instead of off `text`. `text` is not the host's bytes in
+ *  two places. (1) The Messages codec gives an empty system message the
+ *  placeholder text "[system]" (kernel/src/wire/anthropic.ts
+ *  systemMessageText; the same value seeds the id), so `content: ""` and a
+ *  single empty text block read as non-empty: taken at face value such a
+ *  node holds this identity and, arriving after the prompt in force, its
+ *  latest slot, and the prompt is foldable again. (2) In a view rendered
+ *  with ref tags (processTurn renderTags) a numbered message's `text` starts
+ *  with its tag, so an empty node reads as non-empty there on all three
+ *  wires and skews the protection set of whatever classifies that view.
+ *  A core without a sidecar is judged on `text`, as before. No copy is
+ *  made: this runs on every protection check. */
+function hostSentSystemText(msg: CoreMessage, text: string): boolean {
+    const sidecars = msg as { rawAnthropicMessage?: unknown; rawOpenaiMessage?: unknown; rawResponsesItem?: unknown };
+    const raw = sidecars.rawAnthropicMessage ?? sidecars.rawOpenaiMessage ?? sidecars.rawResponsesItem;
+    if (raw == null) return /\S/.test(text);
+    const content = (raw as { content?: unknown }).content;
+    if (typeof content === "string") return /\S/.test(content);
+    return Array.isArray(content) && content.some((part) => {
+        const partText = (part as { text?: unknown } | null)?.text;
+        return typeof partText === "string" && /\S/.test(partText);
+    });
 }
 
 /** #2286 wire shape (AUTO_INJECTED_NOTIFICATION_PREFIXES in src/server.ts):
