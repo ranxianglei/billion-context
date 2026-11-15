@@ -157,14 +157,14 @@ Usage:
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
-   bili bench [scenario]            perf harness (#5460 P2): boots a hermetic proxy
+  bili bench [scenario]            perf harness (#5460 P2): boots a hermetic proxy
                                     against a deterministic fake upstream in throwaway
                                     XDG dirs, replays a seeded fixture as full-resend
                                     rounds, reports p50/p95/HWM from perf.sqlite —
                                     RECORD ONLY, never judges metrics; no scenario
                                     lists the catalog (--rounds N, --out FILE,
                                     --keep-workdir, --dist PATH)
-   bili fixture-gen                 emit a deterministic perf fixture — pure function
+  bili fixture-gen                 emit a deterministic perf fixture — pure function
                                     of --seed K --msgs N --shape openai|anthropic
                                     (--out FILE writes JSON instead of stdout)
   bili --version                   print version
@@ -735,7 +735,6 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-
     // -i/-s posture flags (#5428): translate onto the existing lanes so the
     // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
     // + extension preflight + BILI_PI_INLINE=1, no proxy spawned), and
@@ -763,7 +762,6 @@ export function parseArgs(argv: string[]): Parsed {
     }
 
     return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, storageSub, storageKeep, storageFrom, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce, benchScenario, benchRounds, benchKeepWorkdir, benchDist, outFile, fixtureSeed, fixtureMsgs, fixtureShape };
-
 }
 
 export async function main(): Promise<void> {
@@ -792,7 +790,7 @@ export async function main(): Promise<void> {
     if (command === "fixture-gen") {
         try {
             if (fixtureSeed === undefined || fixtureMsgs === undefined) {
-                console.error("bili fixture-gen: --seed K and --msgs N are required (try one of: bili bench <scenario>)");
+                console.error("bili fixture-gen: --seed K and --msgs N are required (e.g. bili fixture-gen --seed 42 --msgs 50)");
                 process.exit(2);
             }
             const fx = generateFixture({ seed: fixtureSeed, msgs: fixtureMsgs, shape: fixtureShape ?? "openai" });

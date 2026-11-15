@@ -11,6 +11,8 @@ import { generateFixture, renderAnthropicBody, renderOpenaiBody, type FixtureMes
 import { computeStats, BENCH_SCENARIOS } from "../src/bench.js";
 import { parseArgs } from "../src/cli.js";
 
+const DIST = process.env.E2E_BILI_DIST ?? path.resolve(import.meta.dirname, "../dist/index.js");
+
 const fixtureJson = (spec: { seed: number; msgs: number; shape: "openai" | "anthropic" }) => JSON.stringify(generateFixture(spec));
 
 test("fixture: deterministic — same seed yields identical bytes", () => {
@@ -111,7 +113,7 @@ test("bench: end-to-end hermetic run (smoke scenario)", { timeout: 180_000 }, as
     const { runBench } = await import("../src/bench.js");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-bench-test-"));
     try {
-        const { artifact } = await runBench({ scenarioId: "smoke-openai-tiny", workdirRoot: dir, log: () => { /* quiet */ } });
+        const { artifact } = await runBench({ scenarioId: "smoke-openai-tiny", workdirRoot: dir, dist: DIST, log: () => { /* quiet */ } });
         assert.equal(artifact.schema_version, 1);
         assert.equal(artifact.scenario.id, "smoke-openai-tiny");
         assert.equal(artifact.env.storage_mode, "full");
