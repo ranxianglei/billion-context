@@ -23,7 +23,9 @@
 //                         GATE_R_CORPUS_TOKENS — crank to MB scale if you want
 //                         the drama), answer the S40 marker
 //   t2  @ big window    : recall S07 verbatim — fixture alive, intact context
-//   t3  @ small window  : preflight fold MUST fire on this turn
+//   t3  @ small window  : preflight fold MUST fire on this turn (one retry —
+//                         the client's estimated-tokens overflow trigger can
+//                         wobble; 2026-11-15)
 //   R0/R1/R2            : kill the proxy (SIGTERM -15 / SIGKILL -9 / clean
 //                         POST /__bili/shutdown), next host turn respawns it;
 //                         assertions after each respawn:
@@ -110,7 +112,10 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 const results = [];
 // Recorder spawned for the in-flight lane; killed from main()'s catch when a
 // lane aborts before its own teardown (2026-11-14 leak fix).
-let activeRec = null;
+// Recorder handle for the in-flight lane(s) (lane -> handle), killed from
+// main()'s catch when a lane aborts before its own teardown. A Map because
+// lanes run concurrently (2026-11-15 parallel gate).
+const activeRec = new Map();
 function record(lane, name, ok, note) {
   results.push({ lane, name, ok, note });
   console.log(`${ok ? "PASS" : "FAIL"} [${lane}] ${name}${note ? ` — ${note}` : ""}`);
@@ -294,7 +299,7 @@ async function runLane(agent) {
     stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
     detached: true,
   });
-  activeRec = rec;
+  activeRec.set(agent, rec);
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -444,20 +449,27 @@ async function runLane(agent) {
     record(agent, "S07 recalled pre-fold (fixture alive)", MARK_RE(6).test(t2.out), `"${t2.out.trim().slice(0, 80)}"`);
 
     setHostWindow(R_WINDOW);
-    const mark3 = lineCount();
-    const t3 = await turn("Reply with the single word DONE.", "t3", { expectContent: false });
-    fs.writeFileSync(path.join(laneDir, "turn-t3.txt"), t3.out || "");
-    record(agent, "t3 completes", t3.ok, t3.why.slice(0, 160));
-    // Everything forwarded in t1–t3 happened before/around the wall flip, so
-    // their max is the honest UNCOMPRESSED fiber size. Every later forwarded
-    // request must sit well inside it (folded) and well above a bare greeting
-    // (session actually adopted).
+    let mark3 = lineCount();
+    let t3 = await turn("Reply with the single word DONE.", "t3", { expectContent: false });
+    // The client's proactive overflow fold is estimated-tokens based and can
+    // wobble (measured 2026-11-15, same fixture: fold fires on one run, raw
+    // send + client-side CONTEXT_WINDOW_EXCEEDED on the next — bili's engine
+    // folds correctly whenever the client asks). One retry mirrors the t2
+    // needle-retry policy.
     const rawFiber = reqMaxSoFar();
     const floor = Math.max(15_000, Math.round(rawFiber * 0.05));
     const foldCap = Math.round(rawFiber * 0.75);
     record(agent, "pre-fold wire baseline established", rawFiber > 50_000,
       `${rawFiber} bytes raw; post-fold bound [${floor}, ${foldCap}]`);
-    const afterFold = reqMaxSince(mark3);
+    let afterFold = reqMaxSince(mark3);
+    if (!(t3.ok && afterFold > 0 && afterFold <= foldCap)) {
+      console.log(`EVIDENCE [${agent}] t3 first try red (ok=${t3.ok}, forwarded ${afterFold}B vs cap ${foldCap}) — retrying once`);
+      mark3 = lineCount(); // the raw send above must not pollute the post-fold bound
+      t3 = await turn("Reply with the single word DONE.", "t3-retry", { expectContent: false });
+      afterFold = reqMaxSince(mark3);
+    }
+    fs.writeFileSync(path.join(laneDir, "turn-t3.txt"), t3.out || "");
+    record(agent, "t3 completes", t3.ok, t3.why.slice(0, 160));
     const foldLog = /acp-compress-obs\] shrink (\d+)%/.exec(fs.existsSync(biliLog) ? fs.readFileSync(biliLog, "utf8") : "");
     record(agent, "small window fired the fold before the kills", afterFold > 0 && afterFold <= foldCap,
       `${afterFold} bytes forwarded under small window vs raw ${rawFiber}${foldLog ? ` (log: shrink ${foldLog[1]}%)` : ""}`);
@@ -624,7 +636,7 @@ async function runLane(agent) {
   const unknownTool = (logTxt.match(/unknown tool "[^"]+"/gi) || []).slice(0, 3);
   record(agent, "no unknown-tool loops", unknownTool.length === 0, unknownTool.join(" | "));
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
-  activeRec = null;
+  activeRec.delete(agent);
 }
 
 async function main() {
@@ -633,10 +645,24 @@ async function main() {
     console.log("restart-lanes: skipped (GATE_SKIP=r)");
     process.exit(0);
   }
-  for (const agent of AGENTS) {
-    console.log(`\n===== restart lane: ${agent} =====`);
-    try { await runLane(agent); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); try { if (activeRec) process.kill(-activeRec.pid, "SIGKILL"); } catch {} activeRec = null; }
+  // Lanes are fully independent (own recorder port, XDG dirs, per-agent
+  // port zone) and each agent is one model consumer at a time, so they run
+  // concurrently (GATE_R_CONC, default 2 = both agents at once).
+  const PAR = Math.max(1, parseInt(process.env.GATE_R_CONC || "2", 10));
+  const laneQueue = [...AGENTS];
+  async function laneWorker() {
+    while (laneQueue.length > 0) {
+      const agent = laneQueue.shift();
+      console.log(`\n===== restart lane: ${agent} =====`);
+      try { await runLane(agent); } catch (e) {
+        record(agent, "lane", false, String(e).slice(0, 400));
+        const r = activeRec.get(agent);
+        try { if (r) process.kill(-r.pid, "SIGKILL"); } catch {}
+        activeRec.delete(agent);
+      }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(PAR, laneQueue.length) }, () => laneWorker()));
   const failed = results.filter((r) => !r.ok);
   console.log(`\nrestart-lanes: ${results.length - failed.length}/${results.length} passed`);
   process.exit(failed.length ? 1 : 0);

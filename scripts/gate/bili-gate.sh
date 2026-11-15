@@ -73,7 +73,7 @@ GIT_PROXY=$(jget gitProxy "")
 NPM_REG=$(jget npmRegistry "https://registry.npmjs.org")
 TURN_MS=$(jget turnTimeoutMs "300000")
 AGENTS=$(jget agents "dsh,pi,codex,opencode,claude")
-AGENTS_R=$(jget agentsR "")
+AGENTS_R=$(jget agentsR "dsh,pi")
 R_CORPUS=$(jget r.corpusTokens "80000")
 R_WINDOW=$(jget r.window "16384")
 R_CAP=$(jget r.capRatio "0.4")
@@ -121,9 +121,12 @@ RUN+=(-e MODEL1_BASE_URL="$M1_URL" -e MODEL1_MODEL="$M1_MODEL" -e MODEL1_API_KEY
   -e GATE_AGENTS="$AGENTS" -e GATE_AGENTS_R="${AGENTS_R}" \
   -e GATE_R_CORPUS_TOKENS="$R_CORPUS" -e GATE_R_WINDOW="$R_WINDOW" \
   -e GATE_R_CAP_RATIO="$R_CAP" -e GATE_R_CACHE_RATIO="$R_CACHE" \
+  -e GATE_CONCURRENT="${GATE_CONCURRENT:-1}" \
+  -e GATE_P_CONC="${GATE_P_CONC:-4}" -e GATE_R_CONC="${GATE_R_CONC:-2}" \
   -v bili-gate-npm-cache:/root/.npm \
   -v "$OUT_DIR:/work" \
   -e GATE_REV="$REV" -e GATE_SKIP="$SKIP" -e GATE_KEEP="$KEEP" \
+  -e GATE_UID="$(id -u)" -e GATE_GID="$(id -g)" \
   bili-gate)
 
 if [ "$DRY" = 1 ]; then
