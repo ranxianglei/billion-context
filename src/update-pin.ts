@@ -23,7 +23,7 @@ import path from "node:path";
 import { cacheDir } from "./paths.js";
 import { parseDurationField } from "./duration.js";
 
-export interface PinRecord {
+interface PinRecord {
     v: 1;
     /** The installed version being held in place. */
     version: string;
@@ -34,7 +34,7 @@ export interface PinRecord {
     until?: number;
 }
 
-export const PIN_FILE_NAME = ".pin.json";
+const PIN_FILE_NAME = ".pin.json";
 
 /** Machine-level pin file path (per cache dir, next to the throttle file). */
 export function pinFilePath(): string {
@@ -77,7 +77,7 @@ export async function clearPin(): Promise<boolean> {
     return true;
 }
 
-export type PinState =
+type PinState =
     | { kind: "none" }
     | { kind: "active"; pin: PinRecord }
     | { kind: "expired"; pin: PinRecord }
