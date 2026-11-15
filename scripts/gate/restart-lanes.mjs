@@ -596,8 +596,20 @@ async function runLane(agent) {
       if (usages[i - 1].pt > 0 && usages[i].ct > 0) { pair = [usages[i - 1], usages[i]]; break; }
     }
     if (!pair) {
-      console.log(`EVIDENCE [${agent}] upstream did not report prompt/cached token details — cache ratio unmeasurable on this lane`);
-      record(agent, "cache-hit evidence available", false, "no usage details on wire (soft — upstream-dependent)");
+      if (usages.length === 0) {
+        // The upstream itself reports no usage details on this wire (some
+        // gateways strip them). That is an environment fact, not a product
+        // regression — same class as Lane P's ENV-BLOCKED demotion: the
+        // ratio is unmeasurable here, so it stays evidence-only and out of
+        // the tally. (If usage WAS reported but no prev/next pair exists,
+        // the cache plainly did not recover — that one stays red below.)
+        console.log(`EVIDENCE [${agent}] upstream did not report prompt/cached token details — cache ratio unmeasurable on this lane (evidence-only, per lane contract)`);
+        record(agent, "cache-hit evidence available (upstream reports no usage — evidence-only)", true,
+          "no usage details on wire; not counted against the gate (upstream-dependent)");
+      } else {
+        record(agent, "cache-hit evidence available", false,
+          "usage on wire but no prev-prompt/next-cached pair — cache did not recover across restarts");
+      }
     } else {
       const [prevU, nextU] = pair;
       const ratio = nextU.ct / prevU.pt;

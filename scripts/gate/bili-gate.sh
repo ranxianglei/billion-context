@@ -44,16 +44,19 @@ done
 # argument the key is REQUIRED and a missing value fails fast (exit 2) before
 # the expensive docker build. The has-default flag is passed explicitly because
 # an unset $2 would otherwise collapse to "" (a string) and the required branch
-# would never fire.
+# would never fire. The config file is passed by PATH and read inside node —
+# never inlined into argv (the file may carry API keys, and "$(cat ...)" argv
+# would expose them in ps during the parse window).
 jget() {
   local key="$1" def="${2-}" hasdef=0
   if [ "$#" -ge 2 ]; then hasdef=1; fi
   node -e '
-  const c = JSON.parse(process.argv[1]);
+  const fs = require("fs");
+  const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const v = process.argv[2].split(".").reduce((o, k) => (o == null ? undefined : o[k]), c);
   if (v === undefined) { if (process.argv[4] === "1") { console.log(process.argv[3]); } else { process.exit(3); } }
   else process.stdout.write(Array.isArray(v) ? v.join(",") : String(v));
-' "$(cat "$CONFIG")" "$key" "$def" "$hasdef" || { echo "FATAL: config missing required key: $key (file: $CONFIG)" >&2; exit 2; }
+' "$CONFIG" "$key" "$def" "$hasdef" || { echo "FATAL: config missing required key: $key (file: $CONFIG)" >&2; exit 2; }
 }
 
 M1_URL=$(jget model1.baseUrl)
