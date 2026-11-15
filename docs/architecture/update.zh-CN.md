@@ -19,6 +19,8 @@
 
 **自更新器（`update.ts`）。** 默认每 3 分钟查一次 npm 注册表（`CHECK_INTERVAL_MS`，旋钮可覆盖 #2030；每进程首查忽略节流）。更新是 tarball 解包，**不是** `npm install`——用户机器上永不跑 lifecycle 脚本。全局安装就地换包。插件模式里注入的代码跑在**宿主进程**中：新代码要宿主重启才生效；注入坏掉则模型流量退化为不压缩直连——面板 banner 与 `/__bili/status` 的 `attribution` 可见（#3581）。
 
+**版本门（#6804）。** 在 rollout 策略之前有两条用户可见规则：发布通道（`tag="latest"`）上安装的预发布/临时构建**永不**被自动扫到正式版——检查照常跑、新版本照常上报、但不安装（预发布通道如 `updateTag=dev` 仍在临时构建之间前进）；`bili pin [duration]` 固定的版本为 check-only——新版本照常发现并上报，但永不自动安装，pin 到期自动解除（`bili unpin` 提前解除）。显式 `bili update` 可穿透两条门。pin 状态是机器级运行态（`update-pin.ts`），不是配置键。
+
 **安装车道。** 全局（`npm i -g`，就地自更新） · 引用车道（omp/claude/codex/kimi/zcode/hermes——无拷贝、指全局 dist） · 宿主世界（dsh profile bundle、opencode/pi 树——走宿主自己的通道更新，由全局自更新驱动 + 无全局时拷贝自己的周期检查兜底，#1196） · 启动器（`bili <client>` overlay 模式：零持久拷贝）。
 
 **三账收敛。** 桌面 dsh profile 是 bili 唯一完全自有的拷贝；它的自愈直接换 `node_modules/billion-context`，所以 `convergeDshLedger`（`src/dsh-ledger.ts`）同一操作里还要挪 profile manifest 的声明 spec 与 lockfile 的记录（#3496）——只挪拷贝的写者会亲手造出 #3224 检测的那种漂移。既有漂移只在显式要求时收敛：`bili doctor --fix`。`plugin-install.ts` 只驱动宿主自己的通道（`dsh plugin add`），绝不在旁边装第二份（#966）。
@@ -31,7 +33,7 @@
 
 ## 关键入口
 
-`src/update.ts`（更新器——承重件） · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts`（更新器——承重件） · `src/update-pin.ts`（机器级版本 pin，#6804） · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## 相关
 

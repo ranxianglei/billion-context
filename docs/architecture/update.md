@@ -19,6 +19,8 @@ Get every copy of bili on a machine to the newest version without bricking anyth
 
 **Self-updater (`update.ts`).** Checks the npm registry every 3 min by default (`CHECK_INTERVAL_MS`, knob-overridable #2030; the first check per process ignores the throttle). Updates are tarball extraction, NOT `npm install` — no lifecycle scripts ever run on user boxes. The global install swaps in place. In plugin mode the injected code lives in the HOST process: new code only takes effect after a host restart, and a broken injection degrades model traffic to uncompressed direct — visible via the panel banner and `/__bili/status` `attribution` (#3581).
 
+**Version gates (#6804).** Before the rollout policy, two user-facing rules: an installed prerelease/temp build on the release channel (`tag="latest"`) is never auto-swept forward to a release — the check runs, the new version is reported, nothing is installed (a prerelease channel like `updateTag=dev` still moves between temp builds); and a version pinned via `bili pin [duration]` is check-only — new versions are discovered and reported but never auto-installed, with the pin lifting itself at expiry (`bili unpin` lifts it early). An explicit `bili update` breaks through both. Pin state is machine-level runtime state in `update-pin.ts`, not a config key.
+
 **Install lanes.** Global (`npm i -g`, self-updating) · reference lanes (omp/claude/codex/kimi/zcode/hermes — no copy, point at the global dist) · host worlds (dsh profile bundle, opencode/pi trees — updated through the host's own channel, driven by the global self-update AND by the copy's own periodic check when no global ever runs, #1196) · launchers (`bili <client>` overlay mode: zero persistent copy).
 
 **Ledger convergence.** The desktop dsh profile is the one copy bili owns outright; its self-heal swaps `node_modules/billion-context` directly, so `convergeDshLedger` (`src/dsh-ledger.ts`) also moves the profile manifest's declared spec AND the lockfile's recorded resolution in the same operation (#3496) — a writer that moves only the copy manufactures the drift #3224 detects. Pre-existing drift converges on explicit demand only: `bili doctor --fix`. `plugin-install.ts` only drives the host's own channel (`dsh plugin add`), never installs a second copy beside it (#966).
@@ -31,7 +33,7 @@ Human-review tier (§7.4) — no auto-merge; changing `update.ts` requires a NO-
 
 ## Key entries
 
-`src/update.ts` (updater — load-bearing) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts` (updater — load-bearing) · `src/update-pin.ts` (per-machine version pin, #6804) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## Related
 
