@@ -8,6 +8,7 @@
 
 import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
 import { logHostEvent } from "./host-log.js";
+import { INLINE_ORIGIN } from "../inline-engine.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
@@ -2221,7 +2222,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             }
             throw err;
         }
-    });
+    }, { inlineOrigin: INLINE_ORIGIN });
     g[INTERCEPT_FLAG] = true;
     return true;
 }

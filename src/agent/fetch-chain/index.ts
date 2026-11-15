@@ -94,6 +94,16 @@ export function isDeadClosureError(err: unknown): boolean {
     return err instanceof TypeError && /is not a function$/.test(err.message);
 }
 
+function urlOf(input: string | URL | Request): string | undefined {
+    try {
+        if (typeof input === "string") return input;
+        if (input instanceof URL) return input.href;
+        return input.url;
+    } catch {
+        return undefined;
+    }
+}
+
 function noteFetch(f: unknown): void {
     if (typeof f !== "function") return;
     const fn = f as typeof globalThis.fetch;
@@ -107,7 +117,10 @@ function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch 
     return observedFetches.find((f) => !knownDeadFetches.has(f));
 }
 
-export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch): void {
+export function installFetchChain(
+    makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch,
+    opts: { inlineOrigin?: string } = {},
+): void {
     const orig = globalThis.fetch;
     noteFetch(orig);
     const makeChain = (downstream: typeof globalThis.fetch) => {
@@ -163,7 +176,18 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
-                if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);
+                if (Reflect.get(ds, "__piWebAccessProxyFetch") === true || Reflect.get(ds, "__piWebAccessSharedProxyFetch") === true) return send(input, init);
+                // #6829: INLINE_ORIGIN URLs are served IN-PROCESS by the inline
+                // transport link below, not by the host's native fetch. The
+                // #1662 cutoff below would hand them to the oldest live anchor
+                // (the host fetch) → a real DNS lookup for the pseudo-origin →
+                // guaranteed ENOTFOUND, every model call, until restart. Continue
+                // the descent instead: the inline engine is reached via the #4527
+                // chainHop legitimate descent and serves the URL in-process.
+                if (opts.inlineOrigin !== undefined) {
+                    const url = urlOf(input);
+                    if (url !== undefined && url.startsWith(opts.inlineOrigin)) return send(input, init);
+                }
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
@@ -183,6 +207,14 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // Keep the install guard visible, following ds if dead-closure recovery changes it.
         Object.defineProperty(chain, "__piWebAccessProxyFetch", {
             get: () => Reflect.get(ds, "__piWebAccessProxyFetch"),
+        });
+        // #6829: pi-web-access >= 0.46 renamed its marker to __piWebAccessSharedProxyFetch
+        // and its install guard keys on THAT name. Propagate it the same way so a
+        // re-armed top still reads as "a pi-web-access wrapper is already in this
+        // chain" — without it, every proxied web tool call re-wraps the top and the
+        // chain grows one (wrapper, bili-link) pair per call (the #1662 churn shape).
+        Object.defineProperty(chain, "__piWebAccessSharedProxyFetch", {
+            get: () => Reflect.get(ds, "__piWebAccessSharedProxyFetch"),
         });
         return chain;
     };
@@ -223,7 +255,9 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // leaves; "evict" was the pre-self-heal framing and is dropped
                 // from the wording. Unknown wrappers and any LATER (repeat /
                 // abnormal) marked install keep the full diagnostic below.
-                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true;
+                // #6829: recognize BOTH marker names — pi-web-access < 0.46 uses
+                // __piWebAccessProxyFetch, >= 0.46 uses __piWebAccessSharedProxyFetch.
+                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true || Reflect.get(v, "__piWebAccessSharedProxyFetch") === true;
                 // Visibility (#1158): a third-party install used to be silent —
                 // log it so "un-routed by a third party" is diagnosable. Past
                 // REARM_LIMIT the WARNING stops (log spam), but the adoption
