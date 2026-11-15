@@ -678,6 +678,22 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
 });
 
+test("sideRequestGuard: a dual-shape body's foreign field does not false-block (#6828)", () => {
+    // The #554 guard meters the raw body before forwarding a side request.
+    // On a dual-shape body the protocol-blind walk counted the foreign
+    // conversation field too, so the compress call — the very request that
+    // would shrink the session — false-blocked at the same phantom total.
+    const cjk = "测".repeat(400_000);
+    const body = {
+        messages: [{ role: "user", content: cjk }],
+        input: [{ type: "message", role: "user", content: cjk }],
+    };
+    const limit = 600_000;
+    const guard = sideRequestGuard(body, "openai", limit);
+    assert.ok(guard.estimate < limit * 1.15, `native field alone is under the guard bar (${guard.estimate} < ${Math.round(limit * 1.15)})`);
+    assert.equal(guard.blocked, false, "the dual-shape body's foreign field must not false-block the side request");
+});
+
 function okSse(inputTokens: number): string {
     return (
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: inputTokens } } })}\n\n` +
