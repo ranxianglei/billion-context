@@ -121,7 +121,8 @@ test("resolution priority: repo layout wins over plugin-dir self", async () => {
   fs.writeFileSync(path.join(inner, "dist", "mcp.js"), entrySrc("plugin-dir\n"));
 
   const p = startShell(path.join(inner, "mcp-server.mjs"), root, { ENTRY_REPORT_FILE: reportFile });
-  await withDeadline("entry report", 10000, waitFor("entry report file", 10000, () => fs.existsSync(reportFile)));
+  await withDeadline("entry report", 10000, waitFor("entry report file", 10000,
+    () => fs.existsSync(reportFile) && fs.readFileSync(reportFile, "utf8").length > 0));
   assert.equal(fs.readFileSync(reportFile, "utf8"), "repo-layout\n", "documented order: repo layout before plugin-dir");
   p.endStdin();
   await withDeadline("clean exit", 10000, p.done);
