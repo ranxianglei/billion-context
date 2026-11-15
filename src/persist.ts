@@ -1616,6 +1616,7 @@ export class SessionStore {
      *  proxy runs and nothing is resident in memory — that is exactly the
      *  point. */
     async removeSession(id: string): Promise<{ envelopeFound: boolean; unifiedHadRows: boolean }> {
+        this.durabilityArms.delete(id); // #6780 P0 (review F5): no arm for a dead session
         // Resolve identity from whichever side knows it: the unified row
         // carries protocol+origin even when the JSON tree is already gone,
         // and the envelope carries them when only the tree survives.
@@ -2109,6 +2110,17 @@ export class SessionStore {
     private consumePendingLedgerAlign(session: Session): void {
         if (!session.pendingLedgerAlign) return;
         delete session.pendingLedgerAlign;
+        // #6780 P0 (review F1): the restamp below mutates state that this tick's
+        // pre-forward durability ingest (ingestRowsNow) already made durable —
+        // it renumbers refs and re-keys the CCR store AFTER that ingest. Consuming
+        // the arm here forces the restamp turn's coalesced build to run in full
+        // (once per session lifetime — maybeRestampToLedger no-ops once aligned),
+        // keeping the #4733 invariant: aligned state and re-keyed CCR land in the
+        // SAME serialized record. Without this, pendingLedgerAlign is already
+        // deleted by the time the writer-off gate reads it, so the gate's own
+        // align check would be a dead signal and the restamped bytes would ride
+        // one ingestRowsNow late.
+        this.durabilityArms.delete(session.id);
         this.maybeRestampToLedger(session);
     }
 
@@ -3323,6 +3335,12 @@ export class SessionStore {
                     !session.contentStoreDirty &&
                     session.pendingLedgerAlign === undefined &&
                     JSON.stringify(session.metadata) === armed.metadataFp;
+                // #6780 P0 (review F2): single-shot arm — this run made the
+                // decision; the arm must not survive to justify a skip for a
+                // LATER save (a stale arm could match any later epoch exactly
+                // one beyond the one it was armed at). The next ingestRowsNow
+                // re-arms if its state is durable.
+                this.durabilityArms.delete(session.id);
                 let settledOk = false;
                 try {
                     const recMeta = durabilitySkip && armed
