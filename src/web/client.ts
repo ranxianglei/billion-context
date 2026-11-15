@@ -2067,12 +2067,6 @@ function changelogCatOf(rawLine) {
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
         return xt + xtTime;
     }
-    // #6729: nudge-recommended vs actually-folded recovery bars (#6720 ratchet).
-    // Each nudge arm draws a hollow PENDING outline; each nudge-attributed fold
-    // fills its FOLDED portion inside the same outline geometry (green/yellow/
-    // red by recovery rate); active folds stand alone in blue. A nudge whose arm
-    // never produced a fold keeps its hollow bar + red top marker — the ratchet
-    // made visible. Bars are token-scaled on the input axis like everything else.
     // #6729/#6720 follow-up: the recovery view lives in ONE self-contained
     // time-based chart (the trajectory chart no longer mixes in recovery
     // marks — they overlapped the existing fold lines and could not be told
@@ -2198,7 +2192,8 @@ function changelogCatOf(rawLine) {
     }
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return "";        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
         const iw = W - PL - PR, ih = H - PT - PB;
         let maxY = 0;
         lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
@@ -2383,18 +2378,13 @@ function changelogCatOf(rawLine) {
             // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
             // the byte-parity acceptance criterion pins). Time-filtering only applies to a
             // ZOOMED window, where a foreign mark would land on the wrong sample.
-            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], recovery: z.state.recovery || null, offset: a };
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
             const t0 = lines[0] ? (lines[0].at || 0) : 0;
             const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
             return {
                 lines,
                 folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
                 seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
-                // #6729: events follow the same zoom filter; the session-wide summary
-                // stays global so the recovery rate never lies about a zoomed window.
-                recovery: (z.state.recovery && z.state.recovery.events.length)
-                    ? { events: z.state.recovery.events.filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1), summary: z.state.recovery.summary }
-                    : null,
                 offset: a,
             };
         };
@@ -2417,7 +2407,7 @@ function changelogCatOf(rawLine) {
             const wrap = $(cfg.elId);
             const v = z.visible();
             if (!wrap || !v) return;
-            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams, v.recovery) : "";
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
@@ -2510,8 +2500,7 @@ function changelogCatOf(rawLine) {
         const seam = detailSeam(ledger);
         trajAux.win = d.contextWindow || 0;
         trajAux.baseIn = d.systemPromptTokens || 0;
-        const rec = ledger.recovery && ledger.recovery.events && ledger.recovery.events.length ? ledger.recovery : null;
-        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [], recovery: rec });
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
     function bindHitRateChart(d) {
         const ledger = d.ledger || {};
