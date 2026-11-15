@@ -2,6 +2,9 @@
 // adjacent requests per session (INCOMING = client raw wire, REQ = proxy
 // rebuilt wire) and classifies each pair so a cache break is attributed to
 // its producer instead of surfacing as an unattributed TTL bucket (#1254).
+// #6788: also reads the long-retention body-only dumps (dumps/req-*.json and
+// REREQUEST) — raw/*-REQ.txt captures are GC'd within minutes, so the
+// forensic window for older samples lives only in the JSON format.
 import fs from "node:fs";
 import path from "node:path";
 import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
@@ -91,6 +94,12 @@ interface DumpMeta {
     kind: "incoming" | "outgoing";
     file: string;
     legacy: boolean;
+    // #6788: dumps/req-*.json layout — banner + bare JSON body, no request
+    // line, no headers (the relay's pretty re-serialization / loop re-request).
+    bodyOnly?: boolean;
+    // #6788: loop re-request round (core.ts) — never has a raw/*-REQ.txt
+    // sibling, so it is exempt from the same-request dedup below.
+    reRequest?: boolean;
 }
 
 interface DumpContent {
@@ -98,11 +107,17 @@ interface DumpContent {
     headers: Record<string, string>;
     model: string | null;
     cacheHeaders: Record<string, string>;
+    bodyOnly: boolean;
 }
 
 const INC_NEW_RE = /^(\d+)-([a-zA-Z0-9._-]+)-INCOMING\.txt$/;
 const INC_LEGACY_RE = /^(\d+)-INCOMING\.txt$/;
 const REQ_RE = /^(\d+)-([a-zA-Z0-9._-]+)-REQ\.txt$/;
+// #6788: the long-retention body-only dumps. REREQUEST must match BEFORE the
+// generic pattern — a sid-less greedy match would swallow "-REREQUEST" into
+// the sid of req-<ts>-<sid>-REREQUEST.json.
+const REQ_REREQ_RE = /^req-(\d+)-([a-zA-Z0-9._-]+)-REREQUEST\.json$/;
+const REQ_JSON_RE = /^req-(\d+)-([a-zA-Z0-9._-]+)\.json$/;
 
 function collectDumps(root: string): DumpMeta[] {
     const dirs: string[] = [root];
@@ -124,13 +139,47 @@ function collectDumps(root: string): DumpMeta[] {
             m = INC_LEGACY_RE.exec(name);
             if (m) { all.push({ ts: Number(m[1]), sid: null, kind: "incoming", file, legacy: true }); continue; }
             m = REQ_RE.exec(name);
-            if (m) all.push({ ts: Number(m[1]), sid: m[2]!, kind: "outgoing", file, legacy: false });
+            if (m) { all.push({ ts: Number(m[1]), sid: m[2]!, kind: "outgoing", file, legacy: false }); continue; }
+            m = REQ_REREQ_RE.exec(name);
+            if (m) { all.push({ ts: Number(m[1]), sid: m[2]!, kind: "outgoing", file, legacy: false, bodyOnly: true, reRequest: true }); continue; }
+            m = REQ_JSON_RE.exec(name);
+            if (m) all.push({ ts: Number(m[1]), sid: m[2]!, kind: "outgoing", file, legacy: false, bodyOnly: true });
         }
     }
     return all.sort((a, b) => a.ts - b.ts || a.kind.localeCompare(b.kind));
 }
 
-function parseDumpFile(file: string): DumpContent | null {
+// The initial relay writes TWO outgoing dumps for one request: dumps/req-<ts>-
+// <sid>.json (pretty re-serialization, no headers, relay.ts) and raw/<ts>-<sid>
+// -REQ.txt (exact wire bytes, a few ms later in the same call). When both
+// survive, keep only the wire-exact REQ.txt — otherwise the same request pairs
+// against itself and the pretty-vs-compact whitespace reads as a mid-stream
+// rewrite. Loop re-requests (REREQUEST) never get a raw/*-REQ.txt (the loop
+// lane skips the raw capture) and are never dropped.
+const DEDUP_WINDOW_MS = 500;
+
+function dedupSameRequestCaptures(metas: DumpMeta[]): DumpMeta[] {
+    const outBySid = new Map<string, DumpMeta[]>();
+    for (const m of metas) {
+        if (m.kind !== "outgoing" || m.sid === null) continue;
+        const list = outBySid.get(m.sid) ?? [];
+        list.push(m);
+        outBySid.set(m.sid, list);
+    }
+    const drop = new Set<string>();
+    for (const list of outBySid.values()) {
+        for (const m of list) {
+            if (!m.bodyOnly || m.reRequest) continue;
+            for (const other of list) {
+                if (!other.bodyOnly && Math.abs(other.ts - m.ts) <= DEDUP_WINDOW_MS) { drop.add(m.file); break; }
+            }
+        }
+    }
+    if (drop.size === 0) return metas;
+    return metas.filter((m) => !drop.has(m.file));
+}
+
+function parseDumpFile(file: string, bodyOnly: boolean): DumpContent | null {
     let buf: Buffer;
     try { buf = fs.readFileSync(file); } catch { return null; }
     // #4482: new-format dumps open with the plaintext-warning banner line; drop
@@ -139,6 +188,21 @@ function parseDumpFile(file: string): DumpContent | null {
     const nl = buf.indexOf(0x0a);
     if (nl > 0 && buf.subarray(0, nl).toString("utf8").replace(/\r$/, "") === DUMP_PLAINTEXT_BANNER) {
         buf = buf.subarray(nl + 1);
+    }
+    if (bodyOnly) {
+        // #6788: dumps/req-*.json — banner + bare JSON body, no request line
+        // and no headers (relay.ts pretty re-serialization / core.ts re-request
+        // round). Headers degrade to empty: model is read from the body, the
+        // cacheHeaders dimension reads unknown — never guessed.
+        let model: string | null = null;
+        try {
+            const parsed: unknown = JSON.parse(buf.toString("utf8"));
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                const md = (parsed as Record<string, unknown>).model;
+                if (typeof md === "string") model = md;
+            }
+        } catch { /* non-JSON body */ }
+        return { body: buf, headers: {}, model, cacheHeaders: {}, bodyOnly: true };
     }
     // #3331: the request-line + headers block can be terminated by \r\n\r\n as
     // well as \n\n (dump files written on Windows / by CRLF-emitting clients);
@@ -171,7 +235,7 @@ function parseDumpFile(file: string): DumpContent | null {
     } catch { /* non-JSON body */ }
     const cacheHeaders: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) if (/cache/i.test(k)) cacheHeaders[k] = v;
-    return { body, headers, model, cacheHeaders };
+    return { body, headers, model, cacheHeaders, bodyOnly: false };
 }
 
 function prefixCompare(a: Buffer, b: Buffer): { rel: "append" | "diverge"; offset: number; extra: number } {
@@ -545,6 +609,11 @@ function classifyPair(index: number, tsA: number, tsB: number, aOut: DumpContent
         const snip = snippetAround(bText, textOffset);
         divergence = { offset: outRel.byteOffset, messageIndex: loc.index, roleType: loc.roleType, before: snip.before, after: snip.after };
         if (outRel.preArray) notes.push("divergence before the message array (field-level change)");
+        // #6788: at the retention boundary one side may be the pretty JSON
+        // dump and the other the wire-exact REQ.txt — the byte divergence is
+        // then formatting noise, not content. Flag it instead of letting the
+        // offset read as a real field-level break.
+        if (aOut.bodyOnly !== bOut.bodyOnly) notes.push("mixed capture formats (pretty JSON vs raw wire bytes) — the byte divergence may be formatting, not content");
         if (inRel && inRel.rel === "diverge") incomingDivergenceOffset = inRel.byteOffset;
         if (attribution === "proxy") notes.push("incoming stayed pure-append — drift introduced by proxy rebuild (#1249 shape)");
     } else {
@@ -580,9 +649,9 @@ export async function runDiff(root: string, opts: DiffOptions = {}): Promise<Dif
     try { st = fs.statSync(rootResolved); } catch (error) { throw new Error(`cannot access ${root}: ${error instanceof Error ? error.message : String(error)}`); }
     if (!st.isDirectory()) throw new Error(`${root} is not a directory`);
 
-    const metas = collectDumps(rootResolved);
+    const metas = dedupSameRequestCaptures(collectDumps(rootResolved));
     if (metas.length === 0) {
-        throw new Error(`no ACP_DUMP_BODY dumps found under ${rootResolved} (expected *-REQ.txt / *-INCOMING.txt in ., ./raw or ./dumps) — enable ACP_DUMP_BODY=1 first`);
+        throw new Error(`no ACP_DUMP_BODY dumps found under ${rootResolved} (expected *-REQ.txt / *-INCOMING.txt / req-*.json in ., ./raw or ./dumps) — enable ACP_DUMP_BODY=1 first`);
     }
     const outgoing = metas.filter((m) => m.kind === "outgoing");
     for (const inc of metas) {
@@ -642,7 +711,7 @@ export async function runDiff(root: string, opts: DiffOptions = {}): Promise<Dif
 
     const contentCache = new Map<string, DumpContent | null>();
     const read = (m: DumpMeta): DumpContent | null => {
-        if (!contentCache.has(m.file)) contentCache.set(m.file, parseDumpFile(m.file));
+        if (!contentCache.has(m.file)) contentCache.set(m.file, parseDumpFile(m.file, m.bodyOnly === true));
         return contentCache.get(m.file) ?? null;
     };
 
