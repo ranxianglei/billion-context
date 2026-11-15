@@ -8,7 +8,7 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
     return { id, role, contentType: "text", text };
 }
 
-// #5151: three independent reporters (Claude Code 0.1.197, omp/OpenAI 0.1.209
+// #5149: three independent reporters (Claude Code 0.1.197, omp/OpenAI 0.1.209
 // + 0.1.212) hit the same production defect — the compression nudge offers
 // refs from a long-lived conversation view, but the compress call resolves to
 // a DIFFERENT (near-empty) session view, so every offered ref sits far above
@@ -19,9 +19,9 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
 // this all-above-frontier shape) must now name the binding inconsistency,
 // forbid probing/guessing other refs, and give the fresh-conversation recovery.
 
-test("#5151: beyond-frontier note carries the session-binding-inconsistency warning", () => {
-    // near-empty target session: refs minted only up to m00009 (francis-io's
-    // "highest allocated ref=m00009" shape)
+test("#5149: beyond-frontier note carries the session-binding-inconsistency warning", () => {
+    // near-empty target session: only 3 refs minted (a scaled-down version of
+    // francis-io's near-empty "highest allocated ref=m00009" shape)
     const res = assignRefs(
         [textMsg("r1", "assistant", "a"), textMsg("r2", "assistant", "b"), textMsg("r3", "assistant", "c")],
         { existing: emptyRefMap(), nextIndex: 0 },
@@ -42,7 +42,7 @@ test("#5151: beyond-frontier note carries the session-binding-inconsistency warn
     assert.match(note, /start a fresh conversation/i, "gives the safe recovery");
 });
 
-test("#5151: note stays empty for in-frontier / no-mapped-refs (negatives unchanged)", () => {
+test("#5149: note stays empty for in-frontier / no-mapped-refs (negatives unchanged)", () => {
     const res = assignRefs([textMsg("r1", "assistant", "a"), textMsg("r2", "assistant", "b")], { existing: emptyRefMap(), nextIndex: 0 });
     const state = createInitialState();
     state.messageRefs = res.map;
