@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // restart-lanes.mjs — Lane R: repeated KILL/RESTART of the bili proxy inside a
-// LIVE long session, driven by REAL host CLIs (dsh headless, pi) against the
+// LIVE long session, driven by REAL host CLIs (dsh headless, pi, claude) against the
 // REAL model. Companion to PR billion-context#5635 (hermetic CI-side twin):
 // the CI suite proves the mechanism deterministically with zero tokens; this
 // lane proves it against the surfaces users actually run, where the proxy is
@@ -17,7 +17,7 @@
 // into a context explosion or a cache-blackhole, invisible until someone
 // notices bills tripled.
 //
-// Per agent (dsh, pi):
+// Per agent (dsh, pi, claude):
 //   w0  warmup          : cheap turn, absorbs boot races
 //   t1  @ big window    : read the whole corpus (~80k tok default, tunable via
 //                         GATE_R_CORPUS_TOKENS — crank to MB scale if you want
@@ -27,7 +27,9 @@
 //                         the client's estimated-tokens overflow trigger can
 //                         wobble; 2026-11-15)
 //   R0/R1/R2            : kill the proxy (SIGTERM -15 / SIGKILL -9 / clean
-//                         POST /__bili/shutdown), next host turn respawns it;
+//                         POST /__bili/shutdown), next host turn respawns it
+//                         (claude: R0/R1 only — prefix topology, the harness
+//                         re-establishes the proxy on the same port);
 //                         assertions after each respawn:
 //                           * alive on the same port, NEW pid
 //                           * continuation completes under the small window
@@ -45,7 +47,8 @@
 //                             from the dying pid lands milliseconds before the
 //                             adopter's first write; the defect would be TWO
 //                             LIVE proxies committing one session)
-//       plus ONE hostile variant per agent: the HOST process itself is
+//       plus ONE hostile variant (dsh only; pi's P-matrix doubles as its
+//       host-kill matrix): the HOST process itself is
 //       SIGKILLed mid-turn (real abnormal restart of the agent), the next
 //       invocation of the same session must recover.
 //   final               : cache-hit recovery ≥50% measured on the wire
@@ -745,7 +748,7 @@ async function main() {
   }
   // Lanes are fully independent (own recorder port, XDG dirs, per-agent
   // port zone) and each agent is one model consumer at a time, so they run
-  // concurrently (GATE_R_CONC, default 2 = both agents at once).
+  // concurrently (GATE_R_CONC, default 2).
   const PAR = Math.max(1, parseInt(process.env.GATE_R_CONC || "2", 10));
   const laneQueue = [...AGENTS];
   async function laneWorker() {
