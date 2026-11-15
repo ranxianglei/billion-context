@@ -1034,6 +1034,20 @@ function changelogCatOf(rawLine) {
             sel.innerHTML = opt;
             if (cur) sel.value = cur;
         }
+        // #6804: pin status display
+        const pinStatus = $("up-pin-status");
+        const pinBtn = $("up-pin");
+        const unpinBtn = $("up-unpin");
+        if (pinStatus) {
+            if (st.pin) {
+                const until = st.pin.until ? new Date(st.pin.until).toLocaleString() : t("up.pin_none").replace("No pin", "indefinite").replace("未固定", "");
+                pinStatus.textContent = t("up.pin_active", { v: st.pin.version, until: until || "indefinite" });
+            } else {
+                pinStatus.textContent = t("up.pin_none");
+            }
+        }
+        if (pinBtn) pinBtn.disabled = upBusyAction || Boolean(st.pin);
+        if (unpinBtn) unpinBtn.disabled = upBusyAction || !st.pin;
         applyUpdateButtons(st);
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
@@ -1167,6 +1181,47 @@ function changelogCatOf(rawLine) {
     }
     function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
     function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    function upInstallVersion() {
+        const input = $("up-version-input");
+        if (input && input.value.trim()) upInstall(input.value.trim().replace(/^v/, ""));
+    }
+    async function upPin() {
+        if (upBusyAction) return;
+        const running = $("up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (!running || running === "?") return;
+        const durSel = $("up-pin-duration");
+        const duration = durSel ? durSel.value : "forever";
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: running, duration: duration }) });
+            if (r.ok) showUpdateResult(t("up.pin_set", { v: running, until: duration }), true);
+            else showUpdateResult(String(r.error || t("up.pin_failed", { err: "unknown" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    async function upUnpin() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/unpin", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.ok) showUpdateResult(t("up.pin_cleared"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "unpin failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
     async function upCheckNow() {
         if (upBusyAction) return;
         upBusyAction = true;
@@ -5395,6 +5450,13 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const unins = $("up-install");
         if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
         if (unins) unins.addEventListener("click", () => upInstallSelected());
+        // #6804: free-text version install + pin/unpin controls
+        const upvins = $("up-install-version");
+        if (upvins) upvins.addEventListener("click", () => upInstallVersion());
+        const uppin = $("up-pin");
+        if (uppin) uppin.addEventListener("click", () => upPin());
+        const upunpin = $("up-unpin");
+        if (upunpin) upunpin.addEventListener("click", () => upUnpin());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });

@@ -169,6 +169,22 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <select id="up-select" class="ses-filter"></select>
 <button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
 </div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<input id="up-version-input" type="text" placeholder="0.1.215-pr.202.1" style="width:200px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);font-family:var(--mono);font-size:13px" />
+<button id="up-install-version" class="btn sm"><span data-i18n="up.install_version">${zh("up.install_version")}</span></button>
+</div>
+<div id="up-pin-section" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+<span id="up-pin-status" class="small dim"></span>
+<select id="up-pin-duration" class="ses-filter" style="width:auto">
+<option value="1h">1h</option>
+<option value="12h">12h</option>
+<option value="1d">1d</option>
+<option value="7d">7d</option>
+<option value="forever" selected>forever</option>
+</select>
+<button id="up-pin" class="btn sm"><span data-i18n="up.pin">${zh("up.pin")}</span></button>
+<button id="up-unpin" class="btn sm" disabled><span data-i18n="up.unpin">${zh("up.unpin")}</span></button>
+</div>
 <p id="up-result" class="small" style="margin:0" hidden></p>
 </div></div>
 <!-- #3719 phase 2: changelog card moved here from the overview page — same
