@@ -1025,10 +1025,12 @@ export class SessionStore {
         const filesByRoot = new Map<string, string[]>();
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`]) {
             const files = existsSync(root) ? await walkJsonFiles(root) : [];
+            const rootFiles: string[] = [];
+            filesByRoot.set(root, rootFiles);
             for (const file of files) {
                 if (path.basename(file).endsWith(".content-store.json")) continue;
                 this.diskFiles.push(file);
-                filesByRoot.set(root, [...(filesByRoot.get(root) ?? []), file]);
+                rootFiles.push(file);
             }
         }
         // #3199: unified mode (shadow or full) — the listener must not wait
@@ -1610,7 +1612,7 @@ export class SessionStore {
         const unifiedAvailable = this.replicasAvailable();
         if (unifiedAvailable) {
             try {
-                const row = this.liveShadow().sessionSummaries().find((r) => r.sessionId === id);
+                const row = this.liveShadow().sessionIdentity(id);
                 if (row && (row.protocol || row.origin)) meta = { protocol: row.protocol, upstreamOrigin: row.origin };
             } catch { /* sidecar degraded mid-call: fall back to tree-only probing */ }
         }

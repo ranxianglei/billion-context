@@ -2067,22 +2067,13 @@ export async function installViaTarball(
         }
     }
 
-    // Back up the current install before overwriting. If anything fails after
-    // the copy (partial copy, version drift, corrupted entry), the backup is
-    // restored so the previously working version keeps running.
+    // #6309: the atomic swap renames the current install ASIDE into backupDir,
+    // and that rename requires backupDir to be absent (ENOTEMPTY otherwise) —
+    // so the file backup is created only on the fallback merge-copy path,
+    // into a fresh destination. A pre-existing non-empty backup both kills
+    // the atomic path and makes the re-copy over it trip libuv's self-copy
+    // guard on npm's relative node_modules/.bin symlinks (gate Lane X, 2026-11-14).
     const backupDir = path.join(workDir, "backup");
-    if (!pnpmOldLink) {
-        // The pnpm-link lane needs no file backup: the displaced artifact IS
-        // the link itself (kept at pnpmOldLink) and the store contents it
-        // points into were never touched.
-        try {
-            await cp(installDir, backupDir, { recursive: true, force: true });
-        } catch (e) {
-            // Fail closed: without a backup we refuse to overwrite the running
-            // install — the current version keeps working.
-            return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
-        }
-    }
 
     const restoreFromBackup = async (): Promise<string | null> => {
         try {
@@ -2107,21 +2098,27 @@ export async function installViaTarball(
     // fall back to the previous merge-copy path.
     const swapCandidate = `${installDir}.update-new-${Date.now()}`;
     let copiedForSwap = false;
+    let renamedBackup = false;
     try {
         await cp(stagingDir, swapCandidate, { recursive: true, force: true });
         copiedForSwap = true;
         await rename(installDir, backupDir);
+        renamedBackup = true;
         try {
             await rename(swapCandidate, installDir);
         } catch (e) {
             const swapError = String(e);
             await rename(backupDir, installDir);
+            renamedBackup = false;
             throw new Error(swapError);
         }
         await rm(stagingDir, { recursive: true, force: true });
     } catch {
         if (copiedForSwap) await rm(swapCandidate, { recursive: true, force: true });
-        if (!pnpmOldLink) {
+        if (!pnpmOldLink && !renamedBackup) {
+            // File backup for the merge-copy path, created into a FRESH
+            // destination — re-copying over the existing backup tree trips
+            // libuv's self-copy guard on npm's relative .bin symlinks.
             try {
                 await cp(installDir, backupDir, { recursive: true, force: true });
             } catch (e) {

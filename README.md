@@ -501,6 +501,7 @@ bili --host 0.0.0.0           # listen on all interfaces (see host note below)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
+bili -c dsh-test             # named config → ~/.config/billion-context/dsh-test.json (per-model files)
 bili update                  # check & install a newer version now (bypasses throttle)
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
@@ -567,7 +568,8 @@ providers, compression tuning, environment variables — lives in
 ### Config file
 
 One JSON document at `~/.config/billion-context/billion-context.json`
-(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`).
+(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`; a bare name
+selects a sibling file, e.g. `-c dsh-test` → `~/.config/billion-context/dsh-test.json`).
 Precedence when several sources set the same knob: **CLI flag (where one exists) > env var > config file > built-in default** — every env var keeps working as the override tier.
 
 What's inside (details in docs/configuration.md):

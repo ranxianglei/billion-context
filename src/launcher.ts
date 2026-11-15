@@ -6799,13 +6799,14 @@ function parsePort(raw: string | undefined): number {
     return port;
 }
 
-/** -s/--server posture pins (#5491): parseArgs records them in overrides, but
- *  the launch path skips the generic env merge the start/update lanes use —
- *  mirror that merge for these keys so each lane's child-env spread delivers
- *  the pin to the child. Without this, an ambient BILI_PI_INLINE=1 flips a
- *  `-s pi` launch onto the inline lane and the launcher proxy idles. */
+/** -s/--server posture pins (#5491) + -c/--config: parseArgs records them in
+ *  overrides, but the launch path skips the generic env merge the start/update
+ *  lanes use — mirror that merge for these keys so each lane's child-env spread
+ *  delivers the pin to the child. Without this, an ambient BILI_PI_INLINE=1
+ *  flips a `-s pi` launch onto the inline lane and the launcher proxy idles;
+ *  likewise a `-c NAME` before the client name never reached the spawned proxy. */
 export function applyPosturePins(overrides: Record<string, string | undefined>): void {
-    for (const key of ["BILI_PI_INLINE", "BILI_OPENCODE_INLINE"]) {
+    for (const key of ["BILI_PI_INLINE", "BILI_OPENCODE_INLINE", "BILI_CONFIG_FILE"]) {
         const v = overrides[key];
         if (v !== undefined) process.env[key] = v;
     }
