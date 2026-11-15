@@ -3028,6 +3028,11 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
+                // #6199 × #4753: the retained preflight closure re-enters
+                // runPrepare AFTER releaseRequestInput (post-forward) has nulled
+                // `parsed`, so capture the parsed body once here — re-prepares
+                // must read the original body, not the released slot.
+                const inboundParsed = parsed;
                 const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
@@ -3093,7 +3098,7 @@ async function handleRequest(
                     // Eviction rides along (best-effort, throttled to once a minute).
                     if (protocol && !countTokens) {
                         session.incomingImageIndex = bodyMayCarryImages
-                            ? buildIncomingImageIndex(parsed, protocol, session.state, session.id)
+                            ? buildIncomingImageIndex(inboundParsed, protocol, session.state, session.id)
                             : new Map<string, IndexedImage[]>();
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
                             session.lastImgPrune = Date.now();
@@ -3102,7 +3107,7 @@ async function handleRequest(
                     } else if (session.incomingImageIndex) {
                         session.incomingImageIndex = undefined;
                     }
-                    const work = parsed;
+                    const work = inboundParsed;
                     // #3211: pair this request's per-route k̂ calibration policy
                     // (providers[<key>].calibration) onto the session so the NEXT
                     // usage settle applies it at k̂ publication time — same
