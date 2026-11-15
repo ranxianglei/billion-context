@@ -87,7 +87,7 @@ test("#5542: fork witness gates on fresh fork + raw session with minted refs", (
     seedRefs(rawBusy, 5);
     const fork3 = getSession(`${rawBusy.id}|sub:task:feedface`);
     seedRefs(fork3, 2);
-    assert.equal(witnessForkedGeneration(fork3, rawBusy.id, fork3.id), false, "non-fresh fork was already witnessed on birth");
+    assert.equal(witnessForkedGeneration(fork3, rawBusy.id, fork3.id), false, "non-fresh fork (already holds refs) — the witness only fires on the fork's first empty turn");
     assert.equal(readGenerationBoundary(fork3), undefined);
 });
 
