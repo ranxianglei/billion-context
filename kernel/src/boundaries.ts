@@ -405,7 +405,7 @@ function inheritedContentIds(
 // Ref numbers are assigned in session order and never recycled, so the visible
 // list is an order-preserving subsequence: nearest-by-ref-number ==
 // nearest-by-position. Synthetic summary/retrieved messages carry no ref and
-// protected ones hold BLOCKED_REF, so both are skipped here.
+// permanently protected ones hold BLOCKED_REF, so both are skipped here.
 function snapToNeighborVisible(
   state: CompressionState,
   indexByMessageId: Map<string, number>,

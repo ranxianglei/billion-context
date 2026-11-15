@@ -241,7 +241,7 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
  *  tool-less single-user body carrying one of those markers is therefore a MAIN
  *  turn whose assistant surface happens to be empty — routing it to the verbatim
  *  side lane skips the kernel, so the classifier can never stamp the carrier's
- *  BLOCKED ref (#2419/#2446/#2447/#2481) and the wire-byte contracts of
+ *  ref (#2419/#2446/#2447/#2481) and the wire-byte contracts of
  *  #2817/#5403 reset. Genuine sidecars (title / enhance / translate /
  *  auto-review) carry the host's own prompt and no marker, so they keep the
  *  side lane. */
