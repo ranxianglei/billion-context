@@ -48,11 +48,18 @@ function makeSession(id: string): Session {
 const foldGate = (store: SessionStore): { dropResidentMetadata(session: Session): void } =>
     store as unknown as { dropResidentMetadata(session: Session): void };
 
+// #6547: full mode opens index.db (+shm/wal) in dir; Windows refuses to
+// delete open files, so close every store a test created before rmrf.
+function closeAll(stores: SessionStore[]): void {
+    for (const s of stores) s.closeQuietly();
+}
+
 test("metadata fold is refused while live metadata diverges from the last committed bytes (#5506)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-fpgate-neg-"));
-    let store: SessionStore | undefined;
+    const stores: SessionStore[] = [];
     try {
-        store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        const store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        stores.push(store);
         const s = makeSession("fpgate-negative");
         s.metadata.anonymousPrefixAffinity = { depth: 22, tailHash: "test-tail", via: "prefix" };
         await store.writeNow(s);
@@ -65,19 +72,19 @@ test("metadata fold is refused while live metadata diverges from the last commit
         assert.equal((s.metadata as Record<string, unknown>).lateStamp, "unsaved", "the unsaved mutation must stay resident");
         store.closeQuietly(); // dual-write pin opens index.db — close before teardown (Windows cannot unlink an open SQLite file; see persist-zstd.test.ts for the family)
     } finally {
-        // Close before rm: under unified=full the store holds an index.db
-        // handle Windows cannot unlink (#6480 pinned full in this file).
-        store?.closeQuietly();
+        // Close before rm: under unified=full the stores hold index.db
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
+        closeAll(stores);
         rmrf(dir);
     }
 });
 
 test("metadata fold proceeds once the divergent mutation has been committed (#5506 positive direction)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-fpgate-pos-"));
-    let store: SessionStore | undefined;
-    let reloaded: SessionStore | undefined;
+    const stores: SessionStore[] = [];
     try {
-        store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        const store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        stores.push(store);
         const s = makeSession("fpgate-positive");
         s.metadata.anonymousPrefixAffinity = { depth: 22, tailHash: "test-tail", via: "prefix" };
         await store.writeNow(s);
@@ -87,7 +94,8 @@ test("metadata fold proceeds once the divergent mutation has been committed (#55
         // Commit the mutation; the post-save fold must now see matching fingerprints.
         await store.writeNow(s);
         assert.equal(isDroppedMetadata(s.metadata), true, "fold must proceed once live == committed");
-        reloaded = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        const reloaded = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        stores.push(reloaded);
         const back = reloaded.loadSync("fpgate-positive");
         assert.ok(back, "session reloaded");
         assert.equal((back?.metadata as Record<string, unknown>).lateStamp, "unsaved", "committed mutation survives the round trip");
@@ -96,18 +104,18 @@ test("metadata fold proceeds once the divergent mutation has been committed (#55
         reloaded.closeQuietly();
     } finally {
         // Close before rm: under unified=full the stores hold index.db
-        // handles Windows cannot unlink (#6480 pinned full in this file).
-        store?.closeQuietly();
-        reloaded?.closeQuietly();
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
+        closeAll(stores);
         rmrf(dir);
     }
 });
 
 test("metadata fold stays closed for a session with no committed save yet (#5506 conservative default)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-fpgate-cold-"));
-    let store: SessionStore | undefined;
+    const stores: SessionStore[] = [];
     try {
-        store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        const store = new SessionStore({ dir, debounceMs: 60000, enabled: true });
+        stores.push(store);
         const s = makeSession("fpgate-cold");
         (s.metadata as Record<string, unknown>).onlyInMemory = true;
         foldGate(store).dropResidentMetadata(s);
@@ -115,9 +123,9 @@ test("metadata fold stays closed for a session with no committed save yet (#5506
         assert.equal((s.metadata as Record<string, unknown>).onlyInMemory, true);
         store.closeQuietly();
     } finally {
-        // Close before rm: under unified=full the store holds an index.db
-        // handle Windows cannot unlink (#6480 pinned full in this file).
-        store?.closeQuietly();
+        // Close before rm: under unified=full the stores hold index.db
+        // handles Windows cannot unlink (#6480 pinned full in this file; #6547).
+        closeAll(stores);
         rmrf(dir);
     }
 });

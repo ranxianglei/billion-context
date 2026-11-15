@@ -22,7 +22,8 @@ import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeq
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, nudgeStampsOf, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, restoreNudgeStamps, snapshotMessages, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -123,6 +124,7 @@ export async function prepareResponses(
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
+    let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -414,8 +416,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
+        // #6531: snapshot before the kernel pass so a 4xx reject of the
+        // nudge-carrying request rolls the cadence back to pre-turn (lane
+        // mirror of the anthropic-lane fix).
+        nudgeStampsBefore = nudgeStampsOf(session);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
+        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
         // In-request ledger flush: the transcript up to THIS user message is
         // durable before the model call (#3397 durability-before-render) and
@@ -477,7 +485,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // two DELIBERATE differences are explicit inputs: the compaction
         // trigger (#2155/#2432 — a trigger request never carries the nudge)
         // and the codex-intercept health window (#2774).
-        const willInjectNudge = nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
@@ -824,6 +832,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         responsesTextProtocol,
         nudge,
         nudgeOutcome,
+        nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined,
         prompts,
         surface,
         renderTags,

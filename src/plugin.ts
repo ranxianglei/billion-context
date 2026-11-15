@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -2848,10 +2848,11 @@ export async function pipePluginChatWithStrip(
     // write through the request logger landed in the SAME tee file, doubling
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -3326,7 +3327,10 @@ export async function pipePluginChatWithStrip(
         // #1595: clean completion but no input usage sample — name it (the
         // cut-stream paths below have sawTerminal=false, so they stay
         // distinguishable from transport failures).
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -3870,7 +3874,10 @@ export async function pipePluginChatWithStrip(
         // structured or user data (#1039) and are excluded from the audit.
         if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // #5848 twin on the google lane: a frame carrying only empty parts has
+        // nothing a held tail must precede, and draining on it split a render tag
+        // so the remainder reached the host as prose (the #5192 shape).
+        if (!hadText && anyPending() && googleFrameHasNonText(ev)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     try {
@@ -4104,9 +4111,11 @@ export async function pipePluginJsonlWithStrip(
     // delta as a whole line, so the filters' held tails are only resolved at
     // the terminal frame / EOF / read failure — never per line (a per-line
     // flush destroys the cross-delta tag/marker state this filter exists for).
-    const onStrip = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onStrip = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode plugin mode)";
+        const head = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] ${head}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
     const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
@@ -4424,8 +4433,9 @@ export async function pipePluginResponsesWithStrip(
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {
@@ -4566,7 +4576,10 @@ export async function pipePluginResponsesWithStrip(
             markDirty(session);
         }
         // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -5301,7 +5314,10 @@ export async function pipePluginJson(
             }
         }
         // #1595: parsed success body carrying no input usage report — name it.
-        if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        if (session && !sawInputSample) {
+            diagnoseSuccessWithoutUsage(session, "plugin-json");
+            releaseNudgeHold(session);
+        }
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).
