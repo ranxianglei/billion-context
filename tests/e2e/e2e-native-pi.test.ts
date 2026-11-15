@@ -468,13 +468,14 @@ function piRun(
         // (CI sentinel incident, #4599). Pin the legacy posture so this
         // coverage stays deterministic; inline posture is covered by
         // tests/pi-inline-ws.test.ts and tests/pi-native.test.ts.
-         BILI_PI_INLINE: "0",
-         // Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope
-         // writer OFF, but this lane asserts on the on-disk .json session
-         // file. Pin the writer ON so the envelope this test was written for
-         // is still produced regardless of the storage-mode default.
-         BILI_STORAGE_JSON_WRITER: "on",
-         PI_CODING_AGENT_DIR: ctx.piAgentDir,
+        // Pure-SQLite became the default storage writer (2026-11-13 owner
+        // decision): JSONL session envelopes stop being written unless
+        // dual-write is requested. This lane asserts the JSONL envelopes —
+        // pin dual-write so the coverage does not ride the default; the
+        // pure-SQLite path is covered by unit tests + the real-model gate.
+        BILI_STORAGE_JSON_WRITER: "1",
+        BILI_PI_INLINE: "0",
+        PI_CODING_AGENT_DIR: ctx.piAgentDir,
         XDG_CONFIG_HOME: ctx.xdg.config,
         XDG_CACHE_HOME: ctx.xdg.cache,
         XDG_STATE_HOME: ctx.xdg.state,

@@ -38,12 +38,6 @@ import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
-// Pure-sqlite default (5a80e2b8e, #6480) turns the JSON envelope writer OFF,
-// so the per-session CCR content-store sidecar (.content-store.json) this
-// suite asserts on is never written. Pin the writer ON at module load (before
-// any SessionStore is constructed) so the companion-envelope coverage this
-// test was written for still runs regardless of the storage-mode default.
-process.env.BILI_STORAGE_JSON_WRITER = "on";
 
 const LIMIT = 200_000;
 const META = { protocol: "openai" as const, upstreamOrigin: "http://upstream.example/v1" };
@@ -296,6 +290,12 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
 });
 
 test("child persists its own companion and survives a proxy restart (#1341)", async () => {
+    // Pure-SQLite is the default storage writer now (2026-11-13): this test
+    // counts the .content-store.json companion envelope on disk, which the
+    // default writer never emits (0 !== 1 in the e2e-dsh-plugin-lane). Pin
+    // dual-write like the other e2e lanes (74a925db/d252543a).
+    const previousWriter = process.env.BILI_STORAGE_JSON_WRITER;
+    process.env.BILI_STORAGE_JSON_WRITER = "1";
     const dir = mkdtempSync(path.join(tmpdir(), "bili-fork-ccr-"));
     _setStoreForTest(new SessionStore({ dir, debounceMs: 0 }));
     try {
@@ -329,6 +329,8 @@ test("child persists its own companion and survives a proxy restart (#1341)", as
         assert.match(ack, /acp-retrieved #m00003/);
         assert.ok(ack.includes(BIG_A.slice(0, 200)), "true original after reload (v2 tool result)");
     } finally {
+        if (previousWriter === undefined) delete process.env.BILI_STORAGE_JSON_WRITER;
+        else process.env.BILI_STORAGE_JSON_WRITER = previousWriter;
         _setStoreForTest(new SessionStore({ enabled: false }));
         rmrf(dir);
     }
