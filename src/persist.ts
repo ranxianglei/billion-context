@@ -3240,20 +3240,25 @@ export class SessionStore {
             }
             return originals;
         };
+        // #5485: legacy-mode sessions never reach the fold-time re-key, so their
+        // originals can still sit under refs from before a renumbering. Apply the
+        // same re-key here; the source files stay untouched.
+        const rekeyed = (originals: MessageContentStore | undefined): MessageContentStore | undefined =>
+            originals && refs?.byRaw ? restampContentStore(originals, refs.byRaw) : originals;
         const sidecar = file.endsWith(".fb.json")
             ? `${file.slice(0, -".fb.json".length)}.content-store.json`
             : file.replace(/\.json$/, ".content-store.json");
         let bytes: Buffer;
         try { bytes = readFileSync(sidecar); }
         catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") return validateOwners(this.mergeOriginalStores([embedded]));
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return validateOwners(rekeyed(this.mergeOriginalStores([embedded])));
             throw new Error("CCR originals sidecar cannot be read", { cause: err });
         }
         let parsed: MessageContentStore;
         try { parsed = JSON.parse(this.readCodec.decode(bytes)) as MessageContentStore; }
         catch (err) { throw new Error("CCR originals sidecar cannot be decoded", { cause: err }); }
         if (parsed == null) throw new Error("malformed CCR originals sidecar");
-        return validateOwners(this.mergeOriginalStores([embedded, parsed]));
+        return validateOwners(rekeyed(this.mergeOriginalStores([embedded, parsed])));
     }
 
     private mergeDurableOriginals(session: Session, disk: MessageContentStore | null): MessageContentStore | undefined {

@@ -102,11 +102,12 @@ test("paired originals retain frozen aliases for pruned message IDs without reke
     } finally { rmrf(dir); }
 });
 
-test("paired originals cannot contradict a still-mapped message identity", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-owner-"));
+test("paired originals under a pre-renumbering ref are re-keyed to the message's current ref", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-rekey-"));
     try {
         await seed(dir);
         const file = join(dir, relPathFor(id, meta.protocol, meta.upstreamOrigin));
+        const source = join(dir, contentStoreRelPathFor(id, meta.protocol, meta.upstreamOrigin));
         const record = JSON.parse(readFileSync(file, "utf8"));
         record.payload.state.messageRefs.byRef.m90001 = "a-different-known-message";
         record.payload.state.messageRefs.byRaw["a-different-known-message"] = "m90001";
@@ -114,8 +115,30 @@ test("paired originals cannot contradict a still-mapped message identity", async
         record.payload.state.messageRefs.byRef.m90002 = originals.byRef.m90001.rawId;
         writeFileSync(file, JSON.stringify(record));
         const before = readFileSync(file);
+        const sourceBefore = readFileSync(source);
         const result = await runStorageMigrateCommand({ dir, json: true });
-        assert.equal(result.code, 1, "a mispaired store must not be attached to a known different owner");
+        assert.equal(result.code, 0, result.text);
+        const indexed = await indexedOriginals(dir);
+        assert.deepEqual(indexed?.byRef, { m90002: originals.byRef.m90001 }, "the original follows its message, never the other owner of m90001");
+        assert.deepEqual(indexed?.byHash, originals.byHash);
+        assert.deepEqual(readFileSync(file), before, "source refs stay untouched");
+        assert.deepEqual(readFileSync(source), sourceBefore, "source originals stay untouched");
+    } finally { rmrf(dir); }
+});
+
+test("paired originals cannot attach to an inconsistent session ref map", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-owner-"));
+    try {
+        await seed(dir);
+        const file = join(dir, relPathFor(id, meta.protocol, meta.upstreamOrigin));
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        record.payload.state.messageRefs.byRaw[originals.byRef.m90001.rawId] = "m90001";
+        record.payload.state.messageRefs.byRef.m90001 = "a-different-known-message";
+        record.payload.state.messageRefs.byRaw["a-different-known-message"] = "m90001";
+        writeFileSync(file, JSON.stringify(record));
+        const before = readFileSync(file);
+        const result = await runStorageMigrateCommand({ dir, json: true });
+        assert.equal(result.code, 1, "a ref the map assigns both ways to different messages must not be imported");
         assert.equal(JSON.parse(result.text).counts.failed, 1);
         const store = new SessionStore({ dir, enabled: true });
         try { assert.deepEqual(store.unifiedListSessionIds(), [], "wrong-owner source must not be partially imported"); }
