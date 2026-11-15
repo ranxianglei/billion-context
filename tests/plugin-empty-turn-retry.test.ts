@@ -219,6 +219,27 @@ test("plugin chat passes the empty turn through when the retry cannot be issued"
     }
 });
 
+// The opt-in switch (#5897) makes the relay pass NO refetch when degenerateRetry
+// is off (the default). That not-armed branch is distinct from the armed path
+// whose refetch() returns null (the test above): it must pass the empty turn
+// through unchanged AND leave a trace, so "the model replied nothing" is
+// diagnosable instead of reading as an idle session.
+test("plugin chat passes the empty turn through unchanged when the retry is not armed (no refetch)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    await pipePluginChatWithStrip(
+        streamOf(echoOnlyTurn()), makeRes(out), "openai", makeSession(),
+        (msg) => { logs.push(msg); },
+    );
+    const text = out.join("");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "one turn, one terminal, no re-issue");
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+    assert.ok(
+        logs.some((l) => l.includes("continuation retry not armed")),
+        `the not-armed pass-through leaves a trace, got: ${JSON.stringify(logs)}`,
+    );
+});
+
 test("plugin chat (anthropic) lands the retry's content in a block after the client's own", async () => {
     const out: string[] = [];
     let calls = 0;
@@ -322,6 +343,24 @@ test("plugin responses retries once when the turn's only text was a stripped ech
     assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
     assert.ok(!text.includes("item_2") && !text.includes("resp_2"), `the retry's ids are rewritten onto the client's, got: ${text}`);
     assert.ok(text.includes('"item_id":"item_1"'), "the retry's deltas carry the item id the client already holds");
+});
+
+// Responses-pipe twin of the chat not-armed test above: no refetch (degenerateRetry
+// off) must pass the empty completed turn through unchanged and leave a trace.
+test("plugin responses passes the empty turn through unchanged when the retry is not armed (no refetch)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    await pipePluginResponsesWithStrip(
+        streamOf(responsesEchoOnlyTurn()), makeRes(out), makeSession(),
+        (msg) => { logs.push(msg); },
+    );
+    const text = out.join("");
+    assert.equal((text.match(/"type":"response\.completed"/g) ?? []).length, 1, "one turn, one terminal, no re-issue");
+    assert.ok(!text.includes("m00155"), "the echoed tag never leaks");
+    assert.ok(
+        logs.some((l) => l.includes("continuation retry not armed")),
+        `the not-armed pass-through leaves a trace, got: ${JSON.stringify(logs)}`,
+    );
 });
 
 test("plugin responses releases the held done-family events on a healthy turn", async () => {
