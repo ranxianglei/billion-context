@@ -25,12 +25,16 @@ function extractFn(src: string, name: string): string {
 }
 
 const TIP_TEMPLATES: Record<string, string> = {
-    "det.rec_tick_n_tip": "round {i}, call {k}/{n} · {at} · folded {s} · round recovery {pct}",
+    "det.rec_tick_n_tip": "compression (round {n}, call {k}/{nn}) · {at} · folded {s} of {p} recommended = {pct}%",
     "det.rec_tick_a_tip": "active compression · {at} · folded {s}",
     "det.rec_line_base": "baseline 100% (fully folded the recommendation)",
     "det.rec_line_over_note": " (over-compression, includes old stock)",
     "det.rec_line_under_note": " (under-compression)",
     "det.rec_bracket_over": " excess old stock {s}",
+    "det.rec_bracket": "round {i} · {k} calls · {s}/{p} · {pct}",
+    "det.rec_bracket_open": "open round · {k} calls · {s}/{p} · {pct}",
+    "det.rec_flag_tip": "nudge injected · {tier} · {at} · {p} recommended",
+    "det.rec_norec": "no recommendation (non-T1) · {at} · folded {s}",
 };
 const T = (k: string, p?: Record<string, unknown>): string => {
     const tpl = TIP_TEMPLATES[k] || k;
@@ -63,14 +67,14 @@ const MIN = 60_000;
 // round 3 (pct null) then: n4@T0+30m(pending 100) → f5 310 (OVER-fold: 100 from the list + 210 old stock)
 const EVENTS = [
     { at: T0, kind: "n", tier: 1, pending: 100, paired: true },
-    { at: T0 + 1 * MIN, kind: "f", S: 60, folded: 60, mode: "n", pct: 60 },
-    { at: T0 + 2 * MIN, kind: "f", S: 50, folded: 50, mode: "n", pct: 50 },
+    { at: T0 + 1 * MIN, kind: "f", S: 60, folded: 60, p: 100, mode: "n", pct: 60 },
+    { at: T0 + 2 * MIN, kind: "f", S: 50, folded: 50, p: 100, mode: "n", pct: 50 },
     { at: T0 + 10 * MIN, kind: "n", tier: 1, pending: 200, paired: true },
-    { at: T0 + 11 * MIN, kind: "f", S: 150, folded: 150, mode: "n", pct: 75 },
-    { at: T0 + 12 * MIN, kind: "f", S: 40, folded: 40, mode: "a", pct: null },
+    { at: T0 + 11 * MIN, kind: "f", S: 150, folded: 150, p: 200, mode: "n", pct: 75 },
+    { at: T0 + 12 * MIN, kind: "f", S: 40, folded: 40, p: 0, mode: "a", pct: null },
     { at: T0 + 20 * MIN, kind: "n", tier: 2, pending: 0, paired: false },
     { at: T0 + 30 * MIN, kind: "n", tier: 1, pending: 100, paired: true },
-    { at: T0 + 31 * MIN, kind: "f", S: 310, folded: 310, mode: "n", pct: 310 },
+    { at: T0 + 31 * MIN, kind: "f", S: 310, folded: 310, p: 100, mode: "n", pct: 310 },
 ];
 
 test("#6729: full-window episode derivation matches the server-side aggregation", () => {
@@ -106,14 +110,13 @@ test("#6729: over-100% rounds read against the baseline — extra is old stock, 
     assert.equal(first.extra, 10);
 });
 
-test("#6729: the chart draws the 100% baseline, an extended axis, and the extra as old stock", () => {
+test("#6729: the chart draws the 100% baseline, an extended axis, per-fold points and old stock", () => {
     const svg = recoveryRoundSvg(EVENTS);
     assert.ok(svg.includes("baseline 100%"), "100% baseline label present");
     assert.ok(svg.includes('stroke="#57606a"'), "main recovery line present");
-    // round 4 (310%) → blue over dot with halo + the true label
+    // f5 (310%) → blue over dot with halo + the true label
     assert.ok(svg.includes('r="7" fill="none" stroke="#0969da"'), "over-100% halo dot");
-    assert.ok(!svg.includes("<rect"), "no bars — per-round recovery is a line chart (per-call info = ticks)");
-    assert.ok(svg.includes("<line") && svg.includes('stroke-width="2"'), "per-call ticks on the time axis");
+    assert.ok(svg.includes('width="4" height="13"'), "active compression stays a visible axis tick");
     assert.ok(svg.includes("310%"), "true >100% value labeled");
     assert.ok(svg.includes("excess old stock"), "bracket shows the extra as old stock");
     assert.ok(svg.includes("(over-compression, includes old stock)"), "point tip marks over-compression");
@@ -133,8 +136,8 @@ test("#6729: windowed events re-derive per-round aggregates (the linked-zoom pat
     assert.equal(built.eps[0].pct, 75);
     assert.equal(built.eps[0].activeFolds, 1);
     const svg = recoveryRoundSvg(windowed);
-    assert.match(svg, /75\.0%/);
-    // the active fold still draws (blue bar) even though it is not a round numerator
+    assert.match(svg, /75%/);
+    // the active fold still draws (blue tick) even though it is not a round numerator
     assert.match(svg, /#0969da/);
 });
 
@@ -154,12 +157,40 @@ test("#6729: a fold before the first visible nudge lands in the synthetic open r
     // (the window filter also drops pre-window nudges), so they form the synthetic open round
     const windowed = EVENTS.filter((e) => e.at >= T0 + 1 * MIN && e.at <= T0 + 3 * MIN);
     const svg = recoveryRoundSvg(windowed);
-    assert.doesNotMatch(svg, /r=\"4\.5\"/);       // no round points
-    // tooltip must not claim a round number that does not exist in the window:
-    // the open round is numbered 0, no other round appears
-    assert.match(svg, /round 0, call 1\/2/);
-    assert.match(svg, /round 0, call 2\/2/);
-    assert.doesNotMatch(svg, /round 1, call /);
+    // both folds are compressions with a measurable recommendation → both sit on the line
+    const pts = (svg.match(/r="4\.5"/g) || []).length;
+    assert.equal(pts, 2);
+    // the open round must not claim the nudge's pending twice: a burst folding the same
+    // list (both folds p=100) counts ONE 100, so the bracket reads 110/100 = 110%
+    assert.match(svg, /open round · 2 calls · 110\/100 · 110%/);
+    // tooltips number the open round 1 (no other round exists in the window)
+    assert.match(svg, /round 1, call 1\/2/);
+    assert.match(svg, /round 1, call 2\/2/);
+    assert.doesNotMatch(svg, /round 2, call /);
+});
+
+test("#6729: every compression sits on the line; a round's points sum to its recovery", () => {
+    const svg = recoveryRoundSvg(EVENTS);
+    // 4 measurable compressions (60, 50, 75, 310) → 4 dots; the active one is a tick, not a dot
+    const dots = (svg.match(/r="4\.5"/g) || []).length;
+    assert.equal(dots, 4, "one dot per measurable compression");
+    for (const lab of ["60%", "50%", "75%", "310%"]) assert.ok(svg.includes(lab), "label " + lab);
+    // main line connects all four in time order (M + 3 L segments)
+    assert.match(svg, /stroke="#57606a" stroke-width="1\.5"/);
+    // cumulative dashed line present (mass-weighted running average)
+    assert.ok(svg.includes("stroke-dasharray") && svg.includes("#8250df"), "cumulative line");
+    // round 1's point values (60 + 50) equal its bracket pct (110/100 = 110%)
+    assert.match(svg, /round 1 · 2 calls · 110\/100 · 110%/);
+    // the per-fold tip carries round/call numbering and the true denominator
+    assert.ok(svg.includes("compression (round 1, call 1/2)"), "per-fold tooltip");
+    assert.ok(svg.includes("folded 60 of 100 recommended = 60%"), "tooltip shows folded/recommended");
+    // a fold whose nudge carried no recommendation (non-T1) stays a grey axis tick — 不放过
+    const noRec = recoveryRoundSvg([
+        { at: T0, kind: "n", tier: 2, pending: 0, paired: false },
+        { at: T0 + MIN, kind: "f", S: 30, folded: 30, p: 0, mode: "n", pct: null },
+    ]);
+    assert.ok(noRec.includes("#6e7781"), "no-recommendation fold keeps a grey tick");
+    assert.ok(noRec.includes("no recommendation (non-T1)"), "its tooltip explains why");
 });
 
 test("#6729: empty window returns empty string (the render callback contract)", () => {
