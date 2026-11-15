@@ -239,7 +239,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const role = m.role === "model" ? "assistant" : typeof m.role === "string" ? m.role : "user";
             const texts: string[] = [];
             const calls: string[] = [];
-            let toolBody: string | undefined;
+            const toolBodies: string[] = [];
             for (const part of m.parts) {
                 if (!part || typeof part !== "object") continue;
                 const p = part as { text?: unknown; functionCall?: unknown; functionResponse?: unknown };
@@ -253,11 +253,11 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     // gemini clients wrap the tool body under an arbitrary key
                     // ({output:…}/{result:…}/{content:…}); a single-string-valued
                     // object IS the body — unwrap so it equals the openai render.
-                    if (typeof resp === "string") toolBody = resp;
+                    if (typeof resp === "string") toolBodies.push(resp);
                     else if (resp && typeof resp === "object" && !Array.isArray(resp)) {
                         const entries = Object.entries(resp as Record<string, unknown>);
-                        toolBody = entries.length === 1 && typeof entries[0]![1] === "string" ? entries[0]![1]! : canon(resp);
-                    } else toolBody = canon(resp ?? p.functionResponse);
+                        toolBodies.push(entries.length === 1 && typeof entries[0]![1] === "string" ? entries[0]![1]! : canon(resp));
+                    } else toolBodies.push(canon(resp ?? p.functionResponse));
                 }
             }
             // model turns MERGE into the pending assistant run — gemini splits
@@ -273,8 +273,8 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                 continue;
             }
             flushAssistant();
-            if (toolBody !== undefined) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
-            if (calls.length > 0 && toolBody === undefined) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
+            for (const toolBody of toolBodies) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
+            if (calls.length > 0 && toolBodies.length === 0) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
             else if (texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
             continue;
         }
@@ -285,13 +285,9 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const call = `${m.name}\u0000${canonicalCallArgs(m.arguments)}`;
             // codex splits assistant commentary and the tool call across items —
             // merge into the pending run so it reduces like the openai render.
-            if (asst !== null) {
-                asst.calls = [...(asst.calls ?? []), call];
-                asstFrags.push(fragmentHash("assistant", "", [call]));
-                continue;
-            }
-            flushAssistant();
-            turns.push({ kind: "assistant", calls: [call], frags: [fragmentHash("assistant", "", [call])] });
+            asst = asst ?? { kind: "assistant", text: "", calls: [] };
+            asst.calls = [...(asst.calls ?? []), call];
+            asstFrags.push(fragmentHash("assistant", "", [call]));
             continue;
         }
         if (typeof m.type === "string" && (m.type === "function_call_output" || m.type === "local_shell_call_output")) {

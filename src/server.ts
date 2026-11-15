@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -111,6 +111,7 @@ import { reconcileSystemAnchor } from "./system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
+import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
@@ -200,6 +201,16 @@ export function warnDroppedOpenaiParts(parsed: unknown, sessionId: string, log: 
 // tight loops. Bounded FIFO, same shape as warnedWireDropKeys.
 export const NON_CONVERSATION_RELAY_WARN_CAP = 4096;
 export const nonConversationRelayWarned = new Set<string>();
+
+// #1295 review F4: (declaration, URL-pinned protocol) pairs already warned
+// about a modelEndpointPatterns/explicitProtocol conflict — a misconfigured
+// client retries in tight loops, so one warn per pair per process suffices.
+// Bounded FIFO, same shape as nonConversationRelayWarned.
+export const declPinConflictWarned = new Set<string>();
+
+export function getDeclPinConflictStats(): { total: number } {
+    return { total: declPinConflictWarned.size };
+}
 
 // #1073/#3245: a forward-proxy-style (absolute-form) request whose authority IS
 // this instance's own listening endpoint is a fetch of us, not a tunnel — e.g.
@@ -2078,6 +2089,13 @@ export type Prepared = {
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
     codexForge?: { kind: "endpoint" | "trigger" | "prompt"; body: string; contentType: string };
+    /** #1295: the request came from a declared `commandcode` endpoint — an
+     *  openai-completions-shaped conversation inside the nested CLI envelope.
+     *  The pipeline above ran on the UNWRAPPED flat body; forward() rewraps it
+     *  into the envelope at the final boundary (and every compress-loop re-send
+     *  via wireTransform) using this meta. Presence also gates the JSONL
+     *  response codecs and disables #371 fake-completion retry. */
+    commandcode?: { meta: CommandcodeEnvelopeMeta };
     /** #2740: set when a Claude Code auto-mode classifier one-shot was answered
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */
@@ -2420,32 +2438,6 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
-}
-
-/** Predicate factory for the experimental fold-point carrier relocation
- *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
- *  be dropped at the moment its compress pair is repositioned ONLY when it
- *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
- *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
- *  for sessions where the kernel must not drop anything at all: strict-echo
- *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
- *  holding ANY signed thinking block (presence-based gate, same posture as
- *  planReasoningDrop), so a conservative misclassification can never break a
- *  signed session. Pure + cheap; install per request. */
-export function makeFoldPointReasoningDroppable(
-    msgs: BiliMessage[],
-    strictEcho: boolean,
-): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
-    if (strictEcho) return undefined;
-    if (msgs.some(hasSignedThinkingBlock)) return undefined;
-    return (m: import("acp-kernel").CoreMessage): boolean => {
-        const core = m as BiliMessage;
-        if (core.contentType === "reasoning") {
-            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
-        }
-        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
-        return raw?.type !== "redacted_thinking";
-    };
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see
@@ -4144,9 +4136,10 @@ export async function preflightCompressIfNeeded(
     // only the original tokenCount reads as "nothing happened" even when 16
     // folds removed hundreds of thousands of tokens. foldedTokens/rangesLeft
     // stay undefined when no fold ran, so the original phrasing holds there.
+    let remainingImageTokens = imageTokens;
     const failFast = (status: number, detail: string, retryable: boolean, foldedTokens?: number, rangesLeft?: number): PreflightFailFast => {
-        const imageNote = imageTokens >= limit
-            ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
+        const imageNote = remainingImageTokens >= limit
+            ? ` Images alone account for ~${remainingImageTokens} estimated tokens (≥ window ${limit}); reduce the remaining image payload or raise the window.`
             : "";
         const sizeClause = foldedTokens !== undefined && foldedTokens < tokenCount
             ? `context ~${foldedTokens} tokens (down from ~${tokenCount} before preflight) exceeds the model window ${limit}`
@@ -4256,41 +4249,78 @@ export async function preflightCompressIfNeeded(
     // #3226: re-sign the summarization egress over its own body (same arm as the
     // main forward); undefined for unsigned traffic.
     const preflightResignCtx = inboundResignCredential(req.headers, opts, upstreamUrl);
+    const responsesProjection = prepared.responsesProjection;
+    const preflightDeps: PreflightDeps = {
+        core,
+        session,
+        config,
+        compressionTarget,
+        compressReason: growthArmed ? "growth" : "overflow",
+        prompts: prepared.prompts ?? defaultPrompts,
+        surface: prepared.surface,
+        protocol: prepared.protocol,
+        billingBlock: prepared.anthropicBillingBlock,
+        url: upstreamUrl,
+        headers,
+        resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
+            try {
+                resignApig(hdrs, preflightResignCtx, "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
+            } catch (err) {
+                log("warn", `[${session.id}] [preflight] re-sign failed; sending the previous signature: ${String(err)}`);
+            }
+        } : undefined,
+        model,
+        proxyUrl,
+        signal: clientAbort.signal,
+        log,
+        imageReserve: imageTokens,
+        measureImageReserve: prepared.protocol === "responses" && responsesProjection
+            ? (view) => imageReserveFor(session, "responses", { input: patchResponsesInput(responsesProjection, view) }, opts, upstreamUrl)
+            : undefined,
+        wireOverhead: overheadEstimate,
+        unknownBaseline,
+        upstreamOrigin: currentOrigin,
+        forceStreamSummary,
+        streamSummaryOff,
+    };
     let result: PreflightResult;
+    // #5974: when the corrective pass below folds nothing, its probe rebuild IS the final outbound — reuse it instead of paying for another prepare over a multi-MB body.
+    let pendingRebuild: Prepared | undefined;
     try {
-        result = await preflightCompress(
-            {
-                core,
-                session,
-                config,
-                compressionTarget,
-                compressReason: growthArmed ? "growth" : "overflow",
-                prompts: prepared.prompts ?? defaultPrompts,
-                surface: prepared.surface,
-                protocol: prepared.protocol,
-                billingBlock: prepared.anthropicBillingBlock,
-                url: upstreamUrl,
-                headers,
-                resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
-                    try {
-                        resignApig(hdrs, preflightResignCtx, "POST", upstreamUrl, bodyStr, findRoute(opts.routes, upstreamUrl));
-                    } catch (err) {
-                        log("warn", `[${session.id}] [preflight] re-sign failed; sending the previous signature: ${String(err)}`);
-                    }
-                } : undefined,
-                model,
-                proxyUrl,
-                signal: clientAbort.signal,
-                log,
-                imageReserve: imageTokens,
-                wireOverhead: overheadEstimate,
-                unknownBaseline,
-                upstreamOrigin: currentOrigin,
-                forceStreamSummary,
-                streamSummaryOff,
-            },
-            prepared.originalMessages,
-        );
+        result = await preflightCompress(preflightDeps, prepared.originalMessages);
+        // #5974 (#4543-①): view-vs-reconstruction convergence. The walk's fit exit judges on its own blind processTurn(originalMessages) view, which can undershoot the full-pipeline reconstruction — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about. When the fresh rebuild measures over the window while the view exited early-fit with foldable mass left, run ONE corrective second pass seeded with the measured divergence as its exit bar: the fit judgment is forced through the post-reconstruction single source of truth (issue expectation clause ②). Bounded: the divergence must clear max(10K tok, 2% of window), unknown-baseline sessions keep their legacy upper-bound regime (#553), and a corrective pass that folds nothing falls through unchanged to the arms below.
+        if (result.compressedRanges > 0 && !unknownBaseline && result.failure === undefined && result.rangesRemaining > 0) {
+            const probe = await runPrepare();
+            session.stats.requests -= 1;
+            pendingRebuild = probe;
+            const probeMsgs = probe.processedMessages.length > 0 ? probe.processedMessages : probe.originalMessages;
+            const probeTextSize = estimateCoreMessages(probeMsgs) + overheadEstimate;
+            if (probeTextSize > session.stats.lastInputTokens) {
+                session.stats.lastInputTokens = probeTextSize;
+                session.stats.lastInputTokensSource = "estimate";
+            }
+            const probeCalibrated = applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+            const divergence = Math.round(probeCalibrated - result.payloadEstimate);
+            if (probeCalibrated >= limit && divergence >= Math.max(10_000, Math.round(limit * 0.02))) {
+                log("warn", `[${session.id}] preflight view fits (~${Math.round(result.payloadEstimate)} tok) but the rebuilt body measures ~${Math.round(probeCalibrated)} tok (Δ~${divergence} tok) — running one corrective second pass with the measured divergence as its exit bar (#5974)`);
+                const corrective = await preflightCompress({ ...preflightDeps, viewDeltaCorrection: divergence }, prepared.originalMessages);
+                // Phase 1 exited early-fit (failure undefined), so phase 2's verdicts are strictly newer.
+                result.compressedRanges += corrective.compressedRanges;
+                result.savedTokens += corrective.savedTokens;
+                result.payloadEstimate = corrective.payloadEstimate;
+                result.rangesRemaining = corrective.rangesRemaining;
+                result.fitsWindow = corrective.fitsWindow;
+                result.hadFoldableCandidates = result.hadFoldableCandidates || corrective.hadFoldableCandidates;
+                if (corrective.failure !== undefined) result.failure = corrective.failure;
+                if (corrective.externalDispatch !== undefined) {
+                    const prev = result.externalDispatch ?? { calls: 0, attempts: 0 };
+                    result.externalDispatch = { calls: prev.calls + corrective.externalDispatch.calls, attempts: prev.attempts + corrective.externalDispatch.attempts };
+                }
+                if (corrective.compressedRanges > 0) {
+                    pendingRebuild = undefined; // stale — the standard block below must rebuild fresh
+                }
+            }
+        }
     } finally {
         clearTimeout(holdTimer);
         stopHold?.();
@@ -4311,13 +4341,19 @@ export async function preflightCompressIfNeeded(
     // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
+    let reducedImageWire = false;
     let fits: boolean;
     let foldedCalibratedSize: number | undefined;
     if (result.compressedRanges > 0) {
-        const rebuilt = await runPrepare();
-        // runPrepare re-incremented stats.requests; the rebuild is internal
-        // to this single client request.
-        session.stats.requests -= 1;
+        // #5974: the corrective probe above may already hold the final rebuild —
+        // reuse it (a prepare pass over a multi-MB CJK body is not free).
+        const rebuilt = pendingRebuild ?? await runPrepare();
+        if (pendingRebuild === undefined) {
+            // runPrepare re-incremented stats.requests; the rebuild is internal
+            // to this single client request.
+            session.stats.requests -= 1;
+        }
+        pendingRebuild = undefined;
         outbound = rebuilt;
         // #1987: anchor the usage baseline to what ACTUALLY ships — the rebuilt
         // normal-config payload (text + wire overhead; images excluded per the
@@ -4333,6 +4369,9 @@ export async function preflightCompressIfNeeded(
         // raw body rides; mirror outboundPayloadBreakdown's fallback).
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
+        const rebuiltImageTokens = imageReserveFor(session, rebuilt.protocol, rebuilt.body, opts, upstreamUrl);
+        remainingImageTokens = rebuiltImageTokens;
+        reducedImageWire = result.compressedRanges > 0 && rebuiltImageTokens < imageTokens;
         if (rebuiltTextSize > session.stats.lastInputTokens) {
             session.stats.lastInputTokens = rebuiltTextSize;
             session.stats.lastInputTokensSource = "estimate";
@@ -4342,7 +4381,7 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens;
         // #3645: hoist the calibrated post-fold figure so the fail-fast message
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
@@ -4356,21 +4395,22 @@ export async function preflightCompressIfNeeded(
         // already-at-window context. Raw caliber (images included, no k̂
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
-        setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
+        setPostRebuildAnchor(session, rebuiltTextSize + rebuiltImageTokens);
         // [#3444] exhausted honest pass: the chain folded everything it could
         // (no failure) yet the rebuilt payload still sits at/above the growth
         // target — the target is physically unreachable for this session.
         // Record the measured floor so the next trigger arms on real growth
         // past it instead of re-firing every request; latest measurement wins.
-        if (growthArmed && result.failure === undefined && rebuiltTextSize + imageTokens >= compressionTarget) {
-            session.metadata.autoFoldFloorTokens = rebuiltTextSize + imageTokens;
+        if (growthArmed && result.failure === undefined && rebuiltTextSize + rebuiltImageTokens >= compressionTarget) {
+            session.metadata.autoFoldFloorTokens = rebuiltTextSize + rebuiltImageTokens;
             markDirty(session);
-            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
+            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + rebuiltImageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + rebuiltImageTokens} for headroom`);
         }
     } else {
-        fits = unknownBaseline
-            ? result.fitsWindow
-            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
+        // No block landed: judge the same prepared wire with the same scoped
+        // calibration used at entry, including its raw-body fallback. A fresh
+        // core-only estimate can reject fitting requests or admit oversized ones.
+        fits = unknownBaseline ? result.fitsWindow : payloadFitsWindow;
     }
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
@@ -4525,13 +4565,16 @@ export async function preflightCompressIfNeeded(
     // upstream overflow evidence. Forward for the upstream to arbitrate billing
     // instead of fail-fasting a payload whose real bill likely fits (#496). The text
     // portion was already folded above when foldable; we do NOT re-loop.
-    if (imageArbitration && !localRefusalHere) {
+    const imageArbitrationAfterFold = reducedImageWire && resolveImageBilling(opts.imageBilling, upstreamUrl) === "pixels"
+        && session.stats.lastInputTokensSource !== "overflow-arm";
+    if ((imageArbitration || imageArbitrationAfterFold) && !localRefusalHere) {
         // Same fallback as the fit-gate measurement above: processedMessages
         // empty ⇒ kernel transform failure ⇒ the raw body rides.
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const outText = estimateCoreMessages(outMsgs);
-        if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
-            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
+        const remainingImages = imageReserveFor(session, outbound.protocol, outbound.body, opts, upstreamUrl);
+        if (outText + overheadEstimate < limit && outText + overheadEstimate + remainingImages >= limit) {
+            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s); remaining images (~${remainingImages} estimated tokens) still exceed window ${limit}; forwarding the reduced wire for upstream billing arbitration (#496/#1800)`);
             return outbound;
         }
     }
@@ -4768,20 +4811,48 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
-        let aborted = false;
-        req.on("data", (c: Buffer) => {
-            if (aborted) return;
+        let settled = false;
+        const cleanup = () => {
+            settled = true;
+            chunks.length = 0;
+            req.off("data", onData);
+            req.off("end", onEnd);
+            req.off("error", onError);
+            req.off("close", onClose);
+        };
+        const onError = (error: unknown) => {
+            if (settled) return;
+            cleanup();
+            reject(error);
+        };
+        const onData = (c: Buffer) => {
+            if (settled) return;
             size += c.length;
-            if (size > knobLimitsReceiveBytes()) {
-                aborted = true;
+            const limit = knobLimitsReceiveBytes();
+            if (size > limit) {
+                onError(new BodyTooLargeError(limit));
                 req.destroy();
-                reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
-        });
-        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
-        req.on("error", (e) => { if (!aborted) reject(e); });
+        };
+        const onEnd = () => {
+            if (settled) return;
+            try {
+                const body = Buffer.concat(chunks);
+                cleanup();
+                resolve(body);
+            } catch (error) {
+                onError(error);
+            }
+        };
+        // IncomingMessage also closes after a normal end, whose handler has
+        // already settled and removed this premature-close fallback.
+        const onClose = () => onError(new Error("request closed before body completed"));
+        req.on("data", onData);
+        req.on("end", onEnd);
+        req.on("error", onError);
+        req.on("close", onClose);
     });
 }
 
@@ -4791,6 +4862,6 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 }
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
+export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, anthropicBetaMessageThreads, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
+export { BILI_TOOL_NAMES, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";

@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
+import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
@@ -273,6 +274,23 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `acp_status` reporting "unknown plugin conversation") (#5593).
 const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
+// #1295: declared custom-wire endpoints (src/model-endpoints.ts) — the SAME
+// config source the proxy classifier reads, so client claim and proxy
+// classification can no longer drift. Entries populate this at plugin load;
+// a config change takes effect on the next host start.
+let declaredPatterns: readonly ModelEndpointPattern[] = [];
+
+export function setDeclaredModelEndpoints(patterns: readonly ModelEndpointPattern[]): void {
+    declaredPatterns = patterns;
+}
+
+/** Current declared patterns (read-only view). Host gates consult this to let
+ *  explicitly declared endpoints through even when heuristic attribution is
+ *  unavailable (#1295). */
+export function getDeclaredModelEndpoints(): readonly ModelEndpointPattern[] {
+    return declaredPatterns;
+}
+
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
 /** True when this process carries the native fetch intercept (#519) — every
@@ -291,6 +309,8 @@ export function isModelApiUrl(url: string): boolean {
         const u = new URL(url);
         const segments = u.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] === "bili") return false;
+        // #1295: an explicit declaration outranks the built-in suffix table.
+        if (matchModelEndpoint(declaredPatterns, url) !== undefined) return true;
         const pathname = u.pathname.replace(/\/+$/, "");
         return MODEL_API_SUFFIX.test(pathname);
     } catch {
@@ -410,7 +430,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         try {
             const headers = new Headers(input.headers);
             for (const [k, v] of Object.entries(extra)) headers.set(k, v);
-            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, duplex: "half" });
+            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, signal: input.signal, duplex: "half" });
             return { input: rebuilt, init };
         } catch {
             return { input, init };
@@ -1420,9 +1440,9 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
     } catch {
         // undici refuses to copy a body-bearing Request without explicit
         // duplex — reconstruct with the body stream passed explicitly.
-        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
+        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null; signal?: AbortSignal };
         try {
-            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
+            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET", signal: src.signal };
             const pairs: [string, string][] = [];
             try {
                 for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
@@ -1445,7 +1465,7 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
  *  whose target and headers must survive while the body is swapped for the
  *  incremental payload. A string body needs no duplex. */
 export function replaceRequestPayload(e: { request?: unknown }, body: string, extraHeaders?: Record<string, string>): void {
-    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown } | null | undefined;
+    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown; signal?: AbortSignal } | null | undefined;
     if (old == null || typeof old.url !== "string") return;
     try {
         const headers = new Headers((old.headers ?? undefined) as ConstructorParameters<typeof Headers>[0]);
@@ -1454,6 +1474,7 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
             method: typeof old.method === "string" ? old.method : "POST",
             headers,
             body,
+            signal: old.signal,
         });
     } catch {
         // replacement impossible (exotic request) — the caller's plan is
@@ -1468,14 +1489,14 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
 export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
             return { input: plain, init: { ...(init ?? {}), body } };
         } catch {
             const headers: Record<string, string> = {};
             try {
                 for (const [k, v] of input.headers) headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
     return { input, init: { ...(init ?? {}), body } };
@@ -1886,7 +1907,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5403/#5418: the watermark handshake (x-bili-pf-count / -tail-ids)
             // is emitted ONCE here for every routed model request — lanes differ
             // only in where their ids are captured (pfChannel.pfCaptureIds).
-            const pfExtra = pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {});
+            // pfRequestHeaders must see the MERGED view: the conversation header
+            // may come from headersFor (dsh lane) rather than the client request (#5813).
+            const pfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const pfExtra = pfChannel.pfRequestHeaders({ ...pfOutgoing, ...(routedExtra ?? {}) });
             const allExtra = { ...(routedExtra ?? {}), ...pfExtra };
             captureStampedWindow(allExtra); // #5996: remember this lane's resolved window
             let target = url;
@@ -2119,7 +2143,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #5418: hosts that dial the proxy directly (dsh profile bundles,
             // #809 attach probes) land here already addressed — stamp + learn
             // here or their watermark channel silently never seeds.
-            const selfStamp = withHeaders(input, hoplessForLoopback(url, init), pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}));
+            // Same merge discipline as the routed branch (#5813): headersFor may
+            // be the sole source of the conversation header.
+            const selfRouted = state.headersFor?.(url);
+            const selfOutgoing = outgoingHeadersOf(input, init) ?? {};
+            const selfPfExtra = pfChannel.pfRequestHeaders({ ...selfOutgoing, ...(selfRouted ?? {}) });
+            const selfStamp = withHeaders(input, hoplessForLoopback(url, init), { ...(selfRouted ?? {}), ...selfPfExtra });
             const resp = await send(selfStamp.input, selfStamp.init);
             pfChannel.pfLearnStamp(outgoingHeadersOf(selfStamp.input, selfStamp.init) ?? {}, resp.status, resp.headers);
             noteDispatchMode("proxy");
@@ -2138,8 +2167,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         state.onDispatch?.(rewritten, "rewrite");
         // #5403/#5418: same single chokepoint as the routed branch — the
         // rewrite path is where attach-mode hosts (and the V1 fetch patch)
-        // ride the proxy without a settings overlay.
-        const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
+        // ride the proxy without a settings overlay. Same merged-view fix (#5813).
+        const rwRouted = state.headersFor?.(url) ?? {};
+        const rwOutgoing = outgoingHeadersOf(input, init) ?? {};
+        const branchExtra = { ...rwRouted, ...pfChannel.pfRequestHeaders({ ...rwOutgoing, ...rwRouted }), ...(resignExtra ?? {}) };
         captureStampedWindow(branchExtra); // #5996: remember this lane's resolved window
         try {
             const stamped = withHeaders(first, hoplessForLoopback(rewritten, init), branchExtra);
@@ -2227,6 +2258,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    declaredPatterns = [];
     lastMissingStateLogSeq = Symbol("unset");
     lastKnownContextWindow = undefined;
     respawnCooldownOverrideMs = undefined;

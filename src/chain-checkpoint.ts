@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { WireProtocol } from "./util.js";
+import { trailingSystemRunStart, type WireProtocol } from "./util.js";
 import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 // #1357/#1395/#1421 — Chain Checkpoint (first-processor-wins idempotent interop).
@@ -509,6 +509,13 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
                 return { ...body, messages: [...messages.slice(0, li), { ...m, content: merged }] };
             }
         }
+        // #5432: a body ending in a client trailing system run (legal — the
+        // kernel heal keeps it verbatim at array end) admits NO carrier slot:
+        // recognition only sees the TRAILING USER run (contract above), so a
+        // carrier inserted before the run would never be recognized again, and
+        // appending after the run is exactly the 400 shape (#5432 case 2).
+        // Skip the stamp — relay forwards unstamped on null (best-effort).
+        if (trailingSystemRunStart(messages) < messages.length) return null;
         return { ...body, messages: [...messages, { role: "user", content: tag }] };
     }
     if (wire === "responses") {

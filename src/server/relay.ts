@@ -8,7 +8,7 @@ import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorM
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, relocateCompressCarriers, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, buildBlockOpsSystemPrompt, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
@@ -16,6 +16,7 @@ import { noteSuccessfulForward } from "../cache-keepalive.js";
 import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
+import { rewrapCommandcodeBody } from "../commandcode-wire.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
@@ -40,11 +41,12 @@ import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutbou
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
+import { createCommandcodeAdapter } from "../loop/adapter-commandcode.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
-import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
+import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
@@ -62,7 +64,7 @@ import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
-import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { applyEstimateCalibration, BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
@@ -71,10 +73,10 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
+import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
-import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -345,14 +347,19 @@ async function forwardCaptured(
     v1Meta?: Record<string, unknown>,
     throttleModelHint?: string,
     onWireBody?: (body?: Buffer | string) => void,
+    releaseRequestInput?: () => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
-    const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
+    const hostOwnsTruncationRecovery = req.headers[BILI_HOST_RECOVERY_OWNER_HEADER] === BILI_HOST_RECOVERY_OWNER_OMP;
+    // #4861: persistence answers "did the upstream turn finish?", not "is the
+// client socket still open?" — a client that hangs up on the terminal frame
+// (pi's shape) must not lose the finished reply. Partial turns (no terminal)
+// are still never captured.
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
-        onWireBody?.();
-        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
+        onWireBody?.();        releaseRequestInput?.();        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
         return;
@@ -361,6 +368,7 @@ async function forwardCaptured(
     // zero-egress contract as codexForge; the audit line was written in
     // prepare (this line is the egress-proof for the serve itself).
     if (prepared?.autoModeForge) {
+        releaseRequestInput?.();
         log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
         res.end(prepared.autoModeForge.body);
@@ -679,6 +687,14 @@ async function forwardCaptured(
             }
         }
     }
+    // #1295: restore the CLI envelope at the final forward boundary — AFTER
+    // every flat-body mutation above (compat roles, output steering) so the
+    // client's provider plugin receives its exact native shape.
+    if (prepared?.commandcode && typeof wireBody === "string") {
+        try {
+            wireBody = JSON.stringify(rewrapCommandcodeBody(JSON.parse(wireBody) as Record<string, unknown>, prepared.commandcode.meta));
+        } catch { /* malformed flat body — pass through unchanged */ }
+    }
     // #1421/#1683: outbound chain checkpoint — when egress stamping is enabled
     // (chainEgressStamp, DEFAULT OFF), every request THIS instance actually
     // processed leaves with a request-level stamp, so a downstream bili applies
@@ -735,13 +751,20 @@ async function forwardCaptured(
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
     // Reads compatRoles at CALL time: a role learned mid-request (retry below)
     // applies to later re-sends within the same request.
-    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active
+    // #1295: commandcode re-sends must carry the envelope too — a compress-loop
+    // retry that dropped it would present flat OpenAI where the client's wire
+    // expects the CLI envelope.
+    const ccMetaForResend = prepared?.commandcode?.meta;
+    const wireTransform = compatProtocol || (steerCfg !== null && steerCfg.enabled) || compatDropPaths.length > 0 || v1Active || ccMetaForResend !== undefined
         ? (b: Record<string, unknown>): Record<string, unknown> => {
-            if (compatProtocol && compatRoles) applyCompatRolesJson(b, compatProtocol, compatRoles);
-            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(b, steerProtocol, steerCfg);
-            if (compatDropPaths.length > 0) dropCompatFieldsJson(b, compatDropPaths);
+            let out = b;
+            if (compatProtocol && compatRoles) applyCompatRolesJson(out, compatProtocol, compatRoles);
+            if (steerCfg && steerCfg.enabled && steerProtocol) applyOutputSteeringJson(out, steerProtocol, steerCfg);
+            if (compatDropPaths.length > 0) dropCompatFieldsJson(out, compatDropPaths);
             // #3129: re-nest the rebuilt inner request into the CloudCode envelope.
-            return v1Active ? wrapV1Internal(b, v1Meta) : b;
+            out = v1Active ? wrapV1Internal(out, v1Meta) : out;
+            if (ccMetaForResend !== undefined) out = rewrapCommandcodeBody(out, ccMetaForResend);
+            return out;
         }
         : undefined;
     // Show the final proxied URL (where the request actually lands) as the
@@ -1949,6 +1972,11 @@ async function forwardCaptured(
             }
         }
     }
+    // No further overflow refold can run. Release its inbound-only state before
+    // consuming a potentially long response; wireBody still owns retry/echo data.
+    releaseRequestInput?.();
+    releaseRequestInput = undefined;
+    overflowRefold = undefined;
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
     // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is
@@ -2036,14 +2064,18 @@ async function forwardCaptured(
                 }
                 log("warn", `[${s.id}] upstream image-count wall (cap ${info.imageCountCap}, request carried ${info.imageCountSeen ?? "?"}) — learned for pre-send convergence on this route; no token-space arm (#4124)`);
             } else if (isMarkerlessOverflowReject(upstream.status, errText)) {
-                // #4452: the gateway rewrote this overflow-shaped reject into a body with no
-                // parseable marker, so bili's self-heal cannot engage from it — name that here
-                // (+ the last meter reading) so a body-rewriting gateway's silent starvation is
-                // diagnosable from the log rather than the opaque line further down.
+                // #4452: a 413 IS the payload-size verdict, yet this body carries no
+                // parseable marker, so bili's self-heal cannot engage from it — name that
+                // here (+ the last meter reading) so a body-rewriting gateway's silent
+                // starvation is diagnosable from the log rather than the opaque line
+                // further down. Only 413 reaches this branch: an unmarked 400 is the
+                // generic malformed/schema-rejected bucket across relays and says nothing
+                // about size, so it is never diagnosed as overflow here (see
+                // isMarkerlessOverflowReject).
                 const est = s.stats.lastInputTokens > 0 ? s.stats.lastInputTokens : 0;
                 const win = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
                 const meterNote = est > 0 && win > 0 ? `; last settled input ~${Math.round(est)} vs effective window ${win}` : "";
-                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
+                log("warn", `[${s.id}] ← upstream ${upstream.status} carries no parseable overflow marker (an intermediate gateway rewrote the payload-size rejection body?) — bili's overflow self-heal (refold / emergency-shrink / window-learn) CANNOT engage from this rejection${meterNote}; repeated at similar size = calibration-starved route (#4452)`);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -2080,7 +2112,15 @@ async function forwardCaptured(
         let snippet = bodyText.slice(0, 600).replace(/\s+/g, " ").trim();
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
-        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4452: a relay that fans out to several targets answers a total failure
+        // with ONE aggregate body whose real cause sits in the LAST attempt's
+        // `details.error.message` — past the 600-byte snippet above, so the log
+        // showed only "all targets failed". Append that single terminal cause
+        // (bounded + credential-scrubbed by the helper; empty when absent, leaving
+        // this line byte-identical to before). Read-only: no recovery decision
+        // here depends on it.
+        const terminalCause = rejectionDiagnosticSuffix(bodyText);
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}${terminalCause}`);
         // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
         // selected only by its structured code plus exact request-model match;
         // keyring_all_limited and every ambiguous response remain account-wide.
@@ -2101,7 +2141,7 @@ async function forwardCaptured(
             // longer change, so deliver the upstream failure in-band (protocol error
             // event for streams; verbatim error body under 200 otherwise).
             if (prepared?.stream) {
-                emitStreamError(res, prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
+                emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, `upstream HTTP ${upstream.status}: ${snippet}`, (m) => loggerLog("info", m), opts.streamErrorShape);
             } else {
                 try { res.end(errBody ?? undefined); } catch { /* client gone */ }
             }
@@ -2215,7 +2255,9 @@ async function forwardCaptured(
         // signal, or end raw for permitlist hosts that own the handling.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
-            if (prepared.stream && maxFakeCompletionRetries() > 0) {
+            // #1295: the JSONL wire has no fake-completion shape to detect —
+            // its finish event IS the terminal frame.
+            if (prepared.stream && !prepared.commandcode && maxFakeCompletionRetries() > 0) {
                 // #1900: retry from wireBody — the exact bytes this request's main
                 // attempt shipped (post wireTransform and any same-request re-send),
                 // never the raw client body: upstream may have rejected those raw
@@ -2248,7 +2290,13 @@ async function forwardCaptured(
                 // first attempt's status/content-type (a resolveFakeCompletion
                 // re-send is not reflected; the pipes' own diag says which
                 // retry budget was spent instead).
-                const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+                const upstreamMeta: UpstreamMeta = {
+                    status: upstream.status,
+                    contentType: upstream.headers.get("content-type") ?? undefined,
+                    requestId: upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id") ?? undefined,
+                    opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
+                    cfRay: upstream.headers.get("cf-ray") ?? undefined,
+                };
                 // #2346: intrinsic runaway-enumeration terminator for the plugin-streamed
                 // body (the incident lane). Applied after any fake-completion buffering so
                 // both the live and replayed paths are guarded; byte-verbatim otherwise.
@@ -2258,7 +2306,16 @@ async function forwardCaptured(
                     log("error", `[${prepared.session.id}] output-side runaway guard tripped (${v.reason}; ${JSON.stringify(v.detail)}) — aborting upstream stream`);
                     clientAbort.abort();
                 });
-                if (prepared.protocol === "responses") {
+                if (prepared.commandcode) {
+                    // #1295: bare JSONL events — no SSE framing, no [DONE]; the
+                    // pipe strips render tags from the two prose fields only.
+                    await pipePluginJsonlWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                    );
+                } else if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
                     // when the turn completes with nothing visible.
@@ -2284,6 +2341,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        hostOwnsTruncationRecovery,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -2314,6 +2372,7 @@ async function forwardCaptured(
                         upstreamMeta,
                         reply,
                         opts.streamErrorShape,
+                        hostOwnsTruncationRecovery,
                     );
                 }
             } else {
@@ -2364,7 +2423,9 @@ async function forwardCaptured(
     // skipped the trailing clearUpstreamTimer and leaked a live idle
     // timer plus its socket for the full window.
     try {
-        if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
+        // #1295: commandcode streams terminate with their own finish event —
+        // no fake-completion shape exists to buffer-and-retry (#371 off).
+        if (prepared !== null && prepared.stream && !prepared.commandcode && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             // #1900: retry from wireBody — the exact bytes this request's main
             // attempt shipped (post wireTransform and any same-request re-send),
             // never the raw client body: upstream may have rejected those raw
@@ -2416,7 +2477,13 @@ async function forwardCaptured(
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         // #2328: pipes cite the first upstream response's HTTP identity.
-        const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+        const upstreamMeta: UpstreamMeta = {
+            status: upstream.status,
+            contentType: upstream.headers.get("content-type") ?? undefined,
+            requestId: upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id") ?? undefined,
+            opencodeLogId: upstream.headers.get("x-opencode-log-id") ?? undefined,
+            cfRay: upstream.headers.get("cf-ray") ?? undefined,
+        };
         if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
@@ -2449,6 +2516,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    hostOwnsTruncationRecovery,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2460,6 +2528,12 @@ async function forwardCaptured(
             } else {
                 log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
             }
+        } else if (prepared && prepared.commandcode && prepared.stream) {
+            // #1295: bare JSONL response on a non-injected turn — same prose-only
+            // strip pipe as plugin mode; no session (usage accounting stays off,
+            // same rationale as the SSE branch below).
+            const p = prepared;
+            await pipePluginJsonlWithStrip(responseBody, res, undefined, (msg) => log("info", `[${p.session.id}] ${msg}`));
         } else if (
             prepared &&
             prepared.stream &&
@@ -2495,6 +2569,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    hostOwnsTruncationRecovery,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2522,6 +2597,7 @@ async function forwardCaptured(
                     upstreamMeta,
                     reply,
                     opts.streamErrorShape,
+                    hostOwnsTruncationRecovery,
                 );
             }
         } else if (
@@ -2574,13 +2650,11 @@ async function forwardCaptured(
             // the first request (prefix-cache anchor).
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            // #5765 cache-seam parity: the block-ops section rides the round-2
+            // rebuild exactly like the steady prepare* paths (hybrid lane on
+            // text protocol — it is a function tool there).
+            const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-            // Experimental fold-point "thinking clear" (default OFF): install the
-            // kernel drop predicate only when BOTH switches are set; strict-echo
-            // and signed-thinking views yield none at all (#684/#1658).
-            if (loopConfig.compressAtFoldPointClearThinking) {
-                loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(prepared.originalMessages as BiliMessage[], isStrictReasoningEcho(prepared.session, targetOrigin, modelIdOf({ model: prepared.model })));
-            }
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
             // section with a plain "\n\n" (sysParts.join / injectSystem parts
@@ -2590,6 +2664,9 @@ async function forwardCaptured(
             // the absorb boundary char).
             const absorbSection = absorbActive
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const blockOpsSection = blockOpsActive
+                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2610,8 +2687,12 @@ async function forwardCaptured(
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
+            // #1295: commandcode keeps the internal protocol "openai" (request
+            // shape is openai-completions) but speaks bare JSONL on the wire.
+            const adapter = prepared.commandcode
+                ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
+                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             // #564/#2627: separator slots for the CURRENT round's body, refreshed
             // by each fold. The loop reads this through `ctx.separatorSlots` so the
             // continuity judge sees the same producer record prepare sees.
@@ -2657,20 +2738,7 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point summary relocation round-2 mirror (switch A): with
-                    // the switch on, each still-visible compress pair keeps its
-                    // chronological slot but its SUMMARY TEXT is re-emitted at its
-                    // fold point (call args become a pointer — v2 semantics).
-                    // Idempotent when processTurn's node already relocated them
-                    // (view-only + deterministic transform).
-                    const out = loopConfig.compressAtFoldPoint
-                        ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
-                            isCompressTool: loopConfig.isCompressTool,
-                            ...(loopConfig.compressAtFoldPointClearThinking && loopConfig.reasoningDroppable
-                                ? { clearThinking: true, reasoningDroppable: loopConfig.reasoningDroppable }
-                                : {}),
-                        }) as BiliMessage[]
-                        : outBase;
+                    const out = outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
@@ -2730,7 +2798,7 @@ async function forwardCaptured(
             }
             res.end();
         } catch (e) {
-            emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
+            emitStreamError(res, prepared.commandcode ? "commandcode" : prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;

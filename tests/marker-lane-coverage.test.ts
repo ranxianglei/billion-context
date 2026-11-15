@@ -249,7 +249,13 @@ test("engine: signed thinking slots are byte-invariant under the raw walk (KDD #
         const before = JSON.stringify(body.messages[0]);
         stripRawStage(body, "anthropic");
         assert.equal(JSON.stringify(body.messages[0]), before, "anthropic thinking block must ride byte-for-byte");
-        assert.equal((body.messages[1] as { content: string }).content, " ", "non-signed user slot still strips");
+        // #5812: messages[1] is the LATEST (and only) user turn, so a marker-shaped
+        // whole slot now fails open to the original bytes instead of blanking.
+        assert.equal(
+            (body.messages[1] as { content: string }).content,
+            "📦 [ACP] Compressed m00001–m00010 → b5",
+            "latest user turn fails open when its whole slot is a marker line (#5812)",
+        );
     }
 
     // google: {text, thought:true} and {text, thoughtSignature} parts
@@ -364,5 +370,58 @@ test("engine: wrapped-only assistant content becomes a space without rewriting t
         assert.equal(stripRawStage(body, "openai").statusBodies, 1);
         assert.equal(body.messages[0].content, " ");
         assert.equal(JSON.stringify(body.messages[0].tool_calls), before);
+    }
+});
+
+// ── #5812: a marker-shaped line the USER typed must not be blanked ──────────
+// The raw layer cannot tell a pasted error line from a forged/bili marker by
+// content alone. The fix protects ONLY the latest user turn (live input —
+// bili's own injected markers never land in the client's latest user message)
+// and fails open to the original bytes when stripping would wipe the whole
+// slot. Older positions and assistant slots keep the degrade-to-space rule.
+const PASTED_MARKER_LINE =
+    "❌ [ACP] stream error: the turn degenerated again after the continuation nudge 这是什么报错？";
+
+test("engine: a marker-shaped LATEST user turn survives intact on every wire (fail-open, #5812)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = { messages: [{ role: "user", content: PASTED_MARKER_LINE }] };
+        const counts = stripRawStage(body, wire);
+        assert.equal((body.messages[0] as { content: string }).content, PASTED_MARKER_LINE, `${wire}: latest user turn preserved`);
+        assert.equal(counts.markerLines, 0, `${wire}: nothing counted as stripped (bytes kept)`);
+    }
+    const g = { contents: [{ role: "user", parts: [{ text: PASTED_MARKER_LINE }] }] };
+    const gc = stripRawStage(g, "google");
+    assert.equal((g.contents[0] as { parts: { text: string }[] }).parts[0]!.text, PASTED_MARKER_LINE, "google: latest user turn preserved");
+    assert.equal(gc.markerLines, 0, "google: nothing counted");
+    const r = { input: [{ type: "message", role: "user", content: PASTED_MARKER_LINE }] };
+    const rc = stripRawStage(r, "responses");
+    assert.equal((r.input[0] as { content: string }).content, PASTED_MARKER_LINE, "responses: latest user turn preserved");
+    assert.equal(rc.markerLines, 0, "responses: nothing counted");
+});
+
+test("engine: an OLDER marker-only user slot and assistant slots still degrade to a space (#5812 boundary)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = {
+            messages: [
+                { role: "user", content: "📦 [ACP] Compressed m00001–m0010 → b5" },
+                { role: "assistant", content: "❌ [ACP] compress FAILED: x", tool_calls: [{ id: "t1", function: { name: "compress", arguments: "{}" } }] },
+                { role: "user", content: PASTED_MARKER_LINE },
+            ],
+        };
+        stripRawStage(body, wire);
+        assert.equal((body.messages[0] as { content: string }).content, " ", `${wire}: older marker-only user slot still blanks`);
+        assert.equal((body.messages[1] as { content: string }).content, " ", `${wire}: assistant marker slot still blanks (tool_calls survive)`);
+        assert.ok(Array.isArray(body.messages[1]!.tool_calls), `${wire}: tool_calls untouched`);
+        assert.equal((body.messages[2] as { content: string }).content, PASTED_MARKER_LINE, `${wire}: latest user turn fails open`);
+    }
+});
+
+test("engine: a marker line WITH prose in the latest user turn strips the marker, keeps the prose (#5812 non-degenerate)", () => {
+    for (const wire of ["anthropic", "openai"] as const) {
+        const body = { messages: [{ role: "user", content: "❌ [ACP] compress FAILED: x\nwhat do I do?" }] };
+        stripRawStage(body, wire);
+        const c = (body.messages[0] as { content: string }).content;
+        assert.ok(!c.includes("[ACP]"), `${wire}: marker line stripped`);
+        assert.ok(c.includes("what do I do?"), `${wire}: user prose survives`);
     }
 });

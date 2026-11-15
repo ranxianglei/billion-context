@@ -268,4 +268,30 @@ describe("#1685 review: duplicate-hash index safety + TTL", () => {
         assert.equal(_toolRingSizeForTest(), 0);
         _setToolRingClockForTest(undefined);
     });
+
+    it("record-only traffic reclaims expired sessions without a witness lookup", () => {
+        const ttl = 10 * 60 * 1000;
+        let now = 1_700_000_000_000;
+        _setToolRingClockForTest(() => now);
+        for (let i = 0; i < 20; i++) {
+            recordToolWitness(`finished-${i}`, "compress", { summary: `summary ${i}` });
+            assert.equal(_toolRingSizeForTest(), 1, "expired sessions must not accumulate on native-id lanes");
+            now += ttl + 1;
+        }
+    });
+
+    it("record-time collection preserves fresh witnesses and shared hash memberships", () => {
+        const ttl = 10 * 60 * 1000;
+        let now = 1_700_000_000_000;
+        _setToolRingClockForTest(() => now);
+        const shared = { summary: "shared witness" };
+        recordToolWitness("expired", "compress", shared);
+        now += 1000;
+        recordToolWitness("fresh", "compress", shared);
+        now += ttl - 999;
+        recordToolWitness("trigger", "compress", { summary: "new witness" });
+        assert.equal(_toolRingSizeForTest(), 2);
+        assert.deepEqual([...lookupToolWitness("compress", shared)], ["fresh"]);
+        assert.deepEqual([...lookupToolWitness("compress", { summary: "new witness" })], ["trigger"]);
+    });
 });
