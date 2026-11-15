@@ -3186,10 +3186,18 @@ export class SessionStore {
     /** #3818: decoded-size proxy for budget arbitration of index-only
      *  sessions — the serialized record the JSON writer would emit, which
      *  is what readRawFileWithBytes measures for file-backed candidates
-     *  (#2803: the budget is a RAM proxy, not a disk one). */
+     *  (#2803: the budget is a RAM proxy, not a disk one).
+     *  #6773 review: measure from the pure record projection, not the
+     *  committing guardedBuild — the CCR generation guard throws for a
+     *  cold session whose contentStore is not yet materialized (the
+     *  request path materializes it via contentStoreOf, but the warm loop
+     *  invokes the builder directly), so the catch returned
+     *  MAX_SAFE_INTEGER and silently skipped every CCR-bearing session
+     *  from pre-warming. buildRecordForSave is the same record guardedBuild
+     *  returns on the normal path, without the commit side effect. */
     private estimateDecodedBytes(session: Session): number {
         try {
-            return JSON.stringify(this.guardedBuild(session)()).length;
+            return JSON.stringify(this.buildRecordForSave(session, this.liveStorageStamp)).length;
         } catch {
             return Number.MAX_SAFE_INTEGER;
         }
@@ -3362,6 +3370,18 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
+            if (settleCcr && this.shadow) {
+                // #6773 review: convergence discards the in-memory state, so
+                // the stale in-memory originals are discarded with it — rebind
+                // from the index mirror (the newer generation we just converged
+                // to) and seed the basis so the guarded commit merges against
+                // it instead of refusing the unproven generation (a stale
+                // resident with no basis wedges every subsequent save until
+                // restart).
+                session.contentStore = this.shadow.getCcr(session.id, true) ?? undefined;
+                session.contentStoreDirty = false;
+                this.rememberOriginalsBasis(session);
+            }
             this.shadow?.record(disk, undefined, undefined, requireCommit, settleCcr);
             if (settleCcr) {
                 this.rememberOriginalsBasis(session);
