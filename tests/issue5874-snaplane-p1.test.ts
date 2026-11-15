@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { readSnapView, snapL1Lookup, _resetSnapPlaneDeadForTests } from "../src/storage/snap.ts";
+import { readSnapView, snapGcCoveredRows, snapL1Lookup, _resetSnapPlaneDeadForTests } from "../src/storage/snap.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 
@@ -232,6 +232,75 @@ test("#5874 T7: a block's covered range lands in the checkpoint coverage map", (
         // The read-side view verifies even though 8 rows are covered.
         const view = readSnapView(db, "sess-t7");
         assert.ok(view?.verified);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// T8 — GC gating (ruling B: inactive rows are physically released only when
+// their cover is gone; a LIVE cover keeps them on disk, invariant iv).
+// ---------------------------------------------------------------------------
+
+test("#5874 T8: GC releases covered rows only when the cover is gone (+/-)", () => {
+    _resetSnapPlaneDeadForTests();
+    const dir = tmpDir("bili-5874-t8-");
+    const p = path.join(dir, "index.db");
+    const store = openPlane(p);
+    try {
+        const msgs = Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
+        const byRaw: Record<string, string> = {};
+        const byRef: Record<string, string> = {};
+        msgs.forEach((m, i) => {
+            const ref = `m${String(i + 1).padStart(5, "0")}`;
+            byRaw[m.id] = ref;
+            byRef[ref] = m.id;
+        });
+        const blk = {
+            blockId: "blk-c1",
+            runId: 1,
+            createdAt: 1_000,
+            tier: 1,
+            active: true,
+            summary: "folded 1-8",
+            kind: "fold",
+            reason: "test",
+            effectiveMessageIds: msgs.slice(0, 8).map((m) => m.id),
+            directMessageIds: [] as string[],
+        };
+        const sess: LegacySessionLike = {
+            id: "sess-t8",
+            createdAt: 1_000,
+            lastSeen: 2_000,
+            meta: { protocol: "openai" },
+            stats: { requests: 1 },
+            metadata: {},
+            state: { blocks: [blk as never], nextBlockId: 2, nextRunId: 2, messageRefs: { byRaw, byRef } },
+            blockContents: new Map(),
+            lastMessages: msgs.map((m, i) => ({ id: m.id, role: i % 2 === 0 ? "user" : "assistant", contentType: "text", text: m.text })),
+            lastMessagesFolded: false,
+            pluginSnapshot: undefined,
+            contentStore: undefined,
+        };
+        store.ingestSession(planIngest(sess));
+        const db = raw(store);
+        const covered = () => (db.prepare("SELECT pos, active, cover_ref FROM snap_rows WHERE sid = 'sess-t8' AND active = 0 AND cover_ref = 'blk-c1'").all() as unknown[]).length;
+        assert.equal(covered(), 8, "the compact derivation must flip 8 rows under blk-c1");
+        // (-) the block row is STILL LIVE: GC removes nothing, rows stay on
+        // disk (invariant iv), the view still verifies.
+        assert.equal(snapGcCoveredRows(db, "sess-t8"), 0, "a live cover must not release its rows");
+        assert.equal(covered(), 8, "live-cover rows must stay on disk");
+        assert.ok(readSnapView(db, "sess-t8")?.verified);
+        // (+) the cover is gone (the block row is deleted): GC physically
+        // releases the 8 rows AND re-anchors the fold in the same txn — the
+        // next read must NOT trip R1 on the healthy plane.
+        db.prepare("DELETE FROM blocks WHERE session_id = 'sess-t8' AND block_id = 'blk-c1'").run();
+        assert.equal(snapGcCoveredRows(db, "sess-t8"), 8, "a gone cover must release exactly its rows");
+        assert.equal(covered(), 0, "released rows must be physically gone");
+        const tail = (db.prepare("SELECT pos, active FROM snap_rows WHERE sid = 'sess-t8' ORDER BY pos").all() as Array<{ pos: number; active: number }>).filter((r) => r.pos >= 8);
+        assert.equal(tail.length, 4, "the uncovered tail must survive the GC");
+        assert.ok(readSnapView(db, "sess-t8")?.verified, "the re-anchor must keep the plane verifying (no R1 false-trip)");
     } finally {
         store.close();
         fs.rmSync(dir, { recursive: true, force: true });

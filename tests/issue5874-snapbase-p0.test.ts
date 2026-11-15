@@ -331,6 +331,32 @@ test("#5874 T2: the commit primitive is atomic (invalid event ⇒ no half-state)
     }
 });
 
+test("#5874 T2e: the update event SUCCEEDS on an existing row (two-form retention)", () => {
+    const dir = tmpDir("bili-5874-t2e-");
+    try {
+        const p = path.join(dir, "index.db");
+        const db = rawDb(p);
+        migrateSchema(db);
+        applySnapCommit(db, "s1", [
+            { ev: "append", pos: 1, coreIds: ["m1"], preJson: null, postJson: postJson("a"), tokensEst: 3 },
+        ]);
+        // The success twin of T2's R2 failure case: pos 1 exists, so the
+        // in-place re-form lands — pre_json keeps the OLD post (invariant iv
+        // two-form retention), post_json becomes the new form, seq advances.
+        const out = applySnapCommit(db, "s1", [{ ev: "update", pos: 1, postJson: postJson("a-rewritten") }]);
+        assert.equal(tableCount(db, "snap_rows"), 1, "an update must not add a row");
+        const row = db.prepare("SELECT pre_json, post_json FROM snap_rows WHERE sid = 's1' AND pos = 1").get() as { pre_json: string | null; post_json: string };
+        assert.equal(row.post_json, postJson("a-rewritten"));
+        assert.equal(row.pre_json, postJson("a"), "the old post must be retained as pre_json");
+        assert.equal(out.tailSeq, 2, "the update consumes its own seq");
+        const view = readSnapView(db, "s1");
+        assert.ok(view?.verified, "the re-formed row must still verify");
+        db.close();
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("#5874 T2b: seq is strictly monotonic across folds (invariant ii)", () => {
     const dir = tmpDir("bili-5874-t2b-");
     try {
