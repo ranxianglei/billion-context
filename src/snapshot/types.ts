@@ -6,10 +6,10 @@
  *
  * Aligned to the reference implementation (#6155 `src/snapshot/`) — the stage-0
  * world-match / hydrate / lane decision vocabulary is shared verbatim. The
- * PLANE itself stays on the #5901 message-level model (one `snap_rows` row per
- * ledger element, `post_json` = the post-rewrite common-core BiliMessage JSON,
- * `pos` = the append-only ledger position), so the reconcile/egress event
- * types live in `src/storage/snap.ts` (unchanged) and are not re-declared here.
+ * original message-level plane (one row per ledger element) was retired before
+ * merge in favor of the append-only substrate (#5874 v2); the storage-side row
+ * types live in `src/storage/snap.ts` (fold journal + egress cache) and are
+ * not re-declared here.
  */
 
 /** One entry in the standing canon envelope: a host msgid bound to the

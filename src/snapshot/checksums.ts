@@ -1,12 +1,10 @@
 /**
- * #5874 — snapshot-table compression foundation: checksums (S4 + canon).
+ * #5874 — snapshot-plane checksums (canon digests).
  *
- * Pure, dependency-light. Every checksum in the foundation is a lowercase
+ * Pure, dependency-light. Every checksum in the plane is a lowercase
  * hex sha256 so the values are grep-able across the audit stream and the
- * storage layer (they are stored verbatim in snap_rows / snap_ckpt /
- * l1_world). The S4 per-row aggregate is the red-line invariant (iii): a
- * mismatch means the base material is corrupt and the sid plane is PERMANENTLY
- * dead (R1).
+ * storage layer (stored verbatim in l1_world / fold_journal /
+ * egress_snapshot input hashes).
  */
 import { createHash } from "node:crypto";
 

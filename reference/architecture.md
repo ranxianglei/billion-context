@@ -39,8 +39,7 @@ billion-context/
 │   │   ├── fastpath-scan.ts      #   Zero-decode structural span scan of chat-completions bodies (#5403)
 │   │   ├── lane-decisions.ts     #   Single resolver for per-lane gating decisions (#3417)
 │   │   ├── pi-subagent-channel.ts #   Channel fallback for pi-subagent children missing ACP tools (#2268)
-│   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756)
-│   │   ├── snap-egress.ts       #   Outbound egress from the snapshot plane, direct authority (#5874 P2)
+│   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756) + egress stable-prefix cache splice/cut (#5874 v2)
 │   │   ├── thread-tracking.ts    #   Anthropic Threads previous_message_id repair (#2701)
 │   │   ├── threads-lane.ts       #   Anthropic Threads lane: mirror, budget, reforge (#2926)
 │   │   ├── thinking-posture.ts   #   Signature-less thinking posture: 400-wording detector + wire strip + session memory (#5998)
@@ -146,10 +145,8 @@ billion-context/
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
-│   ├── snapshot/                 # 2×2 snapshot plane logic: stage-0 world match, assembly, delta egress (#6181)
-│   │   ├── assemble.ts           #   Stage-0 kernel-input assembly: plane rows + new spans + anchors, envelope order (#6181)
+│   ├── snapshot/                 # Stage-0 snapshot identity plane: world match, envelope codec, decision glue (#6181/#5874)
 │   │   ├── checksums.ts          #   Snapshot checksums (lowercase hex sha256) + canon digests (#5874)
-│   │   ├── delta.ts              #   Outbound delta selection: seed/delta/no-op + full-resend detection (#6181)
 │   │   ├── identity.ts           #   matchWorld verdicts (echo/probe/scatter/issue/diverge/resync) + canon parse (#5874)
 │   │   ├── plane.ts              #   Stage-0 decision glue: R3 identity check, 400 fault breaker, lane decide (#6181)
 │   │   ├── stage0.ts             #   Lane-agnostic stage-0 entry: pin + R3 + stage-0 decision + assembly, shared by the openai and responses lanes (#6181)
@@ -166,7 +163,7 @@ billion-context/
 │   │   ├── runtime-status.ts     #   Runtime storage degradation status for status surfaces (#3040)
 │   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v12)
 │   │   ├── shadow.ts             #   Unified-storage sidecar: shadow double-write / full read flip
-│   │   ├── snap.ts               #   Snapshot-table compression foundation: four v12 tables, commit primitive, S4-verified rebuild (#5874)
+│   │   ├── snap.ts               #   Snapshot-plane storage primitives: l1_world stage-0 ledger, fold_journal rows, egress_snapshot cache (#5874 v2)
 │   │   ├── sqlite-errors.ts      #   Corruption-shaped SQLite error classification (#5108)
 │   │   ├── store.ts              #   UnifiedStore: index.db (WAL) + content blobs, one txn per mutation
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
