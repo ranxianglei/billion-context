@@ -4,8 +4,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import { createInitialState, defaultCountTokens } from "acp-kernel";
-import type { CompressionBlock } from "acp-kernel";
+import { collectBlockContent, createInitialState, defaultCountTokens } from "acp-kernel";
+import type { CompressionBlock, CoreMessage } from "acp-kernel";
 import { LazyBlockContents, _resetSessionsForTest, getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
@@ -225,6 +225,66 @@ test("frozen-snapshot hydration: a leaf block's pruned messages re-align by posi
     assert.equal(one.role, "tool");
     assert.equal(one.text, "/path/x.ts:1-9", "click-to-open serves the snapshot bytes");
 });
+
+for (const [label, text] of [
+    ["leading blank lines", "\n\n  first line"],
+    ["trailing blank lines", "last line\n\n"],
+    ["only blank lines", "\n\n"],
+    ["CRLF content", "\r\n  mixed\r\n\n"],
+    ["empty content", ""],
+    ["ordinary content", "one\n  two"],
+] as const) {
+    for (const at of [0, 1, 2]) {
+        test(`frozen snapshot preserves ${label} at message ${at + 1}`, async () => {
+            const ids = ["raw-1", "raw-2", "raw-3"];
+            const block = mkBlock("b1", 1, "summary", ids, ids);
+            const session = seedSession(`snapshot-${label}-${at}`, [block]);
+            session.state.messageRefs = {
+                byRaw: { "raw-1": "m00001", "raw-2": "m00002", "raw-3": "m00003" },
+                byRef: { m00001: "raw-1", m00002: "raw-2", m00003: "raw-3" },
+            };
+            const originals: CoreMessage[] = ids.map((id, index) => ({
+                id,
+                role: index === 1 ? "assistant" : "user",
+                contentType: "text",
+                text: index === at ? text : `neighbor ${index + 1}`,
+            }));
+            const full = collectBlockContent(session.state, block, originals, { full: true });
+            session.blockContents.set(block.blockId, { one: null, full });
+            session.lastMessages = [];
+            _resetDiskCacheForTest();
+
+            for (let index = 0; index < originals.length; index++) {
+                const result = await buildMessageContent(session.id, `m0000${index + 1}`);
+                assert.ok(result.ok);
+                assert.equal(result.text, originals[index].text);
+                assert.equal(result.totalBytes, Buffer.byteLength(originals[index].text!));
+                assert.equal(result.bytes, result.totalBytes);
+                assert.equal(result.truncated, false);
+            }
+            assert.deepEqual(session.blockContents.get(block.blockId)?.full, full);
+        });
+    }
+}
+
+for (const leading of ["", "\n", "\n\n"]) {
+    test(`frozen snapshot keeps ${leading.length} leading blank lines around its ref marker`, async () => {
+        const block = mkBlock("b1", 1, "summary", ["raw"], ["raw"]);
+        const session = seedSession(`snapshot-marker-${leading.length}`, [block]);
+        session.state.messageRefs = { byRaw: { raw: "m00001" }, byRef: { m00001: "raw" } };
+        const text = leading + '\x3cacp tokens="2" type="text"\x3em00001\x3c/acp\x3e\n\n body\n\n';
+        const full = collectBlockContent(session.state, block, [
+            { id: "raw", role: "user", contentType: "text", text },
+        ], { full: true });
+        session.blockContents.set(block.blockId, { one: null, full });
+        session.lastMessages = [];
+        _resetDiskCacheForTest();
+        const result = await buildMessageContent(session.id, "m00001");
+        assert.ok(result.ok);
+        assert.equal(result.text, leading + "\n body\n\n");
+        assert.equal(result.totalBytes, Buffer.byteLength(result.text));
+    });
+}
 
 test("frozen-snapshot hydration refuses a partial, shifted or non-leaf parse", async () => {
     // Count mismatch: the snapshot captured only 2 of the block's 3 messages

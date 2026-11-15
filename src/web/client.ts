@@ -3344,6 +3344,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push('<span><span class="dot" style="background:none;border-top:2px dashed #8250df;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_cum") + "</span>");
             parts.push(legendItem("background:#57606a", t("det.rec_leg_pt")));
             parts.push("</div>");
+            parts.push('<div class="hint" style="margin-top:6px">' + escapeHtml(t("det.rec_note_t1")) + "<br>" + escapeHtml(t("det.rec_note_burst")) + "</div>");
             parts.push("</div></div>");
         }
         if (seamActive && seam.events.length > 0) {
