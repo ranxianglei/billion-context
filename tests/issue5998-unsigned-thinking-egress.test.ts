@@ -190,18 +190,25 @@ interface Rig {
     messagesUrl: () => string;
     upstreamBodies: string[];
     setPersonality(mode: Personality): void;
+    setContentRejected(afterRequests?: number): void;
     closeAll(): Promise<void>;
 }
 
 async function startRig(): Promise<Rig> {
     const upstreamBodies: string[] = [];
     let personality: Personality = "lenient";
+    let contentRejectedAfter = Infinity;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
             upstreamBodies.push(raw);
+            if (upstreamBodies.length > contentRejectedAfter) {
+                res.writeHead(400, { "content-type": "application/json", "x-request-id": "thinking-content-verdict" });
+                res.end(JSON.stringify({ error: { code: "content-blocked", type: "agent_router_content_blocked", message: WORDINGS["poisoned-signature"] } }));
+                return;
+            }
             const rejectWith = (message: string): void => {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }));
@@ -261,6 +268,7 @@ async function startRig(): Promise<Rig> {
         messagesUrl: () => `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
         upstreamBodies,
         setPersonality: (mode) => { personality = mode; },
+        setContentRejected: (afterRequests = 0) => { contentRejectedAfter = afterRequests; },
         closeAll: async () => {
             await closeOne(proxy);
             await closeOne(upstream);
@@ -290,6 +298,25 @@ async function post(rig: Rig, sid: string): Promise<Response> {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": "test" },
         body: dshBody(sid),
+    });
+}
+
+for (const afterRequests of [0, 1]) {
+    test(`content rejection quoting signature diagnostics stops thinking repair (after=${afterRequests})`, async () => {
+        const rig = await startRig();
+        try {
+            rig.setPersonality("strict");
+            rig.setContentRejected(afterRequests);
+            const response = await post(rig, "ts-content-rejection");
+            const body = await response.json();
+            assert.equal(response.status, 400);
+            assert.deepEqual(body, { error: { code: "content-blocked", type: "agent_router_content_blocked", message: WORDINGS["poisoned-signature"] } });
+            assert.equal(response.headers.get("x-request-id"), "thinking-content-verdict");
+            assert.equal(bodyHasUnsignedThinking(rig.upstreamBodies[0]!), true, "exercise the actual strip-probe admission");
+            assert.equal(rig.upstreamBodies.length, afterRequests + 1, "no sends after the terminal content verdict");
+        } finally {
+            await rig.closeAll();
+        }
     });
 }
 

@@ -69,7 +69,7 @@ const ROUND_GOOD = [
     sse("response.completed", { response: { id: "resp_3", status: "completed", output: [] } }),
 ].join("");
 
-async function drain(retries: string[], id: string): Promise<{ out: string; fetchCalls: number; bodies: string[] }> {
+async function drain(retries: Array<string | { status: number; body: string; headers?: Record<string, string> }>, id: string): Promise<{ out: string; fetchCalls: number; bodies: string[] }> {
     let fetchCalls = 0;
     const bodies: string[] = [];
     const orig = globalThis.fetch;
@@ -77,7 +77,7 @@ async function drain(retries: string[], id: string): Promise<{ out: string; fetc
         fetchCalls++;
         if (init?.body !== undefined) bodies.push(typeof init.body === "string" ? init.body : String(init.body));
         const body = retries[fetchCalls - 1] ?? "";
-        return new Response(body, { status: 200 });
+        return typeof body === "string" ? new Response(body, { status: 200 }) : new Response(body.body, body);
     }) as typeof fetch;
     const chunks: Buffer[] = [];
     try {
@@ -97,6 +97,19 @@ async function drain(retries: string[], id: string): Promise<{ out: string; fetc
     }
     return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls, bodies };
 }
+
+test("a recovery request rejected for content ends as a failure with body and header request IDs", async () => {
+    const error = { code: "content-blocked", request_id: "fixture-body-id", message: "Synthetic rejection" };
+    const { out, fetchCalls } = await drain([ROUND_DEGENERATE, {
+        status: 400, body: JSON.stringify({ error }), headers: { "x-request-id": "fixture-header-id" },
+    }], "content-rejected-recovery");
+    assert.equal(fetchCalls, 2, "one normal continuation and one rejected recovery; no further send");
+    assert.ok(out.includes('\"code\":\"content-blocked\"'), "do not replace a rejection with a successful empty completion");
+    assert.ok(out.includes("fixture-body-id"), "retain the structured request ID");
+    assert.ok(out.includes("fixture-header-id"), "retain the transport request ID");
+    assert.ok(out.includes("response.failed"));
+    assert.ok(!out.includes("response.completed"), "no successful terminal after recovery rejection");
+});
 
 test("#732 D1: degenerate post-compress turn → one invisible retry with a continuation nudge", async () => {
     // fetch #1 = re-request (degenerate); fetch #2 = the auto-retry (good turn).
@@ -359,17 +372,22 @@ test("#1862 B1: both attempts' usage settled exactly once (replaced attempt no l
     assert.equal(getCacheLedger(session).lines.length, 2, "one ledger sample per attempt — neither dropped nor double-counted");
 });
 
-test("#1862 B2: failed degenerate-retry fetch settles the original attempt exactly once, fabricates nothing", async () => {
-    const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
-    process.env.BILI_REPLAY_RETRY_MAX = "1";
-    try {
-        const { fetchCalls, session } = await drainResp(DEGENERATE_USAGE, [() => new Response("upstream exploded", { status: 500 })], "b2");
-        assert.equal(fetchCalls, 1, "the degenerate retry fetched once and failed");
-        assert.equal(session.stats.inputTokens, 100, "original attempt's input settled exactly once (not double-counted on failure)");
-        assert.equal(session.stats.outputTokens, 5, "original attempt's output settled exactly once");
-        assert.equal(getCacheLedger(session).lines.length, 1, "exactly one ledger sample — no fabricated usage for the failed fetch");
-    } finally {
-        if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
-        else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
-    }
-});
+for (const failure of [
+    { label: "500", status: 500, body: "upstream exploded" },
+    { label: "content rejection", status: 400, body: JSON.stringify({ error: { code: "content-blocked", message: "Synthetic rejection" } }) },
+]) {
+    test(`#1862 B2: ${failure.label} settles the original attempt exactly once, fabricates nothing`, async () => {
+        const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
+        process.env.BILI_REPLAY_RETRY_MAX = "1";
+        try {
+            const { fetchCalls, session } = await drainResp(DEGENERATE_USAGE, [() => new Response(failure.body, { status: failure.status })], `b2-${failure.status}`);
+            assert.equal(fetchCalls, 1, "the degenerate retry fetched once and failed");
+            assert.equal(session.stats.inputTokens, 100, "original attempt's input settled exactly once (not double-counted on failure)");
+            assert.equal(session.stats.outputTokens, 5, "original attempt's output settled exactly once");
+            assert.equal(getCacheLedger(session).lines.length, 1, "exactly one ledger sample — no fabricated usage for the failed fetch");
+        } finally {
+            if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
+            else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
+        }
+    });
+}

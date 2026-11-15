@@ -38,12 +38,14 @@ interface Harness {
     upstreamPort: number;
     captured: Captured[];
     setStrictness(mode: Strictness): void;
+    setRejectionBody(body: string): void;
     close(): Promise<void>;
 }
 
 async function startHarness(strictModels?: Set<string>): Promise<Harness> {
     const captured: Captured[] = [];
     let strictness: Strictness = "lenient";
+    let rejectionBody: string | undefined;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -51,6 +53,11 @@ async function startHarness(strictModels?: Set<string>): Promise<Harness> {
             let body: Record<string, unknown> = {};
             try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { /* keep {} */ }
             captured.push({ headers: req.headers, body });
+            if (rejectionBody !== undefined) {
+                res.writeHead(400, { "content-type": "application/json", "x-request-id": "synthetic-content-rejection" });
+                res.end(rejectionBody);
+                return;
+            }
             const hasKey = typeof body.prompt_cache_key === "string";
             // #2645 evidence table: NVIDIA's strictness is MODEL-level on one
             // origin — honor an explicit strict-model set when given.
@@ -103,6 +110,7 @@ async function startHarness(strictModels?: Set<string>): Promise<Harness> {
         upstreamPort,
         captured,
         setStrictness: (mode) => { strictness = mode; },
+        setRejectionBody: (body) => { rejectionBody = body; },
         close: async () => {
             proxy.close();
             proxy.closeIdleConnections?.();
@@ -206,6 +214,39 @@ test("#2645 probe: unrelated persistent 400 is NOT attributed to the key — key
         await h.close();
     }
 });
+
+for (const protocol of ["openai", "responses"] as const) {
+    for (const errorIdentity of [{ code: "content-blocked" }, { type: "agent_router_content_blocked" }]) {
+        test(`${protocol}: explicit content rejection is preserved without a cache-key probe (${JSON.stringify(errorIdentity)})`, async () => {
+            const h = await startHarness();
+            try {
+                const rejection = JSON.stringify({ error: { ...errorIdentity, message: "Synthetic content rejection; request id: fixture-01" } });
+                h.setRejectionBody(rejection);
+                const endpoint = protocol === "responses" ? "responses" : "chat/completions";
+                const body = {
+                    model: "gpt-test", stream: true, prompt_cache_key: "content-rejection-key",
+                    ...(protocol === "responses"
+                        ? { input: [{ role: "user", content: "Explain a plugin migration plan." }] }
+                        : { messages: [{ role: "user", content: "Explain a plugin migration plan." }] }),
+                };
+                const url = `http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/${endpoint}`;
+                for (let attempt = 1; attempt <= 2; attempt++) {
+                    const response = await fetch(url, {
+                        method: "POST", headers: { "content-type": "application/json", "x-acp-session": `content-rejection-${protocol}` },
+                        body: JSON.stringify(body),
+                    });
+                    assert.equal(response.status, 400);
+                    assert.equal(await response.text(), rejection, "preserve the original error and request identifier");
+                    assert.equal(h.captured.length, attempt, "one upstream send per client request; no internal probe");
+                    assert.equal(h.captured.at(-1)?.body.prompt_cache_key, "content-rejection-key");
+                    assert.equal(pckAblations().length, 0, "content rejection must not change cache routing");
+                }
+            } finally {
+                await h.close();
+            }
+        });
+    }
+}
 
 test("#2645 probe: model-level granularity — sibling model on the same strict origin keeps the key", async () => {
     const h = await startHarness(new Set(["nim-550b"]));

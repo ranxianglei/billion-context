@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { log as loggerLog, setLogCapture } from "../src/logger.ts";
+import { getCacheLedger } from "../src/cache-ledger.ts";
 
 // #413: upstream truncation (200 + early SSE EOF) — zero-side-effect retry,
 // well-formed Anthropic error stream (message_start before content blocks,
@@ -178,6 +179,32 @@ test("#413 T1: 0-event EOF → retried once; failed retry → well-formed error 
         delete process.env.BILI_REPLAY_RETRY_MAX;
     }
 });
+
+for (const [label, first] of [
+    ["invisible truncation", ""],
+    ["visible truncation", MESSAGE_START.replace('"output_tokens":0', '"output_tokens":2') + textStart(0) + textDelta(0, "Partial answer")],
+    ["stalled announcement", MESSAGE_START + textBlock(0, "Running verify after formatting:") + MESSAGE_DELTA() + MESSAGE_STOP],
+]) {
+    test(`content rejection during ${label} recovery stays terminal`, async () => {
+        const error = { code: "content-blocked", type: "agent_router_content_blocked", message: "Synthetic rejection: please retry; request id: fixture-recovery" };
+        const mock = mockFetch(() => new Response(JSON.stringify({ error }), { status: 400 }));
+        try {
+            const ctx = { ...makeCtx(`content-recovery-${label}`), protocol: "anthropic" as const };
+            const output = await drain(new Response(first).body!, ctx);
+            assert.equal(mock.calls(), 1, "do not retry an explicit rejection or enter another recovery");
+            const failure = output.split("\n").filter((line) => line.startsWith("data: {"))
+                .map((line) => JSON.parse(line.slice(6))).find((frame) => frame.type === "error");
+            assert.deepEqual(failure?.error, error, "preserve the content rejection instead of the original truncated or stalled turn");
+            assert.ok(!output.includes('\"stop_reason\":\"end_turn\"'), "recovery rejection is not success");
+            const measured = first.includes("message_start");
+            assert.equal(ctx.session.stats.inputTokens, measured ? 5 : 0, "retain the original attempt's reported input");
+            assert.equal(ctx.session.stats.outputTokens, label === "stalled announcement" ? 3 : label === "visible truncation" ? 2 : 0, "retain measured output without inventing rejected usage");
+            assert.equal(getCacheLedger(ctx.session).lines.length, measured ? 1 : 0, "one ledger sample per measured attempt");
+        } finally {
+            mock.restore();
+        }
+    });
+}
 
 test("#413 T2: 0-event EOF → retry succeeds → one clean stream, no error surfaced", async () => {
     const round2 = [MESSAGE_START, textBlock(0, "Hello retry"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
