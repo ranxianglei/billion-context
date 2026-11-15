@@ -117,6 +117,11 @@ for (const explicitLog of [false, true]) {
     test(`runDiff correlates real scoped logger output and reports a cache miss: explicitLog=${explicitLog}`, async (t) => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-usage-report-"));
         const file = path.join(dir, "bili.log");
+        // Hermetic: runDiff's default log enumeration also scans the state-dir
+        // log — pin XDG_STATE_HOME so a host's live log cannot contribute
+        // samples (same flake class as the usage tests in acp-cache-diff.test.ts).
+        const prevXdg = process.env.XDG_STATE_HOME;
+        process.env.XDG_STATE_HOME = dir;
         t.mock.timers.enable({ apis: ["Date"], now: START + 500 });
         try {
             const messages = [{ role: "user", content: "hello" }, { role: "assistant", content: "reply" }];
@@ -142,6 +147,8 @@ for (const explicitLog of [false, true]) {
             assert.equal(pair.category, "prefix-stable-miss");
             assert.deepEqual(pair.usage, { inputA: 10000, cachedB: 1000, inputB: 11000, missedPrefix: 9000, hitPctB: 9 });
         } finally {
+            if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdg;
             await closeLogger();
             configureLogger("off");
             rmrf(dir);
