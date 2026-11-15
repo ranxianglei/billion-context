@@ -57,6 +57,9 @@ export const LIVE_FILES = [
     // both spawn the corrupt-index-child helper (unified-store cold-load
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
+    // lock-holder CHILD process parks on a hermetic mkdtemp index.db (#2195
+    // release-gate pin); binds no ports — zone slot is a formality
+    "tests/storage-open-busy-lock.test.ts",
     "tests/web-storage-banner.test.ts",
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
@@ -134,6 +137,16 @@ export const LIVE_FILES = [
     // child binds no port and does no network I/O, so no zone band is needed —
     // the entry is for the tripwire alone, like #3890/#5114
     "tests/integrity-worker-stderr.test.ts",
+    // Real npm pack/install children use mkdtemp package fixtures and the
+    // preload's per-process XDG roots; they bind no listener ports.
+    "tests/pack-install.test.ts",
+    // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
+    "tests/ci-janitor-fork-heads.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
+    // Native-zstd absence is simulated in an isolated Node child; it binds
+    // no sockets and changes only that child's built-in module exports.
+    "tests/content-encoding-zstd.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

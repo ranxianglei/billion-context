@@ -28,6 +28,7 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── rejection-diagnostics.ts #   Bounded terminal-cause diagnostic for a relayed upstream rejection: one nested attempts[].details.error.message, scrubbed + bounded, appended to the relay log line (#4452)
 │   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
 │   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
@@ -183,6 +184,7 @@ billion-context/
 │   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
+│   ├── toml-integer.ts           # Shared strict TOML integer reader for model token limits
 │   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)
 │   ├── plugin-install.ts         # `bili plugin install` driving host channels
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)

@@ -27,8 +27,9 @@
 // new turn from idle.
 //
 // Gated by ACP_TEST_E2E_NATIVE=1 (same gate as e2e-native-pi.test.ts; needs
-// `npm run build` first — the pi package loads dist/agent/pi-native.js, which
-// inlines the vendored pi-subagents source). Skips when the pi CLI is absent.
+// `npm run build` first — the pi package loads dist/agent/billion-context.js, a
+// re-export of pi-native.js (which inlines the vendored pi-subagents source).
+// Skips when the pi CLI is absent.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -42,7 +43,7 @@ import { assertPortDead } from "../port-race.js";
 
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
-const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/billion-context.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO_MS = Number(process.env.E2E_TMO ?? 180_000);
 const QUIET_MS = 12_000; // sustained quiescence before declaring the scenario done
@@ -386,7 +387,7 @@ function scenarioSkip(): string | false {
   if (process.env.ACP_TEST_E2E_NATIVE !== "1") {
     return "set ACP_TEST_E2E_NATIVE=1 (real pi RPC lane + local fake upstream; deterministic, zero tokens)";
   }
-  if (!fs.existsSync(PI_NATIVE_ENTRY)) return "dist/agent/pi-native.js missing — run `npm run build` first";
+  if (!fs.existsSync(PI_NATIVE_ENTRY)) return "dist/agent/billion-context.js missing — run `npm run build` first";
   if (!piAvailable()) return `${PI_BIN} CLI not available`;
   return false;
 }

@@ -95,6 +95,35 @@ test("JSON: error field present → failed", async () => {
     assert.equal(await observeResponsesTerminalState(stream, false), "failed");
 });
 
+for (const status of ["failed", "incomplete", "cancelled"]) {
+    test(`JSON: ${status} output never permits a native-compaction rebase`, async () => {
+        const stream = sseStream([JSON.stringify({ status, output: [{ type: "compaction" }] })]);
+        assert.equal(await observeResponsesTerminalState(stream, false), "failed");
+    });
+}
+
+for (const status of ["queued", "in_progress", "future_status", null, 1]) {
+    test(`JSON: nonterminal or unknown status ${JSON.stringify(status)} stays unknown`, async () => {
+        const stream = sseStream([JSON.stringify({ status, output: [] })]);
+        assert.equal(await observeResponsesTerminalState(stream, false), "unknown");
+    });
+}
+
+test("JSON: completed output with a null error is successful", async () => {
+    const stream = sseStream([JSON.stringify({ status: "completed", error: null, output: [] })]);
+    assert.equal(await observeResponsesTerminalState(stream, false), "completed");
+});
+
+test("JSON: a completed claim carrying a real error still fails", async () => {
+    const stream = sseStream([JSON.stringify({ status: "completed", error: { message: "boom" }, output: [] })]);
+    assert.equal(await observeResponsesTerminalState(stream, false), "failed");
+});
+
+test("JSON: compact endpoint output without a status remains supported", async () => {
+    const stream = sseStream([JSON.stringify({ object: "response.compaction", output: [] })]);
+    assert.equal(await observeResponsesTerminalState(stream, false), "completed");
+});
+
 test("JSON: unparseable body → unknown", async () => {
     assert.equal(await observeResponsesTerminalState(sseStream(["<html>502 bad gateway</html>"]), false), "unknown");
 });

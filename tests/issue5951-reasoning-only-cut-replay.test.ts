@@ -81,20 +81,11 @@ function chatFinish(reason = "stop"): string {
 const DONE = "data: [DONE]\n\n";
 const ERROR_SENTINEL = "upstream_stream_truncated";
 
-/** The `meta` object riding the in-band truncation frame, or undefined when the
- *  turn completed without one. */
-function truncationMeta(body: string): Record<string, unknown> | undefined {
-    for (const frame of body.split("\n\n")) {
-        if (!frame.includes(ERROR_SENTINEL)) continue;
-        const payload = frame
-            .split("\n")
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trim())
-            .join("\n");
-        const parsed = JSON.parse(payload) as { error?: { meta?: Record<string, unknown> } };
-        return parsed.error?.meta;
-    }
-    return undefined;
+function diagFromLogs(logs: string[]): Record<string, unknown> {
+    const line = logs.find((entry) => entry.includes("upstream stream truncated"));
+    const serialized = line?.match(/; diag=(\{.*\})\]$/)?.[1];
+    if (!serialized) throw new Error("Expected truncation diagnostics in local logs");
+    return JSON.parse(serialized) as Record<string, unknown>;
 }
 
 function healedTurn(): ReadableStream<Uint8Array> {
@@ -105,6 +96,41 @@ function healedTurn(): ReadableStream<Uint8Array> {
         DONE,
     ]);
 }
+
+for (const field of ["reasoning_content", "reasoning"]) {
+    for (const cause of ["read-error", "eof"]) {
+        test(`chat pipe: ${cause} after filtered ${field} still heals without replaying an answer (#5951)`, async () => {
+            const out: string[] = [];
+            const reasoning = "Inspect \x3cacp before answering";
+            const frames = [chatChunk({ role: "assistant", [field]: reasoning })];
+            const first = cause === "eof" ? eventsStream(frames) : failedStream(frames, new Error("peer closed"));
+            let refetches = 0;
+
+            await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), () => {}, async () => {
+                refetches += 1;
+                return healedTurn();
+            }, "http://up");
+
+            const body = out.join("");
+            assert.equal(refetches, 1);
+            assert.ok(body.includes(reasoning), "the first attempt's reasoning remains byte-exact");
+            assert.ok(body.includes("healed answer"));
+            assert.ok(!body.includes(ERROR_SENTINEL));
+        });
+    }
+}
+
+test("chat pipe: pending answer markup after filtered reasoning is not replayed (#5951)", async () => {
+    const out: string[] = [];
+    const frames = [chatChunk({ reasoning_content: "Inspect \x3cacp" }), chatChunk({ content: "\x3cacp" })];
+    let refetches = 0;
+    await pipePluginChatWithStrip(failedStream(frames, new Error("peer closed")), makeRes(out), "openai", makeSession(), () => {}, async () => {
+        refetches += 1;
+        return healedTurn();
+    }, "http://up");
+    assert.equal(refetches, 0, "the reasoning-filter exception must not accept a pending answer filter");
+    assert.ok(out.join("").includes(ERROR_SENTINEL));
+});
 
 test("chat pipe: a read error after reasoning-only output re-issues once (#5951)", async () => {
     const out: string[] = [];
@@ -225,16 +251,16 @@ test("chat pipe: the reasoning-only replay shares the single re-issue budget (#5
         refetches += 1;
         // The retry is cut in the same place: the budget is already spent, so the
         // host gets the truncation signal rather than a second re-issue.
-        return Promise.resolve(failedStream([chatChunk({ role: "assistant", reasoning_content: "reasoning-c" })], new Error("upstream socket reset mid-stream")));
+        return Promise.resolve(failedStream([chatChunk({ role: "assistant", reasoning_content: "\x3cacp retry" })], new Error("upstream socket reset mid-stream")));
     };
-    const first = failedStream([chatChunk({ role: "assistant", reasoning_content: "reasoning-a" })], new Error("upstream socket reset mid-stream"));
+    const first = failedStream([chatChunk({ role: "assistant", reasoning_content: "\x3cacp first" })], new Error("upstream socket reset mid-stream"));
 
     await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (m) => logs.push(m), refetch, "http://up");
 
     const body = out.join("");
     assert.equal(refetches, 1, "one re-issue per request, shared with the zero-byte path");
     assert.ok(body.includes(ERROR_SENTINEL));
-    assert.equal(truncationMeta(body)?.["retryZeroByteCutSpent"], true);
+    assert.equal(diagFromLogs(logs)["retryZeroByteCutSpent"], true);
 });
 
 test("chat pipe: a cut that is not replayed names the read error in the diag (#5951)", async () => {
@@ -247,8 +273,92 @@ test("chat pipe: a cut that is not replayed names the read error in the diag (#5
 
     await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (m) => logs.push(m), undefined, "http://up");
 
-    const meta = truncationMeta(out.join(""));
-    assert.ok(meta, "the truncation frame carries a diag");
-    assert.equal(meta["cause"], "read-error");
-    assert.equal(meta["readError"], "Error: upstream socket reset mid-stream");
+    const diag = diagFromLogs(logs);
+    assert.equal(diag["cause"], "read-error");
+    assert.equal(diag["readError"], "Error: upstream socket reset mid-stream");
+});
+
+test("chat pipe: a cut refused for its answer text names that clause in the diag (#5951)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    const first = failedStream(
+        [chatChunk({ role: "assistant", reasoning_content: "reasoning-a" }), chatChunk({ content: "partial answer" })],
+        new Error("upstream socket reset mid-stream"),
+    );
+
+    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), () => Promise.resolve(healedTurn()), "http://up");
+
+    const replay = diagFromLogs(logs)["replay"] as Record<string, unknown> | undefined;
+    assert.ok(replay, "a refused cut carries the predicate's inputs");
+    assert.equal(replay["replayAvailable"], true, "the refetch was there, so only the predicate refused");
+    assert.equal(replay["sawThinking"], true);
+    assert.equal(replay["blocksForwarded"], 0);
+    assert.equal(replay["openStreams"], 0);
+    assert.equal(replay["answerProseChars"], "partial answer".length, "the delivered answer text is the flag that refused it");
+});
+
+test("chat pipe: a cut refused for a started tool call names that clause in the diag (#5951)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    const first = failedStream(
+        [
+            chatChunk({ role: "assistant", reasoning_content: "reasoning-a" }),
+            chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "read_file", arguments: '{"pa' } }] }),
+        ],
+        new Error("upstream socket reset mid-stream"),
+    );
+
+    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), () => Promise.resolve(healedTurn()), "http://up");
+
+    const replay = diagFromLogs(logs)["replay"] as Record<string, unknown> | undefined;
+    assert.ok(replay);
+    assert.equal(replay["sawToolUse"], true, "the started tool call is why the replay was refused");
+    assert.ok((replay["proseChars"] as number) > 0, "the partial argument the client already holds is counted too");
+});
+
+test("chat pipe: a pipe with no refetch reports the replay as unavailable (#5951)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    const first = failedStream([chatChunk({ role: "assistant", reasoning_content: "reasoning-a" })], new Error("upstream socket reset mid-stream"));
+
+    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), undefined, "http://up");
+
+    const replay = diagFromLogs(logs)["replay"] as Record<string, unknown> | undefined;
+    assert.ok(replay);
+    assert.equal(replay["replayAvailable"], false);
+    assert.equal(replay["sawThinking"], true, "the reasoning-only shape is visible even where no replay door exists");
+});
+
+test("chat pipe: the host owning truncation recovery suppresses the replay (#5951)", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(healedTurn());
+    };
+    const first = failedStream([chatChunk({ role: "assistant", reasoning_content: "reasoning-a" })], new Error("upstream socket reset mid-stream"));
+
+    await pipePluginChatWithStrip(first, makeRes(out), "openai", makeSession(), (line) => logs.push(line), refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+
+    const body = out.join("");
+    assert.equal(refetches, 0, "the host's own recovery owns the single retry budget");
+    assert.ok(body.includes(ERROR_SENTINEL), "the host is told the cut happened, so its own retry can run");
+    assert.equal(body.split("reasoning-a").length - 1, 1, "the partial reasoning the client already holds is still forwarded");
+    const replay = diagFromLogs(logs)["replay"] as Record<string, unknown> | undefined;
+    assert.equal(replay?.["replayAvailable"], true, "the diag still records that a replay door existed");
+});
+
+test("chat pipe: the host owning recovery also suppresses the zero-byte replay (#5951)", async () => {
+    const out: string[] = [];
+    let refetches = 0;
+    const refetch = (): Promise<ReadableStream<Uint8Array> | null> => {
+        refetches += 1;
+        return Promise.resolve(healedTurn());
+    };
+
+    await pipePluginChatWithStrip(eventsStream([]), makeRes(out), "openai", makeSession(), () => {}, refetch, "http://up", undefined, undefined, undefined, undefined, undefined, true);
+
+    assert.equal(refetches, 0, "a cut with no client-visible output is still the host's to recover");
+    assert.ok(out.join("").includes(ERROR_SENTINEL));
 });
