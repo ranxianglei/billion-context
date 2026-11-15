@@ -112,7 +112,10 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 const results = [];
 // Recorder spawned for the in-flight lane; killed from main()'s catch when a
 // lane aborts before its own teardown (2026-11-14 leak fix).
-let activeRec = null;
+// Recorder handle for the in-flight lane(s) (lane -> handle), killed from
+// main()'s catch when a lane aborts before its own teardown. A Map because
+// lanes run concurrently (2026-11-15 parallel gate).
+const activeRec = new Map();
 function record(lane, name, ok, note) {
   results.push({ lane, name, ok, note });
   console.log(`${ok ? "PASS" : "FAIL"} [${lane}] ${name}${note ? ` — ${note}` : ""}`);
@@ -296,7 +299,7 @@ async function runLane(agent) {
     stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
     detached: true,
   });
-  activeRec = rec;
+  activeRec.set(agent, rec);
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -633,7 +636,7 @@ async function runLane(agent) {
   const unknownTool = (logTxt.match(/unknown tool "[^"]+"/gi) || []).slice(0, 3);
   record(agent, "no unknown-tool loops", unknownTool.length === 0, unknownTool.join(" | "));
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
-  activeRec = null;
+  activeRec.delete(agent);
 }
 
 async function main() {
@@ -642,10 +645,24 @@ async function main() {
     console.log("restart-lanes: skipped (GATE_SKIP=r)");
     process.exit(0);
   }
-  for (const agent of AGENTS) {
-    console.log(`\n===== restart lane: ${agent} =====`);
-    try { await runLane(agent); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); try { if (activeRec) process.kill(-activeRec.pid, "SIGKILL"); } catch {} activeRec = null; }
+  // Lanes are fully independent (own recorder port, XDG dirs, per-agent
+  // port zone) and each agent is one model consumer at a time, so they run
+  // concurrently (GATE_R_CONC, default 2 = both agents at once).
+  const PAR = Math.max(1, parseInt(process.env.GATE_R_CONC || "2", 10));
+  const laneQueue = [...AGENTS];
+  async function laneWorker() {
+    while (laneQueue.length > 0) {
+      const agent = laneQueue.shift();
+      console.log(`\n===== restart lane: ${agent} =====`);
+      try { await runLane(agent); } catch (e) {
+        record(agent, "lane", false, String(e).slice(0, 400));
+        const r = activeRec.get(agent);
+        try { if (r) process.kill(-r.pid, "SIGKILL"); } catch {}
+        activeRec.delete(agent);
+      }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(PAR, laneQueue.length) }, () => laneWorker()));
   const failed = results.filter((r) => !r.ok);
   console.log(`\nrestart-lanes: ${results.length - failed.length}/${results.length} passed`);
   process.exit(failed.length ? 1 : 0);
