@@ -31,6 +31,13 @@ export type RewriteCtx = {
      *  `messages` view has pruned/hidden content (so block anchors can't
      *  resolve) pass the unpruned log here (billion-context-pi#195). */
     compressMessages?: CoreMessage[];
+    /** View the block-content ORIGINAL cache is built from (applyRanges).
+     *  Defaults to the fold view (`compressMessages ?? messages`, #6834).
+     *  The plugin-tool lane passes the TAGGED processed view the model saw:
+     *  its fold view is the raw client history WITHOUT ACP tags, and a full
+     *  decompress must return originals with citable refs (session-
+     *  continuity proof). */
+    blockContentSource?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     debug?: boolean;
@@ -1622,6 +1629,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // ctx.compressMessages also covers the EMPTY-view fold that recovered
         // its source from the unified store (#3982); collecting against []
         // would leave those blocks uncached for later decompress/range-restore.
+        // EXCEPTION: the plugin-tool lane (plugin.ts) passes
+        // ctx.blockContentSource — the TAGGED processed view the model saw —
+        // because its fold view (mem.original) is the raw client history
+        // WITHOUT ACP tags, and a full decompress must return originals with
+        // citable refs (session-continuity proof).
         // Storing the text here lets decompress work in later rounds where
         // neither live view carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
@@ -1629,7 +1641,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
-        const contentSource = ctx.compressMessages ?? ctx.messages;
+        const contentSource = ctx.blockContentSource ?? ctx.compressMessages ?? ctx.messages;
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
             const full = collectBlockContent(res.state, b, contentSource, { full: true });

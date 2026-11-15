@@ -240,6 +240,9 @@ export interface LoopCtx {
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
+    /** View the block-content ORIGINAL cache is built from (see
+     *  RewriteCtx.blockContentSource). */
+    blockContentSource?: CoreMessage[];
     session: Session;
     reply?: HandoffReply;
     log: (msg: string) => void;
