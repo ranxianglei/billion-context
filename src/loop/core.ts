@@ -15,7 +15,7 @@ import { maybeJudgeContinuity } from "../invariant-judge.js";
 import type { SeparatorSlot } from "../server/responses-ordering.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, releaseNudgeHold, withSessionLock, type Session } from "../session.js";
-import type { BiliMessage } from "acp-kernel/wire";
+import type { BiliMessage, GooglePart } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -322,7 +322,7 @@ export interface RequestOptions {
 // arrive instead of being re-laid out as [reasoning…, text, tool…].
 type RoundPart =
     | { kind: "reasoning"; text: string; signature: string }
-    | { kind: "text"; text: string }
+    | { kind: "text"; text: string; rawGooglePart?: GooglePart }
     | { kind: "redacted"; data: string }
     // #3158: a Gemini part whose only payload is a thoughtSignature (no text,
     // no functionCall). Recorded in stream order so a proxy-tool rebuild puts
@@ -333,7 +333,7 @@ export type ParsedStreamEvent =
     // rawHandled: the adapter carries this delta in another event's complete
     // frame (or buffers that frame until tool settlement). Keep accounting it,
     // but do not synthesize a second client frame in continuation rounds.
-    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean }
+    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean; rawGooglePart?: GooglePart }
     // round2-hold: withheld marks a reasoning PAYLOAD the adapter kept off the
     // client wire (bili-owned round ≥ 2 on a signing upstream — see
     // ParseStreamOpts.upstreamSignsThinking). It still feeds the loop's
@@ -963,8 +963,8 @@ export async function* runCompressLoop(
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         let tp = roundParts[roundParts.length - 1];
-                        if (!tp || tp.kind !== "text") {
-                            tp = { kind: "text", text: "" };
+                        if (!tp || tp.kind !== "text" || tp.rawGooglePart !== undefined || ev.rawGooglePart !== undefined) {
+                            tp = { kind: "text", text: "", ...(ev.rawGooglePart ? { rawGooglePart: ev.rawGooglePart } : {}) };
                             roundParts.push(tp);
                         }
                         tp.text += ev.delta;
@@ -1531,6 +1531,10 @@ export async function* runCompressLoop(
                             role: "assistant",
                             contentType: "text",
                             text: part.text,
+                            ...(part.rawGooglePart ? {
+                                googleThoughtSignature: part.rawGooglePart.thoughtSignature,
+                                rawGoogleParts: [part.rawGooglePart],
+                            } : {}),
                         });
                     } else if (part.kind === "standalone_signature") {
                         // #3158: put the standalone thoughtSignature back at its
