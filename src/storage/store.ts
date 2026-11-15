@@ -2225,7 +2225,7 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps, " +
                     "(SELECT COUNT(*) FROM l1_world WHERE ledger_id = ?) AS l1Entries",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
             sessions: number; conversations: number;
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
