@@ -93,6 +93,21 @@ export interface CompressionBlock {
    *  is likewise restored — instead of rejecting it as "already compressed".
    *  Optional: old persisted states lack the field, which reads as false. */
   restoredInline?: boolean;
+  /** #5765 retire: the user marked this block retired — its summary is no
+   *  longer injected into the resident view (prune skips its anchor) while its
+   *  folded messages stay covered and decompress/search keep working. The
+   *  block remains `active` (its absence from the view is intentional, so
+   *  syncBlocks must not deactivate it and orphan GC must not reap it).
+   *  acp_restore clears the flag. Optional: old persisted states lack the
+   *  field, which reads as false (never retired). */
+  retired?: boolean;
+  /** #5765 rewrite: the summary text immediately before the last acp_rewrite,
+   *  kept one step deep so a rewrite is roll-backable without re-compressing.
+   *  A further rewrite overwrites this slot (only the immediate predecessor
+   *  is retained by design). */
+  previousSummary?: string;
+  /** #5765 rewrite: Date.now() of the last acp_rewrite on this block. */
+  rewrittenAt?: number;
   durationMs?: number;
   compressCallId?: string;
   startRef?: string;
@@ -210,6 +225,14 @@ export interface AbsorbConfig {
   excludeTools: string[];
   /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
   mediaOnly?: boolean;
+}
+
+/** #5765: opt-in switch for the block-lifecycle tools (acp_retire /
+ *  acp_restore / acp_rewrite). Absent/disabled = off: the tools are not
+ *  advertised, not injected, not in the prompt, and a stray call gets a
+ *  "not enabled" receipt (host-side). */
+export interface BlockOpsConfig {
+  enabled: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -620,6 +643,9 @@ export interface Config {
   modelContextLimit: number;
   /** Instant tool-result absorption (see absorb.ts). Absent/disabled = feature off. */
   absorb?: AbsorbConfig;
+  /** #5765: block-lifecycle tools (acp_retire/acp_restore/acp_rewrite).
+   *  Absent/disabled = feature off (default). */
+  blockOps?: BlockOpsConfig;
   /** Persistent acp_rule reminders (see rules.ts). Absent/disabled = feature off. */
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */

@@ -85,7 +85,16 @@ function gifDims(b: Buffer): Dims | undefined {
 
 function bmpDims(b: Buffer): Dims | undefined {
     if (b.length < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return undefined; // "BM"
-    const w = b.readUInt32LE(18), h = Math.abs(b.readInt32LE(22));
+    // DIB size is a DWORD @14 in every variant (MS-Win32 BITMAPCOREHEADER /
+    // BITMAPINFOHEADER): CORE (=12) keeps dims as WORDs @18/20; INFO/V2-V5
+    // (>=40) use LONGs @18/22. Offsets pinned to encoder output, #6179.
+    const headerSize = b.readUInt32LE(14);
+    if (headerSize === 12) {
+        const w = b.readUInt16LE(18), h = b.readUInt16LE(20);
+        return w > 0 && h > 0 ? { w, h } : undefined;
+    }
+    if (headerSize < 40) return undefined;
+    const w = b.readInt32LE(18), h = Math.abs(b.readInt32LE(22));
     return w > 0 && h > 0 ? { w, h } : undefined;
 }
 
@@ -119,6 +128,7 @@ function jpegDims(b: Buffer): Dims | undefined {
     while (off + 4 <= b.length) {
         if (b[off] !== 0xff) { off += 1; continue; }
         const marker = b[off + 1];
+        if (marker === 0xff) { off += 1; continue; } // T.81 B.1.1.2: marker fill, not a length-bearing segment
         if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) { off += 2; continue; }
         if (marker === 0xda) break; // SOS with no SOF before it — malformed
         const segLen = b.readUInt16BE(off + 2);
@@ -224,6 +234,18 @@ function opaquePartCost(part: Record<string, unknown>, configuredCap?: number): 
     return applyCap(Math.ceil(JSON.stringify(part).length / 4), configuredCap);
 }
 
+/** Gemini tool responses carry media beside their JSON result, in parts. */
+export function* googleMediaParts(parts: unknown[]): Generator<Record<string, unknown>> {
+    for (const part of parts) {
+        if (!isObj(part)) continue;
+        yield part;
+        const response = part.functionResponse;
+        if (isObj(response) && Array.isArray(response.parts)) {
+            for (const nested of response.parts) if (isObj(nested)) yield nested;
+        }
+    }
+}
+
 export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
     if (!isObj(body)) return 0;
     let total = 0;
@@ -235,8 +257,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
         if (!Array.isArray(contents)) return 0;
         for (const c of contents) {
             if (!isObj(c) || !Array.isArray(c.parts)) continue;
-            for (const part of c.parts) {
-                if (!isObj(part)) continue;
+            for (const part of googleMediaParts(c.parts)) {
                 const inline = part.inlineData;
                 if (isObj(inline) && typeof inline.data === "string") { total += base64ImageCost(inline.data, billing, configuredCap); continue; }
                 const file = part.fileData;
@@ -349,18 +370,19 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
 }
 
 // Cheap gate: most bodies carry no images — skip the JSON parse entirely then.
-// prepared.body is bili's own compact JSON.stringify, but client raw buffers
-// may carry spaces, so probe both forms.
+// prepared.body is compact JSON.stringify; client buffers may use any JSON
+// whitespace or escape field names and discriminators with Unicode escapes.
 function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "google", s: string): boolean {
+    if (s.includes("\\u")) return true;
     // #3398: custom-shape media carries no recognizable literal — on the
     // wires where content arrays are the multi-part marker (openai/responses)
     // the array form itself is the gate; anthropic adds its two opaque block
     // types. Array-content bodies are the minority case on these wires, so the
     // extra parses stay rare (#2824's 170ms/32MiB worst case is unchanged).
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
-        : protocol === "responses" ? s.includes("input_image") || s.includes('"content":[') || s.includes('"content": [')
-        : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"') || s.includes('"content":[') || s.includes('"content": [')
-        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"');
+        : protocol === "responses" ? s.includes("input_image") || /"content"[ \t\r\n]*:[ \t\r\n]*\[/.test(s)
+        : protocol === "openai" ? s.includes("image_url") || /"type"[ \t\r\n]*:[ \t\r\n]*"file"/.test(s) || /"content"[ \t\r\n]*:[ \t\r\n]*\[/.test(s)
+        : /"type"[ \t\r\n]*:[ \t\r\n]*"(?:image|redacted_thinking|document)"/.test(s);
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
@@ -395,8 +417,7 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
         if (!Array.isArray(contents)) return 0;
         for (const c of contents) {
             if (!isObj(c) || !Array.isArray(c.parts)) continue;
-            for (const part of c.parts) {
-                if (!isObj(part)) continue;
+            for (const part of googleMediaParts(c.parts)) {
                 const inline = part.inlineData;
                 if (isObj(inline) && typeof inline.data === "string") { n += 1; continue; }
                 const file = part.fileData;

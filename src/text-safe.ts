@@ -111,3 +111,19 @@ export function scrubLoneSurrogateEscapes(text: string): string {
 export function scrubLoneSurrogatesOnWire(text: string): string {
     return scrubLoneSurrogateEscapes(scrubLoneSurrogates(text));
 }
+
+/** One bounded display line out of text this process did not write (remote
+ *  feed documents: an advisory `reason`, a release-note `summary`). Those
+ *  strings are printed inside line-oriented surfaces the MODEL reads
+ *  (acp_status sections) and inside single log lines, so a line break in the
+ *  source would start a new, unattributed line there and an unbounded length
+ *  would land in the context window as-is. Every run of whitespace and
+ *  C0/C1 control characters (CR/LF/TAB, NEL, U+2028/U+2029 included) becomes
+ *  one space; anything past `cap` code units is cut on a code-point boundary
+ *  and marked with an ellipsis. Text already inside both bounds is returned
+ *  unchanged apart from the outer trim callers did before. */
+export function boundedLine(text: string, cap: number): string {
+    const flat = text.replace(/[\s\x00-\x1f\x7f-\x9f]+/g, " ").trim();
+    if (flat.length <= cap) return flat;
+    return `${safePrefix(flat, cap - 1).trimEnd()}\u2026`;
+}
