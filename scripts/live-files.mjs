@@ -57,6 +57,9 @@ export const LIVE_FILES = [
     // both spawn the corrupt-index-child helper (unified-store cold-load
     // corruption probes, #4216/#4249 follow-ups); append-only per the note above
     "tests/storage-engine-proofs.test.ts",
+    // lock-holder CHILD process parks on a hermetic mkdtemp index.db (#2195
+    // release-gate pin); binds no ports — zone slot is a formality
+    "tests/storage-open-busy-lock.test.ts",
     "tests/web-storage-banner.test.ts",
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
@@ -139,6 +142,11 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // Heap-bounded log readers in isolated children; private files, no sockets.
+    "tests/web-logs-query.test.ts",
+    // Native-zstd absence is simulated in an isolated Node child; it binds
+    // no sockets and changes only that child's built-in module exports.
+    "tests/content-encoding-zstd.test.ts",
     // #5241 phase-0 startup-contract stakes: both spawn children — verify-attach
     // drives one child per lane (sequential await), latches drives the stderr
     // flip child. No shared ports (mock bili server + spawn stubs are listen(0)
