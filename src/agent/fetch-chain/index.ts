@@ -15,6 +15,32 @@ function isOwnChain(v: unknown): boolean {
     return typeof v === "function" && Object.prototype.hasOwnProperty.call(v, CHAIN_MARKER);
 }
 
+/** #6829: pi-web-access's marker for "a proxy fetch is installed". 0.45.x set
+ *  `__piWebAccessProxyFetch` unconditionally; from 0.46.0 it only propagates
+ *  that flag when the wrapped fetch already has it, and marks its own wrapper
+ *  with `__piWebAccessSharedProxyFetch` instead. Recognize BOTH names, or the
+ *  #2435 coexistence branch is unreachable for 0.46+ installs. */
+function isPiWebAccessFetch(v: unknown): boolean {
+    return typeof v === "function" && (Reflect.get(v, "__piWebAccessProxyFetch") === true || Reflect.get(v, "__piWebAccessSharedProxyFetch") === true);
+}
+
+/** #6829: pseudo-origin served in-process by the inline engine. Owned by
+ *  src/inline-engine.ts (`INLINE_ORIGIN`); duplicated here because the chain
+ *  module must stay free of the server graph (inline-engine pulls in
+ *  server.js, which would cycle back through the agent lanes). If the origin
+ *  ever changes, update both. */
+const INLINE_ORIGIN = "http://billion-context.inline";
+
+function fetchUrlOf(input: string | URL | Request): string | undefined {
+    try {
+        if (typeof input === "string") return input;
+        if (input instanceof URL) return input.href;
+        return input.url;
+    } catch {
+        return undefined;
+    }
+}
+
 /** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
  *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
  *  bili stops seeing model traffic (documented degradation, visible instead
@@ -147,9 +173,10 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // Windows). The depth check below is the proof of such nesting: an
         // OUR link called from within our own dispatch can only be reached
         // through a foreign wrapper that captured one of our older tops.
-        // A recognized pi-web-access link still owns proxy routing even after
-        // bili dispatched, so retain it at depth 1. Its older bili links must
-        // still be able to truncate unknown wrapper history.
+        // A recognized pi-web-access link (either marker, #6829) still owns
+        // proxy routing even after bili dispatched, so retain it at depth 1.
+        // Its older bili links must still be able to truncate unknown wrapper
+        // history.
         // ponytail: unknown wrappers retain the #1662 cutoff; preserving their
         // deeper hooks requires a shared chain protocol.
         const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -163,7 +190,15 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
-                if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);
+                if (isPiWebAccessFetch(ds)) return send(input, init);
+                // #6829: the #1662 escape must never hand pseudo-origin traffic
+                // to the oldest live anchor — billion-context.inline has no DNS
+                // record, so the request dies ENOTFOUND instead of reaching the
+                // inline engine. Route it down the chain instead: send() stamps
+                // the hop, so the inline transport link recognizes the descent
+                // (#4527) and serves it in-process.
+                const url = fetchUrlOf(input);
+                if (url !== undefined && url.startsWith(INLINE_ORIGIN)) return send(input, init);
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {
@@ -183,6 +218,12 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // Keep the install guard visible, following ds if dead-closure recovery changes it.
         Object.defineProperty(chain, "__piWebAccessProxyFetch", {
             get: () => Reflect.get(ds, "__piWebAccessProxyFetch"),
+        });
+        // #6829: forward the 0.46+ shared marker too, so pi-web-access's own
+        // install guard can see through the chain that a proxy is already in
+        // place and does not re-install on every web tool call.
+        Object.defineProperty(chain, "__piWebAccessSharedProxyFetch", {
+            get: () => Reflect.get(ds, "__piWebAccessSharedProxyFetch"),
         });
         return chain;
     };
@@ -223,7 +264,7 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // leaves; "evict" was the pre-self-heal framing and is dropped
                 // from the wording. Unknown wrappers and any LATER (repeat /
                 // abnormal) marked install keep the full diagnostic below.
-                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true;
+                const webAccess = isPiWebAccessFetch(v);
                 // Visibility (#1158): a third-party install used to be silent —
                 // log it so "un-routed by a third party" is diagnosable. Past
                 // REARM_LIMIT the WARNING stops (log spam), but the adoption
