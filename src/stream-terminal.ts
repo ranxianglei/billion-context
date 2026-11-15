@@ -4,8 +4,6 @@
 // never happened discards valid blocks (#249). "unknown" is the safe default
 // (no rebase; the next request self-heals via kernel message-id deactivation).
 
-import { finalizeSseLineEndings, normalizeSseLineEndings } from "./sse-util.js";
-
 type TerminalState = "completed" | "failed" | "unknown";
 
 const SUCCEEDED = "response.completed";
@@ -40,30 +38,43 @@ function terminalFromSseFrame(frame: string): TerminalState | null {
 async function observeSseTerminalState(stream: ReadableStream<Uint8Array>): Promise<TerminalState> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    let lineParts: string[] = [];
+    let frameLines: string[] = [];
+    let skipLeadingLf = false;
     let state: TerminalState = "unknown";
-    const consumeFrames = () => {
-        let boundary: number;
-        while ((boundary = buf.indexOf("\n\n")) >= 0) {
-            const frame = buf.slice(0, boundary);
-            buf = buf.slice(boundary + 2);
-            const next = terminalFromSseFrame(frame);
-            if (next !== null) {
-                state = next;
-                break;
+    // A response.completed event can contain the entire compacted response.
+    // Scan each decoded chunk once and join each line/frame once, rather than
+    // re-normalizing and searching an ever-growing multi-MiB prefix per chunk.
+    const consumeText = (text: string) => {
+        let start = 0;
+        for (let index = 0; index < text.length; index++) {
+            const code = text.charCodeAt(index);
+            if (skipLeadingLf) {
+                skipLeadingLf = false;
+                if (code === 10) { start = index + 1; continue; }
             }
+            if (code !== 10 && code !== 13) continue;
+            lineParts.push(text.slice(start, index));
+            const line = lineParts.join("");
+            lineParts = [];
+            if (line.length === 0) {
+                const next = terminalFromSseFrame(frameLines.join("\n"));
+                frameLines = [];
+                if (next !== null) { state = next; return; }
+            } else frameLines.push(line);
+            skipLeadingLf = code === 13;
+            start = index + 1;
         }
+        if (start < text.length) lineParts.push(text.slice(start));
     };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) {
-                buf = finalizeSseLineEndings(buf + decoder.decode());
-                consumeFrames();
+                consumeText(decoder.decode());
                 break;
             }
-            buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
-            consumeFrames();
+            consumeText(decoder.decode(value, { stream: true }));
             if (state !== "unknown") {
                 // Release this tee branch; the client branch keeps draining the source.
                 await reader.cancel().catch(() => {});
