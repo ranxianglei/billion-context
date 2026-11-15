@@ -24,12 +24,19 @@ import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type Sq
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import {
+    appendEgressSnapshot,
     appendFoldJournal,
+    egressInputHash,
+    egressLatestRow,
     foldInputHash,
+    foldJournalRows,
+    foldUnpins,
     snapL1EnvelopeRead,
     snapL1Record,
     snapR3LatchedRead,
     snapR3LatchWrite,
+    type EgressReadHit,
+    type EgressSnapshotRow,
 } from "./snap.js";
 import { parseEnvelope } from "../snapshot/identity.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
@@ -1662,6 +1669,76 @@ export class UnifiedStore {
         } catch { /* best-effort — see above */ }
     }
 
+    /** #5874 v2 (step 3): one EGRESS CUT — pin the derived stable prefix
+     *  (CAS bytes; undefined for a hash-only pin) plus the input aggregate
+     *  over the pinned id set. Supersedes the previous row (trimmed in the
+     *  same transaction, its CAS ref released). The FOLD-CROSSING gate runs
+     *  on the READ side (egressReadView): a journal row newer than this cut
+     *  that is pinned and crosses the id set degrades that round — the cut
+     *  itself never fails on fold timing.
+     *  null for an empty id set or an unpinnable aggregate (no rows at all). */
+    egressCut(sessionId: string, ids: string[], prefixJson: string | undefined, nowMs: number): EgressSnapshotRow | null {
+        if (ids.length === 0) return null;
+        const inputHash = egressInputHash(this.db, sessionId, 0, ids);
+        if (!inputHash) return null;
+        const last = this.db.prepare(
+            `SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")}) ORDER BY seq DESC LIMIT 1`,
+        ).get(sessionId, ...ids) as { msg_id: string } | undefined;
+        const lastStableId = last?.msg_id ?? ids[ids.length - 1];
+        const wm = this.db.prepare(
+            `SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")})`,
+        ).get(sessionId, ...ids) as { m: number };
+        const newRef = prefixJson != null ? this.putContent(prefixJson) : null;
+        const prev = egressLatestRow(this.db, sessionId);
+        this.db.transaction(() => {
+            const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, ids, newRef, lastStableId, nowMs);
+            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ? AND snap_seq < ?").run(sessionId, snapSeq);
+        });
+        if (prev?.prefixRef != null && prev.prefixRef !== newRef) this.releaseContent(prev.prefixRef);
+        return egressLatestRow(this.db, sessionId);
+    }
+
+    /** #5874 v2 (step 3): the egress READ — serve the newest cut row's CAS
+     *  bytes ONLY if the input aggregate re-derives identically over the
+     *  stored id set (a miss degrades the round to the live derive — never
+     *  sticky, never partial) AND no PINNED post-cut fold crosses the
+     *  prefix: an active fold that landed after the cut and whose covered
+     *  rows are all retired (pinned, summary in render) replaces the
+     *  originals with the summary, so the materialized bytes are stale;
+     *  an UNPINNED crossing fold (covered rows re-emerged live, #4390 /
+     *  rewind past the boundary) renders the originals again — the old
+     *  bytes are valid, serve them. Any fault ⇒ null (legacy derive). */
+    egressReadView(sessionId: string, _ids?: string[]): EgressReadHit | null {
+        try {
+            const row = egressLatestRow(this.db, sessionId);
+            if (!row || row.prefixRef == null) return null;
+            const recomputed = egressInputHash(this.db, sessionId, row.watermark, row.ids);
+            if (recomputed !== row.inputHash) return null;
+            const content = this.getContent(row.prefixRef);
+            if (content == null) return null;
+            const journal = foldJournalRows(this.db, sessionId);
+            if (journal.length > 0) {
+                const activeBlocks = new Set(
+                    (this.db.prepare("SELECT block_id FROM blocks WHERE session_id = ? AND active = 1").all(sessionId) as { block_id: string }[])
+                        .map((r) => r.block_id),
+                );
+                const liveRows = (this.db.prepare(
+                    "SELECT msg_id, seq FROM messages WHERE session_id = ? AND retired_at IS NULL",
+                ).all(sessionId) as Array<{ msg_id: string; seq: number }>).map((r) => ({ msgId: r.msg_id, seq: r.seq }));
+                const unpinned = foldUnpins(journal, liveRows, activeBlocks);
+                const prefixIds = new Set(row.ids);
+                for (const f of journal) {
+                    if (f.createdAt <= row.createdAt) continue; // baked into these bytes
+                    if (!activeBlocks.has(f.blockId) || unpinned.has(f.blockId)) continue;
+                    if (f.coveredIds.some((id) => prefixIds.has(id))) return null; // pinned fold crossed the prefix
+                }
+            }
+            return { prefix: content, lastStableId: row.lastStableId, inputHash: row.inputHash };
+        } catch {
+            return null; // never-fail: the round falls back to the live derive
+        }
+    }
+
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
      *  Never throws into the ingest path — a failed checkpoint just leaves the
      *  WAL longer than ideal until the next tick. */
@@ -2110,6 +2187,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
@@ -2353,6 +2431,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);

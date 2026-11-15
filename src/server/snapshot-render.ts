@@ -192,11 +192,12 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     //       bytes never ride the outbound and are never read. A covered row
     //       with corrupt bytes therefore cannot degrade the render.
     let rows: ViewRow[] = [];
+    let bySeq = new Map<number, ViewRow>();
     try {
         const light = store.unifiedMessageIdRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
         if (!light || light.length === 0 || !seqs || seqs.length === 0) return { reason: "transcript-empty" };
-        const bySeq = new Map<number, ViewRow>();
+        bySeq = new Map<number, ViewRow>();
         for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId });
         for (const seq of seqs) {
             const v = bySeq.get(seq);
@@ -207,6 +208,38 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         return { reason: "transcript-error" };
     }
     if (rows.length === 0) return { reason: "transcript-empty" };
+
+    // #5874 v2 step 3: the egress prefix cache. egressReadView already ran
+    // the input-hash re-derive and the fold-crossing gate inside the store;
+    // a hit carries the materialized stable rows, and its bytes are spliced
+    // into the identity rows so the content load below only reads what the
+    // cache does not cover. ANY mismatch (unparseable payload, a cached row
+    // that retired, an id drift) leaves egressMaxSeq at -1 and the lane
+    // derives every byte live — never a partial splice, never a guess.
+    let egressMaxSeq = -1;
+    {
+        let hit: import("../storage/snap.js").EgressReadHit | null = null;
+        try { hit = store.egressReadView(session.id); } catch { hit = null; }
+        if (hit) {
+            try {
+                const cached = JSON.parse(hit.prefix) as ViewRow[];
+                if (Array.isArray(cached) && cached.length > 0 && cached.every((c) => c && typeof c.seq === "number" && typeof c.msgId === "string")) {
+                    let ok = true;
+                    for (const c of cached) {
+                        const live = bySeq.get((c as ViewRow).seq);
+                        if (!live || live.msgId !== (c as ViewRow).msgId) { ok = false; break; }
+                    }
+                    const tail = cached[cached.length - 1] as ViewRow;
+                    if (ok && tail.msgId === hit.lastStableId) {
+                        for (const c of cached) {
+                            const live = bySeq.get((c as ViewRow).seq);
+                            if (live) { live.msg = (c as ViewRow).msg; egressMaxSeq = Math.max(egressMaxSeq, (c as ViewRow).seq); }
+                        }
+                    }
+                }
+            } catch { egressMaxSeq = -1; }
+        }
+    }
 
     // #4052: the covered-region map must exist BEFORE the chain — the signature
     // fallback must not offer covered rows as bind targets (see the bySig filter
@@ -241,7 +274,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     // only for the uncovered window. Row-unparsable now guards UNCOVERED
     // bytes only — covered corruption cannot degrade the render.
     try {
-        const intervals: [number, number][] = [];
+        const intervals: [number, number][] = egressMaxSeq >= 0 ? [[0, egressMaxSeq]] : [];
         {
             const sorted = [...coveredSeqUnion].sort((a, b) => a - b);
             for (const seq of sorted) {
@@ -288,6 +321,30 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         }
     } catch {
         return { reason: "transcript-error" };
+    }
+    // #5874 v2 step 3: re-materialize when the stable watermark advanced past
+    // the cached cut (a new fold landed) or the cache missed this turn. The
+    // cached rows are exactly the rendered rows (parseRow's output) up to the
+    // newest active fold's covered region — bytes the fresh derive would have
+    // produced in this state, so the read side is byte-equivalent. Best-
+    // effort: a fault degrades to no cut (the next turn retries).
+    {
+        const newest = activeBlocks[activeBlocks.length - 1];
+        const seed = blockSeeds.find((s) => s.blockId === newest.blockId);
+        const wm = seed && seed.seqs.size > 0 ? Math.max(...seed.seqs) : -1;
+        if (wm > egressMaxSeq) {
+            try {
+                const prefixRows = rows.filter((r) => r.seq <= wm);
+                if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {
+                    store.egressCut(
+                        session.id,
+                        prefixRows.map((r) => r.msgId),
+                        JSON.stringify(prefixRows),
+                        Date.now(),
+                    );
+                }
+            } catch { /* never fail the render for a cache write */ }
+        }
     }
     return { rows, blockSeeds, coveredSeqUnion };
 }

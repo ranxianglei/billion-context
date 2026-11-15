@@ -394,7 +394,34 @@ CREATE TABLE IF NOT EXISTS fold_journal (
     PRIMARY KEY (session_id, jseq),
     UNIQUE (session_id, block_id)
 );
-`; 
+`;
+
+/** #5874 v2 (pure-incremental, step 3): the EGRESS SNAPSHOT — one append-
+ *  only row per CUT pinning the derived stable prefix as a content-CAS
+ *  reference (prefix_ref, nullable for a hash-only pin) plus the input
+ *  aggregate (input_hash) it was derived from, the pinned id set (ids_json —
+ *  the read re-derives the aggregate over exactly those ids, ALL generations,
+ *  so a content rewrite or new-generation row degrades the round) and the
+ *  prefix boundary (watermark = max live seq of the pinned set at cut time).
+ *  watermark is informational for the cut-point choice, NOT a hash scope
+ *  (see src/storage/snap.ts egressInputHash). Only the newest row per
+ *  session is ever served; superseded rows are trimmed by the writer in the
+ *  same transaction (releasing their CAS refs) — the table is a cache, not a
+ *  journal. Probed separately from fold_journal (same probe-first discipline,
+ *  no version bump). */
+const EGRESS_SNAPSHOT_DDL = `-- #5874 v2: cut-point materialized egress prefix (CAS-referenced, verify-then-serve).
+CREATE TABLE IF NOT EXISTS egress_snapshot (
+    session_id TEXT NOT NULL,
+    snap_seq INTEGER NOT NULL,
+    watermark INTEGER NOT NULL,
+    input_hash TEXT NOT NULL,
+    ids_json TEXT NOT NULL,
+    prefix_ref TEXT,
+    last_stable_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, snap_seq)
+);
+`;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
@@ -427,6 +454,13 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fold_journal'")
         .get();
     if (!hasFoldJournal) db.exec(FOLD_JOURNAL_DDL);
+    // #5874 v2 (step 3): the egress snapshot is its OWN probe (a db written
+    // between the fold_journal and egress_snapshot landings picks it up here;
+    // fresh dbs pass through — same discipline, no version bump).
+    const hasEgressSnapshot = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_snapshot'")
+        .get();
+    if (!hasEgressSnapshot) db.exec(EGRESS_SNAPSHOT_DDL);
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev

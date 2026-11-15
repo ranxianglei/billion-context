@@ -2504,6 +2504,31 @@ export class SessionStore {
         this.liveShadow().snapR3Latch(sessionId);
     }
 
+    // #5874 v2 step 3: the egress prefix cache (see UnifiedStore.egressCut).
+    // Never throws — a cache fault degrades the round to the live derive.
+
+    /** Materialize the derived stable prefix into the CAS (cache trim +
+     *  previous-ref release in one tx). null when unavailable/no rows. */
+    egressCut(sessionId: string, ids: string[], prefixJson: string | undefined, nowMs: number): import("./storage/snap.js").EgressSnapshotRow | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().egressCut(sessionId, ids, prefixJson, nowMs);
+        } catch {
+            return null;
+        }
+    }
+
+    /** The verified egress prefix (hash re-derive + fold-crossing gate
+     *  inside the store). null on ANY miss ⇒ the caller derives live. */
+    egressReadView(sessionId: string): import("./storage/snap.js").EgressReadHit | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().egressReadView(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check

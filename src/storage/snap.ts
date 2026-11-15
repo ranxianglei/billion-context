@@ -323,3 +323,112 @@ export function foldUnpins(
     }
     return unpinned;
 }
+
+// ---------------------------------------------------------------------------
+// Egress snapshot — the cut-point materialized prefix (#5874 v2, step 3).
+//
+// One append-only row per CUT (fold boundary / every-K / user-message
+// boundary). A row pins the DERIVED stable prefix (D-lane buildView output
+// up to the seam, anchors included) as a content-CAS reference plus the input
+// aggregate the prefix was derived from. The egress read re-derives the
+// aggregate BEFORE trusting the bytes; a mismatch degrades the round to the
+// live derive (never sticky, never partial).
+//
+// Aggregate semantics (egressInputHash): with a NON-EMPTY id set it covers
+// ALL generations of exactly those ids (no retired filter, no seq bound) —
+// a content rewrite or a new-generation row (edit/rewind re-issue) moves it,
+// while a pure retirement (the fold's own sweep) or TAIL growth beyond the
+// prefix does not. With an EMPTY id set it covers the live rows at
+// seq <= watermark (the "whole prefix window" probe). The fold-CROSSING gate
+// (a fold that lands after the cut covering a prefix id re-renders the
+// bytes) is applied by the lane, which alone knows fold timing relative to
+// the cut — the store primitive here verifies bytes only.
+// ---------------------------------------------------------------------------
+
+export interface EgressSnapshotRow {
+    sessionId: string;
+    snapSeq: number;
+    watermark: number;
+    inputHash: string;
+    ids: string[];
+    prefixRef: string | null;
+    lastStableId: string;
+    createdAt: number;
+}
+
+/** A verified egress read hit: the materialized stable-prefix bytes (CAS
+ *  content, derived view — NOT client wire bytes) plus the seam id and the
+ *  input aggregate they were derived from. */
+export interface EgressReadHit {
+    prefix: string;
+    lastStableId: string;
+    inputHash: string;
+}
+
+/** The egress input aggregate over the pinned id set (all generations, seq
+ *  order) — or, with an empty id set, over the live rows at seq <= watermark.
+ *  null when no rows exist at all. */
+export function egressInputHash(
+    db: DbLike,
+    sessionId: string,
+    watermark: number,
+    ids: readonly string[],
+): string | null {
+    const rows: Array<{ seq: number; msg_id: string; content_hash: string }> = ids.length === 0
+        ? (db.prepare(
+            `SELECT seq, msg_id, content_hash FROM messages
+             WHERE session_id = ? AND retired_at IS NULL AND seq <= ?
+             ORDER BY seq`,
+        ).all(sessionId, watermark) as Array<{ seq: number; msg_id: string; content_hash: string }>)
+        : (db.prepare(
+            `SELECT seq, msg_id, content_hash FROM messages
+             WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(",")})
+             ORDER BY seq`,
+        ).all(sessionId, ...ids) as Array<{ seq: number; msg_id: string; content_hash: string }>);
+    if (rows.length === 0) return null;
+    const h = createHash("sha256");
+    for (const r of rows) h.update(`${r.seq}\u0000${r.msg_id}\u0000${r.content_hash}\n`);
+    return h.digest("hex");
+}
+
+/** Append one egress cut row (snap_seq is per-session, max+1). Returns the
+ *  new snap_seq. */
+export function appendEgressSnapshot(
+    db: DbLike,
+    sessionId: string,
+    watermark: number,
+    inputHash: string,
+    ids: readonly string[],
+    prefixRef: string | null,
+    lastStableId: string,
+    createdAt: number,
+): number {
+    const row = db.prepare("SELECT COALESCE(MAX(snap_seq), 0) AS m FROM egress_snapshot WHERE session_id = ?")
+        .get(sessionId) as { m: number };
+    const snapSeq = row.m + 1;
+    db.prepare(
+        `INSERT INTO egress_snapshot (session_id, snap_seq, watermark, input_hash, ids_json, prefix_ref, last_stable_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(sessionId, snapSeq, watermark, inputHash, JSON.stringify(ids), prefixRef, lastStableId, createdAt);
+    return snapSeq;
+}
+
+/** The newest egress cut row for a session (the only one a read can serve),
+ *  or null. */
+export function egressLatestRow(db: DbLike, sessionId: string): EgressSnapshotRow | null {
+    const row = db.prepare(
+        `SELECT session_id, snap_seq, watermark, input_hash, ids_json, prefix_ref, last_stable_id, created_at
+         FROM egress_snapshot WHERE session_id = ? ORDER BY snap_seq DESC LIMIT 1`,
+    ).get(sessionId) as { session_id: string; snap_seq: number; watermark: number; input_hash: string; ids_json: string; prefix_ref: string | null; last_stable_id: string; created_at: number } | undefined;
+    if (!row) return null;
+    return {
+        sessionId: row.session_id,
+        snapSeq: row.snap_seq,
+        watermark: row.watermark,
+        inputHash: row.input_hash,
+        ids: JSON.parse(row.ids_json) as string[],
+        prefixRef: row.prefix_ref,
+        lastStableId: row.last_stable_id,
+        createdAt: row.created_at,
+    };
+}
