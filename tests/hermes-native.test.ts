@@ -498,7 +498,45 @@ elif SCENARIO.startswith("gate-"):
     envvar = {"opt-out": "BILI_NATIVE_HERMES", "plugin-0": "BILLION_CONTEXT_PLUGIN", "launcher-proxy": "BILLION_CONTEXT_PROXY"}[flag]
     os.environ[envvar] = "http://127.0.0.1:1" if envvar == "BILLION_CONTEXT_PROXY" else "0"
     mod.register(ctx)
+elif SCENARIO == "sidecar-resolution":
+    # 'hermes plugins install' never writes bili.json, so the dist still has to resolve: bili.json ->
+    # the plugin's own node_modules (a host-managed copy) -> 'bili' on PATH (the reference lane).
+    saved_path = os.environ.get("PATH", "")
+    out["resolution"] = {}
+    install_sidecar(False)
+    out["resolution"]["sidecar"] = mod.load_sidecar()
+    os.remove(os.path.join(PLUGIN_DIR, "bili.json"))
+    bundled_dir = os.path.join(PLUGIN_DIR, "node_modules", "billion-context", "dist")
+    os.makedirs(bundled_dir)
+    with open(os.path.join(bundled_dir, "index.js"), "wb") as f:
+        f.write(b"// host-managed copy\n")
+    out["resolution"]["bundled"] = mod.load_sidecar()
+    shutil.rmtree(os.path.join(PLUGIN_DIR, "node_modules"))
+    bindir = os.path.join(BASE, "stub-bin")
+    os.makedirs(bindir)
+    global_entry = os.path.join(BASE, "global-bili.js")
+    with open(global_entry, "wb") as f:
+        f.write(b"// global install entry point\n")
+    os.chmod(global_entry, 0o755)  # shutil.which() only reports executable files
+    if os.name == "nt":
+        # shutil.which() needs a PATHEXT suffix on Windows, and a suffixed stub resolves to a .cmd,
+        # not the .js entry point — so the PATH lane is exercised on POSIX only.
+        out["resolution"]["path"] = "skipped"
+    else:
+        os.symlink(global_entry, os.path.join(bindir, "bili"))
+        os.environ["PATH"] = bindir + os.pathsep + saved_path
+        out["resolution"]["path"] = mod.load_sidecar()
+    empty_bin = os.path.join(BASE, "empty-bin")
+    os.makedirs(empty_bin)
+    os.environ["PATH"] = empty_bin
+    out["resolution"]["none"] = mod.load_sidecar()
+    os.environ["PATH"] = saved_path
 elif SCENARIO == "no-sidecar":
+    # Nothing resolvable at all: no sidecar, no host-managed copy, no 'bili' on PATH (a dev machine
+    # usually has one, so the empty PATH keeps this scenario deterministic everywhere).
+    empty_bin = os.path.join(BASE, "empty-bin")
+    os.makedirs(empty_bin)
+    os.environ["PATH"] = empty_bin
     mod.register(ctx)
 elif SCENARIO == "spawn-fail":
     install_sidecar(True)
@@ -708,7 +746,15 @@ elif SCENARIO == "output-limits":
     while len(RECORDED["runtime_info"]) < 7 and __import__("time").monotonic() < deadline:
         __import__("time").sleep(0.01)
 elif SCENARIO.startswith("attach"):
-    install_sidecar(False)
+    if SCENARIO == "attach-no-sidecar":
+        # 'hermes plugins install' ships no bili.json: the host-managed copy is what resolution finds.
+        # The stub manifest comes from ATTACH, so this dist is resolved and never executed.
+        bundled_dir = os.path.join(PLUGIN_DIR, "node_modules", "billion-context", "dist")
+        os.makedirs(bundled_dir)
+        with open(os.path.join(bundled_dir, "index.js"), "wb") as f:
+            f.write(b"// host-managed copy\n")
+    else:
+        install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
     os.makedirs(ca_dir, exist_ok=True)
@@ -1154,6 +1200,7 @@ interface DriverOut {
     toolsets: string[];
     middlewares: string[];
     hooks: string[];
+    resolution?: Record<string, { script: string; node: string } | null | string>;
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
     env_http_proxy?: string | null;
@@ -1665,6 +1712,40 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
+    });
+
+    // `hermes plugins install <repo>/hermes-plugin` never writes bili.json, so resolution must fall
+    // through to a host-managed node_modules copy and then to the global install's `bili` on PATH.
+    test("no sidecar: resolves a host-managed copy or the global install before giving up", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("sidecar-resolution");
+        assert.ok(out, err);
+        const r = out!.resolution!;
+        assert.match((r.sidecar as { script: string }).script, /proxy\.js$/);
+        assert.match((r.bundled as { script: string }).script,
+            /node_modules[\\/]billion-context[\\/]dist[\\/]index\.js$/);
+        if (r.path !== "skipped") {
+            assert.match((r.path as { script: string }).script, /global-bili\.js$/);
+        }
+        assert.equal(r.none, null);
+    });
+
+    // The installer lane never writes bili.json: resolution falls through to the host-managed copy, and
+    // register() must install the tools instead of going inert.
+    test("no sidecar: a host-managed node_modules copy is enough to register the tools", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-no-sidecar");
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.deepEqual(out!.middlewares, ["llm_request"]);
+        assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
     });
 
     test("spawn failure: child dies -> inert, env untouched, starting marker cleaned up", () => {
