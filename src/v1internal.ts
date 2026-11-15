@@ -111,7 +111,7 @@ export function isV1BackgroundSideRequest(meta: Record<string, unknown>, inner: 
 // (two consecutive same-role entries are rejected by Gemini). A pathological
 // single giant anchor that alone exceeds the budget is returned alone with
 // fits=false so the caller blocks it (413) instead of forwarding a guaranteed 400.
-export interface V1TruncateResult {
+interface V1TruncateResult {
     contents: Array<Record<string, unknown>>;
     truncated: boolean;
     fits: boolean;
