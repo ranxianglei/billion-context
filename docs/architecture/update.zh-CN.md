@@ -17,7 +17,7 @@
 
 ## 工作机制
 
-**自更新器（`update.ts`）。** 默认每 3 分钟查一次 npm 注册表（`CHECK_INTERVAL_MS`，旋钮可覆盖 #2030；每进程首查忽略节流）。更新是 tarball 解包，**不是** `npm install`——用户机器上永不跑 lifecycle 脚本。全局安装就地换包。插件模式里注入的代码跑在**宿主进程**中：新代码要宿主重启才生效；注入坏掉则模型流量退化为不压缩直连——面板 banner 与 `/__bili/status` 的 `attribution` 可见（#3581）。
+**自更新器（`update.ts`）。** 默认每 3 分钟查一次 npm 注册表（`CHECK_INTERVAL_MS`，旋钮可覆盖 #2030；每进程首查忽略节流）。更新是 tarball 解包，**不是** `npm install`——用户机器上永不跑 lifecycle 脚本。全局安装就地换包。插件模式里注入的代码跑在**宿主进程**中：新代码要宿主重启才生效；注入坏掉则模型流量退化为不压缩直连——面板 banner 与 `/__bili/status` 的 `attribution` 可见（#3581）。版本固定：本地 pin（`bili pin [duration]`，状态在 `src/update-pin.ts`）或已装的预发布/临时构建，在有更新的 tag 通道版本时只**报告**、绝不自动安装——自动升级只在自己的 tag 通道内前进；显式 `bili update`、`bili unpin` 或 advisory 修复会解除固定（#6804）。
 
 **安装车道。** 全局（`npm i -g`，就地自更新） · 引用车道（omp/claude/codex/kimi/zcode/hermes——无拷贝、指全局 dist） · 宿主世界（dsh profile bundle、opencode/pi 树——走宿主自己的通道更新，由全局自更新驱动 + 无全局时拷贝自己的周期检查兜底，#1196） · 启动器（`bili <client>` overlay 模式：零持久拷贝）。
 
@@ -31,7 +31,7 @@
 
 ## 关键入口
 
-`src/update.ts`（更新器——承重件） · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts`（更新器——承重件） · `src/update-pin.ts` · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## 相关
 

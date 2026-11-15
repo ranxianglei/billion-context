@@ -169,7 +169,25 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <select id="up-select" class="ses-filter"></select>
 <button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
 </div>
+<!-- #6804: free-text install — any published version (master temp builds
+included); the dropdown above stays as the quick path. -->
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+<input id="up-version-input" class="field-input mono" type="text" placeholder="0.1.215 · 0.1.215-pr.202.1" spellcheck="false" style="min-width:240px">
+<button id="up-install-input" class="btn"><span data-i18n="up.install_input">${zh("up.install_input")}</span></button>
+</div>
 <p id="up-result" class="small" style="margin:0" hidden></p>
+</div></div>
+<!-- #6804: local version pin — hold the installed version; the auto-updater
+keeps checking + reporting but never installs. Temp builds are check-only
+even without a pin (the state line says so). -->
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.pin">${zh("up.pin")}</span></div><div class="card-b">
+<div id="up-pin-state" class="small dim">—</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+<select id="up-pin-duration" class="ses-filter"></select>
+<button id="up-pin" class="btn"><span data-i18n="up.pin_now">${zh("up.pin_now")}</span></button>
+<button id="up-unpin" class="btn"><span data-i18n="up.unpin">${zh("up.unpin")}</span></button>
+</div>
+<p id="up-pin-result" class="small" style="margin:0" hidden></p>
 </div></div>
 <!-- #3719 phase 2: changelog card moved here from the overview page — same
 rendering/linkify in client.js into #changelog-body (collapsed by default). -->

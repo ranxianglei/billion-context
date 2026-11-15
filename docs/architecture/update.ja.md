@@ -17,7 +17,7 @@
 
 ## 動作原理
 
-**セルフアップデータ (`update.ts`)。** デフォルトでは 3 分ごとに npm レジストリをチェックする (`CHECK_INTERVAL_MS`、ノブで上書き可能 #2030; プロセスごとの最初のチェックはスロットリングを無視する)。更新は tarball の展開であり、`npm install` ではない——ユーザーの環境ではライフサイクルスクリプトは決して実行されない。グローバルインストールはインプレースで切り替わる。プラグインモードでは、注入されたコードは HOST プロセス内に存在する: 新しいコードはホストの再起動後にのみ有効になり、壊れた注入はモデルトラフィックを非圧縮の直接通信に劣化させる——パネルのバナーと `/__bili/status` の `attribution` で確認可能 (#3581)。
+**セルフアップデータ (`update.ts`)。** デフォルトでは 3 分ごとに npm レジストリをチェックする (`CHECK_INTERVAL_MS`、ノブで上書き可能 #2030; プロセスごとの最初のチェックはスロットリングを無視する)。更新は tarball の展開であり、`npm install` ではない——ユーザーの環境ではライフサイクルスクリプトは決して実行されない。グローバルインストールはインプレースで切り替わる。プラグインモードでは、注入されたコードは HOST プロセス内に存在する: 新しいコードはホストの再起動後にのみ有効になり、壊れた注入はモデルトラフィックを非圧縮の直接通信に劣化させる——パネルのバナーと `/__bili/status` の `attribution` で確認可能 (#3581)。バージョン固定: ローカルピン (`bili pin [duration]`、状態は `src/update-pin.ts`) またはインストール済みのプレリリース/一時ビルドは、新しい tag チャンネルのバージョンがあっても*報告されるのみ*で自動インストールされない——自動アップグレードは自分の tag チャンネル内でのみ進む。明示的な `bili update`、`bili unpin`、またはアドバイザリ修復で解除される (#6804)。
 
 **インストールレーン。** グローバル (`npm i -g`、自己更新) · 参照レーン (omp/claude/codex/kimi/zcode/hermes — コピーなし、グローバル dist を指す) · ホストワールド (dsh プロファイルバンドル、opencode/pi ツリー — ホスト自身のチャネルを通じて更新され、グローバル自己更新と、グローバルが実行されない場合のコピー自身の定期的チェックによって駆動される、#1196) · ランチャー (`bili <client>` オーバーレイモード: 永続コピーゼロ)。
 
@@ -31,7 +31,7 @@
 
 ## 主要エントリ
 
-`src/update.ts` (アップデータ — 重要) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts` (アップデータ — 重要) · `src/update-pin.ts` · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## 関連
 
