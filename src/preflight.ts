@@ -457,6 +457,13 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // binary-carrying fields (base64 image data, data-URLs) are excluded because
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
+// #6844: DSH attaches model-hidden provider metadata as top-level body fields
+// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory) — documented
+// as staying outside model input. The measured-body walks price the model
+// input, so these fields are excluded at the top level only; the same key
+// nested inside messages[] is model-visible content and still counts.
+const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
 // fails closed.
 // #5932: `image_url` is the responses-lane/OpenAI data-URL shape (the blob sits
 // DIRECTLY under that key) — counting it as text once made a 40 MB screenshot
@@ -467,7 +474,14 @@ const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "ima
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (!MODEL_HIDDEN_BODY_KEYS.has(k)) pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -505,6 +519,7 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (MODEL_HIDDEN_BODY_KEYS.has(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
