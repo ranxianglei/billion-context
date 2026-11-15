@@ -1338,6 +1338,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (await pi.setModel(fullModel) === false) {
                     logHostEvent("warn", "[native-client]", "bili-plugin(pi): could not disable native Anthropic threads for this session (model authentication unavailable)");
                 }
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(pi): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
             } finally {
                 if (ctx.model === fullModel && thinking !== undefined && pi.getThinkingLevel?.() !== thinking) pi.setThinkingLevel?.(thinking);
             }

@@ -106,8 +106,8 @@ test("Pi routed Anthropic models use full requests without changing registry mod
         await emit("model_select", ctx);
         assert.equal(ctx.model, registryModel, "refused selection leaves the active model untouched");
         selection = "reject";
-        await assert.rejects(emit("model_select", ctx), /host selection failed/);
-        assert.equal(ctx.model, registryModel);
+        await emit("model_select", ctx);
+        assert.equal(ctx.model, registryModel, "rejected selection is caught and leaves the active model untouched");
         selection = "redirect";
         await emit("model_select", ctx);
         assert.equal(ctx.model?.api, "openai-responses");
