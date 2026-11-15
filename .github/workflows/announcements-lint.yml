@@ -1,0 +1,38 @@
+name: Announcements Lint
+
+# #5548 P3: validate announcements/remote.json with the SAME module the client
+# parses it with, so a bad feed entry is rejected pre-merge instead of
+# failing open (silently invisible) on every install after the push.
+on:
+  pull_request:
+    paths:
+      - "announcements/**"
+      - "scripts/validate-remote-announcements.ts"
+      - "src/remote-notices.ts"
+  push:
+    branches: [master]
+    paths:
+      - "announcements/**"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      # #2092: the validator transitively imports src modules that resolve
+      # acp-kernel to its built dist (file:./kernel link, inlined at bundle
+      # time) — same prerequisite as the main test matrix in ci.yml.
+      - name: Build in-repo kernel
+        run: npm --prefix kernel run build
+
+      - name: Validate remote announcement feed
+        run: node --import tsx scripts/validate-remote-announcements.ts

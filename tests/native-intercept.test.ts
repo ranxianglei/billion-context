@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, MAX_SILENT_DIRECT_BODY_BYTES, noteRoutedOrigin, observeRoutedOrigin, setDeclaredModelEndpoints, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { parseModelEndpointPatterns } from "../src/model-endpoints.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 import * as pfChannel from "../src/agent/pf-channel.ts";
 
@@ -24,6 +25,21 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
+test("isModelApiUrl: Google model ids may carry a namespace (#5593)", () => {
+    // A provider prefix relayed verbatim in the path (omp `google-generative-ai`
+    // provider pointing at a gateway: `antigravity/gemini-3.8-flash`) and a
+    // gateway route (`group/hard`) are model ids, not path segments.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/group/hard:generateContent"), true);
+    assert.equal(isModelApiUrl("https://gw.example.com/v1beta/models/llmgateway-providers/google-vertex/gemini-3.8-flash:countTokens"), true);
+    // The namespace does not widen what counts as a model call: discovery lists
+    // and methods with no pipeline still go direct.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:predict"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash"), false);
 });
 
 test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
@@ -58,6 +74,26 @@ test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:predict"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-pro:generatecontent"), false);
     assert.equal(isModelApiUrl("http://127.0.0.1:18787/bili/http://127.0.0.1:8317/v1beta/models/m:generateContent"), false);
+});
+
+test("isModelApiUrl: declared modelEndpointPatterns claim custom paths (#1295)", () => {
+    _resetForTest();
+    try {
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate"), false);
+        setDeclaredModelEndpoints(parseModelEndpointPatterns([
+            { match: "https://api.commandcode.ai/alpha/generate", wire: "commandcode" },
+            { match: "http://127.0.0.1:8199/custom", wire: "openai" },
+        ]));
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate"), true);
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate?x=1"), true);
+        assert.equal(isModelApiUrl("https://api.commandcode.ai/alpha/generate2"), false);
+        assert.equal(isModelApiUrl("http://127.0.0.1:8199/custom/run"), true);
+        // declarations never override bili's own control-plane exclusions
+        assert.equal(isModelApiUrl("http://127.0.0.1:36485/bili/http://127.0.0.1:8199/custom"), false);
+        assert.equal(isModelApiUrl("http://127.0.0.1:36485/__bili/plugin/manifest"), false);
+    } finally {
+        _resetForTest();
+    }
 });
 
 function fakeFetch(sink: string[]) {
@@ -116,6 +152,15 @@ test("install: rewrites Google-wire model URLs through the proxy (#2493)", async
         assert.equal(res.status, 200);
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40006/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"]);
+});
+
+test("install: rewrites namespaced Google-wire model URLs through the proxy (#5593)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40008", ready: Promise.resolve("http://127.0.0.1:40008") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40008/bili/http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"]);
 });
 
 test("install: already-routed Google-wire /bili/ request gets plugin headers re-stamped (#2493)", async () => {
@@ -537,6 +582,340 @@ test("install: a same-instance re-activation outranks an older activation's late
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "http://127.0.0.1:40903/bili/http://127.0.0.1:8199/v1/messages");
     assert.equal(calls[0].headers["x-bili-test"], "same");
+});
+
+test("install: a missing live-state slot refuses an oversized direct model request (#5405)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40905", ready: Promise.resolve("http://127.0.0.1:40905") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Simulate the exact #3394 teardown shape: the slot is empty but the
+        // shared fetch chain is still installed.
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+        // Negative rows: small model POSTs, GETs, and non-model URLs keep the
+        // clean by-design direct path while the slot is empty.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages")).status, 200);
+        assert.equal((await globalThis.fetch("https://example.com/upload", { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) })).status, 200);
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages", "http://127.0.0.1:8199/v1/messages", "https://example.com/upload"], "only the oversized model POST is refused");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot body under the byte cap but over the model window is refused locally (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // A lane that stamps the model window onto every proxied request — this
+        // is the only window source the empty-slot branch can ever see (#4894).
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40921",
+            ready: Promise.resolve("http://127.0.0.1:40921"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "1000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Steady state: one live request rides the proxy. This single route is
+        // what stamps the process-level last-known window the doom check relies on.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal(sink[0], "http://127.0.0.1:40921/bili/http://127.0.0.1:8199/v1/messages");
+        // Now the slot empties (dsh deactivate/reactivate, #2082/#2101). A 4 MiB
+        // body is under the 8 MiB byte cap yet prices at ~1.19M tokens against the
+        // 1M floor window — the OLD code sent it raw upstream (provider 400); the
+        // fix refuses it locally with the same retryable 422 class as the byte cap.
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string; retryable: boolean } };
+        assert.match(j.error?.message ?? "", /token/, "refusal names the token-window basis, not the byte ceiling");
+        assert.match(j.error?.message ?? "", /1,000,000/, "names the resolved window");
+        assert.equal(j.error?.retryable, true, "still a retryable policy refusal");
+        // Negative row: a body that fits under the known window still rides direct
+        // while the slot is empty — the guard must not over-refuse in-window work.
+        const inWindow = "x".repeat(1 * 1024 * 1024); // 1 MiB → ~299K est tokens < 1M window
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: inWindow })).status, 200, "in-window body stays direct");
+        assert.deepEqual(sink.slice(1), ["http://127.0.0.1:8199/v1/messages"], "only the in-window send reaches the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot body over the window fails OPEN until a lane has stamped one (#5996 cold start)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // No headersFor → nothing ever stamps the last-known window → cold start.
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40922", ready: Promise.resolve("http://127.0.0.1:40922") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // Same 4 MiB shape as above: under the byte cap, over any real window —
+        // but with no window ever seen the fix must NOT invent a refusal; it fails
+        // open to today's byte-cap-only semantics (direct 200).
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 200, "cold start fails open: no window → byte-cap-only direct path");
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot refusal names a >=1M resolved window verbatim (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // Resolved window at/above the 1M floor: declaredWindow === window, so
+        // the refusal must name it as THE window (the short form), not as a
+        // floored local bar — the sibling fallbackOversizeRefusal distinction.
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40923",
+            ready: Promise.resolve("http://127.0.0.1:40923"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "2000000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        liveStateSlotEffect(state)()();
+        // 7.5 MiB < 8 MiB cap, ~2.24M est tokens > the 2M resolved window.
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(7.5 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string } };
+        assert.match(j.error?.message ?? "", /2,000,000/, "names the resolved window");
+        assert.doesNotMatch(j.error?.message ?? "", /local bar/, "a >=1M resolved window is named as the window, not the floored bar");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("the silent-direct ceiling defaults to 8 MiB and honors BILI_SILENT_DIRECT_MAX_MB (#5405 follow-up, #5826 review)", async () => {
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        assert.equal(MAX_SILENT_DIRECT_BODY_BYTES, 8 * 1024 * 1024, "default ceiling is 8 MiB");
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40913", ready: Promise.resolve("http://127.0.0.1:40913") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // A ~3 MiB body (the shape of an in-window image-heavy session) died
+        // at the old 2 MiB default with a retryable 422 that could never
+        // succeed; under the new default it rides the clean direct path.
+        const imgish = "x".repeat(3 * 1024 * 1024);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "3 MiB passes the 8 MiB default");
+        // The knob lowers the ceiling for installs that want the tight guard.
+        process.env.BILI_SILENT_DIRECT_MAX_MB = "1";
+        const refused = await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish });
+        assert.equal(refused.status, 422);
+        assert.equal(refused.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        // Invalid values fall back to the default (tiny body passes again).
+        for (const bad of ["abc", "0", "-2", ""]) {
+            process.env.BILI_SILENT_DIRECT_MAX_MB = bad;
+            assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        }
+        delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "default restored");
+        assert.deepEqual(
+            sink.filter((u) => u.includes("chat/completions")),
+            ["http://127.0.0.1:8199/v1/chat/completions", "http://127.0.0.1:8199/v1/chat/completions"],
+            "only the two default-cap 3 MiB sends pass",
+        );
+    } finally {
+        globalThis.fetch = saved;
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+        _resetForTest();
+    }
+});
+
+test("install: a missing live-state slot logs direct sends once per generation (#5405)", async () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5405-state-log-"));
+    process.env.XDG_STATE_HOME = root;
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40907", ready: Promise.resolve("http://127.0.0.1:40907") };
+        const { sink } = await withPatch(state, async (fetch) => {
+            liveStateSlotEffect(state)()();
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+            await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" });
+        });
+        assert.equal(sink.length, 2, "small direct sends still reach the provider");
+        const lines = fs.readFileSync(logFile, "utf8").split("\n");
+        const missing = lines.filter((l) => l.includes("intercept state missing"));
+        assert.equal(missing.length, 1, "one warning per live-state generation");
+        assert.match(missing[0], /\[warn\]/);
+        assert.match(missing[0], /127\.0\.0\.1:8199/);
+        assert.equal(lines.filter((l) => l.includes("live-state cleared")).length, 1);
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("install: an unattributed oversized request is refused before direct send (#5405)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40906",
+        ready: Promise.resolve("http://127.0.0.1:40906"),
+        takeoverGate: () => false,
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+    });
+    assert.deepEqual(sink, [], "the oversized request must not reach the provider");
+});
+
+test("install: a missing live-state slot refuses an oversized Request-object model body too (#5405/#5408)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40908", ready: Promise.resolve("http://127.0.0.1:40908") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const req = new Request("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) });
+        const res = await globalThis.fetch(req);
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        assert.equal(req.bodyUsed, false, "the probe reads a clone — the original stays sendable (#2496)");
+        assert.deepEqual(sink, [], "Request-carried bodies must be measured, not skipped");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: the ceiling boundary — exactly at it passes, one byte over refuses (#5405/#5408)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40909", ready: Promise.resolve("http://127.0.0.1:40909") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const url = "http://127.0.0.1:8199/v1/chat/completions";
+        const atCeiling = await globalThis.fetch(url, { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES) });
+        assert.equal(atCeiling.status, 200, "at the ceiling the by-design pass-through holds");
+        const over = await globalThis.fetch(url, { method: "POST", body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) });
+        assert.equal(over.status, 422);
+        assert.deepEqual(sink, [url], "only the under-ceiling dispatch reached the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an unreadable stream body fails open when the slot is empty (#5405/#5408)", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new Uint8Array(MAX_SILENT_DIRECT_BODY_BYTES + 1));
+            controller.close();
+        },
+    });
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40910", ready: Promise.resolve("http://127.0.0.1:40910") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: stream });
+        assert.equal(res.status, 200, "never a false refusal from missing data");
+        assert.equal(sink.length, 1);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: incident shape — declared window 262144 with a ~3 MiB body is refused by the ceiling, not the floored-out doom math (#5405/#5408)", async () => {
+    // The #4079 floor makes the doom bar max(262144, 1_000_000) tokens ≈ 4 MB
+    // of bytes/4 reach; a 3 MiB body sails past it even though it exceeds the
+    // declared window by ~3.7×. That is how the 975K-token field shape would
+    // have slipped the gate path too.
+    // The #5826 release review raised the DEFAULT ceiling to 8 MiB (owner
+    // ruling: media-blind raw bytes killed in-window image sessions), and at
+    // 8 MiB no body can sit between the ceiling and the 4 MB doom bar — so
+    // this isolation pin sets the knob back to 2 MiB (which also proves the
+    // knob takes effect on the unattributed arm).
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    process.env.BILI_SILENT_DIRECT_MAX_MB = "2";
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40911",
+        ready: Promise.resolve("http://127.0.0.1:40911"),
+        takeoverGate: () => false,
+    };
+    try {
+        const { sink } = await withPatch(state, async (fetch) => {
+            const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+                method: "POST",
+                headers: { "x-bili-plugin-context-window": "262144" },
+                body: "d".repeat(3 * 1024 * 1024),
+            });
+            assert.equal(res.status, 422);
+            assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
+        });
+        assert.deepEqual(sink, []);
+    } finally {
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+    }
+});
+
+test("install: degraded proxy-down direct sends keep window-math-only behavior — the ceiling does not apply (#5405/#5408)", async () => {
+    // Scoping pin: non-degraded callers only. With no window source the doom
+    // math is disarmed and #4079/#4516 say fail open — a known large window on
+    // those paths can genuinely fit a big body (#4894 per-request resolution).
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const { sink, result } = await withPatch(state, async (fetch) => {
+        return fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "e".repeat(3 * 1024 * 1024) });
+    });
+    assert.equal(result.status, 200, "degraded direct send unchanged when the doom math is disarmed");
+    assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/chat/completions"]);
+});
+
+test("install: a restored lane body over the ceiling is refused even if the original request was small (#5405/#5408)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40912",
+        ready: Promise.resolve("http://127.0.0.1:40912"),
+        takeoverGate: () => false,
+        prepareDirectSend: async () => ({ outcome: "restored", body: "f".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1) }),
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "{}" });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+    });
+    assert.deepEqual(sink, [], "what goes out is the RESTORED body — measure that, not the original");
 });
 
 test("install: the latest activation's own teardown clears the slot to clean direct (#3394)", async () => {
@@ -1609,13 +1988,18 @@ test("#2592/#2709: unattributed raw-URL POST without the marker still sends dire
     assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
 });
 
-test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+test("#2592/#2709/#5686: marker-decisive compaction POST with dead proxy refuses LOCALLY instead of falling open", async () => {
+    // Pre-#5686 this case fell open to a direct send — exactly the leak
+    // window that let dsh checkpoints land under bili's feet (#5517 cluster).
+    // The decisive marker + no usable proxy combination now refuses with a
+    // protocol-shaped 422; nothing reaches the upstream provider.
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
     const { sink } = await withPatch(state, async (fetch) => {
         const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
-        assert.equal(res.status, 200);
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "dsh-compaction-refused");
     });
-    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+    assert.deepEqual(sink, [], "no upstream fetch — local refusal only");
 });
 
 test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {
@@ -1651,4 +2035,257 @@ test("#2592/#2709: Request-object input with the marker diverts without disturbi
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/https://api.anthropic.com/v1/messages"]);
     assert.equal(req.bodyUsed, false, "the original Request stays sendable (#2496) — the sniff probed a clone");
+});
+
+// #4566: a host memoizes its proxy hop (Bun init.proxy from PI_PROXY_ANTHROPIC /
+// env HTTP(S)_PROXY) for its whole process life. When the lane port moves under
+// it, that stale hop must not ride bili-originated dispatches (loopback targets
+// need no hop) and must be neutralized on direct fallbacks when it points at a
+// bili-owned lane port. Positive+negative pairs per #3617 gate discipline.
+
+type HopInit = RequestInit & { proxy?: string };
+
+interface HopCall {
+    url: string;
+    init?: HopInit;
+    noProxyDuringSend?: string | undefined;
+}
+
+function makeHopRecordingFetch(sink: HopCall[]) {
+    return (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        sink.push({ url, init, noProxyDuringSend: process.env.NO_PROXY });
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+}
+
+async function withHopPatch<T>(state: NativeInterceptState, fn: (fetch: typeof globalThis.fetch) => Promise<T>): Promise<{ sink: HopCall[]; result: T }> {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: HopCall[] = [];
+    globalThis.fetch = makeHopRecordingFetch(sink);
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const result = await fn(globalThis.fetch);
+        return { sink, result };
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+}
+
+const HOP_ENV_KEYS = ["PI_PROXY", "PI_PROXY_ANTHROPIC", "BILLION_CONTEXT_PROXY", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"];
+
+async function withHopEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+    const saved = new Map<string, string | undefined>();
+    for (const k of HOP_ENV_KEYS) saved.set(k, process.env[k]);
+    try {
+        for (const [k, v] of Object.entries(vars)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+        return await fn();
+    } finally {
+        for (const [k, v] of saved) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    }
+}
+
+test("#4566: rewrite drops the host's stale hop — loopback proxy origin needs no hop", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41001", ready: Promise.resolve("http://127.0.0.1:41001") };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41001/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
+});
+
+test("#4566: self branch drops the host's stale hop", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41002", ready: Promise.resolve("http://127.0.0.1:41002") };
+    const stale: HopInit = { proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:41002/bili/http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41002/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the self dispatch");
+});
+
+test("#4566: reroute after respawn drops the stale hop on both sends", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:41003",
+        ready: Promise.resolve("http://127.0.0.1:41003"),
+        attach: true,
+        respawn: () => {
+            state.origin = "http://127.0.0.1:41009";
+            state.ready = Promise.resolve("http://127.0.0.1:41009");
+            return Promise.resolve("http://127.0.0.1:41009");
+        },
+    };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const calls: Array<{ url: string; init?: HopInit }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push({ url, init });
+        if (url.startsWith("http://127.0.0.1:41003/")) throw new TypeError("fetch failed");
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("http://127.0.0.1:41003/bili/http://127.0.0.1:8199/v1/messages", { proxy: "http://127.0.0.1:18788" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.deepEqual(calls.map((c) => c.url), [
+        "http://127.0.0.1:41003/bili/http://127.0.0.1:8199/v1/messages",
+        "http://127.0.0.1:41009/bili/http://127.0.0.1:8199/v1/messages",
+    ]);
+    for (const c of calls) assert.ok(!("proxy" in (c.init ?? {})), `stale hop must not ride ${c.url}`);
+});
+
+test("#4566: fallback drops an init.proxy that points at a bili-owned lane port", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const owned: HopInit = { method: "POST", proxy: "http://127.0.0.1:18791" };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", owned);
+            assert.equal(res.status, 200);
+        });
+        assert.deepEqual(sink.map((c) => c.url), ["https://api.anthropic.com/v1/messages"]);
+        assert.ok(!("proxy" in (sink[0].init ?? {})), "bili-owned stale hop dropped from the direct dispatch");
+    });
+});
+
+test("#4566 negative: fallback keeps the user's own non-bili hop untouched", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const userHop: HopInit = { method: "POST", proxy: "http://user-proxy.example:3128" };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://user-proxy.example:3128" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", userHop);
+            assert.equal(res.status, 200);
+        });
+        assert.equal(sink[0].init?.proxy, "http://user-proxy.example:3128", "a user-chosen hop is never bili's to drop");
+        assert.equal(sink[0].noProxyDuringSend, undefined, "a user-owned env hop must not arm NO_PROXY");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "env restored after the test");
+});
+
+test("#4566: fallback neutralizes a bili-owned env hop with a scoped NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.ok((sink[0].noProxyDuringSend ?? "").includes("api.anthropic.com"), "target host exempted while the send is in flight");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored exactly once the last hold releases");
+});
+
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+    for (let i = 0; i < 500; i++) {
+        if (cond()) return;
+        await new Promise((r) => setTimeout(r, 1));
+    }
+    assert.fail(`timed out waiting for ${what}`);
+}
+
+test("#4566: NO_PROXY holds refcount concurrent fallbacks and restore the base value exactly", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791", NO_PROXY: "base.example" }, async () => {
+        const sink: HopCall[] = [];
+        let releaseAll: () => void = () => {};
+        const gate = new Promise<void>((r) => { releaseAll = r; });
+        globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+            const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+            sink.push({ url, init, noProxyDuringSend: process.env.NO_PROXY });
+            await gate;
+            return new Response("{}", { status: 200 });
+        }) as typeof fetch;
+        try {
+            assert.equal(installNativeFetchIntercept(state), true);
+            const p1 = (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("https://one.invalid/v1/messages", { method: "POST" });
+            await waitFor(() => sink.length === 1, "first fallback to reach the underlying send");
+            const p2 = (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("https://two.invalid/v1/messages", { method: "POST" });
+            await waitFor(() => sink.length === 2, "second fallback to reach the underlying send");
+            assert.ok((sink[1].noProxyDuringSend ?? "").includes("one.invalid") && (sink[1].noProxyDuringSend ?? "").includes("two.invalid"), "both hosts held while both sends are in flight");
+            releaseAll();
+            await Promise.all([p1, p2]);
+            assert.equal(process.env.NO_PROXY, "base.example", "pre-existing NO_PROXY base restored verbatim");
+        } finally {
+            releaseAll();
+            globalThis.fetch = saved;
+            _resetForTest();
+        }
+    });
+});
+
+test("#4566: rewrite retry after a transient blip drops the stale hop too", async () => {
+    let failures = 0;
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:41004",
+        ready: Promise.resolve("http://127.0.0.1:41004"),
+        respawn: () => {
+            state.ready = Promise.resolve("http://127.0.0.1:41004");
+            return Promise.resolve("http://127.0.0.1:41004");
+        },
+    };
+    const sink: HopCall[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: HopInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        if (failures < 1) {
+            failures += 1;
+            sink.push({ url, init });
+            throw new TypeError("fetch failed");
+        }
+        return makeHopRecordingFetch(sink)(input, init);
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        const res = await (globalThis.fetch as unknown as (u: string, i?: HopInit) => Promise<Response>)("http://127.0.0.1:8199/v1/messages", { method: "POST", proxy: "http://127.0.0.1:18788" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.equal(sink.length, 2, "failed first send + successful retry");
+    for (const c of sink) assert.ok(!("proxy" in (c.init ?? {})), `stale hop must not ride ${c.url}`);
+});
+
+// #3617 gate-direction completion for #4566: the loopback strip gate also has
+// a keep direction (a hop must RIDE when the final target is NOT loopback —
+// remote bili instances, e.g. container networking), and the dsh-compaction
+// divert site carries the same strip as the other loopback sites.
+
+test("#4566 negative: a non-loopback bili origin keeps the host's own hop", async () => {
+    const state: NativeInterceptState = { origin: "http://bili-host.example:41006", ready: Promise.resolve("http://bili-host.example:41006") };
+    const hop: HopInit = { method: "POST", proxy: "http://corp-proxy.example:3128" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.anthropic.com/v1/messages", hop);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://bili-host.example:41006/bili/https://api.anthropic.com/v1/messages"]);
+    assert.equal(sink[0].init?.proxy, "http://corp-proxy.example:3128", "only loopback targets are hopless — a remote bili origin keeps the host's proxy posture");
+});
+
+test("#4566: dsh-compaction divert drops the stale hop like the other loopback sites", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41007", ready: Promise.resolve("http://127.0.0.1:41007"), takeoverGate: () => false };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788", body: dshCompactionEnvelope() };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41007/bili/https://api.deepseek.com/v1/chat/completions"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale hop must not ride the diverted dispatch");
 });

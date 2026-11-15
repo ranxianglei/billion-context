@@ -72,7 +72,9 @@ function open(label: string): Handle {
     const dir = mkdtempSync(path.join(tmpdir(), `bili-clone-ref-${label}-`));
     const dbPath = path.join(dir, "index.db");
     const store = UnifiedStore.open(dbPath);
-    const raw = openSqliteDatabase(dbPath, "node:sqlite");
+    // Engine unpinned on purpose: the store above opened this file through
+    // auto-detect, and bun has no node:sqlite to pin.
+    const raw = openSqliteDatabase(dbPath);
     const q = raw.db as unknown as { prepare(sql: string): { get(...a: unknown[]): unknown; run(...a: unknown[]): unknown }; close?(): void };
     return {
         dir,

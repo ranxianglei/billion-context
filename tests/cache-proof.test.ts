@@ -113,6 +113,14 @@ const NOTE_MARKERS: string[] = [
     "If you compress, fold the ranges you keep in ONE call",
     "Only use IDs from visible messages above",
     "[TIER ",
+    // #5555 CI triage: the compact ref-refresh line (kernel emitCompress
+    // statusLine, appended as a dedicated trailing user element on every
+    // wire) is the same volatile-trailer design as the banner above; without
+    // declaring it, any phase where TWO consecutive requests each carry its
+    // own refresh line breaks positional alignment on the growth pair
+    // between them (observed once prompt byte counts shifted the nudge one
+    // turn earlier).
+    "[ACP status:",
 ];
 const THRESHOLD = 64 * 1024; // high enough that no fold can fire before MIN_FOLD_T
 const MODEL_A = "gpt-proof-a";

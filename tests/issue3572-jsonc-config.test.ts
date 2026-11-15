@@ -36,7 +36,7 @@ function pointAt(name: string): string {
 
 test("#3572: a config copied from the docs (JSONC with // comments) parses fully", () => {
     const f = pointAt("doc-example.json");
-    // Mirrors CONFIGURATION.zh-CN.md's quickstart block plus the exact keys the
+    // Mirrors docs/configuration.zh-CN.md's quickstart block plus the exact keys the
     // reporter said were silently dropped before the fix.
     const content = [
         "// ~/.config/billion-context/billion-context.json",

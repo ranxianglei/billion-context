@@ -44,6 +44,10 @@ interface RequestOptions {
      *  loop's RequestOptions.resign (loop/core.ts): invoked with the outgoing
      *  headers and the final round body right before egress. */
     resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** #6003 phase 2: user egress-transform pipeline hook — runs after the round
+     *  body is built and before resign so the signature covers shipped bytes.
+     *  undefined when unconfigured (exact no-op). */
+    egress?: (body: string | Buffer) => Promise<string | Buffer>;
 }
 
 interface FunctionCallAccumulator {
@@ -213,7 +217,10 @@ export async function compressLoopResponsesJson(
         // #1999 carrier concern does not apply here: this re-request is built
         // from the RAW client input, which never contains kernel carriers.
         requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
-        const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        let roundBody: string | Buffer = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        // #6003 phase 2: user egress-transform pipeline before the re-sign so the
+        // signature covers the shipped bytes.
+        if (requestOptions.egress) roundBody = await requestOptions.egress(roundBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",

@@ -113,16 +113,24 @@ export function viewFromParsed(parsed: unknown): FileView | null {
     const savedAt = num(top.savedAt ?? rec.savedAt);
     if (savedAt === null || savedAt <= 0) return null;
     const state = asRecord(rec.state);
+    if (rec.state !== undefined && state === null) return null;
+    if (state?.blocks !== undefined && !Array.isArray(state.blocks)) return null;
     const blocks = Array.isArray(state?.blocks) ? (state!.blocks as unknown[]) : [];
     // Any block — active OR inactive — or any stored fold content means the
     // session was compressed at some point: its summaries cannot be rebuilt
     // losslessly from a client re-send, so the file is never GC-eligible.
     const blockContents = asRecord(rec.blockContents);
+    if (rec.blockContents !== undefined && blockContents === null) return null;
     const everCompressed = blocks.length > 0 || (blockContents !== null && Object.keys(blockContents).length > 0);
     const stats = asRecord(rec.stats);
-    const contextTokens = num(stats?.contextTokens ?? rec.contextTokens) ?? 0;
+    if (rec.stats !== undefined && stats === null) return null;
     const metadata = asRecord(rec.metadata);
-    const rawInputTokens = num(metadata?.rawInputTokens);
+    const contextValue = stats?.contextTokens ?? rec.contextTokens;
+    const rawValue = metadata?.rawInputTokens;
+    if ([contextValue, rawValue].some((value) => value !== undefined && value !== null
+        && (typeof value !== "number" || !Number.isFinite(value) || value < 0))) return null;
+    const contextTokens = num(contextValue) ?? 0;
+    const rawInputTokens = num(rawValue);
     const id = typeof top.id === "string" ? top.id
         : typeof rec.id === "string" ? rec.id
             : null;
@@ -143,7 +151,8 @@ export function contentStoreTokens(parsed: unknown): number | null {
     if (!byHash || !byRef) return null;
     let tokens = 0;
     for (const text of Object.values(byHash)) {
-        if (typeof text === "string") tokens += defaultCountTokens(text);
+        if (typeof text !== "string") return null;
+        tokens += defaultCountTokens(text);
     }
     return tokens;
 }
@@ -169,6 +178,31 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
         }
     }
     return out;
+}
+
+/** Preserve arbitrary basename suffixes, including legacy cross-namespace names.
+ *  Build only when a companion needs matching, and retain disk-walk probe order. */
+function sessionSuffixLookup(files: string[]): (stem: string) => string[] {
+    let index: Array<{ reversed: string; file: string; order: number }> | undefined;
+    const reverse = (name: string): string => name.split("").reverse().join("");
+    return (stem) => {
+        if (!index) {
+            index = files.map((file, order) => ({ reversed: reverse(path.basename(file)), file, order }));
+            index.sort((a, b) => a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : 0);
+        }
+        const prefix = reverse(stem + ".json");
+        let low = 0;
+        let high = index.length;
+        while (low < high) {
+            const middle = low + Math.floor((high - low) / 2);
+            if (index[middle].reversed < prefix) low = middle + 1;
+            else high = middle;
+        }
+        const matches: typeof index = [];
+        for (let i = low; i < index.length && index[i].reversed.startsWith(prefix); i++) matches.push(index[i]);
+        matches.sort((a, b) => a.order - b.order);
+        return matches.map((entry) => entry.file);
+    };
 }
 
 interface GcResult {
@@ -205,6 +239,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (f.endsWith(companionSuffix)) companions.push(f);
         else sessionFiles.push(f);
     }
+    const matchingSessions = sessionSuffixLookup(sessionFiles);
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
     for (const file of sessionFiles) {
@@ -307,9 +342,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of matchingSessions(stem)) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -361,12 +395,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of matchingSessions(stem)) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;

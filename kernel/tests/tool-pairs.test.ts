@@ -99,7 +99,7 @@ describe("adjustBoundariesForToolPairs", () => {
     assert.deepEqual(result, { startIndex: 0, endIndex: 2 });
   });
 
-  it("stop-at-first-gap: stops after finding match then hitting gap", () => {
+  it("duplicate callId widens to its extremes (host re-echoed result, #5751)", () => {
     const messages = [
       textMsg("a"),
       toolCall("b", "call1"),
@@ -108,17 +108,17 @@ describe("adjustBoundariesForToolPairs", () => {
       toolResult("e", "call1"),
     ];
     const result = adjustBoundariesForToolPairs(0, 1, messages);
-    assert.deepEqual(result, { startIndex: 0, endIndex: 2 });
+    assert.deepEqual(result, { startIndex: 0, endIndex: 4 });
   });
 
-  it("does not pull result beyond maxScan distance", () => {
+  it("pulls the mate in regardless of distance (#5751)", () => {
     const messages: CoreMessage[] = [toolCall("a", "call1")];
     for (let i = 0; i < 25; i++) {
       messages.push(textMsg(`gap${i}`));
     }
     messages.push(toolResult("result", "call1"));
-    const result = adjustBoundariesForToolPairs(0, 0, messages, 5);
-    assert.deepEqual(result, { startIndex: 0, endIndex: 0 });
+    const result = adjustBoundariesForToolPairs(0, 0, messages);
+    assert.deepEqual(result, { startIndex: 0, endIndex: 26 });
   });
 
   it("handles multiple pairs in range", () => {

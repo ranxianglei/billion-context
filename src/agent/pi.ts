@@ -14,7 +14,7 @@ import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
-import { wirePiSubagents } from "./pi-subagents.js";
+import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
 import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
@@ -860,6 +860,32 @@ export function __stashPiIncrementalOriginalForTests(conversationId: string, pay
     stashPiIncrementalOriginal(conversationId, payload);
 }
 
+// #4894 (pi lane): the declared context window of the session's CURRENT model,
+// recorded on every before_provider_headers event. The shared oversize arm in
+// directSendOrRefuse (native-intercept.ts) prefers the stamped
+// x-bili-plugin-context-window header — but this lane stamps that header only
+// on the proxy branch, so a request that finds NO live proxy (respawn failed /
+// spawn budget missed) carried none and the arm stayed disarmed in exactly the
+// state where an uncompressed egress is likeliest to blow the window: the raw
+// history then rode straight to the provider and came back as "input exceeds
+// the context window", unrecoverable while the proxy stayed down. Recorded
+// BEFORE the proxy-readiness early return below for the same reason.
+// `undefined` means UNKNOWN (no ctx.model / no window configured) and the arm
+// then fails open rather than guessing a window for this request.
+let piDeclaredWindow: number | undefined;
+
+/** #4894: window reader the native intercept arms as declaredWindowForDirect
+ *  (see pi-native.ts). Process-scoped: pi dispatches model requests
+ *  sequentially per session and subagents run in their own processes. */
+export function piDeclaredWindowForDirect(): number | undefined {
+    return piDeclaredWindow;
+}
+
+/** Test hook: forget the recorded window (fixtures share one process). */
+export function _resetPiDeclaredWindowForTest(): void {
+    piDeclaredWindow = undefined;
+}
+
 /** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
  *  it on its NativeInterceptState). A body that IS an incremental envelope
  *  was swapped by maybeIncrementalTurn → restore the stashed original
@@ -1102,7 +1128,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 return box;
             });
         }
+        const piCommands = piCommandsEnabled();
         if (typeof pi.registerCommand === "function") {
+          if (piCommands.has("acp")) {
             pi.registerCommand("acp", {
                 description: "Show ACP context-compression status for this session",
                 handler: async (_args, ctx) => {
@@ -1166,6 +1194,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // already has the acp_cache tool; this command shows humans the identical report
             // (both paths hit handleAcpCache on the proxy). Launcher mode and native mode both
             // load this factory (see pi-native.ts), so one registration covers both.
+          }
+          if (piCommands.has("acp-cache")) {
             pi.registerCommand("acp-cache", {
                 description: "Prompt-cache reconciliation for this session (same report as the acp_cache tool). Usage: /acp-cache [full]",
                 handler: async (args, ctx) => {
@@ -1217,6 +1247,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // all via bare `clear` (extra words after clear are recorded, never wiped —
             // a typo must not destroy every rule). Launcher mode and native mode both
             // load this factory (see pi-native.ts), so one registration covers both.
+          }
+          if (piCommands.has("acp-rule")) {
             pi.registerCommand("acp-rule", {
                 description: "Persistent rules for this session (same ops as the acp_rule tool). Usage: /acp-rule [text to record] | /acp-rule remove <id> | /acp-rule clear",
                 handler: async (args, ctx) => {
@@ -1283,9 +1315,31 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     notify(text, "info");
                 },
             });
+          }
         }
+        // Await tool registration in before_agent_start so cold-start native
+        // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
+        // active tool loadout and <codemode_catalog> system prompt. Without this,
+        // session_start's unawaited registerTools(..., false) can lose the race
+        // with native proxy boot, registerTools only completes later inside
+        // before_provider_headers/before_provider_request (after Turn 1's
+        // system prompt is already built), and Turn 2 emits a mid-conversation
+        // role:"system" codemode_catalog diff.
+        pi.on("before_agent_start", async (_event, ctx) => {
+            try {
+                await registerTools(pi, ctx, state, agent);
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+        });
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
+                // #4894: record this request's window FIRST — the
+                // proxy-readiness return right below is precisely the
+                // degraded direct-send path the guard measures against, so
+                // the window must not depend on the proxy being up.
+                const liveWindow = ctx.model?.contextWindow;
+                piDeclaredWindow = typeof liveWindow === "number" && Number.isFinite(liveWindow) && liveWindow > 0 ? Math.floor(liveWindow) : undefined;
                 // #1243: on the native lane the proxy origin lands via an async
                 // bootstrap that writes BILLION_CONTEXT_PROXY only after the spawn;
                 // a one-shot (-p) fires this event exactly once, inside that

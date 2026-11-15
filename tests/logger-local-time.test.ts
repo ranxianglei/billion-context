@@ -4,8 +4,21 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { logTimestamp } from "../src/logger.ts";
-import { queryLogLines } from "../src/web/logs-query.ts";
+import { queryLogFiles } from "../src/web/logs-query.ts";
 import { parseUsageLog } from "../src/acp-cache-diff.ts";
+
+/** Query lines through the real streaming reader: the engine reads files now,
+ *  so a materialized array is no longer an accepted input. */
+async function query(lines: string[], q: string, opts: { ctx: number; winSec: number; n: number }) {
+    const dir = mkdtempSync(join(tmpdir(), "bili-log-query-"));
+    try {
+        const file = join(dir, "bili.log");
+        writeFileSync(file, lines.map((l) => `${l}\n`).join(""));
+        return await queryLogFiles([file], q, opts);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
 
 test("logTimestamp: system local wall clock, no zone suffix", () => {
     const d = new Date(2026, 9, 24, 19, 19, 2, 681);
@@ -18,17 +31,17 @@ test("logTimestamp: system local wall clock, no zone suffix", () => {
     assert.equal(Date.parse(ts), d.getTime());
 });
 
-test("logs-query: window selection parses bare local stamps (and old Z stamps)", () => {
+test("logs-query: window selection parses bare local stamps (and old Z stamps)", async () => {
     const zone = new Date(2026, 9, 24, 12, 0, 0, 0);
     const local = Array.from({ length: 5 }, (_, i) => `${logTimestamp(new Date(zone.getTime() + i * 60_000))} [info] ${i === 1 ? "needle" : `noise-${i}`}`);
     // ±90s around the minute-1 hit → rows 0,1,2 (rows are one minute apart).
-    assert.deepEqual(queryLogLines(local, "needle", { ctx: 0, winSec: 90, n: 100 }).lines, local.slice(0, 3));
+    assert.deepEqual((await query(local, "needle", { ctx: 0, winSec: 90, n: 100 })).lines, local.slice(0, 3));
     // Rotated-file stamps stay Z; they must still parse into the same window.
     const legacy = ["2026-09-24T14:32:05.123Z [info] needle-a", "2026-09-24T14:32:40.000Z [info] noise-legacy", "2026-09-24T14:33:01.000Z [info] needle-b"];
-    assert.deepEqual(queryLogLines(legacy, "needle", { ctx: 0, winSec: 30, n: 100 }).lines, legacy);
+    assert.deepEqual((await query(legacy, "needle", { ctx: 0, winSec: 30, n: 100 })).lines, legacy);
 });
 
-test("logs-query: one mixed-generation file (legacy Z + bare local) stays parseable", () => {
+test("logs-query: one mixed-generation file (legacy Z + bare local) stays parseable", async () => {
     const t0 = Date.parse("2026-10-24T14:32:05.000Z");
     const rows = [
         "2026-10-24T14:32:05.000Z [info] old-gen",
@@ -39,16 +52,16 @@ test("logs-query: one mixed-generation file (legacy Z + bare local) stays parsea
     // A single log file outlives a format change: rotated Z rows and new bare
     // rows coexist, so the window must span BOTH generations while still
     // excluding the far legacy row (10 min outside ±90s).
-    assert.deepEqual(queryLogLines(rows, "needle", { ctx: 0, winSec: 90, n: 100 }).lines, rows.slice(0, 3));
+    assert.deepEqual((await query(rows, "needle", { ctx: 0, winSec: 90, n: 100 })).lines, rows.slice(0, 3));
 });
 
-test("acp-cache-diff: usage lines with a bare local stamp still parse", () => {
+test("acp-cache-diff: usage lines with a bare local stamp still parse", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-log-ts-"));
     try {
         const file = join(dir, "bili.log");
         const ts = logTimestamp(new Date(2026, 9, 24, 12, 0, 0, 0));
         writeFileSync(file, `${ts} [info] [ses_a] [acp-usage] input=1000 cached=900 (cache hit 90%)\n`);
-        const bySession = parseUsageLog(file);
+        const bySession = await parseUsageLog(file);
         assert.deepEqual(bySession.get("ses_a"), [{ ts: Date.parse(ts), input: 1000, cached: 900 }]);
     } finally {
         rmSync(dir, { recursive: true, force: true });

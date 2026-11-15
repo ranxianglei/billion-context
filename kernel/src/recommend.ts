@@ -352,10 +352,12 @@ export function buildCompressibleRanges(
       continue;
     }
 
-    // Unrecoverable media (no stored bytes — remote URL / file refs) is
-    // destroyed by folding with no restore behind it (#1188/#2609): never
-    // advertised as compressible, and a gap so no range spans it. Archivable
-    // inline images are compressible like text (#2607).
+    // Unrecoverable media (no stored bytes AND no re-access handle — since
+    // #5620 ref-based media like remote URLs / file ids is foldable, its
+    // handle riding the summary) is destroyed by folding with no restore
+    // behind it (#1188/#2609): never advertised as compressible, and a gap
+    // so no range spans it. Archivable inline images are compressible like
+    // text (#2607).
     if (hasUnrecoverableMediaPayload(msg)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;

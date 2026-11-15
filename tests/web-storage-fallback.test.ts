@@ -107,3 +107,69 @@ test("#4738 fail-open: with no unified store the pruned leaf stays an honest mis
         _resetDiskCacheForTest();
     }
 });
+
+test("#6029: leaves whose live ref was restamped onto a fresh number still hydrate from storage", async () => {
+    _resetSessionsForTest();
+    const s = getSession("restamp-msgs", { protocol: "openai" });
+    s.state = createInitialState();
+    const block = mkBlock("b1", ["rm1", "rm2", "rm3"], ["rm1", "rm2", "rm3"]);
+    s.state.blocks = [block];
+    // Seed-time state: refs are ALIGNED with position (ref_num == seq+1), exactly
+    // as ingest records them.
+    s.state.messageRefs = {
+        byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003" },
+        byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3" },
+    };
+    s.lastMessages = [
+        { id: "rm1", role: "user", contentType: "text", text: "alpha lead-in" },
+        { id: "rm2", role: "assistant", contentType: "text", text: "beta stored reply" },
+        { id: "rm3", role: "user", contentType: "text", text: "gamma follow-up" },
+    ];
+    s.blockContents = new LazyBlockContents("restamp-msgs", {}, () => null);
+
+    const dbPath = path.join(process.env.BILI_SESSIONS_DIR!, "index.db");
+    const seed = UnifiedStore.open(dbPath);
+    try {
+        seed.ingestSession(planIngest(toLegacyLike(s)));
+    } finally {
+        seed.close();
+    }
+
+    // Cold-load restamp (#5196 slot retirement): two movers vacated their slots so
+    // rm2/rm3 were re-parked onto FRESH HIGH numbers while their store rows keep
+    // ref_num 2/3 frozen at index time. The live ledger now disagrees with the
+    // store on every parked row — the exact divergence #6029 reports (~37% of a
+    // long session's block-detail leaves read as "gone").
+    s.state.messageRefs = {
+        byRaw: { rm1: "m00001", rm2: "m01503", rm3: "m01504", rm4: "m01505" },
+        byRef: { m00001: "rm1", m01503: "rm2", m01504: "rm3", m01505: "rm4" },
+    };
+    block.directMessageIds.push("rm4");
+    block.effectiveMessageIds.push("rm4");
+    s.lastMessages = []; // everything now needs storage hydration
+    _resetDiskCacheForTest();
+    try {
+        const d = await buildSessionDetail("restamp-msgs");
+        assert.ok(d);
+        // Parked refs m01503/m01504 must hydrate by their STABLE msg_id even
+        // though the store's ref_num column still says 2/3. Old code (ref-number
+        // join) reported both missing. m01505 was never stored → honest miss.
+        assert.deepEqual(d.blockDetails[0].directMessages, [
+            { ref: "m00001", role: "user", preview: "alpha lead-in" },
+            { ref: "m01503", role: "assistant", preview: "beta stored reply" },
+            { ref: "m01504", role: "user", preview: "gamma follow-up" },
+            { ref: "m01505", missing: true },
+        ]);
+        assert.equal(d.blockDetails[0].directMessageCount, 4);
+        assert.deepEqual(d.blockDetails[0].directMessageRefs, ["m00001", "m01503", "m01504", "m01505"]);
+
+        const parked = await buildMessageContent("restamp-msgs", "m01503");
+        assert.ok(parked.ok, "click-to-open serves a restamped message from storage by msg_id");
+        assert.equal(parked.role, "assistant");
+        assert.equal(parked.text, "beta stored reply");
+
+        assert.deepEqual(await buildMessageContent("restamp-msgs", "m01505"), { ok: false, reason: "unknown-message" });
+    } finally {
+        _resetDiskCacheForTest();
+    }
+});

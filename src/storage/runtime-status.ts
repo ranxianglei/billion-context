@@ -28,7 +28,7 @@ import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBoo
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { log as loggerLog } from "../logger.js";
 import { safePrefix, safeSuffix } from "../text-safe.js";
-import { resolvedSqliteEngineInfo } from "./driver.js";
+import { isBunRuntime, resolvedSqliteEngineInfo } from "./driver.js";
 import { sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
 
@@ -195,6 +195,17 @@ function shortenError(err: string): string {
     return `${safePrefix(oneLine, 78)}…${safeSuffix(oneLine, 78)}`;
 }
 
+/** The generic no-engine reason, phrased for the runtime that is actually short
+ *  an engine: under bun there is no node:sqlite, and a better-sqlite3 N-API
+ *  prebuild cannot be loaded by bun at all — naming the Node lever there sends
+ *  operators to fix the wrong runtime. Node keeps the historical wording. */
+function noEngineReason(): string {
+    const missing = isBunRuntime()
+        ? "bun:sqlite missing, better-sqlite3 not loadable under bun"
+        : "node:sqlite missing, better-sqlite3 not installed";
+    return `no SQLite engine available (${missing})${nodeSqliteUpgradeHint()}`;
+}
+
 function degradeReason(): string {
     // No pinned artifact serves this runtime (below every Node floor, or a Node
     // ABI no prebuild targets), so the engine is refused BEFORE any load and the
@@ -211,7 +222,7 @@ function degradeReason(): string {
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
         if (isNoEngineError(e)) {
-            return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
+            return noEngineReason();
         }
         // #4626-era owner chain (final, 2026-10-30): a provably-corrupt index
         // stays EXACTLY in place (no move, no copy, no rebuild) and bili
@@ -237,7 +248,7 @@ function degradeReason(): string {
                 break;
         }
     }
-    return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
+    return noEngineReason();
 }
 
 const COOLDOWN_CACHE_MS = 30_000;

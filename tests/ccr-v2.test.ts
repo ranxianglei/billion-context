@@ -432,8 +432,14 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
             res.writeHead(200, { "content-type": "application/json" });
             if (captured.length === 1) {
                 res.end(JSON.stringify({ id: "msg_c", type: "message", role: "assistant", model: "claude-test", content: [{ type: "tool_use", id: "tu_compress", name: "compress", input: { content: [{ startId: "m00001", endId: "m00007", summary: "Early history: messages 1-7 covered initial setup.", topic: "Early history" }] } }], stop_reason: "tool_use", usage: { input_tokens: 500, output_tokens: 20 } }));
-            } else {
+            } else if (captured.length === 2) {
+                // #5957: the turn-1 re-request — the model answers after seeing
+                // the fold receipt in the tool_result.
+                res.end(JSON.stringify({ id: "msg_t1", type: "message", role: "assistant", model: "claude-test", content: [{ type: "text", text: "TURN1 ANSWER" }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 20 } }));
+            } else if (captured.length === 3) {
                 res.end(JSON.stringify({ id: "msg_d", type: "message", role: "assistant", model: "claude-test", content: [{ type: "tool_use", id: "tu_decomp", name: "decompress", input: { blockId: "b1", startId: "m00002", endId: "m00004" } }], stop_reason: "tool_use", usage: { input_tokens: 400, output_tokens: 10 } }));
+            } else {
+                res.end(JSON.stringify({ id: "msg_t2", type: "message", role: "assistant", model: "claude-test", content: [{ type: "text", text: "FINAL ANSWER" }], stop_reason: "end_turn", usage: { input_tokens: 400, output_tokens: 10 } }));
             }
         });
     });
@@ -480,9 +486,13 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
         const body1 = await res1.text();
         assert.ok(res1.ok, `turn 1 failed: HTTP ${res1.status}: ${body1}`);
         const j1 = JSON.parse(body1) as { content: Array<{ type: string; text?: string }>; stop_reason: string };
-        // Non-stream rewrite converts the proxy tool_use into an inline text block (v1 semantics — no tool_result pair on this wire).
+        // #5957: the compress round no longer ends the client turn with the
+        // receipt — the non-stream loop re-requests and the client gets the
+        // model's real post-compress answer. The receipt itself rides the
+        // tool_result of the re-request below.
         assert.equal(j1.stop_reason, "end_turn");
-        assert.match(j1.content.map((c) => c.text ?? "").join("\n"), /\[Compressed m00001\u2013m00007/);
+        assert.match(j1.content.map((c) => c.text ?? "").join("\n"), /TURN1 ANSWER/);
+        assert.equal(j1.content.find((c) => c.type === "tool_use"), undefined, "no undeclared proxy tool_use reaches the client");
 
         const ackText = j1.content.map((c) => c.text ?? "").join("\n");
         const res2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: false, system: [sys], messages: [...baseMsgs, { role: "assistant", content: ackText }, { role: "user", content: "what was detail 2?" }] }) });
@@ -490,16 +500,27 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
         assert.ok(res2.ok, `turn 2 failed: HTTP ${res2.status}: ${body2}`);
         const j2 = JSON.parse(body2) as { content: Array<{ type: string; text?: string }> };
         const out2 = j2.content.map((c) => c.text ?? "").join("\n");
-        assert.match(out2, /restored 3 item\(s\)/, "range ack delivered inline");
-        assert.match(out2, /\[Block b1 content \u2014 m00002\u2013m00004 \u2014 3 item\(s\)\]/, "injected span rides inline after the ack");
-        assert.match(out2, /Historical detail 1\./);
-        assert.match(out2, /Historical detail 3\./);
-        assert.doesNotMatch(out2, /Historical detail 0\./);
-        assert.doesNotMatch(out2, /Historical detail 4\./);
+        assert.match(out2, /FINAL ANSWER/, "turn 2 ends on the model's real answer, not a tool receipt");
 
-        assert.match(captured[1]!, /Early history: messages 1-7 covered initial setup\./, "turn 2 outbound carries the folded view");
-        assert.match(captured[1]!, /Historical detail 0\./, "head anchor visible in turn 2 outbound");
-        for (let d = 1; d <= 6; d++) assert.doesNotMatch(captured[1]!, new RegExp(`Historical detail ${d}\\.`));
+        assert.equal(captured.length, 4, "turn1 orig + turn1 re-request + turn2 orig + turn2 re-request");
+        // Turn-1 re-request: unfolded history plus the assistant/tool_result
+        // continuation carrying the fold receipt.
+        assert.match(captured[1]!, /\[Compressed m00001\u2013m00007/, "fold receipt rides the tool_result of the turn-1 re-request");
+        assert.match(captured[1]!, /tu_compress/);
+        for (let d = 0; d <= 19; d++) assert.match(captured[1]!, new RegExp(`Historical detail ${d}\\.`), "turn-1 re-request resends the UNFOLDED history");
+        // Turn 2 outbound: the fold materializes here from server state.
+        assert.match(captured[2]!, /Early history: messages 1-7 covered initial setup\./, "turn 2 outbound carries the folded view");
+        assert.match(captured[2]!, /Historical detail 0\./, "head anchor visible in turn 2 outbound");
+        for (let d = 1; d <= 6; d++) assert.doesNotMatch(captured[2]!, new RegExp(`Historical detail ${d}\\.`));
+        // Turn-2 re-request: the range restore rides its tool_result.
+        assert.match(captured[3]!, /restored 3 item\(s\)/, "range ack rides the turn-2 re-request tool_result");
+        assert.match(captured[3]!, /\[Block b1 content \u2014 m00002\u2013m00004 \u2014 3 item\(s\)\]/, "injected span rides inline after the ack");
+        assert.match(captured[3]!, /Historical detail 1\./);
+        assert.match(captured[3]!, /Historical detail 3\./);
+        // Detail 0 appears exactly once: the folded-view head anchor in the
+        // resent history — NOT a second copy from the restored span.
+        assert.equal((captured[3]!.match(/Historical detail 0\./g) ?? []).length, 1, "restored span does not duplicate the head anchor");
+        assert.doesNotMatch(captured[3]!, /Historical detail 4\./);
 
         for (let i = 0; i < captured.length; i++) {
             assert.ok(systemAnchorHasCc(captured[i]!), `request ${i + 1}: client cache_control survives on the anchor block`);

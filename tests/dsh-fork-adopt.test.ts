@@ -30,15 +30,17 @@ const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).dige
 // ---------------------------------------------------------------------------
 
 test("forkIdentityHashOf stays byte-identical to plugin.ts forkMessageIdentityHash (#2399 parity)", () => {
-    const identityMatrix: Array<CoreMessage & { toolIsError?: boolean }> = [
+    const identityMatrix: Array<CoreMessage & { toolIsError?: boolean; thinkingSignature?: string; googleThoughtSignature?: string; rawAnthropicBlock?: { type?: unknown; data?: unknown } }> = [
         { id: "a", role: "user", contentType: "text", text: "hello" },
         { id: "b", role: "assistant", contentType: "text" },
         { id: "c", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "tc-1", text: "{}" },
         { id: "d", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "tc-1", text: "ok", toolIsError: true },
         { id: "d2", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "tc-1", text: "ok", toolIsError: false },
         { id: "e", role: "assistant", contentType: "reasoning", text: "hmm", thinkingTokens: 42 },
+        { id: "e2", role: "assistant", contentType: "reasoning", text: "signed thought", thinkingSignature: "sig-a", googleThoughtSignature: "sig-b" },
         { id: "f", role: "assistant", contentType: "text", text: "carrier", summaryOfBlockId: "b3" },
         { id: "g", role: "system", contentType: "text", text: "mid-history system" },
+        { id: "h", role: "assistant", contentType: "text", text: "[redacted_thinking]", rawAnthropicBlock: { type: "redacted_thinking", data: "cmVkYWN0ZWQtZGF0YT0=" } },
     ];
     for (const message of identityMatrix) {
         assert.equal(forkIdentityHashOf(message), forkMessageIdentityHash(message), JSON.stringify(message));

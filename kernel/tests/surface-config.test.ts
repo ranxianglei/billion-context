@@ -108,14 +108,15 @@ test("function builder honors section replace and remove", () => {
   assert.ok(
     !replaced.includes("NEVER echo, repeat, or reference these XML tags"),
   );
-  assert.ok(replaced.includes("You have five context-management tools"));
+  assert.ok(replaced.includes("You have four context-management tools"));
 
   const removed = buildCompressSystemPrompt(undefined, {
     summariesInContext: null,
   });
   assert.ok(!removed.includes("COMPRESSION SUMMARIES IN CONTEXT"));
   assert.ok(!removed.includes("MODEL-GENERATED summaries"));
-  assert.ok(removed.endsWith("Use to find what to compress next."));
+  // #5555: the tools section now closes with the per-generation refs note.
+  assert.ok(removed.includes("before compressing."));
   assert.ok(!removed.includes("next.\n\n\n"));
 
   const crossIgnored = buildCompressSystemPrompt(undefined, {

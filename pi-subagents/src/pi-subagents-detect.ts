@@ -8,7 +8,7 @@ import { CONFIG_DIR_NAME } from "./config-dir.js";
 export const DELEGATE_STAND_DOWN_MESSAGE = [
   "[billion-context-pi-subagents] pi-subagents detected — acp_delegate has been automatically disabled to avoid two overlapping sub-agent systems.",
   "pi-subagents' agents do NOT get ACP context compression by default. Run /acp-subagents (billion-context-pi) to inject compress/decompress/search_context/acp_status into its agent overrides.",
-  'To keep acp_delegate despite pi-subagents being installed, set "delegate": { "forceEnable": true } in acp.json.',
+  'To keep acp_delegate despite pi-subagents being installed, set "delegate": { "forceEnable": true } in acp.json (standalone) or "pi": { "subagents": { "forceEnable": true } } in billion-context.json (bili native lane).',
 ].join("\n");
 
 /** Resolve the pi agent config directory (e.g. ~/.pi/agent), honoring the
@@ -49,9 +49,10 @@ function extensionInstallUnder(root: string): string | null {
   return null;
 }
 
-/** Scope-split detection result (#415): a user-scope install must not silently
- *  disable acp_delegate in every project — only project-scope hits trigger the
- *  auto stand-down; user-scope-only hits get a warning log instead. */
+/** Scope-split detection result (#415): an install at either scope triggers
+ *  the auto stand-down (#5637) — a user-scope install is loaded in every
+ *  project, so leaving acp_delegate registered duplicates a live surface. The
+ *  split survives to name the winning install in the log line. */
 export interface PiSubagentsScopes {
   user: string[];
   project: string[];

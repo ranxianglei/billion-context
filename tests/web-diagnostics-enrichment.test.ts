@@ -16,14 +16,14 @@ const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_
 
 /** Pin every path-relevant env var (unset ones deleted, so homedir fallbacks
  * can never reach the real machine's dirs); restored in finally. */
-function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+async function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T | Promise<T>): Promise<T> {
     const saved: Record<string, string | undefined> = {};
     for (const k of ENV_KEYS) {
         saved[k] = process.env[k];
         if (overrides[k] !== undefined) process.env[k] = overrides[k];
         else delete process.env[k];
     }
-    try { return fn(); } finally {
+    try { return await fn(); } finally {
         for (const k of ENV_KEYS) {
             if (saved[k] === undefined) delete process.env[k];
             else process.env[k] = saved[k];
@@ -73,10 +73,10 @@ function makeFixture(): { root: string; dshHome: string; stateHome: string; conf
     return { root, dshHome, stateHome, configPath };
 }
 
-test("#3611 conflict-banner report carries versions, masked config, and evidence-log tail", (t) => {
+test("#3611 conflict-banner report carries versions, masked config, and evidence-log tail", async (t) => {
     const fx = makeFixture();
     t.after(() => rmSync(fx.root, { recursive: true, force: true }));
-    const rep = withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
+    const rep = await withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
         () => buildDiagnostics("conflict-banner"));
     const blob = rep.blob;
 
@@ -128,7 +128,7 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     assert.equal(decodeURIComponent(u.searchParams.get("body") ?? ""), blob);
 });
 
-test("#3811 config host masking is unconditional — publish boundary ignores BILI_LOG_MASK_HOSTS", (t) => {
+test("#3811 config host masking is unconditional — publish boundary ignores BILI_LOG_MASK_HOSTS", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-hostmask-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const configPath = path.join(root, "billion-context.json");
@@ -141,8 +141,8 @@ test("#3811 config host masking is unconditional — publish boundary ignores BI
     const prev = isMaskHostsEnabled();
     try {
         setMaskHostsEnabled(false);
-        const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: configPath },
-            () => buildDiagnostics()).blob;
+        const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: configPath },
+            () => buildDiagnostics())).blob;
         assert.ok(!blob.includes("open.bigmodel.cn"), "provider-table KEY host masked even with local host-masking OFF");
         assert.ok(!blob.includes("relay.internal.corp"), "upstream VALUE host masked even with local host-masking OFF");
         assert.ok(!blob.includes("proxy-corp.example.org"), "proxy host masked even with local host-masking OFF");
@@ -152,24 +152,24 @@ test("#3811 config host masking is unconditional — publish boundary ignores BI
     }
 });
 
-test("#3611 no dsh profiles → explicit note instead of an empty section", (t) => {
+test("#3611 no dsh profiles → explicit note instead of an empty section", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-empty-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const dshHome = path.join(root, "dsh");
     mkdirSync(dshHome, { recursive: true });
-    const blob = withEnv({ DSH_HOME: dshHome, XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
-        () => buildDiagnostics("conflict-banner")).blob;
+    const blob = (await withEnv({ DSH_HOME: dshHome, XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
+        () => buildDiagnostics("conflict-banner"))).blob;
     assert.ok(blob.includes("no profiles under DSH_HOME"), `expected explicit no-profiles note:\n${blob}`);
     assert.ok(blob.includes("(no config file)"), "missing config file stated honestly");
 });
 
-test("#3611 oversized config is capped with a truncation note", (t) => {
+test("#3611 oversized config is capped with a truncation note", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-big-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const configPath = path.join(root, "billion-context.json");
     writeFileSync(configPath, JSON.stringify({ compress: { prompt: "x".repeat(4000) } }));
-    const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: configPath },
-        () => buildDiagnostics()).blob;
+    const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: configPath },
+        () => buildDiagnostics())).blob;
     assert.ok(blob.includes("… (truncated,"), "truncation note present");
     const cfgSection = blob.slice(blob.indexOf("--- bili config (secrets masked) ---"));
     assert.ok(cfgSection.length < 2200, `config section bounded, got ${cfgSection.length} chars`);
@@ -180,7 +180,7 @@ test("#3611 oversized config is capped with a truncation note", (t) => {
 // tail) did two full synchronous reads. The fix pre-fetches the candidate lines
 // once and hands the SAME array to both tails — output must stay identical while
 // each tail still selects ONLY its own pattern (no cross-leak between the two).
-test("#3813 single-read: storage tail and conflict tail share one candidate set without cross-leak", (t) => {
+test("#3813 single-read: storage tail and conflict tail share one candidate set without cross-leak", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-oneread-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const stateHome = path.join(root, "state");
@@ -190,27 +190,27 @@ test("#3813 single-read: storage tail and conflict tail share one candidate set 
     writeFileSync(path.join(stateHome, "billion-context", "bili.log"), `${storageMarker}\n${conflictMarker}\n`);
     const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
     _resetCandidateLogReadsForTest();
-    const conflictBlob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    const conflictBlob = (await withEnv(env, () => buildDiagnostics("conflict-banner"))).blob;
     assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner reads the rotated pair exactly once (pre-fix: twice)");
-    const storageBlob = withEnv(env, () => buildDiagnostics("storage-legacy-only")).blob;
+    const storageBlob = (await withEnv(env, () => buildDiagnostics("storage-legacy-only"))).blob;
     assert.equal(_candidateLogReadsForTest(), 2, "each report costs exactly one full-pair read");
     assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line from the shared read");
     assert.ok(!conflictBlob.includes(storageMarker), "conflict tail must not leak [storage] lines");
     assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line from the shared read");
     assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
-    withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
+    await withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
     assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
 });
 
-test("#3611 enrichment is generic: storage topic and unknown topics carry it too", (t) => {
+test("#3611 enrichment is generic: storage topic and unknown topics carry it too", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-gen-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
-    const storage = withEnv(env, () => buildDiagnostics("storage-legacy-only")).blob;
+    const storage = (await withEnv(env, () => buildDiagnostics("storage-legacy-only"))).blob;
     assert.ok(storage.includes("--- host client versions ---"), "storage topic gets versions");
     assert.ok(storage.includes("--- bili config (secrets masked) ---"), "storage topic gets config");
     assert.ok(!storage.includes("--- recent conflict-related log lines ---"), "conflict log tail is conflict-topic only");
-    const unknown = withEnv(env, () => buildDiagnostics("totally-unknown-topic")).blob;
+    const unknown = (await withEnv(env, () => buildDiagnostics("totally-unknown-topic"))).blob;
     assert.ok(unknown.includes("topic: totally-unknown-topic (no topic-specific section registered)"), "unknown topic degrades gracefully");
     assert.ok(unknown.includes("--- host client versions ---"), "unknown topic still enriched");
 });

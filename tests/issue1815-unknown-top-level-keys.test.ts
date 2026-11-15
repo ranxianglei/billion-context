@@ -130,6 +130,9 @@ test("#1815: the full documented top-level surface produces no warning (#2062)",
                 subagentSplit: true, forkAdoption: false, resumeInheritance: true,
                 chainContentDetection: true, chainEgressStamp: false, stableSystemAnchor: false,
                 dsh: {},
+                // #5706: the opencode lane block was missing from KNOWN_TOP_LEVEL_KEYS —
+                // a documented key (CONFIGURATION.md "opencode.inline") warned as unknown.
+                opencode: { inline: true },
                 compat: {}, imageBilling: "auto", imageTokenCap: 4096,
                 resign: {}, claude: { nativePort: 8901 }, native: { attachExternal: false },
                 network: { upstreamTimeoutMs: 60000 }, persist: { enabled: true },

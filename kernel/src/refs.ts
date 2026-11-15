@@ -334,6 +334,14 @@ export function restampRefsToLedger(
 
   state.messageRefs = { byRaw, byRef };
   state.refLedgerAligned = true;
+  // #5608-C: alignment moves OLD refs up onto higher ledger seats (seq+1);
+  // raise the visibility mark so none of them suddenly gains a time attribute
+  // without a real fold (that would rewrite cached prefix bytes — exactly the
+  // class of cliff #5608 eliminates).
+  const alignedMax = highestUsedIndex({ byRaw, byRef });
+  if (alignedMax > (state.timestampsHighWaterRefSeq ?? 0)) {
+    state.timestampsHighWaterRefSeq = alignedMax;
+  }
   return out;
 }
 

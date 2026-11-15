@@ -20,13 +20,16 @@
 // renders for the session's lifetime — static text, byte-stable across turns,
 // prefix-cache safe after the (typically never-visible) one-time append.
 //
-// Deliberately display-only: no storage rewrite, no ref-space surgery, no gate
-// changes. The text carries no numbers: the frontier advances as the session
-// allocates, and a fixed ceiling would go stale within turns. Concrete ceilings
-// stay with the reactive notes (beyondFrontierNote / frontierClampNote), which
-// fire on the actual failure and always quote the live value.
+// The note itself stays display-only and numberless: the frontier advances as
+// the session allocates, and a fixed ceiling would go stale within turns —
+// concrete ceilings stay with the reactive notes (beyondFrontierNote /
+// frontierClampNote), which fire on the actual failure and always quote the live
+// value. Detection, however, now also ARMS the native-compaction rebase: proving
+// the ledger belongs to a previous generation is exactly the evidence that rebase
+// needed, and annotating it without repairing it leaves compress rejecting every
+// live ref for the rest of the session (#6061, #5589).
 
-import { markDirty, type Session } from "./session.js";
+import { markDirty, markNativeCompactionBoundary, type Session } from "./session.js";
 import type { CoreMessage } from "acp-kernel";
 
 /** Session-metadata key for the one-shot detection record. */
@@ -88,11 +91,22 @@ export function detectGenerationBoundary(
     log?: (level: string, msg: string) => void,
 ): boolean {
     if (readGenerationBoundary(session)) return true;
+    // A generation boundary only exists at the start of a new session generation
+    // (first request after a model/upstream switch restarts the ref ledger at m00001).
+    // Once request #1 has passed without stale-ref residue, never newly latch on
+    // later turns (stats.requests > 1) — mid-session tool outputs or catalog updates
+    // quoting mNNNNN strings are not ledger-reset residue, and flipping mid-session
+    // mutates the standing system prompt and invalidates the upstream prefix cache.
+    if ((session.stats?.requests ?? 0) > 1) return false;
     if (messages.length === 0) return false;
     const frontier = highestMappedIndex(session.state);
     const stale = new Set<number>();
     let found = false;
     for (const m of messages) {
+        // In-band system messages (e.g. client system-prompt patches or codemode_catalog
+        // sections containing compress's 'm00150–m00220' example) are ambient instructions,
+        // never previous-generation conversation history.
+        if (m.role === "system") continue;
         const text = m.text;
         if (!text) continue;
         REF_CITATION_RE.lastIndex = 0;
@@ -116,6 +130,14 @@ export function detectGenerationBoundary(
     };
     (session.metadata ?? (session.metadata = {}))[STORAGE_KEY] = record;
     markDirty(session);
+    // #6061/#5589: this verdict is also the proof the native-compaction rebase has
+    // always required — the persisted ref ledger provably belongs to the previous
+    // generation. Arm it here so the next request runs resetSessionCompression +
+    // reserveRefsThrough and re-anchors the map onto the generation the client is
+    // actually minting. Without this the note only warns the model away from refs
+    // that compress would otherwise reject for the rest of the session (nudge and
+    // tool disagreeing about "highest allocated ref" is the same defect).
+    markNativeCompactionBoundary(session);
     log?.("info", `[${session.id}] [acp-gen-boundary] ${stale.size} distinct ref citation(s) above this session's frontier (${record.frontier || "no mapped refs yet"}) found in visible history — previous-generation residue confirmed; standing generation-boundary note active (highest stale ${record.maxStaleRef}) (#4305)`);
     return true;
 }

@@ -46,6 +46,11 @@ export interface ShedStats {
     changed: boolean;
 }
 
+export interface ShedWireImagesResult {
+    body: string;
+    stats: ShedStats;
+}
+
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
@@ -163,8 +168,9 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
+                if (typeof inline.mimeType !== "string" || !/^image\//i.test(inline.mimeType)) return;
                 if (matchesOriginalImageReceipt(inline.data, parts)) return;
-                const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
+                const mediaType = inline.mimeType;
                 occ.push({
                     entryIndex,
                     b64: inline.data,
@@ -251,7 +257,7 @@ export async function shedWireImages(
     protocol: WireProtocol,
     targetBytes: number,
     opts: ShedOptions = {},
-): Promise<{ body: string; stats: ShedStats }> {
+): Promise<ShedWireImagesResult> {
     const originalBytes = byteLen(body);
     const noop: ShedStats = { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
     if (targetBytes <= 0 || originalBytes <= targetBytes) return { body, stats: noop };
@@ -274,10 +280,12 @@ export async function shedWireImages(
     let est = originalBytes;
     let archived = 0;
     let downscaled = 0;
-    const work = occurrences.slice(0, MAX_SHED_IMAGES);
-
     // Rung A: archive oldest non-protected images to placeholder notes until under target.
-    for (const o of work) {
+    // Walks every occurrence (not just the first MAX_SHED_IMAGES): archiving is a string swap,
+    // so the jimp CPU bound does not apply here — capping it left any session with more than
+    // 64 images permanently over budget (#5745: 582 images shed only 64, the body stayed over
+    // the 10 MiB cap and upstream 400'd every round).
+    for (const o of occurrences) {
         if (est <= targetBytes) break;
         if (o.protectedTail) continue;
         const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
@@ -291,12 +299,12 @@ export async function shedWireImages(
     // Rung B: downscale whatever still rides the wire (protected tail included) through
     // the dim ladder; stop as soon as the estimate fits.
     if (est > targetBytes) {
+        // Only live occurrences consume the decode/re-encode budget; archived
+        // prefixes must not keep the surviving protected tail out of the pass.
+        const work = occurrences.filter((o) => !o.archived).slice(0, MAX_SHED_IMAGES);
         outer: for (const dim of DOWNSCALE_DIM_LADDER) {
             for (const o of work) {
                 if (est <= targetBytes) break;
-                // an archived occurrence's part was already replaced by the note — shrinking
-                // it would write into a detached object and double-count savings in est
-                if (o.archived) continue;
                 const dims = decodeImageDims(o.b64);
                 if (dims !== undefined && Math.max(dims.w, dims.h) <= dim) continue;
                 const smaller = await shedDownscaleImage(o.mediaType, o.b64, dim);

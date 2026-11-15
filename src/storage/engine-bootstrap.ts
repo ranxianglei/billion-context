@@ -6,10 +6,11 @@
  * build-script approval (pnpm >=10 strictDepBuilds hard-fails unlisted native
  * deps; dsh profile bundles run pnpm non-interactively against a fixed list).
  *
- * Resolution order (owner-approved): builtin node:sqlite -> host-provided
- * better-sqlite3 -> cached self-downloaded prebuilt -> (this module downloads
- * the prebuilt when none of the above exists) -> none = legacy-only (#2825
- * contract). This module owns ONLY the download/cache step; driver.ts owns
+ * Resolution order (owner-approved): builtin bun:sqlite (available ONLY when the
+ * runtime IS bun, where node:sqlite does not exist) -> builtin node:sqlite ->
+ * host-provided better-sqlite3 -> cached self-downloaded prebuilt -> (this module
+ * downloads the prebuilt when none of the above exists) -> none = legacy-only
+ * (#2825 contract). This module owns ONLY the download/cache step; driver.ts owns
  * resolution order and opening.
  *
  * Artifacts are pinned PER NODE MAJOR, because the binding is not portable
@@ -54,7 +55,7 @@ import { gunzipSync } from "node:zlib";
 import { log as loggerLog } from "../logger.js";
 import { cacheDir } from "../paths.js";
 
-import { probeBuiltinSqlite, probeHostBetterSqlite3, registerSelfDownloadedBetterSqlite3, type BetterSqlite3Ctor } from "./driver.js";
+import { isBunRuntime, probeBuiltinSqlite, probeBunSqlite, probeHostBetterSqlite3, registerSelfDownloadedBetterSqlite3, type BetterSqlite3Ctor } from "./driver.js";
 import { fileStorageAutoDownload, fileStorageUnified, resolveStorageMode, resolveSqliteAutoDownload, updateRegistryBase } from "../knobs.js";
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
@@ -346,6 +347,14 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     if (resolveStorageMode(env, fileStorageUnified()) === "legacy") {
         return { status: "not-needed", detail: "unified storage disabled" };
     }
+    // Under bun the builtin engine is bun:sqlite (driver.ts step 0): node:sqlite
+    // does not exist there, and a better-sqlite3 N-API prebuild cannot be loaded
+    // by bun at all ("Could not load the default exports from better-sqlite3" —
+    // measured on bun 1.3.14), so a self-download would be wasted bandwidth
+    // ending in a failed load. bun needs no bootstrap, ever.
+    if (probeBunSqlite()) {
+        return { status: "not-needed", detail: "builtin bun:sqlite available" };
+    }
     if (probeBuiltinSqlite()) {
         return { status: "not-needed", detail: "builtin node:sqlite available" };
     }
@@ -482,6 +491,12 @@ function prebuildMirrors(): string[] {
  * on Nodes that already have the builtin.
  */
 export function nodeSqliteUpgradeHint(nodeVersion: string = process.versions.node): string {
+    // Under bun the missing engine operators hit is bun:sqlite, not node:sqlite,
+    // so the Node lever would point at the wrong runtime. Only the DEFAULT call
+    // (asking about THIS process) takes that branch: an explicit nodeVersion is a
+    // question about Node and keeps the Node answer, which is what the bootstrap
+    // tests pin.
+    if (isBunRuntime() && nodeVersion === process.versions.node) return " — bun's builtin bun:sqlite is unavailable here; run bili under a bun build that ships bun:sqlite, or under Node.js >= 22.5 for the builtin node:sqlite";
     const parts = nodeVersion.split(".").map((p) => Number.parseInt(p, 10));
     const major = parts[0];
     const minor = parts[1];

@@ -732,6 +732,13 @@ def mitm_domains_from_config() -> List[str]:
                         if entry.get(key):
                             add(entry[key])
                             break
+        # Top-level base_url/url/api sits next to `provider:` in Hermes' documented config (#6022) —
+        # the active provider's endpoint when there is no providers map. Additive, not fallback-only:
+        # a config may carry both shapes, and traffic can legally reach either host.
+        for key in ("base_url", "url", "api"):
+            if data.get(key):
+                add(data[key])
+                break
     return hosts
 
 
@@ -756,8 +763,6 @@ def _provider_base_url(provider: Any) -> Optional[str]:
     """The configured base URL of one hermes provider (best effort; same config keys as
     mitm_domains_from_config). None when absent/unreadable."""
     name = str(provider or "").strip()
-    if not name:
-        return None
     cfg = hermes_home() / "config.yaml"
     try:
         data = _yaml_loader()(cfg.read_text(encoding="utf-8"))
@@ -774,18 +779,28 @@ def _provider_base_url(provider: Any) -> Optional[str]:
                 return str(entry[key]).strip()
         return None
 
-    providers = data.get("providers")
-    if isinstance(providers, dict):
-        found = pick(providers.get(name))
-        if found:
-            return found
-    legacy = data.get("custom_providers")
-    if isinstance(legacy, list):
-        for entry in legacy:
-            if str((entry or {}).get("name") or "").strip() == name:
-                found = pick(entry)
-                if found:
-                    return found
+    if name:
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            found = pick(providers.get(name))
+            if found:
+                return found
+        legacy = data.get("custom_providers")
+        if isinstance(legacy, list):
+            for entry in legacy:
+                if str((entry or {}).get("name") or "").strip() == name:
+                    found = pick(entry)
+                    if found:
+                        return found
+    # Top-level base_url/url/api overrides the ACTIVE provider's endpoint (#6022). It answers the
+    # active provider's request — an unnamed one included, since the hook surface often carries no
+    # provider kwarg — and never some other named provider's.
+    active = str(data.get("provider") or "").strip()
+    if not name or name == active:
+        for key in ("base_url", "url", "api"):
+            value = data.get(key)
+            if value:
+                return str(value).strip()
     return None
 
 
@@ -1196,7 +1211,11 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 # — runtime effects -------------------------------------------------------------
 
 # The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
-_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# The HTTP pair and NO_PROXY are here too, so a plain-http provider is unrouted with the rest.
+_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1216,6 +1235,13 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
                 _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
+        # A plain-http provider base_url (a LAN llama.cpp / vLLM / ollama server) is only routed
+        # by HTTP_PROXY; with the HTTPS pair alone its traffic bypasses the proxy entirely and
+        # the session gets no compression. The proxy forwards absolute-form http requests.
+        os.environ["HTTP_PROXY"] = origin
+        os.environ["http_proxy"] = origin
+        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
+        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
@@ -1523,6 +1549,13 @@ def _shutdown() -> None:
     refused by it; the join runs outside the lock, since the bootstrap needs it to observe the
     stop."""
     with _lifecycle_lock:
+        # apply_env routes host traffic by writing HTTPS_PROXY/SSL_CERT_FILE into the
+        # process-global os.environ, and the host does NOT dispose of that on unload — only of
+        # registrations. Leftover routing at a dead origin port breaks every LLM call in the
+        # process until a full restart (#5991), so restore what apply_env overwrote first.
+        # No-op when env was never applied; _unroute_env runs under this same lock.
+        if _state.get("env_applied"):
+            _unroute_env()
         stop = _state.get("stop_event")
         if stop is not None:
             stop.set()

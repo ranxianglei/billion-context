@@ -186,6 +186,53 @@ test("release-ci-gate wait: red lane fails fast and blocks publish", async () =>
   assert.match(r.out, /refusing to publish/);
 });
 
+// #6552 (v0.1.214 one-click release): the fallback PR was opened by the
+// github-actions app, so GitHub auto-created pull_request runs at the
+// publish sha that completed `action_required` without executing a job.
+// They carried NEWER run ids than the workflow_dispatch compensation runs,
+// so the gate picked them as "latest at the publish sha" and refused
+// 26s after the PR opened — while the dispatches that actually certify
+// the sha were still running. The 60-minute supervision never happened.
+test("release-ci-gate wait: approval-gated action_required run does not mask a running dispatch (#6552)", async () => {
+  resetState();
+  // Dispatch compensation run (older id) still in flight…
+  runs.set("ci.yml@publish.dispatch", { id: 1, head_sha: "publish", status: "in_progress", conclusion: null, event: "workflow_dispatch" });
+  // …and the bot-PR pull_request run (NEWER id) that completed action_required.
+  runs.set("ci.yml@publish.pr", { id: 2, head_sha: "publish", status: "completed", conclusion: "action_required", event: "pull_request" });
+  setTimeout(() => {
+    runs.set("ci.yml@publish.dispatch", { id: 1, head_sha: "publish", status: "completed", conclusion: "success", event: "workflow_dispatch" });
+  }, 1500);
+  const r = await gate(["--wait"], {
+    REQUIRED_CI_WORKFLOWS: "ci.yml",
+    CI_GATE_POLL_SEC: "1",
+    CI_GATE_TIMEOUT_MIN: "1",
+  });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /full CI gate PASSED — all 1 lanes green/);
+});
+
+test("release-ci-gate wait: a real red run stays red even when a newer action_required run shadows it", async () => {
+  resetState();
+  runs.set("ci.yml@publish.dispatch", { id: 1, head_sha: "publish", status: "completed", conclusion: "failure", event: "workflow_dispatch" });
+  runs.set("ci.yml@publish.pr", { id: 2, head_sha: "publish", status: "completed", conclusion: "action_required", event: "pull_request" });
+  const r = await gate(["--wait"], {
+    REQUIRED_CI_WORKFLOWS: "ci.yml",
+    CI_GATE_POLL_SEC: "1",
+    CI_GATE_TIMEOUT_MIN: "1",
+  });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /RED at the publish sha: ci\.yml/);
+});
+
+test("release-ci-gate dispatch: lane whose only run is action_required is dispatched (#6552)", async () => {
+  resetState();
+  runs.set("ci-e2e.yml@publish.pr", { id: 9, head_sha: "publish", status: "completed", conclusion: "action_required", event: "pull_request" });
+  const r = await gate(["--dispatch"], { REQUIRED_CI_WORKFLOWS: "ci-e2e.yml" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /dispatched ci-e2e\.yml at ref master/);
+  assert.deepEqual(dispatchLog, ["ci-e2e.yml@master"]);
+});
+
 test("release-ci-gate wait: red at publish sha is never overridden by a green extra (PR-head) sha", async () => {
   resetState();
   runs.set("ci.yml@publish", { id: 1, head_sha: "publish", status: "completed", conclusion: "failure" });

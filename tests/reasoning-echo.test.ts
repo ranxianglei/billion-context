@@ -91,7 +91,7 @@ describe("#684 exit sentinels", () => {
         const c = collector();
         const inbound = [
             { role: "user", content: "u" },
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s1" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
             { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
         ];
         const outbound = [
@@ -107,7 +107,7 @@ describe("#684 exit sentinels", () => {
     it("#1327 anthropic wire: pre-existing asymmetry (turns that never thought) stays silent", () => {
         const c = collector();
         const msgs = [
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s1" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
             { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
         ];
         warnAnthropicThinkingPairs(msgs, msgs, c.log, "s1");
@@ -127,7 +127,7 @@ describe("#684 exit sentinels", () => {
     it("#1327 anthropic wire: counts only blocks bili actually lost, not pre-existing gaps", () => {
         const c = collector();
         const inbound = [
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s1" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
             { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
         ];
         const outbound = [
@@ -144,7 +144,7 @@ describe("#684 exit sentinels", () => {
     it("#1327 anthropic wire: fully folded turn (no preserved tool_use) stays silent", () => {
         const c = collector();
         const inbound = [
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s1" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
             { role: "assistant", content: [{ type: "text", text: "later" }] },
         ];
         const outbound = [
@@ -152,6 +152,50 @@ describe("#684 exit sentinels", () => {
         ];
         warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
         assert.equal(c.lines.length, 0);
+    });
+
+    it("#5998 anthropic wire: unsigned inbound thinking dropped at render stays silent", () => {
+        const c = collector();
+        // DSH transcript shape: reasoning stored as {type, text}, no signature.
+        const inbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        // The relay egress seam drops the unsigned block once the session has
+        // learned a strict upstream (#5998) — by design, not a violation.
+        const outbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("#5998 anthropic wire: empty-string signature counts as unsigned", () => {
+        const c = collector();
+        const inbound = [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ];
+        const outbound = [
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("#5998 anthropic wire: signed thinking loss still warns (the drop is unsigned-only)", () => {
+        const c = collector();
+        const inbound = [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig_A" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ];
+        const outbound = [
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /thinking-pair-violated/);
     });
 
     it("#1479 responses wire: healthy [reasoning, message, function_call] run stays silent (was chronic false positive)", () => {
@@ -786,7 +830,7 @@ describe("#2864 sentinel dedup: per-identity episode reporting", () => {
     it("anthropic wire: repeated loss of the same tool_use warns once; a new loss warns again", () => {
         const inbound = [
             { role: "user", content: "u" },
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "s1" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
             { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
         ];
         const outbound = [
@@ -803,7 +847,7 @@ describe("#2864 sentinel dedup: per-identity episode reporting", () => {
 
         const inbound2 = [
             ...inbound,
-            { role: "assistant", content: [{ type: "thinking", thinking: "t2" }, { type: "tool_use", id: "tu2", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t2", signature: "s2" }, { type: "tool_use", id: "tu2", name: "n", input: {} }] },
             { role: "user", content: [{ type: "tool_result", tool_use_id: "tu2", content: "r" }] },
         ];
         const outbound2 = [

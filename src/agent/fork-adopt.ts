@@ -12,7 +12,7 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
  * parentSession alone, opencode V2 derives it from session.created), and
  * before a fork child's first model request replays into the proxy, adopts
  * the parent conversation's compression state through the plugin fork
- * protocol (PLUGIN.md §8). This module is the client half: it projects the
+ * protocol (docs/plugin-protocol.md §8). This module is the client half: it projects the
  * outgoing body (openai/anthropic/responses dialects) the same way the
  * server's incomingCoreMessages does, matches the longest parent prefix by
  * identity hash, and posts the fork receipt. The google wire has no
@@ -74,10 +74,21 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
-/** Byte-identical to src/plugin.ts forkMessageIdentityHash. */
+/** Byte-identical to src/plugin.ts forkMessageIdentityHash: both-sides-only
+ *  field set — thinkingTokens (host-projected metering mass, never present in
+ *  the client's bytes) is excluded; signed thinking content rides
+ *  thinkingSignature / googleThoughtSignature; the opaque redacted_thinking
+ *  payload digests itself (its projected text is a constant label). */
+function redactedPayloadDigest(message: CoreMessage): string | null {
+    const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
+    if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
+    return createHash("sha256").update(block.data, "utf8").digest("hex").slice(0, 16);
+}
+
 export function forkIdentityHashOf(message: CoreMessage): string {
-    const toolIsError = (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
+    const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
+    const toolIsError = m.toolIsError === true;
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over

@@ -92,7 +92,7 @@ test("unknown-block cores are media AND unrecoverable — folding would destroy 
   assert.equal(hasUnrecoverableMediaPayload(parsed.msgs[0] as never), true);
 });
 
-test("known sidecar classifications stay unchanged (parity pins)", () => {
+test("known sidecar classifications (parity pins, post-#5620 split)", () => {
   const base64Img = {
     type: "image",
     source: { type: "base64", media_type: "image/png", data: "QQ==" },
@@ -108,9 +108,10 @@ test("known sidecar classifications stay unchanged (parity pins)", () => {
   // archivable base64 image: media yes, unrecoverable no (host spills to disk)
   assert.equal(hasMediaPayload(cores[0] as never), true);
   assert.equal(hasUnrecoverableMediaPayload(cores[0] as never), false);
-  // URL image: unrecoverable (no local archive)
+  // URL image: #5620 — ref-recoverable (no local archive, but the URL itself
+  // is the re-access handle and rides the stored summary)
   assert.equal(hasMediaPayload(cores[1] as never), true);
-  assert.equal(hasUnrecoverableMediaPayload(cores[1] as never), true);
+  assert.equal(hasUnrecoverableMediaPayload(cores[1] as never), false);
   // redacted_thinking: existing parity — not media-classified here
   assert.equal(hasMediaPayload(cores[2] as never), false);
   assert.equal(hasUnrecoverableMediaPayload(cores[2] as never), false);

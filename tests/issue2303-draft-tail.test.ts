@@ -215,10 +215,13 @@ test("#2303 chat: a draft-tail RETRY degenerates into the in-band error (#870 pa
     const refetch = () => Promise.resolve(streamOf(draftTailTurn()));
     await pipePluginChatWithStrip(streamOf(draftTailTurn()), makeRes(out), "openai", makeSession(), undefined, refetch);
     const text = out.join("");
+    // #5958: default streamErrorShape="protocol" → a wire-native error frame, not
+    // the legacy completed-turn shape (no finish_reason:"stop" success terminal).
     assert.ok(
-        text.includes("[ACP] stream error"),
-        "the client is told, rather than left with a second silent draft tail",
+        text.includes('"code":"stream_error"'),
+        "the client is told via a native error frame, rather than left with a second silent draft tail",
     );
+    assert.ok(!text.includes('"finish_reason":"stop"'), "an exhausted retry is not serialized as a successful completion");
 });
 
 // ---------- plugin responses pipe ----------

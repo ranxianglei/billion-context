@@ -203,17 +203,23 @@ async function runCase(opts: { inputTokens: number | null; sessionId?: string; t
         // Multi-turn: the client re-sends its FULL growing history every turn
         // (the proxy-mode wire contract). Turn 1 = base conversation; turn 2
         // adds an assistant reply + one heavy follow-up user message (~same
-        // scale); turn 3 SHRINKS to the recent small tail (a client-side
-        // compaction/edit — the stale-estimate regime).
+        // scale); turn 3 adds another heavy round — under the #5865
+        // estimate-hold backstop (nudge.maxEstimateHoldRounds, default 2)
+        // this is the FIRST round whose estimate reading may inject, since
+        // turns 1–2 only accumulate the consecutive-estimate streak; turn 4
+        // SHRINKS to the recent small tail (a client-side compaction/edit —
+        // the stale-estimate regime).
         const turns = opts.turns ?? (() => {
             const base = baseConversation();
+            const step2 = [
+                ...base,
+                { role: "assistant", content: "ok, done with step one." },
+                { role: "user", content: HEAVY(99) + " now step two" },
+            ];
             return [
                 base,
-                [
-                    ...base,
-                    { role: "assistant", content: "ok, done with step one." },
-                    { role: "user", content: HEAVY(99) + " now step two" },
-                ],
+                step2,
+                [...step2, { role: "assistant", content: "ok, done with step two." }, { role: "user", content: HEAVY(98) + " now step three" }],
                 [
                     { role: "user", content: "short recent slice one" },
                     { role: "assistant", content: "ok fine" },
@@ -223,6 +229,9 @@ async function runCase(opts: { inputTokens: number | null; sessionId?: string; t
         })();
         const statuses: number[] = [];
         for (const t of turns) statuses.push(await post(t));
+        if (process.env.SILENT_NUDGE_TRACE) {
+            console.log(`TRACE ${opts.sessionId ?? "default"}: markers=[${streamed.map((s) => (s.includes(NUDGE_MARKER) ? "N" : "."))}] nonStream=${nonStream}`);
+        }
         return { statuses, streamed, nonStream };
     } finally {
         proxy.close();
@@ -230,26 +239,27 @@ async function runCase(opts: { inputTokens: number | null; sessionId?: string; t
     }
 }
 
-test("#728A: silent-backend explicit session — turn 1 idle, turn 2 nudge via local estimate, preflight silent", async () => {
+test("#728A: silent-backend explicit session — held through the backstop window, then nudged via local estimate, preflight silent", async () => {
     const { statuses, streamed, nonStream } = await runCase({ inputTokens: null });
-    assert.deepEqual(statuses, [200, 200, 200]);
+    assert.deepEqual(statuses, [200, 200, 200, 200]);
     assert.equal(nonStream, 0, "preflight must stay silent (optimistic estimate under window)");
-    assert.equal(streamed.length, 3);
+    assert.equal(streamed.length, 4);
     assert.ok(!streamed[0].includes(NUDGE_MARKER), "turn 1 must stay idle — nothing measured yet (pre-fix first-turn behavior)");
-    const fwd = msgsOf(streamed[1]);
+    assert.ok(!streamed[1].includes(NUDGE_MARKER), "turn 2 must stay held inside the #5865 estimate-hold window (round ≤ 2 of 2)");
+    const fwd = msgsOf(streamed[2]);
     const last = fwd.at(-1)!;
     assert.ok(
         last.role === "user" && msgText(last).includes(NUDGE_MARKER),
-        `turn 2 must carry the trailing nudge once the recorded local estimate crosses the threshold, got: ${streamed[1].slice(-800)}`,
+        `turn 3 must carry the trailing nudge once the #5865 estimate-hold backstop elapses (3rd consecutive estimate round > maxEstimateHoldRounds 2) and the recorded local estimate crosses the threshold, got: ${streamed[2].slice(-800)}`,
     );
     for (let i = 0; i < 12; i++) {
-        assert.ok(streamed[1].includes(`CODE_${i}_`), `CODE_${i}_ must survive un-folded (nudge is advisory, no fold happened)`);
+        assert.ok(streamed[2].includes(`CODE_${i}_`), `CODE_${i}_ must survive un-folded (nudge is advisory, no fold happened)`);
     }
 });
 
 test("#728B: real usage always takes precedence — reported input_tokens beats the local estimate", async () => {
     const { statuses, streamed } = await runCase({ inputTokens: 2000 });
-    assert.deepEqual(statuses, [200, 200, 200]);
+    assert.deepEqual(statuses, [200, 200, 200, 200]);
     for (let i = 0; i < streamed.length; i++) {
         assert.ok(!streamed[i].includes(NUDGE_MARKER), `turn ${i + 1}: reported usage (2000 << ${WINDOW}) must drive tokenCount, not the ~90% payload estimate`);
     }
@@ -257,9 +267,9 @@ test("#728B: real usage always takes precedence — reported input_tokens beats 
 
 test("#728C: stale-high cap — shrunk history does not re-trigger on the previous turn's estimate", async () => {
     const { statuses, streamed } = await runCase({ inputTokens: null });
-    assert.deepEqual(statuses, [200, 200, 200]);
-    assert.ok(streamed[1].includes(NUDGE_MARKER), "precondition: turn 2 nudged (see #728A)");
-    assert.ok(!streamed[2].includes(NUDGE_MARKER), "turn 3 (shrunk history) must not nudge — the previous turn's high estimate is capped by this request's inbound upper bound");
+    assert.deepEqual(statuses, [200, 200, 200, 200]);
+    assert.ok(streamed[2].includes(NUDGE_MARKER), "precondition: turn 3 nudged after the #5865 backstop elapsed (see #728A)");
+    assert.ok(!streamed[3].includes(NUDGE_MARKER), "turn 4 (shrunk history) must not nudge — the previous turn's high estimate is capped by this request's inbound upper bound");
 });
 
 test("#1119: silent-backend image term survives the stale-high cap — inline images count toward the nudge numerator", async () => {
@@ -281,22 +291,30 @@ test("#1119: silent-backend image term survives the stale-high cap — inline im
         { role: "assistant", content: "ok, done with step one." },
         { role: "user", content: "now step two" },
     ];
+    // #5865 backstop: turns 1–2 accumulate the estimate streak; the heavy
+    // image-bearing turn 3 is the first round whose reading may inject.
     const turn3: TurnMsg[] = [
+        ...turn2,
+        { role: "assistant", content: "ok, done with step two." },
+        { role: "user", content: [{ type: "text", text: "and these follow-ups" }, imgPart(), imgPart()] },
+    ];
+    const turnShrink: TurnMsg[] = [
         { role: "user", content: "short recent slice one" },
         { role: "assistant", content: "ok fine" },
         { role: "user", content: "tiny question only" },
     ];
-    const { statuses, streamed, nonStream } = await runCase({ inputTokens: null, sessionId: "silent-backend-img-sess", turns: [turn1, turn2, turn3], window: 80_000 });
-    assert.deepEqual(statuses, [200, 200, 200]);
+    const { statuses, streamed, nonStream } = await runCase({ inputTokens: null, sessionId: "silent-backend-img-sess", turns: [turn1, turn2, turn3, turnShrink], window: 80_000 });
+    assert.deepEqual(statuses, [200, 200, 200, 200]);
     assert.equal(nonStream, 0, "preflight must stay silent (optimistic estimate under window)");
-    assert.equal(streamed.length, 3);
+    assert.equal(streamed.length, 4);
     assert.ok(!streamed[0].includes(NUDGE_MARKER), "turn 1 must stay idle — nothing measured yet");
-    assert.ok(streamed[1].includes('"media_type":"image/png"'), "images must ride along un-folded (nudge is advisory, no fold happened)");
-    const fwd = msgsOf(streamed[1]);
+    assert.ok(!streamed[1].includes(NUDGE_MARKER), "turn 2 must stay held inside the #5865 estimate-hold window");
+    assert.ok(streamed[2].includes('"media_type":"image/png"'), "images must ride along un-folded (nudge is advisory, no fold happened)");
+    const fwd = msgsOf(streamed[2]);
     const last = fwd.at(-1)!;
     assert.ok(
         last.role === "user" && msgText(last).includes(NUDGE_MARKER),
-        `turn 2 must carry the trailing nudge — the text-only bound (~63%) sits below every band, so only the recorded estimate's image term (2 x 10k tokens) can push the numerator over the 75% pressure band; pre-fix the text-only bound capped it away, got: ${streamed[1].slice(-800)}`,
+        `turn 3 must carry the trailing nudge once the #5865 backstop elapses — the text-only bound (~63%) sits below every band, so only the recorded estimate's image term (2 x 10k tokens) can push the numerator over the 75% pressure band; pre-fix the text-only bound capped it away, got: ${streamed[2].slice(-800)}`,
     );
-    assert.ok(!streamed[2].includes(NUDGE_MARKER), "turn 3 (shrunk history, no images) must not nudge — a client-side shrink shrinks the bound in BOTH terms");
+    assert.ok(!streamed[3].includes(NUDGE_MARKER), "turn 4 (shrunk history, no images) must not nudge — a client-side shrink shrinks the bound in BOTH terms");
 });

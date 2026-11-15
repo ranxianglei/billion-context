@@ -238,21 +238,27 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
-        const r = await fetch(url, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2481-stamp" },
-            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }] }),
-        });
-        assert.equal(r.status, 200);
-        await r.text();
-        const s = peekSession("i2481-stamp");
-        assert.ok(s, "dsh session exists");
+        const headers = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2481-stamp" };
+        // Turn 1 is a tool-less single-shot shape: the #5656 generic dsh
+        // single-shot sidecar gate diverts it onto the verbatim side lane
+        // (kernel no-touch — the declared residual), so no refs are assigned
+        // yet. No fold can happen before turn 2 (nothing compressible, no
+        // action surface), so protection landing on the first full-pipeline
+        // turn keeps the snapshot safe against every possible fold.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }] }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        assert.ok(peekSession("i2481-stamp"), "dsh session exists");
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: RT_MSG }, { role: "assistant", content: "ok" }, { role: "user", content: "Second turn after the snapshot." }] }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
         // The stamped effective config (read by /__bili/plugin/tool) carries the
         // guard — proven indirectly: the snapshot got a BLOCKED ref, i.e. it was
-        // recognized as protected AT ASSIGNMENT TIME on the very first turn.
+        // recognized as protected AT ASSIGNMENT TIME on the first full-pipeline
+        // turn (turn 2 — turn 1 rides the #5656 side lane).
         const sFull = getSession("i2481-stamp");
         const blockedRefs = Object.entries(sFull.state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
-        assert.ok(blockedRefs >= 1, "the snapshot message must carry a BLOCKED ref (never advertised, never foldable)");
+        assert.ok(blockedRefs >= 1, "the snapshot message must carry a BLOCKED ref by the first full-pipeline turn (never advertised, never foldable)");
     } finally {
         await closeRig(rig);
     }

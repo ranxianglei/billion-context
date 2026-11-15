@@ -8,4 +8,8 @@ declare module "react" {
     // /bili/origin route in place (the boot snapshot is only a first-paint hint).
     export function useState<T>(initial: T | (() => T)): [T, (value: T | ((prev: T) => T)) => void];
     export function useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+    // #4406: the Context tab marks its scroll container after commit, so the
+    // host composer seat can be hidden only while that tab is mounted.
+    export function useLayoutEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void;
+    export function useRef<T>(initial: T): { current: T };
 }

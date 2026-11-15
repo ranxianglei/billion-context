@@ -16,8 +16,8 @@
  * field, always guarded by those assertions.
  */
 
-import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync, statSync, openSync, fsyncSync, fchmodSync, closeSync, renameSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
@@ -42,6 +42,10 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
+/** Max bound parameters per generated statement (refs batching, #5744).
+ *  Well under the conservative 999-parameter default some SQLite builds
+ *  still ship with — see sqlite3.MAX_BIND_PARAMS. */
+const REF_STMT_MAX_PARAMS = 700;
 
 /** #4796: rows per batch of gc()'s zero-ref CAS sweep. Sized so one batch's
  *  page churn stays modest even when the store is dominated by multi-MB
@@ -55,8 +59,27 @@ const GC_ZERO_REF_BATCH_SIZE = 2000;
  *  session's distinct released hashes exceed it only pathologically, and
  *  the loop simply continues with the next chunk. */
 const ZERO_REF_SWEEP_CHUNK = 500;
+
+export function rewriteArchiveLog(file: string, text: string): void {
+    const target = realpathSync(file);
+    const tmp = `${target}.${randomUUID()}.tmp`;
+    let fd: number | undefined;
+    try {
+        const mode = statSync(target).mode & 0o777;
+        fd = openSync(tmp, "wx", mode);
+        fchmodSync(fd, mode);
+        writeFileSync(fd, text);
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        renameSync(tmp, target);
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+        try { unlinkSync(tmp); } catch { /* rename already consumed the temporary file */ }
+    }
+}
 /** #4739 test instrumentation: message rows materialized by getMessages /
- *  getMessagesAt (each row = one CAS read + media hydration). Production
+ *  getMessagesAt (including content decoding + media hydration). Production
  *  code never reads this; tests assert ordinary loads stop decoding the
  *  whole historical log. */
 export const messageRowReads = { count: 0 };
@@ -156,6 +179,12 @@ export interface MessageRow {
  *  hydration row, served when the resident window no longer carries the bytes. */
 export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
 
+/** #6029: one stored message addressed by its STABLE msg_id (the content-derived
+ *  identity). Unlike ref_num — frozen at index time — msg_id never moves under a
+ *  restampRefsToLedger renumbering, so it is the correct join key for the web
+ *  hydration lane once the live ref space has diverged from the stored numbers. */
+export type MessageIdContentRow = { msgId: string; role: string; kind: string; content: string };
+
 export interface BlockRow {
     blockId: string;
     ord: number;
@@ -166,8 +195,14 @@ export interface BlockRow {
     tier: number;
     /** JSON of the full BlockView {text, count}. */
     summary: string;
+    /** #5744: sha256(summary) computed by the planner — lets ingest
+     *  compare against the stored row BEFORE any CAS op, so an
+     *  unchanged block costs neither a re-hash nor a refcount dance. */
+    summaryHash: string;
     /** JSON of the one-line BlockView, or null (legacy #401 collapse). */
     one: string | null;
+    /** #5744: sha256(one), or null with `one`. */
+    oneHash: string | null;
     supersedesBlockId: string | null;
     active: boolean;
     createdAt: number;
@@ -188,6 +223,9 @@ export interface CcrEntryRow {
     ord: number;
     key: string;
     content: string;
+    /** #5744: sha256(content) from the planner — unchanged entries skip the
+     *  CAS bump/release round-trips entirely on steady-state ingests. */
+    contentHash: string;
 }
 
 /** One checkpoint/replica row (Phase 2, #2671). `state_hash` never leaves
@@ -248,12 +286,13 @@ export interface CheckpointRow {
 }
 
 /** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
- *  CAS bytes are split by ownership so the number is honest: only refcount-1
- *  blobs die with this session (they are attributed to it); shared blobs are
- *  counted but never double-attributed, because they outlive any single
- *  session's deletion. */
+ *  CAS ownership follows the references deleteSession releases: several
+ *  references within one session can own one blob, while a pinned checkpoint
+ *  retains its reference even after that session is removed. */
 export interface SessionStorageStats {
     rows: {
+        sessions: number;
+        conversations: number;
         messages: number;
         media: number;
         blocks: number;
@@ -268,11 +307,11 @@ export interface SessionStorageStats {
      *  record + blocks payload_json + session_ext value_json) — everything
      *  except the content-addressed blobs. */
     inlineBytes: number;
-    /** CAS blob bytes this session references at refcount = 1 (freed when it
-     *  is deleted). */
+    /** CAS payload bytes whose last references are released by deletion. */
     casExclusiveBytes: number;
-    /** CAS blobs this session references that other sessions also hold
-     *  (refcount > 1) — they survive the deletion. */
+    /** Number of the distinct CAS rows represented by casExclusiveBytes. */
+    casExclusiveBlobs: number;
+    /** Referenced CAS blobs retained by other sessions or pinned checkpoints. */
     casSharedBlobs: number;
 }
 
@@ -321,7 +360,7 @@ export interface IngestSessionInput {
 const EXT_KEY_MAX = 256;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
-function validateExtKey(value: string, what: string): void {
+export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
         throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
     }
@@ -333,12 +372,12 @@ function validateExtKey(value: string, what: string): void {
     }
 }
 
-function serializeExtValue(value: unknown): string {
+export function serializeExtValue(value: unknown): string {
     const json = JSON.stringify(value);
     if (json === undefined) {
         throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
     }
-    if (json.length > EXT_VALUE_MAX_BYTES) {
+    if (Buffer.byteLength(json, "utf8") > EXT_VALUE_MAX_BYTES) {
         throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
     }
     return json;
@@ -414,6 +453,21 @@ export class StorageSecondWriterError extends Error {
     }
 }
 
+/**
+ * #2195 release-gate fix (e2e-fake-codex failure, 2026-11-13_release-v0.1.214):
+ * true when the SQLite file header already declares WAL (header bytes 18-19
+ * == 0x02). A plain file read — no database lock, so it is always safe,
+ * unlike asking the engine via `PRAGMA journal_mode`.
+ */
+function dbFileIsAlreadyWal(dbPath: string): boolean {
+    try {
+        const head = readFileSync(dbPath);
+        return head.length >= 100 && head[18] === 0x00 && head[19] === 0x02;
+    } catch {
+        return false; // file absent/unreadable → not WAL → let the pragma decide
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -421,6 +475,10 @@ export class UnifiedStore {
     private readonly db: SqliteDatabase;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
+    /** #5744: last periodic checkpoint result (plus its wall time) for the
+     * slow-ingest warn line — lets an operator attribute a stall spike to a
+     * checkpoint burst instead of guessing. Null until the first tick. */
+    private lastWalTick: { busy: number; log: number; checkpointed: number; ms: number } | null = null;
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
@@ -430,6 +488,13 @@ export class UnifiedStore {
      * verdict cache onto the post-checkpoint stats so the next boot skips
      * the rescan. Never true while a check is still in flight or failed. */
     private lastIntegrityOk = false;
+    /** #5539 secondary finding: releaseContent runs once per released hash
+     * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
+     * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
+     * per-instance and readonly for the store's whole life, so a statement
+     * prepared once stays valid until close(). */
+    private releaseDecrement: ReturnType<SqliteDatabase["prepare"]> | null = null;
+    private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -447,6 +512,23 @@ export class UnifiedStore {
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
+        // The pre-migration quick_check below runs BEFORE the storagePragmas
+        // loop installs the connection's busy handler — on a bare handle the
+        // first statement throws raw SQLITE_BUSY the instant a concurrent
+        // writer holds the lock. That is a real, reachable shape, not a lab
+        // artifact: the launcher kills its proxy fire-and-forget on exit
+        // (stopProxy is a bare SIGTERM, no wait-for-exit), so the NEXT launch's
+        // opener routinely starts while the previous instance is still
+        // draining its graceful flush against the SAME shared sessions dir
+        // (one index.db per machine is the supported topology, #5082). The
+        // e2e #2195 gate hit exactly this: the fresh proxy parked on the
+        // startup-failure page ("database is locked") and the launcher burned
+        // its 60 s health budget on a child whose only problem was a missing
+        // busy handler. busy_timeout is a connection-level pragma that never
+        // touches the file, so it is safe to install before the corruption
+        // classification below; storagePragmas reapplies the same value
+        // idempotently for the remaining opens.
+        db.exec("PRAGMA busy_timeout = 5000");
         // #4175/#4609: integrity self-check, verdict-cached and size-gated.
         // An unchanged file set (index.db + -wal stats + schema version) skips
         // the rescan; a small store checks synchronously BEFORE migrations (a
@@ -555,7 +637,44 @@ export class UnifiedStore {
         }
         try {
             const limit = opts?.walJournalSizeLimitBytes ?? WAL_JOURNAL_SIZE_LIMIT;
-            for (const pragma of storagePragmas(limit)) db.exec(pragma);
+            for (const pragma of storagePragmas(limit)) {
+                if (pragma === "PRAGMA journal_mode = WAL") {
+                    // The #2195 trap: `PRAGMA journal_mode` needs exclusive
+                    // access and BYPASSES the connection's busy handler — it
+                    // throws raw SQLITE_BUSY instantly while a peer holds a
+                    // write transaction (repro: holder BEGIN IMMEDIATE +
+                    // insert, fresh handle with busy_timeout=5000 installed →
+                    // journal_mode throws at 0 ms, quick_check is fine).
+                    // That peer is the normal one: stopProxy is fire-and-
+                    // forget, so the previous proxy may still be draining its
+                    // final flush on this same machine-global file when the
+                    // next launch opens it (#5082). Two cases:
+                    if (dbFileIsAlreadyWal(path)) {
+                        // The store is ALREADY WAL (created WAL, never
+                        // switched back) — skipping the pragma is a strict
+                        // no-op and saves the exclusive acquisition entirely.
+                        continue;
+                    }
+                    try {
+                        db.exec(pragma);
+                    } catch (err) {
+                        const msg = String((err as { message?: unknown })?.message ?? err);
+                        if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
+                        // The file is still in its legacy journal mode and a
+                        // peer holds the write transaction, so the switch
+                        // cannot run right now. #5082 owner decision
+                        // 2026-10-31: a live foreign writer never blocks
+                        // startup — defer the switch to the next open (the
+                        // previous open already moved the file to WAL in the
+                        // normal case) and continue in the current journal
+                        // mode, which is safe multi-process, just less
+                        // concurrent.
+                        loggerLog("warn", `[storage] journal_mode=WAL deferred for ${path} — a peer holds the write lock (#5082); continuing in the current journal mode, switch retries on the next open`);
+                        continue;
+                    }
+                }
+                db.exec(pragma);
+            }
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
@@ -796,16 +915,21 @@ export class UnifiedStore {
         // row in the same statement — orphans cannot structurally accumulate.
         // Re-putContent of the same bytes re-inserts cleanly (putContent is
         // upsert), so no correctness change, only no-leak.
-        this.db
-            .prepare(
+        if (this.releaseDecrement === null) {
+            this.releaseDecrement = this.db.prepare(
                 "UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0 RETURNING refcount",
-            )
-            .all(hash)
-            .forEach((row) => {
-                if ((row as { refcount: number }).refcount <= 0) {
-                    this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0").run(hash);
-                }
-            });
+            );
+        }
+        if (this.releaseDelete === null) {
+            this.releaseDelete = this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0");
+        }
+        const decrement = this.releaseDecrement;
+        const remove = this.releaseDelete;
+        decrement.all(hash).forEach((row) => {
+            if ((row as { refcount: number }).refcount <= 0) {
+                remove.run(hash);
+            }
+        });
     }
 
     /** Ingests one session plan as a single transaction. Full path (no
@@ -945,6 +1069,15 @@ export class UnifiedStore {
                         // unbounded leak #3762/#3901 called out. The
                         // re-ingest path below re-establishes mappings and
                         // refcounts if the row ever reactivates.
+                        // #5756: a row that is ALREADY retired is pure
+                        // bookkeeping — every reader checks only
+                        // NULL/non-NULL, so re-stamping the tombstone and
+                        // re-sweeping its (already-empty) media mappings
+                        // costs O(history) statements per turn on stable
+                        // sessions for no effect. First retirement still
+                        // does the full work below; later sweeps skip the
+                        // row entirely.
+                        if (row.retired_at !== null) continue;
                         this.db
                             .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
                             .run(Date.now(), s.sessionId, row.seq);
@@ -981,10 +1114,10 @@ export class UnifiedStore {
                        next_run_id = excluded.next_run_id,
                        meta_json = excluded.meta_json,
                        stats_json = excluded.stats_json,
-                       metadata_json = excluded.metadata_json,
-                       kstate_json = excluded.kstate_json,
+                       metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
+                       kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
                        tail_json = excluded.tail_json,
-                       ccr_json = excluded.ccr_json,
+                       ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
                        orphans_json = excluded.orphans_json`,
                 )
@@ -1074,14 +1207,34 @@ export class UnifiedStore {
             // via reapDestroyedSubstrate) — they would resurrect on every
             // unified load. Drop absent ids first, releasing their content
             // refs inside the same transaction (deleteSession discipline).
+            // #5744: ONE full-row read serves both the stale sweep and the
+            // unchanged-row skip below (previously: 1 hash-only sweep read +
+            // 1 point read per block per save).
+            type StoredBlockRow = {
+                block_id: string; ord: number; start_seq: number; end_seq: number;
+                start_ref: number | null; end_ref: number | null; tier: number;
+                summary_hash: string; one_hash: string | null; supersedes_block_id: string | null;
+                active: number; created_at: number; covered_hash: string; payload_json: string;
+            };
+            const storedBlocks = new Map<string, StoredBlockRow>();
+            for (const row of this.db
+                .prepare(
+                    "SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, " +
+                    "summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json " +
+                    "FROM blocks WHERE session_id = ?",
+                )
+                .all(s.sessionId) as StoredBlockRow[]) {
+                storedBlocks.set(row.block_id, row);
+            }
+            // #5898 review (P3): rebuild the O(1) membership set the
+            // pre-#5744 code had — a per-stored-block Array.some over the
+            // incoming blocks is O(stored×incoming) string compares on the
+            // sync record() path that #5744 exists to make cheaper.
             const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
-            const staleBlocks = this.db
-                .prepare("SELECT block_id, summary_hash, one_hash FROM blocks WHERE session_id = ?")
-                .all(s.sessionId) as Array<{ block_id: string; summary_hash: string; one_hash: string | null }>;
-            for (const stale of staleBlocks) {
-                if (incomingBlockIds.has(stale.block_id)) continue;
+            for (const [blockId, stale] of storedBlocks) {
+                if (incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
-                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, stale.block_id);
+                this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, blockId);
                 this.releaseContent(stale.summary_hash);
                 if (stale.one_hash !== null) this.releaseContent(stale.one_hash);
             }
@@ -1142,109 +1295,90 @@ export class UnifiedStore {
                 } catch { /* malformed payload: keep the no-claim sentinel */ }
                 return hi < 0 ? [-1, -1] : [lo, hi];
             };
+            const blocksUpsert = this.db.prepare(
+                `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
+                   summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(session_id, block_id) DO UPDATE SET
+                   ord = excluded.ord,
+                   start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
+                   end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
+                   start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
+                   summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
+                   supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
+                   created_at = excluded.created_at, covered_hash = excluded.covered_hash,
+                   payload_json = excluded.payload_json`,
+            );
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
-                const summaryHash = this.putContent(b.summary);
-                const oneHash = b.one === null ? null : this.putContent(b.one);
+                // #5744: steady-state saves re-send every block byte-identical.
+                // When the effective post-upsert row equals the stored row the
+                // whole write (and its CAS bump/release dance, which nets to
+                // zero anyway) is skipped — the ingest then costs no statement
+                // per unchanged block. #4608 bound preservation makes "the
+                // incoming -1 keeps the stored value" part of the equality.
+                const ex = storedBlocks.get(b.blockId);
+                if (ex &&
+                    ex.ord === b.ord &&
+                    (bStartSeq < 0 || bStartSeq === ex.start_seq) &&
+                    (bEndSeq < 0 || bEndSeq === ex.end_seq) &&
+                    (ex.start_ref ?? null) === (b.startRef ?? null) &&
+                    (ex.end_ref ?? null) === (b.endRef ?? null) &&
+                    ex.tier === b.tier &&
+                    ex.summary_hash === b.summaryHash &&
+                    (ex.one_hash ?? null) === (b.oneHash ?? null) &&
+                    (ex.supersedes_block_id ?? null) === b.supersedesBlockId &&
+                    ex.active === (b.active ? 1 : 0) &&
+                    ex.created_at === b.createdAt &&
+                    ex.covered_hash === b.coveredHash &&
+                    ex.payload_json === b.payloadJson) {
+                    continue;
+                }
+                const summaryHash = this.putContent(b.summary, b.summaryHash);
+                const oneHash = b.one === null ? null : this.putContent(b.one, b.oneHash ?? undefined);
                 // Re-ingest of the same block id replaces the row (dry-run
                 // idempotence). Refcount math must distinguish identical
                 // re-ingest (bump then undo) from a true replacement (release
                 // the old hash, keep the new bump) — otherwise identical
                 // re-ingest drives the surviving refcount to zero.
-                const existing = this.db
-                    .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ? AND block_id = ?")
-                    .get(s.sessionId, b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
-                if (existing) {
-                    // #4608: preserve interval bounds across resaves. A later batch that
-                    // no longer contains the covered raws (a post-fold client resend sees
-                    // the folded view, not the raw tail) re-derives -1/-1 "unknown" from
-                    // its own log; once real evidence exists it is durable — the upsert's
-                    // CASE keeps the stored bounds when the incoming side is unknown.
-                    // #4242: redirect the row BEFORE the undo/release so a
-                    // released-to-zero old hash is no longer FK-referenced by
-                    // this blocks row when the content DELETE fires. The
-                    // identical-re-ingest undo (same hash) is a pure -1
-                    // against the +1 bump and cannot reach zero while the row
-                    // itself holds the reference.
-                    // Re-saves bind the TRANSCRIPT-resolved bounds (same source
-                    // as the fresh-insert branch below), never the plan-local
-                    // b.startSeq/endSeq: those are positions in THIS plan's log,
-                    // and once a covered id's old generation is tombstoned (an
-                    // in-place edit lands the new one past max(seq)) they no
-                    // longer coincide with absolute seqs — writing them would
-                    // clobber the durable interval with plan-relative numbers.
-                    this.db
-                        .prepare(
-                            `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                               summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                              ON CONFLICT(session_id, block_id) DO UPDATE SET
-                                ord = excluded.ord,
-                                start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
-                                end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
-                                start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
-                                summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
-                                supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
-                                created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                                payload_json = excluded.payload_json`,
-                        )
-                        .run(
-                            b.blockId,
-                            s.sessionId,
-                            b.ord,
-                            bStartSeq,
-                            bEndSeq,
-                            b.startRef,
-                            b.endRef,
-                            b.tier,
-                            summaryHash,
-                            oneHash,
-                            b.supersedesBlockId,
-                            b.active ? 1 : 0,
-                            b.createdAt,
-                            b.coveredHash,
-                            b.payloadJson,
-                        );
-                    if (existing.summary_hash === summaryHash) this.releaseContent(summaryHash);
-                    else this.releaseContent(existing.summary_hash);
-                    if (existing.one_hash !== null) {
-                        if (existing.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
-                        else this.releaseContent(existing.one_hash);
+                // #4242: redirect the row BEFORE the undo/release so a
+                // released-to-zero old hash is no longer FK-referenced by
+                // this blocks row when the content DELETE fires. The
+                // identical-re-ingest undo (same hash) is a pure -1
+                // against the +1 bump and cannot reach zero while the row
+                // itself holds the reference.
+                // Re-saves bind the TRANSCRIPT-resolved bounds, never the
+                // plan-local b.startSeq/endSeq: those are positions in THIS
+                // plan's log, and once a covered id's old generation is
+                // tombstoned (an in-place edit lands the new one past
+                // max(seq)) they no longer coincide with absolute seqs —
+                // writing them would clobber the durable interval with
+                // plan-relative numbers.
+                blocksUpsert.run(
+                    b.blockId,
+                    s.sessionId,
+                    b.ord,
+                    bStartSeq,
+                    bEndSeq,
+                    b.startRef,
+                    b.endRef,
+                    b.tier,
+                    summaryHash,
+                    oneHash,
+                    b.supersedesBlockId,
+                    b.active ? 1 : 0,
+                    b.createdAt,
+                    b.coveredHash,
+                    b.payloadJson,
+                );
+                if (ex) {
+                    if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
+                    else this.releaseContent(ex.summary_hash);
+                    if (ex.one_hash !== null) {
+                        if (ex.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
+                        else this.releaseContent(ex.one_hash);
                     }
-                    continue;
                 }
-                this.db
-                    .prepare(
-                        `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier,
-                           summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT(session_id, block_id) DO UPDATE SET
-                           ord = excluded.ord,
-                           start_seq = CASE WHEN excluded.start_seq >= 0 THEN excluded.start_seq ELSE blocks.start_seq END,
-                           end_seq = CASE WHEN excluded.end_seq >= 0 THEN excluded.end_seq ELSE blocks.end_seq END,
-                           start_ref = excluded.start_ref, end_ref = excluded.end_ref, tier = excluded.tier,
-                           summary_hash = excluded.summary_hash, one_hash = excluded.one_hash,
-                           supersedes_block_id = excluded.supersedes_block_id, active = excluded.active,
-                           created_at = excluded.created_at, covered_hash = excluded.covered_hash,
-                           payload_json = excluded.payload_json`,
-                    )
-                    .run(
-                        b.blockId,
-                        s.sessionId,
-                        b.ord,
-                        bStartSeq,
-                        bEndSeq,
-                        b.startRef,
-                        b.endRef,
-                        b.tier,
-                        summaryHash,
-                        oneHash,
-                        b.supersedesBlockId,
-                        b.active ? 1 : 0,
-                        b.createdAt,
-                        b.coveredHash,
-                        b.payloadJson,
-                    );
             }
 
             // dead_refs: tombstones can be LIFTED (backing message
@@ -1261,31 +1395,119 @@ export class UnifiedStore {
 
             // refs: the incoming array is AUTHORITATIVE — native compaction
             // and the #2695 zombie reap renumber byRaw/byRef (survivors move
-            // to lower ords, pruned ids vanish). Upserting onto that shape
-            // either hits the (session_id, ord) PK (ingest rolls back, 3-strike
-            // self-disable — review #2690 blocking 1) or leaves ghost rows that
-            // make the loaded map strictly larger than legacy (permanent
-            // DIGEST DRIFT spam — blocking 2). Replace the whole set.
-            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(s.sessionId);
+            // to lower ords, pruned ids vanish). A blind upsert onto that shape
+            // would hit the (session_id, ord) PK (review #2690 blocking 1) or
+            // leave ghost rows (blocking 2), which is why this used to
+            // DELETE-all + re-insert EVERY row on EVERY save. That made the
+            // store leg of an O(new messages) delta save O(full history):
+            // ~H native statement executions per turn on a long session
+            // (~97% of all per-save statements; the CDP profile behind #5744)
+            // while touching zero history rows in the append-only steady
+            // state. Now: one indexed read of the stored set, an in-memory
+            // diff, and writes ONLY for what changed — vanished raw_ids are
+            // deleted (ghosts can never outlive one save, so the loaded map
+            // stays exactly the legacy one), untouched survivors are skipped,
+            // and added/moved rows go out as multi-row upsert batches (a
+            // first ingest of a 3k-message session costs ~20 statements,
+            // not 3001; the compaction storm that motivated the old
+            // replace-all now costs the same bounded batch budget).
+            //
+            // Load-bearing precondition (guaranteed by the producers, not
+            // checked here): a surviving raw_id's ord never INCREASES between
+            // saves — appends take higher ords, and the only renumberers
+            // (native-compaction archive #395 and zombie reap #2695, both via
+            // pruneRefsToLiveIds) preserve survivor key order and only drop
+            // ids. The incremental upsert depends on that: a new ord crossing a
+            // still-live neighbour's ord violates the (session_id, ord) PK
+            // mid-batch and rolls the whole ingest back. If a future producer
+            // can reorder survivors upward, add a delete-all fallback around
+            // the write phase below.
+            const oldRefs = new Map<string, { ord: number; ref: string; refNum: number | null }>();
+            for (const row of this.db
+                .prepare("SELECT raw_id, ord, ref, ref_num FROM refs WHERE session_id = ?")
+                .all(s.sessionId) as Array<{ raw_id: string; ord: number; ref: string; ref_num: number | null }>) {
+                oldRefs.set(row.raw_id, { ord: row.ord, ref: row.ref, refNum: row.ref_num });
+            }
+            const goneRefIds: string[] = [];
+            const touchedRefs: RefRow[] = [];
             for (const r of input.refs) {
-                this.db
-                    .prepare(
-                        "INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, raw_id) DO UPDATE SET ord = excluded.ord, ref = excluded.ref, ref_num = excluded.ref_num",
-                    )
-                    .run(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
+                const o = oldRefs.get(r.rawId);
+                if (!o || o.ord !== r.ord || o.ref !== r.ref || o.refNum !== r.refNum) {
+                    touchedRefs.push(r);
+                } else {
+                    oldRefs.delete(r.rawId); // matched and unmodified — consume it
+                }
+            }
+            for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
+            if (goneRefIds.length > 0) {
+                const perChunk = REF_STMT_MAX_PARAMS - 1; // reserve the leading session_id slot
+                for (let i = 0; i < goneRefIds.length; i += perChunk) {
+                    const ids = goneRefIds.slice(i, i + perChunk);
+                    this.db
+                        .prepare(
+                            "DELETE FROM refs WHERE session_id = ? AND raw_id IN (" + ids.map(() => "?").join(", ") + ")",
+                        )
+                        .run(s.sessionId, ...ids);
+                }
+            }
+            if (touchedRefs.length > 0) {
+                const colsPerRow = 5;
+                const perChunk = Math.floor(REF_STMT_MAX_PARAMS / colsPerRow);
+                for (let i = 0; i < touchedRefs.length; i += perChunk) {
+                    const rows = touchedRefs.slice(i, i + perChunk);
+                    const params: unknown[] = [];
+                    for (const r of rows) params.push(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
+                    this.db
+                        .prepare(
+                            "INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES " +
+                                rows.map(() => "(?, ?, ?, ?, ?)").join(", ") +
+                                " ON CONFLICT(session_id, raw_id) DO UPDATE SET ord = excluded.ord, ref = excluded.ref, ref_num = excluded.ref_num",
+                        )
+                        .run(...params);
+                }
             }
 
             // ccr_entries: the content store is a map whose keys can be
-            // dropped — full-replace keeps the table authoritative. Release
-            // every old hash first, then re-insert (idempotent: identical
-            // sets cancel out bump+release).
-            const oldCcr = this.db
-                .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
-                .all(s.sessionId) as { content_hash: string }[];
-            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(s.sessionId);
-            for (const row of oldCcr) this.releaseContent(row.content_hash);
+            // dropped — the final state must be EXACTLY the incoming set.
+            // #5744: steady state no longer pays DELETE-all + re-INSERT-all
+            // (which also destroyed and recreated every CAS blob via
+            // release-to-zero each save). Unchanged entries (same key → same
+            // ord AND same content hash) are skipped entirely — no CAS
+            // round-trips. Changed/absent rows are deleted FIRST (frees their
+            // PK ords so renumbered swaps cannot collide), their old hashes
+            // released while nothing references them anymore (#4242
+            // redirect-then-release), then the changed+new entries are
+            // put+inserted.
+            const incomingCcr = new Map<string, CcrEntryRow>();
+            for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
+            const storedCcr = this.db
+                .prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ?")
+                .all(s.sessionId) as Array<{ ord: number; ccr_key: string; content_hash: string }>;
+            const changedCcrKeys: string[] = [];
+            const unchangedCcrKeys = new Set<string>();
+            const releasedOldCcrHashes: string[] = [];
+            for (const row of storedCcr) {
+                const inc = incomingCcr.get(row.ccr_key);
+                if (!inc) { changedCcrKeys.push(row.ccr_key); releasedOldCcrHashes.push(row.content_hash); continue; }
+                if (row.ord !== inc.ord || row.content_hash !== inc.contentHash) {
+                    changedCcrKeys.push(row.ccr_key);
+                    releasedOldCcrHashes.push(row.content_hash);
+                } else {
+                    unchangedCcrKeys.add(row.ccr_key);
+                }
+            }
+            if (changedCcrKeys.length > 0) {
+                for (let i = 0; i < changedCcrKeys.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const keys = changedCcrKeys.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    this.db
+                        .prepare(`DELETE FROM ccr_entries WHERE session_id = ? AND ccr_key IN (${keys.map(() => "?").join(", ")})`)
+                        .run(s.sessionId, ...keys);
+                }
+            }
+            for (const hash of releasedOldCcrHashes) this.releaseContent(hash);
             for (const e of input.ccrEntries) {
-                const hash = this.putContent(e.content);
+                if (unchangedCcrKeys.has(e.key)) continue;
+                const hash = this.putContent(e.content, e.contentHash);
                 this.db
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
@@ -1305,14 +1527,36 @@ export class UnifiedStore {
         try {
             // Log the result: operators tuning storage.walJournalSizeLimitBytes
             // need to see whether ticks are actually reclaiming frames.
+            const t0 = performance.now();
             const row = this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get() as { busy: number; log: number; checkpointed: number };
+            const ms = Math.round(performance.now() - t0);
+            this.lastWalTick = { busy: row.busy, log: row.log, checkpointed: row.checkpointed, ms };
             loggerLog(
                 "debug",
-                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed}`,
+                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed} took=${ms}ms`,
             );
         } catch (err) {
             loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
         }
+    }
+
+    /** #5744: read-only WAL forensics for the slow-ingest warn line — current
+     * WAL size plus the last periodic checkpoint's (busy, log, checkpointed)
+     * triple and duration. A slow save whose window contains a multi-second
+     * tick is a checkpoint burst, not per-row statement cost; the two must be
+     * told apart from the log alone. Returns null when there is nothing to
+     * report (no WAL file). Never throws into the caller. */
+    walDiagnosticsSuffix(): string | null {
+        let walBytes: number;
+        try {
+            walBytes = statSync(`${this.dbPath}-wal`).size;
+        } catch {
+            return null;
+        }
+        const tick = this.lastWalTick
+            ? ` lastCheckpoint=(busy=${this.lastWalTick.busy} log=${this.lastWalTick.log} checkpointed=${this.lastWalTick.checkpointed} took=${this.lastWalTick.ms}ms)`
+            : "";
+        return `, ${formatDbSize(walBytes)} WAL${tick}`;
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
@@ -1430,9 +1674,11 @@ export class UnifiedStore {
         // #4390: a rewound message that comes back reactivates in place —
         // the tombstone clears, the original seq is reused, and the view
         // heals without a duplicate row even on completeLog-less saves.
-        for (const seq of retiredSeqs) {
-            const back = messages.some((m) => m.seq === seq);
-            if (back) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+        if (retiredSeqs.length > 0) {
+            const presentedSeqs = new Set(messages.map((m) => m.seq));
+            for (const seq of retiredSeqs) {
+                if (presentedSeqs.has(seq)) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+            }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
@@ -1622,6 +1868,31 @@ export class UnifiedStore {
         return out.sort((a, b) => a.refNum - b.refNum);
     }
 
+    /** #6029: message bodies addressed by their STABLE msg_id — the restamp-proof
+     *  twin of messageContentByRefNums. restampRefsToLedger renumbers the LIVE
+     *  refs at cold load (the #5196 parked band lands on fresh high numbers), but
+     *  messages.ref_num is frozen at index time, so a ref-number join silently
+     *  misses every renumbered row. msg_id never moves under a restamp; unknown
+     *  ids come back absent and retired rows stay excluded, exactly like the
+     *  ref-number sibling. */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (msgIds.length === 0) return [];
+        const ids = [...new Set(msgIds)];
+        const CHUNK = 500;
+        const out: MessageIdContentRow[] = [];
+        for (let i = 0; i < ids.length; i += CHUNK) {
+            const chunk = ids.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT msg_id, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as { msg_id: string; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ msgId: r.msg_id, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out;
+    }
+
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
      *  state.blocks loses the entry, blockContents keeps the text). The full
      *  ingest skips orphan-shaped records (envelope-served, owner-pinned
@@ -1709,12 +1980,14 @@ export class UnifiedStore {
 
     /** #3928: per-session storage footprint for `bili sessions ls`. Counts
      *  never cascade into each other: inline bytes cover only JSON columns,
-     *  CAS bytes only content-addressed blobs; the CAS split by refcount
-     *  mirrors exactly what deleteSession frees. */
+     *  CAS bytes only content-addressed blobs; the CAS split compares the
+     *  global refcount with this deletion's per-hash release count. */
     sessionStorageStats(sessionId: string): SessionStorageStats {
         const counts = this.db
             .prepare(
                 "SELECT " +
+                    "(SELECT COUNT(*) FROM sessions WHERE session_id = ?) AS sessions, " +
+                    "(SELECT COUNT(*) FROM conversations WHERE session_id = ?) AS conversations, " +
                     "(SELECT COUNT(*) FROM messages WHERE session_id = ?) AS messages, " +
                     "(SELECT COUNT(*) FROM message_media WHERE session_id = ?) AS media, " +
                     "(SELECT COUNT(*) FROM blocks WHERE session_id = ?) AS blocks, " +
@@ -1725,40 +1998,47 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            sessions: number; conversations: number;
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
         };
         const inlineBytes =
             ((this.db
                 .prepare(
-                    "SELECT COALESCE(SUM(LENGTH(meta_json)), 0) + COALESCE(SUM(LENGTH(stats_json)), 0) " +
-                        "+ COALESCE(SUM(LENGTH(metadata_json)), 0) + COALESCE(SUM(LENGTH(kstate_json)), 0) " +
-                        "+ COALESCE(SUM(LENGTH(tail_json)), 0) + COALESCE(LENGTH(ccr_json), 0) AS b " +
+                    "SELECT COALESCE(SUM(LENGTH(CAST(meta_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(stats_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(metadata_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(kstate_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(tail_json AS BLOB))), 0) + COALESCE(SUM(LENGTH(CAST(ccr_json AS BLOB))), 0) " +
+                        "+ COALESCE(SUM(LENGTH(CAST(orphans_json AS BLOB))), 0) AS b " +
                         "FROM sessions WHERE session_id = ?",
                 )
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
-                .prepare("SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS b FROM blocks WHERE session_id = ?")
+                .prepare("SELECT COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0) AS b FROM blocks WHERE session_id = ?")
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
-                .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .prepare("SELECT COALESCE(SUM(LENGTH(CAST(value_json AS BLOB))), 0) AS b FROM session_ext WHERE session_id = ?")
                 .get(sessionId) as { b: number }).b ?? 0);
         const cas = this.db
             .prepare(
-                "SELECT COALESCE(SUM(CASE WHEN refcount = 1 THEN byte_len ELSE 0 END), 0) AS exclusiveBytes, " +
-                    "COALESCE(SUM(CASE WHEN refcount > 1 THEN 1 ELSE 0 END), 0) AS sharedBlobs " +
-                    "FROM content WHERE hash IN (" +
-                    "SELECT content_hash FROM messages WHERE session_id = ? " +
-                    "UNION SELECT media_hash FROM message_media WHERE session_id = ? " +
-                    "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
-                    "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
-                    "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
-                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+                `WITH owned_refs(hash, released) AS (
+                    SELECT content_hash, 1 FROM messages WHERE session_id = ?
+                    UNION ALL SELECT media_hash, 1 FROM message_media WHERE session_id = ?
+                    UNION ALL SELECT summary_hash, 1 FROM blocks WHERE session_id = ?
+                    UNION ALL SELECT one_hash, 1 FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL
+                    UNION ALL SELECT content_hash, 1 FROM ccr_entries WHERE session_id = ?
+                    UNION ALL SELECT state_hash, CASE WHEN pinned = 0 THEN 1 ELSE 0 END FROM checkpoints WHERE session_id = ?
+                 ), releases AS (SELECT hash, SUM(released) AS n FROM owned_refs GROUP BY hash)
+                 SELECT COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN c.byte_len ELSE 0 END), 0) AS exclusiveBytes,
+                        COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN 1 ELSE 0 END), 0) AS exclusiveBlobs,
+                        COALESCE(SUM(CASE WHEN c.refcount > r.n THEN 1 ELSE 0 END), 0) AS sharedBlobs
+                   FROM releases r JOIN content c ON c.hash = r.hash`,
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
         return {
             rows: {
+                sessions: counts.sessions,
+                conversations: counts.conversations,
                 messages: counts.messages,
                 media: counts.media,
                 blocks: counts.blocks,
@@ -1771,6 +2051,7 @@ export class UnifiedStore {
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,
+            casExclusiveBlobs: cas.exclusiveBlobs,
             casSharedBlobs: cas.sharedBlobs,
         };
     }
@@ -1881,7 +2162,7 @@ export class UnifiedStore {
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
@@ -1899,7 +2180,15 @@ export class UnifiedStore {
         // One JSONL line per archived session: append-only (cheap, crash =
         // at worst one truncated line which the reader skips), restore
         // rewrites the file without the restored session's lines.
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        // Serialized here, appended as the LAST step inside the sweep
+        // transaction below: a sweep that cannot start or fails midway
+        // (write lock held by another process, constraint error) must not
+        // leave a line behind for a session that is still active — that
+        // stale line would shadow the next successful archive on restore,
+        // and every failed attempt would add another full copy. The line
+        // still reaches the log before COMMIT, so a committed sweep always
+        // has its export.
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
@@ -1921,6 +2210,7 @@ export class UnifiedStore {
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
             contentRowsDeleted = this.collectZeroRefIn(rel);
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#3901] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1945,22 +2235,31 @@ export class UnifiedStore {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
-        // Scan the JSONL for the session's line (skip malformed/truncated
+        // Scan the JSONL for the session's NEWEST line (#6317: a pre-fix
+        // failed archive can leave stale lines behind; a later successful
+        // archive appends the newest dump). Skip malformed/truncated
         // trailing lines — an archive append interrupted by a crash must not
-        // block restoring OTHER sessions).
+        // block restoring OTHER sessions). Newest first: when the log holds
+        // more than one line for this session (an archive whose sweep never
+        // committed, then a later successful one), the last line appended is
+        // the state the session was actually archived in.
         let lineNo = -1;
+        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
-            for (let i = 0; i < rawLines.length; i++) {
+            for (let i = rawLines.length - 1; i >= 0; i--) {
                 if (!rawLines[i].trim()) continue;
-                let candidate: { sessionId?: string };
+                let candidate: unknown;
                 try {
-                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                    candidate = JSON.parse(rawLines[i]) as unknown;
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+                // #6317: count ALL entries for this session. The reverse scan
+                // meets the NEWEST line first — keep that; a plain
+                // `lineNo = i` without break would end on the OLDEST.
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) { if (lineNo === -1) lineNo = i; matchCount += 1; }
             }
         } catch {
             return { ok: false, reason: "export-corrupt" };
@@ -1972,9 +2271,32 @@ export class UnifiedStore {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        if (matchCount > 1) {
+            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
+        }
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            const references = new Map<string, number>();
+            const addRef = (hash: unknown): void => {
+                if (typeof hash === "string") references.set(hash, (references.get(hash) ?? 0) + 1);
+            };
+            for (const m of dump.messages) addRef(m.content_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) addRef(mm.media_hash);
+            for (const b of dump.blocks) {
+                if (this.db.prepare("SELECT 1 FROM blocks WHERE session_id = ? AND block_id = ?").get(sessionId, b.block_id)) continue;
+                addRef(b.summary_hash);
+                addRef(b.one_hash);
+            }
+            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const cp of dump.checkpoints) {
+                if (!this.getCheckpoint(cp.cp_id as string)) addRef(cp.state_hash);
+            }
+            for (const [hash, count] of references) {
+                const body = dump.content[hash] ?? this.getContent(hash);
+                if (body === null || body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+                if (count > 1) this.db.prepare("UPDATE content SET refcount = refcount + ? WHERE hash = ?").run(count - 1, hash);
+            }
             const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             for (const m of dump.messages) {
                 // #4665: pre-fix dumps lack both fields — recompute identity
@@ -1996,8 +2318,10 @@ export class UnifiedStore {
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
             for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
-            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
-            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+            for (const x of dump.sessionExt) {
+                insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now());
+            }
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
             this.db
@@ -2011,19 +2335,24 @@ export class UnifiedStore {
                     sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
                 );
         });
-        // Drop the restored session's line(s) from the JSONL (a same-session
-        // archive can theoretically appear more than once across reinstalls;
-        // rewrite removes them all). Other sessions' lines are untouched.
+        // Drop the restored session's line(s) from the JSONL. #6317: a
+        // pre-fix failed archive can leave more than one line; restore now
+        // already used the newest match and removes all matches, warning when
+        // stale lines were present so the loss pattern is diagnosable.
         const kept: string[] = [];
+        let ownLines = 0;
         for (const l of rawLines) {
             if (!l.trim()) continue;
             try {
                 const head = JSON.parse(l) as { sessionId?: string };
-                if (head.sessionId === sessionId) continue;
+                if (head.sessionId === sessionId) {
+                    if (++ownLines === 2) loggerLog("warn", `[storage] archive log holds more than one line for session ${sessionId}: the newest was restored, older ones are dropped`);
+                    continue;
+                }
             } catch { continue; }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
         return { ok: true };
     }
@@ -2091,9 +2420,9 @@ export class UnifiedStore {
         let lineNo = -1;
         for (let i = 0; i < rawLines.length; i++) {
             if (!rawLines[i].trim()) continue;
-            let head: { sessionId?: string; blockId?: string };
-            try { head = JSON.parse(rawLines[i]) as typeof head; } catch { continue; }
-            if (head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
+            let head: unknown;
+            try { head = JSON.parse(rawLines[i]) as unknown; } catch { continue; }
+            if (head && typeof head === "object" && "sessionId" in head && "blockId" in head && head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
         }
         if (lineNo === -1) return { ok: false, reason: "not-found" };
         let dump: { block: Record<string, unknown>; content: Record<string, string> };
@@ -2107,7 +2436,12 @@ export class UnifiedStore {
                 "SELECT 1 AS one FROM blocks WHERE session_id = ? AND block_id = ?",
             ).get(sessionId, blockId);
             if (twin) return;
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            for (const hash of [dump.block.summary_hash, dump.block.one_hash]) {
+                if (typeof hash !== "string") continue;
+                const body = dump.content[hash];
+                if (body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+            }
             this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,
@@ -2127,7 +2461,7 @@ export class UnifiedStore {
             } catch { continue; }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#5312] restored block ${blockId} into ${sessionId} from ${exportPath}`);
         return { ok: true };
     }
@@ -2135,9 +2469,10 @@ export class UnifiedStore {
     /** #3901/#3463: age-sweep GC. Sessions whose updated_at is older than
      *  the retention cutoff are archived (export + sweep); zero-ref content
      *  rows left by any path are collected. `vacuum: 'full'` additionally
-     *  rebuilds the database file (auto_vacuum=INCREMENTAL handles freed
-     *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
-     *  databases created before that pragma). */
+     *  rebuilds the database file. `vacuum: 'incremental'` hands the
+     *  freelist back without the rewrite, but only on a file whose header
+     *  says auto_vacuum=INCREMENTAL (see storagePragmas); on a file created
+     *  with auto_vacuum=0 it is a no-op until one full VACUUM converts it. */
     gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
         // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
         // write lock with no intermediate progress. Running it against a db that
@@ -2387,8 +2722,8 @@ export class UnifiedStore {
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
             validateExtKey(keyPrefix, "key prefix");
-            where.push("key LIKE ? ESCAPE '\\'");
-            args.push(likeEscape(keyPrefix) + "%");
+            where.push("key LIKE ? ESCAPE '\\' AND instr(key, ?) = 1");
+            args.push(likeEscape(keyPrefix) + "%", keyPrefix);
         }
         const sql =
             "SELECT namespace, key, value_json, updated_at FROM kv_store" +
@@ -2419,6 +2754,13 @@ export class UnifiedStore {
             .prepare("SELECT updated_at FROM sessions WHERE session_id = ?")
             .get(sessionId) as { updated_at: number } | undefined;
         return row?.updated_at ?? null;
+    }
+
+    sessionIdentity(sessionId: string): { protocol?: string; origin?: string } | null {
+        const row = this.db
+            .prepare("SELECT protocol, origin FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { protocol: string | null; origin: string | null } | undefined;
+        return row ? { protocol: row.protocol ?? undefined, origin: row.origin ?? undefined } : null;
     }
 
     getCheckpoint(cpId: string): CheckpointRow | undefined {
@@ -2682,6 +3024,14 @@ export class UnifiedStore {
         return Buffer.from(row.bytes).toString("utf8");
     }
 
+    /** Scalar drift arbitration without reading or decoding block CAS views.
+     *  Count rows even when the session header is absent, as getBlocks does. */
+    activeBlockCount(sessionId: string): number {
+        const row = this.db.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ? AND active = 1")
+            .get(sessionId) as { n: number };
+        return row.n;
+    }
+
     /** Small arbitration fields for lazy reads; no serialized session surfaces. */
     getLoadHeader(sessionId: string): { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number } | null {
         const row = this.db.prepare(`
@@ -2730,13 +3080,17 @@ export class UnifiedStore {
     getBlockContents(sessionId: string): BlockContentsMap | null;
     getBlockContents(sessionId: string, opts?: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] | BlockContentsMap | null {
         if (opts !== undefined) {
-            const rows = this.db.prepare(`SELECT block_id, summary_hash, one_hash FROM blocks
-                WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?`)
-                .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; summary_hash: string; one_hash: string | null }[];
+            const rows = this.db.prepare(`SELECT b.block_id, b.one_hash, s.bytes AS summary_bytes, o.bytes AS one_bytes
+                FROM (SELECT block_id, ord, summary_hash, one_hash FROM blocks
+                    WHERE session_id = ? ORDER BY ord, block_id LIMIT ? OFFSET ?) b
+                LEFT JOIN content s ON s.hash = b.summary_hash
+                LEFT JOIN content o ON o.hash = b.one_hash
+                ORDER BY b.ord, b.block_id`)
+                .all(sessionId, opts.limit, opts.offset ?? 0) as { block_id: string; one_hash: string | null; summary_bytes: Buffer | null; one_bytes: Buffer | null }[];
             return rows.map((row) => ({
                 blockId: row.block_id,
-                summary: this.getContent(row.summary_hash) ?? "",
-                one: row.one_hash ? this.getContent(row.one_hash) : null,
+                summary: row.summary_bytes === null ? "" : Buffer.from(row.summary_bytes).toString("utf8"),
+                one: row.one_hash && row.one_bytes !== null ? Buffer.from(row.one_bytes).toString("utf8") : null,
             }));
         }
         const row = this.db
@@ -2956,18 +3310,37 @@ export class UnifiedStore {
 
     /** #D5-5 render windowing: full rows (content + media) ONLY for seqs
      *  outside the covered intervals. Inclusive [start, end] pairs; overlaps
-     *  are harmless (each pair contributes an outside-of-pair conjunct).
+     *  are merged before querying the uncovered gaps in bounded batches.
      *  Empty interval list = every live row. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
-        let sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? AND retired_at IS NULL";
-        const params: unknown[] = [sessionId];
-        for (const [a, b] of intervals) {
-            sql += " AND (seq < ? OR seq > ?)";
-            params.push(a, b);
+        const merged: [number, number][] = [];
+        for (const [start, end] of [...intervals].sort((a, b) => a[0] - b[0])) {
+            if (start > end) continue;
+            const last = merged.at(-1);
+            if (last && start <= last[1] + 1) last[1] = Math.max(last[1], end);
+            else merged.push([start, end]);
         }
-        sql += " ORDER BY seq";
-        const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
-        return rows.map((r) => ({
+        const gaps: Array<[number | undefined, number | undefined]> = [];
+        let lower: number | undefined;
+        for (const [start, end] of merged) {
+            gaps.push([lower, start]);
+            lower = end;
+        }
+        gaps.push([lower, undefined]);
+        const rows: Record<string, unknown>[] = [];
+        for (let offset = 0; offset < gaps.length; offset += 200) {
+            const params: unknown[] = [sessionId];
+            const clauses = gaps.slice(offset, offset + 200).map(([lo, hi]) => {
+                const bounds: string[] = [];
+                if (lo !== undefined) { bounds.push("seq > ?"); params.push(lo); }
+                if (hi !== undefined) { bounds.push("seq < ?"); params.push(hi); }
+                return bounds.length > 0 ? `(${bounds.join(" AND ")})` : "1";
+            });
+            const sql = "SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages WHERE session_id = ? AND retired_at IS NULL"
+                + ` AND (${clauses.join(" OR ")}) ORDER BY seq`;
+            for (const row of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) rows.push(row);
+        }
+        return Array.from(this.messageContents(rows), ([r, content]) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
             ref: (r.ref as string | null) ?? null,
@@ -2976,8 +3349,26 @@ export class UnifiedStore {
             kind: r.kind as string,
             contentHash: r.content_hash as string,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
         }));
+    }
+
+    /** Fetch bodies for captured message rows in bounded batches. Keeping
+     *  the metadata query separate avoids holding a whole history's BLOBs
+     *  alongside all of its decoded strings. Hashes preserve row identity. */
+    private *messageContents(rows: readonly Record<string, unknown>[]): Generator<readonly [Record<string, unknown>, string]> {
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => row.content_hash as string))];
+            const contents = this.db.prepare(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
+                .all(...hashes) as { hash: string; bytes: Uint8Array }[];
+            const byHash = new Map(contents.map((row) => [row.hash, row.bytes]));
+            for (const row of chunk) {
+                const bytes = byHash.get(row.content_hash as string);
+                yield [row, bytes === undefined ? "" : Buffer.from(bytes).toString("utf8")];
+            }
+        }
     }
 
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[]; fromSeqExclusive?: number }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
@@ -2998,7 +3389,7 @@ export class UnifiedStore {
                 `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
             )
             .all(...params) as Record<string, unknown>[];
-        return rows.map((r) => {
+        return Array.from(this.messageContents(rows), ([r, content]) => {
             messageRowReads.count++;
             return {
             seq: r.seq as number,
@@ -3010,7 +3401,7 @@ export class UnifiedStore {
             contentHash: r.content_hash as string,
             retiredAt: (r.retired_at as number | null) ?? null,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
             };
         });
     }
@@ -3030,7 +3421,8 @@ export class UnifiedStore {
             const chunk = unique.slice(i, i + CHUNK);
             const rows = this.db
                 .prepare(
-                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                     LEFT JOIN content c ON c.hash = messages.content_hash
                      WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 )
                 .all(sessionId, ...chunk) as Record<string, unknown>[];
@@ -3045,7 +3437,7 @@ export class UnifiedStore {
                     kind: r.kind as string,
                     contentHash: r.content_hash as string,
                     ts: (r.ts as number | null) ?? null,
-                    content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+                    content: this.hydrateMedia(r.content_bytes === null ? "" : Buffer.from(r.content_bytes as Uint8Array).toString("utf8")),
                 });
             }
         }
@@ -3137,9 +3529,16 @@ export class UnifiedStore {
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): (BlockRow & { summaryHash: string; oneHash: string | null })[] {
         const rows = this.db
             .prepare(
-                `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
-                        supersedes_block_id, active, created_at, covered_hash, payload_json
-                 FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,            )
+                `SELECT b.block_id, b.ord, b.start_seq, b.end_seq, b.start_ref, b.end_ref, b.tier, b.summary_hash, b.one_hash,
+                        b.supersedes_block_id, b.active, b.created_at, b.covered_hash, b.payload_json,
+                        s.bytes AS summary_bytes, o.bytes AS one_bytes
+                 FROM (SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
+                              supersedes_block_id, active, created_at, covered_hash, payload_json
+                       FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}) b
+                 LEFT JOIN content s ON s.hash = b.summary_hash
+                 LEFT JOIN content o ON o.hash = b.one_hash
+                 ORDER BY b.ord, b.block_id`,
+            )
             .all(sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])) as Record<string, unknown>[];
         return rows.map((r) => ({
             blockId: r.block_id as string,
@@ -3151,8 +3550,8 @@ export class UnifiedStore {
             tier: r.tier as number,
             summaryHash: r.summary_hash as string,
             oneHash: (r.one_hash as string | null) ?? null,
-            summary: this.getContent(r.summary_hash as string) ?? "",
-            one: r.one_hash ? (this.getContent(r.one_hash as string) ?? null) : null,
+            summary: r.summary_bytes === null ? "" : Buffer.from(r.summary_bytes as Buffer).toString("utf8"),
+            one: r.one_hash && r.one_bytes !== null ? Buffer.from(r.one_bytes as Buffer).toString("utf8") : null,
             supersedesBlockId: (r.supersedes_block_id as string | null) ?? null,
             active: (r.active as number) === 1,
             createdAt: r.created_at as number,
@@ -3211,6 +3610,7 @@ export class UnifiedStore {
             ord: r.ord as number,
             key: r.ccr_key as string,
             content: this.getContent(r.content_hash as string) ?? "",
+            contentHash: r.content_hash as string,
         }));
     }
 }

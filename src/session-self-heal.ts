@@ -44,7 +44,7 @@ import type { Session } from "./session.js";
  */
 
 /** Consecutive idle/zombie rounds before a remedy arms. Constant by design
- * (#2155: no new config knobs); recorded in TECHNICAL-NOTES.md. */
+ * (#2155: no new config knobs); recorded in docs/technical-notes.md. */
 export const SELF_HEAL_WINDOW = 5;
 
 /** #3004: wall-clock cap on the suppress-nudge remedy. Release is

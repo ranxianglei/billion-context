@@ -77,15 +77,40 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -95,7 +120,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -192,10 +217,35 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
-            "properties": {}
+            "properties": {
+              "scope": {
+                "type": "string",
+                "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+              },
+              "view": {
+                "type": "string",
+                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              },
+              "tool": {
+                "type": "string",
+                "description": "With view:\"messages\": only list results of this tool name"
+              },
+              "sort": {
+                "type": "string",
+                "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+              },
+              "limit": {
+                "type": "number",
+                "description": "Max entries to list"
+              },
+              "archiveDetail": {
+                "type": "boolean",
+                "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+              }
+            }
           }
         }
       },
@@ -203,7 +253,7 @@
         "type": "function",
         "function": {
           "name": "acp_cache",
-          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -213,7 +263,7 @@
                   "summary",
                   "full"
                 ],
-                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
               }
             }
           }
@@ -307,16 +357,41 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -326,7 +401,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }

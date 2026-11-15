@@ -81,13 +81,25 @@ function makeWorld(webVersion: string): World {
     };
 }
 
-function recordingAsyncRunner(calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
+/** #5642: a successful op materializes the requested version into the
+ *  profile's node_modules, mirroring what the real channel leaves behind —
+ *  refreshDshProfileBundles verifies that outcome instead of trusting the
+ *  exit code. */
+function recordingAsyncRunner(dshHome: string, calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
     return async (plan) => {
         const base = path.basename(plan.command).toLowerCase();
         const tokens = base === "cmd.exe" || base === "cmd"
             ? (plan.args[3] ?? "").replace(/^"|"$/g, "").split(" ").map((t) => t.replace(/^"|"$/g, "")).filter((t) => t.length > 0).slice(1)
             : [...plan.args];
         calls.push(tokens.join(" "));
+        const name = tokens[tokens.indexOf("--profile") + 1];
+        const spec = tokens[tokens.length - 1];
+        const version = spec.startsWith("billion-context@") ? spec.slice("billion-context@".length) : undefined;
+        if (name !== undefined && version !== undefined) {
+            const copy = path.join(dshHome, "profiles", name, "node_modules", "billion-context");
+            fs.mkdirSync(copy, { recursive: true });
+            fs.writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "billion-context", version }));
+        }
         return { stdout: "", stderr: "" };
     };
 }
@@ -112,7 +124,7 @@ test("convergeDshProfileBundles: stale registry copy + declared-but-missing moun
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(w.dshHome, calls) });
         await convergeDshProfileBundles(w.globalDir, "0.1.176", w.env, log);
         assert.deepEqual(calls, ["plugin --profile ghost add billion-context@0.1.176", "plugin --profile web add billion-context@0.1.176"]);
         assert.ok(entries.some((l) => l.includes("behind the global copy (web@0.1.175") && l.includes("0.1.176")), "stale transition logged");
@@ -127,7 +139,7 @@ test("convergeDshProfileBundles: in-step world stays silent and spawn-free", asy
     const calls: string[] = [];
     const { entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(w.dshHome, calls) });
         await convergeDshProfileBundles(w.globalDir, "0.1.176", w.env, entries.push.bind(entries) as unknown as Logger);
         assert.deepEqual(calls, []);
         assert.equal(entries.length, 0, "no log lines for a healthy machine");
@@ -141,7 +153,7 @@ test("convergeDshProfileBundles: missing installDir or version is a no-op", asyn
     const w = makeWorld("0.1.175");
     const calls: string[] = [];
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(w.dshHome, calls) });
         await convergeDshProfileBundles(undefined, "0.1.176", w.env);
         await convergeDshProfileBundles(w.globalDir, undefined, w.env);
         assert.deepEqual(calls, []);
@@ -157,7 +169,7 @@ test("checkForUpdate: an up-to-date global still converges stale dsh profile cop
     const prevDshHome = process.env.DSH_HOME;
     process.env.DSH_HOME = w.dshHome;
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(w.dshHome, calls) });
         process.env.XDG_CACHE_HOME = path.join(w.base, "cache");
         await withRegistry("0.1.176", async () => {
             await checkForUpdate({ packageName: "billion-context", currentVersion: "0.1.176", autoUpdate: true, installDir: w.globalDir }, true);
@@ -178,7 +190,7 @@ test("checkForUpdate: in-step profiles spawn nothing on the up-to-date path", as
     const prevDshHome = process.env.DSH_HOME;
     process.env.DSH_HOME = w.dshHome;
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(w.dshHome, calls) });
         process.env.XDG_CACHE_HOME = path.join(w.base, "cache");
         await withRegistry("0.1.176", async () => {
             await checkForUpdate({ packageName: "billion-context", currentVersion: "0.1.176", autoUpdate: true, installDir: w.globalDir }, true);

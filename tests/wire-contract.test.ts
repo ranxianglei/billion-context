@@ -53,7 +53,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
+import { verifySdkHmac, WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -145,6 +145,25 @@ test("WC-023 mid-conversation system messages satisfy the two-sided positional c
             { role: "user", content: [{ type: "text", text: "v" }] },
         ],
     })[0], /WC-023.*precede/);
+});
+
+test("WC-024 thinking blocks must carry a signature (#5998)", () => {
+    // Legal: signed thinking replayed verbatim.
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig_A" }, { type: "text", text: "a" }] },
+        ],
+    }), []);
+    // Illegal: unsigned thinking — the DSH transcript shape (reasoning stored as {type, text}).
+    assert.match(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ],
+    })[0], /WC-024/);
+    // Illegal: an empty-string signature counts as missing.
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "" }] }],
+    })[0], /WC-024/);
 });
 
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
@@ -248,6 +267,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 { role: "assistant", content: [{ type: "text", text: "a" }] },
                 { role: "system", content: [{ type: "text", text: "s" }] },
             ] },
+            // WC-024: the DSH transcript shape (#5998) — assistant thinking without a signature.
+            { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t" }] }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -313,8 +334,10 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
 });
 
 test("wire-contract ledger: every header rule has a live enforcement clause", () => {
+    const apig = verifySdkHmac({ method: "POST", url: "https://api.example.com/v1/chat/completions", headers: {}, body: Buffer.alloc(0), sk: "fixture-key" });
+    const violations = [...validateGoSessionHeaders({}), ...(apig.reason ? [apig.reason] : [])];
     for (const rule of WIRE_HEADER_RULES) {
-        const enforced = validateGoSessionHeaders({}).some((v) => v.startsWith(rule.id));
+        const enforced = violations.some((v) => v.startsWith(rule.id));
         assert.ok(enforced, `header rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
 });

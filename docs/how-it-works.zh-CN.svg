@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="620" viewBox="0 0 1160 620" font-family="'Noto Sans CJK SC','Droid Sans Fallback','Inter','Helvetica Neue',Arial,sans-serif">
+  <style>
+    .hd{font-size:15.5px;font-weight:700;fill:#1e293b}
+    .hd2{font-size:14px;font-weight:700;fill:#1e293b}
+    .sm{font-size:12.5px;fill:#475569}
+    .row{font-size:13.5px;fill:#1e293b}
+    .num{font-size:12.5px;font-weight:700;fill:#ffffff}
+    .lbl{font-size:12px;fill:#475569}
+    .tname{font-size:14px;font-weight:700;fill:#0f172a;font-family:ui-monospace,'SF Mono',Consolas,monospace}
+    .desc{font-size:12.5px;fill:#475569}
+    .step{font-size:11px;fill:#6366f1}
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto"><path d="M0,0 L8,3.5 L0,7 Z" fill="#475569"/></marker>
+  </defs>
+  <rect x="0" y="0" width="1160" height="620" fill="#ffffff"/>
+
+  <rect x="60" y="40" width="420" height="64" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+  <text x="270" y="66" text-anchor="middle" class="hd">编程助手</text>
+  <text x="270" y="88" text-anchor="middle" class="sm">Claude Code · Codex · Cursor · Aider · …</text>
+
+  <line x1="270" y1="104" x2="270" y2="152" stroke="#475569" stroke-width="1.6" marker-end="url(#ar)"/>
+  <text x="282" y="134" class="lbl">把 agent 的 base URL 指向代理</text>
+
+  <rect x="60" y="160" width="420" height="316" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.6"/>
+  <text x="80" y="190" class="hd">billion-context 代理</text>
+  <circle cx="92" cy="234" r="11" fill="#6366f1"/><text x="92" y="238.5" text-anchor="middle" class="num">1</text>
+  <text x="114" y="239" class="row">解析请求（Anthropic 或 OpenAI 格式）</text>
+  <circle cx="92" cy="286" r="11" fill="#6366f1"/><text x="92" y="290.5" text-anchor="middle" class="num">2</text>
+  <text x="114" y="291" class="row">对对话运行 acp-kernel 压缩</text>
+  <circle cx="92" cy="338" r="11" fill="#6366f1"/><text x="92" y="342.5" text-anchor="middle" class="num">3</text>
+  <text x="114" y="343" class="row">注入 `compress` 工具 + 压缩哲学</text>
+  <circle cx="92" cy="390" r="11" fill="#6366f1"/><text x="92" y="394.5" text-anchor="middle" class="num">4</text>
+  <text x="114" y="395" class="row">转发到真实模型 API</text>
+  <circle cx="92" cy="442" r="11" fill="#6366f1"/><text x="92" y="446.5" text-anchor="middle" class="num">5</text>
+  <text x="114" y="447" class="row">重写流式响应</text>
+
+  <line x1="270" y1="476" x2="270" y2="522" stroke="#475569" stroke-width="1.6" marker-end="url(#ar)"/>
+
+  <rect x="60" y="528" width="420" height="64" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+  <text x="270" y="554" text-anchor="middle" class="hd">真实模型 API</text>
+  <text x="270" y="576" text-anchor="middle" class="sm">Anthropic · OpenAI · 兼容厂商</text>
+
+  <path d="M480,560 H1120 V72 H486" fill="none" stroke="#64748b" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+  <text x="800" y="60" text-anchor="middle" class="lbl">流式响应 —— 回程重写</text>
+
+  <rect x="640" y="160" width="460" height="316" rx="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="660" y="190" class="hd2">注入的上下文工具 —— 模型自己调用</text>
+  <text x="660" y="232" class="tname">compress</text>
+  <text x="660" y="254" class="desc">把一段消息范围折叠成详细摘要</text>
+  <text x="660" y="298" class="tname">decompress</text>
+  <text x="660" y="320" class="desc">需要精确细节时恢复某个已压缩范围</text>
+  <text x="660" y="364" class="tname">search_context</text>
+  <text x="660" y="386" class="desc">在压缩摘要与可见消息中做关键词检索</text>
+  <text x="660" y="430" class="tname">acp_status</text>
+  <text x="660" y="452" class="desc">上下文用量概览 + 哪些区间仍可压缩</text>
+
+  <line x1="480" y1="338" x2="640" y2="338" stroke="#6366f1" stroke-width="1.3" stroke-dasharray="4 3"/>
+  <text x="560" y="330" text-anchor="middle" class="step">第 3 步</text>
+</svg>

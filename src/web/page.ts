@@ -40,8 +40,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="plugin-advisory-banner" class="banner warn" hidden></div>
 <div id="pck-banner" class="banner warn" hidden></div>
 <div id="host-plugin-banner" class="banner warn" hidden></div>
-<div id="pck-notice-banner" class="banner warn" hidden></div>
-<div id="wm-notice-banner" class="banner ok" hidden></div>
+<div id="notices-banner-region"></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">

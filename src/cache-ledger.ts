@@ -442,6 +442,11 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #564/#2627: exit-core indexes of THIS body that bili proved are its own
+     *  ordering separators, as the invariant judge returned them at send. The
+     *  next loop round's continuity verdict reads them as entry-side ownership.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    ownedSeparatorCores?: ReadonlySet<number>;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -642,16 +647,22 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+// #5795: single source of truth for the credential header names — the 429
+// governor's hold key (upstream-throttle.ts) and the pre-ingest fast path
+// (server/handle.ts) must read exactly these headers or holds go unmatched.
+export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
+
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
  *  key is ever persisted in (raw secrets never reach the ledger, logs or the
  *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
@@ -667,12 +678,18 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
                 // per request. The STABLE credential on that line is the
                 // Access key id — fingerprint only that.
                 const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
@@ -753,6 +770,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        ownedSeparatorCores: samePayload ? prior.ownedSeparatorCores : undefined,
     };
     if ("round" in transient && transient.round > 1) {
         delete transient.imageFacts;
@@ -1246,12 +1264,13 @@ export function getCacheLedger(session: Session): CacheLedger {
     return led;
 }
 
-function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">): void {
+function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">, closeFrom: number): void {
     // Freeze k = samples since each open fold (#1286): samples arrive in
     // order, so at this instant the count equals the batch-path
     // turnsToNextFold window (f.at < s.at <= nextFold.at); requestsAfter
     // keeps growing afterward to the full post-fold total.
-    for (const open of led.folds) {
+    for (let i = closeFrom; i < led.folds.length; i++) {
+        const open = led.folds[i];
         if (open.k === null) open.k = open.requestsAfter;
     }
     led.foldSeqCounter += 1;
@@ -1264,6 +1283,7 @@ function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "
 export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
     if (blocks.length === 0) return;
     const led = getCacheLedger(session);
+    let closeFrom = 0;
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
@@ -1275,7 +1295,10 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,
-        });
+        }, closeFrom);
+        // The first new fold closes every older open record. Within this
+        // synchronous batch, only the just-appended record can remain open.
+        closeFrom = led.folds.length - 1;
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
 }
@@ -2258,7 +2281,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             else byLo.set(lo, [l.hitPct]);
         }
         for (const [lo, hits] of [...byLo.entries()].sort((x, y) => x[0] - y[0]).slice(0, 24)) {
-            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: Math.min(...hits) });
+            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: hits.reduce((min, hit) => Math.min(min, hit), Infinity) });
         }
     }
     const lowGaps: number[] = [];

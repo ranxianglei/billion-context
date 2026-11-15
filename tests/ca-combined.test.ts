@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import test from "node:test";
-import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, osStoreExecOptions, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
+import forge from "node-forge";
+import { combinedCaPath, collectOsStorePems, collectSystemCaPems, decodeOsStoreOutput, ensureRootCA, isCaLike, osStoreExecOptions, osStorePowerShellScript, parseOsStoreNdjson, pemFingerprint, rootCaPath, wrapDerPem } from "../src/ca.js";
 import { resolveCombinedCaPath } from "../src/launcher.js";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -222,4 +224,99 @@ test("#5103: write-refused rebuild with NO usable bundle still fails fast", (t) 
     assert.match(String(code ?? ""), /EACCES|EPERM/, `expected a permission errno, got ${String(code)}`);
     // leave the shared tmp home in a healthy state for any later test
     ensureRootCA();
+});
+
+// #5802: security(1) find-certificate -a exports EVERY keychain entry (Apple
+// system identities, app/content-signing and S-MIME leaves), and
+// replacement-semantics clients (codex/rustls) parse every bundle entry
+// strictly — one RFC-violating leaf (com.apple.kerberos.kdc, duplicate EKU)
+// aborted codex's whole HTTP client. The combined bundle must hold anchors only.
+
+function forgedPem(spec: { cn: string; basicConstraints?: boolean; keyCertSign?: boolean; digitalSignature?: boolean; keyEncipherment?: boolean; serverAuth?: boolean; kuCritical?: boolean }): string {
+    const keys = forge.pki.rsa.generateKeyPair({ bits: 512 });
+    const cert = forge.pki.createCertificate();
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = "01";
+    const now = new Date();
+    cert.validity.notBefore = now;
+    cert.validity.notAfter = now;
+    cert.validity.notAfter.setFullYear(now.getFullYear() + 1);
+    cert.setSubject([{ name: "commonName", value: spec.cn }]);
+    cert.setIssuer(cert.subject.attributes);
+    const exts: Array<Record<string, unknown>> = [];
+    if (spec.basicConstraints !== undefined) exts.push({ name: "basicConstraints", cA: spec.basicConstraints, critical: true });
+    const ku: Record<string, boolean> = {};
+    if (spec.keyCertSign) ku.keyCertSign = true;
+    if (spec.digitalSignature) ku.digitalSignature = true;
+    if (spec.keyEncipherment) ku.keyEncipherment = true;
+    if (Object.keys(ku).length > 0) exts.push({ name: "keyUsage", ...ku, ...(spec.kuCritical ? { critical: true } : {}) });
+    if (spec.serverAuth) exts.push({ name: "extKeyUsage", names: ["serverAuth"] });
+    if (exts.length > 0) cert.setExtensions(exts);
+    cert.sign(keys.privateKey, forge.md.sha256.create());
+    return forge.pki.certificateToPem(cert);
+}
+
+test("#5802: isCaLike keeps anchors, drops serverAuth leaves and unparseable entries (both gate directions)", () => {
+    const realRoot = tls.rootCertificates[0];
+    assert.equal(new crypto.X509Certificate(realRoot).ca, true, "ground truth: public root IS a CA");
+    assert.ok(isCaLike(realRoot), "a real public root must pass");
+
+    const legacyAnchor = forgedPem({ cn: "legacy-anchor", keyCertSign: true });
+    assert.equal(new crypto.X509Certificate(legacyAnchor).ca, false, "ground truth: no basicConstraints extension");
+    assert.ok(isCaLike(legacyAnchor), "keyCertSign without basicConstraints still anchors chains (pre-BC CAs)");
+
+    // RFC 5280 recommends the critical marking for CA certs — the DER scan
+    // must skip the optional critical BOOLEAN between OID and extnValue.
+    const legacyAnchorCritical = forgedPem({ cn: "legacy-anchor-critical", keyCertSign: true, kuCritical: true });
+    assert.equal(new crypto.X509Certificate(legacyAnchorCritical).ca, false, "ground truth: no basicConstraints extension");
+    assert.ok(isCaLike(legacyAnchorCritical), "critical-marked keyCertSign still anchors chains (pre-BC CAs)");
+
+    // The com.apple.kerberos.kdc class: identity leaf with a serverAuth EKU, not an anchor.
+    const kdcLike = forgedPem({ cn: "com.example.kerberos.kdc", basicConstraints: false, digitalSignature: true, keyEncipherment: true, serverAuth: true });
+    assert.equal(new crypto.X509Certificate(kdcLike).ca, false, "ground truth: fixture leaf is NOT a CA");
+    assert.equal(isCaLike(kdcLike), false, "a serverAuth leaf must never enter the bundle");
+
+    // Non-RSA anchors: the predicate must judge ECDSA CAs correctly too
+    // (node-forge cannot parse them; a parser swap would silently drop these).
+    const ecRoots = tls.rootCertificates.filter((pem) => {
+        try { return new crypto.X509Certificate(pem).publicKey.asymmetricKeyType === "ec"; } catch { return false; }
+    });
+    assert.ok(ecRoots.length > 0, "fixture precondition: the Mozilla snapshot contains EC roots");
+    for (const pem of ecRoots.slice(0, 5)) assert.ok(isCaLike(pem), "an ECDSA public root must pass");
+
+    assert.equal(isCaLike("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"), false, "unparseable entries anchor nothing");
+});
+
+test("#5802: the written combined bundle contains ONLY parseable CAs and carries the marker", () => {
+    ensureRootCA();
+    const combined = fs.readFileSync(combinedCaPath(), "utf8");
+    assert.ok(combined.startsWith("# "), "rebuilt bundles carry the format marker line");
+    const blocks = combined.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\s*/g) ?? [];
+    assert.ok(blocks.length > 10, `bundle should carry the public roots (found ${blocks.length})`);
+    for (const b of blocks) assert.ok(isCaLike(b), `bundle entry is not a CA:\n${b.slice(0, 120)}`);
+    assert.ok(combined.includes(fs.readFileSync(rootCaPath(), "utf8").trim()), "the MITM root survives the filter");
+});
+
+test("#5802: a pre-upgrade bundle (missing marker) is force-rebuilt once even while fresh", () => {
+    ensureRootCA();
+    const file = combinedCaPath();
+    const stripped = fs.readFileSync(file, "utf8").replace(/^# [^\n]*\n/, "");
+    assert.ok(!stripped.startsWith("# "), "fixture: marker line removed");
+    fs.writeFileSync(file, stripped);
+    const future = new Date(Date.now() + 3600e3);
+    fs.utimesSync(file, future, future);
+    ensureRootCA();
+    const after = fs.readFileSync(file, "utf8");
+    assert.ok(after.startsWith("# "), "missing marker forces the one-time convergence rebuild");
+    assert.ok(after.includes(fs.readFileSync(rootCaPath(), "utf8").trim()));
+});
+
+test("#5802: a fresh bundle WITH marker + root is not rewritten (steady state)", () => {
+    ensureRootCA();
+    const file = combinedCaPath();
+    const future = new Date(Date.now() + 3600e3);
+    fs.utimesSync(file, future, future);
+    const mtimeBefore = fs.statSync(file).mtimeMs;
+    ensureRootCA();
+    assert.equal(fs.statSync(file).mtimeMs, mtimeBefore, "marker + root + fresh = reused, not rebuilt");
 });

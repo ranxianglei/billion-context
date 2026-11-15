@@ -63,6 +63,48 @@ test("applyOpencodePluginEntry: npm form is idempotent", () => {
     assert.deepEqual(args.data.plugin, [OPENCODE_NPM_ENTRY]);
 });
 
+test("applyOpencodePluginEntry: 2.x host (plugins key) writes the shim dir even for npm form (#3976)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-v2npm-"));
+    const notes = applyOpencodePluginEntry({ ...args, key: "plugins" });
+    assert.deepEqual(args.data.plugins, [args.shimDir]);
+    assert.equal(notes[0], `plugins -> ${args.shimDir}`);
+    assert.match(notes[1], /#3976/);
+    const shim = fs.readFileSync(path.join(args.shimDir, "index.js"), "utf8");
+    assert.equal(shim, `export { default } from ${JSON.stringify(args.agentJs)};\n`);
+});
+
+test("applyOpencodePluginEntry: 2.x host migrates a legacy bare-name entry to the shim dir (#3976)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-v2migrate-"));
+    args.data.plugins = ["other-pkg", OPENCODE_NPM_ENTRY];
+    const notes = applyOpencodePluginEntry({ ...args, key: "plugins" });
+    assert.deepEqual(args.data.plugins, ["other-pkg", args.shimDir]);
+    assert.equal(notes[0], `plugins -> ${args.shimDir} (replaced ${OPENCODE_NPM_ENTRY})`);
+    assert.match(notes[1], /#3976/);
+    assert.ok(fs.existsSync(path.join(args.shimDir, "index.js")), "shim written");
+});
+
+test("applyOpencodePluginEntry: 2.x shim entry is idempotent", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-v2idem-"));
+    args.data.plugins = [args.shimDir];
+    fs.mkdirSync(args.shimDir, { recursive: true });
+    fs.writeFileSync(path.join(args.shimDir, "index.js"), `export { default } from ${JSON.stringify(args.agentJs)};\n`);
+    const touched = new Set<string>();
+    assert.deepEqual(applyOpencodePluginEntry({ ...args, key: "plugins", touched }), ["plugins present"]);
+    assert.equal(touched.size, 0, "no key touched — no rewrite");
+});
+
+test("applyOpencodePluginEntry: a stale shim is healed even when the config entry is already present", () => {
+    const base = tempDir("bili-oc-stale-");
+    const args = entryArgs(NPM_ROOT, base);
+    const staleAgentJs = "/opt/old-bili/dist/agent/opencode-native.js";
+    fs.mkdirSync(args.shimDir, { recursive: true });
+    fs.writeFileSync(path.join(args.shimDir, "index.js"), `export { default } from ${JSON.stringify(staleAgentJs)};\n`);
+    args.data.plugins = [args.shimDir];
+    assert.deepEqual(applyOpencodePluginEntry({ ...args, key: "plugins" }), ["plugins present"]);
+    const shim = fs.readFileSync(path.join(args.shimDir, "index.js"), "utf8");
+    assert.equal(shim, `export { default } from ${JSON.stringify(args.agentJs)};\n`, "shim re-export follows the current root");
+});
+
 test("applyOpencodePluginEntry: dev form writes a local shim and warns it is not portable", () => {
     const args = entryArgs("/opt/checkout-bili", tempDir("bili-oc-dev-"));
     const notes = applyOpencodePluginEntry(args);
@@ -106,11 +148,13 @@ test("applyOpencodePluginEntry: map-form plugins keep foreign options and stay a
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-map-"));
     args.data.plugins = { "@org/x": { options: { z: 1 } }, "plain-y": true };
     applyOpencodePluginEntry({ ...args, key: "plugins" });
-    assert.deepEqual(args.data.plugins, { "@org/x": { options: { z: 1 } }, "plain-y": true, [OPENCODE_NPM_ENTRY]: true });
+    // #3976: the `plugins` key means a 2.x host — even an npm-form install
+    // lands as the shim dir there, so the map carries the dir, not the name.
+    assert.deepEqual(args.data.plugins, { "@org/x": { options: { z: 1 } }, "plain-y": true, [args.shimDir]: true });
     assert.ok(!Array.isArray(args.data.plugins), "map form preserved");
 });
 
-type OcCfg = { plugin?: unknown; compaction?: { auto?: boolean } & Record<string, unknown>; mcp?: unknown };
+type OcCfg = { plugin?: unknown; plugins?: unknown; compaction?: { auto?: boolean } & Record<string, unknown>; mcp?: unknown };
 
 test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", (t) => {
     const prevXdg = process.env.XDG_CONFIG_HOME;
@@ -179,6 +223,59 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", (t)
     assert.equal(ocStatus(), "not installed");
 
     assert.match(pluginRemove("opencode"), /not installed/);
+});
+
+test("pluginInstall opencode under a 2.x host writes the plugins key + shim dir (#3976)", (t) => {
+    if (process.platform === "win32") {
+        t.skip("probe stub is a POSIX shell script");
+        return;
+    }
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const prevState = process.env.XDG_STATE_HOME;
+    const prevOpen = process.env.OPENCODE_CONFIG;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    delete process.env.OPENCODE_CONFIG;
+    const xdg = tempDir("bili-oc-v2xdg-");
+    const state = tempDir("bili-oc-v2state-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    process.env.XDG_STATE_HOME = state;
+    const bin = path.join(xdg, "fake-opencode");
+    fs.writeFileSync(bin, "#!/bin/sh\necho 'opencode 2.1.0'\n");
+    fs.chmodSync(bin, 0o755);
+    process.env.BILI_CLIENT_BIN = bin;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+        if (prevState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevState;
+        if (prevOpen === undefined) delete process.env.OPENCODE_CONFIG;
+        else process.env.OPENCODE_CONFIG = prevOpen;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(xdg);
+        rmrf(state);
+    });
+
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const shimDir = path.join(xdg, "opencode", "plugins", "billion-context");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ model: "anthropic/claude" }, null, 2));
+
+    const out = pluginInstall("opencode");
+    assert.ok(out.startsWith(`opencode: installed -> ${file}`), out);
+    assert.match(out, /plugins -> .+plugins[\\/]billion-context/);
+    const cfg = JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    assert.deepEqual(cfg.plugins, [shimDir]);
+    assert.equal(cfg.plugin, undefined, "no singular-key entry on a 2.x host");
+    assert.equal(cfg.compaction?.auto, false);
+    assert.ok(fs.existsSync(path.join(shimDir, "index.js")), "shim written");
+    assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "installed");
+
+    const rem = pluginRemove("opencode");
+    assert.match(rem, /plugin removed \(/);
+    const after = JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    assert.equal(after.plugins, undefined);
+    assert.equal(fs.existsSync(shimDir), false);
 });
 
 const MCP_PINNED = { type: "local", command: ["/usr/bin/node", "/opt/old/dist/mcp.js"], environment: { BILI_MCP_PROXY: "http://127.0.0.1:18787" }, enabled: true };

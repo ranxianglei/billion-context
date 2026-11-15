@@ -32,7 +32,7 @@
 // provider turned call_x|fc_0 into call_x_fc_0 on both sides of every pair).
 // That defeats both claim passes by construction, because both key on the
 // toolCallId. Pairing old→new without host knowledge would be guessing, and
-// misattribution is the expensive failure mode (MESSAGE-IDENTITY.md), so the
+// misattribution is the expensive failure mode (docs/message-identity.md), so the
 // pass only COUNTS such cases (an inbound twin with identical normalized
 // content under a different toolCallId) and the drift log line names the
 // cause instead of reading as "mutation or deletion".
@@ -199,6 +199,10 @@ const METADATA_TRUNC_NOTED = "foldTruncationNoted";
  *  resent wire is a prefix-cut of the pre-rewind wire). Same benign class as
  *  head truncation; a distinct key so the log can name which end moved. */
 const METADATA_TAIL_TRUNC_NOTED = "foldTailTruncationNoted";
+/** #5715: one-per-episode info latch for the surviving-direct-ID-majority
+ *  partial-loss verdict (cleared with the rest of the drift state on recovery,
+ *  like the #3641/#3724 benign latches). */
+const METADATA_MAJORITY_LOSS_NOTED = "foldMajorityLossNoted";
 /** #3641: the wire order frozen at the moment the drift episode began — the
  *  baseline against which truncation-vs-replacement is decided. */
 const METADATA_EPISODE_ORDER = "foldEpisodeOrder";
@@ -338,6 +342,7 @@ function resetFoldDriftState(session: Session): void {
     delete md[METADATA_SHAPE_NOTED];
     delete md[METADATA_TRUNC_NOTED];
     delete md[METADATA_TAIL_TRUNC_NOTED];
+    delete md[METADATA_MAJORITY_LOSS_NOTED];
     delete md[METADATA_EPISODE_ORDER];
     // #5142: the expected-rebase RECORD itself (METADATA_EXPECTED_REBASE) is
     // id-level truth and survives episodes on purpose; only its one-shot log
@@ -999,7 +1004,8 @@ export function planReconciliation(
     // claimed. A gap cell is bracketed when verified claims exist on both
     // sides — order ownership that the tiers below may corroborate.
     const gapPairs: { oldIdx: number; oldId: string; newId: string }[] = [];
-    const claimedIdx: number[] = [];
+    let minClaimed = Infinity;
+    let maxClaimed = -Infinity;
     const recordGap = (oldIdx: number, oldId: string, newId: string): void => {
         if (oldId !== newId && missingSet.has(oldId) && !covered.has(newId) && !claimedCandidates.has(newId)) {
             gapPairs.push({ oldIdx, oldId, newId });
@@ -1029,7 +1035,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(i);
+            minClaimed = Math.min(minClaimed, i);
+            maxClaimed = Math.max(maxClaimed, i);
             i++;
         }
         const tail = Math.min(oldOrder.length, newOrder.length) - prefix;
@@ -1059,7 +1066,8 @@ export function planReconciliation(
             plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
-            claimedIdx.push(iOld);
+            minClaimed = Math.min(minClaimed, iOld);
+            maxClaimed = Math.max(maxClaimed, iOld);
             j++;
         }
     }
@@ -1357,7 +1365,7 @@ export function planReconciliation(
     // byTwin / byNorm / byTurn / byImage) run BELOW Pass 0, so by the time
     // this tier sees a gap cell every exact channel has already had its
     // bite — what remains is tiered corroboration, in order of evidence
-    // strength:
+    // strength. User-role messages stay on the exact passes above:
     //   (a) simhash: a re-rendered cell (formatting churn normalization
     //       still misses — key reordering beyond canonical-Json's reach,
     //       template re-stamps) keeps its word-shingle mass, so a 64-bit
@@ -1382,13 +1390,13 @@ export function planReconciliation(
     //   when something verified it.
     if (gapPairs.length > 0) {
         const fenced = plan.byPos > 0 || plan.resyncs > 0;
-        const minClaimed = claimedIdx.length > 0 ? Math.min(...claimedIdx) : -1;
-        const maxClaimed = claimedIdx.length > 0 ? Math.max(...claimedIdx) : -1;
         for (const gap of gapPairs) {
             if (plan.claims.has(gap.oldId) || claimedCandidates.has(gap.newId)) continue;
             const anchor = anchors[gap.oldId];
             const message = byId.get(gap.newId);
             if (anchor === undefined || message === undefined) continue;
+            // Changed user instructions must reach the model, even between unchanged neighbors.
+            if (anchor.r === "user") continue;
             if (anchor.r !== undefined && anchor.r !== message.role) continue;
             const len = message.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
@@ -1434,7 +1442,9 @@ export function planReconciliation(
     // the words still on the wire. Doctrine (order carries, content gates,
     // the id is only a hint): when a MISSING MASSES of cells still carry
     // word evidence, pair them in order instead of diagnosing destruction.
-    //   prose anchors: wordbag equality + simhash ≤ GAP bar (the same
+    //   text user anchors: exact normalizedIdentity after newline→space unwrap
+    //     (line wrap that reconstructs the stored identity; never wordbag/simhash);
+    //   other prose anchors: wordbag equality + simhash ≤ GAP bar (the same
     //     edit-honesty gate as the sim tier) — role-checked, length-guarded;
     //   textless anchors (image families, no sh/wh by construction): k-th
     //     family pairing, only when the anchor/candidate counts per
@@ -1445,10 +1455,15 @@ export function planReconciliation(
     const residualMiddle = missingMiddle.filter((id) => !plan.claims.has(id));
     if (residualMiddle.length >= SHAPE_MASS_MIN) {
         const looseProse = (anchor: FoldAnchor, m: CoreMessage): boolean => {
-            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             if (anchor.r !== undefined && anchor.r !== m.role) return false;
             const len = m.text?.length ?? 0;
             if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) return false;
+            if (anchor.r === "user") {
+                if (anchor.c !== "text" || m.contentType !== "text") return false;
+                const unwrapped: CoreMessage = { ...m, text: (m.text ?? "").replace(/\r?\n/g, " ") };
+                return normalizedIdentity(unwrapped) === anchor.n;
+            }
+            if (anchor.wh === undefined || anchor.sh === undefined) return false;
             const wh = wordBagDigest(canonicalTextOf(m.text ?? ""));
             if (wh !== anchor.wh) return false;
             const dist = hammingHex(anchor.sh, simhashHex(canonicalTextOf(m.text ?? "")));
@@ -1626,29 +1641,37 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): bool
     for (const block of blocks) {
         const lists = [block.effectiveMessageIds, block.directMessageIds] as (string[] | undefined)[];
         for (const list of lists) {
-            if (list === undefined) continue;
-            for (let i = 0; i < list.length; i++) {
-                const replacement = claims.get(list[i]);
-                if (replacement === undefined || replacement.length === 0) continue;
+            if (list === undefined || !list.some((id) => (claims.get(id)?.length ?? 0) > 0)) continue;
+            // Counts include unread originals and already emitted replacements.
+            const present = new Map<string, number>();
+            for (const id of list) present.set(id, (present.get(id) ?? 0) + 1);
+            const rewritten: string[] = [];
+            for (const id of list) {
+                const replacement = claims.get(id);
+                if (replacement === undefined || replacement.length === 0) {
+                    rewritten.push(id);
+                    continue;
+                }
                 // Claims map 1→N (a merged core stands in for a reasoning+text
                 // pair) and N→1 (both pair members claim one merged witness).
-                // Splice the targets in and drop any already present — a
+                // Write the targets in order and drop any already present — a
                 // block must never list the same message id twice. When the
                 // replacement is already in the list (the second member of an
                 // N→1 collapse), the old id is removed, not kept: two covered
                 // ids collapsing onto one live id is exactly the model-switch
                 // pair→merged shape (#2636).
-                const keep = replacement.filter((t) => !list.includes(t));
-                if (keep.length === 0) {
-                    list.splice(i, 1);
-                    i--;
-                    touched = true;
-                    continue;
+                const keep = replacement.filter((target) => !present.has(target));
+                const remaining = present.get(id)! - 1;
+                if (remaining === 0) present.delete(id);
+                else present.set(id, remaining);
+                for (const target of keep) {
+                    rewritten.push(target);
+                    present.set(target, (present.get(target) ?? 0) + 1);
                 }
-                list.splice(i, 1, ...keep);
-                i += keep.length - 1;
-                touched = true;
             }
+            list.length = rewritten.length;
+            for (let i = 0; i < rewritten.length; i++) list[i] = rewritten[i];
+            touched = true;
         }
     }
     return touched;
@@ -1697,8 +1720,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
     // retained view-deactivated lineage re-fed into the claim ladder (#4050);
-    // see recoveryCandidateIds for what is excluded and why.
-    const covered = coveredIdsOf(blocks);
+    // see recoveryCandidateIds for what is excluded and why. activeCovered keeps
+    // the active-only caliber intact (a separate object, never mutated) so the
+    // #5715 surviving-majority test below can run on live substrate alone.
+    const activeCovered = coveredIdsOf(blocks);
+    const covered = new Set(activeCovered);
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
@@ -2166,6 +2192,39 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         && plan.nearDupResidual.length === 0
         && classCarryingResidual.every((id) => absentSet.has(id))
         && tailTruncated;
+    // #5715: a strict majority of hard-covered ids still PRESENT VERBATIM on
+    // the wire is the opposite of wholesale replacement — the fold substrate
+    // is alive. The verdict classifier above only sees claims==0 + unmatched>0
+    // and never counts the surviving direct matches, so a handful of interior
+    // edits/deletions (neither a head cut nor a tail rewind) read as total
+    // drift and, after FOLD_DRIFT_ESCALATE_PASSES, falsely latch epoch-confirm
+    // and pause compression on a healthy session. We deliberately do NOT relax
+    // totalDrift itself: the #3641 drift streak + frozen witness are what keep
+    // a genuine mid-history edit reading as honest loss (zombie accrual)
+    // rather than sanctioned truncation (#4050/#2695). The surviving majority
+    // only voids the TERMINAL verdict (below). The base is ACTIVE coverage only
+    // (the coveredIdsOf caliber), NOT the full `covered`: the #4050 view-
+    // deactivated lineage re-fed via recoveryCandidateIds is recoverable-but-
+    // gone, and its legitimate post-rewind/post-drift absence must never be able
+    // to dilute a healthy active majority below the bar (#5715 field report).
+    // Denominators match the per-block coverage (separators / expected rebases /
+    // reasoning cores excluded); the bar is >= MIN_RESYNC_RUN and > half.
+    // Genuine wholesale replacement has ~0 directly-present ACTIVE covered ids,
+    // so this can never mask a real collapse.
+    let coveredHard = 0;
+    let presentHard = 0;
+    for (const id of activeCovered) {
+        if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined || anchors[id]?.c === "reasoning") continue;
+        coveredHard++;
+        if (byId.has(id)) presentHard++;
+    }
+    const hardDirectMajority = presentHard >= MIN_RESYNC_RUN && 2 * presentHard > coveredHard;
+    // #5715: a strict direct-ID majority proves the fold substrate is alive on
+    // the wire — any pending epoch-confirm latch is stale (the histories
+    // realigned) and clears immediately, whether or not this pass still carries
+    // residual loss (a partial restore keeps totalDrift true, so the normal
+    // !totalDrift reset below would never fire for it).
+    if (hardDirectMajority && epochConfirmPending(session)) resetFoldDriftState(session);
     const totalDrift = plan.claims.size === 0 && realUnmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained
         && !shapeExplained && !truncationExplained && !tailTruncationExplained;
     // Classify before reaping: the epoch-confirm gate promises to retain the
@@ -2264,14 +2323,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                     for (const id of block.directMessageIds ?? []) deadIds.add(id);
                 }
                 for (const id of deadIds) delete nextAnchors[id];
-                for (let i = nextOrder.length - 1; i >= 0; i--) {
-                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
-                }
-                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[]; canon?: string[] } | undefined;
                 const positionIds = storedPositions?.ids;
+                const positionCanon = storedPositions?.canon;
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) {
+                        nextOrder.splice(i, 1);
+                        if (positionIds === nextOrder && Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                    }
+                }
                 if (Array.isArray(positionIds) && positionIds !== nextOrder) {
                     for (let i = positionIds.length - 1; i >= 0; i--) {
-                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                        if (deadIds.has(positionIds[i])) {
+                            positionIds.splice(i, 1);
+                            if (Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                        }
                     }
                 }
                 recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
@@ -2362,7 +2428,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         session.metadata[METADATA_DRIFT_STREAK] = streak;
         if (prevStreak === 0) session.metadata[METADATA_DRIFT_SINCE] = Date.now();
-        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        // #5715: a strict direct-ID majority means the fold substrate is alive
+        // on the wire — this is partial loss, not wholesale replacement, so the
+        // terminal epoch-confirm verdict (and its compression pause) must not
+        // fire even though the #2193 streak above has accrued.
+        if (!hardDirectMajority && streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
             // #2709: take a ledger action at the destruction point (not just log) — attribute
@@ -2416,6 +2486,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 session.metadata[METADATA_MARKER_CHURN_NOTED] = true;
                 opts.log("info",
                     `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing with no anchor match${expectedNote}, but this pass stripped ${opts.markerStripped} raw marker artifact(s) — covered ids minted from marker-laden bytes churn once the strip engine cleans the resent history; benign on stateless resend (content still on the wire, re-folds re-cover), tolerated (#2815/#2789)`);
+            }
+        } else if (hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+                && !shapeExplained && !truncationExplained && !tailTruncationExplained) {
+            // #5715: a surviving direct-ID majority AT THE MASS BAR is PARTIAL
+            // loss, not the "fold silently lost" the generic warn below names —
+            // report it once per episode at info level (acceptance, not repair).
+            // Sub-mass-bar single edits keep the honest per-pass warn below. The
+            // #3641 verdict above already kept this from latching epoch-confirm.
+            // Already-explained episodes (shape churn / head / tail truncation)
+            // own their own one-per-episode note — reporting them here too would
+            // print a second line mislabeling a head/tail cut as "interior"
+            // loss, so they fall through to the original per-pass warn.
+            if (session.metadata[METADATA_MAJORITY_LOSS_NOTED] !== true) {
+                session.metadata[METADATA_MAJORITY_LOSS_NOTED] = true;
+                opts.log("info", `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing but ${presentHard}/${coveredHard} hard-covered id(s) still ride verbatim on the wire — partial interior loss, fold substrate healthy, no epoch confirmation (#5715)`);
             }
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the

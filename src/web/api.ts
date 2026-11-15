@@ -7,6 +7,7 @@ import { defaultPrompts, isValidPackName, sanitizePackSurface, type PromptPackFi
 import { resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import {
     collectNamedProviders,
+    isUrlLikeKey,
     loadNamedProviders,
     parseBiliConfig,
     parseCacheKeepaliveSettings,
@@ -321,8 +322,10 @@ export async function handleConfigPut(
                 if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
                 // Named entries may carry a dialing recipe (baseUrl/api/...) —
                 // validate its shape at save time too, so the chain
-                // references below can only fail on dangling names.
-                if (!/^https?:\/\//.test(url)) {
+                // references below can only fail on dangling names. Classify
+                // URL lanes via the runtime's isUrlLikeKey (incl. mitm://), not
+                // an https-only regex, or documented lanes mis-fail (#5620).
+                if (!isUrlLikeKey(url)) {
                     try { parseNamedProviderRecipe(value); } catch (error) {
                         return sendError(res, 400, `invalid recipe on named provider "${url}": ${String(error)}`);
                     }

@@ -100,6 +100,9 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
+// Recorder spawned for the in-flight lane; killed from main()'s catch when a
+// lane aborts before its own teardown (2026-11-14 leak fix).
+let activeRec = null;
 // #3475: lanes whose upstream lacks the protocol door — degraded verdict,
 // excluded from the failure tally (see runLane's env-blocked rule).
 const BLOCKED = new Map(); // lane -> { kind: "env" | "client", reason }
@@ -280,8 +283,13 @@ async function runLane(agent, recipe) {
   console.log(`-- lane ${agent}: recorder :${recPort} -> ${MODEL1.base}`);
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
     env: { ...process.env, RECORDER_PORT: String(recPort), RECORDER_TARGET: MODEL1.base, RECORDER_OUT: recOut },
-    stdio: ["ignore", "ignore", "inherit"], detached: true,
+    // stderr to a per-lane file: inheriting the lane's log pipe meant a
+    // detached recorder surviving an aborted lane held the entrypoint's
+    // `| tee` pipe open and wedged the whole gate (2026-11-14, 3h hang).
+    stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
+    detached: true,
   });
+  activeRec = rec;
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -330,6 +338,21 @@ async function runLane(agent, recipe) {
 
   try {
     await recipe.setup(ctx);
+    // One-time host warmup BEFORE timed turns: opencode v1 runs a one-time
+    // sqlite storage migration on fresh XDG ("Performing one time database
+    // migration, may take a few minutes...") — in hermetic containers that
+    // eats the whole t1 turn budget and wipes the lane (r5: every turn red,
+    // 0 upstream requests). A disposable long-timeout turn absorbs it;
+    // output discarded, failure logged but non-fatal.
+    if (recipe.warmup) {
+      const t0 = Date.now();
+      try {
+        await recipe.warmup(ctx);
+        console.log(`-- lane ${agent}: warmup ok in ${Math.round((Date.now() - t0) / 1000)}s`);
+      } catch (e) {
+        console.log(`-- lane ${agent}: warmup failed (non-fatal): ${String(e).slice(0, 140)}`);
+      }
+    }
     const sid = { v: null };
     // Dual marker: the t2/t4 S07-recall assertions presume t1 actually READ
     // the corpus middle — models sometimes elide it despite the chunk-read
@@ -598,6 +621,7 @@ async function runLane(agent, recipe) {
   ctx.killInstances();
   if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} }
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
+  activeRec = null;
 }
 
 async function startManualProxy(ctx, args) {
@@ -898,6 +922,16 @@ const RECIPES = {
       ocFor(BIG_WINDOW);
       ctx.env = { ...ctx.baseEnv, BILLION_CONTEXT_NODE: process.execPath };
     },
+    // see runLane: absorbs the v1 CLI's one-time storage migration
+    async warmup(ctx) {
+      const model = MODEL1.model.split(",")[0];
+      const r = sh((process.env.GATE_OC1_BIN || "opencode").trim(),
+        ["run", "-m", `gate/${model}`, "--dangerously-skip-permissions", "Reply with the single word READY."],
+        { cwd: ctx.workDir, env: ctx.env, timeout: 600_000 });
+      // sh() swallows exit codes — throw so runLane logs "warmup failed"
+      // instead of a misleading "warmup ok" when the turn actually died.
+      if (r.status !== 0) throw new Error(`opencode warmup exited ${r.status ?? "timeout"}\n${(r.stderr || "").slice(-300)}`);
+    },
     setWindow(ctx, w) {
       const file = path.join(ctx.laneDir, "xdg/config/opencode/opencode.json");
       const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -1042,7 +1076,7 @@ async function main() {
     const recipe = RECIPES[agent];
     if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
     console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
-    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); }
+    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); try { if (activeRec) process.kill(-activeRec.pid, "SIGKILL"); } catch {} activeRec = null; }
   }
   // #3475: env-blocked lanes (upstream lacks the protocol door) keep their
   // degraded verdict — FAIL records from turn-dependent assertions are honest

@@ -1,11 +1,13 @@
 import { after } from "node:test";
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import http from "node:http";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import * as tar from "tar";
 import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 
@@ -20,23 +22,31 @@ process.env.XDG_CACHE_HOME = path.join(root, "cache");
 const biliConfig = path.join(root, "billion-context.json");
 writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
 process.env.BILI_CONFIG_FILE = biliConfig;
+// #4791: point the remote update policy at the in-process mock registry so the
+// check-only tests' policy fetch is a deterministic local 404 (fail-open), not
+// a real network call.
+const prevPolicyUrl = process.env.BILI_UPDATE_POLICY_URL;
+process.env.BILI_UPDATE_POLICY_URL = "https://registry.test/policy.json";
 after(() => {
     if (prevCache === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = prevCache;
     if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+    if (prevPolicyUrl === undefined) delete process.env.BILI_UPDATE_POLICY_URL; else process.env.BILI_UPDATE_POLICY_URL = prevPolicyUrl;
 });
 
-// #3719 phase 2: web 更新/Updates tab actions. Nothing in here fakes a registry
-// SUCCESS path — every updater invocation below lands on a deterministic local
-// guard (unwired process, bad input, or the source-checkout refusal) so the
-// tests make zero network calls. The panel's own buttons live behind the same
-// DNS-rebinding gate as every other /__bili/ route; that is asserted against a
-// real startServer below.
+// #3719 phase 2: web 更新/Updates tab actions. The guard tests land every
+// updater invocation on a deterministic local guard (unwired process, bad
+// input, or the source-checkout refusal); the #4791 check-only section swaps
+// globalThis.fetch for an in-process mock registry (restored per test). Either
+// way these tests make zero real network calls. The panel's own buttons live
+// behind the same DNS-rebinding gate as every other /__bili/ route; that is
+// asserted against a real startServer below.
 const { startServer } = await import("../src/server.ts");
 const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 const { VERSION } = await import("../src/version.ts");
 const { _setReleaseNotesStateForTest, _resetReleaseNotesWatcherForTest } = await import("../src/update-notes.ts");
 const ua = await import("../src/server/update-actions.ts");
+const { forceInstallVersion, getLastInstall, readDiskVersion, lastUpdateCheckTime, _resetLastInstallForTest } = await import("../src/update.ts");
 const { rmrf } = await import("./tmp-rm.ts");
 
 /** Fresh fixture "install" — a plain dir whose package.json pins a version
@@ -131,6 +141,179 @@ test("concurrent checks and installs each collapse to one in-flight run (#3719)"
         assert.deepEqual(installs[1], { ok: true, already: true }, "second concurrent install must not stack");
     } finally {
         ua._resetUpdateActionsForTest();
+    }
+});
+
+// ---- #4791: "Check now" is check-only — full gate ladder, zero installs ----
+// The mock registry is an in-process Map behind a swapped globalThis.fetch
+// (restored per test); the policy URL answers a deterministic local 404
+// (fail-open), so even these success-path tests make zero real network calls.
+
+interface RegistryStubState {
+    latest?: string;
+    tarballs: Map<string, Buffer>;
+    hits: Record<string, number>;
+}
+
+function integrityField(buf: Buffer, alg = "sha512"): string {
+    return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
+}
+
+/** A real npm-layout tarball (package/ prefix) for one version — enough
+ *  structure to pass verifyEntries' declared-main check on the install path. */
+function makeNpmTgz(version: string): Buffer {
+    const srcRoot = path.join(root, `pkg-src-${version}`);
+    const pkgDir = path.join(srcRoot, "package");
+    mkdirSync(path.join(pkgDir, "dist"), { recursive: true });
+    writeFileSync(path.join(pkgDir, "package.json"), `${JSON.stringify({ name: "billion-context", version, type: "module", main: "dist/index.js" }, null, 2)}\n`, "utf8");
+    writeFileSync(path.join(pkgDir, "dist", "index.js"), `export const loaded = '${version}';\n`, "utf8");
+    const tgzPath = path.join(srcRoot, `bc-${version}.tgz`);
+    tar.c({ cwd: srcRoot, file: tgzPath, gzip: true, sync: true }, ["package"]);
+    return readFileSync(tgzPath);
+}
+
+function stubRegistryFetch(state: RegistryStubState): () => void {
+    const prev = globalThis.fetch;
+    globalThis.fetch = ((input: string | URL | Request) => {
+        const u = String(input);
+        if (u.endsWith("/policy.json")) {
+            return Promise.resolve(new Response(JSON.stringify({ error: "no remote policy in this test" }), { status: 404, headers: { "content-type": "application/json" } }));
+        }
+        if (u.endsWith("/billion-context/latest")) {
+            state.hits.latest = (state.hits.latest ?? 0) + 1;
+            if (!state.latest) {
+                return Promise.resolve(new Response(JSON.stringify({ name: "billion-context" }), { status: 200, headers: { "content-type": "application/json" } }));
+            }
+            const tgz = state.tarballs.get(state.latest);
+            return Promise.resolve(new Response(JSON.stringify({
+                name: "billion-context",
+                version: state.latest,
+                dist: { tarball: `https://registry.test/bc-${state.latest}.tgz`, ...(tgz !== undefined ? { integrity: integrityField(tgz) } : {}) },
+            }), { status: 200, headers: { "content-type": "application/json" } }));
+        }
+        const tgzMatch = u.match(/\/bc-(.+)\.tgz$/);
+        if (tgzMatch) {
+            const key = `tarball:${tgzMatch[1]}`;
+            state.hits[key] = (state.hits[key] ?? 0) + 1;
+            const buf = state.tarballs.get(tgzMatch[1]);
+            if (buf === undefined) return Promise.resolve(new Response("unknown tarball", { status: 404 }));
+            return Promise.resolve(new Response(buf));
+        }
+        const verMatch = u.match(/\/billion-context\/(\d[\d.]*)$/);
+        const verTgz = verMatch ? state.tarballs.get(verMatch[1]) : undefined;
+        if (verTgz !== undefined) {
+            const key = `doc:${verMatch![1]}`;
+            state.hits[key] = (state.hits[key] ?? 0) + 1;
+            return Promise.resolve(new Response(JSON.stringify({
+                name: "billion-context",
+                version: verMatch![1],
+                dist: { tarball: `https://registry.test/bc-${verMatch![1]}.tgz`, integrity: integrityField(verTgz) },
+            }), { status: 200, headers: { "content-type": "application/json" } }));
+        }
+        return Promise.reject(new Error(`unexpected fetch in test: ${u}`));
+    }) as typeof globalThis.fetch;
+    return () => { globalThis.fetch = prev; };
+}
+
+test("web panel Check now is check-only: gate ladder runs, nothing downloads or installs (#4791)", async () => {
+    const fixture = makeFixture("0.9.300");
+    const state: RegistryStubState = { latest: "0.9.400", tarballs: new Map([["0.9.400", makeNpmTgz("0.9.400")]]), hits: {} };
+    const restore = stubRegistryFetch(state);
+    try {
+        ua._resetUpdateActionsForTest();
+        // autoUpdate:false is exactly the reported setup — the old force=true
+        // wiring sailed past every gate and installed anyway.
+        ua.registerUpdateActions({ packageName: "billion-context", currentVersion: VERSION, autoUpdate: false, installDir: fixture });
+        const r = await ua.triggerManualCheck();
+        assert.equal(r.ok, true);
+        assert.equal(r.status, "update-available");
+        assert.equal(r.latest, "0.9.400");
+        assert.equal(r.candidate, "0.9.400");
+        assert.equal(state.hits["tarball:0.9.400"] ?? 0, 0, "check-only must never fetch the tarball");
+        assert.equal(await readDiskVersion(fixture), "0.9.300", "check-only must never install — on-disk version untouched");
+        assert.ok(await lastUpdateCheckTime(), "the last-checked marker still refreshes — that is what the button promises");
+    } finally {
+        restore();
+        ua._resetUpdateActionsForTest();
+    }
+});
+
+test("web panel Check now reports an advisory-blocked version instead of installing it (#4791/#1588)", async () => {
+    const fixture = makeFixture("0.9.300");
+    const state: RegistryStubState = { latest: "0.9.400", tarballs: new Map([["0.9.400", makeNpmTgz("0.9.400")]]), hits: {} };
+    const restore = stubRegistryFetch(state);
+    try {
+        ua._resetUpdateActionsForTest();
+        ua.registerUpdateActions({ packageName: "billion-context", currentVersion: VERSION, autoUpdate: false, installDir: fixture, advisoryBlocksVersion: (v) => v === "0.9.400" });
+        const r = await ua.triggerManualCheck();
+        assert.equal(r.ok, true);
+        assert.equal(r.status, "blocked-advisory");
+        assert.equal(r.latest, "0.9.400");
+        assert.equal(state.hits["tarball:0.9.400"] ?? 0, 0);
+        assert.equal(await readDiskVersion(fixture), "0.9.300");
+    } finally {
+        restore();
+        ua._resetUpdateActionsForTest();
+    }
+});
+
+test("web panel Check now reports up-to-date when dist-tag equals the on-disk version (#4791)", async () => {
+    const fixture = makeFixture("0.9.400");
+    const state: RegistryStubState = { latest: "0.9.400", tarballs: new Map([["0.9.400", makeNpmTgz("0.9.400")]]), hits: {} };
+    const restore = stubRegistryFetch(state);
+    try {
+        ua._resetUpdateActionsForTest();
+        ua.registerUpdateActions({ packageName: "billion-context", currentVersion: VERSION, autoUpdate: false, installDir: fixture });
+        const r = await ua.triggerManualCheck();
+        assert.equal(r.ok, true);
+        assert.equal(r.status, "up-to-date");
+        assert.equal(r.latest, "0.9.400");
+        assert.equal(state.hits["tarball:0.9.400"] ?? 0, 0);
+        assert.equal(await readDiskVersion(fixture), "0.9.400");
+    } finally {
+        restore();
+        ua._resetUpdateActionsForTest();
+    }
+});
+
+test("web panel Check now defers to an active advisory without racing it (#4791/#1481)", async () => {
+    const fixture = makeFixture("0.9.300");
+    const state: RegistryStubState = { latest: "0.9.400", tarballs: new Map([["0.9.400", makeNpmTgz("0.9.400")]]), hits: {} };
+    const restore = stubRegistryFetch(state);
+    try {
+        ua._resetUpdateActionsForTest();
+        ua.registerUpdateActions({ packageName: "billion-context", currentVersion: VERSION, autoUpdate: false, installDir: fixture, advisoryActive: () => true });
+        const r = await ua.triggerManualCheck();
+        assert.equal(r.ok, true);
+        assert.equal(r.status, "deferred-advisory");
+        assert.equal(state.hits.latest ?? 0, 0, "deferral happens before any registry fetch");
+    } finally {
+        restore();
+        ua._resetUpdateActionsForTest();
+    }
+});
+
+test("panel installs attribute manual-web; advisory callers keep the legacy label (#4791)", async () => {
+    const fixture = makeFixture("0.9.300");
+    const state: RegistryStubState = { latest: "0.9.400", tarballs: new Map([["0.9.400", makeNpmTgz("0.9.400")]]), hits: {} };
+    const restore = stubRegistryFetch(state);
+    await _resetLastInstallForTest();
+    try {
+        const opts = { packageName: "billion-context", currentVersion: "0.9.300", autoUpdate: false, installDir: fixture };
+        const panel = await forceInstallVersion("0.9.400", fixture, opts, "web-panel", "manual-web");
+        assert.equal(panel.ok, true);
+        const rec = await getLastInstall();
+        assert.equal(rec?.source, "manual-web", "a user-initiated panel install must not be misfiled under an advisory id");
+        assert.equal(rec?.version, "0.9.400");
+        assert.equal(await readDiskVersion(fixture), "0.9.400");
+        await _resetLastInstallForTest();
+        const fixture2 = makeFixture("0.9.300");
+        const adv = await forceInstallVersion("0.9.400", fixture2, { ...opts, installDir: fixture2 }, "adv-test");
+        assert.equal(adv.ok, true);
+        assert.equal((await getLastInstall())?.source, "advisory:adv-test", "advisory callers omitting the explicit source keep the legacy label");
+    } finally {
+        restore();
+        await _resetLastInstallForTest();
     }
 });
 

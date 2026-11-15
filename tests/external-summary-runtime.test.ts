@@ -204,14 +204,65 @@ test("missing primary key skips its network call and tries the configured backup
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
-test("protected ranges cause no paid call and no fold", async () => {
+test("protected ranges return an idempotent no-op without a paid call", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.match(result.text, /^\[Compression no-op:/);
+        assert.equal(ctx.session.state.blocks.length, 0);
+        assert.equal(calls, 0);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("already-folded ranges return a no-op without another paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const input = args(ctx);
+        const first = await applyConfiguredCompression(input, ctx);
+        assert.equal(first.outcome, "applied", first.text);
+        const blockId = ctx.session.state.blocks[0]?.blockId;
+        assert.ok(blockId);
+        const again = await applyConfiguredCompression(input, ctx);
+        assert.equal(again.outcome, "applied", again.text);
+        assert.match(again.text, /^\[Compression no-op:/);
+        assert.match(again.text, /covered by active block/);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0]?.blockId, blockId);
+        assert.equal(calls, 1);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("restamped stale refs fold through the external summarizer, never under a probe summary", async () => {
+    const paths: string[] = [];
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // #4797 restamp shape: the model still cites a number vacated by the
+        // ledger alignment; the map holds old-ref -> raw id (message id) of
+        // the SAME message under its current label.
+        ctx.session.restampSuperseded = new Map([["m00999", "history"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0].summary, SUMMARY);
+        assert.deepEqual(paths, ["/primary"]);
+    }, (req, res) => { paths.push(req.url ?? ""); success(res); });
+});
+
+test("dead-end restamped refs keep the specific superseded-ref refusal without a paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // The vacated number's raw id lost its mapping entirely — an honest
+        // stale cite that translation cannot repair.
+        ctx.session.restampSuperseded = new Map([["m00999", "gone"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
         assert.equal(result.outcome, "refused");
+        assert.match(result.text, /re-numbered by the ledger alignment/);
         assert.equal(ctx.session.state.blocks.length, 0);
         assert.equal(calls, 0);
     }, (_req, res) => { calls++; success(res); });
@@ -311,6 +362,74 @@ test("batch protection checks the aggregate range length instead of rejecting va
         assert.equal(calls, 2);
         assert.equal(ctx.session.state.blocks.length, 2);
     }, (_req, res) => { calls++; success(res); });
+});
+
+test("external refolds index selected block ids once while preserving reference order", async (t) => {
+    let sentReference: Record<string, unknown> | undefined;
+    let blockIdReads = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const count = 512;
+        const selected = 384;
+        ctx.messages = [
+            ...Array.from({ length: count }, (_, index): CoreMessage => ({
+                id: `reference-source-${index}`, role: "assistant", contentType: "text", text: `Source ${index}. ${RAW}`,
+            })),
+            ctx.messages[1],
+        ];
+        ctx.session.state = ctx.core.processTurn({ messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 200_000 }).state;
+        const seeded = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: ctx.messages.slice(0, count).map((message, index) => ({
+                startRef: ctx.session.state.messageRefs.byRaw[message.id], endRef: ctx.session.state.messageRefs.byRaw[message.id],
+                summary: `Historical summary ${index}. ${SUMMARY}`, topic: `topic-${index}`,
+            })),
+        });
+        assert.equal(seeded.result.blocksCreated, count, JSON.stringify(seeded.result));
+        ctx.session.state = seeded.state;
+        const lastId = seeded.state.blocks.at(-1)!.blockId;
+        const retired = ctx.core.applyCompression({
+            messages: ctx.messages, state: ctx.session.state, config: ctx.config,
+            ranges: [{ startRef: lastId, endRef: lastId, summary: SUMMARY, topic: "retained-distillation" }],
+        });
+        assert.equal(retired.result.blocksCreated, 1, JSON.stringify(retired.result));
+        ctx.session.state = retired.state;
+        const initial = ctx.session.state;
+        const selectedIds = new Set(initial.blocks.slice(0, selected).map((block) => block.blockId));
+        const expected = initial.blocks.filter((block) => block.active && !selectedIds.has(block.blockId))
+            .map(({ topic, summary }) => ({ topic, summary }));
+        const applyCompression = ctx.core.applyCompression.bind(ctx.core);
+        let preview = true;
+        ctx.core = { ...ctx.core, applyCompression(input) {
+            const result = applyCompression(input);
+            if (!preview) return result;
+            preview = false;
+            for (const block of result.state.blocks) {
+                if (block.summary.startsWith("external-probe-")) block.directBlockIds = new Proxy(block.directBlockIds, {
+                    get(target, key, receiver) {
+                        if (typeof key === "string" && /^\d+$/.test(key)) blockIdReads++;
+                        return Reflect.get(target, key, receiver);
+                    },
+                });
+            }
+            return result;
+        } };
+
+        const result = await applyConfiguredCompression({ content: [{
+            startId: initial.blocks[0].blockId, endId: initial.blocks[selected - 1].blockId, summary: "Retain the selected historical work.",
+        }] }, ctx);
+
+        assert.equal(result.outcome, "applied", result.text);
+        assert.deepEqual(sentReference?.otherSummaries, expected);
+        assert.deepEqual(sentReference?.currentContext, ctx.messages.slice(-5).map(({ role, text }) => ({ role, text })));
+        assert.equal(sentReference?.submittedSummaryHint, "Retain the selected historical work.");
+        t.diagnostic(`${blockIdReads} selected-block-id visits for ${count} source blocks`);
+        assert.ok(blockIdReads <= count * 8, `selected block ids were visited ${blockIdReads} times for ${count} source blocks`);
+    }, (_req, res, body) => {
+        const payload = JSON.parse((body.input as Array<{ content: string }>)[0].content) as { reference: string };
+        sentReference = JSON.parse(payload.reference) as Record<string, unknown>;
+        success(res);
+    });
 });
 
 test("inline restore refolds the original block even when originals have left the wire view", async () => {
