@@ -384,6 +384,18 @@ def stub_bili(bin_dir, target):
     os.symlink(target, p)
     return p
 
+def clean_node_bin():
+    # A bin dir holding ONLY a node shim. The "no bili anywhere" assertions must hold against a
+    # PATH that has node but no bili; the node's own bin dir is NOT safe for that, because a real
+    # global install puts its \`bili\` symlink next to \`node\` on the standard npm layout.
+    d = os.path.join(BASE, "cleanbin")
+    os.makedirs(d, exist_ok=True)
+    node = os.path.join(d, "node")
+    if os.path.lexists(node):
+        os.remove(node)
+    os.symlink(os.environ["BC_NODE"], node)
+    return d
+
 # --- #2905 instance-record fixtures (identity fields discovery now checks) ---
 
 def fp_of(bad):
@@ -517,7 +529,8 @@ elif SCENARIO.startswith("gate-"):
 elif SCENARIO == "no-sidecar":
     # Hermetic: a \`bili\` on the machine's own PATH must not turn "no dist anywhere" into a
     # resolution — the ladder's last rung is asserted against a PATH that holds node only.
-    os.environ["PATH"] = os.path.dirname(os.environ["BC_NODE"])
+    # clean_node_bin(), not the node's own dir: a real global install sits next to node there.
+    os.environ["PATH"] = clean_node_bin()
     mod.register(ctx)
 elif SCENARIO == "load-sidecar":
     # #6672: the sidecar resolution ladder, first hit wins and nothing is ever written.
@@ -535,7 +548,9 @@ elif SCENARIO == "load-sidecar":
     else:
         bin_dir = os.path.join(BASE, "bin")
         os.makedirs(bin_dir, exist_ok=True)
-        node_dir = os.path.dirname(os.environ["BC_NODE"])
+        # node_dir must hold node but NO bili: clean_node_bin(), not the node's own bin dir,
+        # which on a standard install also carries the real global \`bili\` symlink.
+        node_dir = clean_node_bin()
         wrapper = os.path.join(BASE, "wrapper.sh")
         with open(wrapper, "w") as f:
             f.write("#!/bin/sh\nexit 0\n")
