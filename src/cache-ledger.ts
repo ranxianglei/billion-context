@@ -2214,9 +2214,6 @@ interface RecoveryReport {
      *  are ONE 100% point, the ratchet's single-folds stay low). pct is null
      *  when the nudge carried no measurable pending (non-T1 tiers). */
     episodes: Array<{ at: number; tier: number | null; pending: number; folded: number; pct: number | null; credited: number; extra: number; activeFolds: number }>;
-    /** Active (no-nudge) folds that happened BEFORE the first nudge — they
-     *  have no round to attach to, but the chart still marks their spot. */
-    activesBefore: number;
 }
 
 interface BiliCacheReport extends CacheReport {
@@ -2460,13 +2457,10 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         // on its own — so a 370% round reads as "list + 182K old stock",
         // not 370K of phantom recovery.
         const episodes: RecoveryReport["episodes"] = [];
-        let activesBefore = 0;
-        let sawNudge = false;
         let recPool = 0;
         for (let j = 0; j < recEvents.length; j++) {
             const ev = recEvents[j];
             if (ev.kind === "n") {
-                sawNudge = true;
                 recPool += ev.pending;
                 let epFolded = 0;
                 let epActive = 0;
@@ -2487,15 +2481,12 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
                     extra: epFolded - credited,
                     activeFolds: epActive,
                 });
-            } else if (!sawNudge && ev.mode === "a") {
-                activesBefore += 1;
             }
         }
         recovery = {
             events: recEvents.map(({ i: _i, ...ev }) => ev),
             summary: { nudges, folds, nudgeFolds, activeFolds, totalPending, totalFolded, pct: totalPending > 0 ? Math.round((totalFolded / totalPending) * 1000) / 10 : null },
             episodes,
-            activesBefore,
         };
     }
     return {

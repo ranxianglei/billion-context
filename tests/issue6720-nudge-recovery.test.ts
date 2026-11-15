@@ -175,7 +175,6 @@ test("episodes: partial folds in one nudge round merge into a single 100% point"
     assert.equal(ep.folded, 52000);
     assert.equal(ep.pct, 100);
     assert.equal(ep.activeFolds, 0);
-    assert.equal(rec.activesBefore, 0);
 });
 
 test("episodes: per-round ratios stay separate; in-window actives are markers, not numerator", () => {
@@ -196,11 +195,10 @@ test("episodes: per-round ratios stay separate; in-window actives are markers, n
     assert.equal(rec.episodes[0].folded, 5200);
     assert.equal(rec.episodes[0].activeFolds, 1, "active fold rides as a marker, never in the numerator");
     assert.equal(rec.episodes[1].pct, 40);
-    assert.equal(rec.activesBefore, 0);
     assert.equal(rec.summary.pct, Math.round((13200 / 30000) * 1000) / 10);
 });
 
-test("episodes: active folds before the first nudge count as activesBefore", () => {
+test("episodes: an active fold before the first nudge does not enter any round", () => {
     const session = makeSession();
     const t0 = Date.now();
     recordCacheFoldsFromBlocks(session, [block("b1", t0, 3000)]);
@@ -208,9 +206,9 @@ test("episodes: active folds before the first nudge count as activesBefore", () 
     recordCacheFoldsFromBlocks(session, [block("b2", t0 + 2 * MIN + 30_000, 4000)]);
     const rec = buildSessionCacheReport(session).recovery;
     assert.ok(rec);
-    assert.equal(rec.activesBefore, 1);
     assert.equal(rec.episodes.length, 1);
     assert.equal(rec.episodes[0].pct, 100);
+    assert.equal(rec.episodes[0].activeFolds, 0);
 });
 
 test("episodes: non-T1 nudge round keeps pct null (no NaN)", () => {
@@ -226,12 +224,13 @@ test("episodes: non-T1 nudge round keeps pct null (no NaN)", () => {
     assert.equal(rec.episodes[0].pct, null);
 });
 
-test("folds-only session: no episodes, every fold lands in activesBefore", () => {
+test("folds-only session: no nudge rounds → no episodes", () => {
     const session = makeSession();
     const t0 = Date.now();
     recordCacheFoldsFromBlocks(session, [block("b1", t0, 20000), block("b2", t0 + 5_000, 4000)]);
     const rec = buildSessionCacheReport(session).recovery;
     assert.ok(rec);
     assert.equal(rec.episodes.length, 0);
-    assert.equal(rec.activesBefore, 2);
+    assert.equal(rec.summary.nudges, 0);
+    assert.equal(rec.summary.activeFolds, 2);
 });

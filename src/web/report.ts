@@ -53,7 +53,6 @@ interface ReportData {
             summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
             /** #6729 follow-up: one point per nudge round for the recovery line chart. */
             episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number }>;
-            activesBefore?: number;
         };
         lines?: Array<{ input?: number; cached?: number }>;
     }) | null;
