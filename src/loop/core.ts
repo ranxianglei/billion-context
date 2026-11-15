@@ -322,7 +322,10 @@ export interface RequestOptions {
 // arrive instead of being re-laid out as [reasoning…, text, tool…].
 type RoundPart =
     | { kind: "reasoning"; text: string; signature: string }
-    | { kind: "text"; text: string }
+    // #6842: a signed ordinary text part (Gemini thoughtSignature without
+    // thought: true) — verified byte-for-byte on replay, so the proxy-tool
+    // rebuild must put the signature back on the re-request at its position.
+    | { kind: "text"; text: string; signature?: string }
     | { kind: "redacted"; data: string }
     // #3158: a Gemini part whose only payload is a thoughtSignature (no text,
     // no functionCall). Recorded in stream order so a proxy-tool rebuild puts
@@ -333,7 +336,10 @@ export type ParsedStreamEvent =
     // rawHandled: the adapter carries this delta in another event's complete
     // frame (or buffers that frame until tool settlement). Keep accounting it,
     // but do not synthesize a second client frame in continuation rounds.
-    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean }
+    // signature: #6842 — a signed ordinary text part (Google thoughtSignature
+    // without thought: true) carries it here; the loop keeps it on the part
+    // for the proxy-tool rebuild.
+    | { kind: "text"; delta: string; raw?: Buffer; rawHandled?: boolean; signature?: string }
     // round2-hold: withheld marks a reasoning PAYLOAD the adapter kept off the
     // client wire (bili-owned round ≥ 2 on a signing upstream — see
     // ParseStreamOpts.upstreamSignsThinking). It still feeds the loop's
@@ -963,11 +969,17 @@ export async function* runCompressLoop(
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         let tp = roundParts[roundParts.length - 1];
-                        if (!tp || tp.kind !== "text") {
+                        // #6842: a text part that already carries its
+                        // thoughtSignature is complete — Gemini computes the
+                        // signature over the FULL part text, so it arrives in
+                        // that part's last chunk; any later text delta starts
+                        // a new part.
+                        if (!tp || tp.kind !== "text" || tp.signature !== undefined) {
                             tp = { kind: "text", text: "" };
                             roundParts.push(tp);
                         }
                         tp.text += ev.delta;
+                        if (ev.signature !== undefined && tp.signature === undefined) tp.signature = ev.signature;
                         if (!ctx.textProtocol && (ev.raw || ev.rawHandled)) {
                             recordReplyText("text", ev.delta);
                             if (ev.raw) yield fwd(ev.raw, true);
@@ -1531,6 +1543,13 @@ export async function* runCompressLoop(
                             role: "assistant",
                             contentType: "text",
                             text: part.text,
+                            // #6842: signed ordinary text part — the re-request
+                            // must carry the thoughtSignature or the
+                            // continuation disagrees with the client's persisted
+                            // history (KDD#10).
+                            ...(ctx.protocol === "google" && part.signature
+                                ? { googleThoughtSignature: part.signature }
+                                : {}),
                         });
                     } else if (part.kind === "standalone_signature") {
                         // #3158: put the standalone thoughtSignature back at its

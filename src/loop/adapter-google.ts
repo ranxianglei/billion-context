@@ -634,13 +634,24 @@ export function createGoogleAdapter(
                         });
                         continue;
                     }
-                    const clean = tagFilter.push(part.text);
+                    // #6842/KDD#10: Gemini also signs ORDINARY text parts
+                    // (thoughtSignature without thought: true). The signature is
+                    // verified byte-for-byte over the part's text on replay —
+                    // the same verbatim contract as thought parts, so the text
+                    // is never filtered and the signature rides the loop event.
+                    const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
+                    const clean = signed ? part.text : tagFilter.push(part.text);
                     if (clean !== part.text) {
                         editedParts ??= [...parts];
                         editedParts[i] = { ...part, text: clean };
                     }
                     if (clean.length === 0) continue;
-                    partEvents.push({ kind: "text", delta: clean, rawHandled: true });
+                    partEvents.push({
+                        kind: "text",
+                        delta: clean,
+                        rawHandled: true,
+                        ...(signed ? { signature: part.thoughtSignature } : {}),
+                    });
                 }
                 // Decide wire output only after every prose sibling has been
                 // cleaned. Each complete frame belongs to one event, regardless
