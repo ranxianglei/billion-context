@@ -32,6 +32,15 @@ echo "primary   : $MODEL1_BASE_URL  model=$MODEL1_MODEL  key=${MODEL1_API_KEY:0:
 echo "secondary : ${MODEL2_BASE_URL:-<none>}  model=${MODEL2_MODEL:-<none>}"
 echo "repo      : $GATE_REPO_URL @ ${GATE_REV}"
 echo "registry  : ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org} (deps)"
+# release-gate-local takes its skips as a CLI flag (--skip a,b,u), not via
+# env — GATE_SKIP above only reaches the P/R/I/X scripts. Forward the a/b/u
+# subset here; i/x/p/r are handled by those scripts themselves.
+ABU_SKIP=""
+if [ -n "$SKIP" ]; then
+  for k in ${SKIP//,/ }; do
+    case "$k" in a|b|u) ABU_SKIP="${ABU_SKIP:+$ABU_SKIP,}$k" ;; esac
+  done
+fi
 echo "skip      : ${SKIP:-none}"
 
 node --version; npm --version; git --version; dsh --version || true
@@ -127,6 +136,7 @@ env \
   GATE_SKIP="$SKIP" \
   node "$REPO/scripts/release-gate-local.mjs" \
     --tarball "$TGZ" --base-dir "$SCRATCH" --with-update $KEEP_FLAG \
+    ${ABU_SKIP:+--skip "$ABU_SKIP"} \
   2>&1 | tee "$WORK/gate-local.log"
 RC_GATE=${PIPESTATUS[0]}
 
