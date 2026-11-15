@@ -2516,12 +2516,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 `${tag}[fold-reconcile] resent history drifted: ${realUnmatched.length} covered id(s) missing with no anchor match${expectedNote} — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire)${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} of them have an inbound twin with identical normalized content under a different toolCallId — consistent with the host rewriting authoritative tool-call ids across provider projections (host contract: keep tool-call ids byte-stable per conversation, #2396)` : ""} (#1921)${driftTok}`);
         }
     }
-    // #4920: surface the TRULY-lost coverage (the unmatched tail — claims were
-    // re-anchored onto churned bytes, their folds live on) on the session so
-    // acp_status can show it; recording here (not in the lanes' post-reconcile
-    // snapshots) covers every verdict class, including mutation passes that
-    // deactivate the drifted blocks before the lane snapshot runs.
-    if (plan.unmatched.length > 0) noteFoldDrift(session, { expected: covered.size, matched: covered.size - plan.unmatched.length });
+    // #4920: surface the TRULY-lost coverage on the session so acp_status can
+    // show it. The set is realUnmatched, not plan.unmatched: claims were
+    // re-anchored onto churned bytes (their folds live on) and expected rebases
+    // (carrier retirement / offload rewrites) are not loss (#5142) — the same
+    // set the clean-pass early return above and the drift-warn cascade key on.
+    // Recording here (not in the lanes' post-reconcile snapshots) covers every
+    // verdict class, including mutation passes that deactivate the drifted
+    // blocks before the lane snapshot runs.
+    if (realUnmatched.length > 0) noteFoldDrift(session, { expected: covered.size, matched: covered.size - realUnmatched.length });
     return {
         kind: plan.claims.size > 0 ? (mode === "repair" ? "reanchored" : "unmatched") : "unmatched",
         missing: plan.claims.size + realUnmatched.length,

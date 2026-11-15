@@ -506,7 +506,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const drift = foldDriftOf(ctx.session);
     if (drift) {
         extra.push("");
-        extra.push(`FOLD DRIFT (session-level): only ${drift.matched}/${drift.expected} covered message id(s) are back on the resent wire — ${drift.expected - drift.matched} covered id(s) missing since ${drift.at} (#4920): their folded content rides the wire raw again until coverage re-anchors; see the [acp-drift] lines in the bili log.`);
+        extra.push(`FOLD DRIFT (session-level): ${drift.expected - drift.matched} covered message id(s) lost fold coverage since ${drift.at} (#4920) — ${drift.matched}/${drift.expected} covered id(s) retain fold coverage; the lost id(s)' folded content rides the wire raw again until coverage re-anchors; see the [acp-drift] lines in the bili log.`);
     }
     const adv = getAdvisoryState();
     if (adv.active) {
