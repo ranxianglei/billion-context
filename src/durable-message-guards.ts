@@ -200,7 +200,7 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
  *  system / developer item); no such emitter is evidenced. */
 export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
     return msg.role === "system" && msg.contentType === "text" && typeof msg.text === "string" &&
-        hostSentSystemText(msg, msg.text) && !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg)
+        !msg.text.startsWith(SUMMARY_HEADER) && !hasUnrecoverableMediaPayload(msg) && hostSentSystemText(msg, msg.text)
         ? "durable/system-prompt"
         : undefined;
 }
@@ -219,8 +219,16 @@ export function dshSystemPromptPath(msg: CoreMessage): string | undefined {
  *  with ref tags (processTurn renderTags) a numbered message's `text` starts
  *  with its tag, so an empty node reads as non-empty there on all three
  *  wires and skews the protection set of whatever classifies that view.
- *  A core without a sidecar is judged on `text`, as before. No copy is
- *  made: this runs on every protection check. */
+ *  A core without a sidecar is judged on `text`, as before. The caller
+ *  asks hasUnrecoverableMediaPayload first, so a sidecar that reaches
+ *  this is plain text for the kernel and each of its blocks is one whose
+ *  text the codec read into `text`; it is read the same way here. On the
+ *  Messages and chat-completions wires a missing or null value is empty
+ *  and any other value is stringified (the codec did the same conversion
+ *  at decode, so it cannot throw here); on the responses wire the kernel
+ *  admits string text only. The blank node is therefore the only thing
+ *  this takes out of what `text` matched. A string is not copied: this
+ *  runs on every protection check. */
 function hostSentSystemText(msg: CoreMessage, text: string): boolean {
     const sidecars = msg as { rawAnthropicMessage?: unknown; rawOpenaiMessage?: unknown; rawResponsesItem?: unknown };
     const raw = sidecars.rawAnthropicMessage ?? sidecars.rawOpenaiMessage ?? sidecars.rawResponsesItem;
@@ -229,7 +237,7 @@ function hostSentSystemText(msg: CoreMessage, text: string): boolean {
     if (typeof content === "string") return /\S/.test(content);
     return Array.isArray(content) && content.some((part) => {
         const partText = (part as { text?: unknown } | null)?.text;
-        return typeof partText === "string" && /\S/.test(partText);
+        return partText != null && /\S/.test(String(partText));
     });
 }
 

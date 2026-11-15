@@ -123,6 +123,23 @@ describe("dshSystemPromptPath units", () => {
         assert.equal(dshSystemPromptPath(literal), "durable/system-prompt", "host text that happens to equal the codec's placeholder is still host text");
         const padded = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: [{ type: "text", text: "" }, { type: "text", text: PROMPT_V2 }] }] }).msgs[1]!;
         assert.equal(dshSystemPromptPath(padded), "durable/system-prompt", "Messages wire, an empty text block next to the prompt text");
+        // A block's text is read the way the Messages and chat-completions
+        // codecs read it into `text`: a value that is neither missing nor
+        // null is stringified there, and it is the converted text that is
+        // tested for blank. The object below converts to "[object Object]",
+        // so this is not an empty node. Off-spec on both wires; pinned so the
+        // sidecar reading takes nothing but the blank node out of what `text`
+        // matched.
+        const oddBlocks = [{ type: "text", text: { value: PROMPT_V2 } }];
+        const antOdd = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: oddBlocks } as unknown as AnthropicWireMessage] }).msgs[1]!;
+        assert.equal(antOdd.text, "[object Object]", "precondition: the Messages codec stringifies a block text that is not a string");
+        assert.equal(hasUnrecoverableMediaPayload(antOdd), false, "precondition: still plain text for the kernel");
+        assert.equal(dshSystemPromptPath(antOdd), "durable/system-prompt", "Messages wire, a text block whose text is not a string");
+        const oaiOdd = openaiToCore({ model: "m", messages: [{ role: "user", content: "hi" }, { role: "system", content: oddBlocks }] } as never).msgs.filter((m) => m.role === "system");
+        assert.equal(oaiOdd.length, 1);
+        assert.equal(oaiOdd[0]!.text, "[object Object]", "precondition: the chat-completions codec does the same");
+        assert.equal(hasUnrecoverableMediaPayload(oaiOdd[0]!), false);
+        assert.equal(dshSystemPromptPath(oaiOdd[0]!), "durable/system-prompt", "chat-completions wire, a text block whose text is not a string");
     });
 
     test("negatives: other roles, non-text, empty, structured systems, bili's own summary carrier", () => {
@@ -145,6 +162,8 @@ describe("dshSystemPromptPath units", () => {
             ["", "empty string content"],
             [[{ type: "text", text: "" }], "one empty text block"],
             [[{ type: "text" }], "one text block without a text key"],
+            [[{ type: "text", text: null }], "one text block whose text is null"],
+            [[{ type: "text", text: [] }], "one text block whose text is an empty array"],
         ] as Array<[unknown, string]>) {
             const blank = antBlank(content);
             assert.equal(blank.role, "system");
@@ -190,6 +209,22 @@ describe("dshSystemPromptPath units", () => {
         const oaiTools = openaiToCore({ model: "m", messages: [{ role: "user", content: "hi" }, { role: "system", tools: [{ type: "function", function: { name: "search", parameters: { type: "object", properties: {} } } }] }] } as never).msgs.find((m) => m.role === "system")!;
         assert.equal(hasUnrecoverableMediaPayload(oaiTools), true);
         assert.equal(dshSystemPromptPath(oaiTools), undefined, "tools-carrying system (chat-completions wire)");
+        // The sidecar is read only after the kernel's structured-system check,
+        // so the string conversion never meets a block text the codec did not
+        // read into `text`. A JSON object whose own toString is not callable
+        // cannot be converted, and the kernel calls the classifier without a
+        // try.
+        const unreadable = JSON.parse('{"toString":1}') as unknown;
+        const antUnread = anthropicToCore({ messages: [{ role: "user", content: "hi" }, { role: "system", content: [{ type: "tool_addition", text: unreadable }] } as unknown as AnthropicWireMessage] }).msgs[1]!;
+        assert.equal(hasUnrecoverableMediaPayload(antUnread), true);
+        assert.equal(dshSystemPromptPath(antUnread), undefined, "structured system whose block carries a text the codec never reads (anthropic wire)");
+        const rspUnread = responsesToCore({ model: "m", input: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+            { type: "message", role: "system", content: [{ type: "input_text", text: unreadable }] },
+        ] } as never).msgs.filter((m) => m.role === "system");
+        assert.equal(rspUnread.length, 1);
+        assert.equal(hasUnrecoverableMediaPayload(rspUnread[0]!), true);
+        assert.equal(dshSystemPromptPath(rspUnread[0]!), undefined, "responses wire, an input_text part whose text is not a string");
     });
 
     test("lane wiring: the dsh slot registry resolves it, the drift-accounting registry does not, no other lane does", () => {
