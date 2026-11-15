@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultCountTokens } from "acp-kernel";
 import { estimateRawBodyBreakdown, estimateRawBodyTokens } from "../src/preflight.ts";
+import { measuredBreakdownClause } from "../src/server.ts";
 
 // #6844: DSH attaches model-hidden provider metadata as top-level body fields
 // (`dsh_session_log`, `dsh_plugin_packages`) — documented as staying outside
@@ -62,4 +63,44 @@ test("total invariant holds with hidden and other fields mixed", () => {
     assert.equal(bd.other, t("deepseek-flash") + t("structural note"));
     assert.equal(bd.total, visible + t("structural note"));
     assert.equal(bd.total, estimateRawBodyTokens(mixed));
+});
+
+test("otherTop attributes the other bucket to its top-level fields, descending (#6844 item 3)", () => {
+    const { body, visible } = incidentBody();
+    const extra = "E".repeat(50_000);
+    const withOther = { ...body, custom_extension: extra, metadata: { note: "note x" } };
+    const bd = estimateRawBodyBreakdown(withOther);
+    assert.deepEqual(bd.otherTop, [
+        { field: "custom_extension", tokens: t(extra) },
+        { field: "model", tokens: t("deepseek-flash") },
+        { field: "metadata", tokens: t("note x") },
+    ], "per-field attribution, largest first");
+    assert.equal(bd.otherTop.reduce((sum, e) => sum + e.tokens, 0), bd.other, "otherTop sums to the other bucket");
+    assert.equal(bd.total, visible + t(extra) + t("note x"));
+});
+
+test("hidden fields leave no otherTop attribution; empty other stays empty", () => {
+    const { body } = incidentBody();
+    const bd = estimateRawBodyBreakdown({ ...body, model: undefined });
+    assert.equal(bd.other, 0, "only the two hidden fields were in other — both excluded");
+    assert.deepEqual(bd.otherTop, []);
+    assert.deepEqual(estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }] }).otherTop, []);
+});
+
+test("measuredBreakdownClause names the field dominating other (#6844 item 3)", () => {
+    const { body } = incidentBody();
+    const extra = "E".repeat(50_000);
+    const bd = estimateRawBodyBreakdown({ ...body, custom_extension: extra });
+    const clause = measuredBreakdownClause(bd);
+    assert.match(clause, /other ~[\d,]+ \(top field: custom_extension ~[\d,]+\)/, `the 413 clause must name the dominating field, got: ${clause}`);
+    assert.match(clause, /^messages ~[\d,]+ · tools\[\] ~[\d,]+ · system ~[\d,]+ · other /, "the four-bucket shape is unchanged");
+});
+
+test("measuredBreakdownClause stays bare when other is empty", () => {
+    const bd = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }] });
+    assert.equal(
+        measuredBreakdownClause(bd),
+        `messages ~${bd.messages.toLocaleString("en-US")} · tools[] ~0 · system ~0 · other ~0`,
+        "no top-field suffix when other has nothing to attribute",
+    );
 });
