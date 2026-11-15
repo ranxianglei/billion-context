@@ -670,7 +670,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[]; compatThreadsDisabled?: boolean };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[]; compatThreadsDisabledSids?: Set<string> };
 
 // #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
 // the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
@@ -1558,25 +1558,37 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // requests through the existing compression pipeline, without
             // requiring a user models.json edit, disabling bili, filtering
             // payloads, or retrying deterministic failures.
-            if (agent === "pi" && typeof pi.setModel === "function" && !state.compatThreadsDisabled) {
+            //
+            // The latch is per-SESSION, not per-process: `state` is one plugin
+            // instance shared across every session in the host process (see
+            // lastReportedNames / carriedSids), so a process-global boolean
+            // would latch on the first anthropic session and leave every later
+            // session still on native threads → 429. Key by sid; a missing sid
+            // degrades to the process-global key "" (one setModel for the
+            // whole no-sid process, same as before).
+            if (agent === "pi" && typeof pi.setModel === "function") {
                 const model = ctx.model;
                 if (model && model.provider === "anthropic" && model.api === "anthropic-messages") {
                     const proxyBase = proxyBaseForCtx(ctx);
                     if (proxyBase !== undefined) {
-                        state.compatThreadsDisabled = true;
-                        try {
-                            const m = model as unknown as Record<string, unknown>;
-                            const compat = (m.compat ?? {}) as Record<string, unknown>;
-                            await pi.setModel({
-                                ...m,
-                                compat: {
-                                    ...compat,
-                                    supportsMessageThreads: false,
-                                },
-                            });
-                        } catch (err) {
-                            state.compatThreadsDisabled = false;
-                            logHostEvent("warn", "[native-client]", `bili-plugin(pi): failed to disable native threads for Anthropic Messages model (${err instanceof Error ? err.message : String(err)}) — continuing with native threads`);
+                        const key = sessionIdOf(ctx) ?? "";
+                        const latched = state.compatThreadsDisabledSids ?? (state.compatThreadsDisabledSids = new Set<string>());
+                        if (!latched.has(key)) {
+                            latched.add(key);
+                            try {
+                                const m = model as unknown as Record<string, unknown>;
+                                const compat = (m.compat ?? {}) as Record<string, unknown>;
+                                await pi.setModel({
+                                    ...m,
+                                    compat: {
+                                        ...compat,
+                                        supportsMessageThreads: false,
+                                    },
+                                });
+                            } catch (err) {
+                                latched.delete(key);
+                                logHostEvent("warn", "[native-client]", `bili-plugin(pi): failed to disable native threads for Anthropic Messages model (${err instanceof Error ? err.message : String(err)}) — continuing with native threads`);
+                            }
                         }
                     }
                 }

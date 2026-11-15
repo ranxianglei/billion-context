@@ -102,6 +102,30 @@ test("#6796: second request does NOT call setModel again (idempotent)", async ()
     assert.equal(pi.setModelCalls.length, 1, "setModel called exactly once across two requests");
 });
 
+test("#6796: a DIFFERENT session gets its own setModel (per-session latch, not process-global)", async () => {
+    const pi = makeFakePi();
+    createBiliPlugin("pi")(pi as never);
+    const handler = pi.events.get("before_provider_request");
+    assert.ok(handler, "before_provider_request handler registered");
+
+    // Two distinct sessions in the SAME plugin instance (one host process
+    // shares `state` across sessions). Each must negotiate its own
+    // compat.supportsMessageThreads=false — a process-global boolean latch
+    // would latch on the first session and leave the second on native threads.
+    const ctxA = anthropicCtx(PROXY_BASE_URL); // sid "test-sid"
+    const ctxB: Record<string, unknown> = {
+        ...anthropicCtx(PROXY_BASE_URL),
+        sessionManager: { getSessionId: () => "other-sid" },
+    };
+    await handler![0]({ payload: { model: "claude-opus-4-5", messages: [] } }, ctxA);
+    await handler![0]({ payload: { model: "claude-opus-4-5", messages: [] } }, ctxB);
+
+    assert.equal(pi.setModelCalls.length, 2, "setModel called once per distinct session");
+    // Same session again → still latched (no third call).
+    await handler![0]({ payload: { model: "claude-opus-4-5", messages: [] } }, ctxA);
+    assert.equal(pi.setModelCalls.length, 2, "re-request on a latched session does not re-negotiate");
+});
+
 test("#6796: non-anthropic model → setModel NOT called", async () => {
     const pi = makeFakePi();
     createBiliPlugin("pi")(pi as never);
