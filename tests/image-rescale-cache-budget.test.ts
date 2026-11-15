@@ -4,6 +4,10 @@ import { Jimp } from "jimp";
 import { createSession } from "../src/session.ts";
 import { applyImageRescalePass, clearRescaleEncodeCache, shedDownscaleImage } from "../src/image-rescale.ts";
 
+// Isolate the rescale knob from any host config: the pass must run on the
+// default (enabled) posture, matching the issue3400 suite's isolation.
+process.env.BILI_CONFIG_FILE = "/nonexistent/bili-image-rescale-cache-budget.json";
+
 // Exercise the production admission/eviction paths with small payloads; the
 // real-codec benchmark uses the unchanged default 64 MiB budget.
 test.beforeEach(() => clearRescaleEncodeCache(64));
