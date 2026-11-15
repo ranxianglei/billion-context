@@ -4,7 +4,7 @@ import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { listSessions, type Session } from "../session.js";
 import { loadConfigFile } from "../config.js";
-import { resolveSnapshotShadow } from "../knobs.js";
+import { resolveSnapshotShadow, snapBasePlaneEnabled } from "../knobs.js";
 import { createHash } from "node:crypto";
 
 /**
@@ -209,15 +209,16 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     }
     if (rows.length === 0) return { reason: "transcript-empty" };
 
-    // #5874 v2 step 3: the egress prefix cache. egressReadView already ran
-    // the input-hash re-derive and the fold-crossing gate inside the store;
-    // a hit carries the materialized stable rows, and its bytes are spliced
-    // into the identity rows so the content load below only reads what the
-    // cache does not cover. ANY mismatch (unparseable payload, a cached row
-    // that retired, an id drift) leaves egressMaxSeq at -1 and the lane
-    // derives every byte live — never a partial splice, never a guess.
+    // #5874 v2 step 3: the egress prefix cache (gated by storage.snapBase —
+    // config-file only, dormant by default). egressReadView already ran the
+    // input-hash re-derive and the fold-crossing gate inside the store; a hit
+    // carries the materialized stable rows, and its bytes are spliced into
+    // the identity rows so the content load below only reads what the cache
+    // does not cover. ANY mismatch (unparseable payload, a cached row that
+    // retired, an id drift) leaves egressMaxSeq at -1 and the lane derives
+    // every byte live — never a partial splice, never a guess.
     let egressMaxSeq = -1;
-    {
+    if (snapBasePlaneEnabled(session.meta?.protocol)) {
         let hit: import("../storage/snap.js").EgressReadHit | null = null;
         try { hit = store.egressReadView(session.id); } catch { hit = null; }
         if (hit) {
@@ -323,7 +324,8 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         return { reason: "transcript-error" };
     }
     // #5874 v2 steps 3+4: re-materialize when the stable watermark advanced
-    // past the cached cut or the cache missed this turn. The cut lands on the
+    // past the cached cut or the cache missed this turn (same gate as the
+    // read side — an off plane neither serves nor cuts). The cut lands on the
     // max of the newest active fold's covered region and the newest live
     // USER message (turn boundary — the natural rollback point, so a warm
     // render after a rewind still serves a cut it can verify). The cached
@@ -339,7 +341,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         for (const r of rows) {
             if (r.msg && r.msg.role === "user" && r.seq > cutWm) cutWm = r.seq;
         }
-        if (cutWm > egressMaxSeq) {
+        if (snapBasePlaneEnabled(session.meta?.protocol) && cutWm > egressMaxSeq) {
             try {
                 const prefixRows = rows.filter((r) => r.seq <= cutWm);
                 if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {

@@ -981,6 +981,17 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
+/** #5874 v2: egress stable-prefix cache plane gate. storage.snapBase.enabled
+ *  (default dormant) × cohorts (missing/empty = all). Config-file only —
+ *  no env tier (#2030); tests drive the real path by writing the config
+ *  file (loadConfigFile's cache is keyed on the raw text). */
+export function snapBasePlaneEnabled(protocol: string | undefined): boolean {
+    const snapBase = loadConfigFile().storage?.snapBase;
+    if (snapBase?.enabled !== true) return false;
+    if (!Array.isArray(snapBase.cohorts) || snapBase.cohorts.length === 0) return true;
+    return protocol !== undefined && snapBase.cohorts.includes(protocol);
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
  *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED
  *  (1/true = shadow, full/unified = full, sqlite = pure-sqlite, 0/false/legacy/

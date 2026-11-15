@@ -381,19 +381,16 @@ async function main() {
           },
           // Lane U reads `latest` from here (a dsh-managed proxy must NOT self-update in place).
           ...(verdaccioOk ? { update: { registry: G.verdaccio } } : {}),
-          // --snapbase-full: run the #5874 snapshot plane (P0+P1+P2) fully ON
-          // for this gate invocation — master + shadow-write lane + direct
-          // egress authority, all four wire cohorts. Absent flag = plane off
-          // (the shipped default), so a normal gate run is byte-identical to
-          // pre-plane.
+          // --snapbase-full: run the #5874 v2 snapshot-base plane fully ON
+          // for this gate invocation — egress stable-prefix cache for all
+          // four wire cohorts. Absent flag = plane off (the shipped
+          // default), so a normal gate run is byte-identical to pre-plane.
           ...(G.snapbaseFull
             ? {
                 storage: {
                   snapBase: {
                     enabled: true,
-                    shadowWrite: true,
-                    egress: true,
-                    egressCohorts: ["openai", "anthropic", "google", "responses"],
+                    cohorts: ["openai", "anthropic", "google", "responses"],
                   },
                 },
               }

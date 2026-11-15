@@ -10,7 +10,7 @@ process.env.BILI_STORAGE_UNIFIED = "shadow";
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -113,6 +113,7 @@ const CLIENT: BiliMessage[] = [
 function makeSession(): Session {
     return {
         id: "sess-es",
+        meta: { protocol: "openai" },
         state: {
             blocks: [{
                 blockId: "blk-f1",
@@ -124,9 +125,23 @@ function makeSession(): Session {
     } as unknown as Session;
 }
 
+/** #5874 v2 step 5: the plane is config-file-only (storage.snapBase) — the
+ *  test drives the REAL config path (loadConfigFile's cache is keyed on the
+ *  raw text, so a rewrite takes effect on the next gate read). null = no
+ *  file (the shipped default: plane dormant). */
+function setSnapBaseConfig(value: Record<string, unknown> | null): void {
+    const p = process.env.BILI_CONFIG_FILE!;
+    if (value === null) {
+        rmSync(p, { force: true });
+        return;
+    }
+    writeFileSync(p, JSON.stringify(value));
+}
+
 function setup() {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-5874-lane-"));
     const dbPath = path.join(dir, "store.db");
+    setSnapBaseConfig({ storage: { snapBase: { enabled: true } } });
     const store = UnifiedStore.open(dbPath);
     assert.ok(store.ingestSession(planIngest(plainSession(6))), "seed");
     assert.ok(store.ingestSession(planIngest(foldedSession(["m5", "m6"])), undefined, { completeLog: true }), "fold");
@@ -186,6 +201,7 @@ test("#5874-v2 L1: warm render is byte-identical to the cold derive and skips th
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });
         _resetStoreForTest();
+        setSnapBaseConfig(null);
     }
 });
 
@@ -222,6 +238,7 @@ test("#5874-v2 L2: a same-id content move degrades the round to the live derive 
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });
         _resetStoreForTest();
+        setSnapBaseConfig(null);
     }
 });
 
@@ -280,6 +297,7 @@ test("#5874-v2 L3: a cached row the ledger no longer carries degrades the splice
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });
         _resetStoreForTest();
+        setSnapBaseConfig(null);
     }
 });
 
@@ -311,5 +329,65 @@ test("#5874-v2 L4: the cut advances to the newest user-message boundary past the
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });
         _resetStoreForTest();
+        setSnapBaseConfig(null);
+    }
+});
+
+test("#5874-v2 L5: the plane is config-gated — dormant by default, cohort-restricted when set (+/-)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-5874-lane-"));
+    const dbPath = path.join(dir, "store.db");
+    const store = UnifiedStore.open(dbPath);
+    assert.ok(store.ingestSession(planIngest(plainSession(6))), "seed");
+    assert.ok(store.ingestSession(planIngest(foldedSession(["m5", "m6"])), undefined, { completeLog: true }), "fold");
+    let reads = 0;
+    const uncoveredIntervals: number[][][] = [];
+    const facade = {
+        unifiedMessageIdRows: (sid: string) => store.messageIdRows(sid),
+        unifiedTailSeqs: (sid: string) => store.tailSeqs(sid),
+        unifiedTailViewRows: (sid: string) => store.getMessages(sid),
+        unifiedUncoveredRows: (sid: string, intervals: readonly [number, number][]) => {
+            uncoveredIntervals.push(intervals.map(([a, b]) => [a, b]));
+            return store.uncoveredRows(sid, intervals);
+        },
+        egressReadView: (sid: string) => { reads++; return store.egressReadView(sid); },
+        egressCut: (sid: string, ids: string[], prefixJson: string | undefined, nowMs: number) => store.egressCut(sid, ids, prefixJson, nowMs),
+        closeQuietly: () => { /* facade */ },
+    } as unknown as Parameters<typeof _setStoreForTest>[0];
+    _setStoreForTest(facade);
+    try {
+        // (−) No config file — the shipped default: the plane is dormant.
+        // No row is cut, and the render still serves (live derive, full load).
+        setSnapBaseConfig(null);
+        const offSession = makeSession();
+        const offView = maybeSnapshotView(offSession, CLIENT, { sessionId: "sess-es" });
+        assert.ok(offView.length > 0, "off: the lane still renders (live derive)");
+        assert.equal(store.egressReadView("sess-es"), null, "off: no cache row is cut");
+        const offLast = uncoveredIntervals[uncoveredIntervals.length - 1];
+        assert.ok(offLast.length > 0, "off: the content load reads live (no skip)");
+
+        // (+) The real config path arms the plane.
+        setSnapBaseConfig({ storage: { snapBase: { enabled: true } } });
+        const onSession = makeSession();
+        const onView = maybeSnapshotView(onSession, CLIENT, { sessionId: "sess-es" });
+        assert.deepEqual(JSON.stringify(onView), JSON.stringify(offView), "on ≡ off — the cache changes nothing outbound");
+        assert.ok(store.egressReadView("sess-es"), "on: the cut landed");
+
+        // (−) A cohort list that EXCLUDES this session's protocol (openai):
+        // same render, no row.
+        setSnapBaseConfig({ storage: { snapBase: { enabled: true, cohorts: ["anthropic"] } } });
+        uncoveredIntervals.length = 0;
+        const exclSession = makeSession();
+        const exclView = maybeSnapshotView(exclSession, CLIENT, { sessionId: "sess-es" });
+        assert.deepEqual(JSON.stringify(exclView), JSON.stringify(offView), "excluded cohort renders identically (live)");
+        const exclRow = store.egressReadView("sess-es");
+        assert.ok(exclRow && exclRow.inputHash, "the earlier (openai) cut stays readable for openai turns…");
+        // …and the excluded turn did NOT cut a new row or skip content.
+        const exclLast = uncoveredIntervals[uncoveredIntervals.length - 1];
+        assert.ok(exclLast.length > 0 && !(exclLast.length === 1 && exclLast[0][0] === 0), "excluded cohort: no cache splice");
+    } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+        _resetStoreForTest();
+        setSnapBaseConfig(null);
     }
 });

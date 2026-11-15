@@ -87,11 +87,11 @@
 //        after the owner ruling) — ONE additive table (l1_world, the
 //        stage-0 identity ledger; the original four-table plane was retired
 //        before merge — see docs/proposals/snapshot-compression-foundation).
-//        No backfill, dormant until storage.snapBase.enabled turns it on,
-//        rollback is DROP the table + index and rewind user_version. The two
-//        later tables of the v2 skeleton (fold_journal, egress_snapshot) land
-//        additive on top in follow-up steps, same discipline. Additive-only:
-//        an older build opening a v12 file ignores the extra table.
+//        No backfill; the tables are the substrate for the v2 skeleton
+//        (fold_journal + egress_snapshot, probe-first below), gated by
+//        storage.snapBase.enabled, rollback is DROP the table + index and
+//        rewind user_version. Additive-only: an older build opening a v12
+//        file ignores the extra tables.
 //        Applied PROBE-FIRST (table-existence check), NOT version-gated:
 //        the unmerged fastpath re-land (#5855) numbers its two table groups
 //        v12/v13 and landed them into a SHARED database first (field,
@@ -606,7 +606,7 @@ export function migrateSchema(db: {
         // the v12/v13 numbers, see the note before the early return).
         // Pure additivity: no backfill, no rewrite of existing rows; the
         // plane stays dormant until storage.snapBase.enabled turns it on.
-        // Rollback = DROP the four tables + index and set user_version back
+        // Rollback = DROP the table + index and set user_version back
         // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
