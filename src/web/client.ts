@@ -2178,35 +2178,29 @@ function changelogCatOf(rawLine) {
             flags += '<path d="M' + x + ',' + (PT - 6) + ' L' + (Number(x) - 6).toFixed(1) + ',' + (PT - 16) + ' L' + (Number(x) + 6).toFixed(1) + ',' + (PT - 16) + ' Z" fill="#d29922"><title>' + escapeHtml(tip) + "</title></path>";
             flags += '<text x="' + x + '" y="8" text-anchor="middle" font-size="9.5" fill="#d29922">' + escapeHtml("T" + (nv.tier != null ? nv.tier : "?") + " · " + fmtW(nv.pending || 0)) + "</text>";
         });
-        // ② per-call bars (same-timestamp bursts get spread apart so a
-        // multi-call round does not collapse into one overlapping column).
-        let maxS = 0;
-        folds.forEach((f) => { if ((f.folded || 0) > maxS) maxS = f.folded || 0; });
-        if (maxS <= 0) maxS = 1;
-        const barMax = ih * 0.42;
-        const bw = Math.min(14, Math.max(5, iw / Math.max(1, folds.length) - 3));
+        // ② per-call ticks on the time axis (the LINE carries the per-round recovery;
+        // each tick = one compress() call — blue = active, colored by its round otherwise).
+        let ticks = "";
+        const tickW = 2;
         const xs = folds.map((f) => xAt(f.at));
         const groups = {};
         xs.forEach((xx, i) => { const k = Math.round(xx * 2) / 2; (groups[k] = groups[k] || []).push(i); });
         const xShift = {};
         Object.keys(groups).forEach((k) => {
             const g = groups[k];
-            g.forEach((i, j) => { xShift[i] = (j - (g.length - 1) / 2) * (bw + 1); });
+            g.forEach((i, j) => { xShift[i] = (j - (g.length - 1) / 2) * (tickW + 1); });
         });
-        let bars = "";
         folds.forEach((f, i) => {
             const S = f.folded || 0;
-            const h = (S / maxS) * barMax;
-            if (h < 1) return;
             const x = Math.min(W - PR - 2, Math.max(PL + 2, xs[i] + (xShift[i] || 0)));
             const r = roundOf(f);
             const ep = f.mode === "n" ? (r < 0 ? (openRound ? openRound : undefined) : episodes[r]) : undefined;
             const pct = ep ? ep.pct : null;
             const col = f.mode === "a" ? "#0969da" : (pct == null ? "#8b949e" : colFor(pct));
             const tip = f.mode === "a"
-                ? t("det.rec_bar_a_tip", { at: fmtDT(f.at), s: fmtW(S) })
-                : t("det.rec_bar_n_tip", { i: r < 0 ? 0 : r + 1, k: (roundSeen[r] = (roundSeen[r] || 0) + 1), n: r < 0 && !openRound ? "?" : (roundTotals[r] || "?"), at: fmtDT(f.at), s: fmtW(S), pct: pct != null ? pct.toFixed(1) + "%" : "?" });
-            bars += '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (base - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + col + '" opacity="0.8" rx="1"><title>' + escapeHtml(tip) + "</title></rect>";
+                ? t("det.rec_tick_a_tip", { at: fmtDT(f.at), s: fmtW(S) })
+                : t("det.rec_tick_n_tip", { i: r < 0 ? 0 : r + 1, k: (roundSeen[r] = (roundSeen[r] || 0) + 1), n: r < 0 && !openRound ? "?" : (roundTotals[r] || "?"), at: fmtDT(f.at), s: fmtW(S), pct: pct != null ? pct.toFixed(1) + "%" : "?" });
+            ticks += '<line x1="' + x.toFixed(1) + '" y1="' + (base - (f.mode === "a" ? 14 : 8)).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + base.toFixed(1) + '" stroke="' + col + '" stroke-width="' + tickW + '"><title>' + escapeHtml(tip) + "</title></line>";
         });
         // ③ round points + true-value labels + main recovery line + running average.
         let dots = "", cumPts = "", mainPts = "";
@@ -2249,7 +2243,7 @@ function changelogCatOf(rawLine) {
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid + flags
             + (mainPts ? '<path d="M' + mainPts + '" fill="none" stroke="#57606a" stroke-width="1.5"/>' : "")
             + (cumPts ? '<path d="M' + cumPts + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="5 3"/>' : "")
-            + bars + dots + brackets + "</svg>";
+            + ticks + dots + brackets + "</svg>";
     }
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));

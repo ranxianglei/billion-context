@@ -25,8 +25,8 @@ function extractFn(src: string, name: string): string {
 }
 
 const TIP_TEMPLATES: Record<string, string> = {
-    "det.rec_bar_n_tip": "round {i}, call {k}/{n} · {at} · folded {s} · round recovery {pct}",
-    "det.rec_bar_a_tip": "active compression · {at} · folded {s}",
+    "det.rec_tick_n_tip": "round {i}, call {k}/{n} · {at} · folded {s} · round recovery {pct}",
+    "det.rec_tick_a_tip": "active compression · {at} · folded {s}",
     "det.rec_line_base": "baseline 100% (fully folded the recommendation)",
     "det.rec_line_over_note": " (over-compression, includes old stock)",
     "det.rec_line_under_note": " (under-compression)",
@@ -112,6 +112,8 @@ test("#6729: the chart draws the 100% baseline, an extended axis, and the extra 
     assert.ok(svg.includes('stroke="#57606a"'), "main recovery line present");
     // round 4 (310%) → blue over dot with halo + the true label
     assert.ok(svg.includes('r="7" fill="none" stroke="#0969da"'), "over-100% halo dot");
+    assert.ok(!svg.includes("<rect"), "no bars — per-round recovery is a line chart (per-call info = ticks)");
+    assert.ok(svg.includes("<line") && svg.includes('stroke-width="2"'), "per-call ticks on the time axis");
     assert.ok(svg.includes("310%"), "true >100% value labeled");
     assert.ok(svg.includes("excess old stock"), "bracket shows the extra as old stock");
     assert.ok(svg.includes("(over-compression, includes old stock)"), "point tip marks over-compression");
@@ -144,7 +146,7 @@ test("#6729: a window with only an active fold renders a chart with no round poi
     assert.ok(svg.startsWith("<svg"));
     // no round-point circles (grid tick labels still say 25% etc., so target the point marks)
     assert.doesNotMatch(svg, /r=\"4\.5\"/);
-    assert.match(svg, /#0969da/);         // the active bar is still visible
+    assert.match(svg, /#0969da/);         // the active tick is still visible
 });
 
 test("#6729: a fold before the first visible nudge lands in the synthetic open round (no fake %)", () => {

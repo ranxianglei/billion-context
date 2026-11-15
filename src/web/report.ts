@@ -492,11 +492,8 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 body.push('<path d="M' + x.toFixed(1) + ',' + (top - 6) + ' L' + (x - 5).toFixed(1) + ',' + (top - 15) + ' L' + (x + 5).toFixed(1) + ',' + (top - 15) + ' Z" fill="#d29922"/>');
                 txt(x, top - 19, "T" + (nv.tier != null ? nv.tier : "?") + " · " + f.W(nv.pending || 0), { size: 8.5, color: "#d29922", anchor: "middle", mono: true });
             });
-            let maxS = 0;
-            foldsE.forEach((fd) => { if ((fd.folded || 0) > maxS) maxS = fd.folded || 0; });
-            if (maxS <= 0) maxS = 1;
-            const barMax = (bot - top) * 0.42;
-            const bw = Math.min(10, Math.max(3, (right - left) / Math.max(1, foldsE.length) - 2));
+            let tickLines = "";
+            const tickW = 2;
             const xs = foldsE.map((fd) => TX(fd.at));
             const groups: Record<string, number[]> = {};
             xs.forEach((xx, i) => {
@@ -506,18 +503,16 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             const xShift: Record<number, number> = {};
             Object.keys(groups).forEach((k) => {
                 const g = groups[k];
-                g.forEach((i: number, j: number) => { xShift[i] = (j - (g.length - 1) / 2) * (bw + 1); });
+                g.forEach((i: number, j: number) => { xShift[i] = (j - (g.length - 1) / 2) * (tickW + 1); });
             });
             foldsE.forEach((fd, i) => {
                 const S = fd.folded || 0;
-                const h = (S / maxS) * barMax;
-                if (h < 1) return;
                 const r = roundOf(fd);
                 const ep = fd.mode === "n" ? eps[r] : undefined;
                 const pct = ep ? ep.pct : null;
                 const col = fd.mode === "a" ? ACC : (pct == null ? MUT : colFor(pct));
                 const x = Math.min(right - 2, Math.max(left + 2, xs[i] + (xShift[i] || 0)));
-                body.push('<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (bot - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + col + '" opacity="0.8" rx="1"/>');
+                tickLines += '<line x1="' + x.toFixed(1) + '" y1="' + (bot - (fd.mode === "a" ? 14 : 8)).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + bot.toFixed(1) + '" stroke="' + col + '" stroke-width="' + tickW + '"/>';
             });
             // #6729 old-stock pool (mirrors the panel's client-side derivation): each round
             // adds its pending, folds consume the pool to a floor of 0, the excess is older
@@ -530,6 +525,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 recPool -= credited;
                 return Math.max(0, folded - credited);
             });
+            body.push(tickLines);
             let cpSum = 0, cfSum = 0;
             const cumPts: string[] = [];
             const mainPts: string[] = [];
