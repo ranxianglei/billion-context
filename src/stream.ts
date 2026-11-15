@@ -1577,18 +1577,25 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             if (scrubbed > 0) ctx.log(`[acp-proxy: scrubbed ${scrubbed} turn-separator id(s) from fold coverage (#2627)]`);
         }
         // Cache original content for newly-created blocks. At compress time the
-        // source messages are still in ctx.messages (this round's view, before
-        // the next processTurn folds them) — or in ctx.compressMessages when an
-        // EMPTY-view fold recovered its source from the unified store (#3982);
-        // collecting against [] would leave those blocks uncached for later
-        // decompress/range-restore. Storing the text here lets decompress work
-        // in later rounds where neither carries the originals.
+        // same source used by applyCompression still holds the originals.
+        // ctx.messages may already be emergency-truncated, so prefer the raw
+        // compressMessages view even when the display is nonempty. It also
+        // supplies recovered originals for EMPTY-view folds (#3982). Storing
+        // this text lets decompress work after both live views are evicted.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
         // Leaf blocks have no active nested children, so both kernel paths
         // emit byte-identical text — persist a single copy in that case
         // (#401: the duplicate was 50% of blockContents bytes on disk).
-        const contentSource = ctx.messages.length > 0 ? ctx.messages : (ctx.compressMessages ?? ctx.messages);
+        const displayById = new Map(ctx.messages.map(message => [message.id, message]));
+        const contentSource = (ctx.compressMessages ?? ctx.messages).map(message => {
+            // Keep the citation metadata already rendered for this message,
+            // but never use its potentially truncated display body as source.
+            const prefix = displayById.get(message.id)?.text?.match(/^\x3cacp [^\x3e]*\x3e(m\d+)\x3c\/acp\x3e\r?\n/);
+            if (!prefix || prefix[1] !== res.state.messageRefs.byRaw[message.id]
+                || message.text?.startsWith(prefix[0])) return message;
+            return { ...message, text: prefix[0] + (message.text ?? "") };
+        });
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
             const full = collectBlockContent(res.state, b, contentSource, { full: true });
