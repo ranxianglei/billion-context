@@ -201,6 +201,15 @@ RC_LANES=${PIPESTATUS[0]}
 
 kill "$VDC_PID" 2>/dev/null || true
 
+# ---- 6.5. make the evidence readable for the invoking (non-root) user -----------
+# Everything above ran as root; without this the host user can't open the
+# per-lane bili.log / session dirs after the run (files are 0600 root).
+if [ -n "${GATE_UID:-}" ] && [ "$GATE_UID" != "0" ]; then
+  GATE_GID="${GATE_GID:-$GATE_UID}"
+  log "6.5 chown evidence $WORK -> uid=$GATE_UID gid=$GATE_GID"
+  chown -R "$GATE_UID:$GATE_GID" "$WORK" || log "WARN: chown failed — evidence may be unreadable outside the container"
+fi
+
 # ---- summary --------------------------------------------------------------------
 log "SUMMARY"
 echo "repo $GATE_REPO_URL @ $GATE_REV ($REV_SHA) — candidate $V"
