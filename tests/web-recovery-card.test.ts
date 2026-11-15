@@ -84,6 +84,9 @@ test("#6729: full-window episode derivation matches the server-side aggregation"
         { p: 200, f: 150, pct: 75, a: 1 });
     // round 3: non-T1 nudge (pending 0) → pct null, not NaN
     assert.equal(built.eps[2].pct, null);
+    // tier survives the derivation (the point tip renders it; an inverted ternary
+    // once silently nulled every tier)
+    assert.deepEqual(built.eps.map((e) => e.tier), [1, 1, 2, 1]);
 });
 
 test("#6729: over-100% rounds read against the baseline — extra is old stock, not fake recovery", () => {

@@ -52,7 +52,7 @@ interface ReportData {
             events?: Array<{ at?: number; kind?: "n" | "f"; tier?: number | null; pending?: number; folded?: number | null; foldSeq?: number | null; mode?: "n" | "a" | null; pct?: number | null; paired?: boolean }>;
             summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
             /** #6729 follow-up: one point per nudge round for the recovery line chart. */
-            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; credited?: number; extra?: number; activeFolds?: number }>;
+            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number }>;
             activesBefore?: number;
         };
         lines?: Array<{ input?: number; cached?: number }>;
@@ -519,6 +519,17 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 const x = Math.min(right - 2, Math.max(left + 2, xs[i] + (xShift[i] || 0)));
                 body.push('<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (bot - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + col + '" opacity="0.8" rx="1"/>');
             });
+            // #6729 old-stock pool (mirrors the panel's client-side derivation): each round
+            // adds its pending, folds consume the pool to a floor of 0, the excess is older
+            // stock the model cleared on its own.
+            let recPool = 0;
+            const epExtra = eps.map((ep) => {
+                recPool += ep.pending || 0;
+                const folded = ep.folded || 0;
+                const credited = Math.min(folded, recPool);
+                recPool -= credited;
+                return Math.max(0, folded - credited);
+            });
             let cpSum = 0, cfSum = 0;
             const cumPts: string[] = [];
             const mainPts: string[] = [];
@@ -539,7 +550,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 } else {
                     body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(0).toFixed(1) + '" r="3" fill="none" stroke="' + MUT + '" stroke-dasharray="2 2"/>');
                 }
-                const extra = (ep.folded != null && ep.credited != null) ? Math.max(0, ep.folded - ep.credited) : 0;
+                const extra = epExtra[i] || 0;
                 const x0 = TX(epAt), yb = bot + 14 + (i % 2) * 15;
                 body.push('<path d="M' + x0.toFixed(1) + ',' + (yb - 4) + ' L' + x0.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + (yb - 4) + '" fill="none" stroke="' + MUT + '" stroke-width="1"/>');
                 txt((x0 + x) / 2, yb + 10, t("det.rec_bracket", { i: i + 1, k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" }) + (extra > 0 ? t("det.rec_bracket_over", { s: f.W(extra) }) : ""), { size: 8.5, color: MUT, anchor: "middle", mono: true });

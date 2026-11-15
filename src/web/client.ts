@@ -2111,7 +2111,7 @@ function changelogCatOf(rawLine) {
             const credited = Math.min(folded, pool);
             const extra = folded - credited;
             pool -= credited;
-            eps.push({ at: nv.at, tier: nv.tier != null ? null : nv.tier, pending: nv.pending || 0, folded, pct: (nv.pending || 0) > 0 ? Math.round((folded / (nv.pending || 0)) * 1000) / 10 : null, credited, extra, activeFolds: active });
+            eps.push({ at: nv.at, tier: nv.tier ?? null, pending: nv.pending || 0, folded, pct: (nv.pending || 0) > 0 ? Math.round((folded / (nv.pending || 0)) * 1000) / 10 : null, credited, extra, activeFolds: active });
         });
         return { eps, nudges, folds, roundOf };
     }
