@@ -14,47 +14,67 @@ export async function observeResponsesTerminalState(stream: ReadableStream<Uint8
     return isStream ? observeSseTerminalState(stream) : observeJsonTerminalState(stream);
 }
 
-function terminalFromSseLine(line: string): TerminalState | null {
-    if (line.startsWith("event:")) {
-        const name = line.slice(6).trim();
-        if (name === SUCCEEDED) return "completed";
-        if (FAILED_EVENTS.has(name)) return "failed";
+function terminalFromSseFrame(frame: string): TerminalState | null {
+    let event = "";
+    const data: string[] = [];
+    for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data.push(line.charAt(5) === " " ? line.slice(6) : line.slice(5));
+    }
+    if (data.length === 0) return null;
+    let body: unknown;
+    try {
+        body = JSON.parse(data.join("\n"));
+    } catch {
         return null;
     }
-    if (line.startsWith("data:")) {
-        const data = line.slice(5).trim();
-        if (!data.startsWith("{")) return null;
-        try {
-            const type = (JSON.parse(data) as { type?: unknown }).type;
-            if (type === SUCCEEDED) return "completed";
-            if (type === "response.failed" || type === "response.incomplete") return "failed";
-        } catch {
-            return null;
-        }
-    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+    const type = (body as { type?: unknown }).type;
+    if (FAILED_EVENTS.has(event) || (typeof type === "string" && FAILED_EVENTS.has(type))) return "failed";
+    if (event === SUCCEEDED || type === SUCCEEDED) return "completed";
     return null;
 }
 
 async function observeSseTerminalState(stream: ReadableStream<Uint8Array>): Promise<TerminalState> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    let lineParts: string[] = [];
+    let frameLines: string[] = [];
+    let skipLeadingLf = false;
     let state: TerminalState = "unknown";
+    // A response.completed event can contain the entire compacted response.
+    // Scan each decoded chunk once and join each line/frame once, rather than
+    // re-normalizing and searching an ever-growing multi-MiB prefix per chunk.
+    const consumeText = (text: string) => {
+        let start = 0;
+        for (let index = 0; index < text.length; index++) {
+            const code = text.charCodeAt(index);
+            if (skipLeadingLf) {
+                skipLeadingLf = false;
+                if (code === 10) { start = index + 1; continue; }
+            }
+            if (code !== 10 && code !== 13) continue;
+            lineParts.push(text.slice(start, index));
+            const line = lineParts.join("");
+            lineParts = [];
+            if (line.length === 0) {
+                const next = terminalFromSseFrame(frameLines.join("\n"));
+                frameLines = [];
+                if (next !== null) { state = next; return; }
+            } else frameLines.push(line);
+            skipLeadingLf = code === 13;
+            start = index + 1;
+        }
+        if (start < text.length) lineParts.push(text.slice(start));
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            let nl: number;
-            while ((nl = buf.indexOf("\n")) >= 0) {
-                const line = buf.slice(0, nl).replace(/\r$/, "");
-                buf = buf.slice(nl + 1);
-                const next = terminalFromSseLine(line);
-                if (next !== null) {
-                    state = next;
-                    break;
-                }
+            if (done) {
+                consumeText(decoder.decode());
+                break;
             }
+            consumeText(decoder.decode(value, { stream: true }));
             if (state !== "unknown") {
                 // Release this tee branch; the client branch keeps draining the source.
                 await reader.cancel().catch(() => {});
@@ -103,7 +123,9 @@ async function observeJsonTerminalState(stream: ReadableStream<Uint8Array>): Pro
     }
     if (typeof body !== "object" || body === null) return "unknown";
     const rec = body as Record<string, unknown>;
-    if (rec.error !== undefined) return "failed";
+    if (rec.error !== undefined && rec.error !== null) return "failed";
+    if (rec.status === "failed" || rec.status === "incomplete" || rec.status === "cancelled") return "failed";
+    if (rec.status !== undefined && rec.status !== "completed") return "unknown";
     if (Array.isArray(rec.output)) return "completed";
     return "unknown";
 }

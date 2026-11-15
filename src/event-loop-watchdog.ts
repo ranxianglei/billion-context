@@ -13,11 +13,16 @@
  * Mechanism: a worker thread has its OWN event loop, so it keeps running while
  * the main thread spins. The main thread posts a heartbeat every 5 s; the
  * worker measures the gap and, after SOFT_WARN_MS of continuous silence, logs
- * a warning; after HARD_TIMEOUT_MS it writes a forensic line and exits the
- * WHOLE process (code 1) so the spawner respawns onto the freed port. Legit
- * work never blocks the loop for five straight minutes — compression runs in
- * sync slices that complete in seconds to minutes and yield between requests —
- * so the hard threshold is deadlock detection, not load detection.
+ * a warning; after HARD_TIMEOUT_MS it writes a forensic line and kills the
+ * WHOLE process so the spawner respawns onto the freed port. The kill is a
+ * SIGKILL to its own pid, NOT process.exit(): inside a worker thread
+ * process.exit() ends only the worker, so the wedged proxy used to survive its
+ * own watchdog and run on unwatched. SIGKILL needs nothing from the blocked
+ * main thread (a JS SIGTERM listener would never run); on Windows
+ * process.kill maps to TerminateProcess. Legit work never blocks the loop for
+ * five straight minutes — compression runs in sync slices that complete in
+ * seconds to minutes and yield between requests — so the hard threshold is
+ * deadlock detection, not load detection.
  *
  * Scope discipline: plugin-injection mode (dist/agent/*) never calls
  * startServer, so a wedged HOST process is never at risk of being killed by
@@ -68,9 +73,10 @@ interface ArmEventLoopWatchdogOptions {
     softWarnMs?: number;
     hardTimeoutMs?: number;
     checkIntervalMs?: number;
-    /** "exit" (production): the worker calls process.exit itself — required,
-     *  because a wedged main thread can never receive a message asking it to
-     *  die. "report": the worker posts {type:"trip"} and stays alive — test
+    /** "exit" (production): the worker SIGKILLs its own process itself,
+     *  required because a wedged main thread can never receive a message
+     *  asking it to die (and process.exit() in a worker ends only the worker).
+     *  "report": the worker posts {type:"trip"} and stays alive — test
      *  seam so the suite process is not killed. */
     fatalMode?: "exit" | "report";
     /** Test seam: swap the Worker constructor. */
@@ -138,6 +144,11 @@ const WORKER_CODE = [
     "  if (emitStderr) { try { process.stderr.write(row); } catch (e) {} }",
     "}",
     "",
+    "function killWholeProcess() {",
+    "  try { process.kill(process.pid, \"SIGKILL\"); } catch (e) {}",
+    "  process.exit(1);",
+    "}",
+    "",
     "function tick() {",
     "  const gap = Date.now() - lastBeat;",
     "  const v = verdict(gap);",
@@ -148,7 +159,7 @@ const WORKER_CODE = [
     "    tripped = true;",
     "    line(\"error\", \"[event-loop-watchdog] FATAL: main event loop silent for \" + fmt(gap) + \" (hard threshold \" + fmt(hardTimeoutMs) + \") — exiting so the spawner can respawn onto the freed port (#4762)\");",
     "    try { parentPort.postMessage({ type: \"trip\", gapMs: gap }); } catch (e) {}",
-    "    if (fatalMode === \"exit\") process.exit(1);",
+    "    if (fatalMode === \"exit\") killWholeProcess();",
     "  }",
     "}",
     "",

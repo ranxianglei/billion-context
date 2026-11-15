@@ -1,6 +1,86 @@
-# Plugin Lanes (Lane P) — real host CLIs × real model
+# The real-model gate — container + lanes + config-driven launcher
 
 (中文版见 [README.zh-CN.md](./README.zh-CN.md))
+
+Everything the real-model release gate needs lives in this one directory: the
+Docker image, the lane scripts, and a config-driven launcher. CI runs the
+subset it can (Lane P, `ci-gate-plugins.yml`); the full container gate is for
+operators with a real model endpoint and takes ~4-5h per round.
+
+## What each lane proves
+
+| Lane | Name | Proves | Driven by |
+|---|---|---|---|
+| A | compression | real model reads a corpus → window shrinks mid-session → **fold fires**, markers recalled from FOLDED context, cache recovers ≥50% | dsh headless (pi-based agent) |
+| B | model switch | same session switches to a **different upstream/model** after the fold: lineage kept (or fork+adopted), cross-upstream baseline demoted, markers still recalled, new-upstream cache ≥75% | dsh headless |
+| U | registry | dsh-managed proxy reads `update.registry`, refuses in-place self-update, "profile bundle up to date" | `scripts/release-gate-local.mjs` |
+| I | install | `npm i -g <tarball> --install-links` = **true copy** (no symlink leak, #1225), CLI reports candidate version | `docker-lanes.mjs` |
+| X | auto-update | publish a fake-newer build of the same commit → `bili update` **installs it** through `update.registry`, CLI lands on the new version | `docker-lanes.mjs` |
+| P | host lanes | real host CLIs (dsh/pi/opencode/codex/claude) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
+| R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
+
+## The secret/endpoint contract
+
+The gate is **fully hermetic inside the container** (own verdaccio on an
+internal port, own DSH_HOME/XDG, own scratch) and every machine-specific fact
+— model endpoints, API keys, npm registry, git proxy/mirror, which rev to
+test — lives in a **local JSON config file that you keep outside this repo**.
+Nothing host-specific (IPs, ports, relays, accounts, keys) may be committed
+here; `config.example.json` shows the shape with placeholders only.
+
+## How to run
+
+Prerequisites: Docker (Linux host networking or Docker Desktop), a real
+OpenAI-compatible model endpoint (Lane A), optionally a second DIFFERENT
+upstream (Lane B; skipped when absent), and a local config file.
+
+```sh
+# 1. copy the example and fill in YOUR endpoints / keys / rev
+cp config.example.json ~/system/bili-gate.json   # location is up to you
+# 2. run the whole gate (one round ≈ 4-5h with real inference)
+scripts/gate/bili-gate.sh --config ~/system/bili-gate.json --rev <branch-or-tag>
+
+# common flags
+scripts/gate/bili-gate.sh --config ... --skip u,i,x        # only A/B/P/R
+scripts/gate/bili-gate.sh --config ... --keep              # keep scratch on green
+scripts/gate/bili-gate.sh --config ... --dry-run           # print the docker command
+```
+
+Config keys (all optional except `model1.baseUrl` / `model1.model`):
+`model1.{baseUrl,model,apiKey}`, `model2.{baseUrl,model,apiKey}` (Lane B),
+`rev`, `skip`, `sourceRepo`, `mirror` (local bare git mirror the container
+clones from — keeps container egress at zero and works behind host git
+proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
+the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
+`agentsR` (Lane R set; default `dsh,pi`), `r.{corpusTokens,window,capRatio,
+cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
+shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
+
+Everything lands in `outDir` (mounted as `/work`): `gate-local.log`
+(A/B/U), `plugin-lanes.log` (+ `plugin-lanes/<agent>/…`), `restart-lanes.log`,
+`docker-lanes.log`, `verdaccio.log`, `gate-scratch/`. The launcher builds the
+image first and, on build failure, refuses to reuse an existing image unless
+every `/gate-tools/*` lane script is byte-identical to this working tree
+(stale lane logic must never gate a release).
+
+## Image notes
+
+- **Keyed-API shims**: `patch-gate.mjs` guards-patches
+  `scripts/release-gate-local.mjs` inside the container so the primary lane
+  can carry a bearer key and probes treat any HTTP response as "up" (401/404
+  from keyed gateways must not abort the lane). If the repo script drifts from
+  the patcher's guarded patterns the build step fails loudly.
+- **verdaccio runs inside the container** (Lanes U/I/X): zero host
+  dependencies, ephemeral storage per run, internal port that cannot collide
+  with any host registry.
+- Host CLIs for Lane P are pinned in the image to the same versions the repo's
+  own CI uses (`ci-e2e-pi-ws` / `ci-e2e-codex-persona` /
+  `ci-e2e-native-opencode`), so the gate tests the same surfaces the project
+  tests.
+
+---
+
+# Plugin Lanes (Lane P) — real host CLIs × real model
 
 These lanes drive billion-context's two activation paths with **real host CLIs**
 (dsh / pi / codex / claude-code / opencode) and a **real model**, closing the
@@ -24,7 +104,9 @@ actually received — internal logs can be fooled by suppression-class bugs
 
 - upstream saw traffic (requests really reached the model)
 - ACP tools (compress / acp_status / …) really appear in the wire's tools
-- plugin claim: session file `payload.metadata.pluginAgent == "<agent>"`
+- plugin claim: session metadata `pluginAgent == "<agent>"` — read from
+  `index.db` first (pure-SQLite is the storage default since 2026-11-13) with
+  the JSONL envelope scan kept as fallback for older candidates
 - **hard nudge assertion**: the nudge text must appear on the wire (a "log
   shows INJECT" is not accepted — the injection can land in an in-band error
   response that is never forwarded; that is a fake green)
@@ -32,6 +114,10 @@ actually received — internal logs can be fooled by suppression-class bugs
 - codeword recall before/after the fold (corpus of 40 sections; S07 early /
   S40 last CODEWORDS markers)
 - no `unknown tool` loops
+
+Lane R reads `cached_tokens` from the recorder's capped response-body tail
+(usage lives in the final chunk); sensitive request headers are masked before
+they hit the JSONL artifact.
 
 ## dsh protocol matrix (#3475)
 
@@ -106,7 +192,7 @@ Not in the default GATE_AGENTS set; runs only when explicitly listed:
 4. **t3 @ small window**: "DONE" — the preflight fold must fire
 5. **t4**: S07 recall after the fold
 
-## How to run
+## Running Lane P standalone (no container)
 
 Prerequisites: node ≥ 20, the host CLIs installed (dsh / pi / codex / claude /
 opencode), one OpenAI-compatible real-model endpoint, and the candidate as an
@@ -115,7 +201,7 @@ opencode), one OpenAI-compatible real-model endpoint, and the candidate as an
 ```sh
 TGZ=/path/to/billion-context-x.y.z.tgz \
 REPO=/path/to/billion-context-checkout \
-MODEL1_BASE_URL=http://127.0.0.1:8199 \
+MODEL1_BASE_URL=<primary model base url> \
 MODEL1_MODEL=<model-id> \
 GATE_AGENTS=dsh,pi,codex,opencode,claude \
 node scripts/gate/plugin-lanes.mjs
@@ -143,10 +229,10 @@ node scripts/gate/plugin-lanes.mjs
   #3401 bug) fails this lane with nudge wire MISSING / log:ARMED-SUPPRESSED;
   a build containing #3403 is all green
 
-## Relation to the out-of-repo harness
+## Relation to CI
 
-The lane scripts live in this repo (versioned with the code under test); the
-containerized wrapper (Dockerfile, verdaccio, custom image, model endpoints)
-stays in its own gate-harness repo / machine and does not enter this repo.
-Remote CI does not run by default: `.github/workflows/ci-gate-plugins.yml` is
-workflow_dispatch-only, with no push/PR triggers.
+The lane scripts live in this repo, versioned with the code under test — the
+container gate and the remote CI lane (`ci-gate-plugins.yml`,
+workflow_dispatch-only, no push/PR triggers) run the SAME script from the
+candidate checkout. The only thing that stays out of the repo is the local
+config file carrying machine-specific endpoints and keys (contract above).
