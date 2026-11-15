@@ -543,34 +543,44 @@ export interface RawBodyBreakdown {
     tools: number;
     system: number;
     other: number;
+    /** #6844: per-top-level-field token counts inside the `other` bucket,
+     *  descending by tokens — the field dominating `other` is the actionable
+     *  signal in a measured-doom 413 (which host-attached field is metered).
+     *  Empty when `other` is empty. */
+    otherTop: Array<{ field: string; tokens: number }>;
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown, protocol?: WireProtocol): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const foreign = protocol === undefined ? undefined : FOREIGN_CONVERSATION_FIELDS[protocol];
-    const pending: [unknown, string | undefined, number][] = [];
+    const otherByField = new Map<string, number>();
+    const pending: [unknown, string | undefined, number, string | undefined][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             if (foreign?.has(k)) continue; // #6828: the other protocol's conversation field
             if (isNonModelTopLevelKey(k)) continue; // #6844: DSH-internal fields the model never sees
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            pending.push([v, k, bucket, bucket === 3 ? k : undefined]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, 3, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, bucket, field] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const tokens = defaultCountTokens(value);
+                buckets[bucket] += tokens;
+                if (bucket === 3 && field !== undefined) otherByField.set(field, (otherByField.get(field) ?? 0) + tokens);
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, bucket, field]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, field]);
         }
     }
     return {
@@ -579,6 +589,7 @@ export function estimateRawBodyBreakdown(parsed: unknown, protocol?: WireProtoco
         tools: buckets[1],
         system: buckets[2],
         other: buckets[3],
+        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens })).sort((a, b) => b.tokens - a.tokens),
     };
 }
 
