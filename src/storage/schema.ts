@@ -83,7 +83,24 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-export const STORAGE_SCHEMA_VERSION = 11;
+//      - v12: snapshot foundation v2 (#5874 P0, pure-incremental redesign
+//        after the owner ruling) — ONE additive table (l1_world, the
+//        stage-0 identity ledger; the original four-table plane was retired
+//        before merge — see docs/proposals/snapshot-compression-foundation).
+//        No backfill, dormant until storage.snapBase.enabled turns it on,
+//        rollback is DROP the table + index and rewind user_version. The two
+//        later tables of the v2 skeleton (fold_journal, egress_snapshot) land
+//        additive on top in follow-up steps, same discipline. Additive-only:
+//        an older build opening a v12 file ignores the extra table.
+//        Applied PROBE-FIRST (table-existence check), NOT version-gated:
+//        the unmerged fastpath re-land (#5855) numbers its two table groups
+//        v12/v13 and landed them into a SHARED database first (field,
+//        2026-11-08: user_version 13 + pf_* present, l1_world absent →
+//        stage-0 died with "no such table: l1_world"). The probe makes
+//        both merge orderings coexist; whichever branch lands second in
+//        master still renumbers its constant mechanically (hygiene only —
+//        the DDL shapes are independent).
+export const STORAGE_SCHEMA_VERSION = 12;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -311,6 +328,42 @@ CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_h
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
+/** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
+ *  one additive table for the stage-0 identity ledger. The original four-table
+ *  plane (snap_rows/snap_log/snap_ckpt, #5874 v1) was RETIRED before merge in
+ *  favor of the pure-incremental skeleton: the per-position materialized state
+ *  is re-derived from the append-only substrate (messages × blocks × refs ×
+ *  fold journal) instead of being stored as its own updatable table. This DDL
+ *  stays ADDITIVE + probe-first exactly as the plane's did (T1): fresh
+ *  installs and in-place upgrades converge on the same shape, rollback is
+ *  DROP + user_version rewind, and a sibling branch that consumed a version
+ *  number after v11 (real-world 2026-11-08: #5855 landed the pf_* planes)
+ *  coexists without renumbering.
+ *
+ *  l1_world: stage-0 identity ledger — the raw host session id (sess_raw)
+ *  maps to the proxy's ledger identity (ledger_id = sessions.session_id).
+ *  witness_probe is the sampled id fingerprint the arm decision was based on
+ *  (composite-probe evidence). issued_at precedes armed_at until one full
+ *  echo round validates the mapping (the "one round of arming" the proposal
+ *  charges for a fresh identity). envelope_json/envelope_checksum carry the
+ *  per-element msgid ENVELOPE ({id, pos} canon, #6181 §4.0) — the committed
+ *  element-level world M2 delta inbound (src/snapshot/identity.ts matchWorld)
+ *  reads/writes; the R3 breaker latch (r3_latched_at, #6181 M3) persists so a
+ *  proxy restart does not re-arm a misbehaving host's envelope. */
+const SNAPBASE_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw       TEXT PRIMARY KEY,
+    ledger_id      TEXT NOT NULL,
+    witness_probe  TEXT NOT NULL,
+    issued_at      INTEGER NOT NULL,
+    armed_at       INTEGER,
+    envelope_json  TEXT,
+    envelope_checksum TEXT,
+    r3_latched_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
+`;
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -319,6 +372,38 @@ export function migrateSchema(db: {
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
+    // v12 (#5874) is PROBE-FIRST, not version-gated. A sibling branch may
+    // have consumed the version numbers after v11 for its own additive DDL
+    // while ours was still unmerged — real-world 2026-11-08: #5855 landed
+    // v12+v13 (the pf_* planes) into a SHARED database, and this branch's
+    // old `if (from < 12)` block was skipped by the early return below, so
+    // the plane died on first save with "no such table: l1_world". The DDL
+    // is pure CREATE ... IF NOT EXISTS (no backfill, no rewrite of existing
+    // rows), so it is safe to run at ANY from-version; probing for the
+    // table itself (the discipline v2/v5/v6/v8 already use) makes both
+    // merge orderings coexist without renumbering — the final master
+    // version number stays a mechanical merge-time hygiene step.
+    const hasL1World = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
+        .get();
+    if (!hasL1World) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
+    // 2×2 (#5874 brief, element-level world): the L1 world carries the
+    // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
+    // session-level witness_probe. Pure additive probe-first ALTER (a dev
+    // window that created l1_world before this column exists upgrades with
+    // one ALTER; a fresh DB already has it from the DDL above). The 2×2
+    // stage-0 (src/snapshot/identity.ts matchWorld) reads/writes these; the
+    // session-level v1 path (#5901) leaves them NULL and is unaffected.
+    const l1Cols = (db.prepare("PRAGMA table_info(l1_world)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    if (l1Cols.length > 0) {
+        if (!l1Cols.includes("envelope_json")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_json TEXT");
+        if (!l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_checksum TEXT");
+        // #6181 M3: the R3 breaker latch PERSISTS (a proxy restart must not
+        // re-arm a misbehaving host's sid and re-400 the same broken
+        // envelope); NULL/0 = not latched, else the epoch-ms of the latch.
+        if (!l1Cols.includes("r3_latched_at")) db.exec("ALTER TABLE l1_world ADD COLUMN r3_latched_at INTEGER");
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
@@ -442,6 +527,13 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
         }
+        // v12 (#5874 P0): snapshot-table compression foundation — ensured
+        // PROBE-FIRST above (coexists with sibling-branch DDL that consumed
+        // the v12/v13 numbers, see the note before the early return).
+        // Pure additivity: no backfill, no rewrite of existing rows; the
+        // plane stays dormant until storage.snapBase.enabled turns it on.
+        // Rollback = DROP the four tables + index and set user_version back
+        // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);

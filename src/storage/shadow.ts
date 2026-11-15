@@ -307,7 +307,9 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, {
+                    walJournalSizeLimitBytes: walLimit,
+                });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -396,7 +398,8 @@ export class UnifiedShadow {
         fileMysqlDsn?: string,
     ): Promise<UnifiedShadow | null> {
         const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
+        if (backendName !== "mysql")
+            return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
@@ -965,6 +968,36 @@ export class UnifiedShadow {
         return this.sync.sessionStorageStats(sessionId);
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): the element world-match accessors.
+    // Errors propagate (the lane maps the R3 reject to a hard 400 and every
+    // other fault to the legacy full path).
+
+    /** Stage 0 for one turn (see UnifiedStore.snapStage0). null when there
+     *  is no sync store. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("../snapshot/plane.js").Stage0Result | null {
+        if (this.sync === null) return null;
+        return this.sync.snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapStage0Reset(sessionId);
+    }
+
+    /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
+    snapR3Latched(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (this.sync === null) return;
+        this.sync.snapR3Latch(sessionId);
+    }
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);
@@ -1191,7 +1224,6 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.

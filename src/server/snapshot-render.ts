@@ -68,16 +68,34 @@ const MIN_SEAM_RUN = 2;
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
  *  derives message ids from. Equal signature ⇒ same logical message even
  *  when the id bytes were re-minted by an upgrade. Image cores share the
- *  "[image]" text, so the sidecar length rides the signature (same image ⇒
- *  same bytes ⇒ same length; different images practically always differ). */
+ *  "[image]" text, so the image BYTES ride the signature (see #4390). */
 export function identitySig(m: BiliMessage): string {
     const text = typeof m.text === "string" ? m.text : "";
     // #4390: hash the image BYTES, never the length — same-size screenshots
     // used to collide and chain a false seam (silent truncation). The walk
     // only touches the tail region, so per-request hashing is bounded; a
     // 24-hex prefix is far beyond collision reach for seam evidence.
-    const img = m.imagePart === true ? `|img:${sha256Hex(m.imageBase64 ?? "").slice(0, 24)}` : "";
+    const img = m.imagePart === true ? `|img:${imageSigPart(m.imageBase64)}` : "";
     return `${m.role}|${m.contentType}|${m.toolName ?? ""}|${text}${img}`;
+}
+
+/** The 24-hex image identity, robust to the media-OFFLOADED storage form:
+ *  persisted rows carry {"$media": sha256Hex(bytes)} instead of the bytes
+ *  (#3762), and that hash IS the identity — so both forms sign identically.
+ *  Anything else degrades to a stable stringify. Never throws: a signature
+ *  helper throwing takes the whole seam walk (and turn) down. */
+function imageSigPart(v: unknown): string {
+    if (typeof v === "string") return v.length > 0 ? sha256Hex(v).slice(0, 24) : "none";
+    if (typeof v === "object" && v !== null) {
+        const h = (v as { $media?: unknown }).$media;
+        if (typeof h === "string" && h.length >= 24) return h.slice(0, 24);
+        try {
+            return `s${sha256Hex(JSON.stringify(v) ?? "").slice(0, 24)}`;
+        } catch {
+            return "unserializable";
+        }
+    }
+    return "none";
 }
 
 /** Test seam (#4390): the seam fingerprint under test — see identitySig. */

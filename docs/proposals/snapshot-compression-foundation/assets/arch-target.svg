@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="984" viewBox="0 0 1560 984">
+  <style>
+    html,body { margin:0; padding:0; background:#fff; }
+    text { font-family: 'Noto Sans CJK SC','Droid Sans Fallback',sans-serif; }
+    .tt { font-size: 22px; font-weight: 700; fill: #0f172a; }
+    .sub { font-size: 13px; fill: #475569; }
+    .h  { font-size: 14px; font-weight: 700; fill: #0f172a; }
+    .b  { font-size: 12px; fill: #1e293b; }
+    .s  { font-size: 11px; fill: #475569; }
+    .chip { font-size: 11px; fill: #334155; }
+    .ok  { font-size: 12px; font-weight: 700; fill: #14532d; }
+    .okb { font-size: 11px; fill: #166534; }
+    .cy  { font-size: 12px; font-weight: 700; fill: #155e75; }
+    .cyb { font-size: 11px; fill: #0e7490; }
+    .am  { font-size: 12px; font-weight: 700; fill: #78350f; }
+    .amb { font-size: 11px; fill: #92400e; }
+    .leg { font-size: 11px; fill: #334155; }
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#334155"/></marker>
+    <marker id="argr" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#16a34a"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1560" height="984" fill="#ffffff"/>
+  <text x="30" y="42" class="tt">目标架构 · 快照表式压缩底座（全貌 —— 与现状图逐位对齐，可直接对照）</text>
+  <text x="30" y="68" class="sub">灰 = 零改动 ｜ 青 = 新增段/表 ｜ 琥珀 = 角色变更 ｜ 红虚线框 = 兜底安全网 ｜ 内核零改动 ｜ 任何疑点该轮回落 legacy（降级，不猜）</text>
+
+  <!-- legend -->
+  <g>
+    <rect x="620" y="84" width="14" height="14" rx="3" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="640" y="95" class="leg">宿主/既有管道</text>
+    <rect x="740" y="84" width="14" height="14" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="760" y="95" class="leg">零改动</text>
+    <rect x="850" y="84" width="14" height="14" rx="3" fill="#cffafe" stroke="#0e7490"/>
+    <text x="870" y="95" class="leg">新增段/表</text>
+    <rect x="950" y="84" width="14" height="14" rx="3" fill="#fef3c7" stroke="#b45309"/>
+    <text x="970" y="95" class="leg">角色变更</text>
+    <rect x="1070" y="84" width="14" height="14" rx="3" fill="#fff" stroke="#ef4444" stroke-dasharray="4 3"/>
+    <text x="1090" y="95" class="leg">兜底安全网</text>
+    <rect x="1190" y="84" width="14" height="14" rx="3" fill="#eef2ff" stroke="#4f46e5"/>
+    <text x="1210" y="95" class="leg">统一存储</text>
+  </g>
+
+  <!-- hosts (unchanged) -->
+  <rect x="30" y="112" width="230" height="238" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="145" y="138" class="h" text-anchor="middle">宿主车道（零改动）</text>
+  <text x="48" y="166" class="b">dsh — shim / 增量信封</text>
+  <text x="48" y="192" class="b">pi — entry-walker 采集</text>
+  <text x="48" y="218" class="b">opencode — transform 钩子</text>
+  <text x="48" y="244" class="b">codex — responses wire</text>
+  <text x="48" y="270" class="b">其他宿主 — 裸代理客户端</text>
+  <text x="48" y="300" class="s">请求头带 session id；插件车道</text>
+  <text x="48" y="316" class="s">信封里逐元素带宿主 msgid</text>
+  <text x="48" y="332" class="s">#5842 采集已就位 —— 原样复用</text>
+
+  <!-- ingress -->
+  <rect x="330" y="148" width="250" height="72" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="176" class="h" text-anchor="middle">入站适配器 prepare-*</text>
+  <text x="455" y="200" class="s" text-anchor="middle">anthropic | openai | responses | google（现成复用）</text>
+  <!-- branching -->
+  <rect x="330" y="272" width="250" height="78" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="296" class="h" text-anchor="middle">lane-decisions 分轨</text>
+  <text x="455" y="318" class="s" text-anchor="middle">按请求形状 × 会话粘滞绑定</text>
+  <text x="455" y="338" class="s" text-anchor="middle" fill="#0e7490" font-weight="700">＋一行「底座命中」正负成对断言(#3617)</text>
+
+  <!-- lanes (reorganized) -->
+  <rect x="640" y="112" width="330" height="80" rx="8" fill="#ecfeff" stroke="#0e7490" stroke-width="2.5"/>
+  <text x="805" y="138" class="h" text-anchor="middle">快照表底座 · 六段固定链（新主路径）</text>
+  <text x="805" y="160" class="s" text-anchor="middle">身份入册 → 协议转换 → 改写 → 快照表 → 出站映射</text>
+  <text x="805" y="176" class="s" text-anchor="middle">cohort 双信道身份 · 非 cohort 顺序&gt;hash 粘滞降级同表</text>
+
+  <rect x="640" y="214" width="330" height="64" rx="8" fill="#f8fafc" stroke="#64748b"/>
+  <text x="805" y="240" class="h" text-anchor="middle">增量 plugin-turn 车道（共存 · 维持原职）</text>
+  <text x="805" y="262" class="s" text-anchor="middle">anthropic wire divert · dsh shim 逐回合二选一</text>
+
+  <rect x="640" y="300" width="330" height="64" rx="8" fill="#ffffff" stroke="#334155" stroke-dasharray="5 4"/>
+  <text x="805" y="326" class="h" text-anchor="middle">v5 watermark 快路径（共存 · 旗位独立）</text>
+  <text x="805" y="348" class="s" text-anchor="middle">继续服务非 cohort 流量的解析成本</text>
+
+  <rect x="640" y="386" width="330" height="54" rx="8" fill="#fef3c7" stroke="#b45309"/>
+  <text x="805" y="410" class="am" text-anchor="middle" style="font-size:13px">D-lane 快照渲染 #3756（让位 · 待裁定 K）</text>
+  <text x="805" y="432" class="amb" text-anchor="middle">新底座就绪后车道让位退役 · 旗互斥</text>
+
+  <rect x="640" y="456" width="330" height="60" rx="8" fill="#ffffff" stroke="#ef4444" stroke-dasharray="5 4"/>
+  <text x="805" y="480" class="h" text-anchor="middle">legacy 全量重发路径（降为兜底安全网）</text>
+  <text x="805" y="502" class="s" text-anchor="middle">任何红门 / 失步命中 ⇒ 该轮整条回到这里并重新盖戳</text>
+
+  <!-- kernel (unchanged) -->
+  <rect x="1030" y="128" width="250" height="252" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="1155" y="156" class="h" text-anchor="middle">acp-kernel 压缩内核</text>
+  <text x="1155" y="174" class="s" text-anchor="middle">（本提案零改动 —— 不动一行）</text>
+  <text x="1048" y="202" class="b">折叠判定 projectUnit（共享投影）</text>
+  <text x="1048" y="228" class="b">摘要生成 + 四条 prompts</text>
+  <text x="1048" y="254" class="b">nudge flat-50K 固定节拍</text>
+  <text x="1048" y="280" class="b">ref/msgid 账本（id 永不复用）</text>
+  <text x="1048" y="306" class="b">CompressionState（字段集不变）：</text>
+  <text x="1048" y="324" class="s">blocks / refs / deadRefs / ckpt …</text>
+  <text x="1048" y="342" class="okb">序列化入 snap_ckpt.meta_json 单一水合源</text>
+  <text x="1048" y="368" class="s">状态存哪、谁水合 —— 见下存储带</text>
+
+  <!-- egress -->
+  <rect x="1330" y="128" width="200" height="230" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="156" class="h" text-anchor="middle">出站映射 mapEgress</text>
+  <text x="1348" y="186" class="b">存活行按 pos 排序 ++ 尾窗 [K..T)</text>
+  <text x="1348" y="214" class="s">前缀跨轮字节稳定 ⇒ 缓存友好</text>
+  <text x="1348" y="232" class="s">carrier 分支粘滞(pluginMode/proxy)</text>
+  <text x="1348" y="250" class="s">pf-*/信封头永不出代理</text>
+  <rect x="1330" y="402" width="200" height="60" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="426" class="h" text-anchor="middle">模型端点</text>
+  <text x="1430" y="444" class="s" text-anchor="middle">sglang / openai·responses</text>
+  <text x="1430" y="458" class="s" text-anchor="middle">anthropic / google</text>
+
+  <!-- storage band -->
+  <rect x="30" y="520" width="1300" height="240" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+  <text x="50" y="550" class="h">统一 SQLite · schema v11 底座 —— 既有 10 表写语义不变；新增四表纯加性(#5855 落地后取新版本)</text>
+  <!-- table chips row1 (identical to current) -->
+  <g>
+    <rect x="50" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="588" class="chip" text-anchor="middle">sessions</text>
+    <rect x="178" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="588" class="chip" text-anchor="middle">content</text>
+    <rect x="306" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="365" y="588" class="chip" text-anchor="middle">messages</text>
+    <rect x="434" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="493" y="588" class="chip" text-anchor="middle">blocks / dead_refs</text>
+    <rect x="562" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="621" y="588" class="chip" text-anchor="middle">refs / checkpoints</text>
+    <rect x="690" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="749" y="588" class="chip" text-anchor="middle">ccr_entries</text>
+    <rect x="818" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="877" y="588" class="chip" text-anchor="middle">kv_store</text>
+    <rect x="946" y="568" width="150" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="1021" y="588" class="chip" text-anchor="middle">message_media / ext</text>
+  </g>
+  <g>
+    <rect x="50" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="628" class="chip" text-anchor="middle">conversations</text>
+    <rect x="178" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="628" class="chip" text-anchor="middle">session_ext</text>
+    <rect x="306" y="608" width="240" height="30" rx="5" fill="#f3f4f6" stroke="#9ca3af"/><text x="426" y="628" class="s" text-anchor="middle">kstate JSON（仅 legacy 路径保留）</text>
+  </g>
+  <!-- NEW tables row -->
+  <g>
+    <rect x="50" y="648" width="210" height="30" rx="5" fill="#cffafe" stroke="#0e7490"/><text x="155" y="668" class="cyb" text-anchor="middle">l1_world · sess_raw↔ledger_id</text>
+    <rect x="270" y="648" width="230" height="30" rx="5" fill="#cffafe" stroke="#0e7490"/><text x="385" y="668" class="cyb" text-anchor="middle">snap_rows · 绝对 pos append-only</text>
+    <rect x="510" y="648" width="190" height="30" rx="5" fill="#cffafe" stroke="#0e7490"/><text x="605" y="668" class="cyb" text-anchor="middle">snap_log · 事件流 seq</text>
+    <rect x="710" y="648" width="200" height="30" rx="5" fill="#cffafe" stroke="#0e7490"/><text x="810" y="668" class="cyb" text-anchor="middle">snap_ckpt · meta 三件套(F+C+S4)</text>
+  </g>
+  <text x="50" y="706" class="b">新增四表 = CREATE IF NOT EXISTS 纯加性、零迁移；回滚 = DROP 四表 + 关旗 = 逐字节回到今天。</text>
+  <text x="50" y="728" class="b">messages/blocks/dead_refs 成为只读审计源(S4 校验和基线)；persona fork / conversations / kv_store 不动。</text>
+  <text x="50" y="750" class="s">#5855(事务骨架 re-land)仍 open —— P0 DDL 必须叠在它之后；P1 影子写期行为零变化。</text>
+
+  <!-- change-scope boxes right -->
+  <rect x="1150" y="520" width="380" height="70" rx="8" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="1166" y="545" class="ok">✔ 零改动区 —— 内核 / 宿主 / 适配器 / 审计源</text>
+  <text x="1166" y="565" class="okb">acp-kernel 不动一行；#5842 采集、prepare-*、carrier 规则原样复用；</text>
+  <text x="1166" y="581" class="okb">既有 10 张统一存储表写语义不变(messages/blocks 只作审计源)。</text>
+  <rect x="1150" y="602" width="380" height="70" rx="8" fill="#cffafe" stroke="#0e7490"/>
+  <text x="1166" y="627" class="cy">＋ 新增区 —— 四薄表 + 两个新段</text>
+  <text x="1166" y="647" class="cyb">L1 身份薄表(sess_raw→ledger_id，P8 id 永生) + snap 三件套(rows/log/ckpt)；</text>
+  <text x="1166" y="663" class="cyb">新段 = 入站身份入册 + 快照表应用(内部细节见分阶段展开图)。</text>
+  <rect x="1150" y="684" width="380" height="76" rx="8" fill="#fef3c7" stroke="#b45309"/>
+  <text x="1166" y="709" class="am">⇄ 角色变更区 —— 三处降级，其余维持原职</text>
+  <text x="1166" y="729" class="amb">legacy 全量 → 兜底安全网 · D-lane #3756 → 让位(待裁定 K) · kstate JSON → legacy 专属；</text>
+  <text x="1166" y="745" class="amb">v5 / 增量 plugin-turn 维持原职不变，每种流量只有一个家、互不双处理。</text>
+
+  <!-- bottom strip -->
+  <rect x="30" y="800" width="1500" height="100" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="830" class="h" fill="#0f172a">一句话影响范围 = lane-decisions ＋1 行 · 一条新链(六段底座) · 四张新表 · 三处角色变更 —— 其余组件与现状图同形同位。</text>
+  <text x="50" y="858" class="b">降级红门 R1–R4：S4 坏=平面永久关死 · join 断=该轮不产事件 · cohort 身份门故障=硬拒绝+零副作用 · structural-pending 未消费=保守判死(细节见分阶段展开图)。</text>
+  <text x="50" y="882" class="s">rollout：master ⊃ lane 两级嵌套开关(config-file key，不新增 env 旋钮，默认 OFF 按会话分桶) · 灰度期 A/B 字节钉常开 · Web「配置」页三态开关同步出厂。</text>
+
+  <!-- arrows -->
+  <g stroke="#334155" fill="none" stroke-width="1.6">
+    <path d="M260,200 H300 V184 H330" marker-end="url(#ar)"/>
+    <path d="M455,220 V272" marker-end="url(#ar)"/>
+    <path d="M580,311 H612"/>
+    <path d="M612,152 V486"/>
+    <path d="M612,152 H640" marker-end="url(#ar)"/>
+    <path d="M612,246 H640" marker-end="url(#ar)"/>
+    <path d="M612,332 H640" marker-end="url(#ar)"/>
+    <path d="M612,413 H640" marker-end="url(#ar)"/>
+    <path d="M612,486 H640" marker-end="url(#ar)"/>
+    <path d="M970,152 H1002"/>
+    <path d="M970,246 H1002"/>
+    <path d="M970,332 H1002"/>
+    <path d="M970,413 H1002"/>
+    <path d="M970,486 H1002"/>
+    <path d="M1002,152 V486"/>
+    <path d="M1002,300 H1030" marker-end="url(#ar)"/>
+    <path d="M1280,243 H1330" marker-end="url(#ar)"/>
+    <path d="M1430,358 V402" marker-end="url(#ar)"/>
+  </g>
+  <!-- state single-channel arrow to storage -->
+  <g stroke="#16a34a" fill="none" stroke-width="1.6">
+    <path d="M1155,380 V520" marker-end="url(#argr)"/>
+  </g>
+  <text x="1163" y="470" class="okb">状态读写 = snap_ckpt.meta_json 单一真源（kstate 双通道分叉点消除）</text>
+</svg>

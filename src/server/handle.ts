@@ -92,7 +92,7 @@ import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { featureEnabled } from "../rollout.js";
-import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, scrubMsgIdFields, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
 import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
@@ -602,7 +602,7 @@ async function handleRequest(
             return;
         }
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     // #5795: pre-ingest 429-hold fast path — while the egress governor holds
@@ -672,7 +672,7 @@ async function handleRequest(
     if (bypass) {
         const reason = bypassOverride === "on" ? "forced by BILI_PLUGIN_BYPASS=on" : "legacy in-process compression";
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (${reason})`);
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -710,7 +710,7 @@ async function handleRequest(
         v1ConvId = extractConversationId(unwrapped.inner) ?? undefined;
         if (isV1BackgroundSideRequest(unwrapped.meta, unwrapped.inner)) {
             log("info", `v1internal background utility call (requestType=${typeof unwrapped.meta.requestType === "string" ? unwrapped.meta.requestType : "micro"}) — verbatim passthrough, ACP state machine bypassed (#3129)`);
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, v1Model ?? googleModel ?? vertexModel);
             return;
         }
         log("debug", `v1internal envelope unwrapped (model=${v1Model ?? "?"} convId=${v1ConvId ?? "none"})`);
@@ -737,7 +737,7 @@ async function handleRequest(
                 }
                 log("warn", `[commandcode] declared endpoint body is not a convertible streaming CLI conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
         parsed = unwrapped.body;
@@ -837,7 +837,7 @@ async function handleRequest(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+            await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, throttleModel);
             return;
         }
     }
@@ -1337,15 +1337,14 @@ async function handleRequest(
                 }
             }
         }
-        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
-        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
-        // it can reach the real upstream, then pin behind the rollout gate.
-        // So a non-body source (header / harvest) stamps the parsed body on
-        // BOTH wires now — nothing extra is ever forwarded either way;
-        // response-ish protocols keep feeding the resolve rung below via this
-        // local alone.
-        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
-            (protocol === "openai" || protocol === "anthropic")) {
+        // The pin-consumers are prepare-openai, prepare-anthropic AND
+        // prepare-google/prepare-responses (#6525): all four read + strip
+        // MSG_IDS_BODY_FIELD unconditionally before it can reach the real
+        // upstream, then pin behind the rollout gate. So a non-body source
+        // (header / harvest) stamps the parsed body on EVERY wire now —
+        // nothing extra is ever forwarded either way, and a length/shape
+        // mismatch is rejected (bail) at the pin, never leaked or mis-pinned.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined) {
             (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
         // #5719: the RECORDED side of the msgid identity rung lives in the
@@ -2578,7 +2577,7 @@ async function handleRequest(
                     autoModeForge: { variant, body: forgeBody, contentType },
                 };
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-                await forward(req, res, opts, bodyBuffer, amPrepared, core, reqConfig, log, route, instanceId, affinity);
+                await forward(req, res, opts, scrubMsgIdFields(bodyBuffer, log), amPrepared, core, reqConfig, log, route, instanceId, affinity);
                 return;
             }
         }
@@ -2681,6 +2680,7 @@ async function handleRequest(
                 }
             }
             sideBody = scrubCompatDrop(sideBody, compatDropPaths, log);
+            sideBody = scrubMsgIdFields(sideBody, log);
             // Gemini and Vertex encode stream mode in the path rather than the body.
             const requestStream = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
                 && "stream" in parsed && parsed.stream === true;
@@ -3071,11 +3071,39 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
                     }
+                    // #6181 B3: a PLUGIN-lane chained round whose input
+                    // carries no ARRAY content (absent or empty — a
+                    // bare-string input is admitted too: the provider
+                    // concatenates it to its retained chain, the same
+                    // outcome the kernel path would produce, with none of
+                    // its side effects) is a pure chain continuation — the
+                    // provider
+                    // already has the full world via its retained chain. The
+                    // kernel path for such a round is HARMFUL: it injects the
+                    // standing dev message into an otherwise-empty input and
+                    // (on the no-delta egress path) strips the chain id, so
+                    // the provider answers from nothing and the host then
+                    // chains from that BLIND response → permanent context
+                    // loss. Forward the client's bytes verbatim instead (the
+                    // same passthrough the /responses/compact endpoint
+                    // already owns: no kernel, no dev injection, no plane
+                    // side effects — the response-side ingest still updates
+                    // the session from the answer).
+                    const pureChainContinuation =
+                        protocol === "responses" &&
+                        !responsesCompact &&
+                        !wsLaneEnvelope &&
+                        pluginMode &&
+                        typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
+                        (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
+                        (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
-                          : responsesCompact
+                          : pureChainContinuation
+                            ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
@@ -3085,6 +3113,17 @@ async function handleRequest(
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
                     preparedOut.model = requestModel;
+                    // #6181 B3: the compact-passthrough base hard-codes
+                    // resetAfterSuccess — which schedules a native-compaction
+                    // REBASE for the next Responses turn (reconcileNative-
+                    // CompactionBoundary → resetSessionCompression). A pure
+                    // chain-continuation round compacts nothing: honoring the
+                    // marker would wipe this session's compression state on
+                    // the next turn with no compaction ever having happened.
+                    // Drop it for the B3 route (the next turn's stage-0
+                    // resync already converges the plane when the host
+                    // resends a genuinely-compact world).
+                    if (pureChainContinuation) preparedOut.resetAfterSuccess = false;
                     return preparedOut;
                 };
                 // #1295: stamp the envelope meta onto every Prepared for this
@@ -3383,6 +3422,13 @@ async function handleRequest(
                     clearSignedRefusal(guardScheme);
                     log("warn", `[signed-passthrough] built-in-scheme request without a working re-sign arm forwarded byte-untouched, no compression (#1884 escape hatch via resign["sdk-hmac-sha256"].passthrough / BILI_RESIGN_PASSTHROUGH — the user has acknowledged this link runs uncompressed)`);
                     forwarded = true;
+                    // #6539: no msgid-field scrub here on purpose — this is the #1884
+                    // signed-passthrough escape hatch with a body-covering signature
+                    // (sdk-hmac-sha256); mutating the body would break the signature
+                    // the client already shipped. The byte-untouched contract wins;
+                    // a stamped body on this lane rides as-is (bounded: the lane is an
+                    // explicit user opt-in, and the kernel is bypassed on this lane,
+                    // so no bili pin ever consumes the field).
                     await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
                     return;
                 }
@@ -3471,6 +3517,6 @@ async function handleRequest(
                 logUnrecognizedPath(log, req.url ?? "");
             }
         }
-        await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
+        await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, reqConfig, log, route, instanceId, undefined, undefined, undefined, throttleModel);
     }
 }

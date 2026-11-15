@@ -22,12 +22,21 @@ import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
-import { identityOfStoredContent } from "./identity.js";
+import { identityOfStoredContent, splitMediaContent } from "./identity.js";
+import {
+    snapL1EnvelopeRead,
+    snapL1Record,
+    snapR3LatchedRead,
+    snapR3LatchWrite,
+} from "./snap.js";
+import { parseEnvelope } from "../snapshot/identity.js";
+import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
-import type { MessageContentStore } from "acp-kernel";
+import { baseIdOf } from "acp-kernel";
+import type { CoreMessage, MessageContentStore } from "acp-kernel";
 import type { BlockView } from "../session.js";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -302,6 +311,9 @@ export interface SessionStorageStats {
         sessionExt: number;
         checkpoints: number;
         pinnedCheckpoints: number;
+        /** #5874: the L1 identity entry this session owns (l1_world, keyed
+         *  by the raw host session id). Zero for a never-observed session. */
+        l1Entries: number;
     };
     /** Bytes held in inline JSON columns of this session's rows (sessions
      *  record + blocks payload_json + session_ext value_json) — everything
@@ -386,6 +398,20 @@ export function serializeExtValue(value: unknown): string {
 /** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
 function likeEscape(prefix: string): string {
     return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
+}
+
+/** #5874 A/B oracle: effectiveMessageIds from a blocks row's payload_json
+ *  (the verbatim CompressionBlock the ingest stored). '' on any parse
+ *  failure — a malformed payload just misses the base-set, it never kills
+ *  the oracle (the throw path latches dead like any A/B failure). */
+function effectiveIdsOfPayload(payload: string | null): string[] {
+    if (!payload) return [];
+    try {
+        const p = JSON.parse(payload) as { effectiveMessageIds?: unknown };
+        return Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : [];
+    } catch {
+        return [];
+    }
 }
 
 /**
@@ -473,7 +499,7 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
-    /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
+    /** #3250: ingest counter driving the cadence-tick WAL checkpoint. */
     private ingestCount = 0;
     /** #5744: last periodic checkpoint result (plus its wall time) for the
      * slow-ingest warn line — lets an operator attribute a stall spike to a
@@ -1523,6 +1549,97 @@ export class UnifiedStore {
         return ok;
     }
 
+    /** L1 witness probe: a sampled fingerprint of the FIRST live ids (the
+     *  head of the id space is what survives rounds — the tail churns). */
+    private snapWitnessProbe(sid: string): string {
+        const rows = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq LIMIT 8")
+            .all(sid) as { msg_id: string }[];
+        return sha256Hex(rows.length ? rows.map((r) => r.msg_id).join("\u0000") : "empty");
+    }
+
+
+    // #5874 2×2 stage 0 (brief 19544722): the element world match lives at the
+    // head of the chain, BEFORE protocol conversion. These accessors are the
+    // storage side of that stage — the pure decision (snapshot/plane.ts) and
+    // the kernel-input assembly (snapshot/assemble.ts) are lane-side.
+
+    private snapSessRawOf(sid: string): string {
+        // Raw host session id (P9: never truncated) → the l1_world key; the
+        // conversation binding when the host supplied one, the sid otherwise.
+        // (Same resolution as the save path below — stage 0 and the plane
+        // commit must address the SAME l1 row.)
+        return (
+            (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
+                ?.conversation_id ?? sid
+        );
+    }
+
+    /** Stage 0 for one turn: ensure the l1 row exists (idempotent session-
+     *  level v1 record), run the element world match on the stored envelope,
+     *  and persist the new canon (every verdict except `diverge` — that one
+     *  has zero side effects by construction). A session-level identity
+     *  conflict ("red") throws — the lane maps it to the R3 hard 400 BEFORE
+     *  any kernel side effect.
+     */
+    snapStage0(sid: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): Stage0Result {
+        const sessRaw = this.snapSessRawOf(sid);
+        const now = Date.now();
+        const l1 = snapL1Record(this.db, sessRaw, sid, this.snapWitnessProbe(sid), now);
+        if (l1 === "red") {
+            // Session-level identity conflict (R3): the raw host id maps to a
+            // DIFFERENT ledger. Hard-reject BEFORE any kernel side effect —
+            // snapL1Record wrote nothing on this path.
+            throw new FoundationRejectError(`l1 ledger conflict: sess_raw=${sessRaw} maps to another ledger (R3)`);
+        }
+        // The gone-set: stored messages whose ids legally vanish from the
+        // envelope head because a LIVE fold block covers them (the covered
+        // messages stay in the ledger — compression deactivates the coverage,
+        // not the rows). Pure ledger math, no per-row state table.
+        const goneRows = this.db
+            .prepare("SELECT m.msg_id FROM messages m JOIN blocks b ON b.session_id = m.session_id AND m.seq >= b.start_seq AND m.seq <= b.end_seq WHERE m.session_id = ? AND m.retired_at IS NULL AND b.active = 1")
+            .all(sid) as { msg_id: string }[];
+        const explainedGone = new Set(goneRows.map((r) => r.msg_id));
+        // The ledger frontier: the max live stamped seq (0 for an empty
+        // ledger) — the M2 contiguity evidence anchors on it.
+        const maxSeq = (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL").get(sid) as { m: number }).m;
+        return stage0Decide({ db: this.db, sessRaw, ledgerId: sid, incoming, seqs: opts?.seqs ?? null, resync: opts?.resync, maxSeq, explainedGone, now });
+    }
+
+    /** The stage-0 resync (brief red gate R4 / the resync ruling): clear the
+     *  l1 element envelope so the NEXT turn re-issues it from the client's
+     *  current array (one-round convergence). This turn runs the legacy full
+     *  path and the normal in-request flush re-baselines the ledger. The l1
+     *  identity row itself (the v1 mapping + witness + R3 latch) survives:
+     *  a resync re-baselines the ENVELOPE, never the session identity.
+     */
+    snapStage0Reset(sid: string): void {
+        const sessRaw = this.snapSessRawOf(sid);
+        this.db
+            .prepare("UPDATE l1_world SET envelope_json = NULL, envelope_checksum = NULL WHERE sess_raw = ?")
+            .run(sessRaw);
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
+     *  previous process (a restart must not re-arm a misbehaving host and
+     *  re-400 the same broken envelope). */
+    snapR3Latched(sid: string): boolean {
+        try {
+            return snapR3LatchedRead(this.db, this.snapSessRawOf(sid));
+        } catch {
+            return false; // schema/column edge: treat as unlatched, the in-memory breaker still fires
+        }
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort — a failed
+     *  write degrades to the in-memory latch, which still fires this
+     *  process). */
+    snapR3Latch(sid: string): void {
+        try {
+            snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
+        } catch { /* best-effort — see above */ }
+    }
+
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
      *  Never throws into the ingest path — a failed checkpoint just leaves the
      *  WAL longer than ideal until the next tick. */
@@ -1976,6 +2093,9 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+            // #5874: the L1 identity entry rides the session (keyed by
+            // ledger_id); no orphan may survive (T6).
+            this.db.prepare("DELETE FROM l1_world WHERE ledger_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // #4796 follow-up: scoped collection over this session's own
             // released hashes (see collectZeroRefIn) — never the whole table.
@@ -2001,12 +2121,14 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
                     "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
-                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps, " +
+                    "(SELECT COUNT(*) FROM l1_world WHERE ledger_id = ?) AS l1Entries",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
             sessions: number; conversations: number;
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+            l1Entries: number;
         };
         const inlineBytes =
             ((this.db
@@ -2053,6 +2175,7 @@ export class UnifiedStore {
                 sessionExt: counts.ext,
                 checkpoints: counts.cps,
                 pinnedCheckpoints: counts.pinnedCps,
+                l1Entries: counts.l1Entries,
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,

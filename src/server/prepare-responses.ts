@@ -16,11 +16,13 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
+import { FoundationRejectError } from "../snapshot/plane.js";
+import { runStage0 } from "../snapshot/stage0.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -43,6 +45,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore, getStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -104,6 +107,14 @@ export async function prepareResponses(
     }
 
     let processedMessages: CoreMessage[] = [];
+    // #6181 2×2: the msgid + ledger-seq dual-channel the plugin host rides
+    // on the body (src/msgid-pin.ts) — read and STRIPPED before any
+    // projection so the real upstream never sees a field it does not know.
+    // (Same discipline as the openai twin.)
+    const incomingMsgIds = (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // #564/#2627: the ordering separators THIS turn's repair actually inserted,
     // recorded by the producer so provenance never has to be inferred from item
     // text later. Empty on the overwhelming majority of turns.
@@ -173,6 +184,9 @@ export async function prepareResponses(
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -242,8 +256,37 @@ export async function prepareResponses(
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
         }
-        const { msgs } = projection;
+        let { msgs } = projection;
         originalMessages = msgs;
+        // #6181 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to input; malformed/absent → null → the M2 fast path is
+        // disabled, the full-resend world-match path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
+        // #6181 2×2 stage 0 (brief 19544722): the SHARED pin + world-match
+        // + kernel-input assembly (src/snapshot/stage0.ts — the SAME helper
+        // as the openai lane, same red gate). Before processTurn, so an R3
+        // FoundationRejectError carries zero kernel side effects.
+        // #6564 note: the responses-wire pin that #6564 added inline here is
+        // SUBSUMED by runStage0 (same validateMsgIds+applyMsgIdPin under the
+        // pluginLaneServerHistory gate); the pinned `msgs` flows through the
+        // render below to the kernel/store. No double-pin.
+        const s0 = runStage0({
+            sessionId,
+            lane: "responses",
+            msgs,
+            incomingMsgIds,
+            incomingSeqs,
+            pluginMode,
+            log,
+        });
+        if (s0.pinned !== null) {
+            msgs = s0.pinned;
+            originalMessages = msgs;
+        }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
@@ -374,6 +417,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -599,6 +650,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         }
         transformOk = true;
     } catch (err) {
+        // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
+        // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
+        // BEFORE the generic 503; zero kernel side effects by construction
+        // (it throws before processTurn).
+        if (err instanceof FoundationRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
@@ -735,10 +791,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims
     // can never be attributed to a body that differs by even one byte.
@@ -786,11 +844,22 @@ export function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    // #6539 KDD #17: the msgid carriers ride the body on the PLUGIN-lane
+    // chained rounds that take THIS verbatim path (the main /responses
+    // pipeline strips them in prepareResponses; this function bypasses it,
+    // so the strip must live here too). Mutate `parsed` (same as the main
+    // pipeline) and force a rebuilt body whenever a field was present —
+    // the raw-buffer fallback would otherwise forward the carrier verbatim.
+    const hadMsgIdFields =
+        Object.prototype.hasOwnProperty.call(parsed, MSG_IDS_BODY_FIELD) ||
+        Object.prototype.hasOwnProperty.call(parsed, MSG_SEQS_BODY_FIELD);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     // A bili-forged compaction item is never for the upstream (it carries our
     // sentinel blob) — strip it on every forwarding path, same as the normal
     // /responses pipeline does.
     const cleaned = Array.isArray(parsed.input) ? stripBiliCompactionItems(parsed.input) : parsed.input;
-    const stripped = Array.isArray(parsed.input) && cleaned.length !== parsed.input.length;
+    const stripped = hadMsgIdFields || (Array.isArray(parsed.input) && cleaned.length !== parsed.input.length);
     const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
     const base: Prepared = {
         body: stripped ? Buffer.from(JSON.stringify(forgeBody)) : body,

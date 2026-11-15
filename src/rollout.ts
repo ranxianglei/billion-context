@@ -96,8 +96,13 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // serve the outbound prefix from the server-owned transcript
     // (POST /__bili/plugin/render). The id-set algebra classifies vanishing
     // cohorts (compressed vs deleted) and detects generation switches.
-    // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
-    pluginLaneServerHistory: { percent: 0 },
+    // GA (#6525/#6539, owner ruling 2026-11-13): pinned by default. The pin is
+    // the intended end-state of the msgid identity infrastructure — stamped
+    // ids become the recorded `messages.msg_id` so the resolve/settlement/fork
+    // consumers read real host identity, not content digests. The render
+    // endpoint it co-gates is inert until a client opts in (none calls it yet).
+    // Roll back with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=0`.
+    pluginLaneServerHistory: { percent: 100 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

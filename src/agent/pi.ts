@@ -17,7 +17,8 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
-import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { detectWireFormat } from "acp-kernel/wire";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
@@ -513,35 +514,11 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         noteOmpCoworkBypass(ctx.model?.id ?? (ctx.model?.baseUrl ?? ""));
         return undefined;
     }
-    if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) {
-        // #1579: native omp mode routes at the FETCH layer — the model
-        // baseUrl stays the real upstream, so the launcher-shaped checks
-        // (a /bili/-wrapped URL, the BILLION_CONTEXT_PROXY origin, the MITM
-        // whitelist) can never match and #1403's gate silently killed the
-        // identity stamp for EVERY native session. Mirror the interceptor's
-        // own predicate instead: when the native intercept is installed it
-        // WILL rewrite any isModelApiUrl request URL to <proxy>/bili/<url>.
-        // The interceptor judges the FULL request URL while ctx carries only
-        // the baseUrl prefix (".../v1" — not suffix-matched by itself), so
-        // probe both the bare baseUrl and its natural chat-completions
-        // expansion; the proxy consumes (and strips) the stamped pck exactly
-        // as on the launcher lanes. Anything the interceptor would NOT
-        // rewrite keeps #1403's guarantee — never stamp where the proxy
-        // cannot see it. The install flag alone is not routing evidence — it
-        // outlives routing (failed bootstrap, or proxy death + respawn
-        // give-up: onGiveUp clears BILLION_CONTEXT_PROXY but not the flag),
-        // and an un-routed stamped request rides verbatim into strict-schema
-        // upstreams (#1403's 400). Live claim = same env-keyed signal
-        // ownsCompaction / registerTools / runtime-info use; bootstrap
-        // rewrites it on (re-)establishment so degrades/recovery track the
-        // traffic. Round 1 inside the pre-bootstrap window misses the stamp
-        // and self-heals on round 2.
-        if (!nativeInterceptInstalled()) return undefined;
-        if (detectProxyBase(ctx.model?.baseUrl) === undefined) return undefined;
-        const base = ctx.model?.baseUrl ?? "";
-        const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
-        if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
-    }
+    // #6525: the routing/visibility gate now lives in bodyProxyVisible —
+    // shared with the full-resend msgid envelope stamp so the two stamp
+    // paths (pck #268, envelope #6525) can never drift. The #1579/#1403
+    // native-fetch rationale moved with it (see bodyProxyVisible).
+    if (!bodyProxyVisible(ctx, agent)) return undefined;
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const p = payload as Record<string, unknown>;
@@ -551,6 +528,106 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     const sid = sessionIdOf(ctx);
     if (sid === undefined || sid.length === 0) return undefined;
     return { ...p, prompt_cache_key: sid };
+}
+
+// #6525: single source of truth for "the proxy will see this request's
+// BODY". Body fields the proxy consumes and strips (prompt_cache_key #268,
+// the biliMsgIds envelope #6525) may be stamped ONLY when true — a
+// blind-tunneled destination never sees the field, and stamping there rides
+// it verbatim into strict-schema upstreams (#1403's 400). Mirrors
+// stampPromptCacheKey's gate exactly so the pck and envelope stamp paths can
+// never drift. Rationale (from the pck gate it replaces): native omp mode
+// routes at the FETCH layer — the model baseUrl stays the real upstream, so
+// the launcher-shaped checks (a /bili/-wrapped URL, the BILLION_CONTEXT_PROXY
+// origin, the MITM whitelist) can never match and #1403's gate silently
+// killed the identity stamp for EVERY native session. Mirror the
+// interceptor's own predicate instead: when the native intercept is
+// installed it WILL rewrite any isModelApiUrl request URL to
+// <proxy>/bili/<url>. The interceptor judges the FULL request URL while ctx
+// carries only the baseUrl prefix (".../v1" — not suffix-matched by
+// itself), so probe both the bare baseUrl and its natural chat-completions
+// expansion; the proxy consumes (and strips) the stamped field exactly as on
+// the launcher lanes. Anything the interceptor would NOT rewrite keeps
+// #1403's guarantee — never stamp where the proxy cannot see it. The install
+// flag alone is not routing evidence — it outlives routing (failed
+// bootstrap, or proxy death + respawn give-up: onGiveUp clears
+// BILLION_CONTEXT_PROXY but not the flag), and an un-routed stamped request
+// rides verbatim into strict-schema upstreams. Round 1 inside the
+// pre-bootstrap window misses the stamp and self-heals on round 2.
+function bodyProxyVisibleForTest(ctx: Ctx, agent: string): boolean {
+    return bodyProxyVisible(ctx, agent);
+}
+export { bodyProxyVisibleForTest as _bodyProxyVisibleForTest };
+function bodyProxyVisible(ctx: Ctx, agent: string): boolean {
+    const profile = hostProfileFor(agent);
+    // Cowork transport bypasses the fetch intercept (#2583) — same reason it
+    // withholds the pck stamp: the field would ride verbatim into Anthropic's
+    // strict schema (#1403). The one-time diagnostic note stays at the pck
+    // site; this is the pure predicate.
+    if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) return false;
+    if (destinationRoutedThroughProxy(ctx.model?.baseUrl)) return true;
+    if (!nativeInterceptInstalled()) return false;
+    if (detectProxyBase(ctx.model?.baseUrl) === undefined) return false;
+    const base = ctx.model?.baseUrl ?? "";
+    const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
+    return isModelApiUrl(base) || isModelApiUrl(expanded);
+}
+
+// #6525 (send): full-resend turns ride the msgid envelope too — the
+// LANE-INDEPENDENT send path. The incremental lane stamps its own msgIds on
+// the delta it diverts (and early-returns before this line); this covers the
+// turns the lane shape-gates away (#3433: OpenAI-family full resends) plus
+// every other full-resend for both pi and omp. Core-aligned via the kernel
+// wireIndex proof (coreAlignEnvelopeIds); ANY mismatch bails to no field —
+// byte-identical to today, never a misaligned array. The pairing source is
+// the live branch (ctx.sessionManager.getBranch) — the same source the
+// incremental lane and the watermark channel use, so no new collector.
+function resolveEnvelopeIdsForFullResend(parsed: Record<string, unknown>, ctx: Ctx): string[] | undefined {
+    try {
+        const fmt = detectWireFormat(parsed);
+        if (fmt !== "openai" && fmt !== "anthropic" && fmt !== "responses") return undefined; // google stays content-derived (#6525 v1)
+        const wire = fmt === "responses" ? parsed.input : parsed.messages;
+        if (!Array.isArray(wire) || wire.length === 0) return undefined;
+        let branch: unknown;
+        try {
+            branch = ctx.sessionManager?.getBranch?.();
+        } catch {
+            branch = undefined;
+        }
+        if (branch === null || branch === undefined) return undefined;
+        const wireAligned = fmt === "anthropic"
+            ? laneMsgIdsForWire(wire, branch)
+            : fmt === "responses"
+            ? laneMsgIdsForResponsesWire(wire, branch)
+            : laneMsgIdsForOpenAiWire(wire, branch);
+        if (wireAligned === undefined) return undefined; // pairing not provable — degrade
+        return coreAlignEnvelopeIds(fmt, wireAligned, wire, parsed);
+    } catch {
+        return undefined; // kernel converter threw on a malformed payload — never stamp
+    }
+}
+
+// #6525 (send): stamp the core-aligned host ids onto the outgoing full-resend
+// body. Returns the payload to send (base + biliMsgIds), or undefined to
+// leave the request exactly as-is. base = the pck-stamped payload when the
+// pck stamp fired (omp), else the original event payload (pi / omp-not-
+// visible). Gated by bodyProxyVisible so a blind-tunneled request is never
+// stamped (#1403).
+export { resolveEnvelopeIdsForFullResend as _resolveEnvelopeIdsForFullResendForTest, stampMsgIdEnvelope as _stampMsgIdEnvelopeForTest };
+function stampMsgIdEnvelope(
+    event: unknown,
+    ctx: Ctx,
+    agent: string,
+    pck: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+    if (!bodyProxyVisible(ctx, agent)) return undefined;
+    const baseRaw = pck !== null && typeof pck === "object" && !Array.isArray(pck) ? pck : (event as { payload?: unknown } | undefined)?.payload;
+    if (baseRaw === null || typeof baseRaw !== "object" || Array.isArray(baseRaw)) return undefined;
+    const base = baseRaw as Record<string, unknown>;
+    if (base.biliMsgIds !== undefined) return undefined; // already stamped — never double-stamp
+    const ids = resolveEnvelopeIdsForFullResend(base, ctx);
+    if (ids === undefined) return undefined;
+    return { ...base, biliMsgIds: ids };
 }
 
 function fmtTok(n: number): string {
@@ -1540,7 +1617,28 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return;
-            await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
+            // #6262 principle 1: host msgids for the msgid identity track — the
+            // SAME gates the incremental pin uses (anthropic wire only, every
+            // message content-pinnable, ids aligned to the full wire). A lane
+            // that can't resolve stable ids yields undefined → the byte track
+            // carries the fork (today's behavior). No new validation: laneMsgIdsForWire
+            // is the parity-pinned collector.
+            const payload = (event as { payload?: unknown } | undefined)?.payload;
+            let forkMsgIds: string[] | undefined;
+            if (payload !== null && typeof payload === "object") {
+                const messages = (payload as { messages?: unknown }).messages;
+                if (wireMessagesLookAnthropic(messages)) {
+                    let branch: unknown;
+                    try {
+                        branch = ctx.sessionManager?.getBranch?.();
+                    } catch {
+                        branch = undefined;
+                    }
+                    const ids = laneMsgIdsForWire(messages, branch);
+                    if (ids !== undefined && ids.length === messages.length && messages.every((m) => lanePinnableContent(m.content))) forkMsgIds = ids;
+                }
+            }
+            await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {
             // #5403/#5418 unified watermark channel: capture THIS request's
@@ -1630,7 +1728,13 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental turn skipped (${err instanceof Error ? err.message : String(err)}) — full resend this turn`);
                 }
             }
-            return stampPromptCacheKey(event, ctx, agent);
+            // #6525 (send): full-resend turns also carry the msgid envelope
+            // (the lane-independent send path). stampMsgIdEnvelope folds in
+            // the pck stamp when it fired (base = pck-stamped payload for
+            // omp, original payload for pi) and returns undefined to leave
+            // the request byte-identical when the envelope can't be stamped.
+            const pck = stampPromptCacheKey(event, ctx, agent);
+            return stampMsgIdEnvelope(event, ctx, agent, pck) ?? pck;
         });
         // #3248 incremental turns: the ack channel. after_provider_response
         // fires with status + headers BEFORE the stream is consumed, so the

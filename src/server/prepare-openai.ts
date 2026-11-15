@@ -7,7 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
@@ -40,6 +40,9 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
+import { FoundationRejectError } from "../snapshot/plane.js";
+import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
@@ -76,6 +79,13 @@ export async function prepareOpenai(
     // host body stamps (pi incremental lane) or the #5825 handle-seam
     // re-stamp of stamped-header/harvested ids.
     const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #5874 2×2: the seqs carrier (biliLedgerSeqs) — the M2 incremental
+    // join evidence. An optimization channel, not an identity channel:
+    // malformed/absent → the M2 fast path is disabled (the full-resend
+    // matchWorld path still works); it never 400s. (Stamped once msgs
+    // exists, below.)
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
@@ -160,6 +170,9 @@ export async function prepareOpenai(
     const markerCounts = wpHit !== undefined ? { ...wpHit.markerCounts, strippedMs: 0 } : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -167,6 +180,14 @@ export async function prepareOpenai(
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
         let msgs = converted.msgs;
+        // #5874 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to messages; malformed/absent → null → M2 fast path
+        // disabled, the full-resend path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
         let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
@@ -180,26 +201,27 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
-        // #4491/#5825 parity: pin identity to client-supplied ids (plugin
-        // lanes only — pure proxy traffic has no msgid channel and stays on
-        // snapshot render D), the SAME gated contract as the anthropic twin.
-        // Skipped on watermark hits on purpose: fastpath turns reuse the
-        // seed stash's prefix view whose rows were already pinned when it was
-        // materialized, and the decoded tail window is SHORTER than the
-        // stamped list, so count-parity there would fail by design — pinning
-        // only adds noise.
-        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
-            if (featureEnabled("pluginLaneServerHistory")) {
-                const v = validateMsgIds(incomingMsgIds, msgs.length);
-                if (v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
-                    originalMessages = msgs;
-                } else {
-                    log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
-                }
-            } else {
-                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
-            }
+        // #4491/#5825 + #5874 2×2 stage 0 (brief 19544722 / #6181): the
+        // SHARED pin + world-match + kernel-input assembly for cohort
+        // traffic (src/snapshot/stage0.ts — the responses lane runs the
+        // SAME helper, same red gate, same one-round-convergence
+        // contract). Runs BEFORE processTurn, so a thrown
+        // FoundationRejectError (R3) carries zero kernel side effects
+        // (the server funnel maps it to the hard 400); every other fault
+        // → the legacy full path (one-round convergence).
+        const s0 = runStage0({
+            sessionId,
+            lane: "openai",
+            msgs,
+            incomingMsgIds,
+            incomingSeqs,
+            pluginMode,
+            wpHit,
+            log,
+        });
+        if (s0.pinned !== null) {
+            msgs = s0.pinned;
+            originalMessages = msgs;
         }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
@@ -207,6 +229,7 @@ export async function prepareOpenai(
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -327,6 +350,15 @@ export async function prepareOpenai(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message). The
+        // watermark window pin is preserved.
+        snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -563,6 +595,11 @@ export async function prepareOpenai(
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
+        // #6181 B1: the R3 identity fault is a HARD reject, not a degrade —
+        // rethrow it to the server funnel (400 + x-bili-snapshot:identity)
+        // BEFORE the generic 503; zero kernel side effects by construction
+        // (it throws before processTurn).
+        if (err instanceof FoundationRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
@@ -638,10 +675,12 @@ export async function prepareOpenai(
     // #5403/#5418: on a watermark hit pin only this turn's window — the
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
-    snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
     if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {

@@ -83,8 +83,14 @@ async function extractInstall(work: string, tgz: string): Promise<string> {
     return installDir;
 }
 
-async function readPkgVersion(dir: string): Promise<string> {
-    return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
+async function readPkgVersion(dir: string): Promise<string | null> {
+    try {
+        return (JSON.parse(await fs.promises.readFile(path.join(dir, "package.json"), "utf8")) as { version: string }).version;
+    } catch (err) {
+        // A poll landing mid-reinstall sees no package.json yet — "not yet", not an error.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+    }
 }
 
 function freePort(): Promise<number> {
