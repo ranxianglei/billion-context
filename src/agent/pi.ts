@@ -96,8 +96,10 @@ type ExtensionAPI = {
     // catalog BEFORE extensions load, and its registerProvider — unlike
     // pi's _refreshCurrentModelFromRegistry — never re-resolves the live
     // session model, so the extension must re-pin it via setModel (see the
-    // session_start handler below). Optional because pi hosts lack it.
+    // session_start handler below). Optional on older hosts.
     setModel?: (model: Record<string, unknown> & { baseUrl?: string }) => Promise<boolean | void> | boolean | void;
+    getThinkingLevel?: () => string;
+    setThinkingLevel?: (level: string) => void;
     // Persistent transcript output (rendered by TUI and web hosts like
     // pi-web); notify() is a transient toast — only the fallback for hosts
     // without sendMessage (issue #359).
@@ -1317,6 +1319,33 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             });
           }
         }
+        // Pi fingerprints the uncompressed history before our transport runs.
+        // A native continuation therefore cannot carry our rewritten history.
+        const useFullAnthropicRequests = async (ctx: Ctx): Promise<void> => {
+            if (agent !== "pi" || typeof pi.setModel !== "function") return;
+            const model = ctx.model;
+            if (model?.api !== "anthropic-messages" || proxyBaseForCtx(ctx) === undefined) return;
+            const base = model.baseUrl;
+            if (typeof base !== "string" || !/^https?:\/\//i.test(base)) return;
+            if (!destinationRoutedThroughProxy(base) && !(nativeInterceptInstalled() && isModelApiUrl(`${base.replace(/\/+$/, "")}/v1/messages`))) return;
+            const compat = model.compat;
+            if (compat !== undefined && (compat === null || typeof compat !== "object" || Array.isArray(compat))) return;
+            const settings = compat as Record<string, unknown> | undefined;
+            if (settings?.supportsMessageThreads === false) return;
+            const thinking = pi.getThinkingLevel?.();
+            const fullModel = { ...model, compat: { ...settings, supportsMessageThreads: false } };
+            try {
+                if (await pi.setModel(fullModel) === false) {
+                    logHostEvent("warn", "[native-client]", "bili-plugin(pi): could not disable native Anthropic threads for this session (model authentication unavailable)");
+                }
+            } finally {
+                if (ctx.model === fullModel && thinking !== undefined && pi.getThinkingLevel?.() !== thinking) pi.setThinkingLevel?.(thinking);
+            }
+        };
+        if (agent === "pi") {
+            pi.on("session_start", (_event, ctx) => useFullAnthropicRequests(ctx));
+            pi.on("model_select", (_event, ctx) => useFullAnthropicRequests(ctx));
+        }
         // Await tool registration in before_agent_start so cold-start native
         // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
         // active tool loadout and <codemode_catalog> system prompt. Without this,
@@ -1330,6 +1359,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 await registerTools(pi, ctx, state, agent);
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+            try {
+                await useFullAnthropicRequests(ctx);
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
             }
         });
         pi.on("before_provider_headers", async (event, ctx) => {
