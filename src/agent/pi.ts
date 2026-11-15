@@ -16,7 +16,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
 import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
@@ -550,7 +550,39 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
     const sid = sessionIdOf(ctx);
     if (sid === undefined || sid.length === 0) return undefined;
+    rememberStampedPromptCacheKey(sid);
     return { ...p, prompt_cache_key: sid };
+}
+
+// Values this process stamped as prompt_cache_key. The proxy strips the field
+// before it forwards; a request that degrades to a direct send never reaches
+// the proxy, so the omp direct-send guard drops the stamp itself — only a
+// value recorded here, never a key the host set. Bounded, oldest first out.
+const STAMPED_PROMPT_CACHE_KEYS_MAX = 1024;
+const stampedPromptCacheKeys = new Set<string>();
+
+function rememberStampedPromptCacheKey(sid: string): void {
+    stampedPromptCacheKeys.delete(sid);
+    stampedPromptCacheKeys.add(sid);
+    if (stampedPromptCacheKeys.size > STAMPED_PROMPT_CACHE_KEYS_MAX) {
+        const oldest = stampedPromptCacheKeys.values().next().value;
+        if (oldest !== undefined) stampedPromptCacheKeys.delete(oldest);
+    }
+}
+
+/** The JSON body without the prompt_cache_key this process stamped, or
+ *  undefined when the body carries no such stamp (unchanged, send as-is). */
+function withoutStampedPromptCacheKey(text: string): string | undefined {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const { prompt_cache_key: key, ...rest } = parsed as Record<string, unknown>;
+    if (typeof key !== "string" || !stampedPromptCacheKeys.has(key)) return undefined;
+    return JSON.stringify(rest);
 }
 
 function fmtTok(n: number): string {
@@ -914,6 +946,29 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
         if (sid === undefined) return { outcome: "as-is" };
         const body = takePiIncrementalOriginal(sid);
         return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
+    };
+}
+
+/** #3304 prepareDirectSend for the omp lane: the shared incremental guard
+ *  (restore a swapped body or refuse), then drop the prompt_cache_key the
+ *  plugin stamped — on a direct send no proxy strips it, and strict upstreams
+ *  reject the unknown field with a 400. */
+export function createOmpDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    const shared = createPrepareDirectSend();
+    return async (url, input, init) => {
+        const prep = await shared(url, input, init);
+        if (prep.outcome === "unrestorable") return prep;
+        let text: string | undefined = prep.outcome === "restored" ? prep.body : undefined;
+        if (text === undefined) {
+            try {
+                if (typeof init?.body === "string") text = init.body;
+                else if (input instanceof Request) text = await input.clone().text();
+            } catch {
+                text = undefined; // unreadable body — send as the shared guard decided
+            }
+        }
+        const cleaned = text === undefined ? undefined : withoutStampedPromptCacheKey(text);
+        return cleaned === undefined ? prep : { outcome: "restored", body: cleaned };
     };
 }
 
