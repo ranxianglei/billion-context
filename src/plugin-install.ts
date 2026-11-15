@@ -1468,7 +1468,7 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
 // fix routes it by pointing it at the proxy in the host config (the
 // reporter's verified workaround), pinned to the LIVE lane port — the port
 // drifts (#5127/#5129), so it is resolved per install, never hardcoded.
-export const OPENCODE_CLAUDE_AGENT_PROVIDER = "claude-agent";
+const OPENCODE_CLAUDE_AGENT_PROVIDER = "claude-agent";
 
 /** #6816: the proxy origin a claude-agent baseURL must point at. */
 export function opencodeClaudeAgentBaseUrl(): string {
