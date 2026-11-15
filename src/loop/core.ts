@@ -14,7 +14,7 @@ import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import type { SeparatorSlot } from "../server/responses-ordering.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
-import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
+import { diagnoseSuccessWithoutUsage, lastCompressSuffix, releaseNudgeHold, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
 import {
@@ -1431,6 +1431,7 @@ export async function* runCompressLoop(
                 recordUsage(ctx, usage, round);
             } else {
                 diagnoseSuccessWithoutUsage(ctx.session, "acp-loop");
+                releaseNudgeHold(ctx.session);
             }
             let resolvedText = assistantText;
             let allCalls = calls;

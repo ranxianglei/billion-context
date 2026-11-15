@@ -56,6 +56,15 @@ the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
 cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
 shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
 
+Concurrency: the P (plugin) and R (restart) lanes run SIDE BY SIDE by default
+(their agents are fully isolated — per-lane recorder ports, XDG dirs, port
+zones — and the shared upstream absorbs ~6 concurrent consumers). Tune via
+host env vars passed straight into the container: `GATE_CONCURRENT` (default
+`1`; set `0` to restore the legacy serial order — use it if a cache-recovery
+assertion false-reds under concurrency and you need pristine cache isolation),
+`GATE_P_CONC` (default `4`, in-flight P agents) and `GATE_R_CONC` (default `2`,
+in-flight R agents).
+
 Everything lands in `outDir` (mounted as `/work`): `gate-local.log`
 (A/B/U), `plugin-lanes.log` (+ `plugin-lanes/<agent>/…`), `restart-lanes.log`,
 `docker-lanes.log`, `verdaccio.log`, `gate-scratch/`. The launcher builds the
@@ -208,8 +217,9 @@ node scripts/gate/plugin-lanes.mjs
 ```
 
 - `GATE_AGENTS` selects a subset of lanes; `GATE_TURN_TIMEOUT_MS` (default
-  300000), `GATE_BIG/MID/SMALL_WINDOW`, and `PLUGIN_LANES_WORK` (artifact
-  dir, default `./plugin-lanes/`) are tunable
+  300000), `GATE_BIG/MID/SMALL_WINDOW`, `GATE_P_CONC` (in-flight agent cap,
+  default 4), and `PLUGIN_LANES_WORK` (artifact dir, default `./plugin-lanes/`)
+  are tunable
 - dsh lanes: `GATE_DSH_VERSION` (each lane self-installs
   `@deepseek-ai/dsh@<v>`, default latest — system dsh may be too old and a
   global billion-context shadows the candidate bundle), `GATE_OUTPUT_TOKENS`
