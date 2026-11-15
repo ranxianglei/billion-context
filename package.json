@@ -68,6 +68,7 @@
     "jimp": "1.6.1"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "^22.0.0",

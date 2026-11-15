@@ -48,6 +48,12 @@ function makeSession(id: string): Session {
 const foldGate = (store: SessionStore): { dropResidentMetadata(session: Session): void } =>
     store as unknown as { dropResidentMetadata(session: Session): void };
 
+// #6547: full mode opens index.db (+shm/wal) in dir; Windows refuses to
+// delete open files, so close every store a test created before rmrf.
+function closeAll(stores: SessionStore[]): void {
+    for (const s of stores) s.closeQuietly();
+}
+
 test("metadata fold is refused while live metadata diverges from the last committed bytes (#5506)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-fpgate-neg-"));
     const stores: SessionStore[] = [];
@@ -66,10 +72,7 @@ test("metadata fold is refused while live metadata diverges from the last commit
         assert.equal((s.metadata as Record<string, unknown>).lateStamp, "unsaved", "the unsaved mutation must stay resident");
         store.closeQuietly(); // dual-write pin opens index.db — close before teardown (Windows cannot unlink an open SQLite file; see persist-zstd.test.ts for the family)
     } finally {
-        // #6480: the explicit dual-write pin opens index.db in this dir; an
-        // unclosed store pins the file and teardown hits Windows EBUSY
-        // (#2799/#2908 family). Release the handle before deleting.
-        for (const store of stores) store.closeQuietly();
+        closeAll(stores);
         rmrf(dir);
     }
 });
@@ -98,10 +101,7 @@ test("metadata fold proceeds once the divergent mutation has been committed (#55
         store.closeQuietly();
         reloaded.closeQuietly();
     } finally {
-        // #6480: the explicit dual-write pin opens index.db in this dir; an
-        // unclosed store pins the file and teardown hits Windows EBUSY
-        // (#2799/#2908 family). Release the handle before deleting.
-        for (const store of stores) store.closeQuietly();
+        closeAll(stores);
         rmrf(dir);
     }
 });
@@ -119,10 +119,7 @@ test("metadata fold stays closed for a session with no committed save yet (#5506
         assert.equal((s.metadata as Record<string, unknown>).onlyInMemory, true);
         store.closeQuietly();
     } finally {
-        // #6480: the explicit dual-write pin opens index.db in this dir; an
-        // unclosed store pins the file and teardown hits Windows EBUSY
-        // (#2799/#2908 family). Release the handle before deleting.
-        for (const store of stores) store.closeQuietly();
+        closeAll(stores);
         rmrf(dir);
     }
 });
