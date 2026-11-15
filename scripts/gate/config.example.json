@@ -1,0 +1,36 @@
+{
+  "_doc": "bili-gate local config. This FILE (and only this file) holds host-specific secrets/ports — it must never be committed. Copy to e.g. ~/system/bili-gate.json and fill in.",
+  "_doc_keys": "Every key except model1.baseUrl and model1.model is optional; defaults shown.",
+
+  "model1": {
+    "baseUrl": "http://HOST.docker.internal:8199",
+    "model": "model-id-on-that-upstream",
+    "apiKey": ""
+  },
+  "model2": {
+    "baseUrl": "",
+    "model": "",
+    "apiKey": ""
+  },
+  "rev": "master",
+  "skip": "",
+
+  "sourceRepo": "https://github.com/ranxianglei/billion-context.git",
+  "mirror": "",
+  "gitProxy": "",
+  "npmRegistry": "https://registry.npmjs.org",
+
+  "turnTimeoutMs": 300000,
+  "agents": ["dsh", "pi", "codex", "opencode", "claude"],
+  "agentsR": "",
+  "r": {
+    "corpusTokens": 80000,
+    "window": 16384,
+    "capRatio": 0.4,
+    "cacheRatio": 0.5
+  },
+
+  "network": "host",
+  "outDir": "./out",
+  "keep": false
+}
