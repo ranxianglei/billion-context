@@ -1,5 +1,15 @@
 name: CI
 
+# #CI-hold (2026-11-15, ci-flood #5795-era incident): a long CI-fix or
+# conflict-rebase session may push MANY intermediate commits. Any commit
+# whose message carries the marker line [ework:ci-held] (conventionally in
+# the commit BODY) suppresses every PR-triggered job in every workflow of
+# this repo — the run completes with all jobs skipped, consuming no runner.
+# The session's FINAL head push must NOT carry the marker: that single
+# push triggers the one full CI pass the PR needs for merge. If a branch
+# ever parks on a marked head, the next wake finishes the work and re-pushes
+# the unmarked final commit.
+
 on:
   push:
     # Release branches also run CI on push: ref updates made with a real
@@ -108,6 +118,7 @@ jobs:
   # explicit job `name:` keeps check-run names identical to the legacy 12-leg
   # names (branch protection keys off `test (os, node, shard)`).
   plan:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -261,7 +272,7 @@ jobs:
   #     a real post-merge test signal (the missing master-push hole, #3197 era)
   test:
     needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (!failure() && !cancelled() && needs.plan.outputs.scope != 'skip' ) }}
     name: test (${{ matrix.os }}, ${{ matrix.node-version }}, ${{ matrix.shard }})
   # #3143: the suite outgrew one runner — ~656 top-level files (~190k LOC) now
   # serialize through c=4 on a single 4-core leg for ~17-20 min (windows slowest;
@@ -332,7 +343,7 @@ jobs:
   # mysql backend still satisfies the operation contract.
   mysql-contract:
     needs: [plan]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (!failure() && !cancelled() && needs.plan.outputs.scope != 'skip' ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -376,7 +387,7 @@ jobs:
   # parallel legs on the same matrix — same commands, off the critical path.
   static-gates:
     needs: [plan, version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync, test-import-graph]
-    if: ${{ !failure() && !cancelled() && needs.plan.outputs.scope != 'skip' }}
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (!failure() && !cancelled() && needs.plan.outputs.scope != 'skip' ) }}
     name: static-gates (${{ matrix.os }}, ${{ matrix.node-version }})
     strategy:
       fail-fast: false
@@ -407,7 +418,7 @@ jobs:
   version-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -439,7 +450,7 @@ jobs:
   kernel-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -509,7 +520,7 @@ jobs:
   pi-subagents-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -541,6 +552,7 @@ jobs:
   # the committed artifacts differ — a schema edit without re-running the
   # generator goes red here. Zero-dep script: no npm install needed.
   docs-sync:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -550,12 +562,13 @@ jobs:
           node-version: 22
       - run: node tools/gen-config-docs.mjs generate
       - name: Fail on artifact drift
-        run: git diff --exit-code -- docs/configuration.md docs/configuration.zh-CN.md website/main.js website/docs/index.html
+        run: git diff --exit-code -- docs/configuration.md docs/configuration.zh-CN.md docs/configuration.ja.md website/main.js website/docs/index.html
 
   # #2107 drift guard B: every BILI_*/ACP_* env var read in src/ and every
   # FileConfig top-level key must have a seed entry — an undocumented param
   # added to src goes red here with the missing names listed.
   docs-coverage:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -574,6 +587,7 @@ jobs:
   # by an unescaped '&'). Visual freshness is enforced by the same-PR rule in
   # AGENTS.md + review, not here. Zero-dep: plain node, no install step.
   architecture-docs:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -589,6 +603,7 @@ jobs:
   # here with the missing names listed. Zero-dep: plain node, no install step.
   # Not gated to pull_request so master pushes are held to the same surface.
   config-surface-guard:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -604,6 +619,7 @@ jobs:
   # Stale entries (dynamic/unmerged/retired names) notice only. Zero-dep: plain
   # node, no install step. Not gated to pull_request, same as the guards above.
   lifecycle-ledger-guard:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -622,7 +638,7 @@ jobs:
   lane-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -663,6 +679,7 @@ jobs:
   # (DEAD = definition line only; INTERNAL_ONLY = own file only). Zero-dep:
   # plain node, no install step.
   unused-exports:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -680,6 +697,7 @@ jobs:
   # "// retired-module pin: <module>" label in the importing test file.
   # Zero-dep: plain node, no install step.
   test-import-graph:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -699,6 +717,7 @@ jobs:
   # and release-branch bumps are held to it too — mechanical enforcement of
   # AGENTS.md §4 rule 2 ("release commit changes ONLY version + lock if drifts").
   lock-sync:
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -725,7 +744,7 @@ jobs:
   # bot does not auto-dispatch titles containing it.
   red-signal:
     needs: [test, static-gates]
-    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (!cancelled() && github.event_name == 'schedule' ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

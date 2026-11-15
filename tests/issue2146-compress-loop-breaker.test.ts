@@ -188,7 +188,8 @@ test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failu
     assert.ok(stale.startsWith("[Compression FAILED:"), `unknown refs fail (got: ${stale.slice(0, 120)})`);
     assert.match(stale, /above this session's highest ref \(m00008\)/, "frontier diagnosis present");
     assert.doesNotMatch(stale, /m00010|m00014/, "phantom endpoints are NOT echoed back into the client-persisted receipt");
-    assert.match(stale, /\[stale-ref\]/, "scrubbed marker takes their place");
+    assert.match(stale, /\[stale-ref:00010\]/, "scrubbed marker takes their place — with the ref number kept (#6712)");
+    assert.match(stale, /\[stale-ref:00014\]/, "end ref number kept too (#6712)");
 
     const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
     assert.ok(mixed.startsWith("[Compressed "), "#4521 flip: an out-frontier endId clamps to the highest allocated ref instead of failing");

@@ -10,22 +10,32 @@ export type HandoffReply = ReturnType<typeof createHandoffReply>;
 export function createHandoffReply(session: Session, canSave: () => boolean = () => true) {
     const request = session.stats.requests;
     const snapshot = session.lastMessages;
-    const messages = new Map<string, CoreMessage>();
+    const messages = new Map<string, { message: CoreMessage; bytes: number; textBytes: number; lastCodeUnit: number }>();
     let bytes = 0;
     let discarded = false;
     const discard = () => { discarded = true; messages.clear(); };
-    const put = (key: string, message: CoreMessage) => {
+    const put = (key: string, message: CoreMessage, textBytes?: number, lastCodeUnit?: number) => {
         if (discarded) return;
         const previous = messages.get(key);
-        const size = (m: CoreMessage) => Buffer.byteLength(m.text ?? "") + Buffer.byteLength(m.toolName ?? "") + Buffer.byteLength(m.toolCallId ?? "") + 128;
-        bytes += size(message) - (previous ? size(previous) : 0);
+        const text = message.text ?? "";
+        const measuredTextBytes = textBytes ?? Buffer.byteLength(text);
+        const size = measuredTextBytes + Buffer.byteLength(message.toolName ?? "") + Buffer.byteLength(message.toolCallId ?? "") + 128;
+        bytes += size - (previous?.bytes ?? 0);
         if (bytes > HANDOFF_REPLY_MAX_BYTES) { discard(); return; }
-        messages.set(key, message);
+        messages.set(key, { message, bytes: size, textBytes: measuredTextBytes, lastCodeUnit: lastCodeUnit ?? text.charCodeAt(text.length - 1) });
     };
     return {
         append(key: string, contentType: "text" | "reasoning", text: string) {
             if (!text || discarded) return;
-            put(key, { id: `reply_${key}`, role: "assistant", contentType, text: (messages.get(key)?.text ?? "") + text });
+            const previous = messages.get(key);
+            const last = previous?.lastCodeUnit ?? 0;
+            const first = text.charCodeAt(0);
+            // Two separately encoded lone surrogates use six bytes; joined
+            // across deltas they form one four-byte code point. Keep only the
+            // trailing code unit so metering never rescans the growing prefix.
+            const joinsPair = last >= 0xd800 && last <= 0xdbff && first >= 0xdc00 && first <= 0xdfff;
+            const textBytes = (previous?.textBytes ?? 0) + Buffer.byteLength(text) - (joinsPair ? 2 : 0);
+            put(key, { id: `reply_${key}`, role: "assistant", contentType, text: (previous?.message.text ?? "") + text }, textBytes, text.charCodeAt(text.length - 1));
         },
         tool(key: string, toolName: string, toolCallId: string, text: string) {
             put(key, { id: `reply_${key}`, role: "assistant", contentType: "tool-call", toolName, toolCallId, text });
@@ -38,7 +48,7 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
         discard,
         save() {
             if (discarded || !messages.size || session.stats.requests !== request || session.lastMessages !== snapshot || !canSave()) return;
-            session.metadata.handoffResponse = { request, messages: [...messages.values()] };
+            session.metadata.handoffResponse = { request, messages: [...messages.values()].map((entry) => entry.message) };
             markDirty(session);
         },
     };

@@ -89,14 +89,27 @@ function statKeyOf(dbPath: string): { db: StatKeyPart | null; wal: StatKeyPart |
     return { db: statPart(dbPath), wal: statPart(`${dbPath}-wal`) };
 }
 
+function isStatKeyPart(value: unknown): value is StatKeyPart {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const part = value as Partial<StatKeyPart>;
+    return typeof part.s === "number" && Number.isSafeInteger(part.s) && part.s >= 0
+        && typeof part.m === "number" && Number.isFinite(part.m);
+}
+
 /** Read + validate the sidecar. Malformed/absent → null (a plain cache
  * miss — never a boot failure). */
 export function readIntegrityCache(dbPath: string): IntegrityCache | null {
     const file = integrityCachePath(dbPath);
     if (!existsSync(file)) return null;
     try {
-        const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<IntegrityCache>;
-        if (parsed.v !== 1 || typeof parsed.ok !== "boolean") return null;
+        const value: unknown = JSON.parse(readFileSync(file, "utf8"));
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+        const parsed = value as Partial<IntegrityCache>;
+        if (parsed.v !== 1 || typeof parsed.ok !== "boolean"
+            || typeof parsed.schema !== "number" || !Number.isSafeInteger(parsed.schema) || parsed.schema < 0
+            || !isStatKeyPart(parsed.db) || (parsed.wal !== null && !isStatKeyPart(parsed.wal))
+            || typeof parsed.at !== "number" || !Number.isFinite(parsed.at) || parsed.at < 0
+            || (parsed.detail !== undefined && typeof parsed.detail !== "string")) return null;
         return parsed as IntegrityCache;
     } catch {
         return null;

@@ -1,4 +1,5 @@
 import { MESSAGES } from "./i18n.js";
+import { makeMdRender } from "./mdrender.js";
 
 // #3572 (client half): the server accepts JSONC config files (comments +
 // trailing commas) since the parseBiliConfig fix, but the web editor still
@@ -141,6 +142,18 @@ export const WEB_CLIENT = `(function () {
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const blogCacheStale = ${blogCacheStale.toString()};
+    // Markdown + syntax-highlight core — the same single implementation the
+    // server uses (web/mdrender.ts), inlined like the JSONC helpers above.
+    // The factory is fully self-contained, so its (minified) source runs
+    // verbatim inside this IIFE.
+    // Dev/transpile note: tsx's esbuild keepNames pass rewrites every NESTED
+    // function inside the factory to call a __name(fn, "name") helper
+    // (name preservation), which only exists at module scope of the dev
+    // bundle. The production tsup/minify output never emits those calls, but
+    // tests run this template through tsx — this one-line shim keeps the
+    // dev-transpiled inlining runnable. It is a no-op in production.
+    var __name = function (fn) { return fn; };
+    const mdApi = (${makeMdRender.toString()})();
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -2418,12 +2431,16 @@ function changelogCatOf(rawLine) {
     // marker, so the handoff renderer would otherwise fold the answer that
     // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
     const HANDOFF_THINK_END = "<!-- /reasoning -->";
-    function splitHandoffBody(bodyLines) {
+    function splitHandoffBody(bodyLines, role) {
         const segs = [];
         let thinkClosed = false;
+        // Tool-role blocks carry whole tool messages; multi-line payloads
+        // (results, multi-line call arguments) must stay attached to the tool
+        // segment so the card renders one highlighted input/output block.
+        const inToolBlock = role === "tool";
         for (let i = 0; i < bodyLines.length; i++) {
             const raw = bodyLines[i];
-            if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            if (raw.trim() === "" && !(segs.length && (segs[segs.length - 1].type === "out" || (inToolBlock && segs[segs.length - 1].type === "tool")))) continue;
             const activeThink = segs[segs.length - 1];
             if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
                 if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
@@ -2440,7 +2457,7 @@ function changelogCatOf(rawLine) {
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
+            if (last && (last.type === "out" || (inToolBlock && last.type === "tool") || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -2505,17 +2522,84 @@ function changelogCatOf(rawLine) {
         fP(); fL(); fQ(); fPr();
         return html.join("");
     }
+    // eWork-grade handoff rendering (2026-11-11): role cards instead of bare
+    // divider lines, Markdown bodies from the shared mdrender core, hand-
+    // highlighted code, and structured tool input/output with language
+    // detection and per-block copy. The old version escaped everything to
+    // plain text — raw backticks, no tables, no highlighting anywhere.
+    const handoffCopyBlobs = [];
+    const HC_ROLE_ICON = { user: "\ud83d\udc64", assistant: "\ud83e\udd16", tool: "\ud83d\udee0" };
+    function hcDetectLang(payload) {
+        const t2 = payload.trim();
+        if (!t2) return "text";
+        const first = t2.charAt(0);
+        const lastCh = t2.charAt(t2.length - 1);
+        if (first === "{" || first === "[") {
+            try { JSON.parse(t2); return "json"; } catch (e) { /* truncated / pretty-printed */ }
+            if (lastCh === "}" || lastCh === "]") return "json";
+        }
+        const ls = t2.split("\\n");
+        let nonempty = 0, mark = 0;
+        for (const l of ls) {
+            const c = l.trim();
+            if (!c) continue;
+            nonempty++;
+            if (c.charAt(0) === "+" || c.charAt(0) === "-" || c.charAt(0) === "@") mark++;
+        }
+        if (nonempty >= 3 && mark / nonempty > 0.5) return "diff";
+        return "text";
+    }
+    function renderHcTool(s) {
+        const payload = s.lines.join("\\n");
+        const lang = hcDetectLang(payload);
+        let shown = payload;
+        if (s.kind === "call" && lang === "json") { try { shown = JSON.stringify(JSON.parse(payload), null, 2); } catch (e) {} }
+        handoffCopyBlobs.push(payload);
+        const idx = handoffCopyBlobs.length - 1;
+        const isRes = s.kind === "res";
+        const open = payload.split("\\n").length <= 20;
+        return '<details class="hc-tool"' + (open ? " open" : "") + '><summary class="hc-tool-sum">'
+            + '<span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + "</span>"
+            + '<span class="tool-cid">' + escapeHtml(s.cid) + "</span>"
+            + (isRes ? '<span class="hc-res">\u2192</span>' : "")
+            + '</summary><div class="hc-tool-body">'
+            + '<div class="hc-io-head"><span class="hc-io-label">' + (isRes ? t("det.io_out") : t("det.io_in")) + (lang !== "text" ? " \u00b7 " + lang : "") + '</span><button type="button" class="hc-copy btn sm" data-hc="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<pre class="hc-io"><code' + (lang !== "text" ? ' class="hl"' : "") + ">" + mdApi.highlight(shown, lang) + "</code></pre>"
+            + "</div></details>";
+    }
     function renderHandoffMd(md) {
+        handoffCopyBlobs.length = 0; // re-render replaces every .hc-copy button — drop the previous session's payloads
         const lines = md.split("\\n");
         let start = 0;
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
         const blocks = [];
+        const sections = []; // post-Conversation ## sections (#845 appends "## Compressed block summaries")
         let cur = null;
+        let section = null;
+        let entry = null;
         // #2065: only known roles open a block — an in-body Markdown heading
         // ("### 7.1 …" inside a user's rules blob) is content, not a divider.
         const KNOWN_ROLE = { user: 1, assistant: 1, tool: 1 };
         for (let i = start; i < lines.length; i++) {
             const l = lines[i];
+            if (start > 0 && l.indexOf("## ") === 0) {
+                // A new ## section closes the role cards. Without this the whole
+                // "## Compressed block summaries" appendix (80+ block entries on
+                // long sessions) lands inside the last assistant card.
+                cur = null;
+                section = { title: l.slice(3).trim(), prologue: [], entries: [] };
+                sections.push(section);
+                entry = null;
+                continue;
+            }
+            if (section) {
+                if (l.indexOf("### Block ") === 0) {
+                    entry = { head: l.slice(10).trim(), lines: [] };
+                    section.entries.push(entry);
+                } else if (entry) entry.lines.push(l);
+                else section.prologue.push(l);
+                continue;
+            }
             let divider = null;
             if (l.indexOf("### ") === 0) { const r = l.slice(4).trim(); if (KNOWN_ROLE[r]) divider = r; }
             if (divider) { cur = { role: divider, lines: [] }; blocks.push(cur); continue; }
@@ -2523,23 +2607,60 @@ function changelogCatOf(rawLine) {
         }
         const html = [];
         if (!blocks.length) return '<span class="dim small">' + escapeHtml(String(md).slice(0, 200)) + "</span>";
+        // Document meta (title, session id, token stats…) sits before the
+        // Conversation heading — the old client skipped it; render it as a
+        // compact key/value box so the handoff keeps its header context.
+        const meta = [];
+        for (let i = 0; i < start - 1; i++) {
+            const l = lines[i];
+            if (l.trim() === "") continue;
+            if (l.indexOf("# ") === 0) meta.push('<div class="hdoc-title">' + escapeHtml(l.slice(2).trim()) + "</div>");
+            else if (l.indexOf("- ") === 0) {
+                const item = l.slice(2);
+                const c = item.indexOf(": ");
+                if (c > -1) meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-k">' + escapeHtml(item.slice(0, c)) + '</span><span class="hdoc-meta-v">' + escapeHtml(item.slice(c + 2)) + "</span></div>");
+                else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(item) + "</span></div>");
+            } else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(l) + "</span></div>");
+        }
+        if (meta.length) html.push('<div class="hdoc-meta">' + meta.join("") + "</div>");
+        if (start > 0 && lines[start - 1] && lines[start - 1].indexOf("## ") === 0) html.push('<div class="hdoc-sub">' + escapeHtml(lines[start - 1].slice(3).trim()) + "</div>");
         for (const b of blocks) {
             const role = b.role === "user" || b.role === "assistant" || b.role === "tool" ? b.role : "assistant";
-            html.push('<h3 class="msg-role ' + role + '">' + role + "</h3>");
-            const segs = splitHandoffBody(b.lines);
-            if (!segs.length) { html.push('<div class="dim small">_(empty)_</div>'); continue; }
+            const segs = splitHandoffBody(b.lines, role);
+            const body = [];
+            if (!segs.length) body.push('<div class="dim small">_(empty)_</div>');
             for (const s of segs) {
                 if (s.type === "think") {
                     const n = s.lines.filter((x) => x.trim() !== "").length;
-                    html.push('<details class="msg-think"><summary>' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="think-box">' + s.lines.map(escapeHtml).join("<br/>") + "</div></details>");
+                    body.push('<details class="hc-think"><summary>\ud83d\udcad ' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="hc-think-body">' + mdApi.render(s.lines.join("\\n")) + "</div></details>");
                 } else if (s.type === "out") {
-                    html.push('<p class="msg-out">' + s.lines.map(escapeHtml).join("<br/>") + "</p>");
+                    body.push('<div class="hc-out">' + mdApi.render(s.lines.join("\\n")) + "</div>");
                 } else {
-                    const txt = s.lines.join("\\n");
-                    let shown = txt;
-                    if (s.kind === "call") { try { shown = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {} }
-                    html.push('<div class="' + (s.kind === "call" ? "msg-tool" : "msg-result") + '"><span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + '</span><span class="tool-cid">' + escapeHtml(s.cid) + "</span>" + (s.kind === "res" ? '<span class="dim"> \u2192 </span>' : "") + '<pre class="' + (s.kind === "call" ? "tool-args" : "tool-out") + '">' + escapeHtml(shown) + "</pre></div>");
+                    body.push(renderHcTool(s));
                 }
+            }
+            html.push('<div class="hcard hc-' + role + '"><div class="hc-head"><span class="hc-badge hc-badge-' + role + '">' + (HC_ROLE_ICON[role] || "") + " " + role.charAt(0).toUpperCase() + role.slice(1) + '</span></div><div class="hc-body">' + body.join("") + "</div></div>");
+        }
+        for (const sec of sections) {
+            html.push('<div class="hdoc-sub">' + escapeHtml(sec.title) + "</div>");
+            if (sec.prologue.some((x) => x.trim() !== "")) html.push('<div class="hc-section-pro">' + mdApi.render(sec.prologue.join("\\n")) + "</div>");
+            for (const e of sec.entries) {
+                const dash = e.head.indexOf(" \u2014 ");
+                const id = dash > -1 ? e.head.slice(0, dash) : e.head;
+                const topic = dash > -1 ? e.head.slice(dash + 3) : "";
+                let tier = "";
+                let tierAt = -1;
+                for (let k = 0; k < e.lines.length; k++) {
+                    const c = e.lines[k].trim();
+                    if (c === "") continue;
+                    if (c.indexOf("tier ") === 0 && c.indexOf(" tokens compressed") > -1) { tier = c; tierAt = k; }
+                    break;
+                }
+                const bodyLines = tierAt > -1 ? e.lines.slice(tierAt + 1) : e.lines;
+                const card = '<div class="hblock"><div class="hblock-head"><span class="hblock-id">' + escapeHtml(id) + "</span>" + (topic ? '<span class="hblock-topic">' + escapeHtml(topic) + "</span>" : "") + "</div>"
+                    + (tier ? '<div class="hblock-tier">' + escapeHtml(tier) + "</div>" : "")
+                    + '<div class="hblock-body">' + mdApi.render(bodyLines.join("\\n")) + "</div></div>";
+                html.push(card);
             }
         }
         return html.join("");
@@ -2656,8 +2777,8 @@ function changelogCatOf(rawLine) {
             const maxCh = Math.floor((TREE_W - 52) / 7);
             if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
             const rr = refRangeOf(b);
-            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
-            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" aria-label="' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"></rect>');
             p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
             p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
             if (hidden > 0)
@@ -3580,6 +3701,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // innerHTML under a pressed finger (same trick as the #4173 live map).
     let treeViewState = null;
     let treeViewRender = null;
+    let treeTipRedraw = null;
     function bindTreeModeActions() {
         const graphView = $("tree-graph");
         const listView = $("tree-list");
@@ -3594,10 +3716,100 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         let mode = "tree";
         try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
         const st = { mode: mode, selected: "", expanded: {} };
+        st.blocks = blocks;
         treeViewState = st;
+        // Stable hover card — the native SVG <title> tooltip dies the moment
+        // any repaint (expand/collapse, Esc, the #4173 live tick) swaps the
+        // drawing under a stationary cursor, so the tree keeps its own.
+        const tip = document.createElement("div");
+        tip.className = "g-tip";
+        tip.hidden = true;
+        graphView.appendChild(tip);
+        const tipState = { x: 0, y: 0 };
+        function blockAt(x, y) {
+            let el = null;
+            try { el = document.elementFromPoint(x, y); } catch (err) {}
+            if (!el || !el.closest) return null;
+            const n = el.closest("[data-bid]");
+            if (!n || !graphView.contains(n)) return null;
+            const bid = n.getAttribute("data-bid");
+            const srcB = st.blocks || [];
+            for (let i = 0; i < srcB.length; i++) if (srcB[i].blockId === bid) return { b: srcB[i], g: n };
+            return null;
+        }
+        // The box only fits ~20 CJK chars at most, so the on-node label is
+        // truncated hard; hovering widens it in place (the float card beside
+        // the pointer still carries the full topic).
+        const TOPIC_LONG_CH = 20;
+        let tipNodeG = null;
+        let tipNodeB = null;
+        function setNodeTopic(g, b, long) {
+            if (!g || !b) return;
+            const t = g.querySelector("text.g-topic");
+            if (!t) return;
+            let topic = blockTopic(b);
+            const maxCh = long ? TOPIC_LONG_CH : Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "\u2026";
+            t.textContent = topic;
+        }
+        function showTipAt(x, y) {
+            if (st.mode !== "tree" || graphView.hidden) { hideTip(); return; }
+            const hit = blockAt(x, y);
+            const b = hit ? hit.b : null;
+            const g = hit ? hit.g : null;
+            if (g !== tipNodeG) {
+                setNodeTopic(tipNodeG, tipNodeB, false);
+                tipNodeG = g;
+                tipNodeB = b;
+                if (tipNodeG) setNodeTopic(tipNodeG, tipNodeB, true);
+            }
+            if (!b) { tip.hidden = true; return; }
+            tipState.x = x; tipState.y = y;
+            const tierNum = Number(b.tier) || 1;
+            const rr = refRangeOf(b);
+            let html = '<div class="gt-id">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + '</div>';
+            const topic = blockTopic(b);
+            if (topic) html += '<div class="gt-topic">' + escapeHtml(topic) + '</div>';
+            const bits = [];
+            if (b.compressedTokens) bits.push(fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens));
+            if (b.effectiveMessageCount) bits.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+            if (bits.length) html += '<div class="gt-meta">' + escapeHtml(bits.join(" \u00b7 ")) + '</div>';
+            tip.innerHTML = html;
+            tip.hidden = false;
+            const box = graphView.getBoundingClientRect();
+            let lx = x - box.left + 14;
+            let ly = y - box.top + 16;
+            const tw = tip.offsetWidth;
+            const th = tip.offsetHeight;
+            if (lx + tw > box.width - 4) lx = x - box.left - tw - 14;
+            if (ly + th > box.height - 4) ly = y - box.top - th - 16;
+            if (lx < 4) lx = 4;
+            if (ly < 4) ly = 4;
+            tip.style.left = lx + "px";
+            tip.style.top = ly + "px";
+        }
+        function hideTip() {
+            setNodeTopic(tipNodeG, tipNodeB, false);
+            tipNodeG = null;
+            tipNodeB = null;
+            tip.hidden = true;
+        }
+        // After a repaint the node under a stationary pointer may have moved
+        // or been replaced — re-resolve it so the tip neither dangles over the
+        // wrong node nor vanishes while the cursor is still hovering.
+        treeTipRedraw = function () {
+            if (tip.hidden) return;
+            showTipAt(tipState.x, tipState.y);
+        };
+        graphView.addEventListener("pointermove", function (e) { showTipAt(e.clientX, e.clientY); });
+        graphView.addEventListener("pointerleave", hideTip);
         function renderTree() {
             const inner = graphView.querySelector(".tm-inner");
             if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+            // the redraw replaced the drawing — the widened label died with it
+            tipNodeG = null;
+            tipNodeB = null;
+            if (treeTipRedraw) treeTipRedraw();
         }
         treeViewRender = renderTree;
         function select(bid) {
@@ -3718,6 +3930,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
     function bindHandoffActions(d) {
+        // Per-tool copy buttons (data-hc indexes handoffCopyBlobs, filled by
+        // renderHandoffMd at render time). Bound before the !handoffMd early
+        // return: the server-rendered fallback pane has no such buttons, so
+        // this is a harmless no-op there.
+        const hcPane = document.querySelector('#session-detail-view .det-pane[data-pane="handoff"]');
+        if (hcPane) hcPane.querySelectorAll(".hc-copy").forEach((btn) => {
+            btn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const i = Number(btn.getAttribute("data-hc") || 0);
+                copyText(handoffCopyBlobs[i] || "", btn);
+            });
+        });
         const copyBtn = $("handoff-copy-md");
         const dlBtn = $("handoff-dl");
         if (!d.handoffMd) {
@@ -5383,7 +5607,30 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     // selection survive the tick (the list is static DOM).
                     const inner = view.querySelector(".tm-inner");
                     const stv = treeViewState || { expanded: {}, selected: "" };
-                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                    // The /tree tick ships lean nodes (no topic/summary/token
+                    // counts) — merge each over the rich detail block so the
+                    // 5s repaint keeps node titles, tip meta and counts.
+                    const rich = (stv && stv.blocks) || window.__biliDetailBlocks || [];
+                    const richById = {};
+                    for (let ri = 0; ri < rich.length; ri++) {
+                        const rb = rich[ri];
+                        if (rb && rb.blockId) richById[rb.blockId] = rb;
+                    }
+                    const merged = r.blocks.map(function (x) {
+                        const base = richById[x.blockId];
+                        if (!base) return x;
+                        const out = {};
+                        for (const k in base) out[k] = base[k]; // rich: topic/summary/tokens/counts
+                        out.blockId = x.blockId; out.tier = x.tier; out.active = x.active; // tick wins
+                        out.directBlockIds = (x.directBlockIds || []).slice();
+                        if (x.startRef !== undefined) out.startRef = x.startRef;
+                        if (x.endRef !== undefined) out.endRef = x.endRef;
+                        if (x.parentBlockId !== undefined) out.parentBlockId = x.parentBlockId;
+                        return out;
+                    });
+                    if (stv) stv.blocks = merged;
+                    if (inner) inner.innerHTML = renderCollapSvg(merged, stv.expanded, stv.selected).html;
+                    if (treeTipRedraw) treeTipRedraw();
                 }
             }
         } catch (e) {
