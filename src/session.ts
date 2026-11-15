@@ -1163,6 +1163,16 @@ export function rejectNudge(session: Session, before: NudgeStamps, status: numbe
     loggerLog("info", `[${session.id}] nudge rejected with its request (upstream ${status}): stamps rolled back to shown=${before.shown}; nudges held until a request succeeds`);
 }
 
+/** The hold set by rejectNudge must end on ANY success — including ones that
+ *  never report usage. settleUsageReport only clears it for s.total > 0
+ *  samples, so on routes where the upstream never reports usage the flag
+ *  would latch forever (a single 4xx would kill nudging for the rest of the
+ *  process lifetime — the exact failure #6531 fixes, relocated to the #1595
+ *  route class). Called at every no-usage success site. */
+export function releaseNudgeHold(session: Session): void {
+    if (session.transient?.nudgeHeldAfterReject) delete session.transient.nudgeHeldAfterReject;
+}
+
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
 // usage-grade baseline is momentarily absent (the rebuild request's own report
 // hasn't landed yet, or the upstream never reports one), so effectiveTokenCount

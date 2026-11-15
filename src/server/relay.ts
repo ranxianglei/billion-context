@@ -50,7 +50,7 @@ import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipe
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
-import { diagnoseSuccessWithoutUsage, markDirty, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
+import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
@@ -2928,6 +2928,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`);
                 } else {
                     diagnoseSuccessWithoutUsage(prepared.session, "proxy-json");
+                    releaseNudgeHold(prepared.session);
                 }
                 if (typeof out === "number") {
                     prepared.session.stats.outputTokens += out;
