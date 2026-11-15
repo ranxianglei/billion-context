@@ -85,6 +85,20 @@ function foldedSession(covered: string[]): LegacySessionLike {
     return base;
 }
 
+/** The extended production log: the folded session plus one full turn past
+ *  the fold — m8 (user) and m9 (assistant) are live rows above the fold's
+ *  covered region, so the cut watermark lands on the user boundary m8. */
+function extendedSession(): LegacySessionLike {
+    const base = foldedSession(["m5", "m6"]);
+    base.lastMessages = [...(base.lastMessages ?? []),
+        { id: "m8", role: "user", text: "text 8", contentType: "text" } as CoreMessage,
+        { id: "m9", role: "assistant", text: "text 9", contentType: "text" } as CoreMessage];
+    const refs = base.state.messageRefs as { byRaw: Record<string, string>; byRef: Record<string, string> };
+    refs.byRaw["m8"] = "1008"; refs.byRef["1008"] = "m8";
+    refs.byRaw["m9"] = "1009"; refs.byRef["1009"] = "m9";
+    return base;
+}
+
 /** The client's re-sent history for the folded session: originals + summary. */
 const CLIENT: BiliMessage[] = [
     msg("m1", "text 1", "user"),
@@ -262,6 +276,37 @@ test("#5874-v2 L3: a cached row the ledger no longer carries degrades the splice
         assert.ok(healed);
         const healedIds = (JSON.parse(healed.prefix) as Array<{ msgId: string }>).map((r) => r.msgId);
         assert.ok(!healedIds.includes("m4"), "self-healed cache row drops m4");
+    } finally {
+        h.store.close();
+        rmSync(h.dir, { recursive: true, force: true });
+        _resetStoreForTest();
+    }
+});
+
+test("#5874-v2 L4: the cut advances to the newest user-message boundary past the fold (+/-)", () => {
+    const h = setup();
+    try {
+        assert.ok(h.store.ingestSession(planIngest(extendedSession()), undefined, { completeLog: true }), "extend");
+        const client = [
+            ...CLIENT,
+            msg("m8", "text 8", "user"),
+            msg("m9", "text 9", "assistant"),
+        ];
+        const cold = maybeSnapshotView(makeSession(), client, { sessionId: "sess-es" });
+        const row = h.store.egressReadView("sess-es");
+        assert.ok(row, "cut landed on the extended ledger");
+        const ids = (JSON.parse(row.prefix) as Array<{ msgId: string }>).map((r) => r.msgId);
+        assert.deepEqual(ids, ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"], "cut stops at the newest USER message (m8), not the tail");
+        assert.equal(row.lastStableId, "m8");
+        const warm = maybeSnapshotView(makeSession(), client, { sessionId: "sess-es" });
+        assert.deepEqual(JSON.stringify(warm), JSON.stringify(cold), "warm ≡ cold");
+        const last = h.uncovered()[h.uncovered().length - 1];
+        assert.ok(last.length > 0 && last[0][0] === 0, "warm turn skips the cached prefix from seq 0");
+        // (±) A cache that stopped at the FOLD watermark is not enough to
+        // skip m7/m8 — without the user-boundary advance the warm turn
+        // would still load [0, …] content.
+        const warmViewIds = warm.map((m) => m.id);
+        assert.ok(warmViewIds.includes("m8") && warmViewIds.includes("m9"), "tail above the cut rides verbatim");
     } finally {
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });

@@ -322,19 +322,26 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     } catch {
         return { reason: "transcript-error" };
     }
-    // #5874 v2 step 3: re-materialize when the stable watermark advanced past
-    // the cached cut (a new fold landed) or the cache missed this turn. The
-    // cached rows are exactly the rendered rows (parseRow's output) up to the
-    // newest active fold's covered region — bytes the fresh derive would have
-    // produced in this state, so the read side is byte-equivalent. Best-
-    // effort: a fault degrades to no cut (the next turn retries).
+    // #5874 v2 steps 3+4: re-materialize when the stable watermark advanced
+    // past the cached cut or the cache missed this turn. The cut lands on the
+    // max of the newest active fold's covered region and the newest live
+    // USER message (turn boundary — the natural rollback point, so a warm
+    // render after a rewind still serves a cut it can verify). The cached
+    // rows are exactly the rendered rows (parseRow's output) up to that
+    // watermark — bytes the fresh derive would have produced in this state,
+    // so the read side is byte-equivalent. Best-effort: a fault degrades to
+    // no cut (the next turn retries).
     {
         const newest = activeBlocks[activeBlocks.length - 1];
         const seed = blockSeeds.find((s) => s.blockId === newest.blockId);
         const wm = seed && seed.seqs.size > 0 ? Math.max(...seed.seqs) : -1;
-        if (wm > egressMaxSeq) {
+        let cutWm = wm;
+        for (const r of rows) {
+            if (r.msg && r.msg.role === "user" && r.seq > cutWm) cutWm = r.seq;
+        }
+        if (cutWm > egressMaxSeq) {
             try {
-                const prefixRows = rows.filter((r) => r.seq <= wm);
+                const prefixRows = rows.filter((r) => r.seq <= cutWm);
                 if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {
                     store.egressCut(
                         session.id,
