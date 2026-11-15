@@ -363,7 +363,7 @@ export type ParsedStreamEvent =
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
     // client's view.
-    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean; terminalExtra?: Record<string, unknown> }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean; terminalExtra?: Record<string, unknown>; upstreamError?: { code?: string; message?: string } }
     | { kind: "error"; message: string }
 | { kind: "diag"; level: "info" | "warn"; message: string }
     // #1455: stateless marks an inert keep-alive frame (anthropic ping) whose
@@ -964,6 +964,24 @@ export async function* runCompressLoop(
                 // sign thinking, so it can keep round-2 thinking off the wire until
                 // the signature makes it valid (see ParseStreamOpts).
                 const parseOpts: ParseStreamOpts = { upstreamSignsThinking: historyHasSignedThinking || sawSignedThinkingThisTurn };
+                // Observe structured failure evidence without changing terminal
+                // frame forwarding, streamError, or the retry decisions below.
+                const noteOverflow = (fields: { code?: string; message?: string }): void => {
+                    const oinfo = classifyStructuredOverflow(fields);
+                    if (!oinfo.isOverflow || overflowArmedHere) return;
+                    overflowArmedHere = true;
+                    const sentFull = lastForwardedBody(ctx.session)?.full;
+                    try {
+                        armSessionOverflow(
+                            ctx.session, oinfo, requestOptions.url,
+                            sentFull === undefined || sentFull === null ? undefined : typeof sentFull === "string" ? sentFull : sentFull.toString("utf8"),
+                            loggerLog,
+                        );
+                    } catch {
+                        // Evidence persistence must not break the error path.
+                    }
+                    ctx.log(`[acp-loop] round ${round}: in-band context overflow classified — armed emergency shrink (#4950)`);
+                };
                 for await (const ev of adapter.parseStream(currentUpstream, round, parseOpts)) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
@@ -1034,6 +1052,7 @@ export async function* runCompressLoop(
                             cacheCreation: ev.cacheCreation,
                         };
                     } else if (ev.kind === "done") {
+                        if (ev.upstreamError) noteOverflow(ev.upstreamError);
                         sawDone = true;
                         finishReason = ev.finishReason;
                         suppressCompletion = ev.suppressCompletion === true;
@@ -1056,24 +1075,7 @@ export async function* runCompressLoop(
                         // Generic failures stay un-armed (#570 discipline);
                         // no re-fetch here — the zero-side-effect retry path
                         // below is untouched.
-                        const oinfo = classifyStructuredOverflow({ message: ev.message });
-                        if (oinfo.isOverflow && !overflowArmedHere) {
-                            overflowArmedHere = true;
-                            const sentFull = lastForwardedBody(ctx.session)?.full;
-                            try {
-                                armSessionOverflow(
-                                    ctx.session,
-                                    oinfo,
-                                    requestOptions.url,
-                                    sentFull === undefined || sentFull === null ? undefined : typeof sentFull === "string" ? sentFull : sentFull.toString("utf8"),
-                                    loggerLog,
-                                );
-                            } catch {
-                                // evidence arming is advisory — a store failure
-                                // must never break the error path itself
-                            }
-                            ctx.log(`[acp-loop] round ${round}: in-band context overflow classified — armed emergency shrink (#4950)`);
-                        }
+                        noteOverflow({ message: ev.message });
                 } else if (ev.kind === "diag") {
                     ctx.log(ev.message);
                     if (ev.level === "warn") loggerLog("warn", `[${ctx.session.id}] ${ev.message}`);
