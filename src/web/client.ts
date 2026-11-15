@@ -2082,45 +2082,101 @@ function changelogCatOf(rawLine) {
     //   • round brackets under the bars — span, call count, Σfolded/pending
     //   • header — honest totals: nudges / compressions (split nudge-follows
     //     vs active) / recommended vs folded, never a blended “recovery %”
-    function recoveryRoundSvg(events, episodes, summary) {
-        events = (events || []).filter((ev) => ev && ev.at > 0);
-        episodes = episodes || [];
-        summary = summary || {};
-        if (!events.length) return "";
-        const W = TRAJ_W, H = 252, PL = 46, PR = 14, PT = 46, PB = 46;
-        const iw = W - PL - PR, ih = H - PT - PB;
-        const base = PT + ih;
-        const times = events.map((ev) => ev.at);
-        const t0 = Math.min.apply(null, times), t1 = Math.max.apply(null, times);
-        const xAt = (at) => PL + (t1 > t0 ? ((at - t0) / (t1 - t0)) * iw : iw / 2);
-        const yPct = (pct) => base - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+    // #6729: episodes are recomputed HERE from whatever event window is handed in, so the
+    // linked zoom can pass a filtered slice and get correct per-round aggregates for it.
+    // The session-wide summary is always carried through untouched — the header never lies
+    // about a zoomed window.
+    function recoveryEpisodesFromEvents(events) {
         const nudges = events.filter((ev) => ev.kind === "n");
         const folds = events.filter((ev) => ev.kind === "f");
-        // fold → round index (last nudge not after the fold); active otherwise.
         const roundOf = (ev) => {
             let r = -1;
             for (let i = 0; i < nudges.length; i++) { if (nudges[i].at <= ev.at) r = i; else break; }
             return r;
         };
+        const eps = [];
+        // #6729 outstanding recommended pool: each nudge adds its pending, and the nudge-mode
+        // folds consume it (floor 0). Anything consumed beyond the pool is older stock the model
+        // cleared on its own (extra) — the true pct is kept, but the two parts are separated so
+        // ">100%" reads as over-compression, never as inflated recovery.
+        let pool = 0;
+        nudges.forEach((nv, i) => {
+            let folded = 0, active = 0;
+            folds.forEach((f) => {
+                if (f.at < nv.at || (i + 1 < nudges.length && f.at >= nudges[i + 1].at)) return;
+                if (f.mode === "a") { active++; return; }
+                folded += f.folded || 0;
+            });
+            pool += nv.pending || 0;
+            const credited = Math.min(folded, pool);
+            const extra = folded - credited;
+            pool -= credited;
+            eps.push({ at: nv.at, tier: nv.tier != null ? null : nv.tier, pending: nv.pending || 0, folded, pct: (nv.pending || 0) > 0 ? Math.round((folded / (nv.pending || 0)) * 1000) / 10 : null, credited, extra, activeFolds: active });
+        });
+        return { eps, nudges, folds, roundOf };
+    }
+    // Windowed rendering: when the visible slice starts MIDDLE of a round, the pre-nudge
+    // mode-n folds belong to a round whose nudge is off-screen. Group them into one
+    // synthetic open round so their bars are not mislabeled as "round -1". The open round
+    // has no recommendation (pending 0 → pct null → grey, "?" in tooltips), never a fake %.
+    function recoveryWindowMeta(events) {
+        const built = recoveryEpisodesFromEvents(events);
+        const firstN = built.nudges.length ? built.nudges[0].at : Infinity;
+        let preFolded = 0, preActive = 0;
+        built.folds.forEach((f) => { if (f.at < firstN) { if (f.mode === "a") preActive++; else preFolded += f.folded || 0; } });
+        const open = (preFolded > 0 || preActive > 0) ? { open: { at: Math.min.apply(null, events.map((e) => e.at)), tier: null, pending: 0, folded: preFolded, pct: null, activeFolds: preActive, openRound: true } } : { open: null };
+        return Object.assign({}, built, open);
+    }
+    function recoveryHeadHtml(rec) {
+        const s = rec.summary || {};
+        let head = t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: fmtW(s.totalPending || 0), s: fmtW(s.totalFolded || 0) });
+        if ((s.totalFolded || 0) > (s.totalPending || 0)) head += " · " + t("det.rec_over_stock");
+        return '<div class="hint mono" style="margin:2px 0 4px 2px;font-size:12px">' + escapeHtml(head) + "</div>";
+    }
+    function recoveryRoundSvg(events) {
+        events = (events || []).filter((ev) => ev && ev.at > 0);
+        if (!events.length) return "";
+        const W = TRAJ_W, H = 252, PL = 46, PR = 14, PT = 30, PB = 46;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const base = PT + ih;
+        const times = events.map((ev) => ev.at);
+        const t0 = Math.min.apply(null, times), t1 = Math.max.apply(null, times);
+        const xAt = (at) => PL + (t1 > t0 ? ((at - t0) / (t1 - t0)) * iw : iw / 2);
+        const built = recoveryWindowMeta(events);
+        const nudges = built.nudges, folds = built.folds, episodes = built.eps, openRound = built.open;
+        const roundOf = built.roundOf;
+        // #6729 dynamic axis: 100% is the central reference ("exactly the recommendation");
+        // rounds that over-fold push the axis up (capped at 400%) so over-compression sits
+        // ABOVE the baseline instead of being clamped onto it.
+        const measuredPcts = episodes.filter((e) => e.pct != null).map((e) => e.pct);
+        const maxPct = measuredPcts.length ? Math.max.apply(null, measuredPcts) : 100;
+        const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
+        const yAt = (pct) => base - (Math.max(0, Math.min(axisMax, pct)) / axisMax) * ih;
         const colFor = (pct) => (pct >= 80 ? "#2da44e" : pct >= 40 ? "#bf8700" : "#cf222e");
         // per-round call counts + per-fold ordinal, computed from events
         // (the report payload carries round aggregates, not per-call indices).
         const roundTotals = {};
+        if (openRound) roundTotals[-1] = 0;
         folds.forEach((f) => { if (f.mode !== "n") return; const r = roundOf(f); roundTotals[r] = (roundTotals[r] || 0) + 1; });
         const roundSeen = {};
         let grid = "";
-        [0, 25, 50, 75, 100].forEach((g) => {
-            const yy = yPct(g);
+        const gStep = axisMax <= 200 ? 25 : 50;
+        for (let g = 0; g <= axisMax; g += gStep) {
+            const yy = yAt(g);
             grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
             grid += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + g + "%</text>";
-        });
+        }
+        // the 100% baseline — where "the model folded exactly what was recommended" lands
+        const yB = yAt(100);
+        grid += '<line x1="' + PL + '" y1="' + yB.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yB.toFixed(1) + '" stroke="#57606a" stroke-width="1.3"/>';
+        grid += '<text x="' + (W - PR) + '" y="' + (yB - 4).toFixed(1) + '" text-anchor="end" font-size="9" fill="#57606a">' + escapeHtml(t("det.rec_line_base")) + "</text>";
         // ① nudge flags.
         let flags = "";
         nudges.forEach((nv, i) => {
             const x = xAt(nv.at).toFixed(1);
             const tip = t("det.rec_nudge_tip", { tier: nv.tier != null ? nv.tier : "?", at: fmtDT(nv.at), p: fmtW(nv.pending || 0) }) + (nv.paired === false ? "\\n" + t("det.rec_unfolded") : "");
-            flags += '<path d="M' + x + ',' + (PT - 14) + ' L' + (Number(x) - 6).toFixed(1) + ',' + (PT - 24) + ' L' + (Number(x) + 6).toFixed(1) + ',' + (PT - 24) + ' Z" fill="#d29922"><title>' + escapeHtml(tip) + "</title></path>";
-            flags += '<text x="' + x + '" y="' + (PT - 28) + '" text-anchor="middle" font-size="9.5" fill="#d29922">' + escapeHtml("T" + (nv.tier != null ? nv.tier : "?") + " · " + fmtW(nv.pending || 0)) + "</text>";
+            flags += '<path d="M' + x + ',' + (PT - 6) + ' L' + (Number(x) - 6).toFixed(1) + ',' + (PT - 16) + ' L' + (Number(x) + 6).toFixed(1) + ',' + (PT - 16) + ' Z" fill="#d29922"><title>' + escapeHtml(tip) + "</title></path>";
+            flags += '<text x="' + x + '" y="8" text-anchor="middle" font-size="9.5" fill="#d29922">' + escapeHtml("T" + (nv.tier != null ? nv.tier : "?") + " · " + fmtW(nv.pending || 0)) + "</text>";
         });
         // ② per-call bars (same-timestamp bursts get spread apart so a
         // multi-call round does not collapse into one overlapping column).
@@ -2144,32 +2200,37 @@ function changelogCatOf(rawLine) {
             if (h < 1) return;
             const x = Math.min(W - PR - 2, Math.max(PL + 2, xs[i] + (xShift[i] || 0)));
             const r = roundOf(f);
-            const ep = f.mode === "n" ? episodes[r] : undefined;
+            const ep = f.mode === "n" ? (r < 0 ? (openRound ? openRound : undefined) : episodes[r]) : undefined;
             const pct = ep ? ep.pct : null;
             const col = f.mode === "a" ? "#0969da" : (pct == null ? "#8b949e" : colFor(pct));
             const tip = f.mode === "a"
                 ? t("det.rec_bar_a_tip", { at: fmtDT(f.at), s: fmtW(S) })
-                : t("det.rec_bar_n_tip", { i: r + 1, k: (roundSeen[r] = (roundSeen[r] || 0) + 1), n: roundTotals[r] || "?", at: fmtDT(f.at), s: fmtW(S), pct: pct != null ? pct.toFixed(1) + "%" : "?" });
+                : t("det.rec_bar_n_tip", { i: r < 0 ? 0 : r + 1, k: (roundSeen[r] = (roundSeen[r] || 0) + 1), n: r < 0 && !openRound ? "?" : (roundTotals[r] || "?"), at: fmtDT(f.at), s: fmtW(S), pct: pct != null ? pct.toFixed(1) + "%" : "?" });
             bars += '<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (base - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + col + '" opacity="0.8" rx="1"><title>' + escapeHtml(tip) + "</title></rect>";
         });
-        // ③ round points + true-value labels + running average.
-        let dots = "", cumPts = "";
+        // ③ round points + true-value labels + main recovery line + running average.
+        let dots = "", cumPts = "", mainPts = "";
         let cp = 0, cf = 0;
         episodes.forEach((ep, i) => {
             const start = ep.at;
             let end = start;
             folds.forEach((f) => { if (f.mode === "n" && f.at >= start && (i + 1 >= nudges.length || f.at < nudges[i + 1].at) && f.at > end) end = f.at; });
             const x = xAt(t1 > t0 ? (start + end) / 2 : start);
-            const tip = t("det.rec_point_tip", { i: i + 1, tier: ep.tier != null ? ep.tier : "?", at: fmtDT(ep.at), s: fmtW(ep.folded || 0), p: fmtW(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(1) + "%" : "?", a: ep.activeFolds || 0 });
+            const note = ep.pct == null ? "" : (ep.pct > 100 ? t("det.rec_line_over_note") : t("det.rec_line_under_note"));
+            const tip = t("det.rec_point_tip", { i: i + 1, tier: ep.tier != null ? ep.tier : "?", at: fmtDT(ep.at), s: fmtW(ep.folded || 0), p: fmtW(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(1) + "%" : "?", a: ep.activeFolds || 0 }) + note;
             if (ep.pct == null) {
                 dots += '<circle cx="' + x.toFixed(1) + '" cy="' + base.toFixed(1) + '" r="3.5" fill="none" stroke="#8b949e" stroke-width="1.2"><title>' + escapeHtml(tip) + "</title></circle>";
                 return;
             }
-            const yy = yPct(ep.pct);
-            dots += '<circle cx="' + x.toFixed(1) + '" cy="' + yy.toFixed(1) + '" r="4.5" fill="' + colFor(ep.pct) + '" stroke="#fff" stroke-width="1"><title>' + escapeHtml(tip) + "</title></circle>";
-            dots += '<text x="' + x.toFixed(1) + '" y="' + (yy - 9).toFixed(1) + '" text-anchor="middle" font-size="10" font-weight="600" fill="' + colFor(ep.pct) + '">' + ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%</text>";
+            const yy = yAt(ep.pct);
+            const over = ep.pct > 100;
+            const dcol = over ? "#0969da" : colFor(ep.pct);
+            dots += (over ? '<circle cx="' + x.toFixed(1) + '" cy="' + yy.toFixed(1) + '" r="7" fill="none" stroke="#0969da" stroke-width="1.5"/>' : "")
+                + '<circle cx="' + x.toFixed(1) + '" cy="' + yy.toFixed(1) + '" r="4.5" fill="' + dcol + '" stroke="#fff" stroke-width="1"><title>' + escapeHtml(tip) + "</title></circle>";
+            dots += '<text x="' + x.toFixed(1) + '" y="' + (yy - 9).toFixed(1) + '" text-anchor="middle" font-size="10" font-weight="600" fill="' + dcol + '">' + ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%</text>";
             cp += ep.pending || 0; cf += ep.folded || 0;
-            if (cp > 0) cumPts += (cumPts ? " " : "") + x.toFixed(1) + "," + yPct((cf / cp) * 100).toFixed(1);
+            mainPts += (mainPts ? " " : "") + x.toFixed(1) + "," + yy.toFixed(1);
+            if (cp > 0) cumPts += (cumPts ? " " : "") + x.toFixed(1) + "," + yAt((cf / cp) * 100).toFixed(1);
         });
         // ④ round brackets under the bars.
         let brackets = "";
@@ -2179,14 +2240,14 @@ function changelogCatOf(rawLine) {
             folds.forEach((f) => { if (f.mode === "n" && f.at >= start && (i + 1 >= nudges.length || f.at < nudges[i + 1].at)) { k++; if (f.at > end) end = f.at; } });
             const x0 = xAt(start), x1 = xAt(end), yb = H - PB + 12 + (i % 2) * 16;
             brackets += '<path d="M' + x0.toFixed(1) + ',' + (yb - 4) + ' L' + x0.toFixed(1) + ',' + yb + ' L' + x1.toFixed(1) + ',' + yb + ' L' + x1.toFixed(1) + ',' + (yb - 4) + '" fill="none" stroke="#6e7681" stroke-width="1"/>';
-            const label = t("det.rec_bracket", { i: i + 1, k, s: fmtW(ep.folded || 0), p: fmtW(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "?" });
+            const label = t("det.rec_bracket", { i: i + 1, k, s: fmtW(ep.folded || 0), p: fmtW(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "?" })
+                + ((ep.extra || 0) > 0 ? t("det.rec_bracket_over", { s: fmtW(ep.extra) }) : "");
             brackets += '<text x="' + ((x0 + x1) / 2).toFixed(1) + '" y="' + (yb + 11) + '" text-anchor="middle" font-size="9.5" fill="var(--text-muted)">' + escapeHtml(label) + "</text>";
         });
-        // ⑤ honest header (no blended %).
-        let head = t("det.rec_head2", { n: summary.nudges || 0, f: summary.folds || 0, nf: summary.nudgeFolds || 0, a: summary.activeFolds || 0, p: fmtW(summary.totalPending || 0), s: fmtW(summary.totalFolded || 0) });
-        if ((summary.totalFolded || 0) > (summary.totalPending || 0)) head += " · " + t("det.rec_over_stock");
-        head = '<text x="' + PL + '" y="14" font-size="11" fill="var(--text-muted)">' + escapeHtml(head) + "</text>";
-        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid + head + flags
+        // ⑤ honest header lives in the card HTML (recoveryHeadHtml), not inside this SVG —
+        // an in-chart text line at the top left collided with the first nudge flag's label.
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid + flags
+            + (mainPts ? '<path d="M' + mainPts + '" fill="none" stroke="#57606a" stroke-width="1.5"/>' : "")
             + (cumPts ? '<path d="M' + cumPts + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="5 3"/>' : "")
             + bars + dots + brackets + "</svg>";
     }
@@ -2378,13 +2439,18 @@ function changelogCatOf(rawLine) {
             // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
             // the byte-parity acceptance criterion pins). Time-filtering only applies to a
             // ZOOMED window, where a foreign mark would land on the wrong sample.
-            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], recovery: z.state.recovery || null, offset: a };
             const t0 = lines[0] ? (lines[0].at || 0) : 0;
             const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
             return {
                 lines,
                 folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
                 seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                // #6729: recovery events follow the zoom window; the session-wide summary
+                // stays global so the header never lies about a zoomed window.
+                recovery: (z.state.recovery && z.state.recovery.events.length)
+                    ? { events: z.state.recovery.events.filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1), summary: z.state.recovery.summary }
+                    : null,
                 offset: a,
             };
         };
@@ -2407,7 +2473,7 @@ function changelogCatOf(rawLine) {
             const wrap = $(cfg.elId);
             const v = z.visible();
             if (!wrap || !v) return;
-            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams, v.recovery) : "";
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
@@ -2494,6 +2560,10 @@ function changelogCatOf(rawLine) {
     const detailChartLink = { members: [] };
     const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
     const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #6729: the recovery chart joins the same brush link. makeChartZoom's visible()
+    // filters recovery events to the zoomed [t0, t1]; this render callback re-derives the
+    // per-round aggregates for whatever window it is given.
+    const recZoom = makeChartZoom({ elId: "rec-chart", statusId: "rec-status", resetId: "rec-reset", link: detailChartLink, render: (lines, folds, seams, recovery) => (recovery && recovery.events && recovery.events.length) ? recoveryRoundSvg(recovery.events) : "" });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -2508,11 +2578,20 @@ function changelogCatOf(rawLine) {
         const seam = detailSeam(ledger);
         hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
+    function bindRecoveryChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const rec = ledger.recovery && ledger.recovery.events && ledger.recovery.events.length ? ledger.recovery : null;
+        recZoom.bind({ lines, folds: ledger.folds || [], seams: [], recovery: rec });
+    }
     window.bili_trajSvg = trajectorySvg;
     window.bili_hitSvg = hitRateSvg;
+    window.bili_recoveryRoundSvg = recoveryRoundSvg;
+    window.bili_recoveryEpisodes = recoveryEpisodesFromEvents;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
     window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
+    window.bili_recZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => recZoom.visible(), range: () => recZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -3323,7 +3402,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const recLine = ledger.recovery;
         if (recLine && recLine.events && recLine.events.length) {
             parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.rec_line_title") + '</span><span class="hint">' + t("det.rec_line_sub") + '</span></div><div class="card-b">');
-            parts.push('<div class="chart-wrap">' + recoveryRoundSvg(recLine.events, recLine.episodes || [], recLine.summary || {}) + "</div>");
+            // #6729: the honest header is HTML above the chart (never overlaps the flags),
+            // and the chart is a linked zoom member — drag-select on the trajectory or
+            // hit-rate chart re-renders this one over the same window.
+            parts.push(recoveryHeadHtml(recLine));
+            parts.push('<div id="rec-status" class="chart-status" style="min-height:0"></div>');
+            parts.push('<div id="rec-chart" class="chart-wrap"></div>');
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:#d29922", t("det.rec_leg_nudge")));
             parts.push(legendItem("background:#2da44e", t("det.rec_line_g")));
@@ -3538,6 +3622,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
             bindHitRateChart(d);
+            bindRecoveryChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {

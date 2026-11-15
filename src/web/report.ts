@@ -52,7 +52,7 @@ interface ReportData {
             events?: Array<{ at?: number; kind?: "n" | "f"; tier?: number | null; pending?: number; folded?: number | null; foldSeq?: number | null; mode?: "n" | "a" | null; pct?: number | null; paired?: boolean }>;
             summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
             /** #6729 follow-up: one point per nudge round for the recovery line chart. */
-            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number }>;
+            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; credited?: number; extra?: number; activeFolds?: number }>;
             activesBefore?: number;
         };
         lines?: Array<{ input?: number; cached?: number }>;
@@ -466,7 +466,11 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             const times = revEvs.map((ev) => ev.at);
             const t0 = Math.min(...times), t1 = Math.max(...times);
             const TX = (at: number): number => left + (t1 > t0 ? ((at - t0) / (t1 - t0)) * (right - left) : (right - left) / 2);
-            const RY = (pct: number): number => bot - (Math.max(0, Math.min(100, pct)) / 100) * (bot - top);
+            // #6729 dynamic axis: 100% is the central reference; over-folds push the axis up
+            // (capped at 400%) so over-compression sits ABOVE the baseline, never clamped onto it.
+            const maxPct = eps.reduce((mx, ep) => (ep.pct != null && ep.pct > mx ? ep.pct : mx), 100);
+            const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
+            const RY = (pct: number): number => bot - (Math.max(0, Math.min(axisMax, pct)) / axisMax) * (bot - top);
             const nudgesE = revEvs.filter((ev) => ev.kind === "n");
             const foldsE = revEvs.filter((ev) => ev.kind === "f");
             const roundOf = (ev: { at: number }): number => {
@@ -475,10 +479,14 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 return r;
             };
             const colFor = (pct: number): string => pct >= 80 ? "#2da44e" : pct >= 40 ? AMB : RED;
-            [0, 50, 100].forEach((g) => {
+            const gStep = axisMax <= 200 ? 25 : 50;
+            for (let g = 0; g <= axisMax; g += gStep) {
                 body.push('<line x1="' + left + '" y1="' + RY(g).toFixed(1) + '" x2="' + right + '" y2="' + RY(g).toFixed(1) + '" stroke="' + LINEC + '" stroke-width="1"/>');
                 txt(left - 6, RY(g) + 3, g + "%", { size: 9.5, color: MUT, anchor: "end", mono: true });
-            });
+            }
+            const yB = RY(100);
+            body.push('<line x1="' + left + '" y1="' + yB.toFixed(1) + '" x2="' + right + '" y2="' + yB.toFixed(1) + '" stroke="#57606a" stroke-width="1.3"/>');
+            txt(right, yB - 4, t("det.rec_line_base"), { size: 8.5, color: "#57606a", anchor: "end", mono: true });
             nudgesE.forEach((nv) => {
                 const x = TX(nv.at);
                 body.push('<path d="M' + x.toFixed(1) + ',' + (top - 6) + ' L' + (x - 5).toFixed(1) + ',' + (top - 15) + ' L' + (x + 5).toFixed(1) + ',' + (top - 15) + ' Z" fill="#d29922"/>');
@@ -513,23 +521,30 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             });
             let cpSum = 0, cfSum = 0;
             const cumPts: string[] = [];
+            const mainPts: string[] = [];
             eps.forEach((ep, i) => {
                 const epAt = ep.at ?? 0;
                 let end = epAt, k = 0;
                 foldsE.forEach((fd) => { if (fd.mode === "n" && fd.at >= epAt && (i + 1 >= nudgesE.length || fd.at < nudgesE[i + 1].at)) { k++; if (fd.at > end) end = fd.at; } });
                 const x = TX(t1 > t0 ? (epAt + end) / 2 : epAt);
                 if (ep.pct != null) {
-                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(ep.pct).toFixed(1) + '" r="3.5" fill="' + colFor(ep.pct) + '" stroke="#ffffff" stroke-width="1"/>');
-                    txt(x, RY(ep.pct) - 7, ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "600", color: colFor(ep.pct), anchor: "middle", mono: true });
+                    const over = ep.pct > 100;
+                    const dcol = over ? ACC : colFor(ep.pct);
+                    if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(ep.pct).toFixed(1) + '" r="6" fill="none" stroke="' + ACC + '" stroke-width="1.5"/>');
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(ep.pct).toFixed(1) + '" r="3.5" fill="' + dcol + '" stroke="#ffffff" stroke-width="1"/>');
+                    txt(x, RY(ep.pct) - 7, ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "600", color: dcol, anchor: "middle", mono: true });
                     cpSum += ep.pending || 0; cfSum += ep.folded || 0;
+                    mainPts.push(x.toFixed(1) + "," + RY(ep.pct).toFixed(1));
                     if (cpSum > 0) cumPts.push(x.toFixed(1) + "," + RY((cfSum / cpSum) * 100).toFixed(1));
                 } else {
                     body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(0).toFixed(1) + '" r="3" fill="none" stroke="' + MUT + '" stroke-dasharray="2 2"/>');
                 }
+                const extra = (ep.folded != null && ep.credited != null) ? Math.max(0, ep.folded - ep.credited) : 0;
                 const x0 = TX(epAt), yb = bot + 14 + (i % 2) * 15;
                 body.push('<path d="M' + x0.toFixed(1) + ',' + (yb - 4) + ' L' + x0.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + (yb - 4) + '" fill="none" stroke="' + MUT + '" stroke-width="1"/>');
-                txt((x0 + x) / 2, yb + 10, t("det.rec_bracket", { i: i + 1, k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" }), { size: 8.5, color: MUT, anchor: "middle", mono: true });
+                txt((x0 + x) / 2, yb + 10, t("det.rec_bracket", { i: i + 1, k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" }) + (extra > 0 ? t("det.rec_bracket_over", { s: f.W(extra) }) : ""), { size: 8.5, color: MUT, anchor: "middle", mono: true });
             });
+            if (mainPts.length > 1) body.push('<polyline points="' + mainPts.join(" ") + '" fill="none" stroke="#57606a" stroke-width="1.5"/>');
             if (cumPts.length > 1) body.push('<polyline points="' + cumPts.join(" ") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="4 3"/>');
             y += CH + 16;
         }
