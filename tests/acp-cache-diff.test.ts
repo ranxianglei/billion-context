@@ -164,6 +164,10 @@ test("runDiff: client-side rewrite forwarded verbatim attributes client", async 
 
 test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefix-stable-miss", async () => {
     const dir = tmpdir("acp-diff-miss-");
+    // Hermetic: runDiff's default log enumeration also scans the state-dir
+    // log — pin XDG_STATE_HOME so a host's live log cannot contribute samples.
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-x", [M1, M2]),
@@ -185,7 +189,11 @@ test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefi
         assert.equal(p.usage?.missedPrefix, 99000);
         assert.equal(p.usage?.hitPctB, 1);
         assert.ok(report.worst.some((w) => w.session === "ses_a" && w.pair.category === "prefix-stable-miss"));
-    } finally { rmrf(dir); }
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(dir);
+    }
 });
 
 test("runDiff: dense request cadence (<2s apart, compress-loop regime) still aligns usage — a later request must not steal its predecessor's response line", async () => {
@@ -195,6 +203,10 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
     // undetected (pure-append + "no [acp-usage] data") precisely in the dense
     // compress-loop cadence this tool exists to diagnose.
     const dir = tmpdir("acp-diff-dense-");
+    // Hermetic: same as the prefix-stable-miss test above — keep the host's
+    // state-dir log out of runDiff's default enumeration.
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = dir;
     try {
         const tA = Date.parse("2026-09-24T14:32:04.500Z");
         const tB = tA + 1500; // 1.5s apart
@@ -213,7 +225,11 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
         assert.equal(p.category, "prefix-stable-miss");
         assert.equal(p.usage?.inputA, 100000);
         assert.equal(p.usage?.cachedB, 1000);
-    } finally { rmrf(dir); }
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(dir);
+    }
 });
 
 test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", async () => {
