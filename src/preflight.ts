@@ -457,13 +457,6 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // binary-carrying fields (base64 image data, data-URLs) are excluded because
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
-// #6844: DSH attaches model-hidden provider metadata as top-level body fields
-// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory) — documented
-// as staying outside model input. The measured-body walks price the model
-// input, so these fields are excluded at the top level only; the same key
-// nested inside messages[] is model-visible content and still counts.
-const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
-
 // fails closed.
 // #5932: `image_url` is the responses-lane/OpenAI data-URL shape (the blob sits
 // DIRECTLY under that key) — counting it as text once made a 40 MB screenshot
@@ -471,6 +464,15 @@ const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+
+// #6844: DSH attaches model-hidden provider metadata as top-level body fields
+// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory) — documented
+// as staying outside model input — but the measured-body walks priced every
+// top-level field, so an ordinary request 413'd at the egress fuse with the
+// hidden field dominating the `other` bucket (88% of the measured body, #6844).
+// Excluded at the top level only: the same key nested inside messages[] is
+// model-visible content and still counts.
+const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
