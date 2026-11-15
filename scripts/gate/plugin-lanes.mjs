@@ -1138,4 +1138,10 @@ async function main() {
   console.log(`\nplugin-lanes: ${counted.length - failed.length}/${counted.length} passed${BLOCKED.size ? ` (${[...BLOCKED.keys()].map((l) => `${l}:${BLOCKED.get(l).kind}`).join(", ")})` : ""}`);
   process.exit(failed.length ? 1 : 0);
 }
-main();
+// Import guard: restart-lanes.mjs imports { buildCorpus, CODEWORDS } from THIS
+// file. An unguarded top-level main() would re-run the entire P-lane suite as an
+// import side effect inside the restart-lanes process (2026-11-15 gate run:
+// doubled dsh/pi P lanes in the same $WORK dirs -> npm ENOTEMPTY install races,
+// a sibling pi recorder killed via the shared instance registry, and the
+// side-effect suite's process.exit(1) becoming the R process's exit code).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
