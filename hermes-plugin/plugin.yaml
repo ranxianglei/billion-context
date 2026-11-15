@@ -6,5 +6,15 @@ provides_tools:
   - compress
   - decompress
   - acp_status
+  - acp_cache
+  # served only while imageRescale is on (the default): an over-declaration is a validation
+  # warning, an undeclared registration is the failure — so declare the default surface.
+  - acp_read_original_image
+  - search_context
+provides_hooks:
+  - pre_api_request
+provides_middleware:
+  - llm_request
+# Legacy spelling, kept for hosts that predate provides_hooks (plugins_manifest falls back to it).
 hooks:
   - pre_api_request
