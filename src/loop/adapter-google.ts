@@ -624,13 +624,16 @@ export function createGoogleAdapter(
                         });
                         continue;
                     }
-                    const clean = tagFilter.push(part.text);
+                    // A signature may belong to ordinary text, without thought:true.
+                    // Preserve its bytes and part boundary on both replay paths.
+                    const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
+                    const clean = signed ? part.text : tagFilter.push(part.text);
                     if (clean !== part.text) {
                         editedParts ??= [...parts];
                         editedParts[i] = { ...part, text: clean };
                     }
                     if (clean.length === 0) continue;
-                    partEvents.push({ kind: "text", delta: clean, rawHandled: true });
+                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed ? { rawGooglePart: part } : {}) });
                 }
                 // Decide wire output only after every prose sibling has been
                 // cleaned. Each complete frame belongs to one event, regardless
