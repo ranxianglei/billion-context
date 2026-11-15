@@ -19,3 +19,8 @@ tests/golden/web-hitrate/*.svg text eol=lf
 # "every fixture artifact matches its recorded digest and size" failed every
 # windows-latest leg (run 38982246862).
 tests/fixtures/vertex-anthropic/* text eol=lf
+
+# #6692: docs/ Markdown is prose rather than byte-exact, but Git-for-Windows'
+# default autocrlf=true rewrote whole files to CRLF on commit (a +18-line docs
+# PR landed as +1509/-1489). Pin LF so Windows-side edits stay line-accurate.
+docs/**/*.md text eol=lf

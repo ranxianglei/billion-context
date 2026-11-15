@@ -57,9 +57,14 @@ export const WEB_STYLES = String.raw`
    framed document's prefers-color-scheme. An explicit pin outranks the OS
    signal, so the media query below is narrowed to documents WITHOUT one;
    the pinned palette repeats the same list (CSS cannot share declarations
-   across media boundaries — keep the two lists in sync). */
+   across media boundaries — keep the two lists in sync).
+   #6587: each dark palette declares color-scheme: dark. The UA paints native
+   control chrome (a select's option popup, checkbox/radio glyphs, scrollbars)
+   from color-scheme rather than from the CSS vars, so the declaration keeps
+   those controls on the dark ground the palette establishes. */
 @media (prefers-color-scheme: dark) {
     :root:not([data-theme]) {
+        color-scheme: dark;
         --bg: #0d1117;
         --bg-elev: #161b22;
         --bg-muted: #1c2129;

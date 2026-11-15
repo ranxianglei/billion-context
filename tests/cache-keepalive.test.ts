@@ -621,3 +621,55 @@ for (const reply of [
         assert.equal(timers.pendingCount(), 1, "only the replacement snapshot stays scheduled");
     });
 }
+
+for (const [tier, wireBody] of [["5m", BODY_5M], ["1h", BODY_1H]] as const) {
+    test(`arm: rotating credentials without a replacement ${tier} snapshot cancels its timer`, () => {
+        noteSuccessfulForward(armInput({ wireBody, headers: { "x-api-key": "rotation-old" } }));
+        assert.equal(timers.pendingCount(), 1);
+        noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": "rotation-new" } }));
+        assert.equal(keepaliveStatusFor(sid), undefined, "the old credential's snapshot is ineligible");
+        assert.equal(timers.pendingCount(), 0, "no callback should retain the dropped snapshot until its old cadence");
+    });
+}
+
+test("arm: repeated credential rotation cannot retain snapshots outside the concurrent cap", () => {
+    process.env.BILI_CACHE_KEEPALIVE_MAX_PINGS = "1";
+    for (let round = 0; round < 20; round++) {
+        noteSuccessfulForward(armInput({ wireBody: BODY_1H, headers: { "x-api-key": `old-${round}` } }));
+        noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": `new-${round}` } }));
+        assert.equal(keepaliveStatusFor(sid), undefined);
+    }
+    assert.equal(timers.pendingCount(), 0, "all unregistered snapshots release their timer-held references");
+});
+
+test("arm: dropping one rotated snapshot leaves another session's timer intact", () => {
+    const other = `${sid}-other`;
+    noteSuccessfulForward(armInput({ sessionId: other, wireBody: BODY_1H }));
+    const otherStatus = keepaliveStatusFor(other);
+    noteSuccessfulForward(armInput({ headers: { "x-api-key": "rotation-old" } }));
+    noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP, headers: { "x-api-key": "rotation-new" } }));
+    assert.equal(keepaliveStatusFor(sid), undefined);
+    assert.deepEqual(keepaliveStatusFor(other), otherStatus);
+    assert.equal(timers.pendingCount(), 1);
+});
+
+test("arm: unchanged credentials preserve the prior eligible snapshot when no new breakpoint exists", () => {
+    noteSuccessfulForward(armInput());
+    const previous = keepaliveStatusFor(sid);
+    noteSuccessfulForward(armInput({ wireBody: BODY_NO_BP }));
+    assert.deepEqual(keepaliveStatusFor(sid), previous);
+    assert.equal(timers.pendingCount(), 1);
+});
+
+test("arm: an eligible replacement after rotation keeps one live timer and sends the new credential", async () => {
+    noteSuccessfulForward(armInput({ wireBody: BODY_1H, headers: { "x-api-key": "rotation-old" } }));
+    noteSuccessfulForward(armInput({ headers: { "x-api-key": "rotation-new" } }));
+    assert.equal(timers.pendingCount(), 1);
+    assert.equal(keepaliveStatusFor(sid)?.tierLabel, "5m");
+    timers.advance(270_000);
+    await settle(() => keepaliveStatusFor(sid)?.pingCount === 1);
+    assert.equal(upstreamRequests.length, 1);
+    assert.equal(upstreamRequests[0].headers["x-api-key"], "rotation-new");
+    assert.equal(upstreamRequests[0].body, PING_5M);
+    assert.equal(timers.pendingCount(), 1);
+});

@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { maskHostInText, maskHostPortForDisplay, maskUrlForLog } from "./log-mask.js";
+import { maskHostInText, maskHostPortForDisplay, maskUrlForLog, maskIpsInText, maskUrlsInText, redactSecretsInText } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
@@ -214,6 +214,12 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined, options
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
+        // URL already canonicalizes the target's IPv6 spelling. Do the same
+        // for literal entries, including expanded and IPv4-embedded forms.
+        if (host.includes(":") && net.isIP(token) === 6) {
+            const literal = targetUrl(`http://[${token}]`);
+            if (literal) token = literal.hostname.slice(1, -1);
+        }
         if (options.windowsBypass && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
@@ -413,12 +419,14 @@ export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number
             factory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
             clientFactory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
         };
-        // #3776: trust the merged CA bundle for end-to-end TLS to the target through the tunnel.
+        // ProxyAgent builds separate connectors for the proxy and the tunneled
+        // target; its internal connector replaces a top-level connect option.
+        // Apply the configured merged trust to both TLS legs (#3776).
         const ca = upstreamExtraCa();
-        const withConnect = ca ? { ...base, connect: { ca } } : base;
+        const withTls = ca ? { ...base, requestTls: { ca }, proxyTls: { ca } } : base;
         agent = ka > 0
-            ? new ProxyAgent({ ...withConnect, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
-            : new ProxyAgent(withConnect);
+            ? new ProxyAgent({ ...withTls, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
+            : new ProxyAgent(withTls);
         dispatcherCache.set(key, agent);
     }
     return agent;
@@ -434,7 +442,9 @@ export function resetProxyCache(): void {
 
 function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
     if (proxy.protocol === "https:") {
-        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host });
+        const ca = upstreamExtraCa();
+        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host,
+            ...(ca ? { ca } : {}) });
     }
     return net.connect(proxy.port, proxy.host);
 }
@@ -486,15 +496,20 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
     return new Promise((resolve, reject) => {
         const socket = openProxySocket(proxy);
         let settled = false;
+        const closedBeforeHeaders = () => finishError(new Error(`upstream proxy CONNECT ${host}:${port} closed before response headers`));
         const finishError = (error: Error) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            socket.removeListener("end", closedBeforeHeaders);
+            socket.removeListener("close", closedBeforeHeaders);
             socket.destroy();
             reject(error);
         };
         const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), CONNECT_TIMEOUT_MS);
         socket.once("error", finishError);
+        socket.once("end", closedBeforeHeaders);
+        socket.once("close", closedBeforeHeaders);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
             const authority = `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
@@ -508,14 +523,18 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
             ];
             socket.write(headers.join("\r\n"));
             let buffer = Buffer.alloc(0);
-            const onData = (chunk: Buffer) => {
+            // Keep the socket out of flowing mode until its tunnel owner
+            // attaches a reader, including bytes following the HTTP headers.
+            const onReadable = () => {
+                const chunk: Buffer | null = socket.read();
+                if (chunk === null) return;
                 buffer = Buffer.concat([buffer, chunk]);
                 const end = buffer.indexOf("\r\n\r\n");
                 if (end < 0) {
                     if (buffer.length > 64 * 1024) finishError(new Error("upstream proxy CONNECT response header is too large"));
                     return;
                 }
-                socket.removeListener("data", onData);
+                socket.removeListener("readable", onReadable);
                 const head = buffer.subarray(0, end).toString("latin1");
                 const statusLine = head.split("\r\n", 1)[0] ?? "";
                 if (!/^HTTP\/1\.[01]\s+2\d\d(?:\s|$)/.test(statusLine)) {
@@ -525,11 +544,13 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
                 settled = true;
                 clearTimeout(timer);
                 socket.removeListener("error", finishError);
+                socket.removeListener("end", closedBeforeHeaders);
+                socket.removeListener("close", closedBeforeHeaders);
                 const rest = buffer.subarray(end + 4);
                 if (rest.length > 0) socket.unshift(rest);
                 resolve(socket);
             };
-            socket.on("data", onData);
+            socket.on("readable", onReadable);
         });
     });
 }
@@ -537,22 +558,33 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
 function errorChain(error: unknown): Array<Record<string, unknown>> {
     const chain: Array<Record<string, unknown>> = [];
     const seen = new Set<unknown>();
-    let current: unknown = error;
-    while (current && !seen.has(current)) {
+    // Bound both depth and visits so large or cyclic aggregates cannot flood diagnostics.
+    let remaining = 32;
+    let truncated = false;
+    const visit = (current: unknown, depth: number): void => {
+        if (remaining-- <= 0 || depth >= 8) { truncated = true; return; }
+        if (!current || seen.has(current)) return;
         seen.add(current);
         if (current instanceof Error) {
-            const record: Record<string, unknown> = { message: current.message };
+            const record: Record<string, unknown> = { message: String(current.message) };
             for (const key of ["code", "errno", "syscall", "address", "port"]) {
                 const value = (current as unknown as Record<string, unknown>)[key];
-                if (value !== undefined) record[key] = value;
+                if (typeof value === "string" || typeof value === "number") record[key] = value;
             }
             chain.push(record);
-            current = current.cause;
+            if (current.cause !== undefined) visit(current.cause, depth + 1);
+            if (current instanceof AggregateError && Array.isArray(current.errors)) {
+                for (const child of current.errors) {
+                    if (remaining <= 0) { truncated = true; break; }
+                    visit(child, depth + 1);
+                }
+            }
         } else {
             chain.push({ message: String(current) });
-            break;
         }
-    }
+    };
+    visit(error, 0);
+    if (truncated) chain.push({ message: "[error chain truncated]" });
     return chain;
 }
 
@@ -579,9 +611,9 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     try { targetHostPort = new URL(url).host; } catch { /* not a URL — no display host */ }
     const maskHostIn = (s: string): string => {
         try {
-            return maskHostInText(s, new URL(url).hostname);
-        } catch { /* not a URL — nothing to mask */ }
-        return s;
+            s = maskHostInText(s, new URL(url).hostname);
+        } catch { /* not a URL — no target host to mask */ }
+        return redactSecretsInText(maskUrlsInText(maskIpsInText(s)));
     };
     let codeValue: unknown;
     for (const field of fields) {
@@ -593,6 +625,12 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     }
     const messages = chain.map((entry) => maskHostIn(String(entry.message ?? ""))).filter(Boolean);
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
+    if (chain.length > 1) {
+        const causes = chain.slice(1).map((entry) => Object.fromEntries(
+            Object.entries(entry).map(([key, value]) => [key, typeof value === "string" ? maskHostIn(value) : value]),
+        ));
+        parts.push(`causes=${JSON.stringify(causes)}`);
+    }
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
     let hint = hintWithSkippedProxy(kind, skipped);

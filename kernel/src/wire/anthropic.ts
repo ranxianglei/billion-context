@@ -511,6 +511,85 @@ export function healAnthropicSystemPositions(
   return out;
 }
 
+/** Server-tool pairing backstop. Server-side tools (advisor, web_search,
+ *  code_execution, …) put BOTH halves of an exchange inside one assistant
+ *  message: a `server_tool_use` block and its `<name>_tool_result` block
+ *  (paired by `tool_use_id` → `id`). anthropicToCore splits every block into
+ *  its own BiliMessage (unknown types ride the rawAnthropicBlock sidecar), so
+ *  a fold can cover one half and leave the other. Anthropic then rejects the
+ *  WHOLE request, permanently, e.g.
+ *  'messages.5.content.0: unexpected tool_use_id found in advisor_tool_result
+ *  blocks: srvtoolu_… Each advisor_tool_result block must have a
+ *  corresponding server_tool_use block in the same message'.
+ *  Field repro: claude-code + advisor tool, bili v0.1.213 / acp-kernel 0.0.195.
+ *
+ *  Heal: per assistant message, drop a `*_tool_result` whose `tool_use_id`
+ *  has no `server_tool_use` in the same message, and a `server_tool_use`
+ *  without its result — except in the LAST message, where an open server
+ *  call is legal client state. Plain `tool_use`/`tool_result` are never
+ *  touched (their pairing spans user/assistant and has its own contract).
+ *  A message emptied by the heal gets a placeholder text block so roles stay
+ *  alternating. Legal messages are left as the same object (no churn for the
+ *  prefix cache); only messages that would 400 anyway are rewritten, so the
+ *  thinking-signature rule (KDD #10) never loses a request that would have
+ *  succeeded. Returns the number of dropped blocks. */
+function isServerToolResultBlock(b: { type?: unknown }): boolean {
+  return (
+    typeof b.type === "string" &&
+    b.type !== "tool_result" &&
+    b.type.endsWith("_tool_result")
+  );
+}
+
+const SERVER_TOOL_FOLDED_PLACEHOLDER = "(server tool exchange folded)";
+
+function healUnpairedServerToolBlocks(out: AnthropicWireMessage[]): number {
+  let dropped = 0;
+  for (let mi = 0; mi < out.length; mi++) {
+    const msg = out[mi]!;
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    const blocks = msg.content as unknown as Array<Record<string, unknown>>;
+    const uses = new Set<string>();
+    const results = new Set<string>();
+    for (const b of blocks) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "server_tool_use" && typeof b.id === "string")
+        uses.add(b.id);
+      else if (isServerToolResultBlock(b) && typeof b.tool_use_id === "string")
+        results.add(b.tool_use_id);
+    }
+    if (uses.size === 0 && results.size === 0) continue;
+    const isLast = mi === out.length - 1;
+    const kept = blocks.filter((b) => {
+      if (!b || typeof b !== "object") return true;
+      if (
+        b.type === "server_tool_use" &&
+        typeof b.id === "string" &&
+        !results.has(b.id) &&
+        !isLast
+      )
+        return false;
+      if (
+        isServerToolResultBlock(b) &&
+        typeof b.tool_use_id === "string" &&
+        !uses.has(b.tool_use_id)
+      )
+        return false;
+      return true;
+    });
+    if (kept.length === blocks.length) continue;
+    dropped += blocks.length - kept.length;
+    out[mi] = {
+      role: "assistant",
+      content:
+        kept.length > 0
+          ? (kept as unknown as AnthropicBlock[])
+          : [{ type: "text", text: SERVER_TOOL_FOLDED_PLACEHOLDER }],
+    };
+  }
+  return dropped;
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,
@@ -584,6 +663,7 @@ export function coreToAnthropic(
     }
   }
   flush();
+  healUnpairedServerToolBlocks(out);
   healIllegalSystemPositions(out);
   return out;
 }
