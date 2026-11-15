@@ -121,6 +121,51 @@ test("parseArgs: -i/-s misuse exits 2 with a pointed message (#5428)", () => {
     }
 });
 
+// #6804: `bili update [version]` (exact install), `bili pin [duration]`,
+// `bili unpin`, and the pin-only --clear flag.
+test("parseArgs: update takes an exact version; pin/unpin take a duration (#6804)", () => {
+    const upd = parseArgs(["update"]);
+    assert.equal(upd.command, "update");
+    assert.equal(upd.updateVersion, undefined, "bare update = the check + auto-install path");
+    const upv = parseArgs(["update", "0.1.215-pr.202.1"]);
+    assert.equal(upv.command, "update");
+    assert.equal(upv.updateVersion, "0.1.215-pr.202.1");
+    const pin = parseArgs(["pin", "1h"]);
+    assert.equal(pin.command, "pin");
+    assert.equal(pin.pinDuration, "1h");
+    const pinStatus = parseArgs(["pin"]);
+    assert.equal(pinStatus.command, "pin");
+    assert.equal(pinStatus.pinDuration, undefined, "no arg = show pin status");
+    const unpin = parseArgs(["unpin"]);
+    assert.equal(unpin.command, "unpin");
+    assert.equal(unpin.pinClear, false);
+    const pinClear = parseArgs(["pin", "--clear"]);
+    assert.equal(pinClear.command, "pin");
+    assert.equal(pinClear.pinClear, true);
+});
+
+test("parseArgs: --clear outside pin/unpin exits 2 (#6804)", () => {
+    const origExit = process.exit;
+    const origError = console.error;
+    let code: string | number | undefined;
+    let printed = "";
+    // biome-ignore lint/suspicious/noExplicitAny: test stub
+    (process as any).exit = ((c: number) => { code = c; throw new Error(`exit ${c}`); }) as any;
+    console.error = ((...args: unknown[]) => { printed += args.join(" ") + "\n"; }) as typeof console.error;
+    try {
+        parseArgs(["start", "--clear"]);
+        assert.fail("expected start --clear to exit 2");
+    } catch (err) {
+        assert.match(String(err), /exit 2/);
+        assert.equal(code, 2);
+        assert.match(printed, /--clear only applies to `bili pin`/);
+    } finally {
+        // biome-ignore lint/suspicious/noExplicitAny: test stub
+        (process as any).exit = origExit;
+        console.error = origError;
+    }
+});
+
 test("parseArgs+applyPosturePins: -s pins reach the launcher env the child inherits (#5491)", () => {
     const origPi = process.env.BILI_PI_INLINE;
     const origOc = process.env.BILI_OPENCODE_INLINE;
