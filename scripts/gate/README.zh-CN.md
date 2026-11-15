@@ -50,6 +50,12 @@ git 代理)、`gitProxy`、`npmRegistry`(构建依赖镜像;与容器内车道 r
 (`host` | `bridge`;bridge 是 Docker Desktop 形态——把配置里的 URL 指向
 `host.docker.internal`)、`outDir`、`keep`。
 
+并发:P(插件)车道与 R(重启)车道默认**并行**跑(各 agent 完全隔离——独立
+recorder 端口、XDG 目录、端口区间;共享上游能吃 ~6 路并发)。用宿主环境变量
+直接透传进容器来调:`GATE_CONCURRENT`(默认 `1`;置 `0` 回到旧的纯串行顺序——
+若并发下缓存恢复断言假红、需要「缓存完全独占」复核就用它)、`GATE_P_CONC`
+(默认 `4`,在途 P agent 数)、`GATE_R_CONC`(默认 `2`,在途 R agent 数)。
+
 所有产物落 `outDir`(挂载为 `/work`):`gate-local.log`(A/B/U)、
 `plugin-lanes.log`(+ `plugin-lanes/<agent>/…`)、`restart-lanes.log`、
 `docker-lanes.log`、`verdaccio.log`、`gate-scratch/`。启动器先构建镜像;构建
@@ -176,8 +182,8 @@ node scripts/gate/plugin-lanes.mjs
 ```
 
 - `GATE_AGENTS` 选车道子集;`GATE_TURN_TIMEOUT_MS`(默认 300000)、
-  `GATE_BIG/MID/SMALL_WINDOW`、`PLUGIN_LANES_WORK`(工件目录,默认
-  `./plugin-lanes/`)可调
+  `GATE_BIG/MID/SMALL_WINDOW`、`GATE_P_CONC`(在途 agent 上限,默认 4)、
+  `PLUGIN_LANES_WORK`(工件目录,默认 `./plugin-lanes/`)可调
 - dsh 车道:`GATE_DSH_VERSION`(每车道自装 `@deepseek-ai/dsh@<v>`,默认
   latest——系统 dsh 可能太旧且全局 billion-context 会遮蔽候选 bundle)、
   `GATE_OUTPUT_TOKENS`(输出预算:bili.json 预留 + dsh cordis maxTokens,

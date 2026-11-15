@@ -140,11 +140,21 @@ env \
   2>&1 | tee "$WORK/gate-local.log"
 RC_GATE=${PIPESTATUS[0]}
 
-# ---- 5.5 plugin lanes (Lane P) --------------------------------------------
-log "5.5 plugin lanes (real host CLIs through bili plugin mode)"
-RC_PLUGINS=0
+# ---- 5.5 + 5.7 plugin (P) + restart (R) lanes, concurrent ------------------
+# P and R are fully independent (per-lane recorder ports, XDG dirs, per-agent
+# port zones) and each of their agents is one model consumer at a time, so
+# the two lane groups run SIDE BY SIDE: their internal agent pools are capped
+# (GATE_P_CONC default 4 + GATE_R_CONC default 2 ≈ 6 concurrent consumers,
+# the shared upstream's comfortable headroom). Lane I/X (section 6) still
+# waits: its registry publishes must not race the lanes' update probes.
+# GATE_CONCURRENT=0 restores the legacy serial order — use it if you need
+# pristine cache isolation for measurement-sensitive assertions.
+log "5.5 plugin + 5.7 restart lanes (concurrent)"
+CONCURRENT=${GATE_CONCURRENT:-1}
+P_PID=""; R_PID=""
 if echo ",${SKIP}," | grep -q ",p,"; then
   sub "GATE_SKIP contains p — plugin lanes skipped"
+  RC_PLUGINS=0
 else
   # Prefer the candidate repo's OWN lane script when present (newer candidates
   # ship it — #3462); fall back to the bundled copy for older candidates
@@ -156,38 +166,52 @@ else
   done
   [ -n "$PL" ] || { echo "plugin-lanes.mjs not found"; exit 1; }
   echo "plugin-lanes: using $PL"
-  env \
-    TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK" \
-    MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY" \
-    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude}" \
-    GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}" \
-    GATE_OC2_BIN="${GATE_OC2_BIN:-}" \
-    GATE_OC1_BIN="${GATE_OC1_BIN:-}" \
-    node "$PL" 2>&1 | tee "$WORK/plugin-lanes.log"
-  RC_PLUGINS=${PIPESTATUS[0]}
+  P_ENV=(TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK"
+    MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY"
+    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude}"
+    GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}"
+    GATE_OC2_BIN="${GATE_OC2_BIN:-}" GATE_OC1_BIN="${GATE_OC1_BIN:-}")
+  if [ "$CONCURRENT" = "1" ]; then
+    ( env "${P_ENV[@]}" node "$PL" 2>&1 | tee "$WORK/plugin-lanes.log"
+      echo "${PIPESTATUS[0]}" > "$WORK/.rc-plugins" ) &
+    P_PID=$!
+  else
+    env "${P_ENV[@]}" node "$PL" 2>&1 | tee "$WORK/plugin-lanes.log"
+    RC_PLUGINS=${PIPESTATUS[0]}
+  fi
 fi
 
-# ---- 5.7 restart lanes (Lane R) --------------------------------------------
-# Repeated kill -15 / kill -9 / clean-shutdown of the SELF-SPAWNED bili proxy
-# inside a live folded session (dsh + pi vs the real model): fold state must
-# survive respawn, outbound stays capped, verbatim recall holds, cache hits
-# recover. Companion to CI-side PR billion-context#5635.
-log "5.7 restart lanes (repeated proxy kill/restart inside a live session)"
-RC_RESTART=0
 if echo ",${SKIP}," | grep -q ",r,"; then
   sub "GATE_SKIP contains r — restart lanes skipped"
+  RC_RESTART=0
 else
-  env \
-    TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK" \
-    MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY" \
-    GATE_AGENTS="${GATE_AGENTS_R:-${GATE_AGENTS:-dsh,pi}}" \
-    GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}" \
-    GATE_R_CORPUS_TOKENS="${GATE_R_CORPUS_TOKENS:-80000}" \
-    GATE_R_WINDOW="${GATE_R_WINDOW:-16384}" \
-    GATE_R_CAP_RATIO="${GATE_R_CAP_RATIO:-0.4}" \
-    GATE_R_CACHE_RATIO="${GATE_R_CACHE_RATIO:-0.5}" \
-    node /gate-tools/restart-lanes.mjs 2>&1 | tee "$WORK/restart-lanes.log"
-  RC_RESTART=${PIPESTATUS[0]}
+  R_ENV=(TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK"
+    MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY"
+    GATE_AGENTS="${GATE_AGENTS_R:-${GATE_AGENTS:-dsh,pi}}"
+    GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}"
+    GATE_R_CORPUS_TOKENS="${GATE_R_CORPUS_TOKENS:-80000}"
+    GATE_R_WINDOW="${GATE_R_WINDOW:-16384}"
+    GATE_R_CAP_RATIO="${GATE_R_CAP_RATIO:-0.4}"
+    GATE_R_CACHE_RATIO="${GATE_R_CACHE_RATIO:-0.5}")
+  if [ "$CONCURRENT" = "1" ]; then
+    ( env "${R_ENV[@]}" node /gate-tools/restart-lanes.mjs 2>&1 | tee "$WORK/restart-lanes.log"
+      echo "${PIPESTATUS[0]}" > "$WORK/.rc-restart" ) &
+    R_PID=$!
+  else
+    env "${R_ENV[@]}" node /gate-tools/restart-lanes.mjs 2>&1 | tee "$WORK/restart-lanes.log"
+    RC_RESTART=${PIPESTATUS[0]}
+  fi
+fi
+
+# Wait for whichever lane group(s) were launched in the background and pick up
+# their exit codes from the rc files (the subshell itself always exits 0).
+if [ -n "$P_PID" ]; then
+  wait "$P_PID"
+  if [ -f "$WORK/.rc-plugins" ]; then RC_PLUGINS=$(cat "$WORK/.rc-plugins"); else RC_PLUGINS=2; fi
+fi
+if [ -n "$R_PID" ]; then
+  wait "$R_PID"
+  if [ -f "$WORK/.rc-restart" ]; then RC_RESTART=$(cat "$WORK/.rc-restart"); else RC_RESTART=2; fi
 fi
 
 # ---- 6. container-only lanes ---------------------------------------------------

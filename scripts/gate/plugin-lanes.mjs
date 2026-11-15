@@ -102,9 +102,10 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
-// Recorder spawned for the in-flight lane; killed from main()'s catch when a
-// lane aborts before its own teardown (2026-11-14 leak fix).
-let activeRec = null;
+// Recorders spawned for in-flight lanes (lane -> handle), killed from
+// main()'s catch when a lane aborts before its own teardown (2026-11-14
+// leak fix). A Map because lanes run concurrently (2026-11-15 parallel gate).
+const activeRec = new Map();
 // #3475: lanes whose upstream lacks the protocol door — degraded verdict,
 // excluded from the failure tally (see runLane's env-blocked rule).
 const BLOCKED = new Map(); // lane -> { kind: "env" | "client", reason }
@@ -291,7 +292,7 @@ async function runLane(agent, recipe) {
     stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
     detached: true,
   });
-  activeRec = rec;
+  activeRec.set(agent, rec);
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -647,7 +648,7 @@ async function runLane(agent, recipe) {
   ctx.killInstances();
   if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} }
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
-  activeRec = null;
+  activeRec.delete(agent);
 }
 
 async function startManualProxy(ctx, args) {
@@ -1098,12 +1099,28 @@ async function main() {
     console.log("plugin-lanes: skipped (GATE_SKIP=p)");
     process.exit(0);
   }
-  for (const agent of AGENTS) {
-    const recipe = RECIPES[agent];
-    if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
-    console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
-    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); try { if (activeRec) process.kill(-activeRec.pid, "SIGKILL"); } catch {} activeRec = null; }
+  // Lanes are fully independent (own recorder port, XDG dirs, per-agent
+  // BILI_ZONE_PORT ladder) and each agent is one model consumer at a time,
+  // so they run concurrently to cut wall time. In-flight count is capped by
+  // GATE_P_CONC (default 4) — combined with restart-lanes' default 2 that
+  // keeps total concurrent consumers within the shared upstream's headroom.
+  const PAR = Math.max(1, parseInt(process.env.GATE_P_CONC || "4", 10));
+  const laneQueue = [...AGENTS];
+  async function laneWorker() {
+    while (laneQueue.length > 0) {
+      const agent = laneQueue.shift();
+      const recipe = RECIPES[agent];
+      if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
+      console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
+      try { await runLane(agent, recipe); } catch (e) {
+        record(agent, "lane", false, String(e).slice(0, 400));
+        const r = activeRec.get(agent);
+        try { if (r) process.kill(-r.pid, "SIGKILL"); } catch {}
+        activeRec.delete(agent);
+      }
+    }
   }
+  await Promise.all(Array.from({ length: Math.min(PAR, laneQueue.length) }, () => laneWorker()));
   // #3475: env-blocked lanes (upstream lacks the protocol door) keep their
   // degraded verdict — FAIL records from turn-dependent assertions are honest
   // output but excluded from the gate tally, mirroring the opencode2/#3461 rule.
