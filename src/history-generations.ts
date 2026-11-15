@@ -361,7 +361,7 @@ export function historyNavNote(session: Session, generations?: readonly HistoryG
     const tail = index.slice(-NAV_LIMIT);
     const lines = tail.map((gen) => {
         const when = new Date(gen.at).toISOString().slice(0, 10);
-        const span = gen.maxRefIndex > 0 ? `refs m00001–${indexToRef(gen.maxRefIndex)}` : "no message refs";
+        const span = gen.maxRefIndex > 0 ? `refs ${gen.firstRef ?? "m00001"}–${indexToRef(gen.maxRefIndex)}` : "no message refs";
         return `- generation ${gen.generation} — ${when} — ${gen.blockCount} block(s), ${gen.messageCount} message(s), ${span} — closed by ${gen.cause}`;
     });
     const omitted = index.length - tail.length;
