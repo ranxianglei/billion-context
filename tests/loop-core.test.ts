@@ -4,6 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
 import type { WireProtocol } from "../src/util.ts";
@@ -409,6 +410,28 @@ for (const completion of ["text", "tool"] as const) {
         });
     }
 }
+
+test("#6329: OpenAI cache-field omission means zero cached tokens, not unmeasured", async () => {
+    const ctx = makeCtx([], "openai");
+    const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+    const raw = [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hello" } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 10, total_tokens: 1010 } })}\n\n`,
+        "data: [DONE]\n\n",
+    ].join("");
+    for await (const _chunk of runCompressLoop(
+        new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+        createOpenaiAdapter(body), buildCompressSystemPrompt(),
+    )) {}
+    assert.equal(ctx.session.stats.inputTokens, 1000);
+    assert.equal(ctx.session.stats.cachedTokens, 0);
+    assert.equal(ctx.session.stats.cacheSamples, 1);
+    const report = buildSessionCacheReport(ctx.session);
+    assert.equal(report.unmeasured.samples, 0);
+    assert.equal(report.unmeasured.inputTokens, 0);
+    assert.equal(report.totals.input, 1000);
+    assert.equal(report.totals.cached, 0);
+});
 
 test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
     const ctx = makeCtx();
