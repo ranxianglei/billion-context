@@ -83,18 +83,20 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-//      - v12: snapshot-table compression foundation (#5874 P0) — four
-//        ADDITIVE tables + one index (l1_world / snap_rows / snap_log /
-//        snap_ckpt). No backfill, no rewrite of existing rows: the plane is
-//        dormant until storage.snapBase.enabled turns it on, and rollback is
-//        DROP the four tables + index and rewind user_version — T1 pins the
-//        byte-identical behavior in both directions. Additive-only: an
-//        older build opening a v12 file ignores the extra tables.
+//      - v12: snapshot foundation v2 (#5874 P0, pure-incremental redesign
+//        after the owner ruling) — ONE additive table (l1_world, the
+//        stage-0 identity ledger; the original four-table plane was retired
+//        before merge — see docs/proposals/snapshot-compression-foundation).
+//        No backfill, dormant until storage.snapBase.enabled turns it on,
+//        rollback is DROP the table + index and rewind user_version. The two
+//        later tables of the v2 skeleton (fold_journal, egress_snapshot) land
+//        additive on top in follow-up steps, same discipline. Additive-only:
+//        an older build opening a v12 file ignores the extra table.
 //        Applied PROBE-FIRST (table-existence check), NOT version-gated:
 //        the unmerged fastpath re-land (#5855) numbers its two table groups
 //        v12/v13 and landed them into a SHARED database first (field,
-//        2026-11-08: user_version 13 + pf_* present, snap tables absent →
-//        the plane died with "no such table: l1_world"). The probe makes
+//        2026-11-08: user_version 13 + pf_* present, l1_world absent →
+//        stage-0 died with "no such table: l1_world"). The probe makes
 //        both merge orderings coexist; whichever branch lands second in
 //        master still renumbers its constant mechanically (hygiene only —
 //        the DDL shapes are independent).
@@ -326,41 +328,29 @@ CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_h
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
-/** #5874 snapshot-table compression foundation (P0, v12) — four additive
- *  tables + one index, created here so fresh installs and in-place upgrades
- *  converge on the same shape. The plane is DORMANT unless the
- *  storage.snapBase config surface turns it on: with the flag off these
- *  tables stay empty forever, and rollback is DROP + user_version rewind
- *  (no data migration exists in either direction — pure additivity, T1).
+/** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
+ *  one additive table for the stage-0 identity ledger. The original four-table
+ *  plane (snap_rows/snap_log/snap_ckpt, #5874 v1) was RETIRED before merge in
+ *  favor of the pure-incremental skeleton: the per-position materialized state
+ *  is re-derived from the append-only substrate (messages × blocks × refs ×
+ *  fold journal) instead of being stored as its own updatable table. This DDL
+ *  stays ADDITIVE + probe-first exactly as the plane's did (T1): fresh
+ *  installs and in-place upgrades converge on the same shape, rollback is
+ *  DROP + user_version rewind, and a sibling branch that consumed a version
+ *  number after v11 (real-world 2026-11-08: #5855 landed the pf_* planes)
+ *  coexists without renumbering.
  *
  *  l1_world: stage-0 identity ledger — the raw host session id (sess_raw)
  *  maps to the proxy's ledger identity (ledger_id = sessions.session_id).
  *  witness_probe is the sampled id fingerprint the arm decision was based on
  *  (composite-probe evidence). issued_at precedes armed_at until one full
  *  echo round validates the mapping (the "one round of arming" the proposal
- *  charges for a fresh identity).
- *
- *  snap_rows: the materialized snapshot projection — one row per ledger
- *  position (pos = messages.seq for the same session). core_ids is the JSON
- *  array of host message ids bound to the position; pre_json / post_json
- *  carry the canonical core shape (NEVER wire bytes — invariant v); an
- *  active=0 row is folded/tombstoned but NEVER physically deleted by events
- *  (invariant iv — physical cleanup waits for the covering block's archive,
- *  snapGcCoveredRows). cover_ref names the covering block for folded rows.
- *
- *  snap_log: the append-only event stream. seq is strictly monotonic per
- *  session and always > max(log max, ckpt_seq) (invariant ii — enforced by
- *  the commit primitive, snap.ts). payload carries the applied event, the
- *  per-row S4 checksums of the touched rows, and the post-apply aggregate
- *  checksum over ALL rows (R1's verification anchor). Entries fold into
- *  snap_ckpt and are truncated at fold time — bounded depth (T9).
- *
- *  snap_ckpt: the fold point. ckpt_seq = the last log seq absorbed into the
- *  rows; checksum = the S4 aggregate over ALL rows at fold time — the read
- *  side re-derives it and any mismatch kills the plane for the sid (R1);
- *  meta_json is the three-piece set (kernel state verbatim, coverage
- *  mapping, folded at fold time). */
-const SNAPBASE_DDL_V12 = `-- #5874 snapshot-table compression foundation (P0, v12).
+ *  charges for a fresh identity). envelope_json/envelope_checksum carry the
+ *  per-element msgid ENVELOPE ({id, pos} canon, #6181 §4.0) — the committed
+ *  element-level world M2 delta inbound (src/snapshot/identity.ts matchWorld)
+ *  reads/writes; the R3 breaker latch (r3_latched_at, #6181 M3) persists so a
+ *  proxy restart does not re-arm a misbehaving host's envelope. */
+const SNAPBASE_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
 CREATE TABLE IF NOT EXISTS l1_world (
     sess_raw       TEXT PRIMARY KEY,
     ledger_id      TEXT NOT NULL,
@@ -372,33 +362,6 @@ CREATE TABLE IF NOT EXISTS l1_world (
     r3_latched_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
-CREATE TABLE IF NOT EXISTS snap_rows (
-    sid          TEXT NOT NULL,
-    pos          INTEGER NOT NULL,
-    core_ids     TEXT NOT NULL,
-    pre_json     TEXT,
-    post_json    TEXT,
-    tokens_est   INTEGER NOT NULL DEFAULT 0,
-    active       INTEGER NOT NULL DEFAULT 1,
-    cover_ref    TEXT,
-    updated_at   INTEGER NOT NULL,
-    PRIMARY KEY (sid, pos)
-);
-CREATE TABLE IF NOT EXISTS snap_log (
-    sid        TEXT NOT NULL,
-    seq        INTEGER NOT NULL,
-    kind       TEXT NOT NULL,
-    payload    TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (sid, seq)
-);
-CREATE TABLE IF NOT EXISTS snap_ckpt (
-    sid        TEXT PRIMARY KEY,
-    ckpt_seq   INTEGER NOT NULL,
-    meta_json  TEXT NOT NULL DEFAULT '{}',
-    checksum   TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -420,10 +383,10 @@ export function migrateSchema(db: {
     // table itself (the discipline v2/v5/v6/v8 already use) makes both
     // merge orderings coexist without renumbering — the final master
     // version number stays a mechanical merge-time hygiene step.
-    const hasSnapRows = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'snap_rows'")
+    const hasL1World = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
-    if (!hasSnapRows) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
+    if (!hasL1World) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev

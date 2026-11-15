@@ -20,7 +20,6 @@ import {
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
-    fileSnapBase,
     fileStorageJsonWriter,
     fileStorageArchiveAfterDays,
     fileStorageWalJournalSizeLimit,
@@ -717,7 +716,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -2452,33 +2451,8 @@ export class SessionStore {
         }
     }
 
-    /** #5874: snapshot-plane status for /__bili/status. Null when the
-     *  unified store is unavailable (legacy-only lanes) — the status wire
-     *  then reports the flags with zeroed counters. */
-    snapplaneStatus(): import("./storage/snap.js").SnapPlaneStatusWire | null {
-        if (!this.replicasAvailable()) return null;
-        try {
-            return this.liveShadow().snapplaneStatus();
-        } catch {
-            return null; // sidecar degraded mid-call
-        }
-    }
-
-    /** #5874 P2 (mapEgress): the S4-verified plane view for egress assembly.
-     *  null when the unified store is unavailable or the sid has no plane
-     *  yet — callers keep the legacy egress bytes. */
-    snapEgressView(sessionId: string): import("./storage/snap.js").SnapView | null {
-        if (!this.replicasAvailable()) return null;
-        try {
-            return this.liveShadow().snapEgressView(sessionId);
-        } catch {
-            return null; // sidecar degraded mid-call — degrade, never fail the turn
-        }
-    }
-
     // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
-    // R3 reject to a hard 400 and any other fault to the legacy full path) —
-    // the egress-view swallow above must not be copied here.
+    // R3 reject to a hard 400 and any other fault to the legacy full path).
 
     /** Stage 0 (element world match) for one turn. null when the unified
      *  store is unavailable — the lane keeps the legacy path. */
@@ -2487,21 +2461,7 @@ export class SessionStore {
         return this.liveShadow().snapStage0(sessionId, incoming, opts);
     }
 
-    /** The plane's ACTIVE cores, pos-ordered (the "old cores from the
-     *  table" half of the kernel-input assembly). */
-    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
-        if (!this.replicasAvailable()) return null;
-        return this.liveShadow().snapStage0Cores(sessionId);
-    }
-
-    /** #6181 round 2, Residual 2 hardening: the plane's max ACTIVE pos
-     *  (-1 when empty) — see UnifiedStore.snapPlaneMaxPos. */
-    snapPlaneMaxPos(sessionId: string): number {
-        if (!this.replicasAvailable()) return -1;
-        return this.liveShadow().snapPlaneMaxPos(sessionId);
-    }
-
-    /** The stage-0 resync (R4 / table behind): reset the session plane so
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
      *  the next turn re-issues from the client's current array. */
     snapStage0Reset(sessionId: string): void {
         if (!this.replicasAvailable()) return;
@@ -3126,11 +3086,7 @@ export class SessionStore {
                 this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                     tail && tail.length > 0
                         ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined,
-                    // #5874 mapEgress: the kernel's tagged turn view rides the
-                    // save live (the envelope record never serializes it) so
-                    // the snapshot plane persists the tagged forms.
-                    session.lastPlaneMessages);
+                        : undefined, session.contentStore ?? undefined);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3917,7 +3873,7 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):

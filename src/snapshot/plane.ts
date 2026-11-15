@@ -1,10 +1,10 @@
 /**
  * #5874 / 2×2 — stage 0 (identity / world match) decision glue.
  *
- * Sits at the head of the six-stage chain (raw bytes → **stage 0** → protocol
- * conversion → kernel → plane write → egress). It runs the pure `matchWorld`
+ * Sits at the head of the chain (raw bytes → **stage 0** → protocol
+ * conversion → kernel → egress). It runs the pure `matchWorld`
  * (identity.ts) on the l1_world element envelope and carries the R3 identity
- * fault policy (brief 19544722 red gate R3):
+ * fault policy (red gate R3):
  *
  *   - a cohort host that DECLARED the dual-channel (per-element msgids) but
  *     did not collect them all → the request is HARD-REJECTED (400) BEFORE
@@ -13,18 +13,20 @@
  *     keeps rejecting until an operator clears it).
  *
  * The decision itself is pure (identity.ts); this module adds the storage
- * glue (read the stored envelope, build the fold-explained-gone set from the
- * full row set, persist the new canon) — and ONLY for non-diverge verdicts
- * (a diverge turn has zero side effects by construction).
+ * glue (read the stored envelope, persist the new canon) — and ONLY for
+ * non-diverge verdicts (a diverge turn has zero side effects by
+ * construction). The gone-set and the ledger frontier are COMPUTED by the
+ * store (messages × blocks coverage, max live seq) and passed in: the pure
+ * core never touches a table (pure-incremental redesign: there is no
+ * per-row plane to read).
  */
 import { matchAppend, matchWorld, parseEnvelope } from "./identity.ts";
-import { snapL1EnvelopeRead, snapL1EnvelopeUpsert, snapL1Lookup, snapRowsAll } from "../storage/snap.ts";
+import { snapL1EnvelopeRead, snapL1EnvelopeUpsert, snapL1Lookup } from "../storage/snap.ts";
 import type { DbLike } from "../storage/snap.ts";
 import type { WorldDecision } from "./types.ts";
 
 /** R3 identity fault — the lane rejects the request with HTTP 400 and takes
- *  NO side effect (no plane event, no kernel run, no session ext write other
- *  than the breaker counter). */
+ *  NO side effect (no ledger write beyond the R1 mapping, no kernel run). */
 export class FoundationRejectError extends Error {
     readonly status = 400;
     constructor(public readonly reason: string) {
@@ -35,9 +37,9 @@ export class FoundationRejectError extends Error {
 
 /** R3 breaker: a per-process fault window (10 minutes) with a strike cap
  *  (3). On the third strike within the window the sid gets a PERSISTENT
- *  latch (the caller persists it, e.g. session_ext) and every subsequent
- *  R3 fault for that sid rejects immediately without re-counting. Mirrors
- *  the incremental-lane breaker discipline (the brief's R3 reference). */
+ *  latch (the caller persists it) and every subsequent R3 fault for that
+ *  sid rejects immediately without re-counting. Mirrors the
+ *  incremental-lane breaker discipline (the R3 reference). */
 export class R3FaultTracker {
     private readonly faults = new Map<string, { count: number; firstAt: number }>();
     private readonly latched = new Set<string>();
@@ -85,6 +87,12 @@ export const r3FaultTracker = new R3FaultTracker();
  *  @param ledgerId      the bili canonical ledger identity (the sid).
  *  @param incoming      the per-element msgids in host order.
  *  @param resync        true for an explicit re-baseline (mode switch).
+ *  @param maxSeq        the ledger frontier: the max live stamped seq
+ *                       (store-computed; 0 for an empty ledger). The M2
+ *                       contiguity evidence anchors on it.
+ *  @param explainedGone the ids that legally vanished from the envelope
+ *                       head — stored messages covered by a live fold
+ *                       block (store-computed from messages × blocks).
  *  @param now           clock (injectable for tests).
  */
 interface Stage0Input {
@@ -94,13 +102,15 @@ interface Stage0Input {
     incoming: string[];
     /** The `biliLedgerSeqs` carrier (M2 position locating, #4316 layer-3
      *  transport). When it is contiguous and starts exactly after the
-     *  plane's max stamped seq, an ALL-UNKNOWN incoming is a pure M2
-     *  append (matchAppend); without it, an all-unknown incoming is
+     *  ledger frontier, an ALL-UNKNOWN incoming is a pure M2 append
+     *  (matchAppend); without it, an all-unknown incoming is
      *  treated as a full (possibly re-minted) envelope → the normal
      *  matchWorld verdict (usually diverge → resync, one-round
      *  convergence). */
     seqs?: number[] | null;
     resync?: boolean;
+    maxSeq: number;
+    explainedGone: Set<string>;
     now?: number;
 }
 
@@ -108,39 +118,29 @@ export interface Stage0Result {
     /** The pure world-match verdict (identity.ts). */
     decision: WorldDecision;
     /** True when the verdict is `diverge` — the caller runs this turn on the
-     *  legacy path with ZERO plane side effects (the canon is untouched; the
-     *  client converges one turn later). */
+     *  legacy path with ZERO identity side effects (the canon is untouched;
+     *  the client converges one turn later). */
     diverge: boolean;
-    /** The fold-explained gone set (stored ids whose row is inactive with a
-     *  coverRef) — exposed for the reconcile (delete events) and tests. */
+    /** The fold-explained gone set — exposed for the reconcile and tests. */
     explainedGone: Set<string>;
 }
 
-/** Run stage 0: read the stored element envelope + the full row set, match
- *  the incoming ids, and (for every verdict except `diverge`) persist the
- *  new canon. A `diverge` turn writes NOTHING (zero side effects).
+/** Run stage 0: read the stored element envelope, match the incoming ids
+ *  against it (with the store-computed gone set + frontier), and (for every
+ *  verdict except `diverge`) persist the new canon. A `diverge` turn writes
+ *  NOTHING (zero side effects).
  *
- *  The pos values the verdict issues are the LOGICAL append-only ledger
- *  positions (maxPos+1..); the physical snap_rows pos (ledger seq) is
- *  assigned by the ingest path in the same incoming order, so the two agree
- *  for tail-appends. For scatter (middle insertion) the reconcile re-homes
- *  the new rows to their envelope pos in the same transaction. */
+ *  The pos values the verdict issues are the LOGICAL append-only envelope
+ *  positions (maxPos+1..); the physical ledger seq is assigned by the
+ *  ingest in the same incoming order, so the two agree for tail-appends.
+ *  For scatter (middle insertion) the ingest re-homes in the same
+ *  transaction. */
 export function stage0Decide(input: Stage0Input): Stage0Result {
     const now = input.now ?? Date.now();
     const l1 = snapL1Lookup(input.db, input.sessRaw);
     const env = snapL1EnvelopeRead(input.db, input.sessRaw);
-
-    // Fold-explained gone: a stored id may legally vanish from the envelope
-    // head when its row was deactivated by a fold (coverRef set). Read the
-    // FULL row set (active + inactive) — the egress-side view filters the
-    // inactive rows out and would under-explain.
-    const rows = snapRowsAll(input.db, input.ledgerId);
-    const explainedGone = new Set<string>();
-    for (const r of rows) {
-        if (r.active === 0 && r.coverRef !== null) {
-            for (const id of r.coreIds) explainedGone.add(id);
-        }
-    }
+    const explainedGone = input.explainedGone;
+    const planeMaxSeq = input.maxSeq;
 
     const stored =
         l1 && env && env.envelopeJson !== null && env.envelopeChecksum !== null
@@ -153,33 +153,17 @@ export function stage0Decide(input: Stage0Input): Stage0Result {
               }
             : null;
 
-    // M2 pure append (brief 19544722): the client sent ONLY new elements —
-    // every incoming id is unknown to the canon — and the seqs carrier says
-    // they land as a contiguous run starting exactly after the plane's max
-    // stamped seq. That is the 世界匹配定位序列位置 evidence: issue append-
-    // only pos (maxPos+1..) without any head/order risk. Anything less
-    // certain (missing seqs, a gap, a known id mixed in) falls through to
-    // matchWorld — an all-unknown full array there is usually a re-mint and
-    // diverges → resync, one-round convergence. Never guess.
     let decision: WorldDecision;
     const seqs = input.seqs ?? null;
     const storedSet = stored !== null ? new Set(stored.envelope.map((e) => e.id)) : null;
-    // The plane's max stamped seq: rows are stamped ledgerSeq = pos+1
-    // (the D-lane contract, snapshot-render.ts:154), so the frontier is
-    // derivable from the row pos alone — no post_json parse.
-    let planeMaxSeq = 0;
-    for (const r of rows) {
-        if (r.active === 1 && r.pos + 1 > planeMaxSeq) planeMaxSeq = r.pos + 1;
-    }
     // Review-round-2 Residual 1b: the host re-sent a body this proxy already
     // processed — every id is already in the stored canon and the carrier
-    // seqs (when present) sit at/below the plane frontier (the original
+    // seqs (when present) sit at/below the ledger frontier (the original
     // turn's in-request flush stamped them before its response left). Zero
-    // side effects: the canon is kept as-is, the lane re-assembles the SAME
-    // world (an idempotent kernel round), and the egress no-op
-    // classification keeps the chain id and skips the developer message.
-    // Without this guard the M2 retry ([m5] vs head m1) would headMove →
-    // diverge → snapStage0Reset: a harmless retry would WIPE the plane.
+    // side effects: the canon is kept as-is, the lane re-renders the SAME
+    // world (an idempotent kernel round). Without this guard the M2 retry
+    // ([m5] vs head m1) would headMove → diverge → envelope reset: a
+    // harmless retry would WIPE the identity canon.
     if (
         stored !== null &&
         storedSet !== null &&
@@ -199,14 +183,15 @@ export function stage0Decide(input: Stage0Input): Stage0Result {
             witness: `replay: all ${input.incoming.length} ids known (maxSeq ${seqs ? Math.max(...seqs) : "-"} <= frontier ${planeMaxSeq})`,
         };
     } else {
-        // M2 pure append (brief 19544722): the client sent ONLY new elements —
-        // every incoming id is unknown to the canon — and the seqs carrier says
-        // they land as a contiguous run starting exactly after the plane's max
-        // stamped seq. That is the 世界匹配定位序列位置 evidence: issue append-
-        // only pos (maxPos+1..) without any head/order risk. Anything less
-        // certain (missing seqs, a gap, a known id mixed in) falls through to
-        // matchWorld — an all-unknown full array there is usually a re-mint and
-        // diverges → resync, one-round convergence. Never guess.
+        // M2 pure append: the client sent ONLY new elements — every
+        // incoming id is unknown to the canon — and the seqs carrier says
+        // they land as a contiguous run starting exactly after the ledger
+        // frontier. That is the 世界匹配定位序列位置 evidence: issue
+        // append-only pos (maxPos+1..) without any head/order risk.
+        // Anything less certain (missing seqs, a gap, a known id mixed in)
+        // falls through to matchWorld — an all-unknown full array there is
+        // usually a re-mint and diverges → resync, one-round convergence.
+        // Never guess.
         const m2Candidate =
             stored !== null &&
             !input.resync &&
@@ -278,7 +263,7 @@ export function checkR3Identity(
     elementCount: number,
     msgids: string[] | null | undefined,
 ): boolean {
-    if (!declared) return true; // non-cohort: sticky order>hash degrade, same tables
+    if (!declared) return true; // non-cohort: sticky order>hash degrade
     if (elementCount === 0) return true;
     if (!msgids || msgids.length !== elementCount) return false;
     return true;

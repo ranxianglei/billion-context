@@ -16,7 +16,6 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
-import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -229,7 +228,7 @@ export async function prepareOpenai(
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = s0.kernelInput ?? maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
 
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
@@ -351,25 +350,13 @@ export async function prepareOpenai(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
-        // #5874 mapEgress (owner ruling 2026-11-11): the plane persists the
-        // kernel's OWN tagged processTurn output (invariant v: post_json is
-        // the post-rewrite core form, never wire bytes). Deep-copy — the lane
-        // mutates turn.messages in place later (absorb view, subagent attach)
-        // and the egress transform re-applies exactly those passes, so the
-        // stored rows must stay the pre-mutation bytes. The anchor rows ride
-        // the copy too: they are processTurn output.
-        session.lastPlaneMessages = JSON.parse(JSON.stringify(turn.messages));
-        // #5874 P2-final: snapshot application (in-request) — the canonical
-        // transcript up to THIS user message plus the kernel's post-fold state
-        // must be on the snapshot plane before the egress stage reads it
-        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
-        // rewrite → egress). snapshotMessages first: the persist build reads
-        // session.lastMessages — and it stays the RAW client resend (never
-        // the D-lane view: its synthetic acp_summary anchor is not a
-        // transcript message). The plane rows have a separate source:
-        // session.lastPlaneMessages above (the kernel's tagged output).
-        // Never fatal — a failed flush leaves the round on the legacy egress
-        // path. The watermark window pin is preserved.
+        // In-request ledger flush: the transcript up to THIS user message is
+        // durable before the model call (#3397 durability-before-render) and
+        // the stage-0 envelope / M2 evidence read a current ledger.
+        // snapshotMessages first: the persist build reads session.lastMessages
+        // — and it stays the RAW client resend (never the D-lane view: its
+        // synthetic acp_summary anchor is not a transcript message). The
+        // watermark window pin is preserved.
         snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
         snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -444,23 +431,6 @@ export async function prepareOpenai(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
-        // #5874 P2 (mapEgress): when the S4-verified snap plane can assemble
-        // the same view, it is the DIRECT outbound authority (owner ruling
-        // 2026-11-11: no per-round diff — byte-identity is by construction);
-        // a plane gap degrades to these legacy bytes for one round.
-        processedMessages = applySnapEgress(turn.state, processedMessages, {
-            sessionId,
-            protocol: "openai",
-            log,
-            isCompressTool: loopConfig.isCompressTool,
-            // The in-request flush above is the ONLY plane write for this
-            // turn — a failed one leaves the plane one turn stale, and
-            // serving it would drop this round's newest input (degrade to
-            // the legacy bytes; the same turn's legacy save still lands via
-            // the markDirty fallback below).
-            ...(snapFlush && !snapFlush.ok ? { bypass: true } : {}),
-            transform: (m) => applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId),
-        });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
