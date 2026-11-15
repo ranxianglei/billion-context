@@ -257,6 +257,10 @@ test("#5460 P1: SessionStore.closeQuietly releases the perf.sqlite handle it arm
     // issue3769/issue4241/issue4732 tests).
     const { SessionStore } = await import("../src/persist.js");
     resetModule();
+    const savedUnified = process.env.BILI_STORAGE_UNIFIED;
+    const savedKey = process.env.BILI_ENCRYPTION_KEY;
+    delete process.env.BILI_ENCRYPTION_KEY;
+    delete process.env.BILI_STORAGE_UNIFIED;
     const dir = sandbox();
     try {
         const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
@@ -265,7 +269,11 @@ test("#5460 P1: SessionStore.closeQuietly releases the perf.sqlite handle it arm
         store.closeQuietly();
         assert.equal(perfBoundDir(), null, "closeQuietly released the binding");
         assert.equal(perfTelemetryReleaseIfBound(dir), false, "no double release");
-    } finally { perfStopAll(); }
+    } finally {
+        if (savedUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = savedUnified;
+        if (savedKey === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = savedKey;
+        perfStopAll();
+    }
 });
 
 after(() => { for (const d of SANDBOXES.splice(0)) rmSync(d, { recursive: true, force: true }); });
