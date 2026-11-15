@@ -1239,6 +1239,34 @@ _ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
                     "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
 # Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
 _LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+# Non-model hosts the MITM lane cannot serve (#6862): the code/dependency hosts the host's
+# git/uv/npm children reach. The lane allowlists model endpoints only, so a scheduled
+# `hermes update` or shell task that inherits the routed env fails against these with
+# "Failed to connect ... via 127.0.0.1". They bypass the lane by default; the operator's own
+# NO_PROXY entries are merged in below, never replaced.
+_DEFAULT_NO_PROXY_HOSTS = (
+    "github.com", "api.github.com", "objects.githubusercontent.com", "codeload.github.com",
+    "pypi.org", "files.pythonhosted.org", "registry.npmjs.org",
+)
+
+
+def _merged_no_proxy(*existing: Optional[str]) -> str:
+    """Union of the loopback default, the #6862 default bypass hosts, and the operator's
+    NO_PROXY entries — comma-joined, deduped (hostnames compare case-insensitively),
+    first-seen order kept. Idempotent: merging an already-merged value changes nothing."""
+    seen: set = set()
+    merged: List[str] = []
+    for source in (_LOOPBACK_NO_PROXY, *_DEFAULT_NO_PROXY_HOSTS, *(e or "" for e in existing)):
+        for part in source.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return ",".join(merged)
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1263,8 +1291,13 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
         # the session gets no compression. The proxy forwards absolute-form http requests.
         os.environ["HTTP_PROXY"] = origin
         os.environ["http_proxy"] = origin
-        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
-        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
+        # #6862: the routed env is inherited by every child the host spawns, and the lane
+        # allowlists model endpoints only — git/uv/npm children would route code/dependency
+        # hosts through it and fail. Merge the default bypass hosts (plus the operator's own
+        # NO_PROXY, when set) instead of setdefault-ing a loopback-only value.
+        merged_no_proxy = _merged_no_proxy(os.environ.get("NO_PROXY"), os.environ.get("no_proxy"))
+        os.environ["NO_PROXY"] = merged_no_proxy
+        os.environ["no_proxy"] = merged_no_proxy
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
