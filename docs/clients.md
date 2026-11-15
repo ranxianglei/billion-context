@@ -986,6 +986,27 @@ healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
 entirely (the launcher owns the proxy).
 
+### Built-in Claude Agent provider (2.x)
+
+OpenCode 2.x ships a built-in **Claude Agent** provider (`claude-agent/*`) that drives a local Claude Code CLI. That child calls Anthropic directly — it makes no request *from* OpenCode — so the plugin's HTTP-hook routing never sees its traffic and its sessions would otherwise run uncompressed. On a 2.x host, `bili plugin install opencode` routes it by writing `providers.claude-agent.settings.baseURL` in your opencode config, pinned to the live opencode lane port:
+
+```json
+{
+  "providers": {
+    "claude-agent": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:<port>/bili/https://api.anthropic.com"
+      }
+    }
+  }
+}
+```
+
+- **Existing installs** — re-run `bili plugin install opencode`; the entry is written at install time, so a pre-existing config is not retro-routed.
+- **Port drift** — if the opencode lane port changes, the pinned URL goes stale; `bili doctor` warns on the opencode lane and a re-run re-pins it.
+- **Your own proxy** — a non-bili `baseURL` is left untouched (it's yours, not ours to clobber).
+- **Known limitation** — compression works, but the `mcp__opencode__*` bili tools still have no session state in these sessions: the proxy keys the session by the Claude Code child's id, not OpenCode's `ses_…` id.
+
 ### OpenAI Responses WebSockets (V2)
 
 The V2 plugin also intercepts OpenAI `experimental.ws.handshake` requests.

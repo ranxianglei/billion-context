@@ -312,6 +312,27 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
 
+### 内置 Claude Agent provider(2.x)
+
+OpenCode 2.x 内置了一个 **Claude Agent** provider(`claude-agent/*`),它驱动一个本地 Claude Code CLI。这个子进程直连 Anthropic——不从 OpenCode 发请求——所以插件的 HTTP-hook 路由永远看不到它的流量,其会话否则会不压缩地运行。在 2.x 主机上,`bili plugin install opencode` 通过在你的 opencode 配置里写入 `providers.claude-agent.settings.baseURL`(钉在 opencode 泳道的实时端口)来路由它:
+
+```json
+{
+  "providers": {
+    "claude-agent": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:<port>/bili/https://api.anthropic.com"
+      }
+    }
+  }
+}
+```
+
+- **已有安装** —— 重新运行 `bili plugin install opencode`;该条目在安装时写入,所以已有配置不会被追溯路由。
+- **端口漂移** —— 如果 opencode 泳道端口变化,钉死的 URL 会失效;`bili doctor` 会在 opencode 泳道告警,重新运行会重新钉死。
+- **你自己的代理** —— 非 bili 的 `baseURL` 会被保留不动(那是你的,不是我们要覆盖的)。
+- **已知限制** —— 压缩可用,但这些会话里 `mcp__opencode__*` bili 工具仍然没有会话状态:代理以 Claude Code 子进程的 id 为键,而非 OpenCode 的 `ses_…` id。
+
 ### OpenAI Responses WebSocket(V2)
 
 V2 插件也接管 OpenAI 的 `experimental.ws.handshake` 请求，两端均使用
