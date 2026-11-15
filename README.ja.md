@@ -10,6 +10,7 @@
 <a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
 <a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
 <a href="https://github.com/ranxianglei/billion-context"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context-181717?style=flat-square&logo=github" alt="GitHub"></a>
+<a href="https://discord.gg/wSejsBdRf"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -710,7 +711,7 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
 ```
 
-`archive`/`restore`/`gc` には統一ストア（`BILI_STORAGE_UNIFIED=shadow|full` または設定ファイルの `storage.unified`）が必要です — 古い形式だけのインストールは、ヒントを示して拒否します。`--days` のデフォルトは `storage.archiveAfterDays`（365）です。スケジューラーはありません：これらは必要なときに実行します。すべてのコマンドが `--json` を受け付けます。
+`archive`/`restore`/`gc` には統一ストア（`BILI_STORAGE_UNIFIED=sqlite|shadow|full` または設定ファイルの `storage.unified` — 既定はすでに純 sqlite）が必要です — 古い形式だけのインストールは、ヒントを示して拒否します。`--days` のデフォルトは `storage.archiveAfterDays`（365）です。スケジューラーはありません：これらは必要なときに実行します。すべてのコマンドが `--json` を受け付けます。
 
 **大きなデータベースでは、完全なバキュームはオフラインの操作です（#4612）。** `--vacuum full`（デフォルト）は、排他的な書き込みのロックのもとで index.db 全体を書き直します — データベースのサイズに比例し、数 GB のデータベースでは数分から数十分かかり、途中の進捗はありません（SQLite の VACUUM はアトミックで、分割できません）。同じセッションのディレクトリからプロキシが動いている間にこれを実行すると、そのプロキシの書き込みが、ストレージの層が劣化するまで止められてしまうので、`storage gc --vacuum full` は**ほかの生きているプロセスがデータベースを持っているときは開始を拒否します**（`index.db.lock` の pid の規律、#4175）：CLI は行動につながるメッセージとともに終了コード 1 で終了し、パネルのエンドポイントは HTTP 409 を返します。先にほかのインスタンスを止めて（または終了を待って）から、やり直してください。オンラインで安全に縮めるには `--vacuum incremental` を使ってください。これは排他的なロックを取らずに、短いトランザクションで空いたページを回収します。参照のない行の削除の走査そのものは、どちらの場合もバッチごとに進捗を表示しながら行われます。
 

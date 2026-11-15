@@ -4,8 +4,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import { createInitialState, defaultCountTokens } from "acp-kernel";
-import type { CompressionBlock } from "acp-kernel";
+import { collectBlockContent, createInitialState, defaultCountTokens } from "acp-kernel";
+import type { CompressionBlock, CoreMessage } from "acp-kernel";
 import { LazyBlockContents, _resetSessionsForTest, getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail, buildSessionTree } from "../src/web/sessions-data.ts";
@@ -156,6 +156,31 @@ test("#3917: message leaves name each folded message and serve its text lazily",
     assert.deepEqual(await buildMessageContent("no-such-session", "m00001"), { ok: false, reason: "unknown-session" });
 });
 
+for (const [name, text, preview] of [
+    ["empty text", "", ""],
+    ["short ASCII", "x".repeat(109), "x".repeat(109)],
+    ["exact ASCII limit", "x".repeat(110), "x".repeat(110)],
+    ["over ASCII limit", "x".repeat(111), "x".repeat(110) + "…"],
+    ["exact astral limit", "😀".repeat(110), "😀".repeat(110)],
+    ["over astral limit", "😀".repeat(111), "😀".repeat(110) + "…"],
+    ["astral boundary", "x".repeat(109) + "😀tail", "x".repeat(109) + "😀…"],
+    ["combining code points", "e\u0301".repeat(56), "e\u0301".repeat(55) + "…"],
+    ["Unicode whitespace", " \talpha\r\n\u00a0beta\u2028\u2029gamma\ufeff ", "alpha beta gamma"],
+    ["whitespace-only tail", "x".repeat(110) + "\r\n\t ", "x".repeat(110)],
+    ["collapsed boundary", "x".repeat(109) + "\r\n\t tail", "x".repeat(109) + " …"],
+    ["existing lone surrogate", "x".repeat(109) + "\ud800tail", "x".repeat(109) + "\ud800…"],
+] as const) {
+    test(`message preview preserves ${name}`, async () => {
+        const s = seedSession("preview-boundary", [mkBlock("b1", 1, "summary", ["rm1"], ["rm1"])]);
+        s.state.messageRefs = { byRaw: { rm1: "m00001" }, byRef: { m00001: "rm1" } };
+        s.lastMessages = [{ id: "rm1", role: "tool", contentType: "text", text }];
+        const detail = await buildSessionDetail(s.id);
+        assert.ok(detail);
+        assert.deepEqual(detail.blockDetails[0].directMessages, [{ ref: "m00001", role: "tool", preview }]);
+        assert.equal(s.lastMessages?.[0]?.text, text, "rendering must not modify the retained message");
+    });
+}
+
 test("#3917: a folded message the host pruned reports a miss instead of a guess", async () => {
     const s = seedSession("tree-pruned", [mkBlock("b1", 1, "s", ["rm1"], ["rm1"])]);
     s.state.messageRefs = { byRaw: { rm1: "m00001" }, byRef: { m00001: "rm1" } };
@@ -167,6 +192,251 @@ test("#3917: a folded message the host pruned reports a miss instead of a guess"
     assert.equal(d.blockDetails[0].directMessageCount, 1, "but the count still says one message was folded");
     assert.equal(d.blockDetails[0].directMessageRefs.length, 1, "and its ref is still named");
     assert.deepEqual(await buildMessageContent("tree-pruned", "m00001"), { ok: false, reason: "unknown-message" });
+});
+
+test("frozen-snapshot hydration: a leaf block's pruned messages re-align by position", async () => {
+    const s = seedSession("tree-snap", [mkBlock("b1", 1, "s", ["rm1", "rm2", "rm3"], ["rm1", "rm2", "rm3"])]);
+    s.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003" }, byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3" } };
+    s.lastMessages = [];
+    // collectBlockContent's full view: [role] (or [role • toolName]) header
+    // per message, pi-host user text opens with its ACP ref marker.
+    const full = [
+        "[user]",
+        '<acp tokens="2" type="text">m00001</acp>',
+        "hello world",
+        "",
+        "[assistant]",
+        "said hi",
+        "",
+        "[tool \u2022 read]",
+        "/path/x.ts:1-9",
+    ].join("\n");
+    s.blockContents.set("b1", { one: null, full: { text: full, count: 3 } });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m00001", role: "user", preview: "hello world" },
+        { ref: "m00002", role: "assistant", preview: "said hi" },
+        { ref: "m00003", role: "tool", toolName: "read", preview: "/path/x.ts:1-9" },
+    ], "window + store pruned — the frozen snapshot re-aligns by position");
+    const one = await buildMessageContent("tree-snap", "m00003");
+    assert.ok(one.ok);
+    assert.equal(one.role, "tool");
+    assert.equal(one.text, "/path/x.ts:1-9", "click-to-open serves the snapshot bytes");
+});
+
+for (const [label, text] of [
+    ["leading blank lines", "\n\n  first line"],
+    ["trailing blank lines", "last line\n\n"],
+    ["only blank lines", "\n\n"],
+    ["CRLF content", "\r\n  mixed\r\n\n"],
+    ["empty content", ""],
+    ["ordinary content", "one\n  two"],
+] as const) {
+    for (const at of [0, 1, 2]) {
+        test(`frozen snapshot preserves ${label} at message ${at + 1}`, async () => {
+            const ids = ["raw-1", "raw-2", "raw-3"];
+            const block = mkBlock("b1", 1, "summary", ids, ids);
+            const session = seedSession(`snapshot-${label}-${at}`, [block]);
+            session.state.messageRefs = {
+                byRaw: { "raw-1": "m00001", "raw-2": "m00002", "raw-3": "m00003" },
+                byRef: { m00001: "raw-1", m00002: "raw-2", m00003: "raw-3" },
+            };
+            const originals: CoreMessage[] = ids.map((id, index) => ({
+                id,
+                role: index === 1 ? "assistant" : "user",
+                contentType: "text",
+                text: index === at ? text : `neighbor ${index + 1}`,
+            }));
+            const full = collectBlockContent(session.state, block, originals, { full: true });
+            session.blockContents.set(block.blockId, { one: null, full });
+            session.lastMessages = [];
+            _resetDiskCacheForTest();
+
+            for (let index = 0; index < originals.length; index++) {
+                const result = await buildMessageContent(session.id, `m0000${index + 1}`);
+                assert.ok(result.ok);
+                assert.equal(result.text, originals[index].text);
+                assert.equal(result.totalBytes, Buffer.byteLength(originals[index].text!));
+                assert.equal(result.bytes, result.totalBytes);
+                assert.equal(result.truncated, false);
+            }
+            assert.deepEqual(session.blockContents.get(block.blockId)?.full, full);
+        });
+    }
+}
+
+for (const leading of ["", "\n", "\n\n"]) {
+    test(`frozen snapshot keeps ${leading.length} leading blank lines around its ref marker`, async () => {
+        const block = mkBlock("b1", 1, "summary", ["raw"], ["raw"]);
+        const session = seedSession(`snapshot-marker-${leading.length}`, [block]);
+        session.state.messageRefs = { byRaw: { raw: "m00001" }, byRef: { m00001: "raw" } };
+        const text = leading + '\x3cacp tokens="2" type="text"\x3em00001\x3c/acp\x3e\n\n body\n\n';
+        const full = collectBlockContent(session.state, block, [
+            { id: "raw", role: "user", contentType: "text", text },
+        ], { full: true });
+        session.blockContents.set(block.blockId, { one: null, full });
+        session.lastMessages = [];
+        _resetDiskCacheForTest();
+        const result = await buildMessageContent(session.id, "m00001");
+        assert.ok(result.ok);
+        assert.equal(result.text, leading + "\n body\n\n");
+        assert.equal(result.totalBytes, Buffer.byteLength(result.text));
+    });
+}
+
+test("frozen-snapshot hydration refuses a partial, shifted or non-leaf parse", async () => {
+    // Count mismatch: the snapshot captured only 2 of the block's 3 messages
+    // (host pruned the third before capture) — no half-alignment allowed.
+    const s = seedSession("tree-snap-short", [mkBlock("b1", 1, "s", ["rm1", "rm2", "rm3"], ["rm1", "rm2", "rm3"])]);
+    s.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003" }, byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", { one: null, full: { text: "[user]\nfirst\n\n[assistant]\nsecond", count: 2 } });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-short");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m00001", missing: true },
+        { ref: "m00002", missing: true },
+        { ref: "m00003", missing: true },
+    ], "a partial capture keeps every row an honest miss");
+    assert.deepEqual(await buildMessageContent("tree-snap-short", "m00002"), { ok: false, reason: "unknown-message" });
+
+    // Marker shift: three-way count matches, but the marker proves position 0
+    // is the ledger's SECOND ref (the frozen first message was pruned before
+    // capture) — the marker pins its own ref exactly (the pi host stamped it
+    // into the message body), the rest stays an honest miss. The span
+    // m00001–m00002 does NOT arithmetically anchor item 0 (2 − 1 = 1 ≠ 0), so
+    // this case exercises the legacy current-ref pin, not the restamp-proof
+    // arithmetic anchor.
+    const s2 = seedSession("tree-snap-shift", [mkBlock("b1", 1, "s", ["rm1", "rm2"], ["rm1", "rm2"], [], ["m00001", "m00002"])])
+    s2.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002" }, byRef: { m00001: "rm1", m00002: "rm2" } };
+    s2.lastMessages = [];
+    s2.blockContents.set("b2", { one: null, full: { text: "unused", count: 0 } });
+    s2.blockContents.set("b1", { one: null, full: { text: '[user]\n<acp tokens="1" type="text">m00002</acp>\nwrong place\n\n[assistant]\nsecond', count: 2 } });
+    _resetDiskCacheForTest();
+    const d2 = await buildSessionDetail("tree-snap-shift");
+    assert.ok(d2);
+    assert.deepEqual(d2.blockDetails[0].directMessages, [
+        { ref: "m00001", missing: true },
+        { ref: "m00002", role: "user", preview: "wrong place" },
+    ], "a marker pins its own ref exactly; the unprovable neighbour stays a miss");
+    assert.deepEqual(await buildMessageContent("tree-snap-shift", "m00001"), { ok: false, reason: "unknown-message" });
+
+    // Non-leaf span (direct \u2260 effective): children live inside the full
+    // text, so position means nothing — stays a miss even when counts look right.
+    const s3 = seedSession("tree-snap-nonleaf", [mkBlock("b1", 2, "s", ["rm1"], ["rm1", "rm2"])]);
+    s3.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002" }, byRef: { m00001: "rm1", m00002: "rm2" } };
+    s3.lastMessages = [];
+    s3.blockContents.set("b1", { one: null, full: { text: "[user]\nonly direct\n\n[assistant]\nchild message", count: 2 } });
+    _resetDiskCacheForTest();
+    const d3 = await buildSessionDetail("tree-snap-nonleaf");
+    assert.ok(d3);
+    assert.deepEqual(d3.blockDetails[0].directMessages, [{ ref: "m00001", missing: true }], "non-leaf spans never zip");
+});
+
+test("frozen-snapshot hydration anchors on markers when the host pruned a message mid-block", async () => {
+    // The b88 shape: 4 ledger refs, the snapshot only froze 3 messages (the
+    // host pruned the first one before capture). The ACP marker in item 0 pins
+    // it to the SECOND ref — the leading segment no longer balances (m00001
+    // stays an honest miss) but the tail balances and zips positionally.
+    const s = seedSession("tree-snap-anchor", [mkBlock("b1", 1, "s", ["rm1", "rm2", "rm3", "rm4"], ["rm1", "rm2", "rm3", "rm4"])]);
+    s.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003", rm4: "m00004" }, byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3", m00004: "rm4" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", {
+        one: null,
+        full: { text: '[user]\n<acp tokens="1" type="text">m00002</acp>\ntwo\n\n[assistant]\nthree\n\n[tool \u2022 read]\nfour', count: 3 },
+    });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-anchor");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m00001", missing: true },
+        { ref: "m00002", role: "user", preview: "two" },
+        { ref: "m00003", role: "assistant", preview: "three" },
+        { ref: "m00004", role: "tool", toolName: "read", preview: "four" },
+    ], "marker-anchored segments re-align around the pruned message");
+    const one = await buildMessageContent("tree-snap-anchor", "m00003");
+    assert.ok(one.ok);
+    assert.equal(one.text, "three", "click-to-open follows the anchored alignment");
+});
+
+test("frozen-snapshot hydration: restamp-proof arithmetic anchor recovers a renumbered block", async () => {
+    // The b27 shape: the cold load RESTAMPED the block's refs (cold-load #5196
+    // parked bands take fresh numbers), so the markers' frozen numbers no
+    // longer occur in the direct list — identity cannot prove anything. But
+    // the frozen span m00001–m00003 was written WITH the markers, so
+    // `frozenNumber − spanStart === snapshot position` still holds for every
+    // marker, and the whole block zips positionally.
+    const s = seedSession("tree-snap-restamp", [mkBlock("b1", 1, "s", ["ra", "rb", "rc"], ["ra", "rb", "rc"], [], ["m00001", "m00003"])]) ;
+    s.state.messageRefs = { byRaw: { ra: "m90001", rb: "m90002", rc: "m90003" }, byRef: { m90001: "ra", m90002: "rb", m90003: "rc" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", {
+        one: null,
+        full: {
+            text: ["[user]", '<acp tokens="2" type="text">m00001</acp>', "first", "", "[assistant]", "middle", "", "[user]", '<acp tokens="1" type="text">m00003</acp>', "last"].join("\n"),
+            count: 3,
+        },
+    });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-restamp");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m90001", role: "user", preview: "first" },
+        { ref: "m90002", role: "assistant", preview: "middle" },
+        { ref: "m90003", role: "user", preview: "last" },
+    ], "renumbered refs still re-align via the frozen span arithmetic");
+    const one = await buildMessageContent("tree-snap-restamp", "m90001");
+    assert.ok(one.ok);
+    assert.equal(one.text, "first", "click-to-open follows the arithmetic alignment");
+});
+
+test("frozen-snapshot hydration: arithmetic beats a coincidental current-ref match", async () => {
+    // The b27 m01055 trap: a restamped frozen number (m00002) happens to equal
+    // some OTHER message's new ref (the second dref, m90002 in this ledger). The
+    // marker sits at item 0 and its frozen arithmetic (2 − spanStart 2 = 0 =
+    // position 0) proves item 0 IS the marked message — the coincidental
+    // dref[1] number match must not steal the pin (a legacy pin (0,1) would
+    // leave both outer rows missing instead).
+    const s = seedSession("tree-snap-trap", [mkBlock("b1", 1, "s", ["ra", "rb", "rc"], ["ra", "rb", "rc"], [], ["m00002", "m00004"])]) ;
+    s.state.messageRefs = { byRaw: { ra: "m90001", rb: "m90002", rc: "m90003" }, byRef: { m90001: "ra", m90002: "rb", m90003: "rc" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", {
+        one: null,
+        full: { text: "[user]\n<acp tokens=\"1\" type=\"text\">m00002</acp>\nmarked one\n\n[assistant]\nsecond\n\n[assistant]\nthird", count: 3 },
+    });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-trap");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m90001", role: "user", preview: "marked one" },
+        { ref: "m90002", role: "assistant", preview: "second" },
+        { ref: "m90003", role: "assistant", preview: "third" },
+    ], "the marker pins item 0 via arithmetic (a legacy pin (0,1) on the coincidental number would have left m90001/m90003 missing); the anchored tail zips positionally");
+});
+
+test("frozen-snapshot hydration: a marker proving neither anchor rejects the whole block", async () => {
+    // Foreign-content shape: the marker names m00050, which is neither a
+    // current ref at the marker's position nor inside the frozen span
+    // m00001–m00003 — the frozen context mixed in foreign messages. No part of
+    // the block may be served (two-sided assertion: hydrated preview AND
+    // click-to-open both stay honest misses).
+    const s = seedSession("tree-snap-foreign", [mkBlock("b1", 1, "s", ["ra", "rb"], ["ra", "rb"], [], ["m00001", "m00003"])]) ;
+    s.state.messageRefs = { byRaw: { ra: "m90001", rb: "m90002" }, byRef: { m90001: "ra", m90002: "rb" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", {
+        one: null,
+        full: { text: "[user]\n<acp tokens=\"1\" type=\"text\">m00050</acp>\nforeign\n\n[assistant]\nsecond", count: 2 },
+    });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-foreign");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m90001", missing: true },
+        { ref: "m90002", missing: true },
+    ], "an unanchorable marker aborts the whole block");
+    assert.deepEqual(await buildMessageContent("tree-snap-foreign", "m90001"), { ok: false, reason: "unknown-message" });
 });
 
 test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries", async () => {
@@ -248,7 +518,7 @@ test("#4608: the web client bundle stays parseable JS with the master-detail pan
     assert.match(WEB_CLIENT, /window\.__biliDetailBlocks = blocks;/);
     // live lane repaints only the tree drawing from GET /sessions/<id>/tree
     assert.match(WEB_CLIENT, /function refreshTreeMap\(\)/);
-    assert.match(WEB_CLIENT, /renderCollapSvg\(r\.blocks/);
+    assert.match(WEB_CLIENT, /renderCollapSvg\(merged/);
     assert.ok(WEB_CLIENT.includes('"/sessions/" + encodeURIComponent(m[1]) + "/tree"'), "#4173 tree URL wiring still present");
     // raw-view buttons stay reversible; the clamp machinery now measures panels
     assert.match(WEB_CLIENT, /if \(!box\.hidden && box\.getAttribute\("data-view"\) === view\) \{ box\.hidden = true; return; \}/);

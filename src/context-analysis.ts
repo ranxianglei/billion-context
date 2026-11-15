@@ -155,15 +155,23 @@ function snapshotInit(messages: CoreMessage[]): InitProfile {
         totalChars += chars;
         const tok = countMessageTokens(m, defaultCountTokens);
         estTokens += tok;
-        entries.push({ role: m.role, contentType: m.contentType, toolName: m.toolName, estTokens: tok });
+        if (entries.length === INIT_PER_MSG_CAP && tok <= entries[entries.length - 1]!.estTokens) continue;
+        let lo = 0;
+        let hi = entries.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (tok > entries[mid]!.estTokens) hi = mid;
+            else lo = mid + 1;
+        }
+        entries.splice(lo, 0, { role: m.role, contentType: m.contentType, toolName: m.toolName, estTokens: tok });
+        if (entries.length > INIT_PER_MSG_CAP) entries.pop();
     }
-    entries.sort((x, y) => y.estTokens - x.estTokens);
     return {
         ts: Date.now(),
         messageCount: messages.length,
         totalChars,
         estTokens,
-        perMessage: entries.slice(0, INIT_PER_MSG_CAP),
+        perMessage: entries,
     };
 }
 
