@@ -1180,7 +1180,9 @@ export function executeSearchContext(
     const foundLive = blocks.length + origHits.length;
     const header = foundLive === 0
         ? `Found 0 live summary block(s) for "${query}"${scope} — ${archivedHits?.total ?? 0} closed-generation hit(s):`
-        : `Found ${blocks.length} block(s) for "${query}"${scope}:`;
+        : blocks.length === 0
+            ? `Found 0 summary block(s) for "${query}"${scope} — but ${origHits.length} folded original(s) match:`
+            : `Found ${blocks.length} block(s) for "${query}"${scope}:`;
     return toolOk(`${header}\n\n${lines.join("\n\n")}${truncNote}${steering}${tipNote}${origSection}${archivedSection}${note}`);
 }
 
@@ -1231,7 +1233,7 @@ export function executeSearchContextTarget(
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
-    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan, ownOriginals);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan, ownOriginals, historyGenerationsOf(self));
     const resident = self ?? undefined;
     const foreign = resolveForeignSessionState(requested);
     if (!foreign) return toolFail(`[search_context FAILED: unknown session "${requested}"]`);
