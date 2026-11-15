@@ -124,6 +124,7 @@ RUN+=(-e MODEL1_BASE_URL="$M1_URL" -e MODEL1_MODEL="$M1_MODEL" -e MODEL1_API_KEY
   -v bili-gate-npm-cache:/root/.npm \
   -v "$OUT_DIR:/work" \
   -e GATE_REV="$REV" -e GATE_SKIP="$SKIP" -e GATE_KEEP="$KEEP" \
+  -e GATE_UID="$(id -u)" -e GATE_GID="$(id -g)" \
   bili-gate)
 
 if [ "$DRY" = 1 ]; then

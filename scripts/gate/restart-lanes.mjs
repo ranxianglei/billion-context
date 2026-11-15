@@ -23,7 +23,9 @@
 //                         GATE_R_CORPUS_TOKENS — crank to MB scale if you want
 //                         the drama), answer the S40 marker
 //   t2  @ big window    : recall S07 verbatim — fixture alive, intact context
-//   t3  @ small window  : preflight fold MUST fire on this turn
+//   t3  @ small window  : preflight fold MUST fire on this turn (one retry —
+//                         the client's estimated-tokens overflow trigger can
+//                         wobble; 2026-11-15)
 //   R0/R1/R2            : kill the proxy (SIGTERM -15 / SIGKILL -9 / clean
 //                         POST /__bili/shutdown), next host turn respawns it;
 //                         assertions after each respawn:
@@ -444,20 +446,27 @@ async function runLane(agent) {
     record(agent, "S07 recalled pre-fold (fixture alive)", MARK_RE(6).test(t2.out), `"${t2.out.trim().slice(0, 80)}"`);
 
     setHostWindow(R_WINDOW);
-    const mark3 = lineCount();
-    const t3 = await turn("Reply with the single word DONE.", "t3", { expectContent: false });
-    fs.writeFileSync(path.join(laneDir, "turn-t3.txt"), t3.out || "");
-    record(agent, "t3 completes", t3.ok, t3.why.slice(0, 160));
-    // Everything forwarded in t1–t3 happened before/around the wall flip, so
-    // their max is the honest UNCOMPRESSED fiber size. Every later forwarded
-    // request must sit well inside it (folded) and well above a bare greeting
-    // (session actually adopted).
+    let mark3 = lineCount();
+    let t3 = await turn("Reply with the single word DONE.", "t3", { expectContent: false });
+    // The client's proactive overflow fold is estimated-tokens based and can
+    // wobble (measured 2026-11-15, same fixture: fold fires on one run, raw
+    // send + client-side CONTEXT_WINDOW_EXCEEDED on the next — bili's engine
+    // folds correctly whenever the client asks). One retry mirrors the t2
+    // needle-retry policy.
     const rawFiber = reqMaxSoFar();
     const floor = Math.max(15_000, Math.round(rawFiber * 0.05));
     const foldCap = Math.round(rawFiber * 0.75);
     record(agent, "pre-fold wire baseline established", rawFiber > 50_000,
       `${rawFiber} bytes raw; post-fold bound [${floor}, ${foldCap}]`);
-    const afterFold = reqMaxSince(mark3);
+    let afterFold = reqMaxSince(mark3);
+    if (!(t3.ok && afterFold > 0 && afterFold <= foldCap)) {
+      console.log(`EVIDENCE [${agent}] t3 first try red (ok=${t3.ok}, forwarded ${afterFold}B vs cap ${foldCap}) — retrying once`);
+      mark3 = lineCount(); // the raw send above must not pollute the post-fold bound
+      t3 = await turn("Reply with the single word DONE.", "t3-retry", { expectContent: false });
+      afterFold = reqMaxSince(mark3);
+    }
+    fs.writeFileSync(path.join(laneDir, "turn-t3.txt"), t3.out || "");
+    record(agent, "t3 completes", t3.ok, t3.why.slice(0, 160));
     const foldLog = /acp-compress-obs\] shrink (\d+)%/.exec(fs.existsSync(biliLog) ? fs.readFileSync(biliLog, "utf8") : "");
     record(agent, "small window fired the fold before the kills", afterFold > 0 && afterFold <= foldCap,
       `${afterFold} bytes forwarded under small window vs raw ${rawFiber}${foldLog ? ` (log: shrink ${foldLog[1]}%)` : ""}`);
