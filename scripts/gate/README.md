@@ -16,8 +16,8 @@ operators with a real model endpoint and takes ~4-5h per round.
 | U | registry | dsh-managed proxy reads `update.registry`, refuses in-place self-update, "profile bundle up to date" | `scripts/release-gate-local.mjs` |
 | I | install | `npm i -g <tarball> --install-links` = **true copy** (no symlink leak, #1225), CLI reports candidate version | `docker-lanes.mjs` |
 | X | auto-update | publish a fake-newer build of the same commit → `bili update` **installs it** through `update.registry`, CLI lands on the new version | `docker-lanes.mjs` |
-| P | host lanes | real host CLIs (dsh/pi/opencode/codex/claude) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
-| R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
+| P | host lanes | real host CLIs (dsh/dsh-google/pi/opencode/codex/claude — four client-side wires: openai-chat, google, responses, anthropic) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
+| R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; **claude** (opt-in via `agentsR`) adds the anthropic wire to the matrix — a prefix-topology lane where the harness-managed proxy child is killed and re-established on the same port, and the session must resume; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
 
 ## The secret/endpoint contract
 
@@ -52,7 +52,7 @@ Config keys (all optional except `model1.baseUrl` / `model1.model`):
 clones from — keeps container egress at zero and works behind host git
 proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
 the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
-`agentsR` (Lane R set; default `dsh,pi`), `r.{corpusTokens,window,capRatio,
+`agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane), `r.{corpusTokens,window,capRatio,
 cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
 shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
 
@@ -212,7 +212,7 @@ TGZ=/path/to/billion-context-x.y.z.tgz \
 REPO=/path/to/billion-context-checkout \
 MODEL1_BASE_URL=<primary model base url> \
 MODEL1_MODEL=<model-id> \
-GATE_AGENTS=dsh,pi,codex,opencode,claude \
+GATE_AGENTS=dsh,pi,codex,opencode,claude,dsh-google \
 node scripts/gate/plugin-lanes.mjs
 ```
 

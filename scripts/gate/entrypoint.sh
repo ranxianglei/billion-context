@@ -168,7 +168,7 @@ else
   echo "plugin-lanes: using $PL"
   P_ENV=(TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK"
     MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY"
-    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude}"
+    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude,dsh-google}"
     GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}"
     GATE_OC2_BIN="${GATE_OC2_BIN:-}" GATE_OC1_BIN="${GATE_OC1_BIN:-}")
   if [ "$CONCURRENT" = "1" ]; then

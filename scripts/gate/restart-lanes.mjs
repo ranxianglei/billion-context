@@ -110,8 +110,6 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
-// Recorder spawned for the in-flight lane; killed from main()'s catch when a
-// lane aborts before its own teardown (2026-11-14 leak fix).
 // Recorder handle for the in-flight lane(s) (lane -> handle), killed from
 // main()'s catch when a lane aborts before its own teardown. A Map because
 // lanes run concurrently (2026-11-15 parallel gate).
@@ -284,11 +282,9 @@ async function runLane(agent) {
 
   // native lanes read bili.json from the DEFAULT XDG location
   const biliJson = path.join(xdgConfig, "billion-context", "billion-context.json");
+  const biliProviders = { [recUrl]: { models: Object.fromEntries(MODEL_IDS.map((m) => [m, { context: BIG_WINDOW, output: 4096 }])) } };
   fs.mkdirSync(path.dirname(biliJson), { recursive: true });
-  fs.writeFileSync(biliJson, JSON.stringify({
-    providers: { [recUrl]: { models: Object.fromEntries(MODEL_IDS.map((m) => [m, { context: BIG_WINDOW, output: 4096 }])) } },
-    compress: { preserveRecentTokens: 0 },
-  }, null, 2));
+  fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
   fs.writeFileSync(path.join(laneDir, "work", "corpus.md"), buildCorpus(CORPUS_TOKENS));
 
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
@@ -315,6 +311,8 @@ async function runLane(agent) {
 
   // -- host recipes (same shapes as plugin-lanes RECIPES dsh/pi) ------------
   let ctxEnv;
+  let claudeSetWindow = null; // claude lane only: bili-side window flip + proxy restart
+  let claudeProxyHandle = null; // runLane-scope mirror so teardown can reap it
   if (agent === "dsh") {
     const dshHome = path.join(laneDir, "dsh-home");
     const profile = path.join(dshHome, "profiles", "headless");
@@ -345,13 +343,65 @@ async function runLane(agent) {
     }, null, 2));
     writeWindow(BIG_WINDOW);
     ctxEnv = { ...baseEnv, PI_CODING_AGENT_DIR: piDir };
+  } else if (agent === "claude") {
+    // anthropic-wire lane (prefix topology): claude-code speaks anthropic
+    // over HTTP to a harness-managed bili proxy child -> recorder -> model.
+    // Unlike dsh (plugin-spawned proxy) and pi (inline engine), here the
+    // CLIENT-SIDE door is real anthropic traffic and the proxy is ours:
+    // after each kill the harness re-establishes it on the same port
+    // (nothing auto-respawns a manually started proxy).
+    const proxyPort = await freePort();
+    const cfgDir = path.join(laneDir, "claude-cfg");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, "settings.json"), JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxyPort}/bili/${recUrl}`,
+        ANTHROPIC_API_KEY: "gate-local",
+        ANTHROPIC_AUTH_TOKEN: "gate-local",
+        DISABLE_AUTO_COMPACT: "1", // bili does the folding, not the client
+      },
+    }, null, 2));
+    ctxEnv = { ...baseEnv, CLAUDE_CONFIG_DIR: cfgDir };
+    const proxyLogFd = fs.openSync(path.join(laneDir, "proxy.log"), "a");
+    let claudeProxy = null;
+    async function startClaudeProxy() {
+      if (claudeProxy) { await stopClaudeProxy(); }
+      claudeProxy = claudeProxyHandle = spawn("node", [path.join(cand, "dist", "index.js"), "start",
+        "--host", "127.0.0.1", "--port", String(proxyPort), "--no-auto-update"],
+        { env: { ...baseEnv, BILLION_CONTEXT_NO_AUTO_UPDATE: "1" }, stdio: ["ignore", proxyLogFd, proxyLogFd], detached: true });
+      for (let i = 0; i < 60; i++) {
+        await sleep(500);
+        if (await healthy(proxyPort)) return;
+      }
+      throw new Error(`claude manual proxy :${proxyPort} not healthy (see ${laneDir}/proxy.log)`);
+    }
+    async function stopClaudeProxy() {
+      if (!claudeProxy) return;
+      try { process.kill(-claudeProxy.pid, "SIGKILL"); } catch {}
+      await waitForExit(claudeProxy.pid, 10_000);
+      claudeProxy = claudeProxyHandle = null;
+    }
+    // Small window is bili-side (provider context in bili.json); a manually
+    // started proxy re-reads config only on restart (prefix lanes need a
+    // fresh proxy per phase — Lane P rule). Returns the new proxy pid.
+    claudeSetWindow = async (w) => {
+      for (const m of Object.values(biliProviders[recUrl].models)) m.context = w;
+      fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
+      const oldPid = claudeProxy ? claudeProxy.pid : null;
+      await stopClaudeProxy();
+      await startClaudeProxy();
+      return { oldPid, newPid: claudeProxy.pid };
+    };
+    await startClaudeProxy();
   } else {
     throw new Error(`unsupported lane ${agent}`);
   }
-  const setHostWindow = (w) => {
+  const setHostWindow = async (w) => {
     if (agent === "dsh") {
       const p = path.join(laneDir, "dsh-home/profiles/headless/cordis.patch.yml");
       fs.writeFileSync(p, fs.readFileSync(p, "utf8").replace(/contextWindow: \d+/g, `contextWindow: ${w}`));
+    } else if (agent === "claude") {
+      await claudeSetWindow(w);
     } else {
       const f = path.join(laneDir, "pi-dir/models.json");
       const cfg = JSON.parse(fs.readFileSync(f, "utf8"));
@@ -367,6 +417,16 @@ async function runLane(agent) {
       args = ["--profile", "headless", "headless"];
       if (sid.v) args.push("--session-id", sid.v);
       args.push("--json", opts.warm ? "First run the bash tool with command `echo warmup`. Then " + prompt : prompt);
+    } else if (agent === "claude") {
+      bin = "claude";
+      args = ["-p"];
+      if (claudeTurns > 0) args.push("--continue"); // first turn starts the session
+      args.push(prompt);
+      claudeTurns++;
+      // claude small-window preflight runs a multi-stage distillation
+      // (Lane P lesson: observed 297s of local preflight work; the 300s
+      // budget SIGTERMs the CLI mid-preflight) — give it the same 600s.
+      if (opts.timeout === undefined) opts = { ...opts, timeout: 600_000 };
     } else {
       bin = "pi";
       args = ["-p", "--model", `gate/${MODEL_MAIN}`];
@@ -418,6 +478,7 @@ async function runLane(agent) {
   };
 
   const sid = { v: null };
+  let claudeTurns = 0;
   const t1prompt = `Read corpus.md in your cwd fully (~${Math.round(CORPUS_TOKENS / 4)} words). Your read tool may truncate or ELIDE the middle of a long file — read in sequential chunks until you have seen EVERY line including the middle. Then reply with ONLY the TITLE line of section S40. Do not run any other tool or command.`;
   // Pre-fold recall: S07 lives mid-corpus, untouched at big window — proves
   // the fixture + intact context work BEFORE any boundary is introduced.
@@ -448,7 +509,11 @@ async function runLane(agent) {
     fs.writeFileSync(path.join(laneDir, "turn-t2.txt"), t2.out || "");
     record(agent, "S07 recalled pre-fold (fixture alive)", MARK_RE(6).test(t2.out), `"${t2.out.trim().slice(0, 80)}"`);
 
-    setHostWindow(R_WINDOW);
+    await setHostWindow(agent === "claude" ? 32768 : R_WINDOW);
+    // claude uses a wider small window: its unfoldable floor sits near the
+    // wall (Lane P lesson — a knife-edge window deterministically hits
+    // “maximum possible saving below required reduction”); 32768 still
+    // forces the fold on the ~35k-token raw fiber.
     let mark3 = lineCount();
     let t3 = await turn("Reply with the single word DONE.", "t3", { expectContent: false });
     // The client's proactive overflow fold is estimated-tokens based and can
@@ -507,6 +572,38 @@ async function runLane(agent) {
         // Post-fold VERBATIM recall is fold-quality territory (Lane A): which
         // tokens survive the summary is model-dependent, so it is EVIDENCE here
         // — a hallucinated or dropped marker must not fail the RESTART lane.
+        console.log(`EVIDENCE [${agent}] ${tag} S40 recall after ${variant}: "${c2.out.trim().slice(0, 80)}"${MARK_RE(39).test(c2.out) ? " ✓verbatim" : " ✗not-verbatim(fold-quality, Lane A domain)"}`);
+        const nLive = liveInstanceCount(xdgState);
+        record(agent, `${tag}: exactly one live proxy holds the session after ${variant}`, nLive === 1,
+          `${nLive} live proxy(es)`);
+      }
+    } else if (agent === "claude") {
+      // prefix topology: the proxy is a harness-managed child — nothing
+      // auto-respawns it, so after each kill the harness re-establishes it
+      // on the SAME port (claude's config never changes) and the session
+      // must pick up where it left off. "shutdown" is dropped vs dsh: for a
+      // harness-managed proxy the graceful path IS just SIGTERM to our pid.
+      const VARIANTS = [["sigterm", "R0"], ["sigkill", "R1"]];
+      for (const [variant, tag] of VARIANTS) {
+        const before = liveInstance(xdgState);
+        const k = await killProxy(xdgState, variant);
+        if (!k.ok) { record(agent, `${tag}: kill (${variant})`, false, k.why); continue; }
+        record(agent, `${tag}: kill (${variant}) took the proxy down`, true, `pid ${k.pid} released :${k.port}`);
+        const mark = lineCount();
+        // killProxy removes the stale registry marker; re-establish via the
+        // same restart path (re-reads the current bili.json, same window).
+        const { newPid } = await claudeSetWindow(biliProviders[recUrl].models[MODEL_IDS[0]].context);
+        const after = liveInstance(xdgState);
+        record(agent, `${tag}: proxy re-established with a new pid (harness)`, !!(after && before && after.pid !== before.pid),
+          before && after ? `old ${before.pid} → new ${after.pid} (expected ${newPid})` : `before=${before?.pid} after=${after?.pid}`);
+        const c1 = await turn("Reply with the single word DONE.", `${tag}-a`, { expectContent: false });
+        record(agent, `${tag}: continuation completes after re-establish`, c1.ok, c1.why.slice(0, 160));
+
+        const c2 = await turn(recallS40, `${tag}-b`);
+        fs.writeFileSync(path.join(laneDir, `turn-${tag}.txt`), c2.out || "");
+        const lastNew = reqMaxSince(mark);
+        record(agent, `${tag}: resumed outbound compact & non-empty after ${variant} (${Math.round(floor / 1024)}–${Math.round(foldCap / 1024)}KiB)`,
+          lastNew >= floor && lastNew <= foldCap, `${lastNew} bytes vs raw fiber ${rawFiber}`);
         console.log(`EVIDENCE [${agent}] ${tag} S40 recall after ${variant}: "${c2.out.trim().slice(0, 80)}"${MARK_RE(39).test(c2.out) ? " ✓verbatim" : " ✗not-verbatim(fold-quality, Lane A domain)"}`);
         const nLive = liveInstanceCount(xdgState);
         record(agent, `${tag}: exactly one live proxy holds the session after ${variant}`, nLive === 1,
@@ -637,6 +734,7 @@ async function runLane(agent) {
   record(agent, "no unknown-tool loops", unknownTool.length === 0, unknownTool.join(" | "));
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
   activeRec.delete(agent);
+  if (claudeProxyHandle) { try { process.kill(-claudeProxyHandle.pid, "SIGKILL"); } catch {} claudeProxyHandle = null; }
 }
 
 async function main() {
