@@ -40,12 +40,21 @@ done
 [ -f "$CONFIG" ] || { echo "FATAL: config file not found: $CONFIG" >&2; exit 2; }
 
 # ---- parse the JSON config (node is a gate dependency everywhere) ----------
-jget() { node -e '
+# jget <key> [default] — print config[key] or the default; with NO default
+# argument the key is REQUIRED and a missing value fails fast (exit 2) before
+# the expensive docker build. The has-default flag is passed explicitly because
+# an unset $2 would otherwise collapse to "" (a string) and the required branch
+# would never fire.
+jget() {
+  local key="$1" def="${2-}" hasdef=0
+  if [ "$#" -ge 2 ]; then hasdef=1; fi
+  node -e '
   const c = JSON.parse(process.argv[1]);
   const v = process.argv[2].split(".").reduce((o, k) => (o == null ? undefined : o[k]), c);
-  if (v === undefined) { if (process.argv[3] !== undefined) { console.log(process.argv[3]); } else { process.exit(3); } }
+  if (v === undefined) { if (process.argv[4] === "1") { console.log(process.argv[3]); } else { process.exit(3); } }
   else process.stdout.write(Array.isArray(v) ? v.join(",") : String(v));
-' "$(cat "$CONFIG")" "$1" "${2:-}" || { echo "FATAL: config missing required key: $1 (file: $CONFIG)" >&2; exit 2; } }
+' "$(cat "$CONFIG")" "$key" "$def" "$hasdef" || { echo "FATAL: config missing required key: $key (file: $CONFIG)" >&2; exit 2; }
+}
 
 M1_URL=$(jget model1.baseUrl)
 M1_MODEL=$(jget model1.model)
