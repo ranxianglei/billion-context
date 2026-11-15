@@ -501,6 +501,7 @@ bili --host 0.0.0.0           # listen on all interfaces (see host note below)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
+bili -c dsh-test             # named config → ~/.config/billion-context/dsh-test.json (per-model files)
 bili update                  # check & install a newer version now (bypasses throttle)
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
@@ -567,7 +568,8 @@ providers, compression tuning, environment variables — lives in
 ### Config file
 
 One JSON document at `~/.config/billion-context/billion-context.json`
-(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`).
+(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`; a bare name
+selects a sibling file, e.g. `-c dsh-test` → `~/.config/billion-context/dsh-test.json`).
 Precedence when several sources set the same knob: **CLI flag (where one exists) > env var > config file > built-in default** — every env var keeps working as the override tier.
 
 What's inside (details in docs/configuration.md):
@@ -729,7 +731,7 @@ bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
 ```
 
-`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=sqlite|shadow|full` or `storage.unified` in the config file — the default is now pure sqlite) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
 
 **Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
 

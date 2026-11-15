@@ -350,11 +350,16 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // dsh sidecar shape predicate (no tools + one-shot body, any system text)
 // consulted to set sideIntent and to keep unknown sidecars off the raw-key
 // anchor before the first main turn can claim it.
+// #4774 raw-key anchor race. #5073 adds
+// isStructuredOutputCall — same category once more: a pure toolless
+// structured-output shape predicate (no threshold, no session state) consulted
+// to set sideIntent and to keep the call out of the restoreOutputBudget
+// high-water path, exactly like the #2500 server-tool predicate.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
@@ -614,6 +619,65 @@ test("(M) #5135 claude-code title sidecar: no anchor claim in either arrival ord
         });
         assert.equal(r5.status, 200, await r5.text());
         assert.equal(resolveConversation(conv5).session!.stats.requests, 1, "non-CC client evidence gate: full pipeline, counted");
+    } finally {
+        await h.close();
+    }
+});
+
+test("(N) #6104 dsh 0.2.2 review shape: banner-shifted policy + replayed user body ride the side passthrough", async () => {
+    // #2170 duty: a lane-gate edit lands WITH the suite that pins it. The
+    // detector's two bars were host-side FORMAT decisions (policy line offset,
+    // number of user blobs), so both shapes are pinned here end-to-end, plus
+    // the vetoes that must never move.
+    const h = await harness();
+    try {
+        const conv = "rev6104";
+        const POLICY = "REVIEW_POLICY\nYou are the final authorization reviewer for exactly one pending tool call in this conversation.\n\nReply with exactly one JSON verdict.";
+        const BLOBS = [
+            { role: "user", content: "ENVIRONMENT\nprofile: desktop; model: claude-test" },
+            { role: "user", content: "PROJECT_INSTRUCTIONS\n(none)" },
+            { role: "user", content: "FILTERED_HISTORY\nuser: main turn 0\nassistant: answer" },
+            { role: "user", content: "PENDING_ACTION\n{\"tool\":\"bash\",\"args\":{\"command\":\"ls\"}}" },
+        ];
+        // The main turn anchors the raw key.
+        await h.dshSend(conv, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "main turn anchors the raw key");
+        const hits = h.forwarded.length;
+
+        // The 0.2.2 review shape: host-sized budget (past the <=200 heuristic),
+        // no tools, no agent header, banner ABOVE the pinned sentence, and the
+        // whole history replayed as role:"user" blobs.
+        await h.dshSend(conv, BLOBS, undefined, POLICY, 384000);
+        assert.equal(h.forwarded.length, hits + 1, "the review call reaches the upstream");
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the review call counts nowhere (side passthrough, #388)");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "the review call mints no |sub lane");
+
+        // The next main turn still resolves to the SAME session and keeps
+        // compressing — the ledger-damage symptom was that it did not.
+        await h.dshSend(conv, [mainMsg(0), { role: "assistant", content: "answer" }, mainMsg(1)], "main", "MAIN OPERATING SYSTEM", 256);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 2, "the next main turn lands on the raw key, not a drifted lane");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "no drift on the main leg");
+
+        // Veto A — any tools surface marks an agent turn: full pipeline, counted.
+        // Counted ACROSS the raw key and any design persona child: a tool-carrying
+        // request with a foreign system prompt forks by design (#1916), and the
+        // point here is that it was NOT handed to the verbatim side lane.
+        const countAll = (id: string) => listSessions()
+            .filter((s) => s.id === id || s.id.startsWith(id + "|"))
+            .reduce((n, s) => n + (s.stats?.requests ?? 0), 0);
+        const convTools = "rev6104-tools";
+        await h.dshSend(convTools, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        const hitsT = h.forwarded.length;
+        await h.dshSend(convTools, BLOBS, undefined, POLICY, 384000, [{ name: "bash", input_schema: { type: "object" } }]);
+        assert.equal(h.forwarded.length, hitsT + 1);
+        assert.equal(countAll(convTools), 2, "tools-shape request rides the full pipeline (unchanged veto)");
+
+        // Veto B — an assistant turn inside the body is a real resend, not the
+        // review (the load-bearing replay veto now that the user count is out).
+        const convReplay = "rev6104-replay";
+        await h.dshSend(convReplay, [mainMsg(0)], "main", "MAIN OPERATING SYSTEM", 256);
+        await h.dshSend(convReplay, [...BLOBS.slice(0, 2), { role: "assistant", content: "earlier answer" }, ...BLOBS.slice(2)], undefined, POLICY, 384000);
+        assert.equal(countAll(convReplay), 2, "an assistant turn keeps the request on the main pipeline");
     } finally {
         await h.close();
     }

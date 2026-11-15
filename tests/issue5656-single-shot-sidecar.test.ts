@@ -10,7 +10,9 @@
 // feeding #5671's terminal 7.3×-window deaths). isDshSingleShotSidecar closes
 // the hole structurally: no action surface (no tools) + single-shot body (one
 // non-system message, no assistant turn) + a non-empty system carrier, ANY
-// system text. These tests pin that contract in both directions (#3617).
+// system text, and no durable-state marker in the user blob; the call sites
+// additionally require a small pinned output budget (#5687 follow-up,
+// hasSingleShotBudget). These tests pin that contract in both directions (#3617).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -25,7 +27,7 @@ import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts"
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, peekSession, _resetSessionsForTest } from "../src/session.ts";
-import { isDshSingleShotSidecar } from "../src/server/side-request.ts";
+import { hasSingleShotBudget, isDshSingleShotSidecar } from "../src/server/side-request.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -139,6 +141,21 @@ test("unit #5656: isDshSingleShotSidecar vetoes every main-turn and aux shape", 
     assert.equal(isDshSingleShotSidecar("openai", "nope"), false, "non-object body");
 });
 
+test("unit #5687 follow-up: hasSingleShotBudget accepts only a small pinned numeric budget", () => {
+    assert.equal(hasSingleShotBudget({ max_tokens: 4096 }), true, "anthropic wire preset (prompt-enhance 4096)");
+    assert.equal(hasSingleShotBudget({ max_tokens: 8192 }), true, "boundary inclusive");
+    assert.equal(hasSingleShotBudget({ max_tokens: 8193 }), false, "just past the boundary");
+    assert.equal(hasSingleShotBudget({ max_completion_tokens: 4096 }), true, "openai chat modern field");
+    assert.equal(hasSingleShotBudget({ max_output_tokens: 1024 }), true, "responses wire field");
+    assert.equal(hasSingleShotBudget({ model: MODEL }), false, "field omitted (openai main-turn shape) -> full pipeline");
+    assert.equal(hasSingleShotBudget({ max_tokens: 64_000 }), false, "conversation-sized main-turn budget");
+    assert.equal(hasSingleShotBudget({ max_tokens: 0 }), false, "zero");
+    assert.equal(hasSingleShotBudget({ max_tokens: -1 }), false, "negative");
+    assert.equal(hasSingleShotBudget({ max_tokens: "4096" }), false, "numeric string is not a number (fail-safe direction)");
+    assert.equal(hasSingleShotBudget(null), false, "null body");
+    assert.equal(hasSingleShotBudget("nope"), false, "non-object body");
+});
+
 test("e2e #5656 (incident repro): a single-shot sidecar arriving FIRST never claims the raw-key anchor — the main conversation keeps the raw key", async () => {
     const rig = await startRig();
     const CONV = "dshp-5656-openai";
@@ -244,9 +261,9 @@ test("e2e #5656 negative: a tool-less multi-message MAIN turn still goes through
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
         const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
-        // Turn 1 of a tools-disabled conversation matches the single-shot shape
-        // (system + 1 user, no tools): it rides the verbatim side lane for that
-        // one turn — tiny, nothing to compress, accepted residual.
+        // Turn 1 of a tools-disabled conversation matches the single-shot SHAPE
+        // (system + 1 user, no tools); the conversation-sized output budget
+        // (64000 below) is what keeps it off the side lane (#5687 follow-up).
         const r1 = await fetch(url, {
             method: "POST",
             headers,
@@ -254,13 +271,15 @@ test("e2e #5656 negative: a tool-less multi-message MAIN turn still goes through
         });
         assert.equal(r1.status, 200);
         await r1.text();
-        // Accepted residual, pinned honestly: turn 1 rode the verbatim side lane
-        // — no refs minted, no request counted (the session shell may exist for
-        // lane bookkeeping, but it holds no compression state).
         const stub = peekSession(CONV);
         const refs1 = stub ? Object.keys(stub.state.messageRefs.byRaw).length : 0;
         const reqs1 = stub ? stub.stats.requests : 0;
-        assert.ok(refs1 === 0 && reqs1 === 0, `tool-less single-shot turn 1 rides the side lane (refs=${refs1}, requests=${reqs1})`);
+        // #5687 follow-up: this residual is REVOKED. A tool-less turn 1 that
+        // carries a conversation-sized output budget (64000 here) is a MAIN turn,
+        // not a utility sidecar: the small-budget requirement is what keeps it on
+        // the kernel path. Pinning the old "rides the side lane" behavior here is
+        // exactly what let #2817/#5403 regress.
+        assert.ok(refs1 >= 1 && reqs1 >= 1, `tool-less turn 1 with a conversation budget goes through the full pipeline (refs=${refs1}, requests=${reqs1})`);
         // Turn 2 replays history (user+assistant+user): NOT single-shot — full
         // pipeline, claims the raw key, compression state builds.
         const r2 = await fetch(url, {
