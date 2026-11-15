@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { rmrf } from "./tmp-rm.ts";
 
 const SCRIPT = path.resolve(import.meta.dirname, "../scripts/check-test-import-graph.mjs");
@@ -43,8 +44,12 @@ function makeFixture(dir: string, withViolation: boolean): void {
 }
 
 function runGate(dir: string, simulateWinRel: boolean): GateRun {
+    // --import takes a module specifier, not a path: on Windows a raw absolute
+    // path is parsed as a URL with protocol "c:" (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+    // A file:// URL is accepted on every platform, so hand the loader one.
+    const preload = pathToFileURL(path.join(dir, "preload.mjs")).href;
     const args = simulateWinRel
-        ? ["--import", path.join(dir, "preload.mjs"), SCRIPT]
+        ? ["--import", preload, SCRIPT]
         : [SCRIPT];
     try {
         const stdout = execFileSync(process.execPath, args, { cwd: dir, encoding: "utf8", timeout: 30_000 });
