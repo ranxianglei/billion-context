@@ -865,7 +865,7 @@ async function handleRequest(
                     error: {
                         type: "server_error",
                         code: "v1internal_side_request_payload_too_large",
-                        message: `v1internal side request payload (~${guard.estimate} tokens) reaches the effective context window ${guard.limit} (model=${v1Model ?? "unknown"}) and cannot be shrunk; NOT forwarded — the payload is too large (#6457). Shrink the conversation or raise the model's context window.`,
+                        message: `v1internal side-request payload (~${guard.estimate} tokens) reaches the effective context window ${guard.limit} (model=${v1Model ?? "unknown"}) and cannot be shrunk; NOT forwarded — the payload is too large (#6457). Shrink the conversation or raise the model's context window.`,
                         retryable: false,
                     },
                 }));
