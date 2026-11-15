@@ -873,6 +873,16 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
             String(childEnv!.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")),
             "combined CA bundle exported (#1375)",
         );
+        // #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit
+        // HTTPS_PROXY and must not ride the lane for code/dependency hosts — the default NO_PROXY
+        // keeps loopback + those hosts direct. Model hosts are not listed, so model traffic still
+        // rides the lane.
+        assert.ok(
+            (childEnv!.NO_PROXY ?? "").includes("github.com") && (childEnv!.NO_PROXY ?? "").includes("pypi.org")
+                && (childEnv!.NO_PROXY ?? "").includes("127.0.0.1"),
+            "#6862: default NO_PROXY keeps loopback + non-model code/dependency hosts direct",
+        );
+        assert.equal(childEnv!.no_proxy, childEnv!.NO_PROXY, "lowercase NO_PROXY variant matches");
         assert.equal(childEnv!.HERMES_HOME, hermesHome, "user-set real home survives to the child");
         assert.equal(fs.existsSync(`${hermesHome}-bili`), false, "no hermes overlay dir");
         const after = fs.statSync(path.join(hermesHome, "config.yaml"));
