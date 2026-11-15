@@ -981,14 +981,20 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
-/** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
- *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
- *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
- *  config-file `storage.unified` value (strict spellings); absent everywhere =
- *  full (#3818 flip — the shadow dry-run ran as the default since #2815 and
- *  the digest reconciliation held, so the index is now the load path by
- *  default; JSON envelopes keep being written, and "legacy" remains the
- *  one-line escape hatch). */
+/** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
+ *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED
+ *  (1/true = shadow, full/unified = full, sqlite = pure-sqlite, 0/false/legacy/
+ *  garbage = legacy) wins over the config-file `storage.unified` value (strict
+ *  spellings). "sqlite" is a first-class spelling that behaves exactly like
+ *  "full" for the store machinery (index is the load path, unified-first reads)
+ *  but flips the `storage.jsonWriter` DEFAULT to off — the SQLite index becomes
+ *  the only persistent copy (the Phase 3 #2960 jsonWriter-off posture). The
+ *  absent default is pure-sqlite: after the dual-write fleet ran since #3818
+ *  with digest reconciliation holding, JSON envelopes stop being written by
+ *  default; explicit "full" keeps the historical #3818 semantics (dual-write
+ *  by default), and "legacy" remains the one-line escape hatch. Future
+ *  spellings follow the same shape (mysql = network backend mode, json =
+ *  envelope-only alias for legacy). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
@@ -1012,32 +1018,68 @@ export function resolveArchiveAfterDays(env: NodeJS.ProcessEnv = process.env, fi
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
-        if (raw === "full" || raw === "unified") return "full";
+        if (raw === "full" || raw === "unified" || raw === "sqlite") return "full";
         if (raw === "1" || raw === "true" || raw === "shadow") return "shadow";
         return "legacy";
     }
     const file = fileUnified?.trim().toLowerCase();
-    if (file === "full") return "full";
+    if (file === "full" || file === "sqlite") return "full";
     if (file === "shadow") return "shadow";
     if (file) return "legacy";
     return "full";
 }
 
-/** Phase 3 JSON-envelope switch (#2960): when the unified store runs in
- *  full mode, `storage.jsonWriter=off` stops writing the legacy JSON envelope —
- *  the SQLite index becomes the only persistent copy (reads were already
- *  unified-first since #2671; boot enumerates the index union since #2992).
- *  Env BILI_STORAGE_JSON_WRITER (0/false/off = off; 1/true/on = on) wins over
- *  the config-file `storage.jsonWriter` value; absent = on. Only honored when
- *  the effective mode is full — under shadow/legacy the JSON file remains the
- *  sole source of truth and the request is ignored with a one-time warning.
- *  Rollback: unset the knob (JSON writing resumes; index-only sessions keep
- *  loading via the boot union, and replicas/restore re-materialize envelopes). */
-export function resolveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+/** Whether the RAW unified selection is the pure-sqlite posture: the spelling
+ *  is "sqlite" (either tier) or absent everywhere (the default flipped to
+ *  pure-sqlite). Explicit "full"/"shadow"/"legacy" (and garbage, which degrades
+ *  to legacy) are not. This — not the resolved machine mode — decides the
+ *  jsonWriter default, so `full` and `sqlite` stay distinct knobs even though
+ *  both resolve to the same store machinery. */
+export function unifiedSelectionIsSqlite(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): boolean {
+    const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
+    if (raw) return raw === "sqlite";
+    const file = fileUnified?.trim().toLowerCase();
+    return file === undefined || file === "" || file === "sqlite";
+}
+
+/** Phase 3 JSON-envelope switch (#2960), tri-state: was the JSON envelope
+ *  WRITER explicitly turned on or off? Env BILI_STORAGE_JSON_WRITER
+ *  (0/false/off = off; 1/true/on = on) wins over the config-file
+ *  `storage.jsonWriter` value (strict "off"/"on" spellings); absent or garbage
+ *  = unset, so the unified selection decides the default. */
+export function resolveJsonWriterChoice(env: NodeJS.ProcessEnv = process.env, fileValue?: string): "on" | "off" | "unset" {
     const raw = env.BILI_STORAGE_JSON_WRITER?.trim().toLowerCase();
-    if (raw === "0" || raw === "false" || raw === "off") return true;
-    if (raw === "1" || raw === "true" || raw === "on") return false;
-    return fileValue?.trim().toLowerCase() === "off";
+    if (raw === "0" || raw === "false" || raw === "off") return "off";
+    if (raw === "1" || raw === "true" || raw === "on") return "on";
+    const file = fileValue?.trim().toLowerCase();
+    if (file === "off") return "off";
+    if (file === "on") return "on";
+    return "unset";
+}
+
+/** Effective JSON-writer-off decision. Pure-sqlite selections (spelling
+ *  "sqlite" or absent) DEFAULT to off — the SQLite index is the only
+ *  persistent copy (reads were already unified-first since #2671; boot
+ *  enumerates the index union since #2992). Explicit "full" keeps the
+ *  historical #3818 dual-write default. An explicit on/off at either tier
+ *  overrides the default. Only honored when the effective mode is full on the
+ *  sqlite backend — under shadow/legacy the JSON file remains the sole source
+ *  of truth, and the persist constructor ignores a requested off with a
+ *  one-time warning. Rollback: storage.jsonWriter=on or
+ *  BILI_STORAGE_JSON_WRITER=1 (index-only sessions keep loading via the boot
+ *  union, and replicas/restore re-materialize envelopes). */
+export function effectiveJsonWriterOff(env: NodeJS.ProcessEnv = process.env, fileValue?: string, fileUnified?: string): boolean {
+    const choice = resolveJsonWriterChoice(env, fileValue);
+    if (choice !== "unset") return choice === "off";
+    return unifiedSelectionIsSqlite(env, fileUnified);
+}
+
+/** Was off REQUESTED explicitly (env spelling or file "off")? Used by the
+ *  persist constructor to warn once when the request cannot take effect
+ *  (shadow/legacy/encryption/network backend), distinguishing it from the
+ *  pure-sqlite default being in effect. */
+export function jsonWriterOffRequested(env: NodeJS.ProcessEnv = process.env, fileValue?: string): boolean {
+    return resolveJsonWriterChoice(env, fileValue) === "off";
 }
 
 /** Snapshot-render SHADOW observability switch (#3756 follow-up): compute the

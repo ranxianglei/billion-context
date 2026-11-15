@@ -154,7 +154,13 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
         // Phase A — openai lane (commandcode-style). 8 turns ≈ 50KB of history.
         for (let t = 1; t <= 8; t++) {
             hist.push({ role: "user", text: `Turn ${t}: audit chapter ${t}. ` + FILLER(t, 6) });
-            const resp = await fetch(openaiBase, { method: "POST", headers: dshHeaders, body: JSON.stringify({ model: "probe-model", stream: true, messages: renderOpenai() }) });
+            // #5687 follow-up (#5709): the accepted residual ride of a tool-less
+            // turn 1 now ALSO requires the small pinned one-shot output budget
+            // (utility sidecars pin 4096; agent main turns omit the field). Turn
+            // 1 carries it so this fixture keeps exercising the residual path the
+            // count pins below.
+            const turn1Body = { model: "probe-model", stream: true, ...(t === 1 ? { max_tokens: 4096 } : {}), messages: renderOpenai() };
+            const resp = await fetch(openaiBase, { method: "POST", headers: dshHeaders, body: JSON.stringify(turn1Body) });
             assert.equal(resp.status, 200, `openai turn ${t}`);
             await resp.text();
             hist.push({ role: "assistant", text: `Reply about chapter ${t}: acknowledged. ` + FILLER(t, 0.2) });
@@ -193,10 +199,12 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
         assert.ok(blocksAfterFold.length >= 1, "plugin-mode fold landed on the openai lane");
         const foldedBody = bodies.openai[bodies.openai.length - 1]!;
         assert.ok(!foldedBody.includes(EARLY_FILLER_TAG), "covered head content folded away on the openai lane");
-        // #5656 residual: turn 1 is a tool-less single-shot shape and rides the
-        // verbatim side lane (kernel no-touch), so stats.requests counts from
-        // turn 2 — eight counted turns after nine wire turns. The fork teeth
-        // below are unchanged: a fork would still show as a missing increment.
+        // #5656 residual (narrowed by #5687 follow-up / #5709): turn 1 is a
+        // tool-less single-shot shape WITH the small pinned one-shot budget, so
+        // it rides the verbatim side lane (kernel no-touch) and stats.requests
+        // counts from turn 2 — eight counted turns after nine wire turns. The
+        // fork teeth below are unchanged: a fork would still show as a missing
+        // increment.
         assert.equal(main.stats.requests, 8);
 
         // Turns 10-12: openai lane stays folded.
