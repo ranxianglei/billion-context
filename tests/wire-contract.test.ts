@@ -53,7 +53,7 @@ import {
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
 } from "../src/compress-tool.ts";
-import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
+import { verifySdkHmac, WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, validateVertexAnthropicBody, vertexAnthropicPathInfo, vertexErrorEnvelope, type Wire } from "./wire-contract-fakes.ts";
 
 type ToolShape = Record<string, unknown>;
 
@@ -334,8 +334,10 @@ test("wire-contract ledger: every lane-scoped rule has a live enforcement clause
 });
 
 test("wire-contract ledger: every header rule has a live enforcement clause", () => {
+    const apig = verifySdkHmac({ method: "POST", url: "https://api.example.com/v1/chat/completions", headers: {}, body: Buffer.alloc(0), sk: "fixture-key" });
+    const violations = [...validateGoSessionHeaders({}), ...(apig.reason ? [apig.reason] : [])];
     for (const rule of WIRE_HEADER_RULES) {
-        const enforced = validateGoSessionHeaders({}).some((v) => v.startsWith(rule.id));
+        const enforced = violations.some((v) => v.startsWith(rule.id));
         assert.ok(enforced, `header rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }
 });

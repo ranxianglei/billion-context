@@ -383,10 +383,15 @@ test("#1682: transport failure appears in /__bili/overview and clears on recover
         const a1 = await overviewAlerts(proxyPort);
         assert.equal(a1.length, 1);
         assert.equal(a1[0].kind, "connect-refused");
+        assert.equal(a1[0].code, "ECONNREFUSED");
         assert.equal(a1[0].host, `127.0.0.1:${deadPort}`);
         assert.equal(a1[0].count, 1);
         assert.ok(typeof a1[0].hint === "string" && a1[0].hint.length > 0);
         assert.equal(a1[0].firstSeen, a1[0].lastSeen);
+        const healthResponse = await fetch(`http://127.0.0.1:${proxyPort}/__bili/upstreams`);
+        assert.equal(healthResponse.status, 200);
+        const health = await healthResponse.json() as ReturnType<typeof getUpstreamHealthReport>;
+        assert.equal(health.upstreams[0]?.code, "ECONNREFUSED");
 
         // 2) second failure → same entry, count bumped, no stacking
         const r2 = await chatPost(proxyPort, deadPort, "ep-alerts-1");
