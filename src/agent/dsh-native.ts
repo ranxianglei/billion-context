@@ -3068,6 +3068,12 @@ export function _resetDshNewerBuildNoteForTest(): void {
     dshNewerBuildNoted = false;
 }
 
+/** Test hook (#6770): reset the once-per-process compaction-coverage readout
+ *  flag so a test can pin the emit wiring, not just the formatter. */
+export function _resetCompactionCoverageNoteForTest(): void {
+    compactionCoverageNoted = false;
+}
+
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
  *  mid-request) gets a bounded settle-retry before the gate decides. The
  *  defaults cap the added latency of a dying turn at ~(attempts-1)×delayMs;
