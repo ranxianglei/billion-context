@@ -174,12 +174,13 @@ test("#5595/F4 unified-configured instance with latched sidecar keeps the #5188 
     const base = mkdtempSync(path.join(tmpdir(), "bili-5595f4-latched-"));
     const snap = isolateEnv(base);
     process.env.BILI_STORAGE_UNIFIED = "full";
+    let store: SessionStore | undefined;
     try {
         const sessions = process.env.BILI_SESSIONS_DIR!;
         const shadow = UnifiedShadow.maybeOpen(sessions, process.env);
         assert.ok(shadow, "builtin node:sqlite opens a real sidecar in full mode");
         shadow.stats.disabled = true; // the 3-strike latch state
-        const store = new SessionStore({ dir: sessions, enabled: true, shadow });
+        store = new SessionStore({ dir: sessions, enabled: true, shadow });
         assert.equal(store.configuredUnified, true, "configured unified despite the down sidecar");
         assert.equal(store.replicasAvailable(), false);
         assert.equal(store.sidecarDownReason(), "sidecar-disabled");
@@ -190,6 +191,9 @@ test("#5595/F4 unified-configured instance with latched sidecar keeps the #5188 
         );
         assert.ok(!store.configuredUnified === false, "⇒ the F4 bail must keep sidecarDownReason() here, not the legacy-only message");
     } finally {
+        // Windows: rmrf of an open index.db is EBUSY — release the sidecar
+        // handle first (the #2799/#2908 invariant: no self-handle at rmrf time).
+        store?.closeQuietly();
         restoreEnv(snap);
         rmrf(base);
     }
