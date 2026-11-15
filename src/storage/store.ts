@@ -1121,6 +1121,11 @@ export class UnifiedStore {
                        tail_json = excluded.tail_json,
                        ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
+                       -- #6780: no same-value skip here (or for the #6325 columns): an unchanged
+                       -- OVERFLOW blob (a JSON column big enough to spill onto overflow pages) is
+                       -- copied onto fresh pages whenever ANY column of this row changes, so a
+                       -- CASE-when skip only saves inline-size values. Moving the big blobs out of
+                       -- the row (table-ization) is the real byte-cost fix.
                        orphans_json = excluded.orphans_json`,
                 )
                 .run({
