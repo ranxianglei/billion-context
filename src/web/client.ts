@@ -948,6 +948,11 @@ function changelogCatOf(rawLine) {
     // while any action runs (the server dedupes a second call too).
     let upBusyAction = false;
     let upReleases = [];
+    // #6804: last /update/state snapshot — the pin must target the ON-DISK
+    // version (what checkForUpdate compares), not the running one: in the
+    // pending-restart state the two differ and a pin on the running version
+    // would silently be a no-op. Shape: { running, disk }.
+    let upState = null;
     function upSetButtons(on) {
         [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
             if (!b) return;
@@ -1040,7 +1045,7 @@ function changelogCatOf(rawLine) {
         const unpinBtn = $("up-unpin");
         if (pinStatus) {
             if (st.pin) {
-                const until = st.pin.until ? new Date(st.pin.until).toLocaleString() : t("up.pin_none").replace("No pin", "indefinite").replace("未固定", "");
+                const until = st.pin.until ? new Date(st.pin.until).toLocaleString() : t("up.pin_indefinite");
                 pinStatus.textContent = t("up.pin_active", { v: st.pin.version, until: until || "indefinite" });
             } else {
                 pinStatus.textContent = t("up.pin_none");
@@ -1153,6 +1158,7 @@ function changelogCatOf(rawLine) {
         try {
             const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
             upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            upState = (st && typeof st === "object") ? st : null;
             renderUpdateState(st);
         } catch (e) {
             // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
@@ -1187,16 +1193,19 @@ function changelogCatOf(rawLine) {
     }
     async function upPin() {
         if (upBusyAction) return;
-        const running = $("up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
-        if (!running || running === "?") return;
+        // Pin the ON-DISK version (see upState): the gate compares against
+        // diskVersion ?? runningVersion, so a pending-restart install must be
+        // pinned at its disk version or the pin never fires.
+        const version = (upState && (upState.disk || upState.running)) || "";
+        if (!version || version === "?") return;
         const durSel = $("up-pin-duration");
         const duration = durSel ? durSel.value : "forever";
         upBusyAction = true;
         upSetButtons(true);
         showUpdateResult(t("up.installing", {}), true);
         try {
-            const r = await json(API_ROOT + "/update/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: running, duration: duration }) });
-            if (r.ok) showUpdateResult(t("up.pin_set", { v: running, until: duration }), true);
+            const r = await json(API_ROOT + "/update/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version, duration: duration }) });
+            if (r.ok) showUpdateResult(t("up.pin_set", { v: version, until: duration }), true);
             else showUpdateResult(String(r.error || t("up.pin_failed", { err: "unknown" })), false);
         } catch (e) {
             showUpdateResult(e.message, false);
@@ -1212,7 +1221,7 @@ function changelogCatOf(rawLine) {
         upSetButtons(true);
         try {
             const r = await json(API_ROOT + "/update/unpin", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-            if (r.ok) showUpdateResult(t("up.pin_cleared"), true);
+            if (r.ok) showUpdateResult(r.hadPin === false ? t("up.pin_none") : t("up.pin_cleared"), true);
             else showUpdateResult(String(r.error || t("toast.failed", { msg: "unpin failed" })), false);
         } catch (e) {
             showUpdateResult(e.message, false);
