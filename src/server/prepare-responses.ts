@@ -708,7 +708,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                     deltaServed = !sel.reseed && sel.delta.length > 0 && sel.delta.length < totalElements;
                 },
             } : {}),
-            ...(planeBypass ? { bypass: true } : {}),
+            // #6181 B0 plane bypass + the failed-flush guard: when the
+            // in-request flush above failed, the plane is one turn stale and
+            // selectOutbound would delta against the OLD world (new suffix
+            // dropped) — serve the legacy full bytes for this round.
+            ...(planeBypass || (snapFlush !== undefined && !snapFlush.ok) ? { bypass: true } : {}),
         });
         if (deltaState !== undefined && !selectionFired) {
             // Delta was requested but the plane degraded to legacy this round
@@ -1095,11 +1099,22 @@ export function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    // #6539 KDD #17: the msgid carriers ride the body on the PLUGIN-lane
+    // chained rounds that take THIS verbatim path (the main /responses
+    // pipeline strips them in prepareResponses; this function bypasses it,
+    // so the strip must live here too). Mutate `parsed` (same as the main
+    // pipeline) and force a rebuilt body whenever a field was present —
+    // the raw-buffer fallback would otherwise forward the carrier verbatim.
+    const hadMsgIdFields =
+        Object.prototype.hasOwnProperty.call(parsed, MSG_IDS_BODY_FIELD) ||
+        Object.prototype.hasOwnProperty.call(parsed, MSG_SEQS_BODY_FIELD);
+    delete (parsed as unknown as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as unknown as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     // A bili-forged compaction item is never for the upstream (it carries our
     // sentinel blob) — strip it on every forwarding path, same as the normal
     // /responses pipeline does.
     const cleaned = Array.isArray(parsed.input) ? stripBiliCompactionItems(parsed.input) : parsed.input;
-    const stripped = Array.isArray(parsed.input) && cleaned.length !== parsed.input.length;
+    const stripped = hadMsgIdFields || (Array.isArray(parsed.input) && cleaned.length !== parsed.input.length);
     const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
     const base: Prepared = {
         body: stripped ? Buffer.from(JSON.stringify(forgeBody)) : body,

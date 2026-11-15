@@ -334,6 +334,10 @@ export async function prepareGoogle(
             protocol: "google",
             log,
             isCompressTool: loopConfig.isCompressTool,
+            // A failed in-request flush leaves the plane one turn stale —
+            // serving it would drop this round's newest input; degrade to
+            // the legacy bytes (see the openai twin).
+            ...(snapFlush && !snapFlush.ok ? { bypass: true } : {}),
             transform: (m) => stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state),
         });
         // #1001: a silent client history rewrite takes the same archive+prune path

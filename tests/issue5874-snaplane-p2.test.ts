@@ -574,3 +574,31 @@ test("G5 direct authority: the plane is served regardless of the legacy bytes", 
     );
     assert.ok(!out.some((m) => m.id === "sentinel"));
 });
+
+test("G6 failed in-request flush: the prepare lanes pass bypass and the legacy bytes are served", () => {
+    // #6181 review (post-enable path): a failed in-request flush leaves the
+    // plane one turn STALE — serving it would drop this round's newest input.
+    // The four prepare lanes now map flushOrSkip().ok === false to
+    // deps.bypass; this pins that the bypass short-circuits a healthy,
+    // row-backed plane (the exact shape of the failure mode: egress ON,
+    // plane populated, flush failed).
+    const dir = tmpDir("bili-5874-g6-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const sid = "g6";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+    setConfig({ storage: { snapBase: { egress: true } } });
+
+    const legacy = [{ id: "sentinel", role: "user", contentType: "text", text: "stale-plane must not be served" } as BiliMessage];
+    const out = applySnapEgress(stateFor(blk), legacy, {
+        sessionId: sid,
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m,
+        bypass: true, // what prepare-openai/anthropic/google/responses pass when snapFlush.ok === false
+    });
+    assert.equal(out, legacy, "bypass must return the legacy array verbatim");
+    assert.equal(snapEgressStatusWire().plane, 0, "a bypassed turn must not count as a plane serve");
+});

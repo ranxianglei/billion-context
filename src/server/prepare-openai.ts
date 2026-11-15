@@ -452,6 +452,12 @@ export async function prepareOpenai(
             protocol: "openai",
             log,
             isCompressTool: loopConfig.isCompressTool,
+            // The in-request flush above is the ONLY plane write for this
+            // turn — a failed one leaves the plane one turn stale, and
+            // serving it would drop this round's newest input (degrade to
+            // the legacy bytes; the same turn's legacy save still lands via
+            // the markDirty fallback below).
+            ...(snapFlush && !snapFlush.ok ? { bypass: true } : {}),
             transform: (m) => applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId),
         });
         // #1001: a silent client history rewrite takes the same archive+prune path

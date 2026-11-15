@@ -479,6 +479,10 @@ export async function prepareAnthropic(
             protocol: "anthropic",
             log,
             isCompressTool: loopConfig.isCompressTool,
+            // A failed in-request flush leaves the plane one turn stale —
+            // serving it would drop this round's newest input; degrade to
+            // the legacy bytes (see the openai twin).
+            ...(snapFlush && !snapFlush.ok ? { bypass: true } : {}),
             transform: (m) => applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId),
         });
         // #1001: a silent client history rewrite takes the same archive+prune path
