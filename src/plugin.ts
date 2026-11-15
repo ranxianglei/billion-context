@@ -1800,17 +1800,17 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.lastPassIds = prefix.map((m) => m.rawId);
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
-            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            const forkRefs = new Set(prefix.map((m) => m.ref));
+            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => forkRefs.has(ref));
             // #3939 ③: only latch entries whose messages rode the forked
             // prefix — the child never sees the others, so their entries
             // would be dead weight (and retire on the next latch pass anyway).
-            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
+            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => forkRefs.has(e.ref));
             // #3939 ②: deferred refs are content-keyed (byRaw ids) — keep only
             // the ones whose carrier rode the forked prefix.
-            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => prefix.some((m) => m.ref === r));
+            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => forkRefs.has(r));
             // #3939 ⑤: view-latch entries are ref-keyed — keep only the
             // carriers that rode the forked prefix.
-            const forkRefs = new Set(prefix.map((m) => m.ref));
             if (parent.state.viewLatches) {
                 child.state.viewLatches = Object.fromEntries(
                     Object.entries(parent.state.viewLatches).filter(([r]) => forkRefs.has(r)),
@@ -1835,7 +1835,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).
-            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
+            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !forkRefs.has(ref));
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);

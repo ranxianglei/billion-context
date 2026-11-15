@@ -12,11 +12,13 @@
 |------|------|------|
 | **配置文件（Linux）** | `~/.config/billion-context/billion-context.json` | XDG 基础目录规范 —— 标准、用户可编辑的配置 |
 | **配置文件（覆盖目录）** | `XDG_CONFIG_HOME` 的值 | 重定位整个配置目录 |
-| **配置文件（显式指定）** | `BILI_CONFIG_FILE` 的值 | 直接指向任意 JSON 文件 |
-| **CLI 参数** | `--config <FILE>` | 与 `BILI_CONFIG_FILE` 等价，文件路径优先级最高 |
+| **配置文件（显式指定）** | `BILI_CONFIG_FILE` 的值 | 直接指向任意 JSON 文件；不带 `/` 的纯名字 NAME 选择命名配置 `<configDir>/NAME.json` |
+| **CLI 参数** | `--config <NAME\|FILE>`（短名：`-c`） | 与 `BILI_CONFIG_FILE` 等价，文件路径优先级最高 |
 | **会话数据** | `~/.local/share/billion-context/sessions/` | 持久化的压缩状态，会随时间增长 |
 
 首次运行时，`billion-context` 会在配置路径下生成一个空模板（`{ "providers": {} }`），方便你直接编辑。它**不会**覆盖已存在的文件。
+
+不带目录分隔符、且当前目录也没有同名文件的**纯名字**（如 `dsh-test`）不是路径而是**命名配置**：解析为 `<configDir>/<名字>.json` —— 例如 `bili start -c dsh-test` 使用 `~/.config/billion-context/dsh-test.json`。按模型/用途各放一个文件，用 `-c` 切换，不用动 `BILI_CONFIG_FILE` 环境变量。名字写错会拒绝启动并列出可用的名字（显式**路径**写错则保持历史行为：按空配置启动）。
 
 配置文件是一个纯粹的覆盖层 —— 每个字段都是可选的。任何未设置的字段都会回退到内置默认值。
 
@@ -391,7 +393,7 @@
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
 | `BILI_STORAGE_QUICK_CHECK` | string | on | — | 存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；一旦由本次启动自己的扫描证实损坏，文件原样保留在原地——不做任何自动搬移、复制或重建（自动恢复已撤回：BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本，自动操作无法保证完整数据恢复）——bili 照常启动，改用 JSON 信封服务，并给出响亮、可操作的告警指明手工修复步骤（备份后把 index.db/-wal/-shm 手工移开再启动——全新索引会从 JSON 信封重建）。PASS 判定会被缓存，之后的启动跳过重扫；FAIL 判定永不持久化（2026-10-30 owner 策略）：运行期/后台发现只是告警（响亮日志 + runtime-status，进程继续服务——jsonWriter 开启期间所写的 JSON 信封是恢复来源），每次启动都对当前文件集做新鲜扫描再判定，旧版本遗留的陈旧 FAIL 永远不能阻断后续启动。既没有自动改名/修复，也没有 legacy-only 兜底（继续以 legacy-only 运行会让 JSON 信封与死掉的索引永久分叉、再无对账可能）。瞬态打开失败（无引擎 / CANTOPEN / 只读 / 后端 DSN）仍响亮地拒绝启动并给出可操作的错误——环境类问题同样不允许静默走 legacy 兜底（活的第二写者已于 2026-10-31 移出该拒绝清单：多进程共享一个本地盘 index.db 是受支持拓扑，只提示、永不阻断启动）；真正需要纯 JSON 服务的部署请显式设置 BILI_STORAGE_UNIFIED=legacy（注意：留空现在是纯 SQLite 缺省，不是 legacy）。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
-| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
+| `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。不带 `/` 的纯名字 NAME 选择命名配置 `<configDir>/NAME.json`；名字写错立即报错并列出可用名字，显式路径写错保持历史空配置行为。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM 隧道车道的主机白名单。 |
@@ -2075,7 +2077,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_KEEPALIVE_MS` | 流式阶段客户端保活（#1647）：SSE 响应连续该毫秒数没有向客户端写出任何字节时，bili 发一条 SSE 注释行（`: bili-keepalive`，协议层 no-op），防止客户端 undici `bodyTimeout`（默认 300s；Node 内置 fetch 无法按请求覆盖）在长 prefill 时断连——上游的 ping 注释会被重写器/剥离管道吞掉。默认 `15000`；`0` 关闭。与 `BILI_PREFLIGHT_HOLD_MS` 互补：后者覆盖压缩预检期的静默，本变量覆盖流式期上游导致的静默。 |
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。**共存提示（#3528）：** 默认的访问器形态与要求 `globalThis.fetch` 为普通可写数据属性的第三方组件不兼容——它们读取其属性描述符、发现没有 `value`，便在加载时中止 fetch 观察者（已报告：DSH 桌面「开发者工具 / NodeJS 诊断」插件，`@deepseek-ai/dsh-experimental-inspector`）。设 `0`（然后完全重启宿主）让此类观察者经经典直装正常加载；代价见上文。详见 #3528。 |
 | `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。**内置方案**无法重签的请求（解析不出凭据）本地拒收 403 并给出可操作提示——其修复（提供凭据）是可操作的。其他任何被检测到的方案（SigV4、`x-ofm-signature` 等网关自造头——检测是形状判定，#2090）在 bili 内部没有凭据来源也没有重签器，因此**一律本地拒收**（二元契约：重签+压缩或拒绝，绝不无签名放行）：403 指明方案名，记入 `resign-pending.json`，每次启动（以及 web UI）反复提醒直到 bili 补上该方案的重签器。`BILI_RESIGN_PASSTHROUGH=1` 仅对内置方案开启原样转发（不压缩）——对其余方案无效。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块——按签名方案分键（`resign["sdk-hmac-sha256"]`；`providers.<url>.resign["<方案>"]` 是二级覆盖）——环境变量优先于文件。方案键把 passthrough 钉死到具体签名：只有自己的键设了的方案才走隧道。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
-| `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
+| `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件；纯名字选择命名配置 `<configDir>/NAME.json`）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
@@ -2249,7 +2251,7 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 |---|---|
 | `--port <N>` | 监听端口（默认 `8787`） |
 | `--host <ADDR>` | 监听主机（默认 `127.0.0.1`） |
-| `--config <FILE>` | 配置 JSON 路径（默认： XDG 位置） |
+| `--config <NAME\|FILE>` | 配置 JSON 路径，或纯名字的命名配置 `<configDir>/NAME.json`（短名：`-c`；默认： XDG 位置） |
 | `--debug` | 详细日志 |
 | `--passthrough` | 不经压缩直接转发 |
 | `--no-passthrough` | 强制开启压缩（覆盖配置文件） |

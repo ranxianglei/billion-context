@@ -414,6 +414,40 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
 
+test("HTTP fork retains ref state in source order and removes only the excluded side", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false);
+    try {
+        const count = 256;
+        const history = Array.from({ length: count }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `fork source ${i}` }));
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((message) => message.ref);
+        const parent = resolveConversation("parent").session!;
+        parent.state.hiddenOrphanRefs = [refs[127]!, refs[128]!, refs[0]!, refs[127]!];
+        parent.state.emergencyTruncateLatch = [
+            { ref: refs[1]!, text: "first clipped text" },
+            { ref: refs[200]!, text: "outside clipped text" },
+            { ref: refs[126]!, text: "last clipped text" },
+        ];
+        parent.state.renderDeferredRefs = [refs[255]!, refs[2]!, refs[2]!];
+        parent.state.deadRefs = [refs[3]!, refs[254]!, refs[255]!, refs[254]!];
+        parent.state.viewLatches = { [refs[4]!]: { text: "inside" }, [refs[129]!]: { text: "outside" } };
+        const before = structuredClone(parent.state);
+
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", 128));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("child").session!;
+        assert.deepEqual(child.state.hiddenOrphanRefs, [refs[127], refs[0], refs[127]]);
+        assert.deepEqual(child.state.emergencyTruncateLatch, [before.emergencyTruncateLatch![0], before.emergencyTruncateLatch![2]]);
+        assert.deepEqual(child.state.renderDeferredRefs, [refs[2], refs[2]]);
+        assert.deepEqual(child.state.deadRefs, [refs[254], refs[255], refs[254]]);
+        assert.deepEqual(child.state.viewLatches, { [refs[4]!]: { text: "inside" } });
+        assert.deepEqual(child.pluginSnapshot, parent.pluginSnapshot!.slice(0, 128));
+        assert.deepEqual(parent.state, before, "fork filtering does not mutate the parent's state");
+    } finally { await h.close(); }
+});
+
 test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", { timeout: 60_000 }, async () => {
     const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
     try {
