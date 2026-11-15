@@ -27,7 +27,7 @@ import { test } from "node:test";
 import { startRegistry } from "./registry-fixture.js";
 import { biliSpawnEnv, isolatedEnv, npmHomeEnv, npmRunSync, windowsSystemEnv } from "./crossplat.ts";
 
-const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
     name: string;
     files: string[];
