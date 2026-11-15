@@ -166,6 +166,66 @@ test("WC-024 thinking blocks must carry a signature (#5998)", () => {
     })[0], /WC-024/);
 });
 
+test("WC-025 TTS-shaped requests must not carry a leading system message (#6636)", () => {
+    // Illegal: the #6636 shape — audio output + a leading system message is
+    // what bili injected (ACP tags prompt) and what the TTS upstream 400s.
+    assert.match(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "system", content: "ACP TAGS\n\nAddressable messages…" },
+            { role: "user", content: "read this aloud" },
+            { role: "assistant", content: "the text to speak." },
+        ],
+        audio: { format: "mp3", voice: "mimo_default" },
+        stream: false,
+    })[0], /WC-025/);
+    // Legal: the same TTS call without the leading system (the issue's
+    // control experiment — returns 200).
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "user", content: "read this aloud" },
+            { role: "assistant", content: "the text to speak." },
+        ],
+        audio: { format: "mp3", voice: "mimo_default" },
+        stream: false,
+    }), []);
+    // Legal: a leading system message with no audio object is a plain chat
+    // turn, not a TTS request — the rule keys on the audio shape.
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "fake-a",
+        messages: [
+            { role: "system", content: "ACP TAGS\n\nAddressable messages…" },
+            { role: "user", content: "hello" },
+        ],
+        stream: false,
+    }), []);
+    // Legal: an empty audio object carries no media request.
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "mimo-v2.5-tts",
+        messages: [
+            { role: "system", content: "ACP TAGS" },
+            { role: "user", content: "hello" },
+        ],
+        audio: {},
+        stream: false,
+    }), []);
+    // Legal: a tool-carrying audio request is a main turn, not a TTS call —
+    // its model has an action surface and accepts a leading system message,
+    // so bili's ACP decoration there is legal (no-tools veto, mirrors
+    // isAudioOutputCall).
+    assert.deepEqual(VALIDATORS["openai-chat"]({
+        model: "voice-chat",
+        messages: [
+            { role: "system", content: "ACP TAGS" },
+            { role: "user", content: "hello" },
+        ],
+        audio: { format: "wav", voice: "alloy" },
+        tools: [{ type: "function", function: { name: "bash", parameters: { type: "object", properties: {} } } }],
+        stream: false,
+    }), []);
+});
+
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
     // #2648 shape: unmarked tools render ahead of a global system block.
     assert.match(VALIDATORS.anthropic({
@@ -274,6 +334,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
             { tools: [{ type: "function", function: { name: "x".repeat(65), parameters: { type: "object", properties: {} } } }] },
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
+            // WC-025: the #6636 shape — TTS audio object + a leading system message.
+            { model: "mimo-v2.5-tts", messages: [{ role: "system", content: "ACP TAGS" }, { role: "user", content: "hi" }], audio: { format: "mp3", voice: "mimo_default" } },
         ],
         responses: [
             { type: "response.create", input: [], stream: true },

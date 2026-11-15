@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import type http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { recordClientUa, _resetClientUaRegistryForTest } from "../src/client-ua-registry.js";
 import { recordConflict } from "../src/conflict-watch.js";
 import { closeLogger, configureLogger } from "../src/logger.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -15,7 +16,7 @@ import { makeOpts } from "./corrupt-index-child.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "BILI_SESSIONS_DIR", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 type Report = Awaited<ReturnType<typeof buildDiagnostics>>;
-type Source = "storage log" | "conflict log" | "config" | "conflict detail" | "topic";
+type Source = "storage log" | "conflict log" | "config" | "conflict detail" | "topic" | "user-agent";
 type Boundary = "split pair" | "whole pair" | "ASCII";
 interface Fixture { config: string; log: string }
 
@@ -38,12 +39,14 @@ async function withFixture(fn: (fixture: Fixture) => Promise<void>): Promise<voi
     const store = new SessionStore({ enabled: false });
     _setStoreForTest(store);
     _resetSessionsForTest();
+    _resetClientUaRegistryForTest();
     try {
         await fn({ config, log });
     } finally {
         await closeLogger();
         configureLogger(undefined);
         _resetSessionsForTest();
+        _resetClientUaRegistryForTest();
         store.closeQuietly();
         for (const [key, value] of saved) {
             if (value === undefined) delete process.env[key];
@@ -64,6 +67,11 @@ function prepare(fixture: Fixture, source: Source, boundary: Boundary): { topic?
     if (source === "topic") {
         const value = boundedValue("", 64, boundary);
         return { topic: `  ${value.input}  `, expected: `topic: ${value.expected} (no topic-specific section registered)` };
+    }
+    if (source === "user-agent") {
+        const value = boundedValue("Mozilla/5.0 ", 120, boundary);
+        recordClientUa({ "user-agent": `  ${value.input}  ` });
+        return { expected: `observed client user-agents: other: ${value.expected}` };
     }
     if (source === "config") {
         const prefix = '{"notes":"';
@@ -93,7 +101,7 @@ function assertReport(report: Report, expected: string, suffix = false): void {
     assert.equal(url.searchParams.get("title"), report.title);
 }
 
-for (const source of ["storage log", "conflict log", "config", "conflict detail", "topic"] as const) {
+for (const source of ["storage log", "conflict log", "config", "conflict detail", "topic", "user-agent"] as const) {
     for (const boundary of ["split pair", "whole pair", "ASCII"] as const) {
         test(`diagnostics ${source}: ${boundary} at the display boundary`, async () => {
             await withFixture(async (fixture) => {

@@ -3296,7 +3296,13 @@ export class SessionStore {
         // anything (the content-store re-key happens inside and must land in
         // the same write). Cold-load alignment retired: see loadSync note.
         this.consumePendingLedgerAlign(session);
-        if (!this.saveContentStore(session)) return;
+        if (!this.saveContentStore(session)) {
+            // #6793-review: this save will not run — drop the #6780 arm so it
+            // cannot pin this session's lastMessages + metadata fingerprint
+            // in memory forever (leak on eviction).
+            this.durabilityArms.delete(session.id);
+            return;
+        }
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
@@ -3381,6 +3387,12 @@ export class SessionStore {
             });
             return;
         }
+        // #6793-review: the durability arm is only consulted by the writer-off
+        // coalesced run above. The debounced path always builds the full record
+        // and never reads the arm — clear it here, otherwise an armed-but-
+        // debounced save (JSON-writer process) leaks one arm (pinning
+        // lastMessages + a metadata snapshot) per evicted session.
+        this.durabilityArms.delete(session.id);
         if (!this.enabled) return;
         this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
@@ -3577,7 +3589,12 @@ export class SessionStore {
      *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
-        if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
+        if (!this.saveContentStore(session)) {
+            // #6793-review: see scheduleSave — the arm is useless without a
+            // writer-off coalesced run; clear it before propagating.
+            this.durabilityArms.delete(session.id);
+            throw new Error(`Originals were not saved for ${session.id}`);
+        }
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
             // #3133: drop the armed microtask (token mismatch below) — this
@@ -3595,6 +3612,9 @@ export class SessionStore {
             this.dropResidentContentStore(session);
             return;
         }
+        // #6793-review: full-build path (store.writeNow) never consults the
+        // durability arm — clear it so it cannot pin state after eviction.
+        this.durabilityArms.delete(session.id);
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
         this.saveWritesInFlight.add(session.id);
         const rec: { v: PersistedSession | null } = { v: null };
