@@ -146,7 +146,7 @@ export function currentCalibrationFactor(stats: { calibratedEstimate?: number; c
     return k;
 }
 
-/** #5373: clamp band for estimator scale factors — the ring-published k̂ and
+/** #5370: clamp band for estimator scale factors — the ring-published k̂ and
  *  the provisional overflow bias alike. A factor outside [0.25, 4] describes
  *  a different billing substrate, not a scale drift, and must not steer local
  *  judgments. Single home for the band: learning (cache-ledger ingest), read
@@ -154,7 +154,7 @@ export function currentCalibrationFactor(stats: { calibratedEstimate?: number; c
 export const CALIBRATION_CLAMP_MIN = 0.25;
 export const CALIBRATION_CLAMP_MAX = 4;
 
-/** #5373: does a factor recorded on `kOrigin` apply to a request now routing
+/** #5370: does a factor recorded on `kOrigin` apply to a request now routing
  *  to `origin`? Both origins known and equal → yes; either unknown or the
  *  routes differ → no (raw estimate, legacy behavior). The same gate
  *  applyEstimateCalibration enforces at scale time, extracted so
@@ -165,7 +165,7 @@ export function calibrationOriginApplies(kOrigin: string | undefined, origin: st
     return a !== undefined && b !== undefined && a === b;
 }
 
-// #5373: model-compatibility gate shared by the ring factor and the
+// #5370: model-compatibility gate shared by the ring factor and the
 // provisional overflow bias — mirrors currentCalibrationFactor's rule: both
 // models known (non-empty strings) and different → absent; missing
 // information on either side never invalidates the evidence.
@@ -175,12 +175,12 @@ function calibrationModelCompatible(recorded: string | undefined, lastModel?: un
     return true;
 }
 
-/** #5373: pick the estimator scale factor allowed to steer local judgments
+/** #5370: pick the estimator scale factor allowed to steer local judgments
  *  on THIS route, with its provenance origin for applyEstimateCalibration.
  *  A ring-published k̂ applicable to the route wins (unchanged semantics);
  *  otherwise the provisional overflow bias retained at arm time — on a fresh
  *  overflow-only session the ring's ≥2-sample publication can never happen
- *  while every forward keeps overflowing (#5373 permanent 400 loop), so the
+ *  while every forward keeps overflowing (#5370 permanent 400 loop), so the
  *  first overflow's stated counts must steer immediately; otherwise absent
  *  (raw estimate, today's behavior). */
 export function effectiveCalibration(

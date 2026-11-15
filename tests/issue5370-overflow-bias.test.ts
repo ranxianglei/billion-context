@@ -1,4 +1,4 @@
-// #5373 regression — DSH lane, 0.1.209: the local estimator under-counts a
+// #5370 regression — DSH lane, 0.1.209: the local estimator under-counts a
 // CJK-heavy payload while the declared completion reserve eats part of the
 // window, so folding to raw ≤ (window − reserve) still overflows on EVERY
 // forward: permanent 400 loop after a resume-miss. The overflow body STATES
@@ -66,7 +66,7 @@ function estUnits(text: string): number {
 
 // Bills EVERY string in the body at RATIO × the local estimator formula —
 // the same basis family as bili's own estimate (messages + system + tools +
-// wire residue), scaled up by the provider's tokenizer gap (#5373's core
+// wire residue), scaled up by the provider's tokenizer gap (#5370's core
 // asymmetry). Bili's estimate additionally carries overhead ON TOP of the
 // string mass, so a calibrated fold-stop (raw×ratio < target) guarantees the
 // billed total fits, while a raw-estimate stop overshoots.
@@ -281,7 +281,7 @@ test("calibrationOriginApplies: normalized equality only", () => {
 
 // --- e2e: the real pipeline through DeepSeek-shaped overflows -------------
 
-test("#5373 mechanism: the first overflow retains a stated-calibre bias without publishing the ring", { timeout: 240_000 }, async () => {
+test("#5370 mechanism: the first overflow retains a stated-calibre bias without publishing the ring", { timeout: 240_000 }, async () => {
     const up = await startMock();
     const proxy = await startServer(baseOptions(up.port));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -306,7 +306,7 @@ test("#5373 mechanism: the first overflow retains a stated-calibre bias without 
     }
 });
 
-test("#5373 regression: the grown turn after an overflow fits on its initial forward", { timeout: 300_000 }, async () => {
+test("#5370 regression: the grown turn after an overflow fits on its initial forward", { timeout: 300_000 }, async () => {
     const up = await startMock();
     const proxy = await startServer(baseOptions(up.port));
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -340,7 +340,7 @@ test("#5373 regression: the grown turn after an overflow fits on its initial for
         assert.equal(t2.status, 200, `grown turn must recover, got ${t2.status}: ${t2.text.slice(0, 200)}`);
         for (const m of mainsT2) {
             assert.ok(m.billed <= TARGET,
-                `a grown-turn forward billed ${m.billed} (> judging limit ${TARGET}): the stated counts did not steer the fold target (#5373)`);
+                `a grown-turn forward billed ${m.billed} (> judging limit ${TARGET}): the stated counts did not steer the fold target (#5370)`);
         }
         assert.ok(sumsT2 <= 4, `grown turn burned ${sumsT2} summarize calls: fold work must stay bounded under the arm`);
 

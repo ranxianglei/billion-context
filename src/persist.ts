@@ -4227,7 +4227,7 @@ function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Ma
     return blockContents;
 }
 
-// #5373: same discipline for the provisional overflow-stated bias — every
+// #5370: same discipline for the provisional overflow-stated bias — every
 // field validated, ratio clamped into the published band, non-positive
 // measurements dropped. A corrupt entry must degrade to absent (raw estimate),
 // never steer a decision off-scale.

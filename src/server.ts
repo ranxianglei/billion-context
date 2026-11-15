@@ -3963,7 +3963,7 @@ export async function preflightCompressIfNeeded(
     // settleUsageReport). Unknown/mismatched origin → raw estimate, i.e. the
     // uncalibrated legacy behavior. #2117 B: the model dimension gates too — a
     // factor learned on another model acts as absent here rather than deciding
-    // with a cross-model billing scale (currentCalibrationFactor). #5373: when
+    // with a cross-model billing scale (currentCalibrationFactor). #5370: when
     // the ring has published nothing applicable to this route, fall back to the
     // provisional overflow-stated bias retained at arm time — on a fresh
     // overflow-only session ring publication can never happen while every
@@ -4432,7 +4432,7 @@ export async function preflightCompressIfNeeded(
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
         foldedCalibratedSize = rebuiltCalibrated;
-        // Quote savings from THIS line's own endpoints (#5373): result.savedTokens
+        // Quote savings from THIS line's own endpoints (#5370): result.savedTokens
         // is the preflight meter (floored per round by the baseline), which can
         // clamp to 0 while the quoted estimates still show real reduction — the
         // incident logged "~0 tokens saved (913329 → 875788)".

@@ -1799,7 +1799,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // forever. The refold below re-runs prepare and re-notes a fresh
             // pair for the folded body (#1195), so retiring the consumed pair
             // here cannot mispair a later report.
-            // #5373: retain the overflow's stated count as a PROVISIONAL estimator
+            // #5370: retain the overflow's stated count as a PROVISIONAL estimator
             // scale for this route. The ring above publishes only from ≥2 agreeing
             // samples and is a single slot any other-origin/model settle clobbers,
             // so on a fresh overflow-only session (resume-miss sub-session, no usage
@@ -1836,7 +1836,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         const replace = !sameLane || (mismatched !== (prev.mismatched === true) ? !mismatched : ratio > prev.ratio);
                         if (replace) {
                             s.stats.overflowBias = { ratio, origin: biasOrigin, ...(biasModel !== undefined ? { model: biasModel } : {}), measured, estimate: s.stats.lastLocalTextEstimate, ...(mismatched ? { mismatched: true } : {}) };
-                            log("info", `[${s.id}] retained overflow-stated bias r=${ratio.toFixed(3)}${mismatched ? ` (raw ${rawRatio.toFixed(2)} outside [${CALIBRATION_CLAMP_MIN}, ${CALIBRATION_CLAMP_MAX}] — stated count does not match bili's view, NOT steering)` : ""} (upstream stated ${measured} vs local est ${Math.round(s.stats.lastLocalTextEstimate)}, model=${biasModel ?? "unknown"}) — steering local judgments on this route until the ring supersedes (#5373)`);
+                            log("info", `[${s.id}] retained overflow-stated bias r=${ratio.toFixed(3)}${mismatched ? ` (raw ${rawRatio.toFixed(2)} outside [${CALIBRATION_CLAMP_MIN}, ${CALIBRATION_CLAMP_MAX}] — stated count does not match bili's view, NOT steering)` : ""} (upstream stated ${measured} vs local est ${Math.round(s.stats.lastLocalTextEstimate)}, model=${biasModel ?? "unknown"}) — steering local judgments on this route until the ring supersedes (#5370)`);
                         }
                     }
                 }

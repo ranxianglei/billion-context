@@ -1785,7 +1785,7 @@ export const CALIBRATION_SAMPLE_MAX = 5;
 // it covers the measured CJK band and stays BELOW CALIBRATION_SAMPLE_MAX (5),
 // so non-corresponding reports are still rejected before the clamp sees them.
 // Wild values remain bounded by the evidence gates: ≥2 recent samples agreeing
-// within ×2, keyed by route AND model, MIN_ESTIMATE floor. Since #5373 the
+// within ×2, keyed by route AND model, MIN_ESTIMATE floor. Since #5370 the
 // constants live in util.ts (the read side needs them too) and are
 // re-exported here so existing imports keep resolving.
 export { CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN } from "./util.js";
@@ -1826,9 +1826,9 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const pendingEst = session.stats.lastLocalTextEstimate;
     const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst === undefined || pendingEst < CALIBRATION_MIN_ESTIMATE || settleOrigin === undefined || pendingOrigin !== settleOrigin) {
-        // #5373: this gate used to fail SILENTLY — in production there was no
+        // #5370: this gate used to fail SILENTLY — in production there was no
         // trace whether a measurement was ever ingested, which is exactly what
-        // made the #5373 incident undiagnosable from the log. One debug line
+        // made the #5370 incident undiagnosable from the log. One debug line
         // with the reason keeps healthy sessions quiet but makes every miss
         // greppable.
         loggerLog("debug", `[${session.id}] calibration sample not ingested: ${pendingEst === undefined ? "no pending local estimate" : pendingEst < CALIBRATION_MIN_ESTIMATE ? `local estimate ${Math.round(pendingEst)} below min ${CALIBRATION_MIN_ESTIMATE}` : settleOrigin === undefined ? "no settle origin" : `origin mismatch (${pendingOrigin ?? "?"} ≠ ${settleOrigin})`}, billed=${billed} (#1933)`);
@@ -1912,7 +1912,7 @@ export function settleOverflowCalibration(
     if (!(measured > 0)) return;
     const pendingBefore = session.stats.lastLocalTextEstimate;
     ingestCalibrationPair(session, measured, upstream);
-    loggerLog("info", `[${session.id}] overflow-stated measurement ingested: upstream stated ${measured} tokens for the rejected payload, local est ${pendingBefore !== undefined ? Math.round(pendingBefore) : "none"} (route=${normalizeUpstreamOrigin(upstream) ?? "?"}) — ring discipline applies (#3900/#5373)`);
+    loggerLog("info", `[${session.id}] overflow-stated measurement ingested: upstream stated ${measured} tokens for the rejected payload, local est ${pendingBefore !== undefined ? Math.round(pendingBefore) : "none"} (route=${normalizeUpstreamOrigin(upstream) ?? "?"}) — ring discipline applies (#3900/#5370)`);
     // The rejected request will never produce a usage report — retire its
     // pending pair NOW so no later report can mispair against a consumed
     // estimate (#1933 F1). A same-request refold (#1195) re-runs prepare and

@@ -593,14 +593,14 @@ export type Session = {
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
           *  native-compaction boundaries with the rest of the baseline stats. */
           calibrationRing?: { origin: string; model?: string; values: number[] };
-         /** #5373: provisional estimator scale from a SINGLE overflow 400's
+         /** #5370: provisional estimator scale from a SINGLE overflow 400's
           *  stated counts — ratio = upstream-stated message count ÷ the same
           *  payload's local estimate at arm time, clamped like k̂. The ring
           *  above publishes only from ≥2 agreeing samples and is a single slot
           *  that any other-origin/model settle clobbers; on a fresh
           *  overflow-only session (resume-miss sub-session, no usage history)
           *  publication can therefore never happen while every forward keeps
-          *  overflowing — a permanent 400 loop (#5373). This field makes the
+          *  overflowing — a permanent 400 loop (#5370). This field makes the
           *  first overflow steer local judgments immediately (effectiveCalib-
           *  ration falls back to it when the ring has nothing applicable to
           *  the decision route); a ring-published k̂ supersedes it. Update
@@ -608,7 +608,7 @@ export type Session = {
           *  direction — over-folding costs summary tokens, never wire
           *  integrity). Persisted like the ring; reset at compaction
           *  boundaries with it. */
-          /** #5373: the stated count was ≥4× / ≤¼ of bili's own view of the
+          /** #5370: the stated count was ≥4× / ≤¼ of bili's own view of the
            *  same payload — it describes content bili does not hold (host-side
            *  invisible mass, foreign payload state), so the factor must NOT
            *  steer local judgments (effectiveCalibration skips it); kept for
@@ -1833,7 +1833,7 @@ export function resetSessionCompression(session: Session): void {
     // #2117 B: same boundary — the factor's model provenance dies with it.
     delete session.stats.calibratedEstimateModel;
     delete session.stats.calibrationRing;
-    // #5373: same boundary — the bias described the pre-compaction payload's
+    // #5370: same boundary — the bias described the pre-compaction payload's
     // billing scale; the rebuilt conversation re-measures from zero.
     delete session.stats.overflowBias;
     delete session.stats.lastLocalTextEstimate;

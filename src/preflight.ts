@@ -1772,7 +1772,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // stay on one consistent scale with the gate that started it.
     // #2117 B: model-provenance gate — a factor learned on another model acts
     // as absent (raw estimate) rather than deciding with a cross-model scale.
-    // #5373: effectiveCalibration falls back to the provisional overflow-stated
+    // #5370: effectiveCalibration falls back to the provisional overflow-stated
     // bias when the ring has nothing applicable to this route, so an
     // overflow-only session folds on the upstream-stated scale from the first
     // rejection onward.
@@ -2315,7 +2315,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // marathon — that burn was driven by a stale USAGE-sourced baseline
         // measured under a prior wider-window model, which keeps the floorless
         // roundText path.
-        // #5373 carve-out of the exception: when a route-calibration factor applies
+        // #5370 carve-out of the exception: when a route-calibration factor applies
         // to this origin (ring-published k̂ or the provisional overflow-stated bias),
         // roundText is ALREADY projected onto the upstream-stated scale above — the
         // distrust premise ("the local estimate may not outrank the rejection") is
