@@ -85,7 +85,7 @@ function v1Request(opts: { convId?: string; requestType?: string; model?: string
     };
 }
 
-function makeUpstream(calls: Call[]): http.Server {
+function makeUpstream(calls: Call[], encodeFrame: (data: unknown) => string = sse): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -95,7 +95,7 @@ function makeUpstream(calls: Call[]): http.Server {
             calls.push({ path, raw });
             if (path.includes(":streamGenerateContent") || path.includes(":generateContent")) {
                 res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                res.write(sse(envelope(gcr("hello from cloudcode"))));
+                res.write(encodeFrame(envelope(gcr("hello from cloudcode"))));
                 res.end();
             } else if (path.includes(":countTokens")) {
                 res.writeHead(200, { "content-type": "application/json" });
@@ -294,6 +294,32 @@ test("#3129 B: a CLI-style request with no Conversation ID still resolves identi
         assert.match(text, /hello from cloudcode/);
     } finally {
         proxy.close(); upstream.close();
+    }
+});
+
+test("multiline CloudCode SSE preserves the model reply through the real proxy", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstream(calls, data =>
+        JSON.stringify(data, null, 2).split("\n").map(line => `data: ${line}`).join("\n") + "\n\n");
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const { status, text } = await drive(proxyPort, upstreamPort, "/v1internal:streamGenerateContent?alt=sse",
+            v1Request({ convId: "b29caf80-933b-40c7-8e15-089ab49d2774", tools: true }));
+        assert.equal(status, 200);
+        const frames = ssePayloads(text) as Array<{ response?: { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } }>;
+        const texts = frames.flatMap(frame => frame.response?.candidates ?? [])
+            .flatMap(candidate => candidate.content?.parts ?? []).map(part => part.text ?? "").join("");
+        assert.equal(texts, "hello from cloudcode", "the inner model text must reach the client exactly once");
+        assert.equal(calls.length, 1, "a complete reply must not trigger a continuation request");
+        assert.doesNotMatch(text, /upstream_stream_truncated/);
+    } finally {
+        proxy.close();
+        upstream.close();
     }
 });
 

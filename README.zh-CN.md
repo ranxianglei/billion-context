@@ -340,6 +340,7 @@ bili --host 0.0.0.0           # 监听所有网卡(见下面的 host 说明)
 bili --debug                 # 详细日志(也可在配置里设 "debug": true)
 bili --passthrough           # 不压缩直接转发(冒烟测试模式)
 bili --config ~/my-bili.json # 用别的配置文件
+bili -c dsh-test             # 命名配置 → ~/.config/billion-context/dsh-test.json（按模型各放一份）
 bili update                  # 立即检查并安装新版本(跳过节流)
 bili doctor --fix            # 把漂移的 dsh profile 三本账(manifest 声明 / lockfile 记录 / 盘上副本)收敛到盘上版本(#3496)
 bili --no-auto-update        # 本次启动禁用自动更新
@@ -408,7 +409,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 ### 配置文件
 
 一份 JSON 文档:`~/.config/billion-context/billion-context.json`
-(`$XDG_CONFIG_HOME/billion-context/`;用 `BILI_CONFIG_FILE` 可改路径)。
+(`$XDG_CONFIG_HOME/billion-context/`;用 `BILI_CONFIG_FILE` 可改路径;纯名字则选中同目录的兄弟文件,如 `-c dsh-test` → `~/.config/billion-context/dsh-test.json`)。
 同一开关有多个来源时的优先级:**CLI 参数(如有)> 环境变量 > 配置文件 > 内置默认值** —— 每个环境变量都继续作为覆盖层可用。
 
 里面有什么(细节见 docs/configuration.zh-CN.md):
@@ -487,7 +488,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 单机多安装共存（#5046）
 
-同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存）时，各自的代理默认都解析到**同一个** XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。开了统一存储（`storage.unified` = shadow/full）后，两个进程会双写同一个 `index.db`：日志出现 `[instances] another bili instance is running …`，lane 重叠时还有 `[storage] … two processes on one index.db corrupt it` 级别的 error；SQLite 写锁争用（`SQLITE_BUSY` / `database is locked`）会让整轮模型请求直接失败，持续双写还有损坏风险。正确做法是**隔离**：给每份安装设独立的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。隔离后两份可正常并存，`[instances]` 提示会自动降为 info 级（目录不同 ⇒ 无共享状态）。
+同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存）时，各自的代理默认都解析到**同一个** XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。开了统一存储（`storage.unified` = shadow/full）后，两个进程会双写同一个 `index.db`：日志出现 `[instances] another bili instance is running …`，lane 重叠时还有 `[storage] … two processes on one index.db corrupt it` 级别的 error；SQLite 写锁争用（`SQLITE_BUSY` / `database is locked`）会让整轮模型请求直接失败，持续双写还有损坏风险。正确做法是**隔离**：给每份安装设独立的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`，或在各自启动器里固定用 `-c <各自的名字>`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。隔离后两份可正常并存，`[instances]` 提示会自动降为 info 级（目录不同 ⇒ 无共享状态）。
 
 ### 会话文件清理（#1082）
 
