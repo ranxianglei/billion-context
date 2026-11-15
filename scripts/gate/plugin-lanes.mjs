@@ -55,6 +55,8 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
+const requireSync = createRequire(import.meta.url);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORK = process.env.PLUGIN_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "plugin-lanes");
@@ -100,6 +102,9 @@ if (!TGZ || !REPO || !MODEL1.base || !MODEL1.model) {
 }
 
 const results = [];
+// Recorder spawned for the in-flight lane; killed from main()'s catch when a
+// lane aborts before its own teardown (2026-11-14 leak fix).
+let activeRec = null;
 // #3475: lanes whose upstream lacks the protocol door — degraded verdict,
 // excluded from the failure tally (see runLane's env-blocked rule).
 const BLOCKED = new Map(); // lane -> { kind: "env" | "client", reason }
@@ -135,7 +140,7 @@ function readJsonl(file) {
 // corpus (same deterministic shape as scripts/release-gate-local.mjs —
 // 40 sections, codeword canaries double as fold-recall probes)
 // ---------------------------------------------------------------------------
-const CODEWORDS = [
+export const CODEWORDS = [
   "KOAPEL", "TRIVANE", "MURENOK", "SALDIRA", "VEKTRUM", "OLPHANE", "QUIMERA", "ZANDREL",
   "FEROVIK", "LUMETRA", "GHORVAL", "NEXAPIL", "TAVRUON", "SILMADE", "PROVANE", "WEXILOR",
   "ANDRIKE", "MOLVANE", "KESTRIUM", "ULFARON", "BRAVINEK", "TORSELI", "IMMERAL", "DAXUVEN",
@@ -144,7 +149,7 @@ const CODEWORDS = [
 ];
 const S = (i) => `S${String(i + 1).padStart(2, "0")}`;
 const sectionTitle = (i) => `TITLE: GATE-MARK-${S(i)}-${CODEWORDS[i]}`;
-function buildCorpus(targetTokens) {
+export function buildCorpus(targetTokens) {
   const wordsPerSection = Math.max(150, Math.round((targetTokens * 0.72) / 40));
   const out = ["# GATE CORPUS — plugin-lanes fixture (deterministic)", ""];
   for (let s = 0; s < 40; s++) {
@@ -280,8 +285,13 @@ async function runLane(agent, recipe) {
   console.log(`-- lane ${agent}: recorder :${recPort} -> ${MODEL1.base}`);
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
     env: { ...process.env, RECORDER_PORT: String(recPort), RECORDER_TARGET: MODEL1.base, RECORDER_OUT: recOut },
-    stdio: ["ignore", "ignore", "inherit"], detached: true,
+    // stderr to a per-lane file: inheriting the lane's log pipe meant a
+    // detached recorder surviving an aborted lane held the entrypoint's
+    // `| tee` pipe open and wedged the whole gate (2026-11-14, 3h hang).
+    stdio: ["ignore", "ignore", fs.openSync(path.join(laneDir, "recorder.stderr.log"), "a")],
+    detached: true,
   });
+  activeRec = rec;
 
   const baseEnv = cleanEnv({
     HOME: path.join(laneDir, "home"),
@@ -579,22 +589,46 @@ async function runLane(agent, recipe) {
     allTools.slice(0, 10).join(",") || "no tools seen");
 
   if (recipe.type === "native") {
-    // authoritative claim: payload.metadata.pluginAgent in the session files
-    // (durable-message-guards.ts binding), corroborated by the window-source
-    // log line that only exists on plugin lanes.
+    // authoritative claim: the bound pluginAgent in the session metadata.
+    // Carrier: pure-SQLite is the storage default since 2026-11-13 (the JSONL
+    // envelopes are no longer written unless dual-write is pinned), so read
+    // sessions.metadata_json in index.db FIRST and keep the JSONL envelope
+    // scan as fallback for older candidates / dual-write lanes.
+    const claimFromIndexDb = (sessRoot) => {
+      const dbFile = path.join(sessRoot, "index.db");
+      if (!fs.existsSync(dbFile)) return null;
+      try {
+        const { DatabaseSync } = requireSync("node:sqlite");
+        const db = new DatabaseSync(`file:${dbFile}?mode=ro`, { readOnly: true });
+        try {
+          const rows = db.prepare(
+            "SELECT metadata_json FROM sessions WHERE metadata_json LIKE '%pluginAgent%' ORDER BY rowid DESC LIMIT 10"
+          ).all();
+          for (const r of rows) {
+            try { const m = JSON.parse(r.metadata_json); if (m?.pluginAgent) return m.pluginAgent; } catch {}
+          }
+        } finally { db.close(); }
+        return null;
+      } catch { return null; }
+    };
     let claim = null;
+    let claimSrc = "";
     const sessRoot = path.join(ctx.laneDir, "xdg/data/billion-context/sessions");
     if (fs.existsSync(sessRoot)) {
-      for (const f of fs.readdirSync(sessRoot, { recursive: true })) {
-        if (!String(f).endsWith(".json")) continue;
-        try {
-          const meta = JSON.parse(fs.readFileSync(path.join(sessRoot, String(f)), "utf8"))?.payload?.metadata;
-          if (meta?.pluginAgent) { claim = meta.pluginAgent; break; }
-        } catch {}
+      claim = claimFromIndexDb(sessRoot);
+      if (claim) claimSrc = "index.db";
+      if (!claim) {
+        for (const f of fs.readdirSync(sessRoot, { recursive: true })) {
+          if (!String(f).endsWith(".json")) continue;
+          try {
+            const meta = JSON.parse(fs.readFileSync(path.join(sessRoot, String(f)), "utf8"))?.payload?.metadata;
+            if (meta?.pluginAgent) { claim = meta.pluginAgent; claimSrc = "jsonl"; break; }
+          } catch {}
+        }
       }
     }
     record(agent, "plugin lane claimed (x-bili-plugin)", claim === recipe.pluginAgent,
-      claim ? `session metadata.pluginAgent=${claim}` : `no pluginAgent in session files; log source=plugin=${/source=plugin/.test(log)}`);
+      claim ? `session metadata.pluginAgent=${claim} (${claimSrc})` : `no pluginAgent in index.db or session files; log source=plugin=${/source=plugin/.test(log)}`);
   } else {
     record(agent, "prefix lane tools via proxy+manifest", allTools.length > 0, `${allTools.length} tool names on wire`);
   }
@@ -613,6 +647,7 @@ async function runLane(agent, recipe) {
   ctx.killInstances();
   if (ctx.proxy) { try { process.kill(-ctx.proxy.pid, "SIGKILL"); } catch {} }
   try { process.kill(-rec.pid, "SIGKILL"); } catch {}
+  activeRec = null;
 }
 
 async function startManualProxy(ctx, args) {
@@ -1067,7 +1102,7 @@ async function main() {
     const recipe = RECIPES[agent];
     if (!recipe) { record(agent, "recipe", false, "unknown agent"); continue; }
     console.log(`\n===== plugin lane: ${agent} (${recipe.type}) =====`);
-    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); }
+    try { await runLane(agent, recipe); } catch (e) { record(agent, "lane", false, String(e).slice(0, 400)); try { if (activeRec) process.kill(-activeRec.pid, "SIGKILL"); } catch {} activeRec = null; }
   }
   // #3475: env-blocked lanes (upstream lacks the protocol door) keep their
   // degraded verdict — FAIL records from turn-dependent assertions are honest

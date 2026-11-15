@@ -49,7 +49,7 @@ import { getLogPath } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
-import { safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 import { storageDiagnosticsLines } from "../storage/runtime-status.js";
 import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "../version.js";
 
@@ -140,7 +140,7 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
 function storageLogTail(lines: string[]): string[] {
     return lines.map((l) => {
         const masked = redactForPublish(l);
-        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
     });
 }
 
@@ -175,7 +175,7 @@ function conflictLogTail(lines: string[]): string[] {
         // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
         // on-disk log) the published tail still cannot leak them.
         const masked = redactForPublish(l);
-        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
     });
 }
 
@@ -209,7 +209,7 @@ function conflictDiagnosticsLines(summary: ReturnType<typeof summarizeConflicts>
         lines.push("newest event per session:");
         for (const e of summary.latest.slice(0, 8)) {
             const sid = e.sessionId.length > 12 ? "…" + safeSuffix(e.sessionId, 8) : e.sessionId;
-            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${e.detail.slice(0, 160)}`);
+            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${safePrefix(e.detail, 160)}`);
         }
     }
     lines.push("banner policy (#3235): only landed-unrecovered evidence alarms — recovered (intercepted+rebased) and");
@@ -327,7 +327,7 @@ function configSectionLines(): string[] {
         return lines;
     }
     if (text.length > CONFIG_SECTION_MAX_CHARS) {
-        text = text.slice(0, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
+        text = safePrefix(text, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
     }
     lines.push(text);
     return lines;
@@ -414,7 +414,7 @@ function snapshotShadowDiagnosticsLines(): string[] {
 }
 
 export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
-    const t = topic?.trim().slice(0, 64) ?? "";
+    const t = safePrefix(topic?.trim() ?? "", 64);
     const def = t ? TOPICS[t] : undefined;
     // #3813: read the rotated log pair at most ONCE per report — the storage
     // tail and the conflict banner filter the SAME candidate lines, so a
