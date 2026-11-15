@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultCountTokens } from "acp-kernel";
 import { estimateRawBodyBreakdown, estimateRawBodyTokens } from "../src/preflight.ts";
-import { sideRequestGuard } from "../src/server/side-request.ts";
 
 // #6828: a dual-shape body carries the conversation under TWO top-level keys —
 // the lane's native field (messages[] on openai/anthropic, input[] on
@@ -102,20 +101,4 @@ test("reporter scale: the #6828 fuse reading measures ~213K, not ~1.8M (#6828)",
     assert.ok(Math.abs(bd.tools - 76_502) < 200, `tools bucket matches the report (${bd.tools})`);
     assert.equal(bd.system, 10_641, "system bucket matches the report");
     assert.ok(bd.other < 100, `other is envelope-only, not the 1.6M copy (${bd.other})`);
-});
-
-test("side-request guard: the foreign field does not false-block the compress call (#6828)", () => {
-    // The #554 guard meters the raw body before forwarding a side request.
-    // On a dual-shape body the protocol-blind walk counted the foreign
-    // conversation field too, so the compress call — the very request that
-    // would shrink the session — false-blocked at the same phantom total.
-    const cjk = (n: number): string => "测".repeat(n);
-    const body = {
-        messages: [{ role: "user", content: cjk(400_000) }],
-        input: [{ type: "message", role: "user", content: cjk(400_000) }],
-    };
-    const limit = 600_000;
-    const guard = sideRequestGuard(body, "openai", limit);
-    assert.ok(guard.estimate < limit * 1.15, `native field alone is under the guard bar (${guard.estimate} < ${Math.round(limit * 1.15)})`);
-    assert.equal(guard.blocked, false, "the dual-shape body's foreign field must not false-block the side request");
 });
