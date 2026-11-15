@@ -2534,8 +2534,8 @@ export class UnifiedStore {
             if (!view) return null;
             // #3762: rows persist the media-OFFLOADED form (imageBase64 =
             // {"$media": hash}); every other row accessor hydrates on read —
-            // the egress view must too, or the seam walk and tripwire hash an
-            // offload object instead of the image bytes (identitySig TypeError
+            // the egress view must too, or the seam walk hashes an offload
+            // object instead of the image bytes (identitySig TypeError
             // took a whole turn down: the plane path must never fail a turn).
             return {
                 ...view,

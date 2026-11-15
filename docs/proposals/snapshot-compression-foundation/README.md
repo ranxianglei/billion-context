@@ -40,7 +40,7 @@ Objective ordering is unchanged: **stability / extensibility / generality first,
 
 ### 1.3 Carried baseline rulings
 
-All standing rulings from the #5643 body remain in force without restatement here: objective ordering, the fixed chain, the two verification points (kernel-internal state + post-rewrite canonical form), append-only row keys, evidence-addressed diffing only (no fuzzy similarity), the four-piece protection (tripwire / S4 per-row checksums / witness requirement / audit sampling), pure-ignore of client-side compaction, invariants P5–P9. Conflicts, if any, must be registered explicitly in the ruling table (§14).
+All standing rulings from the #5643 body remain in force without restatement here: objective ordering, the fixed chain, the two verification points (kernel-internal state + post-rewrite canonical form), append-only row keys, evidence-addressed diffing only (no fuzzy similarity), the four-piece protection (tripwire — REMOVED by owner ruling 2026-11-11, see §4.5 / S4 per-row checksums / witness requirement / audit sampling), pure-ignore of client-side compaction, invariants P5–P9. Conflicts, if any, must be registered explicitly in the ruling table (§14).
 
 ---
 
@@ -362,7 +362,7 @@ Already discussed online (A–E, draft-v0.1 numbering) + gap-analysis additions 
 - **"Element-count-preserving prefix byte rewrites are undetectable"** (carried cost clause from baseline): the price is a trust-model change that skips per-item re-verification — human review required, auto-merge forbidden (same gate tier as KDD §7.4 items).
 - **Once a multimodal tail enters the cache, that history segment permanently degrades to legacy full turns** (carried KDD#15 honest boundary ②): degrade rather than deviate.
 - **Marker-strip counts inherit with the seed ledger**; mid-history regions are never rescanned (boundary ③ above).
-- The final arbiter of every "invariant" in this document is the runtime tripwire + S4 sampling, not paper argument — which is precisely why the P1 shadow phase exists: to accumulate that empirical evidence before any read-side cutover.
+- The final arbiter of every "invariant" in this document is the fold-time A/B identity oracle + S4 sampling (the runtime tripwire was removed by owner ruling 2026-11-11, see §4.5), not paper argument — which is precisely why the P1 shadow phase exists: to accumulate that empirical evidence before any read-side cutover.
 
 ---
 

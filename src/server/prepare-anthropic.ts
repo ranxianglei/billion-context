@@ -472,7 +472,7 @@ export async function prepareAnthropic(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
-        // #5874 P2 (mapEgress): tripwire-guarded plane egress (see
+        // #5874 P2 (mapEgress): direct-authority plane egress (see
         // prepare-openai.ts for the chain rationale).
         processedMessages = applySnapEgress(turn.state, processedMessages, {
             sessionId,

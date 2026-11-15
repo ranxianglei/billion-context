@@ -445,8 +445,9 @@ export async function prepareOpenai(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #5874 P2 (mapEgress): when the S4-verified snap plane can assemble
-        // the same view, switch the outbound source to it (tripwire-guarded;
-        // any normalized mismatch keeps these legacy bytes).
+        // the same view, it is the DIRECT outbound authority (owner ruling
+        // 2026-11-11: no per-round diff — byte-identity is by construction);
+        // a plane gap degrades to these legacy bytes for one round.
         processedMessages = applySnapEgress(turn.state, processedMessages, {
             sessionId,
             protocol: "openai",

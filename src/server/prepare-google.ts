@@ -326,9 +326,10 @@ export async function prepareGoogle(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
-        // #5874 P2 (mapEgress): tripwire-guarded plane egress. Google's lane
+        // #5874 P2 (mapEgress): direct-authority plane egress. Google's lane
         // applies NO reasoning drop (#651: thoughtSignature rides verbatim),
-        // so the plane transform is strip-only — same chain, same guard.
+        // so the plane transform is strip-only — same chain, same degrade-only
+        // fallback.
         processedMessages = applySnapEgress(turn.state, processedMessages, {
             sessionId,
             protocol: "google",
