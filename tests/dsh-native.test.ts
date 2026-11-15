@@ -1360,6 +1360,79 @@ test("#3354/#3662 apply(): declares lane ownership instead of registering the ov
     }
 });
 
+test("#4872/#6814 apply(): a web profile with the overlay latched registers a visible /compact stub", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-compact-stub-"));
+    const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            // 1. web profile, knob OFF (default) → the preset's /compact is
+            //    stood down by the #3354 overlay, so the stub must be
+            //    registered and answer visibly — never demoted to a plain
+            //    model message (#6814 field evidence).
+            _resetDshCompactionVerdictForTest();
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            ctx.setProfileContext({ startedBundles: webBundles });
+            apply(ctx);
+            const names = ctx.registeredCommands.map((c) => c.name);
+            assert.ok(names.includes("acp"), "baseline: /acp still registered");
+            const stub = ctx.registeredCommands.find((c) => c.name === "compact");
+            assert.ok(stub, "web profile + knob off: the /compact stub must be registered");
+            const outcome = await stub!.handler();
+            assert.equal(outcome.kind, "success");
+            assert.match(outcome.text, /billion-context/);
+            assert.match(outcome.text, /\/acp/);
+            assert.match(outcome.text, /dsh\.keepCommandCompact/);
+            await _stateToolsReadyForTest();
+
+            // 2. web profile, knob ON → the overlay re-arms the real
+            //    command-compact → the stub must stay out (a double
+            //    registration would shadow the real command).
+            _resetDshCompactionVerdictForTest();
+            await withEnv({ BILI_DSH_KEEP_COMMAND_COMPACT: "1" }, async () => {
+                _resetRegisterForTest(proxy.origin);
+                const ctxOn = mockCtx();
+                ctxOn.setProfileContext({ startedBundles: webBundles });
+                apply(ctxOn);
+                assert.ok(!ctxOn.registeredCommands.some((c) => c.name === "compact"), "knob on: the real /compact is armed, the stub must stay out");
+                await _stateToolsReadyForTest();
+            });
+
+            // 3. non-web profile → the host-plane /compact stays armed → no stub.
+            _resetDshCompactionVerdictForTest();
+            _resetRegisterForTest(proxy.origin);
+            const plain = mockCtx();
+            plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
+            apply(plain);
+            assert.ok(!plain.registeredCommands.some((c) => c.name === "compact"), "non-web profile: host-plane /compact armed, no stub");
+            await _stateToolsReadyForTest();
+
+            // 4. overlay failed to latch (host without the internal/config
+            //    hook) → the real command-compact may still be armed → no stub.
+            _resetDshCompactionVerdictForTest();
+            _resetRegisterForTest(proxy.origin);
+            const captured: Array<{ name: string }> = [];
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: (c: { name: string }) => { captured.push(c); } },
+                agents: {},
+                profileContext: { startedBundles: webBundles },
+            };
+            apply(bare);
+            assert.ok(!captured.some((c) => c.name === "compact"), "overlay gap: the real /compact may be armed, no stub");
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetDshCompactionVerdictForTest();
+    }
+});
+
 test("apply() runtime-info (#955): model services stamp model/window/max-output headers", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ri-"));

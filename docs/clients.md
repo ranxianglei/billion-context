@@ -138,13 +138,16 @@ Two lanes, same plugin (#941):
     unavailable there by default — that is EXPECTED, not a bug (#4002):
     bili owns compression on the lane, so the preset's compact command
     and its auto-compaction are both stood down deliberately; there is
-    no re-enable switch for AUTO-compaction by design (#3651/#3666). If
-    you run third-party plugins bridging through the DSH-official
-    `ctx.commands.find(agent, "compact")` path and need the explicit
-    `/compact` command back, set `dsh.keepCommandCompact` (env
-    `BILI_DSH_KEEP_COMMAND_COMPACT`) — the overlay then disables only
-    compaction-basic, and a `/compact`-triggered call still passes the
-    #1729 wire guard; see configuration.md, #4872);
+     no re-enable switch for AUTO-compaction by design (#3651/#3666).
+     While the knob is unset, bili registers a visible `/compact` stub in
+     these profiles so a typed `/compact` is answered — never silently
+     demoted to a plain model message (#6814) — pointing at /acp and at
+     the knob. If you run third-party plugins bridging through the
+     DSH-official `ctx.commands.find(agent, "compact")` path and need the
+     explicit `/compact` command back, set `dsh.keepCommandCompact` (env
+     `BILI_DSH_KEEP_COMMAND_COMPACT`) — the overlay then disables only
+     compaction-basic, and a `/compact`-triggered call still passes the
+     #1729 wire guard; see configuration.md, #4872);
     ACP compression is unaffected. Since #4147 the overlay matches
     STRUCTURALLY — any entry whose resolved `config.plugins` nests
     `compaction-basic`/`command-compact` rows enters the rewrite (always
