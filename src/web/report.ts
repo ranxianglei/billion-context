@@ -249,7 +249,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         L.push("");
         L.push("### " + t("det.rec_title"));
         L.push("");
-        L.push("- " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none) + " · " + t("det.rec_nudge") + " " + (s.nudges || 0) + " · " + t("det.rec_active") + " " + (s.activeFolds || 0) + " · " + t("det.rec_rec_total") + " " + f.W(s.totalPending || 0) + " · " + t("det.rec_fold_total") + " " + f.W(s.totalFolded || 0));
+        L.push("- " + t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: f.W(s.totalPending || 0), s: f.W(s.totalFolded || 0) }) + (((s.totalFolded || 0) > (s.totalPending || 0)) ? " · " + t("det.rec_over_stock") : "") + " · " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none));
         const eps = rec.episodes || [];
         if (eps.length) {
             L.push("");
@@ -436,8 +436,8 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     if (rec) {
         section(t("det.rec_title"));
         const s = rec.summary || {};
+        noteLine(t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: f.W(s.totalPending || 0), s: f.W(s.totalFolded || 0) }) + (((s.totalFolded || 0) > (s.totalPending || 0)) ? " · " + t("det.rec_over_stock") : ""));
         statRow([
-            [t("det.rec_rate"), s.pct != null ? s.pct.toFixed(1) + "%" : f.none, s.pct == null ? MUT : s.pct >= 80 ? "#2da44e" : s.pct >= 40 ? AMB : RED],
             [t("det.rec_nudge"), String(s.nudges || 0)],
             [t("det.rec_active"), String(s.activeFolds || 0)],
             [t("det.rec_rec_total"), f.W(s.totalPending || 0)],
@@ -445,43 +445,89 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
         ]);
         const revs = (rec.events || []).slice(-10);
         const rcols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rec_kind"), w: 150 }, { t: t("det.rec_rec"), w: 120 }, { t: t("det.rec_folded"), w: 120 }, { t: t("det.rec_pct"), w: W - PAD * 2 - 558 }];
-        // #6729 follow-up: recovery-per-nudge-round line chart (one point per
-        // round — partial folds in a round merge into one true recovery %).
+        // #6729 follow-up: the recovery view — nudge flags, one bar per
+        // compress call (colored by its ROUND's recovery, blue = active),
+        // one point per round with the TRUE pct labeled (no clamp-to-top
+        // lie), and a per-round bracket. Mirrors the panel's recoveryRoundSvg.
         const eps = rec.episodes || [];
-        if (eps.length > 0 || (rec.activesBefore || 0) > 0) {
-            const CH = 150, CPL = 38, CPR = 12, CPT = 8, CPB = 28;
+        type RevEv = { at: number; kind: "n" | "f"; tier?: number | null; pending?: number | null; folded?: number | null; mode?: "n" | "a"; pct?: number | null; paired?: boolean };
+        const revEvs: RevEv[] = [];
+        (rec.events || []).forEach((ev) => {
+            if (!ev || ev.at == null || !(ev.at > 0) || (ev.kind !== "n" && ev.kind !== "f")) return;
+            revEvs.push({ at: ev.at, kind: ev.kind, tier: ev.tier ?? null, pending: ev.pending ?? null, folded: ev.folded ?? null, mode: ev.mode ?? undefined, pct: ev.pct ?? null, paired: ev.paired });
+        });
+        if (revEvs.length > 0) {
+            const CH = 190, CPL = 40, CPR = 14, CPT = 30, CPB = 44;
             const left = PAD + CPL, right = W - PAD - CPR, top = y + CPT, bot = y + CH - CPB;
-            const NX = eps.length;
-            const RX = (i: number) => left + (NX <= 1 ? (right - left) / 2 : (i / (NX - 1)) * (right - left));
-            const RY = (pct: number) => bot - (Math.max(0, Math.min(100, pct)) / 100) * (bot - top);
+            const times = revEvs.map((ev) => ev.at);
+            const t0 = Math.min(...times), t1 = Math.max(...times);
+            const TX = (at: number): number => left + (t1 > t0 ? ((at - t0) / (t1 - t0)) * (right - left) : (right - left) / 2);
+            const RY = (pct: number): number => bot - (Math.max(0, Math.min(100, pct)) / 100) * (bot - top);
+            const nudgesE = revEvs.filter((ev) => ev.kind === "n");
+            const foldsE = revEvs.filter((ev) => ev.kind === "f");
+            const roundOf = (ev: { at: number }): number => {
+                let r = -1;
+                for (let i = 0; i < nudgesE.length; i++) { if (nudgesE[i].at <= ev.at) r = i; else break; }
+                return r;
+            };
+            const colFor = (pct: number): string => pct >= 80 ? "#2da44e" : pct >= 40 ? AMB : RED;
             [0, 50, 100].forEach((g) => {
                 body.push('<line x1="' + left + '" y1="' + RY(g).toFixed(1) + '" x2="' + right + '" y2="' + RY(g).toFixed(1) + '" stroke="' + LINEC + '" stroke-width="1"/>');
                 txt(left - 6, RY(g) + 3, g + "%", { size: 9.5, color: MUT, anchor: "end", mono: true });
             });
-            let lp = "", cpPts = "", cpSum = 0, cfSum = 0;
-            eps.forEach((ep, i) => {
-                if (ep.pct == null) return;
-                lp += (lp ? " " : "") + RX(i).toFixed(1) + "," + RY(ep.pct).toFixed(1);
-                if ((ep.pending || 0) > 0) {
-                    cpSum += ep.pending || 0;
-                    cfSum += ep.folded || 0;
-                    cpPts += (cpPts ? " " : "") + RX(i).toFixed(1) + "," + RY((cfSum / cpSum) * 100).toFixed(1);
-                }
+            nudgesE.forEach((nv) => {
+                const x = TX(nv.at);
+                body.push('<path d="M' + x.toFixed(1) + ',' + (top - 6) + ' L' + (x - 5).toFixed(1) + ',' + (top - 15) + ' L' + (x + 5).toFixed(1) + ',' + (top - 15) + ' Z" fill="#d29922"/>');
+                txt(x, top - 19, "T" + (nv.tier != null ? nv.tier : "?") + " · " + f.W(nv.pending || 0), { size: 8.5, color: "#d29922", anchor: "middle", mono: true });
             });
-            if (lp) body.push('<polyline points="' + lp + '" fill="none" stroke="' + INK + '" stroke-width="1.5"/>');
-            if (cpPts) body.push('<polyline points="' + cpPts + '" fill="none" stroke="' + "#8250df" + '" stroke-width="1.2" stroke-dasharray="4 3"/>');
+            let maxS = 0;
+            foldsE.forEach((fd) => { if ((fd.folded || 0) > maxS) maxS = fd.folded || 0; });
+            if (maxS <= 0) maxS = 1;
+            const barMax = (bot - top) * 0.42;
+            const bw = Math.min(10, Math.max(3, (right - left) / Math.max(1, foldsE.length) - 2));
+            const xs = foldsE.map((fd) => TX(fd.at));
+            const groups: Record<string, number[]> = {};
+            xs.forEach((xx, i) => {
+                const k = String(Math.round(xx * 2) / 2);
+                (groups[k] = groups[k] || []).push(i);
+            });
+            const xShift: Record<number, number> = {};
+            Object.keys(groups).forEach((k) => {
+                const g = groups[k];
+                g.forEach((i: number, j: number) => { xShift[i] = (j - (g.length - 1) / 2) * (bw + 1); });
+            });
+            foldsE.forEach((fd, i) => {
+                const S = fd.folded || 0;
+                const h = (S / maxS) * barMax;
+                if (h < 1) return;
+                const r = roundOf(fd);
+                const ep = fd.mode === "n" ? eps[r] : undefined;
+                const pct = ep ? ep.pct : null;
+                const col = fd.mode === "a" ? ACC : (pct == null ? MUT : colFor(pct));
+                const x = Math.min(right - 2, Math.max(left + 2, xs[i] + (xShift[i] || 0)));
+                body.push('<rect x="' + (x - bw / 2).toFixed(1) + '" y="' + (bot - h).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) + '" fill="' + col + '" opacity="0.8" rx="1"/>');
+            });
+            let cpSum = 0, cfSum = 0;
+            const cumPts: string[] = [];
             eps.forEach((ep, i) => {
-                const x = RX(i).toFixed(1);
+                const epAt = ep.at ?? 0;
+                let end = epAt, k = 0;
+                foldsE.forEach((fd) => { if (fd.mode === "n" && fd.at >= epAt && (i + 1 >= nudgesE.length || fd.at < nudgesE[i + 1].at)) { k++; if (fd.at > end) end = fd.at; } });
+                const x = TX(t1 > t0 ? (epAt + end) / 2 : epAt);
                 if (ep.pct != null) {
-                    body.push('<circle cx="' + x + '" cy="' + RY(ep.pct).toFixed(1) + '" r="3.5" fill="' + (ep.pct >= 80 ? "#2da44e" : ep.pct >= 40 ? AMB : RED) + '"/>');
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(ep.pct).toFixed(1) + '" r="3.5" fill="' + colFor(ep.pct) + '" stroke="#ffffff" stroke-width="1"/>');
+                    txt(x, RY(ep.pct) - 7, ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "600", color: colFor(ep.pct), anchor: "middle", mono: true });
+                    cpSum += ep.pending || 0; cfSum += ep.folded || 0;
+                    if (cpSum > 0) cumPts.push(x.toFixed(1) + "," + RY((cfSum / cpSum) * 100).toFixed(1));
                 } else {
-                    body.push('<circle cx="' + x + '" cy="' + RY(0).toFixed(1) + '" r="3" fill="none" stroke="' + MUT + '" stroke-dasharray="2 2"/>');
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(0).toFixed(1) + '" r="3" fill="none" stroke="' + MUT + '" stroke-dasharray="2 2"/>');
                 }
-                txt(Number(x), bot + 20, String(i + 1), { size: 9.5, color: MUT, anchor: "middle", mono: true });
-                if ((ep.activeFolds || 0) > 0) body.push('<rect x="' + (Number(x) - 1.5).toFixed(1) + '" y="' + (bot + 3) + '" width="3" height="8" rx="1" fill="' + ACC + '"/>');
+                const x0 = TX(epAt), yb = bot + 14 + (i % 2) * 15;
+                body.push('<path d="M' + x0.toFixed(1) + ',' + (yb - 4) + ' L' + x0.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + (yb - 4) + '" fill="none" stroke="' + MUT + '" stroke-width="1"/>');
+                txt((x0 + x) / 2, yb + 10, t("det.rec_bracket", { i: i + 1, k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" }), { size: 8.5, color: MUT, anchor: "middle", mono: true });
             });
-            if ((rec.activesBefore || 0) > 0) body.push('<rect x="' + (left - 10) + '" y="' + (bot + 3) + '" width="3" height="8" rx="1" fill="' + ACC + '"/>');
-            y += CH + 14;
+            if (cumPts.length > 1) body.push('<polyline points="' + cumPts.join(" ") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="4 3"/>');
+            y += CH + 16;
         }
         tableHead(rcols);
         revs.forEach((ev, i) => {
