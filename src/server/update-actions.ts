@@ -162,21 +162,22 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
 export async function pinAction(version: string, duration?: string): Promise<{ ok: boolean; error?: string; pin?: PinState }> {
     if (duration === undefined || duration === "forever") {
         const pin = await setPin(version);
+        if (!pin) return { ok: false, error: "pin state could not be persisted (cache dir unwritable)" };
         return { ok: true, pin };
     }
     const ms = parsePinDuration(duration);
     if (ms === undefined) return { ok: false, error: `invalid duration: ${duration} (expected 1h, 12h, 1d, 7d, or forever)` };
     const pin = await setPin(version, ms);
+    if (!pin) return { ok: false, error: "pin state could not be persisted (cache dir unwritable)" };
     return { ok: true, pin };
 }
 
-/** #6804: lift the pin early. Returns ok:true when a pin was active and
- *  cleared; ok:true with no pin when there was nothing to clear. Never throws. */
-export async function unpinAction(): Promise<{ ok: boolean; error?: string }> {
+/** #6804: lift the pin early. `hadPin` reports whether a pin was actually
+ *  active and cleared (false = there was nothing to clear). Never throws. */
+export async function unpinAction(): Promise<{ ok: boolean; error?: string; hadPin: boolean }> {
     const hadPin = (await activePin()) !== undefined;
     await clearPin();
-    if (!hadPin) return { ok: true };
-    return { ok: true };
+    return { ok: true, hadPin };
 }
 
 /** Test seam: clear the registered options and both in-flight flags. */

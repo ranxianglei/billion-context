@@ -23,7 +23,12 @@ export interface PinState {
     until?: number;
 }
 
-const PIN_FILE = path.join(cacheDir(), ".pin.json");
+// Resolved per call, not at import time: paths.ts reads env live, and the
+// hermetic suites swap XDG_CACHE_HOME per scenario (same pattern as
+// update-policy.ts's stagger/policy files).
+function pinFile(): string {
+    return path.join(cacheDir(), ".pin.json");
+}
 
 /** Parse a duration string ("1h", "12h", "1d", "7d") into milliseconds.
  *  Returns undefined for unrecognized input. "forever" is handled by the
@@ -41,7 +46,7 @@ export function parsePinDuration(s: string): number | undefined {
 /** Best-effort read. `undefined` = absent or unreadable/corrupt. */
 export async function readPin(): Promise<PinState | undefined> {
     try {
-        const raw = await readFile(PIN_FILE, "utf-8");
+        const raw = await readFile(pinFile(), "utf-8");
         const doc = JSON.parse(raw) as PinState;
         if (!doc || typeof doc !== "object" || doc.v !== 1) return undefined;
         if (typeof doc.version !== "string" || doc.version.length === 0) return undefined;
@@ -53,23 +58,26 @@ export async function readPin(): Promise<PinState | undefined> {
     }
 }
 
-/** Write the pin state atomically (tmp+rename). Never rejects — an
- *  unwritable cache dir degrades to no-op (the pin simply doesn't persist). */
-export async function writePin(pin: PinState): Promise<void> {
+/** Write the pin state atomically (tmp+rename). Returns false when the state
+ *  file could not be written (e.g. unwritable cache dir) — the caller must
+ *  NOT report the pin as active in that case. */
+export async function writePin(pin: PinState): Promise<boolean> {
     try {
-        await mkdir(path.dirname(PIN_FILE), { recursive: true });
-        const tmp = `${PIN_FILE}.${process.pid}.tmp`;
+        const file = pinFile();
+        await mkdir(path.dirname(file), { recursive: true });
+        const tmp = `${file}.${process.pid}.tmp`;
         await writeFile(tmp, JSON.stringify(pin), "utf-8");
-        await rename(tmp, PIN_FILE);
+        await rename(tmp, file);
+        return true;
     } catch {
-        // best-effort: unwritable cache dir → pin not persisted
+        return false;
     }
 }
 
 /** Clear the pin state (remove the file). Never rejects. */
 export async function clearPin(): Promise<void> {
     try {
-        await rm(PIN_FILE, { force: true });
+        await rm(pinFile(), { force: true });
     } catch {
         // best-effort
     }
@@ -92,18 +100,19 @@ export async function isVersionPinned(version: string): Promise<boolean> {
 }
 
 /** Set a pin for the given version. `durationMs` undefined = indefinite.
- *  Returns the pin state that was written. */
-export async function setPin(version: string, durationMs?: number): Promise<PinState> {
+ *  Returns the pin state that was written, or undefined when the state file
+ *  could not be written — in that case the pin is NOT active. */
+export async function setPin(version: string, durationMs?: number): Promise<PinState | undefined> {
     const now = Date.now();
     const pin: PinState = { v: 1, version, setAt: now };
     if (durationMs !== undefined) {
         pin.until = now + durationMs;
     }
-    await writePin(pin);
+    if (!(await writePin(pin))) return undefined;
     return pin;
 }
 
 /** Test-only: remove the pin state file. */
 export async function _resetPinForTest(): Promise<void> {
-    await rm(PIN_FILE, { force: true });
+    await rm(pinFile(), { force: true });
 }

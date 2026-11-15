@@ -1,6 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parsePinDuration, readPin, writePin, clearPin, activePin, isVersionPinned, setPin, _resetPinForTest } from "../src/update-pin.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+// Isolate the cache dir BEFORE any code touches it: paths.ts reads env live,
+// and update-pin.ts resolves the pin file per call against cacheDir() (same
+// pattern as update-policy.ts's stagger/policy files).
+const scratchRoot = mkdtempSync(path.join(tmpdir(), "bc-pin-scratch-"));
+function freshCacheDir(): string {
+    const dir = mkdtempSync(path.join(scratchRoot, "cache-"));
+    process.env.XDG_CACHE_HOME = dir;
+    return dir;
+}
+function freshConfigDir(): void {
+    process.env.XDG_CONFIG_HOME = mkdtempSync(path.join(scratchRoot, "config-"));
+}
+freshCacheDir();
+freshConfigDir();
+
+const { parsePinDuration, readPin, writePin, clearPin, activePin, isVersionPinned, setPin, _resetPinForTest } = await import("../src/update-pin.js");
 
 test("parsePinDuration parses h and d units", () => {
     assert.equal(parsePinDuration("1h"), 3600000);
@@ -24,6 +43,7 @@ test("parsePinDuration rejects invalid input", () => {
 test("setPin writes and readPin reads the state", async () => {
     await _resetPinForTest();
     const pin = await setPin("0.1.215", 3600000);
+    assert.ok(pin);
     assert.equal(pin.v, 1);
     assert.equal(pin.version, "0.1.215");
     assert.ok(pin.setAt > 0);
@@ -40,6 +60,7 @@ test("setPin writes and readPin reads the state", async () => {
 test("setPin without duration = indefinite (no until field)", async () => {
     await _resetPinForTest();
     const pin = await setPin("0.1.215");
+    assert.ok(pin);
     assert.equal(pin.until, undefined);
 
     const read = await readPin();
@@ -104,7 +125,6 @@ test("readPin returns undefined for corrupt JSON", async () => {
     await _resetPinForTest();
     // Write corrupt JSON directly
     const { writeFile, mkdir } = await import("node:fs/promises");
-    const path = await import("node:path");
     const { cacheDir } = await import("../src/paths.js");
     const pinFile = path.join(cacheDir(), ".pin.json");
     await mkdir(path.dirname(pinFile), { recursive: true });
@@ -117,7 +137,6 @@ test("readPin returns undefined for corrupt JSON", async () => {
 test("readPin returns undefined for wrong version field", async () => {
     await _resetPinForTest();
     const { writeFile, mkdir } = await import("node:fs/promises");
-    const path = await import("node:path");
     const { cacheDir } = await import("../src/paths.js");
     const pinFile = path.join(cacheDir(), ".pin.json");
     await mkdir(path.dirname(pinFile), { recursive: true });
@@ -128,7 +147,7 @@ test("readPin returns undefined for wrong version field", async () => {
 });
 
 test("pinAction sets a pin with duration", async () => {
-    const { pinAction, unpinAction, _resetUpdateActionsForTest, registerUpdateActions } = await import("../src/server/update-actions.js");
+    const { pinAction, _resetUpdateActionsForTest, registerUpdateActions } = await import("../src/server/update-actions.js");
     await _resetPinForTest();
     _resetUpdateActionsForTest();
     registerUpdateActions({ packageName: "billion-context", currentVersion: "0.1.214", autoUpdate: false, installDir: "/tmp/test-install" });
@@ -170,7 +189,7 @@ test("pinAction rejects invalid duration", async () => {
     _resetUpdateActionsForTest();
 });
 
-test("unpinAction clears an active pin", async () => {
+test("unpinAction clears an active pin and reports hadPin", async () => {
     const { pinAction, unpinAction, _resetUpdateActionsForTest, registerUpdateActions } = await import("../src/server/update-actions.js");
     await _resetPinForTest();
     _resetUpdateActionsForTest();
@@ -180,18 +199,24 @@ test("unpinAction clears an active pin", async () => {
     assert.ok(active);
     const r = await unpinAction();
     assert.equal(r.ok, true);
+    assert.equal(r.hadPin, true);
     const after = await activePin();
     assert.equal(after, undefined);
     await _resetPinForTest();
     _resetUpdateActionsForTest();
 });
 
-test("unpinAction is a no-op when no pin is active", async () => {
+test("unpinAction reports hadPin=false when no pin is active", async () => {
     const { unpinAction, _resetUpdateActionsForTest, registerUpdateActions } = await import("../src/server/update-actions.js");
     await _resetPinForTest();
     _resetUpdateActionsForTest();
     registerUpdateActions({ packageName: "billion-context", currentVersion: "0.1.214", autoUpdate: false, installDir: "/tmp/test-install" });
     const r = await unpinAction();
     assert.equal(r.ok, true);
+    assert.equal(r.hadPin, false);
     _resetUpdateActionsForTest();
+});
+
+test("cleanup: remove scratch root", () => {
+    rmSync(scratchRoot, { recursive: true, force: true });
 });
