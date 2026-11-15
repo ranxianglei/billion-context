@@ -26,9 +26,9 @@ export type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
     | "client-abort"
-    /** Idle-budget / read-phase timeout expiry: our own watchdog aborted, or
-     *  OS/undici reported a headers/body timeout. NOT retried — the budget
-     *  already waited and the request may have reached the upstream. */
+    /** Timeout: our idle watchdog, an undici headers/body timeout, or an OS
+     *  ETIMEDOUT whose phase may be unknown. NOT retried — the request may
+     *  have reached the upstream. This category alone does not prove idle expiry. */
     | "upstream-timeout"
     /** Phase-1 FIRST-BYTE timeout: the operator tightened the first-byte budget
      *  (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS below the idle
@@ -266,7 +266,7 @@ export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
  *  taxonomy and the checklist never drift apart. */
 export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "client-abort": "downstream client disconnected — no bili-side action",
-    "upstream-timeout": "idle budget expired (headers/body) — check upstream health; not retried by design",
+    "upstream-timeout": "transport timeout — inspect code/syscall and nested causes to identify the phase; not retried by design",
     "upstream-headers-timeout": "no first response byte within the explicitly-tightened first-byte budget (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS) — zero bytes were received, so a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX); the mid-stream (body) idle budget is unchanged",
     "connect-timeout": "TCP handshake never completed — upstream/proxy unreachable or blackholed; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-unreachable": "ICMP no-route rejection (EHOSTUNREACH/ENETUNREACH/EHOSTDOWN) — nothing reached the upstream; check routing/firewall/ACL (on macOS also the Local Network privacy grant for the app that owns the bili process, #5663); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",

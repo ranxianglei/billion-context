@@ -22,9 +22,8 @@ import { listSessions } from "../src/session.ts";
 //
 // Fix under test (still load-bearing after #987 removed the window learner):
 //   C1 preflight write-back persists text+overhead only (image floor excluded)
-//      — note: since the #1841 futility gate, a doomed image-over-window round
-//      is skipped BEFORE any fold, so C1's write-back (which only runs when a
-//      round folds ≥1 range) is no longer exercised by scenario C below.
+//      — image-bearing ranges may shrink the wire. Scenario C supplies no
+//      acceptable summary, so no fold write-back runs in that control.
 //   C2 stats.lastInputTokensSource tags every baseline raise ("usage"|"estimate")
 //   C4 #496 hatch: an untrusted (estimate-derived / legacy-unmarked) baseline
 //      is not overflow evidence — only usage-grounded evidence closes it
@@ -219,7 +218,7 @@ test("#857 B: genuine overflow evidence (learned limit == configured window) sti
     }
 });
 
-test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the #1841 futility skip leaves the baseline untouched", async () => {
+test("#857 C: unusable image-fold summaries leave the grounded baseline and forwarding guard intact", async () => {
     const { server: upstream, port: uport, stats } = await startMockUpstream();
     // No route model entry: the window is a pure fallback, so the upward
     // self-heal (which requires nativeFromFallback) can confirm it.
@@ -232,35 +231,28 @@ test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the
         assert.equal(r1.status, 200);
         await r1.text();
 
-        // A REAL usage report put the baseline above the window (armed,
-        // usage-grade evidence) — but the image floor exceeds even the window,
-        // so compression cannot make the payload fit.
+        // A usage report put the baseline above the window. Historical images
+        // can now leave the wire, so the reserve alone cannot prove futility.
         const s = sess("s857c");
         s.stats.lastInputTokens = FAKE_CONFIRMED;
         s.stats.lastInputTokensSource = "usage";
 
-        // Filler history gives the kernel foldable candidates. Under the #1841
-        // futility gate this round is provably doomed BEFORE any walk — the
-        // image floor alone (~1.1M) exceeds the window (~999K) while the whole
-        // foldable pool (~4.4K of filler) cannot close the ~110K gap — so the
-        // round is skipped with zero summarization calls: exactly the waste
-        // #1841 removes (old code walked both ranges, burned the calls, and
-        // still failed here).
+        // The mock cannot supply an acceptable summary. The bounded image-fold
+        // attempts must therefore fail without forwarding the original wire or
+        // replacing the measured baseline with an image estimate.
         const r2 = await fetch(url, { method: "POST", headers, body: body(FALLBACK_MODEL, "s857c", [...fillerHistory(16), ...imageInput()]) });
-        // #3461: over-window per bili's own meter with no foldable mass left → 413.
-        assert.equal(r2.status, 413, "usage evidence keeps the hatch closed");
+        assert.equal(r2.status, 502, "unusable summaries keep the hatch closed");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string; message?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
-        assert.match(err2.error?.message ?? "", /futile round/, `the skipped round names its futility verdict (got: ${err2.error?.message})`);
         assert.match(err2.error?.message ?? "", /Images alone account for/, "the image remedy wording survives the futility verdict");
         assert.equal(stats.streamingForwards, 1);
-        assert.equal(stats.summaryCalls, 0, "#1841: a provably futile round spends zero summarization calls");
+        assert.ok(stats.summaryCalls > 0, "image-bearing candidates receive bounded summary attempts");
 
         // No fold ran, so nothing in the turn may touch the baseline: the armed
         // usage value stays exactly where the test put it (far below the image
         // floor — nothing to re-poison) with its grounded provenance intact.
         const after = sess("s857c");
-        assert.equal(after.stats.lastInputTokens, FAKE_CONFIRMED, "skipped round leaves the baseline untouched");
+        assert.equal(after.stats.lastInputTokens, FAKE_CONFIRMED, "failed folds leave the baseline untouched");
         assert.equal(after.stats.lastInputTokensSource, "usage", "grounded provenance preserved");
         assert.equal(confirmedOf("s857c"), undefined, "#987: no window is ever learned from session traffic");
     } finally {
