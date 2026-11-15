@@ -4,7 +4,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import { isServerToolUtilityCall, isSideRequest, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
+import { isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -70,6 +70,49 @@ test("isServerToolUtilityCall: negatives — every veto keeps the request on the
     assert.equal(isServerToolUtilityCall(searchBody({ tools: [null] })), false, "non-object tool entry");
     assert.equal(isServerToolUtilityCall({ input: [{ role: "user", content: "q" }], tools: [{ type: "web_search" }] }), false, "responses-wire input + unversioned type never match");
     assert.equal(isServerToolUtilityCall(searchBody({ tools: [{ type: "web_search", name: "web_search" }] })), false, "unversioned web_search type never matches");
+});
+
+// #6548: pi-web-access's xAI web-search backend sends a deliberately minimal
+// single-shot Responses body — string input, web_search/x_search tools only,
+// no message history — and pi-web-access exposes no knob for a session id,
+// so the client cannot carry an identity. The proxy's #286 refusal hard-400s
+// it before the side lane ever sees it. The Responses-wire predicate below is
+// the shape the refusal branch consults.
+function responsesSearchBody(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+        model: "grok-4.7",
+        input: "latest news on context compression",
+        tools: [{ type: "web_search" }, { type: "x_search" }],
+        ...over,
+    };
+}
+
+test("isResponsesServerToolSingleShot: positive — the captured pi-web-access shape (#6548)", () => {
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody()), true, "captured shape (web_search + x_search, string input)");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [{ type: "web_search" }] })), true, "web_search alone");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [{ type: "web_search_preview" }] })), true, "web_search_preview family");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: "auto" })), true, "string auto");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: "required" })), true, "string required forces one of the declared server tools");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: { type: "web_search" } })), true, "object forcing a DECLARED server tool");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: undefined })), true, "absent tool_choice");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ instructions: "Answer concisely." })), true, "instructions carry no history");
+});
+
+test("isResponsesServerToolSingleShot: negatives — every veto keeps the request under the #286 refusal", () => {
+    assert.equal(isResponsesServerToolSingleShot(null), false, "null body");
+    assert.equal(isResponsesServerToolSingleShot({}), false, "empty body");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "q" }] }] })), false, "array input is message history, not a single shot");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ input: undefined })), false, "missing input");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [{ type: "function", name: "get_weather" }] })), false, "client function tool does not match");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [{ type: "web_search" }, { type: "function", name: "get_weather" }] })), false, "mixing ANY client-side tool vetoes");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [] })), false, "empty tools array");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tools: [null] })), false, "non-object tool entry");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: "none" })), false, "string none vetoes");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: { type: "function", name: "get_weather" } })), false, "forcing a client tool vetoes");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ tool_choice: { type: "required" } })), false, "unrecognized tool_choice shape vetoes");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ previous_response_id: "resp_abc" })), false, "chained continuation is a conversation turn, not a single shot");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ session_id: "sess-1" })), false, "body session_id is an identity signal");
+    assert.equal(isResponsesServerToolSingleShot(responsesSearchBody({ prompt_cache_key: "pck-1" })), false, "prompt_cache_key is an identity signal");
 });
 
 test("isSideRequest: the structural shape outranks the #546 tools veto; explicit intent still outranks the structure", () => {

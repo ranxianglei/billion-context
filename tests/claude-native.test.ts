@@ -405,6 +405,12 @@ test("UPSTREAM_HOP_HEADERS includes expect to prevent undici UND_ERR_NOT_SUPPORT
     assert.ok(UPSTREAM_HOP_HEADERS.has("expect"));
 });
 
+test("OMP recovery ownership marker is stripped before provider egress", () => {
+    assert.ok(UPSTREAM_HOP_HEADERS.has("x-bili-host-recovery-owner"));
+    const out = buildForwardHeaders({ "x-bili-host-recovery-owner": "omp", "content-type": "application/json" });
+    assert.equal(out["x-bili-host-recovery-owner"], undefined);
+});
+
 test("buildForwardHeaders drops expect so undici fetch does not throw UND_ERR_NOT_SUPPORTED (#5369)", async () => {
     const server = http.createServer((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
     await new Promise<void>((resolve) => { server.listen(0, "127.0.0.1", resolve); });
