@@ -228,7 +228,7 @@ asserts the four user-facing guarantees of #1239:
   (`stopProxiesGracefully`) before asserting on-disk state; teardown then
   SIGKILLs survivors (fake + instance-record pids).
 - `E2E_CHECK=1` runs a zero-cost preflight (pi binary version, built
-  `dist/agent/pi-native.js`, fake `/v1/models` probe). `E2E_PI_BIN` /
+  `dist/agent/billion-context.js`, fake `/v1/models` probe). `E2E_PI_BIN` /
   `E2E_TMO` override the binary and per-run timeout.
 
 ### CI
@@ -304,7 +304,7 @@ provider pointed at a local mock that speaks BOTH legs — POST/SSE and a
 WebSocket upgrade on one port — through the real built proxy. Zero tokens.
 
 Gated: `ACP_TEST_E2E_PI_WS=1` (skip-by-default like the other real-client
-lanes); needs the built `dist/agent/pi-native.js`. Override the binary with
+lanes); needs the built `dist/agent/billion-context.js`. Override the binary with
 `E2E_PI_BIN`.
 
 ```bash

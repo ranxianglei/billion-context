@@ -454,7 +454,7 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         try {
             const headers = new Headers(input.headers);
             for (const [k, v] of Object.entries(extra)) headers.set(k, v);
-            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, duplex: "half" });
+            const rebuilt = new Request(input.url, { method: input.method, headers, body: input.body, signal: input.signal, duplex: "half" });
             return { input: rebuilt, init };
         } catch {
             return { input, init };
@@ -1452,13 +1452,45 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     };
 }
 
+/** Replace the outgoing request reference with a new Request against
+ *  `target`, preserving method/headers/body (a Request.url is read-only,
+ *  #810 — the reference itself moves). When the body cannot be copied the
+ *  original request is left untouched (it goes direct rather than dying). */
+export function replaceRequestTarget(e: { request?: unknown }, target: string): void {
+    const old = e.request;
+    if (old == null) return;
+    try {
+        e.request = new Request(target, old as unknown as Request);
+    } catch {
+        // undici refuses to copy a body-bearing Request without explicit
+        // duplex — reconstruct with the body stream passed explicitly.
+        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null; signal?: AbortSignal };
+        try {
+            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET", signal: src.signal };
+            const pairs: [string, string][] = [];
+            try {
+                for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
+            } catch {}
+            if (pairs.length > 0) init.headers = pairs;
+            if (src.body != null) {
+                init.body = src.body as RequestInit["body"];
+                init.duplex = "half";
+            }
+            e.request = new Request(target, init);
+        } catch {
+            // replacement impossible (exotic body) — request goes direct
+        }
+    }
+}
+
+
 /** Replace the hook's request with a new Request carrying a NEW BODY (and
  *  optionally extra headers) while preserving url/method/headers. The
  *  incremental-turn adapters use it: the host hands a real fetch Request
  *  whose target and headers must survive while the body is swapped for the
  *  incremental payload. A string body needs no duplex. */
 export function replaceRequestPayload(e: { request?: unknown }, body: string, extraHeaders?: Record<string, string>): void {
-    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown } | null | undefined;
+    const old = e.request as { url?: unknown; method?: unknown; headers?: unknown; signal?: AbortSignal } | null | undefined;
     if (old == null || typeof old.url !== "string") return;
     try {
         const headers = new Headers((old.headers ?? undefined) as ConstructorParameters<typeof Headers>[0]);
@@ -1467,6 +1499,7 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
             method: typeof old.method === "string" ? old.method : "POST",
             headers,
             body,
+            signal: old.signal,
         });
     } catch {
         // replacement impossible (exotic request) — the caller's plan is
@@ -1481,14 +1514,14 @@ export function replaceRequestPayload(e: { request?: unknown }, body: string, ex
 export function withRestoredBody(input: string | URL | Request, init: RequestInit | undefined, body: string): { input: string | URL | Request; init: RequestInit | undefined } {
     if (input instanceof Request) {
         try {
-            const plain = new Request(input.url, { method: input.method, headers: input.headers });
+            const plain = new Request(input.url, { method: input.method, headers: input.headers, signal: input.signal });
             return { input: plain, init: { ...(init ?? {}), body } };
         } catch {
             const headers: Record<string, string> = {};
             try {
                 for (const [k, v] of input.headers) headers[k] = v;
             } catch {}
-            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body } };
+            return { input: input.url, init: { ...(init ?? {}), method: input.method, headers, body, signal: init?.signal !== undefined ? init.signal : input.signal } };
         }
     }
     return { input, init: { ...(init ?? {}), body } };
