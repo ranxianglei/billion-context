@@ -26,8 +26,8 @@ function makeSession(): Session {
     };
 }
 
-function msg(id: string, role: "user" | "assistant", text: string): CoreMessage {
-    return { id, role, contentType: "text", text };
+function msg(id: string, role: "user" | "assistant", text: string, contentType: "text" | "reasoning" = "text"): CoreMessage {
+    return { id, role, contentType, text };
 }
 
 function logCapture() {
@@ -57,7 +57,8 @@ function retireFixture(opts: FixtureOpts = {}): { session: Session; full: CoreMe
     const drop = opts.drop ?? ["h5", "h6"];
     const session = makeSession();
     const all: CoreMessage[] = [];
-    for (let i = 0; i < 14; i++) all.push(msg(`h${i}`, i % 2 === 0 ? "user" : "assistant", `body ${i} ${"z".repeat(512)}`));
+    const reasoningSet = new Set(opts.reasoningIds ?? []);
+    for (let i = 0; i < 14; i++) all.push(msg(`h${i}`, i % 2 === 0 ? "user" : "assistant", `body ${i} ${"z".repeat(512)}`, reasoningSet.has(`h${i}`) ? "reasoning" : "text"));
     const covered = ["h2", "h3", "h4", "h5", "h6", "h7"];
     const anchors: Record<string, FoldAnchor> = {};
     for (const id of covered) {
@@ -226,4 +227,31 @@ test("#3849: only the persistently absent subset retires; live siblings keep cov
     assert.deepEqual(blockOf(fx.session).effectiveMessageIds, ["h2", "h3", "h4", "h6", "h7"], "order preserved around the splice");
     assert.deepEqual({ p: covOf(fx.session)!.p, r: covOf(fx.session)!.r, t: covOf(fx.session)!.t, e: covOf(fx.session)!.e, z: covOf(fx.session)!.z },
         { p: 5, r: 0, t: 5, e: 1, z: 0 });
+});
+
+test("#3849: exactly-half present is not a strict majority — the #5715 guard protects the block (no retirement)", () => {
+    // 3 of 6 covered ids present (h2,h3,h7), 3 absent (h4,h5,h6) → exactly half.
+    // The #5715 strict-majority boundary pins 2*prHard <= hard.length as protected:
+    // the absent ids accrue to the retire threshold but never retire — such a block
+    // belongs to the escalation/reap machinery, not the #3849 sweep.
+    const fx = retireFixture({ drop: ["h4", "h5", "h6"] });
+    reconcileFoldCoverage(fx.session, fx.full, { mode: "repair" });
+    let r3: ReturnType<typeof reconcileFoldCoverage> | undefined;
+    for (let i = 0; i < 3; i++) r3 = reconcileFoldCoverage(fx.session, fx.drifted, { mode: "repair" });
+    assert.equal(r3?.retired, 0, "exactly-half block is protected — no id retires");
+    assert.deepEqual(blockOf(fx.session).effectiveMessageIds, ["h2", "h3", "h4", "h5", "h6", "h7"], "coverage unchanged at the boundary");
+    assert.deepEqual(fx.session.metadata["foldAbsentStreaks"], { h4: 3, h5: 3, h6: 3 }, "streaks cap at the threshold but the guard blocks the splice");
+});
+
+test("#3849: reasoning survivors cannot inflate the majority — the #5715 guard counts hard ids only", () => {
+    // hard = [h2,h3,h4,h7] (2 present h4,h7; 2 absent h2,h3), reasoning = [h5,h6] (both present).
+    // The old numerator (all present-or-claimed = 4) would read a false majority and
+    // shrink; the #5715 hard-only numerator (2) keeps the block at exactly-half → protected.
+    const fx = retireFixture({ drop: ["h2", "h3"], reasoningIds: ["h5", "h6"] });
+    reconcileFoldCoverage(fx.session, fx.full, { mode: "repair" });
+    let r3: ReturnType<typeof reconcileFoldCoverage> | undefined;
+    for (let i = 0; i < 3; i++) r3 = reconcileFoldCoverage(fx.session, fx.drifted, { mode: "repair" });
+    assert.equal(r3?.retired, 0, "reasoning survivors must not inflate the hard majority");
+    assert.deepEqual(blockOf(fx.session).effectiveMessageIds, ["h2", "h3", "h4", "h5", "h6", "h7"], "coverage unchanged");
+    assert.deepEqual(fx.session.metadata["foldAbsentStreaks"], { h2: 3, h3: 3 }, "the two absent hard ids accrue to the threshold but are protected");
 });
