@@ -3,13 +3,17 @@
  * dsh's auxiliary calls.
  *
  * The post-#6880 dsh plugin stamps `x-bili-plugin-purpose` from
- * GenerateOptions.purpose on every dispatch (dsh contract: ordinary
- * conversation requests leave it unset). The server classifies a
- * plugin-ANNOUNCED request with a non-empty purpose as a side request by
- * declaration — no per-feature template matching — and lets the guard
- * recognize a declared compaction even when dsh's INSTRUCTION text drifted.
- * The content heuristics stay as the fallback for pre-#6880 plugin installs,
- * so every pin below pairs the declared path with its undeclared twin.
+ * GenerateOptions.purpose on EVERY dispatch (dsh contract: ordinary
+ * conversation requests leave it unset, so the plugin stamps the
+ * "conversation" sentinel for main turns). The server normalizes the
+ * sentinel back to "absent" before the side classification, treats any
+ * OTHER declared purpose as a side request by declaration — no per-feature
+ * template matching — lets the guard recognize a declared compaction even
+ * when dsh's INSTRUCTION text drifted, and keys declared main traffic on
+ * the raw session id (the v2 wire terminal state of #6880: one conversation
+ * one key, no persona-order ladder). The content heuristics stay as the
+ * fallback for pre-#6880 plugin installs, so every pin below pairs the
+ * declared path with its undeclared twin.
  */
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -200,6 +204,73 @@ test("a declared dsh compaction is guarded even when the INSTRUCTION text drifte
         const err = r.body?.error as { code?: string };
         assert.equal(err?.code, "dsh_compaction_refused");
         assert.equal(h.forwarded.length, 0, "the refused call never reaches the upstream");
+    } finally {
+        await h.close();
+    }
+});
+
+// ---- #6880 v2 wire: declared main traffic keys the raw session id --------
+//
+// A request that carries the purpose header in ANY value comes from a
+// conversation whose plugin declares every dispatch's purpose (post-#6883
+// dsh). dsh mints one UUID per session and never recycles an id, so for
+// those conversations the raw session id IS the complete identity: the
+// persona-order ladder (claim races, fork rungs) is skipped and the main
+// turn lands on the verbatim key. Pre-#6883 plugins stamp no header and
+// keep the ladder byte-for-byte.
+
+test("v2: a declared main turn keys the raw id on FIRST sight (no ladder, no claim race)", async () => {
+    const h = await harness();
+    try {
+        // A review-shape blob (foreign system, no shared history with what
+        // comes later) would FIRST-SIGHT the raw key under the legacy
+        // ladder and steal it from the real main turn (#1916). Declared
+        // traffic never enters the ladder — its aux is a declared side, so
+        // the first request that ever claims the raw key IS the main turn.
+        const mainBody = { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: "set up the workspace" }, { role: "assistant", content: "done" }, { role: "user", content: "now configure ci" }] };
+        const r = await h.dshSend("conv6", mainBody, undefined, "conversation");
+        assert.equal(r.status, 200);
+        const session = resolveConversation("conv6").session!;
+        assert.ok(session, "the raw conversation resolved to a session");
+        assert.equal(session.stats.requests, 1, "the declared main turn runs the full pipeline");
+        assert.deepEqual(await h.subSessions("conv6"), [], "no persona fork off a declared main turn");
+    } finally {
+        await h.close();
+    }
+});
+
+test("v2: a system change on a declared conversation stays on the raw key (no drift fork)", async () => {
+    const h = await harness();
+    try {
+        const base = [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }];
+        // turn 1, undeclared (pre-#6883 plugin shape): the legacy ladder
+        // anchors the persona on the raw key.
+        await h.dshSend("conv7", { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM }, ...base] });
+        // turn 2: the SAME conversation, new plugin, but its system text has
+        // drifted (dsh version bump) and the history is history-disjoint.
+        // Legacy ladder: all continuation evidence fails → |sub:<fp> fork
+        // (the #5517/#5656 drift cluster). Declared: the raw id IS the
+        // identity — one session, no fork, blocks never orphan.
+        const r = await h.dshSend("conv7", { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM + " (v2 instructions)" }, { role: "user", content: "completely different fresh context" }, { role: "user", content: "keep going" }] }, undefined, "conversation");
+        assert.equal(r.status, 200);
+        assert.equal(resolveConversation("conv7").session?.stats.requests ?? 0, 2, "both turns live on the raw session");
+        assert.deepEqual(await h.subSessions("conv7"), [], "no |sub: drift lane off declared traffic");
+    } finally {
+        await h.close();
+    }
+});
+
+test("v2: the conversation sentinel is a MAIN turn, not a side request", async () => {
+    const h = await harness();
+    try {
+        // Without the sentinel normalization the raw header value would
+        // declare this a sidecar and the kernel would see zero requests —
+        // the full pipeline running proves the split (side declaration vs
+        // identity declaration) holds on one header.
+        const body = { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: "hello" }], tools: [{ type: "function", function: { name: "bash", description: "run a command", parameters: { type: "object", properties: {} } } }] };
+        const r = await h.dshSend("conv8", body, undefined, "conversation");
+        assert.equal(r.status, 200);
+        assert.equal(resolveConversation("conv8").session?.stats.requests ?? 0, 1, "sentinel rides the main pipeline (not the side passthrough)");
     } finally {
         await h.close();
     }

@@ -155,6 +155,16 @@ const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
  *  marker, same trust discipline as the conversation header: an unannounced
  *  client's purpose header is inert telemetry. */
 const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
+/** #6880 v2 wire: the post-#6883 dsh plugin stamps this sentinel for MAIN
+ *  turns (dsh leaves GenerateOptions.purpose unset for ordinary conversation,
+ *  so no real dsh purpose can collide with it). PRESENCE of the header in any
+ *  value is the declaration that this conversation's plugin announces every
+ *  dispatch's purpose — main traffic then keys the raw session id directly
+ *  (dsh mints one UUID per session, ids never recycle) instead of routing
+ *  through the persona-order ladder, and its auxiliary traffic is a declared
+ *  side request by the header alone. The sentinel itself is NOT a side:
+ *  handle.ts normalizes it back to "absent" before the side classification. */
+export const PLUGIN_PURPOSE_CONVERSATION = "conversation";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 

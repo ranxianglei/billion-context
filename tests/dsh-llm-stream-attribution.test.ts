@@ -430,20 +430,23 @@ test("#6880: the dispatch purpose is captured into the scope and stamped per fet
             assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-review");
             assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "auto-review");
         }
-        // 2. ordinary conversation leaves purpose unset → NO purpose header
-        //    (presence is the side-request signal; main turns stay quiet).
+        // 2. ordinary conversation leaves purpose unset → the "conversation"
+        //    sentinel is stamped (presence is the v2 declaration; the server
+        //    normalizes the sentinel back to "no declared purpose", so it is
+        //    never a side request).
         {
             const it = runWaterfall(handle.events, { sessionId: "sess-main" }, base)[Symbol.asyncIterator]();
             await it.next();
             assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-main");
-            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], undefined);
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation");
         }
-        // 3. hostile/odd values degrade to no header, never a bad header.
+        // 3. hostile/odd values degrade to the main-turn sentinel — never a
+        //    bad header, never a declared aux purpose.
         for (const junk of ["", 42, { a: 1 }, "bad\x00control", "a".repeat(65), "has space", "non-ascii-\u00e9"] as unknown[]) {
             stamps.length = 0;
             const it = runWaterfall(handle.events, { sessionId: "sess-junk", purpose: junk }, base)[Symbol.asyncIterator]();
             await it.next();
-            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], undefined, `junk purpose ${JSON.stringify(String(junk).slice(0, 20))} stays off the wire`);
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation", `junk purpose ${JSON.stringify(String(junk).slice(0, 20))} degrades to the sentinel, never the raw value`);
             assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-junk");
         }
     });

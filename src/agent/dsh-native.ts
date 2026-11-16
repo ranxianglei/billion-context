@@ -2609,15 +2609,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
-        // #6880: the declared auxiliary purpose rides its own header (ASCII-
-        // gated like the model header below — an odd value degrades to no
-        // header, and the server falls back to its content heuristics). Only
-        // set for auxiliary dispatches by dsh's contract, so PRESENCE means
-        // "side request" without any per-feature content matching.
-        if (attr.purpose !== undefined) {
-            const purposeHeader = asciiHeaderValue(attr.purpose);
-            if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
-        }
+        // #6880: the declared purpose rides its own header (ASCII-gated like
+        // the model header below — an odd value degrades to no header, and
+        // the server falls back to its content heuristics). Post-#6883 this is
+        // stamped on EVERY dispatch: the real dsh purpose for auxiliary
+        // calls, or the "conversation" sentinel for main turns (dsh leaves
+        // GenerateOptions.purpose unset for ordinary conversation). PRESENCE
+        // is therefore the v2 declaration — the server routes declared aux by
+        // the header alone and keys declared main traffic on the raw session
+        // id (no persona-order ladder); the sentinel itself is not a side.
+        const declaredPurpose = attr.purpose ?? "conversation";
+        const purposeHeader = asciiHeaderValue(declaredPurpose);
+        if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
