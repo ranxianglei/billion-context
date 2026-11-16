@@ -427,6 +427,40 @@ CREATE TABLE IF NOT EXISTS egress_snapshot (
 );
 `;
 
+/** #6785 step 7: the ORPHAN BLOCKS table. The orphan journal (#4216/#4242:
+ *  blockContents entries whose block was reaped out of state.blocks) used to
+ *  accumulate in sessions.orphans_json — an ever-growing JSON blob re-merged
+ *  and re-written on every save of the session. It is now ONE ROW PER BLOCK
+ *  (immutable content; a refreshed view for the same id is an UPDATE), the
+ *  same table-ization as #6325's kstate/ccr columns. The column becomes a
+ *  one-time migration source (legacy rows move onto the table on first
+ *  ingest, then the column is cleared). Probed separately (probe-first,
+ *  no version bump). */
+const ORPHAN_BLOCKS_DDL = `-- #6785 step 7: one row per reaped block's retained contents.
+CREATE TABLE IF NOT EXISTS orphan_blocks (
+    session_id TEXT NOT NULL,
+    block_id TEXT NOT NULL,
+    one_json TEXT,
+    full_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+);
+`;
+
+/** #6785 step 8: one row per UNBOUNDED CompressionState field (the kstate
+ *  slim split). The sessions.kstate_json column keeps only the bounded
+ *  fields; these rows carry the rest (tokenSnapshot, tsStamps, viewLatches,
+ *  absorbed, rules, …). The field set is FROZEN in src/storage/slim.ts
+ *  (ROW_BACKED_KSTATE_FIELDS) and pinned by tests/issue5874-state-fields.
+ *  Probe-first, no version bump. */
+const STATE_FIELDS_DDL = `-- #6785 step 8: unbounded CompressionState fields off the sessions row.
+CREATE TABLE IF NOT EXISTS state_fields (
+    session_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, field)
+);
+`;
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -465,6 +499,18 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_snapshot'")
         .get();
     if (!hasEgressSnapshot) db.exec(EGRESS_SNAPSHOT_DDL);
+    // #6785 step 7: orphan blocks — own probe (a db written between the
+    // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
+    // pass through — same discipline, no version bump).
+    const hasOrphanBlocks = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orphan_blocks'")
+        .get();
+    if (!hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
+    // #6785 step 8: kstate rows — own probe (same discipline, no bump).
+    const hasStateFields = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'state_fields'")
+        .get();
+    if (!hasStateFields) db.exec(STATE_FIELDS_DDL);
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev

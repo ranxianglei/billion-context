@@ -323,12 +323,16 @@ export interface SessionStorageStats {
         deadRefs: number;
         refs: number;
         ccrEntries: number;
+        /** #6785 step 7: the reaped-block journal rows (orphan_blocks). */
+        orphanBlocks: number;
         sessionExt: number;
         checkpoints: number;
         pinnedCheckpoints: number;
         /** #5874: the L1 identity entry this session owns (l1_world, keyed
          *  by the raw host session id). Zero for a never-observed session. */
         l1Entries: number;
+        /** #6785 step 8: the row-backed CompressionState fields (state_fields). */
+        stateFields: number;
     };
     /** Bytes held in inline JSON columns of this session's rows (sessions
      *  record + blocks payload_json + session_ext value_json) — everything
@@ -378,6 +382,11 @@ export interface IngestSessionInput {
      *  journal entries survive, because LazyBlockContents means a live
      *  session's in-memory map may not carry entries trimmed earlier. */
     orphansJson?: string | null;
+    /** #6785 step 8: the unbounded CompressionState fields as one row each
+     *  (field → JSON value) — the kstate slim split. The kstateJson column
+     *  keeps only the bounded fields; rows are upserted on change and a row
+     *  for a field that becomes undefined is dropped (bounded ≤ 9). */
+    stateFields?: Record<string, string>;
 }
 
 /** Extension-namespace guards (#3069): keys/namespaces are non-empty
@@ -913,38 +922,115 @@ export class UnifiedStore {
     }
 
     /** refcount-aware release; the CAS body itself never leaves. */
-    /** #4242: merge the incoming orphan map over the journal's current
-     *  contents. Incoming entries win on key collision (same id, refreshed
-     *  view); existing entries the live session no longer carries (trimmed
-     *  from memory by LazyBlockContents) survive. */
-    private mergeOrphansJson(sessionId: string, incomingJson: string | null): string | null {
-        if (incomingJson === null) {
-            // No orphans in this save — keep whatever the journal already
-            // holds (a previous reap's trimmed-away contents must survive).
-            const row = this.db
-                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-                .get(sessionId) as { orphans_json: string | null } | undefined;
-            return row?.orphans_json ?? null;
+    /** #6785 step 7: the orphan journal moved OFF the sessions row — one
+     *  row per block in orphan_blocks (immutable content; a refreshed view
+     *  for the same id is an UPDATE). Keeps the #4242 merge semantics exactly:
+     *  incoming entries win on key collision, entries the live session no
+     *  longer carries (trimmed by LazyBlockContents) survive — the table is
+     *  only ever INSERT/UPDATE, never DELETE within a session. The legacy
+     *  orphans_json column migrates onto the table on first ingest and is
+     *  then cleared, so the column stops growing and stops being re-written
+     *  on every save. Returns null: the column is deprecated. */
+    private applyOrphanBlocks(sessionId: string, incomingJson: string | null): null {
+        const existing = this.db
+            .prepare("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?")
+            .all(sessionId) as { block_id: string; one_json: string | null; full_json: string }[];
+        const rowMap = new Map(existing.map((r) => [r.block_id, r]));
+        const all: Record<string, unknown> = {};
+        const col = this.getOrphansJson(sessionId);
+        if (col !== null) {
+            try {
+                const parsed = JSON.parse(col) as Record<string, unknown>;
+                if (parsed && typeof parsed === "object") Object.assign(all, parsed);
+            } catch { /* corrupt journal → start fresh (the read path skips bad entries too) */ }
         }
-        let merged: Record<string, unknown> = {};
-        try {
-            const existing = this.db
-                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-                .get(sessionId) as { orphans_json: string | null } | undefined;
-            if (existing?.orphans_json) {
-                const parsed = JSON.parse(existing.orphans_json) as Record<string, unknown>;
-                if (parsed && typeof parsed === "object") merged = parsed;
+        if (incomingJson !== null) {
+            try {
+                const parsed = JSON.parse(incomingJson) as Record<string, unknown>;
+                if (parsed && typeof parsed === "object") Object.assign(all, parsed);
+            } catch { /* corrupt incoming → keep existing only */ }
+        }
+        const upsert = this.db.prepare(
+            "INSERT INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?) " +
+            "ON CONFLICT(session_id, block_id) DO UPDATE SET one_json = excluded.one_json, full_json = excluded.full_json",
+        );
+        for (const [blockId, view] of Object.entries(all)) {
+            const one = (view as { one?: unknown }).one;
+            const full = (view as { full?: unknown }).full;
+            const oneJson = one === undefined ? null : JSON.stringify(one);
+            const fullJson = JSON.stringify(full);
+            const row = rowMap.get(blockId);
+            if (row && row.one_json === oneJson && row.full_json === fullJson) continue;
+            upsert.run(sessionId, blockId, oneJson, fullJson);
+        }
+        this.db.prepare("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?").run(sessionId);
+        return null;
+    }
+
+    /** #6785 step 8: row-backed CompressionState fields — one row per field,
+     *  upserted only on change (a steady-state flush writes zero rows) and
+     *  a row for a row-backed field that becomes undefined is DROPPED (the
+     *  column-merge drop-undefined semantics, bounded ≤ 9). Legacy sessions
+     *  with no incoming rows keep their column copy (the read path falls
+     *  back to it); rows always win over the column on read. */
+    private applyStateFields(sessionId: string, fields: Record<string, string>): void {
+        const existing = this.db
+            .prepare("SELECT field, value_json FROM state_fields WHERE session_id = ?")
+            .all(sessionId) as { field: string; value_json: string }[];
+        const upsert = this.db.prepare(
+            "INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?) " +
+            "ON CONFLICT(session_id, field) DO UPDATE SET value_json = excluded.value_json",
+        );
+        for (const r of existing) {
+            if (fields[r.field] === undefined) {
+                this.db.prepare("DELETE FROM state_fields WHERE session_id = ? AND field = ?").run(sessionId, r.field);
             }
-        } catch {
-            // corrupt journal → start fresh (loadLegacyView skips bad entries too)
         }
-        try {
-            const incoming = JSON.parse(incomingJson) as Record<string, unknown>;
-            if (incoming && typeof incoming === "object") merged = { ...merged, ...incoming };
-        } catch {
-            // corrupt incoming → keep existing only
+        for (const [field, valueJson] of Object.entries(fields)) {
+            const row = existing.find((r) => r.field === field);
+            if (row && row.value_json === valueJson) continue;
+            upsert.run(sessionId, field, valueJson);
         }
-        return Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+    }
+
+    /** #6785 step 8: the unbounded CompressionState field rows (null when
+     *  the session has none — legacy sessions read from the column). */
+    getStateFields(sessionId: string): Record<string, string> | null {
+        const rows = this.db
+            .prepare("SELECT field, value_json FROM state_fields WHERE session_id = ?")
+            .all(sessionId) as { field: string; value_json: string }[];
+        if (rows.length === 0) return null;
+        const out: Record<string, string> = {};
+        for (const r of rows) out[r.field] = r.value_json;
+        return out;
+    }
+
+    /** #6785 step 7: the merged orphan journal — orphan_blocks table rows
+     *  plus legacy column entries the migration has not reached yet (defence
+     *  in depth: after any ingest the column is NULL). null = no orphans
+     *  anywhere (callers keep their "null ⇒ skip merge" semantics). */
+    getOrphanViews(sessionId: string): Record<string, { one: unknown; full: unknown }> | null {
+        const rows = this.db
+            .prepare("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?")
+            .all(sessionId) as { block_id: string; one_json: string | null; full_json: string }[];
+        let out: Record<string, { one: unknown; full: unknown }> | null = null;
+        for (const r of rows) {
+            if (out === null) out = {};
+            out[r.block_id] = { one: r.one_json === null ? null : JSON.parse(r.one_json), full: JSON.parse(r.full_json) };
+        }
+        const col = this.getOrphansJson(sessionId);
+        if (col !== null) {
+            try {
+                const parsed = JSON.parse(col) as Record<string, { one: unknown; full: unknown }>;
+                if (parsed && typeof parsed === "object") {
+                    for (const [id, view] of Object.entries(parsed)) {
+                        if (out === null) out = {};
+                        if (out[id] === undefined) out[id] = view;
+                    }
+                }
+            } catch { /* corrupt legacy column → the table rows remain */ }
+        }
+        return out;
     }
 
     private releaseContent(hash: string | null): void {
@@ -1192,8 +1278,12 @@ export class UnifiedStore {
                     // #4216/#4242: orphan journal rides the normal upsert with
                     // MERGE semantics (existing entries survive — LazyBlockContents
                     // means the live map may not carry trimmed entries).
-                    orphansJson: this.mergeOrphansJson(s.sessionId, s.orphansJson ?? null),
+                    orphansJson: this.applyOrphanBlocks(s.sessionId, s.orphansJson ?? null),
                 });
+
+            // #6785 step 8: row-backed kstate fields ride the same tx (the
+            // column keeps only the bounded fields — see splitKstate).
+            this.applyStateFields(s.sessionId, input.stateFields ?? {});
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)
             // → session_id. ON CONFLICT DO NOTHING — first claimant wins; while
@@ -2152,22 +2242,10 @@ export class UnifiedStore {
                 this.releaseContent(row.summary_hash);
                 if (row.one_hash !== null) this.releaseContent(row.one_hash);
             }
-            if (orphanContents.size > 0) {
-                const sess = this.db
-                    .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-                    .get(sessionId) as { orphans_json: string | null } | undefined;
-                if (sess) {
-                    let merged: Record<string, unknown> = {};
-                    try {
-                        const parsed = JSON.parse(sess.orphans_json ?? "{}") as unknown;
-                        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) merged = parsed as Record<string, unknown>;
-                    } catch {
-                        // corrupt journal → start fresh rather than losing the reap
-                    }
-                    for (const [blockId, view] of orphanContents) merged[blockId] = view;
-                    this.db.prepare("UPDATE sessions SET orphans_json = ? WHERE session_id = ?").run(JSON.stringify(merged), sessionId);
-                }
-            }
+            // #6785 step 7: the reaped-block journal lives in orphan_blocks
+            // now (same merge semantics the column had — incoming entries win
+            // on key collision, trimmed entries survive).
+            this.applyOrphanBlocks(sessionId, orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null);
         });
     }
 
@@ -2207,6 +2285,8 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
@@ -2239,16 +2319,18 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM dead_refs WHERE session_id = ?) AS deadRefs, " +
                     "(SELECT COUNT(*) FROM refs WHERE session_id = ?) AS refs, " +
                     "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
+                    "(SELECT COUNT(*) FROM orphan_blocks WHERE session_id = ?) AS orphanBlocks, " +
                     "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps, " +
-                    "(SELECT COUNT(*) FROM l1_world WHERE ledger_id = ?) AS l1Entries",
+                    "(SELECT COUNT(*) FROM l1_world WHERE ledger_id = ?) AS l1Entries, " +
+                    "(SELECT COUNT(*) FROM state_fields WHERE session_id = ?) AS stateFields",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
             sessions: number; conversations: number;
             messages: number; media: number; blocks: number; deadRefs: number;
-            refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
-            l1Entries: number;
+            refs: number; ccrEntries: number; orphanBlocks: number; ext: number; cps: number; pinnedCps: number;
+            l1Entries: number; stateFields: number;
         };
         const inlineBytes =
             ((this.db
@@ -2293,10 +2375,12 @@ export class UnifiedStore {
                 deadRefs: counts.deadRefs,
                 refs: counts.refs,
                 ccrEntries: counts.ccrEntries,
+                orphanBlocks: counts.orphanBlocks,
                 sessionExt: counts.ext,
                 checkpoints: counts.cps,
                 pinnedCheckpoints: counts.pinnedCps,
                 l1Entries: counts.l1Entries,
+                stateFields: counts.stateFields,
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,
@@ -2413,6 +2497,9 @@ export class UnifiedStore {
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        // #6785 step 7: the reaped-block journal rides the archive too.
+        const orphans = (this.db.prepare("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const stateFields = (this.db.prepare("SELECT field, value_json FROM state_fields WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(m.content_hash as string);
@@ -2437,7 +2524,7 @@ export class UnifiedStore {
         // and every failed attempt would add another full copy. The line
         // still reaches the log before COMMIT, so a committed sweep always
         // has its export.
-        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints, orphanBlocks: orphans, stateFields }) + "\n";
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
@@ -2452,6 +2539,8 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
@@ -2485,6 +2574,8 @@ export class UnifiedStore {
             ccrEntries: Record<string, unknown>[];
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
+            orphanBlocks?: Record<string, unknown>[];
+            stateFields?: Record<string, unknown>[];
         };
         // Scan the JSONL for the session's NEWEST line (#6317: a pre-fix
         // failed archive can leave stale lines behind; a later successful
@@ -2579,6 +2670,11 @@ export class UnifiedStore {
             }
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
+            // #6785 step 7: the journal round-trips through the archive.
+            const insOrphan = this.db.prepare("INSERT INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING");
+            for (const o of dump.orphanBlocks ?? []) insOrphan.run(sessionId, o.block_id, o.one_json ?? null, o.full_json);
+            const insStateField = this.db.prepare("INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?) ON CONFLICT(session_id, field) DO NOTHING");
+            for (const f of dump.stateFields ?? []) insStateField.run(sessionId, f.field, f.value_json);
             this.db
                 .prepare(`UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,
                     created_at = ?, updated_at = ?, next_block_id = ?, next_run_id = ?, meta_json = ?, stats_json = ?, metadata_json = ?, kstate_json = ?, tail_json = ?, ccr_json = ?, last_ingested_seq = ?, orphans_json = ?, status = 'active' WHERE session_id = ?`)

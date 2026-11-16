@@ -47,7 +47,7 @@ test("#4192: sweptOrphanCallIds / pendingOrphanSweepMinRef survive the unified r
             deadRefs: store.getDeadRefs("sf-1"),
             refs: store.getRefs("sf-1"),
         };
-        const view = loadLegacyView(rows);
+        const view = loadLegacyView(rows, undefined, store.getStateFields("sf-1"));
         // The two fields the hand list dropped (#4192) must round-trip intact.
         assert.deepEqual((view.state as Record<string, unknown>).sweptOrphanCallIds, ["m00042", "m00043"]);
         assert.equal((view.state as Record<string, unknown>).pendingOrphanSweepMinRef, 42);

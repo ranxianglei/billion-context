@@ -124,6 +124,8 @@ class StubMysqlBackend implements StorageBackend {
             getDeadRefs: async (id) => row(id)?.deadRefs ?? [],
             getRefs: async (id) => row(id)?.refs ?? [],
             getCcrEntries: async () => [],
+            getOrphanViews: async () => null,
+            getStateFields: async () => null,
         };
         return read(view);
     }
@@ -165,6 +167,12 @@ class StubMysqlBackend implements StorageBackend {
     }
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
         return Promise.resolve(this.rows.get(sessionId)?.ccrEntries ?? []);
+    }
+    getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        return Promise.resolve(null);
+    }
+    getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return Promise.resolve(null);
     }
     // No watermark on the stub → every record takes the full-ingest path
     // (deterministic seeding; the delta probe would need boundary state).

@@ -552,7 +552,7 @@ export class UnifiedShadow {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id));
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -712,6 +712,10 @@ export class UnifiedShadow {
                 // #6785 step 6: slim ccr envelopes hydrate from the CAS-backed
                 // ledger; full legacy envelopes ignore these rows.
                 builder.addCcrEntries(store.getCcrEntries(id));
+                // #6785 step 7: the orphan journal now lives in orphan_blocks;
+                // getOrphanViews also unions any legacy column entries.
+                builder.addOrphanViews(store.getOrphanViews(id) ?? {});
+                builder.addStateFields(store.getStateFields(id) ?? {});
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
                 return builder.finish() as LegacySessionLike;
@@ -747,7 +751,7 @@ export class UnifiedShadow {
                         appendBlockContents(contents, blocks);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
                     }
-                    mergeOrphanBlockContents(contents, store.getOrphansJson(id));
+                    mergeOrphanBlockContents(contents, JSON.stringify(store.getOrphanViews(id) ?? {}));
                     result.blockContents = contents;
                 }
                 return result;
@@ -1290,7 +1294,7 @@ export class UnifiedShadow {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id));
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
@@ -1342,6 +1346,9 @@ export class UnifiedShadow {
                     // #6785 step 6: same slim-envelope hydration on the async
                     // (MySQL seam) leg — one source, both legs.
                     builder.addCcrEntries(await reader.getCcrEntries(id));
+                    // #6785 step 7: same orphan-journal union on the async leg.
+                    builder.addOrphanViews(await reader.getOrphanViews(id) ?? {});
+                    builder.addStateFields(await reader.getStateFields(id) ?? {});
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;
@@ -1607,8 +1614,8 @@ class BatchedViewVerification {
     private tailGaps = 0;
     private tailSlot: DriftDiagnostics["tailSlot"];
 
-    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = []) {
-        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows);
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null) {
+        const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows, stateFieldsRows, orphanViews ?? undefined);
         this.orphans = header.blockContents;
         this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
         this.tail = JSON.parse(session.tailJson);

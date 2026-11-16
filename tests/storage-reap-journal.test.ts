@@ -85,7 +85,7 @@ test("reap journal: reaped block does not resurrect after restart; orphan conten
             deadRefs: reopened.getDeadRefs("sess-reap"),
             refs: reopened.getRefs("sess-reap"),
         };
-        const view = loadLegacyView(rows) as LegacySessionLike;
+        const view = loadLegacyView(rows, undefined, undefined, reopened.getOrphanViews("sess-reap") ?? {}) as LegacySessionLike;
         const state = view.state as { blocks: CompressionBlock[] };
         assert.equal(state.blocks.length, 1, "reaped block must NOT resurrect into state.blocks");
         assert.equal(state.blocks[0].blockId, "b1");
@@ -114,7 +114,7 @@ test("reap journal: idempotent re-reap and no-op for unknown blocks", () => {
             blocks: store.getBlocks("sess-idem"),
             deadRefs: store.getDeadRefs("sess-idem"),
             refs: store.getRefs("sess-idem"),
-        }) as LegacySessionLike;
+        }, undefined, undefined, store.getOrphanViews("sess-idem") ?? {}) as LegacySessionLike;
         assert.equal((view.state as { blocks: CompressionBlock[] }).blocks.length, 1);
         assert.ok(view.blockContents.has("b1"));
         store.close();

@@ -242,6 +242,21 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     KEY idx_ccr_entries_orig_hash (orig_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
+CREATE TABLE IF NOT EXISTS orphan_blocks (
+    session_id  VARCHAR(255) NOT NULL,
+    block_id    VARCHAR(255) NOT NULL,
+    one_json    LONGTEXT NULL,
+    full_json   LONGTEXT NOT NULL,
+    PRIMARY KEY (session_id, block_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS state_fields (
+    session_id  VARCHAR(255) NOT NULL,
+    field       VARCHAR(64) NOT NULL,
+    value_json  LONGTEXT NOT NULL,
+    PRIMARY KEY (session_id, field)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
 CREATE TABLE IF NOT EXISTS conversations (
     namespace       VARCHAR(64) NOT NULL,
     conversation_id VARCHAR(255) NOT NULL,
@@ -788,6 +803,11 @@ export class MysqlBackend implements StorageBackend {
                 "INSERT IGNORE INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?)",
                 [s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt],
             );
+            // #6785 step 7: orphans ride the orphan_blocks table (the column
+            // merges + migrates once, then retires) — same as the sqlite leg.
+            await this.applyOrphanBlocksOn(c, s.sessionId, s.orphansJson ?? null);
+            // #6785 step 8: row-backed kstate fields (state_fields table).
+            await this.applyStateFieldsOn(c, s.sessionId, input.stateFields ?? {});
             const batchTs = Date.now(); // #4313: one sample per save batch
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
@@ -1291,24 +1311,116 @@ export class MysqlBackend implements StorageBackend {
                 if (rows[0].one_hash !== null && rows[0].one_hash !== undefined) await this.releaseContent(c, str(rows[0].one_hash));
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [sessionId, blockId]);
             }
-            if (orphanContents.size > 0) {
-                const [sess] = (await c.query(
-                    "SELECT orphans_json FROM sessions WHERE session_id = ?",
-                    [sessionId],
-                )) as unknown as Row[][];
-                if (sess.length > 0) {
-                    let merged: Record<string, unknown> = {};
-                    try {
-                        const parsed = JSON.parse(str(sess[0].orphans_json ?? "{}")) as unknown;
-                        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) merged = parsed as Record<string, unknown>;
-                    } catch {
-                        /* corrupt journal → start fresh */
-                    }
-                    for (const [blockId, view] of orphanContents) merged[blockId] = view;
-                    await c.query("UPDATE sessions SET orphans_json = ? WHERE session_id = ?", [JSON.stringify(merged), sessionId]);
-                }
-            }
+            // #6785 step 7: the reaped-block journal lives in orphan_blocks
+            // now (same merge semantics as the column did — incoming wins on
+            // key collision, trimmed entries survive).
+            await this.applyOrphanBlocksOn(c, sessionId, orphanContents.size > 0 ? JSON.stringify(Object.fromEntries(orphanContents)) : null);
         });
+    }
+
+    /** #6785 step 7 (MySQL twin of UnifiedStore.applyOrphanBlocks): merge
+     *  legacy column ∪ incoming onto the orphan_blocks table, upsert each
+     *  entry, then retire the column. */
+    private async applyOrphanBlocksOn(c: PoolConnection | Pool, sessionId: string, incomingJson: string | null): Promise<void> {
+        const [col] = (await c.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        const all: Record<string, unknown> = {};
+        if (col.length > 0 && col[0].orphans_json !== null && col[0].orphans_json !== undefined) {
+            try {
+                const parsed = JSON.parse(str(col[0].orphans_json)) as unknown;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(all, parsed as Record<string, unknown>);
+            } catch {
+                /* corrupt journal → start fresh */
+            }
+        }
+        if (incomingJson !== null) {
+            try {
+                const parsed = JSON.parse(incomingJson) as unknown;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(all, parsed as Record<string, unknown>);
+            } catch {
+                /* corrupt incoming → keep existing only */
+            }
+        }
+        for (const [blockId, view] of Object.entries(all)) {
+            const v = view as { one?: unknown; full?: unknown };
+            await c.query(
+                "INSERT INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE one_json = VALUES(one_json), full_json = VALUES(full_json)",
+                [sessionId, blockId, v.one === undefined ? null : JSON.stringify(v.one), JSON.stringify(v.full)],
+            );
+        }
+        await c.query("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?", [sessionId]);
+    }
+
+    /** #6785 step 7 (MySQL twin of UnifiedStore.getOrphanViews). */
+    async getOrphanViews(sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        const conn = await this.pool.getConnection();
+        try {
+            return await this.getOrphanViewsOn(conn, sessionId);
+        } finally {
+            conn.release();
+        }
+    }
+
+    private async getOrphanViewsOn(conn: Pool | PoolConnection, sessionId: string): Promise<Record<string, { one: unknown; full: unknown }> | null> {
+        const [rows] = (await conn.query("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        let out: Record<string, { one: unknown; full: unknown }> | null = null;
+        for (const r of rows as Row[]) {
+            if (out === null) out = {};
+            const oneRaw = r.one_json;
+            out[str(r.block_id)] = {
+                one: oneRaw === null || oneRaw === undefined ? null : JSON.parse(str(oneRaw)),
+                full: JSON.parse(str(r.full_json)),
+            };
+        }
+        const [col] = (await conn.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        if (col.length > 0 && col[0].orphans_json !== null && col[0].orphans_json !== undefined) {
+            try {
+                const parsed = JSON.parse(str(col[0].orphans_json)) as Record<string, { one: unknown; full: unknown }>;
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    for (const [id, view] of Object.entries(parsed)) {
+                        if (out === null) out = {};
+                        if (out[id] === undefined) out[id] = view;
+                    }
+                }
+            } catch {
+                /* corrupt legacy column → the table rows remain */
+            }
+        }
+        return out;
+    }
+
+    /** #6785 step 8 (MySQL twin of UnifiedStore.applyStateFields): row-backed
+     *  CompressionState fields — upsert on change, drop a row for a field
+     *  that becomes undefined (bounded ≤ 9). */
+    private async applyStateFieldsOn(c: PoolConnection | Pool, sessionId: string, fields: Record<string, string>): Promise<void> {
+        const [existing] = (await c.query("SELECT field, value_json FROM state_fields WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        for (const r of existing as Row[]) {
+            if (fields[str(r.field)] === undefined) {
+                await c.query("DELETE FROM state_fields WHERE session_id = ? AND field = ?", [sessionId, str(r.field)]);
+            }
+        }
+        const have = new Map((existing as Row[]).map((r) => [str(r.field), str(r.value_json)]));
+        for (const [field, valueJson] of Object.entries(fields)) {
+            if (have.get(field) === valueJson) continue;
+            await c.query(
+                "INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json)",
+                [sessionId, field, valueJson],
+            );
+        }
+    }
+
+    /** #6785 step 8 (MySQL twin of UnifiedStore.getStateFields). */
+    private async getStateFieldsOn(c: PoolConnection | Pool, sessionId: string): Promise<Record<string, string> | null> {
+        const [rows] = (await c.query("SELECT field, value_json FROM state_fields WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        if (rows.length === 0) return null;
+        const out: Record<string, string> = {};
+        for (const r of rows as Row[]) out[str(r.field)] = str(r.value_json);
+        return out;
+    }
+
+    async getStateFields(sessionId: string): Promise<Record<string, string> | null> {
+        return this.getStateFieldsOn(this.pool, sessionId);
     }
 
     async deleteSession(sessionId: string): Promise<void> {
@@ -1339,6 +1451,7 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM dead_refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
+            await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM conversations WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
@@ -1532,6 +1645,8 @@ export class MysqlBackend implements StorageBackend {
                 getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
                 getRefs: (id) => this.getRefsOn(conn, id),
                 getCcrEntries: (id) => this.getCcrEntriesOn(conn, id),
+                getOrphanViews: (id) => this.getOrphanViewsOn(conn, id),
+                getStateFields: (id) => this.getStateFieldsOn(conn, id),
             });
         } finally {
             try {
@@ -1839,6 +1954,8 @@ export class MysqlBackend implements StorageBackend {
         const ccr = await q("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
         const ext = await q("SELECT ext_key AS `key`, value_json, updated_at FROM session_ext WHERE session_id = ?");
         const checkpoints = await q("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?");
+        // #6785 step 7: the reaped-block journal rides the archive too.
+        const orphanBlocks = await q("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?");
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(str(m.content_hash));
         for (const mm of mediaMaps) wanted.add(str(mm.media_hash));
@@ -1857,7 +1974,7 @@ export class MysqlBackend implements StorageBackend {
         // sqlite twin: appended as the last step inside the sweep
         // transaction, so a failed sweep leaves no line for a session that
         // is still active.
-        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints, orphanBlocks }) + "\n";
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
             const rel: string[] = [];
@@ -1880,6 +1997,7 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM dead_refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
+            await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
@@ -1905,6 +2023,7 @@ export class MysqlBackend implements StorageBackend {
             ccrEntries: Record<string, unknown>[];
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
+            orphanBlocks?: Record<string, unknown>[];
         };
         // sqlite twin: newest matching line wins.
         let lineNo = -1;
@@ -2008,6 +2127,13 @@ export class MysqlBackend implements StorageBackend {
                 await c.query(
                     "INSERT IGNORE INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash],
+                );
+            }
+            // #6785 step 7: the journal round-trips through the archive.
+            for (const o of dump.orphanBlocks ?? []) {
+                await c.query(
+                    "INSERT IGNORE INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?)",
+                    [sessionId, o.block_id, o.one_json ?? null, o.full_json],
                 );
             }
             await c.query(

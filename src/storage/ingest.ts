@@ -29,7 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { CcrLedgerRow, hydrateSlimCcrStore, slimCcrEnvelope } from "./slim.js";
+import { CcrLedgerRow, hydrateSlimCcrStore, slimCcrEnvelope, splitKstate } from "./slim.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -472,12 +472,16 @@ function finishPlan(
           })
         : [];
 
-    const kstate: Record<string, unknown> = {};
+    const kstateRaw: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
         if (TABLE_OWNED_FIELDS.has(field)) continue;
         const v = (session.state as Record<string, unknown>)[field];
-        if (v !== undefined) kstate[field] = v;
+        if (v !== undefined) kstateRaw[field] = v;
     }
+    // #6785 step 8: the kstate slim split — bounded fields stay in the
+    // column (order preserved), unbounded record/array fields ride one row
+    // each in state_fields (see splitKstate).
+    const { column: kstateColumn, rows: stateFields } = splitKstate(MERGE_STATE_FIELDS, kstateRaw);
 
     const sessionRow: SessionRow = {
         sessionId: session.id,
@@ -508,7 +512,7 @@ function finishPlan(
         metaJson: JSON.stringify(session.meta),
         statsJson: JSON.stringify(session.stats),
         metadataJson: JSON.stringify(session.metadata),
-        kstateJson: JSON.stringify(kstate),
+        kstateJson: JSON.stringify(kstateColumn),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
         // #6785 step 6: slim envelope — the column keeps key→hash only; the
         // original bytes live in the CAS behind ccr_entries and are re-fetched
@@ -516,7 +520,7 @@ function finishPlan(
         ccrJson: session.contentStore ? JSON.stringify(slimCcrEnvelope(session.contentStore)) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, stateFields, pluginSnapshotSeqs, tailSeqs };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */
@@ -616,6 +620,8 @@ export class LegacyViewBuilder {
     private readonly blockContents: BlockContents = new Map();
     private readonly messagesBySeq = new Map<number, CoreMessage>();
     private ccrRows: readonly CcrLedgerRow[] = [];
+    private orphanViews?: Record<string, { one: unknown; full: unknown }>;
+    private stateFieldsRows: Record<string, string> | null = null;
 
     constructor(
         private readonly session: LegacyViewRows["session"],
@@ -659,9 +665,31 @@ export class LegacyViewBuilder {
                     state.nextRunId = session.nextRunId;
                     break;
                 default:
+                    // #6785 step 8: row-backed fields ride state_fields and
+                    // are overlaid at finish() (addStateFields); the legacy
+                    // column (pre-upgrade rows) still carries them, so the
+                    // column value is the base either way.
                     if (kstate[field] !== undefined) state[field] = kstate[field];
                     break;
             }
+        }
+    }
+
+    /** #6785 step 8: the unbounded CompressionState field rows (state_fields
+     *  table). Call AFTER constructing, BEFORE finish(); rows overlay the
+     *  column values (legacy sessions have no rows → column serves). */
+    addStateFields(fields: Record<string, string>): void {
+        this.stateFieldsRows = fields;
+    }
+
+    /** #6785 step 8: apply the row-backed state fields OVER the column
+     *  values (rows win; corrupt row → column value, if any, stays). */
+    private applyStateFieldsRows(): void {
+        if (this.stateFieldsRows === null) return;
+        for (const [field, valueJson] of Object.entries(this.stateFieldsRows)) {
+            try {
+                this.state[field] = JSON.parse(valueJson);
+            } catch { /* corrupt row → column value (if any) stays */ }
         }
     }
 
@@ -680,10 +708,26 @@ export class LegacyViewBuilder {
         this.ccrRows = rows;
     }
 
+    /** #6785 step 7: the merged orphan journal (orphan_blocks table ∪
+     *  legacy column, pre-merged by the caller). finish() merges these into
+     *  blockContents INSTEAD of sessions.orphans_json once provided.
+     *  undefined = not provided (callers without table access fall back to
+     *  the column). */
+    addOrphanViews(views: Record<string, { one: unknown; full: unknown }>): void {
+        this.orphanViews = views;
+    }
+
     finish(): LegacyView {
         const s = this.session;
         const tail = this.tail;
-        mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        this.applyStateFieldsRows();
+        // #6785 step 7: the table-backed journal (addOrphanViews) wins over
+        // the legacy orphans_json column; no views fed ⇒ column fallback.
+        if (this.orphanViews !== undefined) {
+            if (Object.keys(this.orphanViews).length > 0) mergeOrphanBlockContents(this.blockContents, JSON.stringify(this.orphanViews));
+        } else {
+            mergeOrphanBlockContents(this.blockContents, s.orphansJson);
+        }
         // #4390: a tail pointer whose row is gone used to be silently filtered
         // out — the view shrank with no trace. Count the gaps so callers can
         // warn (persist logs them); the surviving members still load.
@@ -745,10 +789,12 @@ export function resolveCcrContentStore(
 }
 
 /** Compatibility wrapper for callers that already hold all rows. */
-export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[]): LegacyView {
+export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[], stateFieldsRows?: Record<string, string> | null, orphanViews?: Record<string, { one: unknown; full: unknown }>): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
     if (ccrRows) builder.addCcrEntries(ccrRows);
+    if (stateFieldsRows) builder.addStateFields(stateFieldsRows);
+    if (orphanViews !== undefined) builder.addOrphanViews(orphanViews);
     return builder.finish();
 }

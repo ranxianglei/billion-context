@@ -175,7 +175,7 @@ function runCase(engine: SqliteEngineName, name: string): void {
                 deadRefs: store.getDeadRefs(loaded.id),
                 refs: store.getRefs(loaded.id),
             };
-            const view = loadLegacyView(rows, store.getCcrEntries(loaded.id));
+            const view = loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id));
             assert.equal(sessionDigest(view), manifest[name]!.digest, `${engine}/${name}: unified round-trip digest drift`);
         } finally {
             store.close();
@@ -239,7 +239,7 @@ test("storage unified: re-ingest is idempotent across the whole corpus (digest s
                     deadRefs: store.getDeadRefs(loaded.id),
                     refs: store.getRefs(loaded.id),
                 };
-                assert.equal(sessionDigest(loadLegacyView(rows, store.getCcrEntries(loaded.id))), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
+                assert.equal(sessionDigest(loadLegacyView(rows, store.getCcrEntries(loaded.id), store.getStateFields(loaded.id))), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
             } finally {
                 store.close();
             }
@@ -306,7 +306,7 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
                     // what the override received, whichever that is.
                     const overridePresent = !!liveTail && liveTail.length > 0 && liveFolded !== true;
                     assert.equal(
-                        sessionDigest(loadLegacyView(rows, unified.getCcrEntries(loaded.id))),
+                        sessionDigest(loadLegacyView(rows, unified.getCcrEntries(loaded.id), unified.getStateFields(loaded.id))),
                         overridePresent
                             ? recordDigest({ ...written, messages: liveTail, messagesFolded: liveFolded })
                             : recordDigest(written),
