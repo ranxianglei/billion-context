@@ -159,11 +159,40 @@ if (!skip.includes("x") && NEXT) {
     return srv;
   };
   const stopPinServer = async (srv) => {
-    srv.kill("SIGTERM");
+    try { srv.kill("SIGTERM"); } catch { /* already gone */ }
     await sleep(2000);
-    srv.kill("SIGKILL");
+    try { srv.kill("SIGKILL"); } catch { /* already gone */ }
   };
-  const healthy = (port) => run("curl", ["-sf", "-m", "3", "-o", "", "-w", "%{http_code}", `http://127.0.0.1:${port}/__bili/status`], { log: false });
+  const healthy = (port) => run("curl", ["-sf", "-m", "5", "-o", "", "-w", "%{http_code}", `http://127.0.0.1:${port}/__bili/status`], { log: false });
+  const alive = (srv) => { try { process.kill(srv.pid, 0); return true; } catch { return false; } };
+  // The server's [update] lines go to the session log, not its stdout
+  // (verified: stdout carries only the storage bootstrap).
+  const sessionLogPath = () => path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "billion-context", "bili.log");
+  // Wait for the pin server to answer 200; if it dies during start, restart
+  // it once (the gate container runs sibling lanes at the same time).
+  const startPinServerHealthy = async (logFile) => {
+    let srv = startPinServer(logFile);
+    const waitUp = async (ms) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        if (!alive(srv)) return false;
+        if (healthy(PIN_PORT).stdout?.trim() === "200") return true;
+        await sleep(2000);
+      }
+      return healthy(PIN_PORT).stdout?.trim() === "200";
+    };
+    let up = await waitUp(30000);
+    if (!up) {
+      const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").split("\n").slice(-12).join("\n") : "";
+      log(`[Xp] pin server not healthy after 30s (alive=${alive(srv)}) — restarting once`);
+      if (tail) log(tail);
+      await stopPinServer(srv);
+      await sleep(1500);
+      srv = startPinServer(logFile);
+      up = await waitUp(30000);
+    }
+    return { srv, up };
+  };
 
   // -- Phase 1: pin → live auto-updater holds; explicit update breaks through --
   const p1 = run("bili", ["pin", "1h"]);
@@ -175,14 +204,18 @@ if (!skip.includes("x") && NEXT) {
   record("Xp", `publish ${gateVersion(2)} to registry`, pub2.ok, pub2.err);
 
   const holdLog = path.join(workdir, "lane-x-pin-hold.log");
-  let srv = startPinServer(holdLog);
-  await sleep(25000); // first auto-check lands ~10s after start
-  record("Xp", "pin server is healthy", healthy(PIN_PORT).stdout?.trim() === "200", `status=${healthy(PIN_PORT).stdout?.trim()}`);
+  const p1s = await startPinServerHealthy(holdLog);
+  let srv = p1s.srv;
+  const st1 = healthy(PIN_PORT).stdout?.trim();
+  record("Xp", "pin server is healthy", p1s.up && st1 === "200", `status=${st1 || "no-response"}`);
+  await sleep(25000); // let a few 5s-interval checks land
   const vHold = versionNow();
   record("Xp", `pinned ${NEXT} HOLDS while registry serves ${gateVersion(2)}`, vHold.includes(NEXT) && !vHold.includes(gateVersion(2)), `version="${vHold}"`);
-  const holdLogTxt = fs.existsSync(holdLog) ? fs.readFileSync(holdLog, "utf8") : "";
-  const holdEvidence = (/\[update\] holding[^\n]*/.exec(holdLogTxt) || [""])[0];
-  record("Xp", "auto-updater logged the pin hold (report, no install)", /\[update\] holding .*pinned/.test(holdLogTxt), holdEvidence.slice(0, 160));
+  const sessLog = sessionLogPath();
+  if (fs.existsSync(sessLog)) fs.copyFileSync(sessLog, path.join(workdir, "lane-x-pin-session.log"));
+  const holdTxt = [fs.existsSync(holdLog) ? fs.readFileSync(holdLog, "utf8") : "", fs.existsSync(sessLog) ? fs.readFileSync(sessLog, "utf8") : ""].join("\n");
+  const holdEvidence = (/\[update\] holding[^\n]*/.exec(holdTxt) || [""])[0];
+  record("Xp", "auto-updater logged the pin hold (report, no install)", /\[update\] holding .*pinned/.test(holdTxt), holdEvidence.slice(0, 160));
   await stopPinServer(srv);
 
   const up = run("bili", ["update"], { env: { BILI_CONFIG_FILE: updCfg } });
@@ -200,7 +233,10 @@ if (!skip.includes("x") && NEXT) {
   record("Xp", `publish ${gateVersion(3)} to registry`, pub3.ok, pub3.err);
 
   const resumeLog = path.join(workdir, "lane-x-pin-resume.log");
-  srv = startPinServer(resumeLog);
+  const p2s = await startPinServerHealthy(resumeLog);
+  srv = p2s.srv;
+  const st2 = healthy(PIN_PORT).stdout?.trim();
+  record("Xp", "resume server is healthy", p2s.up && st2 === "200", `status=${st2 || "no-response"}`);
   await sleep(25000);
   const vHold2 = versionNow();
   record("Xp", `re-pinned ${gateVersion(2)} HOLDS again vs ${gateVersion(3)}`, vHold2.includes(gateVersion(2)) && !vHold2.includes(gateVersion(3)), `version="${vHold2}"`);
