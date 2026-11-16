@@ -299,10 +299,13 @@ test("archivable and ref-based media fold like text; only refless payloads stay 
 });
 
 // Partial-pair visibility (call visible, result covered) is UNREACHABLE
-// through the pipeline today: prune's orphan stripping (stripOrphanedToolCalls
-// drops any call whose result left the view) plus apply-side pair widening and
-// the integrity gate keep pairs atomic end to end. The risk is structural —
-// two screening sites judging two different array classes with nothing
+// through the pipeline today: apply-side pair widening and the integrity gate
+// keep pairs atomic end to end, and for ordinary tools prune's orphan
+// stripping (stripOrphanedToolCalls) drops any call whose result left the view
+// as a second line. Compress calls are EXEMPT from that strip (prune.ts, the
+// isCompressTool continue), so for them the atomicity rests on the apply-side
+// widening + integrity gate ALONE — the #5455 boundary. The risk is structural
+// — two screening sites judging two different array classes with nothing
 // enforcing they agree. Pin the contract at the function level with a
 // hand-crafted view pair: the judgment must flip with the array class, and
 // the default (omitted source) must keep judging the passed array for
