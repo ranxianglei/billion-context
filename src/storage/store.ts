@@ -1799,10 +1799,18 @@ export class UnifiedStore {
         ).get(sessionId, ...ids) as { m: number };
         const newRef = prefixJson != null ? this.putContent(prefixJson) : null;
         const prev = egressLatestRow(this.db, sessionId);
-        this.db.transaction(() => {
-            const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, ids, newRef, lastStableId, nowMs);
-            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ? AND snap_seq < ?").run(sessionId, snapSeq);
-        });
+        try {
+            this.db.transaction(() => {
+                const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, ids, newRef, lastStableId, nowMs);
+                this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ? AND snap_seq < ?").run(sessionId, snapSeq);
+            });
+        } catch (err) {
+            // The put above ran BEFORE the tx: a failing tx would otherwise
+            // leave a dangling +1 refcount GC can never collect. Release the
+            // fresh ref (the previous row's ref is untouched) and rethrow.
+            if (newRef) this.releaseContent(newRef);
+            throw err;
+        }
         if (prev?.prefixRef != null && prev.prefixRef !== newRef) this.releaseContent(prev.prefixRef);
         return egressLatestRow(this.db, sessionId);
     }

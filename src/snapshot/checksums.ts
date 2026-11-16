@@ -44,17 +44,3 @@ function stableStringify(value: unknown): string {
 export function envelopeChecksum(envelope: readonly string[]): string {
     return sha256hex(canonicalJson(Array.from(envelope)));
 }
-
-/** sha256 of one row's post form (S4 unit). The post form is the common-core
- *  JSON; checksumming the canonical form keeps it byte-churn-proof. */
-function rowPostChecksum(postJson: string): string {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(postJson);
-    } catch {
-        // A non-JSON post form is itself a fault — checksum the raw bytes so
-        // the mismatch is still detected (and grep-able) rather than masked.
-        return sha256hex(postJson);
-    }
-    return sha256hex(canonicalJson(parsed));
-}

@@ -1452,6 +1452,10 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
+            // #6785 step 8: the row-backed kstate rows cascade with the
+            // session (sqlite twin, store.ts deleteSession) — without this
+            // every MySQL-mode delete leaks them forever.
+            await c.query("DELETE FROM state_fields WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM conversations WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
@@ -1951,11 +1955,15 @@ export class MysqlBackend implements StorageBackend {
         const blocks = await q("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord");
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
         const deadRefs = await q("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord");
-        const ccr = await q("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
+        const ccr = await q("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
         const ext = await q("SELECT ext_key AS `key`, value_json, updated_at FROM session_ext WHERE session_id = ?");
         const checkpoints = await q("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?");
         // #6785 step 7: the reaped-block journal rides the archive too.
         const orphanBlocks = await q("SELECT block_id, one_json, full_json FROM orphan_blocks WHERE session_id = ?");
+        // #6785 step 8: the row-backed kstate fields ride the archive too
+        // (sqlite twin) — without them a portable restore onto a rebuilt DB
+        // silently drops all nine row-backed fields.
+        const stateFields = await q("SELECT field, value_json FROM state_fields WHERE session_id = ?");
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(str(m.content_hash));
         for (const mm of mediaMaps) wanted.add(str(mm.media_hash));
@@ -1963,7 +1971,10 @@ export class MysqlBackend implements StorageBackend {
             wanted.add(str(b.summary_hash));
             if (b.one_hash !== null && b.one_hash !== undefined) wanted.add(str(b.one_hash));
         }
-        for (const e of ccr) wanted.add(str(e.content_hash));
+        for (const e of ccr) {
+            wanted.add(str(e.content_hash));
+            if (e.orig_hash !== null && e.orig_hash !== undefined) wanted.add(str(e.orig_hash));
+        }
         for (const cp of checkpoints) if (num(cp.pinned) === 0) wanted.add(str(cp.state_hash));
         const content: Record<string, string> = {};
         for (const hash of wanted) {
@@ -1974,7 +1985,7 @@ export class MysqlBackend implements StorageBackend {
         // sqlite twin: appended as the last step inside the sweep
         // transaction, so a failed sweep leaves no line for a session that
         // is still active.
-        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints, orphanBlocks }) + "\n";
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints, orphanBlocks, stateFields }) + "\n";
         let contentRowsDeleted = 0;
         await this.tx(async (c) => {
             const rel: string[] = [];
@@ -1984,7 +1995,10 @@ export class MysqlBackend implements StorageBackend {
                 rel.push(str(b.summary_hash));
                 if (b.one_hash !== null && b.one_hash !== undefined) rel.push(str(b.one_hash));
             }
-            for (const e of ccr) rel.push(str(e.content_hash));
+            for (const e of ccr) {
+                rel.push(str(e.content_hash));
+                if (e.orig_hash !== null && e.orig_hash !== undefined) rel.push(str(e.orig_hash));
+            }
             for (const cp of checkpoints) {
                 if (num(cp.pinned) === 0) {
                     rel.push(str(cp.state_hash));
@@ -1998,6 +2012,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM refs WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM orphan_blocks WHERE session_id = ?", [sessionId]);
+            // #6785 step 8: the row-backed kstate rows sweep with the archive
+            // (sqlite twin, store.ts archiveSession).
+            await c.query("DELETE FROM state_fields WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
@@ -2024,6 +2041,7 @@ export class MysqlBackend implements StorageBackend {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
             orphanBlocks?: Record<string, unknown>[];
+            stateFields?: Record<string, unknown>[];
         };
         // sqlite twin: newest matching line wins.
         let lineNo = -1;
@@ -2074,7 +2092,11 @@ export class MysqlBackend implements StorageBackend {
                 addRef(b.summary_hash);
                 addRef(b.one_hash);
             }
-            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const e of dump.ccrEntries) {
+                addRef(e.content_hash);
+                const eh = (e as { orig_hash?: unknown }).orig_hash;
+                if (typeof eh === "string") addRef(eh);
+            }
             for (const cp of dump.checkpoints) {
                 const [twins] = await c.query("SELECT 1 FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
                 if ((twins as Row[]).length === 0) addRef(cp.state_hash);
@@ -2114,7 +2136,10 @@ export class MysqlBackend implements StorageBackend {
                 await c.query("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)", [sessionId, d.ord, d.ref, d.ref_num, d.recorded_at]);
             }
             for (const e of dump.ccrEntries) {
-                await c.query("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)", [sessionId, e.ord, e.ccr_key, e.content_hash]);
+                // #6785 step 6: pre-fix dumps lack orig_hash — NULL keeps the
+                // full ccr_json envelope as the read authority (sqlite twin).
+                const eh = (e as { orig_hash?: unknown }).orig_hash;
+                await c.query("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)", [sessionId, e.ord, e.ccr_key, e.content_hash, typeof eh === "string" ? eh : null]);
             }
             for (const x of dump.sessionExt) {
                 await c.query(
@@ -2135,6 +2160,15 @@ export class MysqlBackend implements StorageBackend {
                     "INSERT IGNORE INTO orphan_blocks (session_id, block_id, one_json, full_json) VALUES (?, ?, ?, ?)",
                     [sessionId, o.block_id, o.one_json ?? null, o.full_json],
                 );
+            }
+            // #6785 step 8: the row-backed kstate fields round-trip too
+            // (sqlite twin: INSERT ... ON CONFLICT DO NOTHING — an existing
+            // row wins, so mirror that instead of overwriting).
+            for (const f of dump.stateFields ?? []) {
+                const [existing] = await c.query("SELECT 1 FROM state_fields WHERE session_id = ? AND field = ?", [sessionId, f.field]);
+                if ((existing as Row[]).length === 0) {
+                    await c.query("INSERT INTO state_fields (session_id, field, value_json) VALUES (?, ?, ?)", [sessionId, f.field, f.value_json]);
+                }
             }
             await c.query(
                 `UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,

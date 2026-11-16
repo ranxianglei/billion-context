@@ -532,6 +532,25 @@ export function migrateSchema(db: {
         // envelope); NULL/0 = not latched, else the epoch-ms of the latch.
         if (!l1Cols.includes("r3_latched_at")) db.exec("ALTER TABLE l1_world ADD COLUMN r3_latched_at INTEGER");
     }
+    // #6785 step 6: ccr_entries.orig_hash — PROBE-FIRST, not version-gated:
+    // a db whose user_version is already at the current version (the #5855
+    // field build wrote v12/v13 into shared databases) takes the early
+    // return below and would never pick the column up if the probe sat
+    // inside the transaction. Every pre-existing db must get it, so probe
+    // unconditionally; a fresh db's table does not exist yet at this point
+    // (PRAGMA table_info → empty) and the base DDL above already carries
+    // the column. Pre-step-6 rows keep NULL; their full ccr_json envelope
+    // remains the read authority (slim.ts). The index rides the same probe
+    // (#5539 FK-child discipline; a lib that already carried the column but
+    // not the key converges on the idempotent CREATE).
+    const ccrCols = (db.prepare("PRAGMA table_info(ccr_entries)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (ccrCols.length > 0) {
+        if (!ccrCols.includes("orig_hash")) {
+            db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
+        }
+        db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+    }
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
@@ -643,23 +662,10 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
         }
-        // #6785 step 6: ccr_entries gains the orig_hash half
-        // (the original text behind each entry). NOT version-gated: every
-        // pre-existing db (user_version already past the crossing point) must
-        // pick the column up, so the probe is unconditional and idempotent —
-        // fresh dbs get it straight from the DDL. Pre-step-6 rows keep NULL;
-        // their full ccr_json envelope remains the read authority (slim.ts).
-        const ccrCols = (db.prepare("PRAGMA table_info(ccr_entries)").all() as unknown as { name?: unknown }[])
-            .map((c) => (typeof c?.name === "string" ? c.name : ""));
-        if (!ccrCols.includes("orig_hash")) {
-            db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
-        }
-        // #6785 step 6: orig_hash is a second FK child column of
-        // content(hash) — #5539's discipline requires its own index, or
-        // every parent delete full-scans ccr_entries. Unconditional
-        // (probe-first) like the column: a lib that already carries the
-        // column but not the key (intermediate build of this PR) converges.
-        db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
+        // #6785 step 6: ccr_entries.orig_hash — probe-first, moved ABOVE the
+        // version early return (a #5855-era db already at user_version 12
+        // must pick the column up; the in-transaction probe it was at never
+        // ran there). See the probe-first note before the early return.
         if (from < 11) {
             // v11 (#5539): FK child indexes on content.hash — see the header
             // note and the DDL comment above for the mechanism and field

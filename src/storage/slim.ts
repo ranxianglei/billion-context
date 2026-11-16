@@ -98,12 +98,13 @@ function hydrateCcrContentStore(
 /**
  * The ONE definition of "rebuild a slim column's store" — used by BOTH the
  * view leg (resolveCcrContentStore) and the direct getCcr path. Legacy
- * NULL-orig rows or an empty ledger ⇒ null (the file lane stays authority;
- * never a partial store). Orphan byHash entries ride the envelope and are
- * merged over the ledger's byHash.
+ * NULL-orig rows, an EMPTY ledger (unless the orphans half alone forms a
+ * real store), a MISSING content body, or an envelope/ledger KEY-SET MISMATCH
+ * ⇒ null (the file lane stays authority; never a partial store). Orphan
+ * byHash entries ride the envelope and are merged over the ledger's byHash.
  */
 export function hydrateSlimCcrStore(
-    parsed: { ccrSlim?: number; orphanByHash?: unknown },
+    parsed: { ccrSlim?: number; orphanByHash?: unknown; byRef?: Record<string, unknown> },
     rows: readonly CcrLedgerRow[],
 ): MessageContentStore | null {
     if (parsed.ccrSlim !== 1) return null;
@@ -111,9 +112,25 @@ export function hydrateSlimCcrStore(
         parsed.orphanByHash !== undefined && parsed.orphanByHash !== null && typeof parsed.orphanByHash === "object"
             ? (parsed.orphanByHash as Record<string, string>)
             : {};
+    // A ledger row whose CAS body was lost (getCcrEntries maps a missing
+    // body to "") would otherwise be silently DROPPED by the JSON.parse
+    // catch below — serving a partial store. Degrade instead.
+    if (rows.some((r) => r.content === "")) return null;
+    // Envelope/ledger key-set coverage: every byRef key the column
+    // declares must have a ledger row, or the hydrated byRef is a strict
+    // subset of the column's — a partial store the file lane would serve
+    // whole. (Column and ledger are written in one tx; this is the
+    // read-side safety net for the invariant, not a fast path.)
+    if (parsed.byRef !== undefined && parsed.byRef !== null) {
+        const rowKeys = new Set(rows.map((r) => r.key));
+        for (const key of Object.keys(parsed.byRef)) {
+            if (!rowKeys.has(key)) return null;
+        }
+    }
     if (rows.length === 0) {
         // A slim envelope with an EMPTY ledger is only a real store when the
-        // orphans half is non-empty (a byHash-only store — host-pruned refs).
+        // orphans half is non-empty (a byHash-only store — host-pruned refs)
+        // and the envelope declares no byRef keys (checked above).
         // Otherwise it is an inconsistency: the file lane stays authority.
         return Object.keys(orphans).length > 0 ? { version: 1, byHash: orphans, byRef: {} } : null;
     }
