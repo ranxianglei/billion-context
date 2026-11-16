@@ -45,9 +45,10 @@ export function summaryAbortSource(signal: AbortSignal): SummaryAbortSource | un
 
 /** #4833: human-readable WHY for a timed-out attempt — the source, the budget
  *  it hit, and how much wall-clock the range had burned. Pure numbers and fixed
- *  words; never echoes payload. */
-function timeoutDetail(source: SummaryAbortSource, limits: SummaryBudget, elapsedMs: number): string {
-    const budgetMs = source === "target-timeout" ? limits.targetTimeoutMs : limits.totalTimeoutMs;
+ *  words; never echoes payload. #6885: the budget is the ACTUAL window the
+ *  attempt had (a target window shrunk by the shared-pot reservation, or the
+ *  range's real remaining total), not the configured nominal value. */
+function timeoutDetail(source: SummaryAbortSource, budgetMs: number, elapsedMs: number): string {
     return `${source} ${budgetMs}ms (elapsed ${Math.round(elapsedMs)}ms)`;
 }
 
@@ -317,9 +318,21 @@ export class ExternalSummaryExecutor {
                 const propagateOverall = (): void => { attempt.abort(overall.signal.reason); };
                 overall.signal.addEventListener("abort", propagateOverall, { once: true });
                 if (overall.signal.aborted) propagateOverall();
-                const targetDeadline = performance.now() + limits.targetTimeoutMs;
+                // #6885: the batch deadline is a shared pot. A fresh
+                // targetTimeoutMs per candidate let early candidates eat the
+                // whole pot (t0 25s + t1 25s = the 50s default), so the third
+                // candidate never got a request out — no matter how fast it
+                // was, the chain failed 100% on long payloads. Divide what is
+                // left among the remaining candidates (this one included); the
+                // configured targetTimeoutMs stays the per-candidate cap and
+                // only the reservation can shrink it (the 600s/180s
+                // workaround keeps its full 180s windows: 600s/3 > 180s).
+                const remainingTargets = targets.length - targetIndex;
+                const reservedMs = Math.floor((deadline - performance.now()) / remainingTargets);
+                const effectiveTargetMs = Math.max(1, Math.min(limits.targetTimeoutMs, reservedMs));
+                const targetDeadline = performance.now() + effectiveTargetMs;
                 const expireTarget = (): void => { attempt.abort(new SummaryAbortError("target-timeout")); };
-                const timer = setTimeout(expireTarget, limits.targetTimeoutMs);
+                const timer = setTimeout(expireTarget, effectiveTargetMs);
                 // Retain the permit until the actual call settles, even if it ignores cancellation.
                 const operation: Promise<AttemptResult> = Promise.resolve().then(() => {
                     if (performance.now() >= deadline) cancel("batch-deadline");
@@ -340,12 +353,13 @@ export class ExternalSummaryExecutor {
                 if (performance.now() >= deadline) cancel("batch-deadline");
                 if (overall.signal.aborted) {
                     if (signal?.aborted) attempts.push({ targetIndex, outcome: "cancelled", detail: "caller abort" });
-                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", limits, performance.now() - startedAt) });
+                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", Math.max(0, Math.round(deadline - startedAt)), performance.now() - startedAt) });
                     return stopped();
                 }
                 if (performance.now() >= targetDeadline) expireTarget();
                 if (result.kind === "aborted" || attempt.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", limits, performance.now() - startedAt) });
+                    const source = summaryAbortSource(attempt.signal) ?? "target-timeout";
+                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(source, source === "target-timeout" ? effectiveTargetMs : Math.max(0, Math.round(deadline - startedAt)), performance.now() - startedAt) });
                 } else if (result.kind === "error") {
                     if (result.detail === undefined) {
                         attempts.push({ targetIndex, outcome: "error" });
