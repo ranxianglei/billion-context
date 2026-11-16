@@ -45,7 +45,7 @@ scripts/gate/bili-gate.sh --config ... --dry-run           # 只打印 docker �
 model,apiKey}`、`model2.{baseUrl,model,apiKey}`(Lane B)、`rev`、`skip`、
 `sourceRepo`、`mirror`(容器 clone 的本地裸 git 镜像——容器零出站,且可走宿主
 git 代理)、`gitProxy`、`npmRegistry`(构建依赖镜像;与容器内车道 registry
-无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认 `dsh,pi`;加 `claude` 跑 anthropic wire 车道)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
+无关)、`turnTimeoutMs`、`agents`(Lane P 集合)、`agentsR`(Lane R 集合,默认 `dsh,pi`;加 `claude` 跑 anthropic wire 车道)、`snapBase`(仅 P/R 车道:在 gate 的 bili.json 里打开候选的 snapBase 出站平面——`"all"` = 全部协议 cohort,`"openai,responses,anthropic,google"` 子集 = 指定 cohort,缺省/`"off"` = 关,gate 行为逐字节不变;用于候选分支验证,如 #6785)、`r.{corpusTokens,window,capRatio,cacheRatio}`、`network`
 (`host` | `bridge`;bridge 是 Docker Desktop 形态——把配置里的 URL 指向
 `host.docker.internal`)、`outDir`、`keep`。
 

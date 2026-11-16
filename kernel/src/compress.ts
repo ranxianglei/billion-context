@@ -205,10 +205,6 @@ function numericBlockId(id: string): number {
   return parsed ? Number(parsed[1]) : 0;
 }
 
-function formatK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-}
-
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -1036,38 +1032,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
-    // #4521: between banner deliveries a compression round can stay armed for
-    // many requests (backoff, tier cadence, model-decided timing). During that
-    // window the model sees NO current refs and starts guessing beyond the
-    // highest allocated ref — every guess a failed round-trip. Emit a compact
-    // boundary line whenever a nudge plan carries offered ranges but its
-    // banner is not being delivered this turn; hosts append it as an ephemeral
-    // trailing user message (same carrier as the nudge, same cache safety).
-    let statusLine: string | undefined;
-    const nudge = result.effects.nudge;
-    // Two shapes authorize the refresh line: a real tiered arm whose banner
-    // is deferred this turn (tier !== null: pressure crossed a threshold but
-    // cadence/backoff holds it), or any plan after at least one banner was
-    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
-    // this line only refreshes them). A fresh session's below-threshold plan
-    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
-    // must stay fully silent: same regime promise as the nudge itself
-    // (#196 regime scoping, #3910 lane baseline).
-    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
-    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      const highest = highestUsedIndex(state.messageRefs);
-      const offered = nudge.compressibleRanges!
-        .slice(0, 3)
-        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
-        .join(", ");
-      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
-      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
-    }
+    // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
+    // emitted on turns where a nudge plan is armed but its banner is not
+    // delivered) is removed. It fired precisely when the banner was withheld,
+    // so its "compressible now" list was always below-gate residue — a
+    // standing fold directive contradicting the same turns' compress receipt
+    // ("named for visibility, not as fold suggestions" / "No compressible
+    // ranges remain"). Ref-guessing backstops remain: the compress receipt and
+    // the unknown-ref refusal both report the session's highest allocated ref.
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
-      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
