@@ -4,9 +4,9 @@ import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
-import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
+import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
-export { readOutputBudget };
+export { outputBudgetField, readOutputBudget, writeOutputBudget };
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized

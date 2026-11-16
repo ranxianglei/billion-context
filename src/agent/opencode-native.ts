@@ -711,9 +711,9 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
 }
 
 /** #4491 host wiring: harvest host message ids per LLM request from the V1
- *  messages.transform hook — the only opencode seam that sees them (V2's
- *  http.request sees just the wire, so V2-shaped turns degrade to
- *  content-derived identities). Never mutates the host's messages. */
+ *  messages.transform hook (V2 hosts instead feed the same store from the
+ *  "context" seam registered in createOpencodeV2Setup). Never mutates the
+ *  host's messages. */
 const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
     // #5403/#5418 unified watermark channel: feed the ONE chokepoint emitter
