@@ -3034,7 +3034,7 @@ export async function pipePluginChatWithStrip(
             // #4913: name the signals that qualified so "again after the retry" is
             // attributable — which of the bare-exemption inputs carried the turn
             // here, plus the retry's own finish reason.
-            log?.(`[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, draftTail=${draftTail}, finishReason=${reason ?? "none"}, visibleTextChars=${visibleTextChars}`);
+            log?.(`[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, draftTail=${draftTail}, announceTail=${announceTail}, stalledTail=${stalledTail}, finishReason=${reason ?? "none"}, visibleTextChars=${visibleTextChars}`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which

@@ -6,8 +6,9 @@ import type { Session } from "../src/session.ts";
 // #4913: when the one-shot continuation retry (#732/#821) also ends with zero
 // usable output, the chat pipe emits the #870 in-band error. The fatal log
 // line must name the signals that qualified (sawThinking/sawStrippedEcho/
-// releasedMarkupChars/draftTail) plus the retry's own finish reason, so
-// "again after the retry" is attributable instead of an opaque verdict.
+// releasedMarkupChars, the stalled-tail flags draftTail/announceTail/
+// stalledTail) plus the retry's own finish reason, so "again after the retry"
+// is attributable instead of an opaque verdict.
 
 function makeSession(): Session {
     return {
@@ -91,6 +92,8 @@ test("chat pipe: double-degenerate turn keeps the #870 error and names its quali
     assert.ok(fatal!.includes("sawStrippedEcho=false"), "the echo flag rides the line");
     assert.ok(fatal!.includes("releasedMarkupChars=0"), "the markup counter rides the line");
     assert.ok(fatal!.includes("draftTail=false"), "the draft-tail flag rides the line");
+    assert.ok(fatal!.includes("announceTail=false"), "the announcement-tail flag rides the line");
+    assert.ok(fatal!.includes("stalledTail=false"), "the combined stalled-tail gate rides the line");
     assert.ok(fatal!.includes("finishReason=stop"), "the retry's own finish reason rides the line");
 });
 
