@@ -95,6 +95,7 @@ billion-context/
 │   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
 │   ├── compress-loop-anthropic.ts # Non-stream Anthropic proxy-tool loop (#5957)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
+│   ├── responses-system-sections.ts # Shared Responses developer-section join for steady + proxy-loop rebuild paths (#6922)
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
 │   ├── compress-tool.ts          # ACP tool surface + host nudge rendering (standing-rule reuse / full fallback)
