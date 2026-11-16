@@ -72,6 +72,17 @@ const MODEL1 = {
 // comma-separated MODEL1_MODEL (host wrapper passes a pair) — register every id,
 // drive with the first (matches Lane A's model rotation semantics).
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
+
+// GATE_SNAPBASE (#6785 candidate verification): exercise the snapBase egress
+// plane. Unset/0/off = off (byte-identical gate); "all" = every protocol
+// cohort; "openai,responses,anthropic,google" subset = explicit cohorts. The
+// gate's bili.json is the only config surface the lanes' proxies read.
+export function gateStorageCfg() {
+  const v = String(process.env.GATE_SNAPBASE || "");
+  if (!v || v === "0" || v.toLowerCase() === "off") return {};
+  const cohorts = v.toLowerCase() === "all" ? [] : v.split(",").map((x) => x.trim()).filter(Boolean);
+  return { storage: cohorts.length ? { snapBase: { enabled: true, cohorts } } : { snapBase: { enabled: true } } };
+}
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -277,6 +288,7 @@ async function runLane(agent, recipe) {
         },
       },
       compress: { preserveRecentTokens: 0 },
+      ...gateStorageCfg(),
     }, null, 2));
   writeWindow(BIG_WINDOW);
 
@@ -1138,4 +1150,10 @@ async function main() {
   console.log(`\nplugin-lanes: ${counted.length - failed.length}/${counted.length} passed${BLOCKED.size ? ` (${[...BLOCKED.keys()].map((l) => `${l}:${BLOCKED.get(l).kind}`).join(", ")})` : ""}`);
   process.exit(failed.length ? 1 : 0);
 }
-main();
+// Import guard: restart-lanes.mjs imports { buildCorpus, CODEWORDS } from THIS
+// file. An unguarded top-level main() would re-run the entire P-lane suite as an
+// import side effect inside the restart-lanes process (2026-11-15 gate run:
+// doubled dsh/pi P lanes in the same $WORK dirs -> npm ENOTEMPTY install races,
+// a sibling pi recorder killed via the shared instance registry, and the
+// side-effect suite's process.exit(1) becoming the R process's exit code).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

@@ -72,8 +72,9 @@ MIRROR=$(jget mirror "")
 GIT_PROXY=$(jget gitProxy "")
 NPM_REG=$(jget npmRegistry "https://registry.npmjs.org")
 TURN_MS=$(jget turnTimeoutMs "300000")
-AGENTS=$(jget agents "dsh,pi,codex,opencode,claude")
+AGENTS=$(jget agents "dsh,pi,codex,opencode,claude,dsh-google")
 AGENTS_R=$(jget agentsR "dsh,pi")
+SNAPBASE=$(jget snapBase "")
 R_CORPUS=$(jget r.corpusTokens "80000")
 R_WINDOW=$(jget r.window "16384")
 R_CAP=$(jget r.capRatio "0.4")
@@ -109,6 +110,11 @@ mkdir -p "$OUT_DIR"
 # ---- docker run --------------------------------------------------------------
 RUN=(docker run --rm "${SRC_ARGS[@]}")
 if [ -n "$GIT_PROXY" ]; then RUN+=(-e GATE_GIT_PROXY="$GIT_PROXY"); fi
+# GATE_SNAPBASE: run the P/R lanes with the candidate's snapBase egress plane
+# ON in the gate's bili.json (value: "all" or openai,responses,anthropic,google).
+# Must be appended AFTER the RUN=(...) init above — an earlier append is wiped
+# by the reassignment.
+if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
 if [ "$NETWORK" = "bridge" ]; then
   RUN+=(--add-host=host.docker.internal:host-gateway)
 else

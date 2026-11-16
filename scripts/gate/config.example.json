@@ -21,8 +21,11 @@
   "npmRegistry": "https://registry.npmjs.org",
 
   "turnTimeoutMs": 300000,
-  "agents": ["dsh", "pi", "codex", "opencode", "claude"],
+  "agents": ["dsh", "pi", "codex", "opencode", "claude", "dsh-google"],
+  "_doc_agentsR": "restart-lane agents, comma list or array. Default dsh,pi; use dsh,pi,claude to also run the anthropic-wire restart lane (prefix topology, harness-managed proxy).",
   "agentsR": "",
+  "_doc_snapBase": "P/R lanes only: run the candidate's snapBase egress plane (storage.snapBase) ON in the gate's bili.json. \"all\" = every protocol cohort; \"openai,responses,anthropic,google\" subset = explicit cohorts; absent or \"off\" = off (byte-identical gate). For candidate-branch verification (e.g. #6785).",
+  "snapBase": "",
   "r": {
     "corpusTokens": 80000,
     "window": 16384,
