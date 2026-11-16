@@ -225,12 +225,17 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
         const inputs = captured.map((c) => (JSON.parse(c.body) as { input?: Item[] }).input ?? []);
         assert.ok(inputs.length >= FOLD_AT + 3, `expected >= ${FOLD_AT + 3} upstream requests, got ${inputs.length}`);
 
-        // (0) Scenario materialization: the nudge must have been injected into
-        // the PRE-FOLD original request (production shape: nudge armed -> model
+        // (0) Scenario materialization: a nudge must have been injected into a
+        // PRE-FOLD original request (production shape: nudge armed -> model
         // calls proxy tool -> compress). Without it this probe does not cover
-        // the #2929 trigger.
-        assert.ok(hasNudge(inputs[PROXY_TOOL_AT]!), `scenario miss: no ephemeral nudge in the pre-fold request (inputs[${PROXY_TOOL_AT}]) — probe does not cover the production trigger; adjust nudgeGrowthTokens/filler`);
-        console.log(`probe: nudge confirmed in pre-fold request; total upstream requests=${inputs.length}`);
+        // the #2929 trigger. The exact arm index tracks the local estimate
+        // curve, so we scan the pre-fold window instead of pinning one index —
+        // pinning made the probe trip on unrelated stable-prefix size changes
+        // (e.g. #6928 removing the per-turn status line shifted the arm one
+        // request earlier and turned a green release CI red).
+        const nudgedIdx = inputs.slice(0, PROXY_TOOL_AT + 1).findIndex((items) => hasNudge(items ?? []));
+        assert.ok(nudgedIdx >= 0, `scenario miss: no ephemeral nudge in any pre-fold request (inputs[0..${PROXY_TOOL_AT}]) — probe does not cover the production trigger; adjust nudgeGrowthTokens/filler`);
+        console.log(`probe: nudge confirmed in pre-fold request[${nudgedIdx}]; total upstream requests=${inputs.length}`);
 
         // (1) The post-fold re-request carries the in-place summary(s).
         const rPost = inputs[FOLD_AT + 1]!;
