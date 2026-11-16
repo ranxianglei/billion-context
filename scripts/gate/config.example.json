@@ -21,7 +21,8 @@
   "npmRegistry": "https://registry.npmjs.org",
 
   "turnTimeoutMs": 300000,
-  "agents": ["dsh", "pi", "codex", "opencode", "claude"],
+  "agents": ["dsh", "pi", "codex", "opencode", "claude", "dsh-google"],
+  "_doc_agentsR": "restart-lane agents, comma list or array. Default dsh,pi; use dsh,pi,claude to also run the anthropic-wire restart lane (prefix topology, harness-managed proxy).",
   "agentsR": "",
   "r": {
     "corpusTokens": 80000,
