@@ -77,7 +77,7 @@ const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Bo
 // plane. Unset/0/off = off (byte-identical gate); "all" = every protocol
 // cohort; "openai,responses,anthropic,google" subset = explicit cohorts. The
 // gate's bili.json is the only config surface the lanes' proxies read.
-function gateStorageCfg() {
+export function gateStorageCfg() {
   const v = String(process.env.GATE_SNAPBASE || "");
   if (!v || v === "0" || v.toLowerCase() === "off") return {};
   const cohorts = v.toLowerCase() === "all" ? [] : v.split(",").map((x) => x.trim()).filter(Boolean);

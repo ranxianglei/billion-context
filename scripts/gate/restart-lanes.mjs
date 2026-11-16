@@ -71,7 +71,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { buildCorpus, CODEWORDS } from "./plugin-lanes.mjs";
+import { buildCorpus, CODEWORDS, gateStorageCfg } from "./plugin-lanes.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const WORK = process.env.RESTART_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "restart-lanes");
@@ -86,14 +86,6 @@ const MODEL1 = {
 };
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
 
-// GATE_SNAPBASE (#6785 candidate verification): see plugin-lanes'
-// gateStorageCfg — same knob, same bili.json surface, R lanes included.
-function gateStorageCfg() {
-  const v = String(process.env.GATE_SNAPBASE || "");
-  if (!v || v === "0" || v.toLowerCase() === "off") return {};
-  const cohorts = v.toLowerCase() === "all" ? [] : v.split(",").map((x) => x.trim()).filter(Boolean);
-  return { storage: cohorts.length ? { snapBase: { enabled: true, cohorts } } : { snapBase: { enabled: true } } };
-}
 const laneCfg = (providers) => ({ providers, compress: { preserveRecentTokens: 0 }, ...gateStorageCfg() });
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS_R || process.env.GATE_AGENTS || "dsh,pi")
