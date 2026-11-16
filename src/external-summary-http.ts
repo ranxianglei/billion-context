@@ -6,7 +6,7 @@ import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { log as loggerLog } from "./logger.js";
 import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
-import { finalizeSseLineEndings } from "./sse-util.js";
+import { bufferedSseEvents, finalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 
@@ -46,7 +46,7 @@ function backoffDelayMs(attempt: number): number {
 }
 
 function retryAfterDelayMs(header: string | null, fallbackMs: number): number {
-    if (header !== null) {
+    if (header !== null && header.trim() !== "") {
         const seconds = Number(header);
         if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds * 1000), SUMMARY_RETRY_AFTER_CAP_MS);
         const dateMs = Date.parse(header);
@@ -122,7 +122,10 @@ function completed(protocol: PreflightProtocol, events: unknown[], streaming: bo
             if (streaming ? item.type === "message_stop" && anthropicStopReason : anthropicStopReason) terminal = true;
         } else if (protocol === "openai") {
             const choice = Array.isArray(item.choices) ? record(item.choices[0]) : undefined;
-            if (record(choice?.message)?.tool_calls || record(choice?.delta)?.tool_calls) return false;
+            if ([record(choice?.message), record(choice?.delta)].some((payload) => {
+                const calls = payload?.tool_calls;
+                return Array.isArray(calls) ? calls.length > 0 : !!calls;
+            })) return false;
             if (choice?.finish_reason) {
                 if (choice.finish_reason !== "stop") return false;
                 terminal = true;
@@ -172,9 +175,8 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     } else {
         const normalized = finalizeSseLineEndings(text);
         const events: unknown[] = [];
-        for (const line of normalized.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
+        for (const event of bufferedSseEvents(normalized)) {
+            const data = event.data.trim();
             if (!data || data === "[DONE]") continue;
             try { events.push(JSON.parse(data)); } catch { throw new Error("External summary response contains an invalid frame"); }
         }
