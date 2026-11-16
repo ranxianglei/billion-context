@@ -249,7 +249,9 @@ export interface CcrEntryRow {
      *  of the content store) — the slim ccr_json envelope has no bytes of
      *  its own, the CAS behind these rows is the content home. */
     origContent: string | null;
-    origHash: string;
+    /** null with origContent null — a missing byHash entry; "" stays
+     *  reserved for a legitimate empty original. */
+    origHash: string | null;
 }
 
 /** One checkpoint/replica row (Phase 2, #2671). `state_hash` never leaves
@@ -1673,7 +1675,7 @@ export class UnifiedStore {
             for (const e of input.ccrEntries) {
                 if (unchangedCcrKeys.has(e.key)) continue;
                 const hash = this.putContent(e.content, e.contentHash);
-                const orig = e.origContent === null ? null : this.putContent(e.origContent, e.origHash);
+                const orig = e.origContent === null ? null : this.putContent(e.origContent, e.origHash ?? undefined);
                 this.db
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash, orig);
@@ -3425,7 +3427,8 @@ export class UnifiedStore {
      *    (storage-bounded-load / issue4739-storage-read-snapshot pin this shape);
      *  - `getBlockContents(id)`: the full narrow replay-leg contents map for
      *    lazy-field restore (#4739) — block-row summary/one CAS bytes plus the
-     *    orphans_json journal precedence, WITHOUT resurrecting state.blocks
+     *    orphan-journal precedence (orphan_blocks table ∪ legacy column,
+     *    #6785 step 7), WITHOUT resurrecting state.blocks
      *    (issue4739-bounded-session-load pins this). */
     getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[];
     getBlockContents(sessionId: string): BlockContentsMap | null;
@@ -3444,10 +3447,8 @@ export class UnifiedStore {
                 one: row.one_hash && row.one_bytes !== null ? Buffer.from(row.one_bytes).toString("utf8") : null,
             }));
         }
-        const row = this.db
-            .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-            .get(sessionId) as { orphans_json: string | null } | undefined;
-        if (!row) return null;
+        const exists = this.db.prepare("SELECT 1 FROM sessions WHERE session_id = ?").get(sessionId);
+        if (!exists) return null;
         const out: BlockContentsMap = new Map();
         for (const b of this.getBlocks(sessionId)) {
             out.set(b.blockId, {
@@ -3455,14 +3456,13 @@ export class UnifiedStore {
                 full: JSON.parse(b.summary) as BlockView,
             });
         }
-        if (row.orphans_json !== null && row.orphans_json !== undefined && row.orphans_json !== "") {
-            try {
-                const orphans = JSON.parse(row.orphans_json) as Record<string, { one: BlockView | null; full: BlockView }>;
-                for (const [blockId, view] of Object.entries(orphans)) {
-                    if (!out.has(blockId)) out.set(blockId, view);
-                }
-            } catch {
-                // corrupt journal → skip (same boundary as loadLegacyView)
+        // #6785 step 7: the journal moved to the orphan_blocks table (the
+        // sessions.orphans_json column is retired on first ingest) — the
+        // merged reader is getOrphanViews(); null = no orphans anywhere.
+        const orphans = this.getOrphanViews(sessionId);
+        if (orphans !== null) {
+            for (const [blockId, view] of Object.entries(orphans)) {
+                if (!out.has(blockId)) out.set(blockId, view as { one: BlockView | null; full: BlockView });
             }
         }
         return out;
@@ -3974,7 +3974,7 @@ export class UnifiedStore {
             // degrade to the full envelope / file lane instead of
             // reconstructing an empty original.
             origContent: r.orig_hash === null || r.orig_hash === undefined ? null : this.getContent(r.orig_hash as string) ?? null,
-            origHash: r.orig_hash === null || r.orig_hash === undefined ? "" : (r.orig_hash as string),
+            origHash: r.orig_hash === null || r.orig_hash === undefined ? null : (r.orig_hash as string),
         }));
     }
 }

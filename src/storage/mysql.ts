@@ -1089,7 +1089,7 @@ export class MysqlBackend implements StorageBackend {
             for (const e of input.ccrEntries) {
                 if (unchangedCcrKeys.has(e.key)) continue;
                 const hash = await this.putContent(c, e.content, e.contentHash);
-                const orig = e.origContent === null ? null : await this.putContent(c, e.origContent, e.origHash);
+                const orig = e.origContent === null ? null : await this.putContent(c, e.origContent, e.origHash ?? undefined);
                 await c.query(
                     "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)",
                     [s.sessionId, e.ord, e.key, hash, orig],
@@ -1927,7 +1927,7 @@ export class MysqlBackend implements StorageBackend {
                 content: (await this.getContent(conn, str(r.content_hash))) ?? "",
                 contentHash: str(r.content_hash),
                 origContent: origHash === null ? null : ((await this.getContent(conn, origHash)) ?? null),
-                origHash: origHash ?? "",
+                origHash,
             });
         }
         return out;

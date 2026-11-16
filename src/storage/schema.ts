@@ -328,6 +328,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
 CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
+-- #6785 step 6: orig_hash is the SECOND FK child column of content(hash) —
+-- #5539's discipline applies to it too, or every parent delete full-scans
+-- ccr_entries (MySQL twin: idx_ccr_entries_orig_hash).
+CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash);
 CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
@@ -650,6 +654,12 @@ export function migrateSchema(db: {
         if (!ccrCols.includes("orig_hash")) {
             db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
         }
+        // #6785 step 6: orig_hash is a second FK child column of
+        // content(hash) — #5539's discipline requires its own index, or
+        // every parent delete full-scans ccr_entries. Unconditional
+        // (probe-first) like the column: a lib that already carries the
+        // column but not the key (intermediate build of this PR) converges.
+        db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash)");
         if (from < 11) {
             // v11 (#5539): FK child indexes on content.hash — see the header
             // note and the DDL comment above for the mechanism and field

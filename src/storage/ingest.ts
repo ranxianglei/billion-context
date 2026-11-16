@@ -467,8 +467,14 @@ function finishPlan(
               // keeps no bytes, so the CAS row must carry them.
               const entry = value as { hash?: unknown } | null;
               const origKey = entry !== null && typeof entry === "object" && typeof entry.hash === "string" ? entry.hash : null;
-              const orig = origKey !== null ? session.contentStore!.byHash[origKey] ?? "" : "";
-              return { ord, key, content, contentHash: sha256Hex(content), origContent: orig, origHash: sha256Hex(orig) };
+              const stored = origKey !== null ? session.contentStore!.byHash[origKey] : undefined;
+              // A missing byHash entry (bytes absent from memory/sidecar)
+              // must land as null, not "": "" would look like a legitimate
+              // empty original and the slim store would reconstruct an
+              // empty original instead of degrading to the file lane
+              // (getCcrEntries null contract, store.ts).
+              const orig = stored === undefined ? null : stored;
+              return { ord, key, content, contentHash: sha256Hex(content), origContent: orig, origHash: orig === null ? null : sha256Hex(orig) };
           })
         : [];
 
