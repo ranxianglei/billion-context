@@ -465,6 +465,15 @@ entries:
     desc_en: "Protocols allowed onto the egress stable-prefix cache plane (#5874 v2): a subset of openai/anthropic/google/responses. Sessions whose protocol is absent render live unconditionally (the fold journal still records). Missing or empty = all cohorts; nested under storage.snapBase.enabled, which must also be set."
     desc_zh: "允许进入出站稳定前缀缓存平面的协议（#5874 v2）：openai/anthropic/google/responses 的子集。协议不在名单内的会话无条件走实时渲染（fold 日志照常记录）。缺省或空 = 全部协议；嵌套在 storage.snapBase.enabled 之下，两者须同时设置。"
     desc_ja: "出站安定プレフィックスキャッシュプレーンへの参加を許可するプロトコル (#5874 v2): openai/anthropic/google/responses の部分集合。プロトコルがリストにないセッションは無条件で live レンダリング (fold ジャーナルは記録継続)。欠如または空 = 全 cohort; storage.snapBase.enabled にネストされ、両方の設定が必要。"
+  - key: storage.snapBase.cutEveryKUserTurns
+    type: integer
+    default: "8"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Re-cut cadence of the egress stable-prefix cache (#5874 v2, #6785 review): a VALID cached row re-materializes its cut once this many user turns have landed past it. A cut re-hashes every pinned id, re-serializes the whole prefix and writes a fresh CAS blob, so cutting on every user turn costs O(n^2) over a session's life; between cuts the session serves the still-valid old row and derives its short tail live (exactly what a session without the plane does). Invalidation never waits on the cadence: a row rejected by the read side (fold crossing, rewind, id drift) cuts immediately. 1 restores the original per-turn behavior; values below 1, non-integers, or garbage fall back to the default 8 (the worst direction is paying the pre-cadence cost). Only active with storage.snapBase.enabled; see also #6935 for the segment-chain design that removes the per-cut O(prefix) cost entirely."
+    desc_zh: "出站稳定前缀缓存的重切节奏（#5874 v2，#6785 评审）：一条有效的缓存行在上次切点之后累积到该数量的 user turn 时重新物化。一次 cut 要重 hash 全部 pin 的 id、重序列化整个前缀并写新 CAS blob，每 user turn 都切会让整个会话生命周期成本 O(n²)；两次切之间会话继续用仍有效的旧行、实时推导短尾巴（与不开平面的会话行为一致）。失效从不等待节奏：被读侧拒绝的行（折叠穿越/回滚/id 漂移）立即重切。1 恢复原每 turn 行为；小于 1、非整数或非法值回落默认 8（最坏方向只是退回节流前的成本）。仅在 storage.snapBase.enabled 开启时生效；彻底消除单次 cut O(前缀) 成本的段链设计见 #6935。"
+    desc_ja: "出站安定プレフィックスキャッシュの再カット周期 (#5874 v2, #6785 レビュー): 有効なキャッシュ行は、前回カット以降にユーザーターンがこの数だけ溜まると再物化する。カット 1 回で pin 済み全 id の再ハッシュ・プレフィックス全体の再シリアライズ・新規 CAS blob 書き込みが発生するため、毎ターン切割ではセッション生涯コスト O(n²) になる。カット間ではセッションは依然有効な旧行を継続提供し短いテールは live 導出 (プレーン未参加セッションと同一)。無効化は周期を待たない: 読み出し側で拒否された行 (fold 交差・巻き戻し・id ドリフト) は即再カット。1 で元の毎ターン挙動に戻す; 1 未満・非整数・ゴミ値はデフォルト 8 にフォールバック (最悪方向は周期導入前コストの支払い)。storage.snapBase.enabled 時のみ有効; 単回カット O(プレフィックス) コストを完全排除するセグメントチェーン設計は #6935 参照。"
   - key: sessions
     type: object
     default: "{} (all defaults)"
