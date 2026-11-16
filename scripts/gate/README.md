@@ -52,7 +52,11 @@ Config keys (all optional except `model1.baseUrl` / `model1.model`):
 clones from — keeps container egress at zero and works behind host git
 proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
 the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
-`agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane), `r.{corpusTokens,window,capRatio,
+`agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane),
+`snapBase` (P/R lanes only: run the candidate's snapBase egress plane ON in the
+gate's bili.json — `"all"` = every protocol cohort, `"openai,responses,anthropic,google"`
+subset = explicit cohorts, absent/`"off"` = off, byte-identical gate; for
+candidate-branch verification, e.g. #6785), `r.{corpusTokens,window,capRatio,
 cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
 shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
 
