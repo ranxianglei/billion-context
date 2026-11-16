@@ -202,11 +202,17 @@ export function createTraeAdapter(
                     // per-request counters carry meaning. Cached tokens read the
                     // openai-vocabulary fields first (the frame may gain them,
                     // #5713), with this wire's native counter as the last rung.
+                    // openaiCachedTokens returns 0 when prompt_tokens is present
+                    // with no openai-vocabulary cache field — on this wire that
+                    // means "consult the native rung", not "definitively zero".
+                    const openaiCached = openaiCachedTokens(ev);
                     yield {
                         kind: "usage",
                         inputTokens: typeof ev.prompt_tokens === "number" ? ev.prompt_tokens : undefined,
                         outputTokens: typeof ev.completion_tokens === "number" ? ev.completion_tokens : undefined,
-                        cachedTokens: openaiCachedTokens(ev) ?? (typeof ev.cache_read_input_tokens === "number" ? ev.cache_read_input_tokens : undefined),
+                        cachedTokens: openaiCached !== null && openaiCached > 0
+                            ? openaiCached
+                            : (typeof ev.cache_read_input_tokens === "number" ? ev.cache_read_input_tokens : undefined),
                     } as ParsedStreamEvent;
                     continue;
                 }
