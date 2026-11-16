@@ -31,6 +31,30 @@ function isPiWebAccessFetch(v: unknown): boolean {
  *  ever changes, update both. */
 const INLINE_ORIGIN = "http://billion-context.inline";
 
+const INLINE_HOSTNAME = "billion-context.inline";
+
+/** Exact-origin classifier for the inline pseudo-origin. A prefix match
+ *  would also match lookalikes (billion-context.inline.evil.com), an https
+ *  URL, a non-default port, or a URL carrying credentials — none of which is
+ *  the inline engine. The hostname comparison is case-insensitive (URL
+ *  normalises it), the scheme must be plain http, and only the default
+ *  port (:80, or no port) counts. */
+export function isInlineOriginUrl(url: string): boolean {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return false;
+    }
+    return (
+        parsed.protocol === "http:" &&
+        parsed.hostname === INLINE_HOSTNAME &&
+        (parsed.port === "" || parsed.port === "80") &&
+        parsed.username === "" &&
+        parsed.password === ""
+    );
+}
+
 function fetchUrlOf(input: string | URL | Request): string | undefined {
     try {
         if (typeof input === "string") return input;
@@ -188,17 +212,22 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             if (chainHop.getStore() === patched) {
                 return dispatchDepth.run((dispatchDepth.getStore() ?? 0) + 1, () => dispatchBody(input, init));
             }
+            // #6841 rework: classify FIRST. An INLINE_ORIGIN request is served
+            // in-process at a fresh depth 1 instead of being handed down the
+            // chain, so it can never reach a foreign wrapper sitting between
+            // this link and the inline link (the pi-web-access wrapper with a
+            // proxy scope on curls it before the #1662 depth-1 fix ever runs).
+            // It cannot loop: once served, the request is never sent down the
+            // chain again, so it terminates here.
+            if (isInlineOriginUrl(fetchUrlOf(input) ?? "")) {
+                return dispatchDepth.run(1, () => dispatchBody(input, init));
+            }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
                 if (isPiWebAccessFetch(ds)) return send(input, init);
-                // #6829: the #1662 escape must never hand pseudo-origin traffic
-                // to the oldest live anchor — billion-context.inline has no DNS
-                // record, so the request dies ENOTFOUND instead of reaching the
-                // inline engine. Route it down the chain instead: send() stamps
-                // the hop, so the inline transport link recognizes the descent
-                // (#4527) and serves it in-process.
-                const url = fetchUrlOf(input);
-                if (url !== undefined && url.startsWith(INLINE_ORIGIN)) return send(input, init);
+                // #6841 rework: INLINE_ORIGIN requests never reach this branch
+                // any more — the classify-first check above serves them
+                // in-process instead, so the old prefix route-down is gone.
                 const anchor = observedFetches.find((f) => !knownDeadFetches.has(f));
                 if (anchor !== undefined && anchor !== ds) {
                     if (!warnedReentry) {

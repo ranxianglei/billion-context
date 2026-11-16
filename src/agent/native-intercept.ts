@@ -6,8 +6,9 @@
 // at extension load always wins. The patch is surgical — it rewrites ONLY
 // model-API shaped URLs and leaves every other request untouched.
 
-import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
+import { installFetchChain, isDeadClosureError, isInlineOriginUrl, resetFetchChainForTest } from "./fetch-chain/index.js";
 import { logHostEvent } from "./host-log.js";
+import { serveInlineOrigin } from "./pi-inline.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
@@ -1579,7 +1580,25 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
     // network again. Only ever contains origins we ourselves observed dying.
     const replacedOrigins = new Set<string>();
 
-    installFetchChain((send) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    installFetchChain((chainSend) => async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        // #6841 rework: never hand pseudo-origin traffic to a downstream
+        // that may be a foreign wrapper. The pi-web-access wrapper sits
+        // ABOVE the inline link; with its proxy scope on it curls an
+        // INLINE_ORIGIN URL before bili's chain ever sees it, so the #1662
+        // depth-1 fix never runs on that path. Bili cannot observe the
+        // wrapper's scope state from outside, so the rule is unconditional:
+        // every INLINE_ORIGIN send from this dispatch is served in-process
+        // by the inline transport instead. Non-inline sends pass through
+        // untouched, and when the inline transport was never installed the
+        // serve returns undefined and the send goes down the chain as today.
+        const send = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+            const url = fetchUrlOf(input);
+            if (url !== undefined && isInlineOriginUrl(url)) {
+                const served = await serveInlineOrigin(input, init);
+                if (served !== undefined) return served;
+            }
+            return chainSend(input, init);
+        };
         const url = fetchUrlOf(input);
         // #3394: resolve the ACTIVE state per request instead of capturing the
         // first installer's — a hot-reimport swapped in a fresh instance whose
