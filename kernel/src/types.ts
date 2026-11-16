@@ -71,6 +71,9 @@ export interface CompressionBlock {
   tier: CompressionTier;
   topic?: string;
   summary: string;
+  /** Render-only fallback: stable surviving user successor when coverage is
+   * absent from the current view. Never a coverage claim or array position. */
+  fallbackUserMessageId?: string;
   directMessageIds: string[];
   effectiveMessageIds: string[];
   directBlockIds: string[];

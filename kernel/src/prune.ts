@@ -109,13 +109,16 @@ export function isRenderedSummaryMessage(
 
 export interface PruneOptions {
   injectSummaries?: boolean;
+  /** Learn render-only fallback successors during the live turn pipeline.
+   * Direct prune callers (exports/previews) remain read-only by default. */
+  rememberFallbackAnchors?: boolean;
   /**
    * Chronological head anchoring for views with NO provider prefix cache at
    * stake (session handoff/restore docs). Default (false) is the pin-safe
-   * placement: an anchor whose ids are absent from the input parks before
-   * the newest user message (never at the tail, #3640), and no summary may
-   * precede the first user message — the pin is the provider prefix-cache
-   * head (#2733).
+   * placement: an anchor whose ids are absent reuses a remembered surviving
+   * user successor, otherwise parks before the newest surviving user (#3640).
+   * Resolved anchors cannot precede the opening user pin (#2733); unresolved
+   * anchors keep the before-opening-user exception when it is the only user.
    */
   headSummaryAnchors?: boolean;
   /**
@@ -143,19 +146,44 @@ export function prune(
   const firstUserIndex = messages.findIndex(
     (message) => message.role === "user",
   );
-  // #3640: an unresolved anchor (no covered id present in this input) parks
-  // immediately BEFORE the newest user message, never at the list tail.
-  // Tail-parking put days-old summaries after the user's current question,
-  // and the model answered the stale recap instead of the question for every
-  // subsequent turn. Parking before the newest user turn also keeps the
-  // provider prefix cache intact: the insertion point sits inside the
-  // turn-over region that the next request rewrites anyway (#2733 trade-off
-  // reassessed). No user message at all: keep the legacy tail.
-  let lastUserIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === "user") {
-      lastUserIndex = i;
-      break;
+  // Keep unresolved summaries before a surviving user, but remember that
+  // user's identity in the live pipeline: chasing the latest user every turn
+  // moves old summaries through an otherwise append-only cached prefix.
+  const seqIntervals = coveredSeqIntervals(state);
+  const userAnchors = new Map<string, number>();
+  let fallbackIndex = messages.length;
+  const userSuccessors = new Map<number, string>();
+  if (inject && !options.headSummaryAnchors) {
+    for (let start = 0; start < messages.length;) {
+      const head = messages[start]!;
+      let end = start + 1;
+      const wire = wireIndexOf(head);
+      if (head.role === "user" && wire !== undefined) {
+        while (
+          end < messages.length &&
+          messages[end]!.role === "user" &&
+          wireIndexOf(messages[end]!) === wire
+        )
+          end++;
+      }
+      if (head.role === "user") {
+        // Bind a surviving part, but insert before its WHOLE wire item. Walk
+        // each run once, even for very wide multimodal user messages.
+        for (let i = start; i < end; i++) {
+          const message = messages[i]!;
+          if (message.contentType === "tool-result") continue;
+          if (
+            start !== firstUserIndex &&
+            (isCovered(message.id, coveredBases) ||
+              isCoveredBySeq(message.ledgerSeq, seqIntervals))
+          )
+            continue;
+          userAnchors.set(message.id, start);
+          if (!userSuccessors.has(start)) userSuccessors.set(start, message.id);
+          fallbackIndex = start;
+        }
+      }
+      start = end;
     }
   }
 
@@ -197,12 +225,11 @@ export function prune(
         state,
         baseIndexById,
         summaryIndexById,
-        options.headSummaryAnchors
-          ? 0
-          : lastUserIndex >= 0
-            ? lastUserIndex
-            : messages.length,
+        options.headSummaryAnchors ? 0 : fallbackIndex,
         visibleCompressCallIds,
+        options.headSummaryAnchors ? new Map() : userAnchors,
+        userSuccessors,
+        options.rememberFallbackAnchors === true && !options.headSummaryAnchors,
       )
     : [];
   // Summary ids of every block this session has ever created — active or
@@ -224,7 +251,7 @@ export function prune(
           messages,
           coveredBases,
           // #4316 layer 3: positional claims, built once per prune pass.
-          coveredSeqIntervals(state),
+          seqIntervals,
           firstUserIndex,
           anchors,
           knownSummaryIds,
@@ -242,8 +269,9 @@ interface SummaryAnchor {
   topic?: string;
   insertAt: number;
   /** True when no anchor id was present in the input (the substrate is off
-   *  the wire). Unresolved anchors park before the newest user message and
-   *  are exempt from the first-user-pin lower bound of firstUserIndex + 1:
+   *  the wire). Unresolved anchors reuse a surviving user successor (or
+   *  choose the newest surviving user initially/on rewrite) and are exempt
+   *  from the first-user-pin lower bound of firstUserIndex + 1:
    *  riding AFTER the user's current question is the functional bug #3640
    *  (the model answered the stale recap instead of the question for five
    *  consecutive turns), and the rendered summary is role "system", so
@@ -260,6 +288,9 @@ function collectSummaryAnchors(
   // blocks created by one of these skip their anchor render (see the
   // collection site above for the rationale and the safety conditions).
   visibleCompressCallIds: Set<string>,
+  userAnchors: Map<string, number>,
+  userSuccessors: Map<number, string>,
+  rememberFallback: boolean,
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
   for (const block of activeBlocks(state)) {
@@ -310,15 +341,26 @@ function collectSummaryAnchors(
         earliest = index;
       }
     }
+    const remembered =
+      block.fallbackUserMessageId === undefined
+        ? undefined
+        : userAnchors.get(block.fallbackUserMessageId);
+    const unresolvedIndex = remembered ?? fallbackIndex;
+    if (earliest === null && rememberFallback) {
+      const successor = userSuccessors.get(unresolvedIndex);
+      // A transient tool-only/no-user view is not evidence that the saved
+      // successor was rewritten. Keep it for the next full client resend.
+      if (successor !== undefined) block.fallbackUserMessageId = successor;
+    }
     anchors.push({
       blockId: block.blockId,
       summary: block.summary,
       topic: block.topic,
       // Unresolved (no anchor id present in this input): park before the
-      // newest user message — see prune() for the #3640/#2733 reasoning.
+      // remembered user successor, or select one on the first render.
       // Tail-parking (the pre-#3640 behavior) let stale summaries land after
       // the user's current question, which the model then answered instead.
-      insertAt: earliest ?? fallbackIndex,
+      insertAt: earliest ?? unresolvedIndex,
       unresolved: earliest === null,
     });
   }

@@ -1332,6 +1332,7 @@ const pruneNode: PipelineNode = {
     return {
       ...io,
       messages: prune(io.messages, io.state, {
+        rememberFallbackAnchors: true,
         isCompressTool: ctx.config.isCompressTool,
       }),
       // #2663: keep the pre-prune resent array reachable so recommend can
