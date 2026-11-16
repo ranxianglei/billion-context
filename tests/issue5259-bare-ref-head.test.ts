@@ -30,8 +30,8 @@ const LT = "\x3c";  // <
 const PROSE = "懂了，你说的是这件事。";
 
 test("#5259: stripBareRefHead drops the reported shape (whole-text)", () => {
-    // reported residue alone, no newline
-    assert.equal(stripBareRefHead("m01464b"), "");
+    // #2023: no newline -> the ref is the whole answer (a citation).
+    assert.equal(stripBareRefHead("m01464b"), "m01464b");
     // reported shape: residue line + prose
     assert.equal(stripBareRefHead(`m01464b\n${PROSE}`), PROSE);
     // width bounds: 4-digit floor (kernel refs start m0001)…
@@ -138,10 +138,11 @@ test("#5259: streaming filter drops the residue at every chunk split", () => {
 
 test("#5259: streaming filter — EOF without newline, empty chunks, callbacks", () => {
     // residue is the entire field, stream ends before any newline
+    // #2023: an EOF-only bare ref is the citation, not residue.
     const a = createBareRefHeadFilter();
-    assert.equal(a.push("m01464b") + a.flush(), "");
-    assert.equal(a.dropped(), true);
-    assert.equal(a.stats().dropCount, 1);
+    assert.equal(a.push("m01464b") + a.flush(), "m01464b");
+    assert.equal(a.dropped(), false);
+    assert.equal(a.stats().dropCount, 0);
     // empty leading chunk must not decide the line
     const b = createBareRefHeadFilter();
     assert.equal(b.push(""), "");

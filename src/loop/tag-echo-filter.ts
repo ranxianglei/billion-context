@@ -702,9 +702,13 @@ const BARE_REF_LINE = /^m\d{4,6}[a-zA-Z]?$/;
  *  residue shape (its \n included); anything else passes through. */
 export function stripBareRefHead(text: string): string {
     const nl = text.indexOf("\n");
-    const line = nl < 0 ? text : text.slice(0, nl);
+    // #2023: reaching EOF with NO newline means the ref is the whole answer —
+    // a bare citation the model legitimately produced. The client must see it.
+    // The residue shape always resumes with a \n because real content follows.
+    if (nl < 0) return text;
+    const line = text.slice(0, nl);
     if (!BARE_REF_LINE.test(line)) return text;
-    return nl < 0 ? "" : text.slice(nl + 1);
+    return text.slice(nl + 1);
 }
 
 /** Field-level engage predicate for the whole-text strips (stream*.ts): does
@@ -2074,11 +2078,9 @@ export function createBareRefHeadFilter(onDrop?: (snippet: string) => void): Tag
         push: (delta: string): string => process(delta),
         flush(): string {
             if (decided || buf.length === 0) return "";
-            if (BARE_REF_LINE.test(buf)) {
-                noteDrop(buf);
-                buf = "";
-                return "";
-            }
+            // #2023: an undecided bare-ref line at EOF never saw a newline, so
+            // it is the whole answer (a citation) — release it verbatim. The
+            // residue shape always has a newline because content follows it.
             const tail = buf;
             buf = "";
             decided = true;
