@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, measuredBreakdownClause } from "../src/server.ts";
 import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
@@ -616,6 +616,52 @@ test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5
     // non-object bodies bucket into other (or nothing) without throwing.
     assert.equal(estimateRawBodyBreakdown(null).total, 0, "null body");
     assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
+});
+
+test("estimateRawBodyBreakdown.otherTop: names the specific top-level field carrying the 'other' mass (#6957)", () => {
+    // The #6957 shape: a body whose mass rides a top-level field OTHER than
+    // messages/tools/system (the dsh→official-DeepSeek wire put ~1.6M tokens in
+    // an unknown top-level field). otherTop must name THAT field so the doom
+    // message is actionable.
+    const body = {
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+        tools: [{ type: "function", function: { name: "t", description: "d".repeat(1_000) } }],
+        system: "s".repeat(1_000),
+        // two "other" fields: the big one must sort first.
+        reasoning_history: "r".repeat(20_000),
+        metadata: "x".repeat(2_000),
+    };
+    const b = estimateRawBodyBreakdown(body);
+    assert.ok(b.other > 0, "the two extra top-level fields land in the other bucket");
+    assert.equal(b.otherTop.length, 2, "both 'other' top-level fields are named");
+    assert.equal(b.otherTop[0].field, "reasoning_history", "the bigger field sorts first");
+    assert.equal(b.otherTop[1].field, "metadata", "the smaller field follows");
+    assert.ok(b.otherTop[0].tokens > b.otherTop[1].tokens, "sorted desc by tokens");
+    // otherTop tokens sum to the other bucket (exhaustive within 'other').
+    assert.equal(b.otherTop.reduce((s, e) => s + e.tokens, 0), b.other, "otherTop is exhaustive over the other bucket");
+    // messages/tools/system fields never leak into otherTop.
+    assert.ok(!b.otherTop.some((e) => e.field === "messages" || e.field === "tools" || e.field === "system"), "named buckets stay out of otherTop");
+    // a body with no 'other' mass has an empty otherTop.
+    const noOther = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "m" }], system: "s" });
+    assert.equal(noOther.otherTop.length, 0, "no other mass ⇒ empty otherTop");
+    // a null body has an empty otherTop (no top-level object to name).
+    assert.equal(estimateRawBodyBreakdown(null).otherTop.length, 0, "null body ⇒ empty otherTop");
+});
+
+test("measuredBreakdownClause: names the oversized 'other' field in the doom message (#6957)", () => {
+    // #6957: the doom message must say WHICH top-level field carries the "other"
+    // mass, so "trim the oversized dimension" is actionable.
+    const b = estimateRawBodyBreakdown({
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+        system: "s".repeat(1_000),
+        reasoning_history: "r".repeat(20_000),
+    });
+    const clause = measuredBreakdownClause(b);
+    assert.ok(clause.includes("other ~"), "the other bucket is still reported");
+    assert.ok(clause.includes("reasoning_history"), "the oversized top-level field is named");
+    // a body with no "other" mass gets no "(other: …)" suffix.
+    const noOther = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "m" }], system: "s" });
+    assert.ok(!measuredBreakdownClause(noOther).includes("(other:"), "no other mass ⇒ no field suffix");
 });
 
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {
