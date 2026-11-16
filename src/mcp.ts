@@ -327,6 +327,18 @@ export function maybeRebindConversation(): string | undefined {
     return current;
 }
 
+// Remote Control children (`claude --print --sdk-url … --resume=<session url>`)
+// spawn this shim under a fresh CLAUDE_CODE_SESSION_ID, then adopt the remote
+// session's id before their first model request, without any /clear and before
+// any bili tool call. Re-check on a timer so the registration follows the host
+// before its requests arrive (#6917).
+export function watchClaudeSession(intervalMs = 1000): () => void {
+    maybeRebindConversation();
+    const timer = setInterval(maybeRebindConversation, intervalMs);
+    timer.unref();
+    return () => clearInterval(timer);
+}
+
 // Test seam: clear the injected resolver between cases (it is module state).
 export function _resetClaudeSessionResolverForTest(): void {
     claudeSessionResolver = undefined;

@@ -14,7 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveProxyOrigin, runMcpStdio, setClaudeSessionResolver } from "./mcp.js";
+import { resolveProxyOrigin, runMcpStdio, setClaudeSessionResolver, watchClaudeSession } from "./mcp.js";
 import { configureLogger, log as teeLog } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
 import { logRetentionPolicy } from "./knobs.js";
@@ -206,6 +206,7 @@ export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}):
     // included — the tool calls still need to follow the host's current session).
     // mcp.ts ignores it unless the shim is identity-bound (CLAUDE_CODE_SESSION_ID).
     setClaudeSessionResolver(readClaudeSessionId);
+    watchClaudeSession();
     const plan = planClaudeNativeBootstrap(process.env);
     if (plan.action !== "start") {
         // attach (BILLION_CONTEXT_PROXY / BILI_PROVIDER_REWRITES) or passthrough
