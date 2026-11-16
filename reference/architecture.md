@@ -289,6 +289,7 @@ billion-context/
 │   ├── identity-mcode.ts         # Identity harvest source: mcode (MiniMax Code) runtime sqlite (#5825)
 │   ├── identity-qwen.ts          # Identity harvest source: qwen-code transcript, opt-in join key (#5825)
 │   ├── identity-sources.ts       # Identity source registry barrel: one import registers every lane (#5825)
+│   ├── incremental-first-seen.ts # Incremental first-seen timestamp journal: ACK only after the save commits
 │   ├── incremental-lane.ts       # Incremental-turn server lane: delta acks via x-bili-applied-seq (#3248)
 │   ├── inline-engine.ts          # In-process compression engine behind the pseudo-origin (#3278)
 │   ├── inline-ws.ts              # Loopback-only WS bridge for the inline engine (#3278)
