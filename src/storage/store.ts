@@ -35,7 +35,9 @@ import {
     snapL1EnvelopeRead,
     snapL1Record,
     snapR3LatchedRead,
+    snapR3LatchClear,
     snapR3LatchWrite,
+    snapR3LatchedList,
     type EgressReadHit,
     type EgressSnapshotRow,
 } from "./snap.js";
@@ -1776,6 +1778,47 @@ export class UnifiedStore {
         try {
             snapR3LatchWrite(this.db, this.snapSessRawOf(sid), Date.now());
         } catch { /* best-effort — see above */ }
+    }
+
+    /** #6785 review: operator escape hatch — clear the persisted R3 latch
+     *  for one RAW host session id. Returns the ledger id the l1 row binds
+     *  (the caller uses it to clear the in-memory breaker too) or null when
+     *  no row exists / a fault. Keyed by sess_raw (the roster key), not by
+     *  sid — the admin surface has the raw id, and the latch row predates
+     *  the sid→raw resolution in its placeholder phase. */
+    snapR3LatchClear(sessRaw: string): string | null {
+        try {
+            return snapR3LatchClear(this.db, sessRaw);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #6785 review: the persisted-latch roster (an operator must be able
+     *  to SEE which raw ids are stuck before clearing them). Empty on a
+     *  fault — the roster is diagnostic, never load-bearing. */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        try {
+            return snapR3LatchedList(this.db);
+        } catch {
+            return [];
+        }
+    }
+
+    /** #6785 review: the ledger sid a raw host session id conversational-
+     *  binds to (null when the host supplied no conversation binding — the
+     *  common case, where sid === raw). The unlatch route clears the
+     *  in-memory breaker for BOTH ids: the latch row's ledger_id can still
+     *  be the sessRaw placeholder (first fault before any stage-0 run),
+     *  while the breaker itself is keyed by the real sid. */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (sessRaw.length === 0) return null;
+        try {
+            return (this.db.prepare("SELECT session_id FROM conversations WHERE conversation_id = ? LIMIT 1").get(sessRaw) as { session_id: string } | undefined)
+                ?.session_id ?? null;
+        } catch {
+            return null;
+        }
     }
 
     /** #5874 v2 (step 3): one EGRESS CUT — pin the derived stable prefix

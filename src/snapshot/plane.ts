@@ -45,7 +45,9 @@ export class R3FaultTracker {
     private readonly latched = new Set<string>();
     constructor(
         private readonly windowMs: number = 10 * 60 * 1000,
-        private readonly strikeCap: number = 3,
+        // readonly-public: the pre-latch strike log (stage0.ts) cites the
+        // cap in its message.
+        public readonly strikeCap: number = 3,
     ) {}
 
     /** Record an R3 fault. Returns the persistent-latch verdict. */
@@ -64,12 +66,23 @@ export class R3FaultTracker {
         return { latched: false };
     }
 
+    /** Strikes recorded in the CURRENT window (a cleared or expired window
+     *  reads 0) — the pre-latch 400s log their progress toward the latch so
+     *  an operator sees a miscounting host BEFORE the sid latches for good. */
+    strikes(sid: string, now: number = Date.now()): number {
+        const entry = this.faults.get(sid);
+        if (!entry || now - entry.firstAt > this.windowMs) return 0;
+        return entry.count;
+    }
+
     isLatched(sid: string): boolean {
         return this.latched.has(sid);
     }
 
-    /** Operator escape hatch (the latch is persistent across the window but
-     *  not across a process restart unless the caller also persists it). */
+    /** Operator escape hatch (paired with the persisted-latch clear at the
+     *  `/__bili/snapshot/r3-unlatch` admin route — that route calls this for
+     *  every sid the latched row can resolve to, since the in-memory latch
+     *  alone would survive a same-process "clear" that misses its key). */
     clearLatched(sid: string): void {
         this.latched.delete(sid);
         this.faults.delete(sid);

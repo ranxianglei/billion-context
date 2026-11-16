@@ -435,6 +435,31 @@ test("M3: the R3 latch persists across store instances — a latched session deg
     assert.equal(b.snapR3Latched("other-sid"), false, "other sessions are unaffected");
 });
 
+// #6785 review: the operator escape hatch — the latch must be VISIBLE
+// (roster) and CLEARABLE (persisted), or a mislatched session is bricked to
+// the legacy path with no remedy.
+test("M3.1: the latch roster lists the stuck sids and the clear PERSISTS (survives a restart)", () => {
+    const p = path.join(hermetic, "m3-unlatch", "index.db");
+    const a = openPlane(p);
+    a.snapR3Latch("sid-u");
+    a.snapR3Latch("sid-v");
+    const roster = a.snapR3LatchedList();
+    assert.deepEqual(roster.map((r) => r.sessRaw).sort(), ["sid-u", "sid-v"], "both latched sids visible in the roster");
+    for (const r of roster) {
+        assert.equal(r.ledgerId, r.sessRaw, "no conversation binding → the bound ledger id is the raw id itself");
+        assert.ok(r.latchedAt > 0, "the latch carries its timestamp (the operator sees how old the stick is)");
+    }
+    const ledger = a.snapR3LatchClear("sid-u");
+    assert.equal(ledger, "sid-u", "the clear returns the bound ledger id (the in-memory breaker key)");
+    assert.equal(a.snapR3Latched("sid-u"), false, "cleared in the same instance");
+    assert.equal(a.snapR3Latched("sid-v"), true, "the other latch is untouched");
+    // The process-restart case: the clear must have persisted.
+    const b = openPlane(p);
+    assert.equal(b.snapR3Latched("sid-u"), false, "the clear survives a new store instance");
+    assert.deepEqual(b.snapR3LatchedList().map((r) => r.sessRaw), ["sid-v"]);
+    assert.equal(b.snapR3LatchClear("no-such-sid"), null, "no row → null (the route reports persistedRowCleared=false)");
+});
+
 // ── HTTP e2e (real proxy + fake upstream) ───────────────────────────────────
 
 import http from "node:http";
@@ -556,6 +581,22 @@ test("B1: a declared host that fails to collect msgids (count mismatch) → 400 
             assert.equal(bodies.length, 0, "zero side effects: the upstream was never contacted");
         },
         { env: { BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY: "1" } },
+    );
+});
+
+test("M3.2: the admin unlatch routes exist and are gated (501 in legacy mode, 400 on a malformed body)", async () => {
+    await withProxyT(
+        () => ({ status: 200, payload: sseDone() }),
+        async (url) => {
+            const base = url.slice(0, url.indexOf("/bili/"));
+            const listRes = await fetch(`${base}/__bili/snapshot/r3-latches`);
+            assert.equal(listRes.status, 501, "legacy mode → 501 (the knob, not the URL, is missing)");
+            const badRes = await fetch(`${base}/__bili/snapshot/r3-unlatch`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+            assert.equal(badRes.status, 400, "a body without sessRaw is rejected before touching the store");
+            const unlatchRes = await fetch(`${base}/__bili/snapshot/r3-unlatch`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessRaw: "e2e-sess" }) });
+            assert.equal(unlatchRes.status, 501, "a well-formed body still 501s in legacy mode (unified store required)");
+        },
+        {},
     );
 });
 

@@ -104,6 +104,14 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                         } catch { /* the in-memory latch already fires; persistence is best-effort */ }
                         log("error", `[${sessionId}] [2x2:${lane}] R3 identity fault ×3 in window (${v.reason}) — sid latched to the legacy path (persisted)`);
                     } else {
+                        // The pre-latch strikes are otherwise SILENT — the
+                        // 400 funnel (server.ts) does not log — so surface
+                        // the progress toward the latch with the identity
+                        // verdict: an operator needs to see a miscounting
+                        // host BEFORE its sid latches to the legacy path
+                        // for good (persisted across restarts).
+                        const strike = r3FaultTracker.strikes(sessionId);
+                        log("warn", `[${sessionId}] [2x2:${lane}] R3 identity fault — strike ${strike}/${r3FaultTracker.strikeCap} in window (${v.reason}) — 400 sent; the sid latches to the legacy path after ${r3FaultTracker.strikeCap - strike} more`);
                         throw new FoundationRejectError(`inbound msgid envelope failed validation (${v.reason})`);
                     }
                 }

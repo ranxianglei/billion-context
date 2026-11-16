@@ -2504,6 +2504,25 @@ export class SessionStore {
         this.liveShadow().snapR3Latch(sessionId);
     }
 
+    /** #6785 review: operator escape hatch — clear the persisted R3 latch
+     *  (see UnifiedStore.snapR3LatchClear; /__bili/snapshot/r3-unlatch). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapSidOfRaw(sessRaw);
+    }
+
     // #5874 v2 step 3: the egress prefix cache (see UnifiedStore.egressCut).
     // Never throws — a cache fault degrades the round to the live derive.
 

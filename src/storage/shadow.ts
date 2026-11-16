@@ -1006,6 +1006,24 @@ export class UnifiedShadow {
         this.sync.snapR3Latch(sessionId);
     }
 
+    /** #6785 review: operator escape hatch (see UnifiedStore.snapR3LatchClear). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (this.sync === null) return [];
+        return this.sync.snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (this.sync === null) return null;
+        return this.sync.snapSidOfRaw(sessRaw);
+    }
+
     // #5874 v2 step 3: the egress prefix cache pass-throughs (see
     // UnifiedStore.egressCut / egressReadView — never fail, null on any miss).
 

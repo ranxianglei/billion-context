@@ -187,6 +187,28 @@ export function snapR3LatchWrite(db: DbLike, sessRaw: string, nowMs: number): vo
     db.prepare("INSERT INTO l1_world (sess_raw, ledger_id, witness_probe, issued_at, r3_latched_at) VALUES (?, ?, '', ?, ?) ON CONFLICT(sess_raw) DO UPDATE SET r3_latched_at = excluded.r3_latched_at, ledger_id = COALESCE(l1_world.ledger_id, excluded.ledger_id), witness_probe = COALESCE(NULLIF(l1_world.witness_probe, ''), excluded.witness_probe)").run(sessRaw, sessRaw, nowMs, nowMs);
 }
 
+/** #6785 review: operator escape hatch — clear the persisted R3 latch.
+ *  Returns the ledger id the row binds (the placeholder `sessRaw` until a
+ *  later stage-0 snapL1Record upsert carries the real id) so the caller can
+ *  also clear the in-memory breaker for every resolvable sid; null when no
+ *  l1 row exists for the raw id. */
+export function snapR3LatchClear(db: DbLike, sessRaw: string): string | null {
+    const r = db.prepare("SELECT ledger_id FROM l1_world WHERE sess_raw = ?").get(sessRaw) as { ledger_id: string } | undefined;
+    if (!r) return null;
+    db.prepare("UPDATE l1_world SET r3_latched_at = NULL WHERE sess_raw = ?").run(sessRaw);
+    return r.ledger_id;
+}
+
+/** #6785 review: the persisted-latch roster — operators must be able to SEE
+ *  which raw session ids are stuck (and since when) before they can unstick
+ *  one. Empty (not null) when none are latched. */
+export function snapR3LatchedList(db: DbLike): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+    return (db
+        .prepare("SELECT sess_raw, ledger_id, r3_latched_at FROM l1_world WHERE r3_latched_at IS NOT NULL ORDER BY r3_latched_at DESC")
+        .all() as Array<{ sess_raw: string; ledger_id: string; r3_latched_at: number }>)
+        .map((r) => ({ sessRaw: r.sess_raw, ledgerId: r.ledger_id, latchedAt: r.r3_latched_at }));
+}
+
 // ---------------------------------------------------------------------------
 // Fold journal — append-only fold decisions with an input aggregate hash.
 //
