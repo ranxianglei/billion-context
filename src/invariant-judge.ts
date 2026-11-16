@@ -203,7 +203,7 @@ function isSummaryCarrier(m: CoreMessage): boolean {
 // side bili renders it itself — synthetic plugin_<ts> tool-call id (#1567,
 // isPluginFoldCallId; the marker lives on the PAIRING KEY, the core id stays a
 // content hash), normalized args — so the client's pair bytes are not what
-// rides the wire. The receipt text shape mirrors src/stream.ts:1356; the
+// rides the wire. The receipt text shape mirrors src/stream.ts:1729; the
 // anchored m-prefix keeps ordinary prose from reading as a carrier.
 const FOLD_RECEIPT_RE = /^\[Compressed m\d+/;
 function isPluginFoldCarrier(m: CoreMessage): boolean {
@@ -479,7 +479,7 @@ export function judgeInboundOutbound(
         if (scanned > cap) break;
         // #4408: toolName joins the twin fingerprint — same role/contentType
         // with a DIFFERENT tool is a drop + unrelated call, not a rewrite
-        // (stableEqual itself already gates on toolName, L197). Label-only.
+        // (stableEqual itself already gates on toolName, L280). Label-only.
         if (x.role === e.role && x.contentType === e.contentType &&
             (e.contentType !== "tool-call" || !e.toolName || !x.toolName || x.toolName === e.toolName) &&
             (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
@@ -539,7 +539,7 @@ export function judgeInboundOutbound(
         if (scanned > maxGap) break;
         // #4408: toolName joins the twin fingerprint — same role/contentType
         // with a DIFFERENT tool is a drop + unrelated call, not a rewrite
-        // (stableEqual itself already gates on toolName, L197). Label-only.
+        // (stableEqual itself already gates on toolName, L280). Label-only.
         if (x.role === e.role && x.contentType === e.contentType &&
             (e.contentType !== "tool-call" || !e.toolName || !x.toolName || x.toolName === e.toolName) &&
             (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
