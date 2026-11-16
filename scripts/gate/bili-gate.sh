@@ -74,6 +74,10 @@ NPM_REG=$(jget npmRegistry "https://registry.npmjs.org")
 TURN_MS=$(jget turnTimeoutMs "300000")
 AGENTS=$(jget agents "dsh,pi,codex,opencode,claude,dsh-google")
 AGENTS_R=$(jget agentsR "dsh,pi")
+# GATE_SNAPBASE: run the P/R lanes with the candidate's snapBase egress plane
+# ON in the gate's bili.json (value: "all" or openai,responses,anthropic,google).
+SNAPBASE=$(jget snapBase "")
+if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
 R_CORPUS=$(jget r.corpusTokens "80000")
 R_WINDOW=$(jget r.window "16384")
 R_CAP=$(jget r.capRatio "0.4")
