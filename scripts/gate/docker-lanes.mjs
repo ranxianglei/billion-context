@@ -174,6 +174,9 @@ if (!skip.includes("x") && NEXT) {
       stdio: ["ignore", fd, fd],
     });
     fs.closeSync(fd); // the child holds its own dup
+    let exited = null;
+    srv.on("exit", (code, sig) => { exited = { code, sig }; });
+    srv._exited = () => exited; // a zombie (unreaped exit) must not count as alive
     return srv;
   };
   const stopPinServer = async (srv) => {
@@ -181,35 +184,57 @@ if (!skip.includes("x") && NEXT) {
     await sleep(2000);
     try { srv.kill("SIGKILL"); } catch { /* already gone */ }
   };
-  const healthy = (port) => run("curl", ["-sf", "-m", "5", "-o", "", "-w", "%{http_code}", `http://127.0.0.1:${port}/__bili/status`], { log: false });
-  const alive = (srv) => { try { process.kill(srv.pid, 0); return true; } catch { return false; } };
+  // Probe /__bili/status and keep BOTH the code and the body: "no response"
+  // turned out to hide a real answer (the body says why the endpoint refuses).
+  // Probe the web shell (static — no fs/registry work), not /__bili/status:
+  // status runs detectStaleInstall which can round-trip the npm registry
+  // (NPM_CONFIG_REGISTRY points at a busy foreign verdaccio in this container)
+  // and stall past the curl timeout while the server itself is perfectly up.
+  const probeStatus = (port) => {
+    const r = run("curl", ["-s", "-m", "8", "-w", "\nCODE:%{http_code}", `http://127.0.0.1:${port}/__bili/`], { log: false });
+    const out = r.stdout || "";
+    const m = out.match(/\nCODE:(\d+)$/);
+    return { code: m ? m[1] : "000", body: m ? out.slice(0, m.index) : out };
+  };
+  const alive = (srv) => {
+    if (srv._exited && srv._exited()) return false;
+    try { process.kill(srv.pid, 0); return true; } catch { return false; }
+  };
   // The server's [update] lines go to the session log, not its stdout
   // (verified: stdout carries only the storage bootstrap).
   const sessionLogPath = () => path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "billion-context", "bili.log");
   // Wait for the pin server to answer 200; if it dies during start, restart
   // it once (the gate container runs sibling lanes at the same time).
-  const startPinServerHealthy = async (logFile) => {
+  const startPinServerHealthy = async (logFile, tag) => {
     let srv = startPinServer(logFile);
+    let last = { code: "000", body: "" };
     const waitUp = async (ms) => {
       const t0 = Date.now();
       while (Date.now() - t0 < ms) {
-        if (!alive(srv)) return false;
-        if (healthy(PIN_PORT).stdout?.trim() === "200") return true;
+        if (!alive(srv)) break;
+        last = probeStatus(PIN_PORT);
+        if (last.code === "200") return true;
         await sleep(2000);
       }
-      return healthy(PIN_PORT).stdout?.trim() === "200";
+      return alive(srv) && (last = probeStatus(PIN_PORT)).code === "200";
     };
     let up = await waitUp(30000);
     if (!up) {
       const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").split("\n").slice(-12).join("\n") : "";
-      log(`[Xp] pin server not healthy after 30s (alive=${alive(srv)}) — restarting once`);
+      const ex = srv._exited ? srv._exited() : null;
+      log(`[Xp] ${tag} pin server not healthy after 30s (alive=${alive(srv)}${ex ? `, exited code=${ex.code} sig=${ex.sig}` : ""}, last status=${last.code} body=${JSON.stringify(last.body.slice(0, 300))})`);
+      fs.writeFileSync(path.join(workdir, `lane-x-pin-status-${tag}.txt`), `code=${last.code}\n${last.body}`);
       if (tail) log(tail);
+      log(`[Xp] ${tag} restarting once`);
       await stopPinServer(srv);
       await sleep(1500);
       srv = startPinServer(logFile);
       up = await waitUp(30000);
+      if (!up) {
+        fs.writeFileSync(path.join(workdir, `lane-x-pin-status-${tag}-retry.txt`), `code=${last.code}\n${last.body}`);
+      }
     }
-    return { srv, up };
+    return { srv, up, last };
   };
 
   // -- Phase 1: pin → live auto-updater holds; explicit update breaks through --
@@ -222,9 +247,9 @@ if (!skip.includes("x") && NEXT) {
   record("Xp", `publish ${gateVersion(2)} to registry`, pub2.ok, pub2.err);
 
   const holdLog = path.join(workdir, "lane-x-pin-hold.log");
-  const p1s = await startPinServerHealthy(holdLog);
+  const p1s = await startPinServerHealthy(holdLog, "hold");
   let srv = p1s.srv;
-  const st1 = healthy(PIN_PORT).stdout?.trim();
+  const st1 = p1s.last.code;
   record("Xp", "pin server is healthy", p1s.up && st1 === "200", `status=${st1 || "no-response"}`);
   await sleep(25000); // let a few 5s-interval checks land
   const vHold = versionNow();
@@ -251,9 +276,9 @@ if (!skip.includes("x") && NEXT) {
   record("Xp", `publish ${gateVersion(3)} to registry`, pub3.ok, pub3.err);
 
   const resumeLog = path.join(workdir, "lane-x-pin-resume.log");
-  const p2s = await startPinServerHealthy(resumeLog);
+  const p2s = await startPinServerHealthy(resumeLog, "resume");
   srv = p2s.srv;
-  const st2 = healthy(PIN_PORT).stdout?.trim();
+  const st2 = p2s.last.code;
   record("Xp", "resume server is healthy", p2s.up && st2 === "200", `status=${st2 || "no-response"}`);
   await sleep(25000);
   const vHold2 = versionNow();
