@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionStore } from "../src/persist.ts";
-import { isDroppedContentStore, markDirty, residentBreakdown, type Session } from "../src/session.ts";
+import { isDroppedContentStore, markDirty, residentBreakdown, sessionWeight, type Session } from "../src/session.ts";
 import { createInitialState, createContentStore, storeOriginal, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -70,10 +70,15 @@ test("idle save folds the content store; first touch transparently re-materializ
         assert.ok(!isDroppedContentStore(s.contentStore), "starts plain");
         const fullBytes = residentBreakdown(s).contentStore;
         assert.ok(fullBytes > 25_000, `seeded originals should be measurable, got ${fullBytes}`);
+        const beforeTotal = sessionWeight(s);
 
         await store.writeNow(s);
 
         assert.ok(isDroppedContentStore(s.contentStore), "idle save swaps in the lazy proxy");
+        assert.ok(
+            sessionWeight(s) < beforeTotal - Math.floor(fullBytes * 0.5),
+            `released store must leave the cached weight (${beforeTotal} -> ${sessionWeight(s)}; store was ~${fullBytes} B)`,
+        );
         assert.equal(residentBreakdown(s).contentStore, 64, "diagnostics count only the unloaded proxy");
         assert.ok(isDroppedContentStore(s.contentStore), "measuring must not load persisted originals");
         assert.equal(Object.keys(s.contentStore!.byRef).length, 30, "all refs visible through the proxy");
