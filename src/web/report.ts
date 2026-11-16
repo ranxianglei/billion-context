@@ -523,7 +523,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 fPts.reduce((mx, fp) => (fp.pct !== null && fp.pct > mx ? fp.pct : mx), 100),
                 gPts.reduce((mx, gp) => (gp.pct !== null && gp.pct > mx ? gp.pct : mx), 0)
             );
-            const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil(maxPct / 50) * 50);
+            const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
             const RY = (pct: number): number => bot - (Math.max(0, Math.min(axisMax, pct)) / axisMax) * (bot - top);
             const colFor = (pct: number): string => pct >= 80 ? "#2da44e" : pct >= 40 ? AMB : RED;
             const gStep = axisMax > 200 ? 50 : 25;
