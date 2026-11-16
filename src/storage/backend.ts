@@ -151,7 +151,7 @@ export interface StorageBackend {
     init?(): Promise<void>;
 }
 
-export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs">;
+export type StorageReadView = Pick<StorageBackend, "getSessionRow" | "getMessages" | "getBlocks" | "getDeadRefs" | "getRefs" | "getCcrEntries">;
 
 /** The sqlite backend: the existing UnifiedStore behind the async contract.
  *  Synchronous under the hood; `Promise.resolve` wrapping only. */
@@ -224,6 +224,7 @@ export class SqliteBackend implements StorageBackend {
             getBlocks: async (id, opts) => store.getBlocks(id, opts),
             getDeadRefs: async (id) => store.getDeadRefs(id),
             getRefs: async (id) => store.getRefs(id),
+            getCcrEntries: async (id) => store.getCcrEntries(id),
         }));
     }
     getCcr(sessionId: string): Promise<MessageContentStore | null> {

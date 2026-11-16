@@ -29,6 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { CcrLedgerRow, hydrateSlimCcrStore, slimCcrEnvelope } from "./slim.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -458,9 +459,16 @@ function finishPlan(
     }));
 
     const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => {
+        ? Object.entries(session.contentStore.byRef).map(([key, value], ord): CcrEntryRow => {
               const content = JSON.stringify(value);
-              return { ord, key, content, contentHash: sha256Hex(content) };
+              // #6785 step 6: the orig half — the kernel invariant
+              // (content-store.ts storeOriginal) pins byHash[entry.hash]
+              // as the original text behind each entry; the slim column
+              // keeps no bytes, so the CAS row must carry them.
+              const entry = value as { hash?: unknown } | null;
+              const origKey = entry !== null && typeof entry === "object" && typeof entry.hash === "string" ? entry.hash : null;
+              const orig = origKey !== null ? session.contentStore!.byHash[origKey] ?? "" : "";
+              return { ord, key, content, contentHash: sha256Hex(content), origContent: orig, origHash: sha256Hex(orig) };
           })
         : [];
 
@@ -502,7 +510,10 @@ function finishPlan(
         metadataJson: JSON.stringify(session.metadata),
         kstateJson: JSON.stringify(kstate),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
-        ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
+        // #6785 step 6: slim envelope — the column keeps key→hash only; the
+        // original bytes live in the CAS behind ccr_entries and are re-fetched
+        // on read (byte-identical by construction).
+        ccrJson: session.contentStore ? JSON.stringify(slimCcrEnvelope(session.contentStore)) : null,
     };
 
     return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
@@ -604,6 +615,7 @@ export class LegacyViewBuilder {
     private readonly blocks: unknown[] = [];
     private readonly blockContents: BlockContents = new Map();
     private readonly messagesBySeq = new Map<number, CoreMessage>();
+    private ccrRows: readonly CcrLedgerRow[] = [];
 
     constructor(
         private readonly session: LegacyViewRows["session"],
@@ -662,6 +674,12 @@ export class LegacyViewBuilder {
         for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
     }
 
+    /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim
+     *  ccr_json envelope — finish() hydrates the store from these rows. */
+    addCcrEntries(rows: readonly CcrLedgerRow[]): void {
+        this.ccrRows = rows;
+    }
+
     finish(): LegacyView {
         const s = this.session;
         const tail = this.tail;
@@ -696,15 +714,41 @@ export class LegacyViewBuilder {
             lastMessagesFolded: tail.tailFolded,
         };
         if (pluginSnapshot) out.pluginSnapshot = pluginSnapshot;
-        if (s.ccrJson !== null) out.contentStore = JSON.parse(s.ccrJson);
+        out.contentStore = resolveCcrContentStore(s.ccrJson, this.ccrRows);
         return out;
     }
 }
 
+/**
+ * #6785 step 6: the ONE definition of "what does a sessions.ccr_json column
+ * mean" — shared by the builder (finish), the verifier header and
+ * loadLegacyView, so the slim/full/legacy degradation rule cannot drift
+ * between legs. Slim envelope → hydrate from the CAS-backed ledger; a slim
+ * row whose ledger is empty or still carries legacy NULL-orig rows is an
+ * inconsistency: no store (the file lane still has it), never a partial one.
+ * Full (pre-step-6) envelopes parse verbatim. Corrupt JSON → undefined.
+ */
+export function resolveCcrContentStore(
+    ccrJson: string | null,
+    ccrRows: readonly CcrLedgerRow[],
+): LegacyView["contentStore"] {
+    if (ccrJson === null) return undefined;
+    try {
+        const parsed = JSON.parse(ccrJson) as { ccrSlim?: number; orphanByHash?: unknown };
+        if (parsed.ccrSlim === 1) {
+            return hydrateSlimCcrStore(parsed, ccrRows) ?? undefined;
+        }
+        return JSON.parse(ccrJson) as LegacyView["contentStore"];
+    } catch {
+        return undefined;
+    }
+}
+
 /** Compatibility wrapper for callers that already hold all rows. */
-export function loadLegacyView(rows: LegacyViewRows): LegacyView {
+export function loadLegacyView(rows: LegacyViewRows, ccrRows?: readonly CcrLedgerRow[]): LegacyView {
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);
     builder.addMessages(rows.messages);
+    if (ccrRows) builder.addCcrEntries(ccrRows);
     return builder.finish();
 }

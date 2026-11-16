@@ -254,6 +254,10 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ord             INTEGER NOT NULL,
     ccr_key         TEXT NOT NULL,
     content_hash    TEXT NOT NULL REFERENCES content(hash),
+    -- #6785 step 6: the ORIGINAL text behind entry.hash (byHash half of the
+    -- content store). NULL only on pre-step-6 rows — their full ccr_json
+    -- envelope still carries the text. See src/storage/slim.ts.
+    orig_hash       TEXT REFERENCES content(hash),
     PRIMARY KEY (session_id, ord)
 );
 
@@ -588,6 +592,17 @@ export function migrateSchema(db: {
             if (!tsCols.includes("ts")) {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
+        }
+        // #6785 step 6: ccr_entries gains the orig_hash half
+        // (the original text behind each entry). NOT version-gated: every
+        // pre-existing db (user_version already past the crossing point) must
+        // pick the column up, so the probe is unconditional and idempotent —
+        // fresh dbs get it straight from the DDL. Pre-step-6 rows keep NULL;
+        // their full ccr_json envelope remains the read authority (slim.ts).
+        const ccrCols = (db.prepare("PRAGMA table_info(ccr_entries)").all() as unknown as { name?: unknown }[])
+            .map((c) => (typeof c?.name === "string" ? c.name : ""));
+        if (!ccrCols.includes("orig_hash")) {
+            db.exec("ALTER TABLE ccr_entries ADD COLUMN orig_hash TEXT REFERENCES content(hash)");
         }
         if (from < 11) {
             // v11 (#5539): FK child indexes on content.hash — see the header

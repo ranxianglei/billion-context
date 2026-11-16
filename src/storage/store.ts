@@ -23,6 +23,7 @@ import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
+import { hydrateSlimCcrStore } from "./slim.js";
 import {
     appendEgressSnapshot,
     appendFoldJournal,
@@ -244,6 +245,11 @@ export interface CcrEntryRow {
     /** #5744: sha256(content) from the planner — unchanged entries skip the
      *  CAS bump/release round-trips entirely on steady-state ingests. */
     contentHash: string;
+    /** #6785 step 6: the original text behind entry.hash (the byHash half
+     *  of the content store) — the slim ccr_json envelope has no bytes of
+     *  its own, the CAS behind these rows is the content home. */
+    origContent: string | null;
+    origHash: string;
 }
 
 /** One checkpoint/replica row (Phase 2, #2671). `state_hash` never leaves
@@ -1541,17 +1547,26 @@ export class UnifiedStore {
             const incomingCcr = new Map<string, CcrEntryRow>();
             for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
             const storedCcr = this.db
-                .prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ?")
-                .all(s.sessionId) as Array<{ ord: number; ccr_key: string; content_hash: string }>;
+                .prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ?")
+                .all(s.sessionId) as Array<{ ord: number; ccr_key: string; content_hash: string; orig_hash: string | null }>;
             const changedCcrKeys: string[] = [];
             const unchangedCcrKeys = new Set<string>();
             const releasedOldCcrHashes: string[] = [];
             for (const row of storedCcr) {
                 const inc = incomingCcr.get(row.ccr_key);
-                if (!inc) { changedCcrKeys.push(row.ccr_key); releasedOldCcrHashes.push(row.content_hash); continue; }
-                if (row.ord !== inc.ord || row.content_hash !== inc.contentHash) {
+                if (!inc) {
                     changedCcrKeys.push(row.ccr_key);
                     releasedOldCcrHashes.push(row.content_hash);
+                    if (row.orig_hash !== null) releasedOldCcrHashes.push(row.orig_hash);
+                    continue;
+                }
+                // #6785 step 6: the orig half joins the unchanged test — a
+                // pre-step-6 row (orig NULL) or an archived-restore row
+                // re-puts its original on the next save and self-heals.
+                if (row.ord !== inc.ord || row.content_hash !== inc.contentHash || row.orig_hash !== inc.origHash) {
+                    changedCcrKeys.push(row.ccr_key);
+                    releasedOldCcrHashes.push(row.content_hash);
+                    if (row.orig_hash !== null) releasedOldCcrHashes.push(row.orig_hash);
                 } else {
                     unchangedCcrKeys.add(row.ccr_key);
                 }
@@ -1568,9 +1583,10 @@ export class UnifiedStore {
             for (const e of input.ccrEntries) {
                 if (unchangedCcrKeys.has(e.key)) continue;
                 const hash = this.putContent(e.content, e.contentHash);
+                const orig = e.origContent === null ? null : this.putContent(e.origContent, e.origHash);
                 this.db
-                    .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
-                    .run(s.sessionId, e.ord, e.key, hash);
+                    .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)")
+                    .run(s.sessionId, e.ord, e.key, hash, orig);
             }
             return true;
         });
@@ -2173,8 +2189,11 @@ export class UnifiedStore {
                 if (b.one_hash !== null) refs.push(b.one_hash);
             }
             for (const e of this.db
-                .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
-                .all(sessionId) as { content_hash: string }[]) refs.push(e.content_hash);
+                .prepare("SELECT content_hash, orig_hash FROM ccr_entries WHERE session_id = ?")
+                .all(sessionId) as { content_hash: string; orig_hash: string | null }[]) {
+                refs.push(e.content_hash);
+                if (e.orig_hash !== null) refs.push(e.orig_hash);
+            }
             // Checkpoints: pinned replicas keep their rows + CAS refcounts; the
             // rest die with the session.
             for (const cp of this.db
@@ -2255,6 +2274,7 @@ export class UnifiedStore {
                     UNION ALL SELECT summary_hash, 1 FROM blocks WHERE session_id = ?
                     UNION ALL SELECT one_hash, 1 FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL
                     UNION ALL SELECT content_hash, 1 FROM ccr_entries WHERE session_id = ?
+                    UNION ALL SELECT orig_hash, 1 FROM ccr_entries WHERE session_id = ? AND orig_hash IS NOT NULL
                     UNION ALL SELECT state_hash, CASE WHEN pinned = 0 THEN 1 ELSE 0 END FROM checkpoints WHERE session_id = ?
                  ), releases AS (SELECT hash, SUM(released) AS n FROM owned_refs GROUP BY hash)
                  SELECT COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN c.byte_len ELSE 0 END), 0) AS exclusiveBytes,
@@ -2262,7 +2282,7 @@ export class UnifiedStore {
                         COALESCE(SUM(CASE WHEN c.refcount > r.n THEN 1 ELSE 0 END), 0) AS sharedBlobs
                    FROM releases r JOIN content c ON c.hash = r.hash`,
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
         return {
             rows: {
                 sessions: counts.sessions,
@@ -2390,7 +2410,7 @@ export class UnifiedStore {
         const blocks = (this.db.prepare("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
+        const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
@@ -2398,7 +2418,7 @@ export class UnifiedStore {
         for (const m of messages) wanted.add(m.content_hash as string);
         for (const mm of mediaMaps) wanted.add(mm.media_hash as string);
         for (const b of blocks) { wanted.add(b.summary_hash as string); if (b.one_hash !== null && b.one_hash !== undefined) wanted.add(b.one_hash as string); }
-        for (const e of ccr) wanted.add(e.content_hash as string);
+        for (const e of ccr) { wanted.add(e.content_hash as string); if (e.orig_hash !== null && e.orig_hash !== undefined) wanted.add(e.orig_hash as string); }
         for (const cp of checkpoints) if (cp.pinned === 0) wanted.add(cp.state_hash as string);
         const content: Record<string, string> = {};
         for (const hash of wanted) {
@@ -2425,7 +2445,7 @@ export class UnifiedStore {
             for (const m of messages) rel.push(m.content_hash as string);
             for (const mm of mediaMaps) rel.push(mm.media_hash as string);
             for (const b of blocks) { rel.push(b.summary_hash as string); if (b.one_hash !== null && b.one_hash !== undefined) rel.push(b.one_hash as string); }
-            for (const e of ccr) rel.push(e.content_hash as string);
+            for (const e of ccr) { rel.push(e.content_hash as string); if (e.orig_hash !== null && e.orig_hash !== undefined) rel.push(e.orig_hash as string); }
             for (const cp of checkpoints) if (cp.pinned === 0) { rel.push(cp.state_hash as string); this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cp.cp_id); }
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
@@ -2518,7 +2538,11 @@ export class UnifiedStore {
                 addRef(b.summary_hash);
                 addRef(b.one_hash);
             }
-            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const e of dump.ccrEntries) {
+                addRef(e.content_hash);
+                const eh = (e as { orig_hash?: unknown }).orig_hash;
+                if (typeof eh === "string") addRef(eh);
+            }
             for (const cp of dump.checkpoints) {
                 if (!this.getCheckpoint(cp.cp_id as string)) addRef(cp.state_hash);
             }
@@ -2547,8 +2571,8 @@ export class UnifiedStore {
             for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
             const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
-            const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
-            for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
+            const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)");
+            for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash, typeof (e as { orig_hash?: unknown }).orig_hash === "string" ? (e as { orig_hash: string }).orig_hash : null);
             const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
             for (const x of dump.sessionExt) {
                 insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now());
@@ -3821,7 +3845,15 @@ export class UnifiedStore {
             .get(sessionId) as { ccr_json: string | null } | undefined;
         if (!row || row.ccr_json === null) return null;
         try {
-            const parsed = JSON.parse(row.ccr_json) as MessageContentStore;
+            const parsed = JSON.parse(row.ccr_json) as MessageContentStore & { ccrSlim?: number };
+            // #6785 step 6: slim envelope — the column keeps key→hash only;
+            // the bytes come back through the CAS via ccr_entries (same
+            // reconstruction as the view leg, one definition in slim.ts).
+            // A slim row with an empty ledger degrades to the file path.
+            if (parsed.ccrSlim === 1) {
+                const entries = this.getCcrEntries(sessionId);
+                return hydrateSlimCcrStore(parsed, entries);
+            }
             if (parsed && typeof parsed === "object" && parsed.version === 1
                 && parsed.byHash && typeof parsed.byHash === "object"
                 && parsed.byRef && typeof parsed.byRef === "object") {
@@ -3835,13 +3867,18 @@ export class UnifiedStore {
 
     getCcrEntries(sessionId: string): CcrEntryRow[] {
         const rows = this.db
-            .prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord")
+            .prepare("SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord")
             .all(sessionId) as Record<string, unknown>[];
         return rows.map((r) => ({
             ord: r.ord as number,
             key: r.ccr_key as string,
             content: this.getContent(r.content_hash as string) ?? "",
             contentHash: r.content_hash as string,
+            // #6785 step 6: null (not "") marks pre-step-6 rows — callers
+            // degrade to the full envelope / file lane instead of
+            // reconstructing an empty original.
+            origContent: r.orig_hash === null || r.orig_hash === undefined ? null : this.getContent(r.orig_hash as string) ?? null,
+            origHash: r.orig_hash === null || r.orig_hash === undefined ? "" : (r.orig_hash as string),
         }));
     }
 }

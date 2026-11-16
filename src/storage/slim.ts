@@ -1,0 +1,125 @@
+import { sha256Hex } from "./store.js";
+import type { MessageContentStore, StoredEntry } from "acp-kernel";
+
+/**
+ * #6785 step 6 — the slim ccr envelope.
+ *
+ * The sessions.ccr_json column used to carry the FULL content store
+ * (byHash: hash → original text, byRef: ref → entry), so every
+ * steady-state flush re-wrote the whole CCR body through the sessions
+ * row even when nothing changed. The content now lives in the
+ * content-addressed store behind ccr_entries — one row per entry with
+ * BOTH halves: the entry metadata (content_hash) and the original text
+ * it points at (orig_hash, #6785 step 6). The column therefore only
+ * needs the ENVELOPE: which refs exist and which content-hash backs
+ * each entry. Bytes come back through the CAS on read.
+ *
+ * Kernel invariant this leans on (content-store.ts storeOriginal):
+ * byHash[entry.hash] === original text, entry.hash = hashContent(text).
+ */
+export interface SlimCcrEnvelope {
+    version: 1;
+    ccrSlim: 1;
+    byRef: Record<string, { hash: string }>;
+    /** byHash entries no byRef entry points at (host-pruned refs — the
+     *  "retained CCR" case). Rare and small; they ride the envelope so the
+     *  slim round-trip stays lossless in both halves. */
+    orphanByHash?: Record<string, string>;
+}
+
+export function slimCcrEnvelope(contentStore: { byRef: Record<string, unknown>; byHash?: Record<string, string> }): SlimCcrEnvelope {
+    const byRef: Record<string, { hash: string }> = {};
+    for (const [key, value] of Object.entries(contentStore.byRef)) {
+        byRef[key] = { hash: sha256Hex(JSON.stringify(value)) };
+    }
+    // "referenced" = the original hashes some entry points at (entry.hash,
+    //    kernel invariant) — NOT the envelope's content-hash values.
+    const referenced = new Set(
+        Object.values(contentStore.byRef)
+            .map((v) => (v !== null && typeof v === "object" && typeof (v as { hash?: unknown }).hash === "string" ? (v as { hash: string }).hash : null)),
+    );
+    const orphanByHash: Record<string, string> = {};
+    for (const [hash, text] of Object.entries(contentStore.byHash ?? {})) {
+        if (!referenced.has(hash)) orphanByHash[hash] = text;
+    }
+    return Object.keys(orphanByHash).length > 0
+        ? { version: 1, ccrSlim: 1, byRef, orphanByHash }
+        : { version: 1, ccrSlim: 1, byRef };
+}
+
+export interface CcrLedgerRow {
+    key: string;
+    /** JSON.stringify(byRef[key]) as planIngest wrote it. */
+    content: string;
+    /** The original text behind entry.hash (CAS-served); null when the
+     *  row predates the orig_hash column (legacy rows — the full column
+     *  envelope still carries those stores). */
+    origContent: string | null;
+}
+
+/**
+ * Rebuilds the content store from ccr_entries rows (CAS-served content) in
+ * ledger order. byRef[key] is the parsed entry — the row content IS
+ * JSON.stringify(value) as planIngest wrote it, so the round-trip is exact.
+ * byHash is rebuilt from the SAME rows through each entry's own hash key,
+ * matching the live store's canonical form (the kernel invariant above).
+ * A legacy row (origContent null) contributes its byRef entry only — the
+ * full column envelope remains the authority for pre-step-6 stores, so no
+ * partial byHash is ever mixed with a slim one. Returns null when there
+ * are no rows at all — callers degrade to the file lane, never a partial
+ * store.
+ */
+export function hydrateCcrContentStore(
+    rows: readonly CcrLedgerRow[],
+): MessageContentStore | null {
+    if (rows.length === 0) return null;
+    const byHash: Record<string, string> = {};
+    const byRef: Record<string, StoredEntry> = {};
+    for (const r of rows) {
+        let entry: unknown;
+        try {
+            entry = JSON.parse(r.content);
+        } catch {
+            continue;
+        }
+        byRef[r.key] = entry as StoredEntry;
+        if (
+            r.origContent !== null
+            && entry !== null
+            && typeof entry === "object"
+            && typeof (entry as { hash?: unknown }).hash === "string"
+        ) {
+            byHash[(entry as { hash: string }).hash] = r.origContent;
+        }
+    }
+    return { version: 1, byHash, byRef };
+}
+
+/**
+ * The ONE definition of "rebuild a slim column's store" — used by BOTH the
+ * view leg (resolveCcrContentStore) and the direct getCcr path. Legacy
+ * NULL-orig rows or an empty ledger ⇒ null (the file lane stays authority;
+ * never a partial store). Orphan byHash entries ride the envelope and are
+ * merged over the ledger's byHash.
+ */
+export function hydrateSlimCcrStore(
+    parsed: { ccrSlim?: number; orphanByHash?: unknown },
+    rows: readonly CcrLedgerRow[],
+): MessageContentStore | null {
+    if (parsed.ccrSlim !== 1) return null;
+    const orphans: Record<string, string> =
+        parsed.orphanByHash !== undefined && parsed.orphanByHash !== null && typeof parsed.orphanByHash === "object"
+            ? (parsed.orphanByHash as Record<string, string>)
+            : {};
+    if (rows.length === 0) {
+        // A slim envelope with an EMPTY ledger is only a real store when the
+        // orphans half is non-empty (a byHash-only store — host-pruned refs).
+        // Otherwise it is an inconsistency: the file lane stays authority.
+        return Object.keys(orphans).length > 0 ? { version: 1, byHash: orphans, byRef: {} } : null;
+    }
+    if (!rows.every((r) => r.origContent !== null)) return null;
+    const store = hydrateCcrContentStore(rows);
+    if (!store) return null;
+    store.byHash = { ...store.byHash, ...orphans };
+    return store;
+}

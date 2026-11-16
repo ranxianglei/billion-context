@@ -123,6 +123,7 @@ class StubMysqlBackend implements StorageBackend {
             getBlocks: async (id, _opts) => (row(id)?.blocks ?? []).map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
             getDeadRefs: async (id) => row(id)?.deadRefs ?? [],
             getRefs: async (id) => row(id)?.refs ?? [],
+            getCcrEntries: async () => [],
         };
         return read(view);
     }

@@ -233,8 +233,13 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ord         BIGINT NOT NULL,
     ccr_key     VARCHAR(255) NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
+    -- #6785 step 6: the original text behind entry.hash (byHash half) —
+    -- NULL only on pre-step-6 rows (their full ccr_json envelope is the
+    -- read authority). See src/storage/slim.ts.
+    orig_hash   VARCHAR(64) NULL,
     PRIMARY KEY (session_id, ord),
-    KEY idx_ccr_entries_content_hash (content_hash)
+    KEY idx_ccr_entries_content_hash (content_hash),
+    KEY idx_ccr_entries_orig_hash (orig_hash)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -377,6 +382,17 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!haveIdx.has("ccr_entries.idx_ccr_entries_content_hash")) {
                     await conn.query("ALTER TABLE ccr_entries ADD INDEX idx_ccr_entries_content_hash (content_hash)");
+                }
+                // #6785 step 6: ccr_entries.orig_hash — probe-first like the v8/v10
+                // columns; every pre-existing table must pick it up, fresh
+                // installs get it from the DDL. The key rides the same ALTER.
+                const [ccrCols] = (await conn.query(
+                    "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ccr_entries'",
+                )) as unknown as Row[][];
+                const haveCcr = new Set((ccrCols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
+                if (!haveCcr.has("orig_hash")) {
+                    await conn.query("ALTER TABLE ccr_entries ADD COLUMN orig_hash VARCHAR(64) NULL");
+                    await conn.query("ALTER TABLE ccr_entries ADD INDEX idx_ccr_entries_orig_hash (orig_hash)");
                 }
                 if (!haveIdx.has("message_media.idx_message_media_media_hash")) {
                     await conn.query("ALTER TABLE message_media ADD INDEX idx_message_media_media_hash (media_hash)");
@@ -1013,7 +1029,7 @@ export class MysqlBackend implements StorageBackend {
             const incomingCcr = new Map<string, CcrEntryRow>();
             for (const e of input.ccrEntries) incomingCcr.set(e.key, e);
             const storedCcrRows = (await c.query(
-                "SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ?",
+                "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ?",
                 [s.sessionId],
             )) as unknown as Row[][];
             const changedCcrKeys: string[] = [];
@@ -1021,11 +1037,21 @@ export class MysqlBackend implements StorageBackend {
             const releasedOldCcrHashes: string[] = [];
             for (const row of storedCcrRows[0]) {
                 const key = str(row.ccr_key);
+                const storedOrig = row.orig_hash === null || row.orig_hash === undefined ? null : str(row.orig_hash);
                 const inc = incomingCcr.get(key);
-                if (!inc) { changedCcrKeys.push(key); releasedOldCcrHashes.push(str(row.content_hash)); continue; }
-                if (num(row.ord) !== inc.ord || str(row.content_hash) !== inc.contentHash) {
+                if (!inc) {
                     changedCcrKeys.push(key);
                     releasedOldCcrHashes.push(str(row.content_hash));
+                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
+                    continue;
+                }
+                // #6785 step 6 (mirror of store.ts): orig joins the unchanged
+                // test — pre-step-6 rows re-put their original and self-heal.
+                const incOrig = inc.origContent === null ? null : inc.origHash;
+                if (num(row.ord) !== inc.ord || str(row.content_hash) !== inc.contentHash || storedOrig !== incOrig) {
+                    changedCcrKeys.push(key);
+                    releasedOldCcrHashes.push(str(row.content_hash));
+                    if (storedOrig !== null) releasedOldCcrHashes.push(storedOrig);
                 } else {
                     unchangedCcrKeys.add(key);
                 }
@@ -1043,9 +1069,10 @@ export class MysqlBackend implements StorageBackend {
             for (const e of input.ccrEntries) {
                 if (unchangedCcrKeys.has(e.key)) continue;
                 const hash = await this.putContent(c, e.content, e.contentHash);
+                const orig = e.origContent === null ? null : await this.putContent(c, e.origContent, e.origHash);
                 await c.query(
-                    "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)",
-                    [s.sessionId, e.ord, e.key, hash],
+                    "INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash, orig_hash) VALUES (?, ?, ?, ?, ?)",
+                    [s.sessionId, e.ord, e.key, hash, orig],
                 );
             }
             return true;
@@ -1296,8 +1323,11 @@ export class MysqlBackend implements StorageBackend {
                 refs.push(str(b.summary_hash));
                 if (b.one_hash !== null && b.one_hash !== undefined) refs.push(str(b.one_hash));
             }
-            const ccrRows = (await c.query("SELECT content_hash FROM ccr_entries WHERE session_id = ?", [sessionId])) as unknown as Row[][];
-            for (const e of ccrRows[0]) refs.push(str(e.content_hash));
+            const ccrRows = (await c.query("SELECT content_hash, orig_hash FROM ccr_entries WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+            for (const e of ccrRows[0]) {
+                refs.push(str(e.content_hash));
+                if (e.orig_hash !== null && e.orig_hash !== undefined) refs.push(str(e.orig_hash));
+            }
             const cpRows = (await c.query("SELECT cp_id, state_hash FROM checkpoints WHERE session_id = ? AND pinned = 0", [sessionId])) as unknown as Row[][];
             for (const cp of cpRows[0]) {
                 await c.query("DELETE FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
@@ -1501,6 +1531,7 @@ export class MysqlBackend implements StorageBackend {
                 getBlocks: (id, opts) => this.getBlocksOn(conn, id, opts),
                 getDeadRefs: (id) => this.getDeadRefsOn(conn, id),
                 getRefs: (id) => this.getRefsOn(conn, id),
+                getCcrEntries: (id) => this.getCcrEntriesOn(conn, id),
             });
         } finally {
             try {
@@ -1762,13 +1793,27 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
-        const [rows] = (await this.pool.query(
-            "SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord",
+        return this.getCcrEntriesOn(this.pool, sessionId);
+    }
+
+    private async getCcrEntriesOn(conn: Pool | PoolConnection, sessionId: string): Promise<CcrEntryRow[]> {
+        const [rows] = (await conn.query(
+            "SELECT ord, ccr_key, content_hash, orig_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord",
             [sessionId],
         )) as unknown as Row[][];
         const out: CcrEntryRow[] = [];
         for (const r of rows) {
-            out.push({ ord: num(r.ord), key: str(r.ccr_key), content: (await this.getContent(this.pool, str(r.content_hash))) ?? "", contentHash: str(r.content_hash) });
+            // #6785 step 6: null marks pre-step-6 rows (the full ccr_json
+            // envelope is the read authority for those stores).
+            const origHash = r.orig_hash === null || r.orig_hash === undefined ? null : str(r.orig_hash);
+            out.push({
+                ord: num(r.ord),
+                key: str(r.ccr_key),
+                content: (await this.getContent(conn, str(r.content_hash))) ?? "",
+                contentHash: str(r.content_hash),
+                origContent: origHash === null ? null : ((await this.getContent(conn, origHash)) ?? null),
+                origHash: origHash ?? "",
+            });
         }
         return out;
     }
