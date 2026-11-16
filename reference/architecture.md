@@ -48,6 +48,7 @@ billion-context/
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
 │   ├── model-endpoints.ts         # Declarable custom-wire model endpoints: pattern parse + longest-prefix match, one source feeds proxy classifier + client claim (#1295)
+│   ├── responses-system-sections.ts #   Single source of truth for the Responses-wire developer-section join: steady prepare + proxy-loop round-2 rebuild share one separator (#6922/#6944)
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
 │   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
