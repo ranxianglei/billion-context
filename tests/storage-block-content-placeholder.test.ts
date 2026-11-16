@@ -78,12 +78,11 @@ test("legacy session without a block snapshot: SQLite load must decompress like 
 
     reload(dir, "full", session); // organic import
     const migrated = reload(dir, "full", session); // served from the index
-    const placeholder = migrated.blockContents.get(block.blockId);
-    console.log("legacy has snapshot:", legacy.blockContents.get(block.blockId) !== undefined);
-    console.log("migrated snapshot:", JSON.stringify(placeholder)?.slice(0, 200));
+    // Pin the precondition: the index replay must serve the placeholder shape —
+    // without it this test would stop exercising the bug and still pass.
+    assert.equal(legacy.blockContents.get(block.blockId), undefined, "legacy load has no snapshot for the block");
+    assert.deepEqual(migrated.blockContents.get(block.blockId), { one: null, full: { text: block.summary, count: 0 } }, "index replay serves the completeBlockContents placeholder");
     const migratedText = resolveDecompress({ blockId: block.blockId }, { ...ctx, session: migrated }).text;
-    console.log("legacy decompress head:", JSON.stringify(legacyText.slice(0, 160)));
-    console.log("migrated decompress head:", JSON.stringify(migratedText.slice(0, 160)));
     assert.match(legacyText, /Historical detail 0\./, "legacy JSON load restores originals from the live messages");
     assert.equal(migratedText, legacyText, "SQLite load must not serve the block summary as its content");
 });

@@ -69,4 +69,8 @@ test("migration: blockContentSnapshot ignores only the placeholder shape", () =>
     assert.equal(blockContentSnapshot(placeholder, block), undefined);
     const emptySummary = new Map([[block.blockId, { one: null, full: { text: "different", count: 0 } }]]);
     assert.ok(blockContentSnapshot(emptySummary, block), "a real zero-count snapshot with other text is kept");
+    const nonEmptyCount = new Map([[block.blockId, { one: null, full: { text: block.summary, count: 5 } }]]);
+    assert.ok(blockContentSnapshot(nonEmptyCount, block), "a snapshot with the summary text but real items is kept");
+    const oneView = new Map([[block.blockId, { one: { text: "x", count: 1 }, full: { text: block.summary, count: 0 } }]]);
+    assert.ok(blockContentSnapshot(oneView, block), "a snapshot with a real one-view is kept");
 });
