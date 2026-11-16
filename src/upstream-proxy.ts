@@ -214,6 +214,12 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined, options
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
+        // URL already canonicalizes the target's IPv6 spelling. Do the same
+        // for literal entries, including expanded and IPv4-embedded forms.
+        if (host.includes(":") && net.isIP(token) === 6) {
+            const literal = targetUrl(`http://[${token}]`);
+            if (literal) token = literal.hostname.slice(1, -1);
+        }
         if (options.windowsBypass && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
