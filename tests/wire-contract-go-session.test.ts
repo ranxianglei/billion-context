@@ -83,7 +83,7 @@ test("WC-016 negative control: a Go candidate with no session id fails on the up
     const result = await withFetchTransport(goFake(capture), () =>
         new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(goTarget(), 4096)], budget));
     assert.equal(result.status, "failed");
-    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "External summary upstream rejected the request with HTTP 400" }]);
     assert.equal(capture[0].headers["x-opencode-session"], undefined, "no session id is fabricated — the failure stays honest");
 });
 
