@@ -7,6 +7,9 @@ here instead of between the options.
 ## Rejected-request token measurements
 
 Context-overflow recovery distinguishes the upstream context window from the rejected request's total, input-message count, and completion reservation. The parser accepts both the OpenAI/DeepSeek parenthesized split (`requested N tokens (M in the messages, C in the completion)`) and the SGLang/LiteLLM colon-separated split (`requested a total of N tokens: M tokens from the input messages and C tokens for the completion`). Explicit input counts feed the existing calibration ring; completion counts arm the existing output-headroom reservation. A window-only or incomplete error provides no invented token measurements. This parsing is shared by plugin and proxy modes and does not change the declared model window.
+
+When a 400/413 reports a complete, consistent token split and the input fits, the relay can retry that payload once with the output budget capped at the measured remaining space. It checks the reported completion reservation against the actual output field and preserves an explicit thinking budget. The same recovery applies after a refold. Requests with an egress transform configured use the existing refold path because the transform can change the input between attempts.
+
 ## Fork recovery after a short source view
 
 Fork adoption judges retained compression blocks against the child replay, rather than the source's last `active` flags. A short source request may temporarily deactivate a fold whose complete original span returns in the child. Fully present retained spans are copied as active blocks; explicitly expanded blocks, consumed tier children, and spans crossing the fork boundary are not independently activated. Tier children accompany an adopted ancestor as inactive records. Planning and adoption never mutate the source session.

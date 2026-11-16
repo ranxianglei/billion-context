@@ -129,6 +129,17 @@ export function anthropicBetaContextWindow(headers: Record<string, string | stri
     return best;
 }
 
+/** #6088: true when an `anthropic-beta` header negotiates Anthropic message
+ *  threads (e.g. `message-threads-2026-08-12`). Such requests carry only the
+ *  newest message(s) — the upstream holds the history — so bili cannot see or
+ *  compress the conversation. */
+export function anthropicBetaMessageThreads(headers: Record<string, string | string[] | undefined>): boolean {
+    const raw = headers["anthropic-beta"];
+    if (raw === undefined) return false;
+    const list = Array.isArray(raw) ? raw.join(",") : raw;
+    return list.split(",").some((part) => part.trim().toLowerCase().startsWith("message-threads"));
+}
+
 // #1321: an [Nm]-suffixed model name (e.g. "claude-opus-5-5[1m]") is the
 // client's own declaration that THIS request runs on the expanded tier — the
 // same evidence class as the context-Nm beta header, carried in the model id

@@ -293,7 +293,7 @@ function armInternal(inp: KeepaliveArmInput): void {
     const prev = registry.get(inp.sessionId);
     // Credential rotated since the snapshot (#2131): the old body was signed
     // for another key — drop it before deciding about the new one.
-    if (prev && prev.credFp !== credFp) registry.delete(inp.sessionId);
+    if (prev && prev.credFp !== credFp) disarm(inp.sessionId, "credential-rotated");
 
     const breakpointTier = detectKeepaliveTier(parsed);
     let cadenceMs: number;
@@ -383,7 +383,16 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     }
     entry.pingInFlight = false;
     if (registry.get(entry.sessionId) !== entry) return;
-    const text = await resp.text().catch(() => "");
+    let text: string;
+    try {
+        text = await resp.text();
+    } catch (err) {
+        if (resp.status !== 429) {
+            handleFailure(entry, `response body: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+        }
+        text = "";
+    }
     if (registry.get(entry.sessionId) !== entry) return;
     if (!resp.ok) {
         if (resp.status === 429) {

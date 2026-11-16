@@ -17,6 +17,11 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// Internal request marker: OMP owns stream truncation recovery for its native
+// fetch calls; the proxy consumes this header and strips it before upstream egress.
+export const BILI_HOST_RECOVERY_OWNER_HEADER = "x-bili-host-recovery-owner";
+export const BILI_HOST_RECOVERY_OWNER_OMP = "omp";
+
 // #4079: the MINIMUM window both egress oversize guards size against. A
 // configured or declared window can be wrong SMALL — a stale
 // modelContextLimit, a registry miss, a model-catalog fallback (#3993:
@@ -398,6 +403,10 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /输入[^。；;！!\n]{0,12}(?:超出|超过|超限)/,
     // (f) #3240/#3246 consolidation: mixed-language gateways write "prompt 过长".
     /prompt[^。；;！!\n]{0,6}(?:过长|太长|超长)/i,
+    // DashScope compatible-mode states the ceiling as an input-length RANGE
+    // ("Range of input length should be [1, 1000000]"), with no token or length
+    // subject phrase: unlisted here, the 400 is not an overflow and nothing arms.
+    /range of input length should be \[/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -462,6 +471,10 @@ function parseOverflowWindow(text: string): number | undefined {
     // tokens allowed (1048576)." — the number after "allowed" is the window; the
     // first parenthesized number is the rejected payload and must not be used.
     m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
+    if (m) return toTokenNumber(m[1]);
+    // DashScope: "Range of input length should be [1, 1000000]" — the upper
+    // bound is the input ceiling; the lower bound is not a window.
+    m = text.match(/range of input length should be \[\s*\d[\d,]*\s*,\s*(\d[\d,]*)\s*\]/i);
     if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
@@ -556,18 +569,30 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     };
 }
 
-// #4452: an intermediate gateway that rewrites EVERY rejection into one generic
-// body (Cherry Studio et al. strip the token counts / window from each overflow
-// 400) makes inspectContextOverflow return isOverflow:false even when the payload
-// really overflows — so bili's whole overflow self-heal (#1195 same-request
-// refold, armOverflowShrink, window learn) keys off a marker that is never there
-// and silently never engages, starving the route of calibration. This predicate
-// names exactly that shape — a 4xx overflow-SHAPED reject whose body matches no
-// pattern — so the relay can log it loudly instead of the opaque `← upstream 400`
-// line. Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
+// #4452: an intermediate gateway that rewrites a payload-size rejection into one
+// generic body (Cherry Studio et al. strip the token counts / window) makes
+// inspectContextOverflow return isOverflow:false even when the payload really
+// was too large — so bili's whole overflow self-heal (#1195 same-request refold,
+// armOverflowShrink, window learn) keys off a marker that is never there and
+// silently never engages, starving the route of calibration. This predicate
+// names exactly that shape — an unmarked size-wall reject whose body matches no
+// pattern — so the relay can log it loudly instead of the opaque
+// `← upstream 413` line.
+//
+// ONLY 413 carries that meaning on its own. A 400 is the generic "malformed /
+// schema-invalid / role-rejected / auth-shaped" bucket across relays: the SAME
+// opaque body (`{"error":{"message":"Internal server error",
+// "code":"bad_request"}}`) is emitted for a truncated JSON body, an unsupported
+// field and a genuinely oversized payload alike, so treating every unmarked 400
+// as evidence of overflow manufactured a false overflow diagnosis for ordinary
+// malformed requests (#4452 follow-up). 413 Request Entity Too Large is the
+// status whose SEMANTICS are already the payload-size verdict, which is why it
+// can be diagnosed without a body marker.
+//
+// Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
 // #604) and any body that DOES carry a marker (self-heal engages normally then).
 export function isMarkerlessOverflowReject(status: number, bodyText: string): boolean {
-    return (status === 400 || status === 413) && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
+    return status === 413 && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the

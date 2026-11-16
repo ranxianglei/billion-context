@@ -1138,9 +1138,12 @@ export class MysqlBackend implements StorageBackend {
             await this.releaseContent(c, r.from);
         }
         // #4390 rewind-redo: reactivate in place (no duplicate row).
-        for (const seq of retiredSeqs) {
-            if (messages.some((m) => m.seq === seq)) {
-                await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+        if (retiredSeqs.length > 0) {
+            const presentedSeqs = new Set(messages.map((m) => m.seq));
+            for (const seq of retiredSeqs) {
+                if (presentedSeqs.has(seq)) {
+                    await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+                }
             }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
@@ -1560,7 +1563,8 @@ export class MysqlBackend implements StorageBackend {
             const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
             if (chunk.length === 0) continue;
             const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                 LEFT JOIN content c ON c.hash = messages.content_hash
                  WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 [sessionId, ...chunk],
             )) as unknown as Row[][];
@@ -1575,7 +1579,7 @@ export class MysqlBackend implements StorageBackend {
                     kind: str(r.kind),
                     contentHash,
                     ts: nullableNum(r.ts),
-                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
+                    content: await this.hydrateMediaAsync(str(r.content_bytes), this.pool),
                 });
             }
         }
@@ -1603,20 +1607,31 @@ export class MysqlBackend implements StorageBackend {
             [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
-        for (const r of rows) {
-            const contentHash = str(r.content_hash);
-            out.push({
-                seq: num(r.seq),
-                msgId: str(r.msg_id),
-                ref: nullableStr(r.ref),
-                refNum: nullableNum(r.ref_num),
-                role: str(r.role),
-                kind: str(r.kind),
-                contentHash,
-                retiredAt: nullableNum(r.retired_at),
-                ts: nullableNum(r.ts),
-                content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
-            });
+        // Keep body batches bounded even when the selected metadata spans a
+        // whole historian log. Every query stays on the caller's connection.
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => str(row.content_hash)))];
+            const [contents] = (await conn.query(
+                `SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`, hashes,
+            )) as unknown as Row[][];
+            const byHash = new Map(contents.map((row) => [str(row.hash), str(row.bytes)]));
+            for (const r of chunk) {
+                const contentHash = str(r.content_hash);
+                out.push({
+                    seq: num(r.seq),
+                    msgId: str(r.msg_id),
+                    ref: nullableStr(r.ref),
+                    refNum: nullableNum(r.ref_num),
+                    role: str(r.role),
+                    kind: str(r.kind),
+                    contentHash,
+                    retiredAt: nullableNum(r.retired_at),
+                    ts: nullableNum(r.ts),
+                    content: await this.hydrateMediaAsync(byHash.get(contentHash) ?? "", conn),
+                });
+            }
         }
         return out;
     }
@@ -1848,6 +1863,7 @@ export class MysqlBackend implements StorageBackend {
         };
         // sqlite twin: newest matching line wins.
         let lineNo = -1;
+        let matchCount = 0;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
@@ -1859,9 +1875,12 @@ export class MysqlBackend implements StorageBackend {
                 } catch {
                     continue;
                 }
+                // #6317: count ALL entries for this session. The reverse scan
+                // meets the NEWEST line first — keep that; a plain
+                // `lineNo = i` without break would end on the OLDEST.
                 if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) {
-                    lineNo = i;
-                    break;
+                    if (lineNo === -1) lineNo = i;
+                    matchCount += 1;
                 }
             }
         } catch {
@@ -1874,6 +1893,9 @@ export class MysqlBackend implements StorageBackend {
             return { ok: false, reason: "export-corrupt" };
         }
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
+        if (matchCount > 1) {
+            loggerLog("warn", `[#6317] archive log contained ${matchCount} entries for session ${sessionId}; restoring the newest entry and removing all entries`);
+        }
         const sess = dump.session;
         await this.tx(async (c) => {
             const references = new Map<string, number>();
