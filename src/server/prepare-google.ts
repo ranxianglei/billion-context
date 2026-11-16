@@ -3,7 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { featureEnabled } from "../rollout.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
@@ -97,6 +97,10 @@ export async function prepareGoogle(
     // anthropic twins). Nothing extra is ever forwarded either way.
     const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // Same unconditional strip for the seqs carrier (biliLedgerSeqs) — parity
+    // with the openai/anthropic/responses prepare lanes: the real upstream
+    // must never see a field it does not know.
+    delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     const inboundMessageCount = Array.isArray(parsed.contents) ? parsed.contents.length : 1;
     let googleClientSystem = "";
     let sysNotes: string[] = [];

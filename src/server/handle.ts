@@ -1636,7 +1636,7 @@ async function handleRequest(
                 // the search backend keeps working instead of hard-400ing.
                 if (protocol === "responses" && isResponsesServerToolSingleShot(parsed)) {
                     log("info", `single-shot server-tool Responses call — no conversation identity possible; forwarding verbatim (#6548): ${maskUrlForLog(req.url ?? "")}`);
-                    await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+                    await forward(req, res, opts, scrubMsgIdFields(scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
                     return;
                 }
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
