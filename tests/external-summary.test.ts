@@ -136,7 +136,10 @@ test("external summary: the total deadline still bounds the chain when every can
     const result = await new ExternalSummaryExecutor(1).execute(work, [hang, { ...hang }], { ...budget, totalTimeoutMs: 15 });
     assert.ok(performance.now() - started < 150, "the chain stops at the total deadline, not after both nominal windows");
     assert.deepEqual(result.attempts.map((item) => item.outcome), ["timeout", "timeout"], "every candidate got a real share of the pot");
-    assert.ok(result.status === "deadline" || result.status === "exhausted");
+    // The last target's timer and the total deadline land on the same mark, so
+    // the verdict is whichever clock the loop observes first.
+    assert.ok(result.status === "deadline" || result.status === "failed");
+    if (result.status === "failed") assert.equal(result.reason, "exhausted");
 });
 
 test("external summary: aggregate concurrency bounds distinct operations", async () => {
