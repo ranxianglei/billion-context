@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { keepResponseId as knobKeepResponseId } from "../knobs.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -342,7 +343,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
-            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"), projection?.headRole ?? "developer");
+            const withDev = injectResponsesDeveloperMessage(inputItems, joinResponsesSystemSections(devParts), projection?.headRole ?? "developer");
             const finalInput = notes && notes.length > 0
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
