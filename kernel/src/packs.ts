@@ -285,6 +285,7 @@ const LEAN_PROMPT_SECTIONS = {
           acpTags: [
             `User/tool messages carry hidden \x3cacp\x3e refs such as m00123. Never echo the XML tags; use only refs in ACP tool calls.`,
             `Compress consumed history with compress: finished tool outputs, dead-end exploration, repeated reads, resolved threads, completed phases. Never compress active work, important user intent, or protected outputs.`,
+            `Compress receipts are authoritative stop signals: after a no-op, an "already compressed" receipt, or "No compressible ranges remain", issue no further compress calls until a receipt or nudge names ranges to fold or the user explicitly asks to compress.`,
             `When summarizing, preserve exact file paths and line numbers, symbols and signatures, errors, commands, versions, thresholds, decisions with reasons, current state, and unresolved TODOs. Never replace exact technical values with vague wording — a good summary is the primary carrier and makes recall unnecessary.`,
             `Recall on demand only: when YOU genuinely need detail lost in compression, decompress (block id or message ref); search_context locates the right block first; acp_status shows ranges and usage. Never run recall as a routine post-compress step.`,
             `Message refs remain stable across compression within the same session state. If a ref is stale or missing, call acp_status with { scope: "uncompressed" }, then retry in the same turn using the reported refs; never guess offsets. Batch target ranges in one call.`,
