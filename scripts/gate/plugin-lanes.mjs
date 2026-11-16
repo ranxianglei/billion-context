@@ -83,6 +83,19 @@ export function gateStorageCfg() {
   const cohorts = v.toLowerCase() === "all" ? [] : v.split(",").map((x) => x.trim()).filter(Boolean);
   return { storage: cohorts.length ? { snapBase: { enabled: true, cohorts } } : { snapBase: { enabled: true } } };
 }
+
+// GATE_SNAPSHOT_RENDER (#6785 verification): flip the candidate's snapshotRender
+// egress body plane LIVE through the CONFIG tier —
+// rollout.features.snapshotRender=true (a forced-on shorthand the rollout
+// resolver honors above bucketing). The env tier
+// (BILI_ROLLOUT_SNAPSHOT_RENDER) does NOT reach the lane proxies: cleanEnv()
+// strips BILI_* from the spawn env by design (2026-11-16 gate run 3 showed
+// snapshotRender=off(bucket) with the env set).
+export function gateRolloutCfg() {
+  const v = String(process.env.GATE_SNAPSHOT_RENDER || "");
+  if (!v || v === "0" || v.toLowerCase() === "off") return {};
+  return { rollout: { features: { snapshotRender: true } } };
+}
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -289,6 +302,7 @@ async function runLane(agent, recipe) {
       },
       compress: { preserveRecentTokens: 0 },
       ...gateStorageCfg(),
+      ...gateRolloutCfg(),
     }, null, 2));
   writeWindow(BIG_WINDOW);
 

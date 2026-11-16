@@ -121,10 +121,10 @@ if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
 # /gate-tools/plugin-lanes.mjs when the candidate predates a harness fix —
 # the entrypoint prefers the candidate's OWN scripts/gate copy when present).
 if [ -n "$LANE_SCRIPT" ]; then RUN+=(-e GATE_LANE_SCRIPT="$LANE_SCRIPT"); fi
-# BILI_ROLLOUT_SNAPSHOT_RENDER: force the candidate's snapshotRender egress
-# body plane live container-wide (env tier beats the 0% rollout default).
-# Plugin-mode lanes stay client-authoritative by design.
-if [ -n "$SNAP_RENDER" ]; then RUN+=(-e BILI_ROLLOUT_SNAPSHOT_RENDER="$SNAP_RENDER"); fi
+# GATE_SNAPSHOT_RENDER: force the candidate's snapshotRender egress body
+# plane live in the P/R lane bili.json (config tier — the env tier never
+# reaches the lane proxies because cleanEnv() strips BILI_* by design).
+if [ -n "$SNAP_RENDER" ]; then RUN+=(-e GATE_SNAPSHOT_RENDER="$SNAP_RENDER"); fi
 if [ "$NETWORK" = "bridge" ]; then
   RUN+=(--add-host=host.docker.internal:host-gateway)
 else

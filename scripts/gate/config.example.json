@@ -28,7 +28,7 @@
   "snapBase": "",
   "_doc_laneScript": "Optional: force the P-lane harness script copy, e.g. \"/gate-tools/plugin-lanes.mjs\". Needed when the candidate checkout predates a harness fix (the gate otherwise prefers the candidate's OWN scripts/gate/plugin-lanes.mjs).",
   "laneScript": "",
-  "_doc_snapshotRender": "Optional: value for BILI_ROLLOUT_SNAPSHOT_RENDER (\"1\" forces the candidate's snapshotRender egress body plane live in every lane; the env tier beats the 0% rollout default). Plugin-mode lanes (dsh profile bundle, pi native) stay client-authoritative by design.",
+  "_doc_snapshotRender": "Optional: \"1\" writes rollout.features.snapshotRender=true into the P/R lane bili.json (config tier, beats the 0% rollout default) so the candidate's snapshotRender egress body plane renders live. Plugin-mode lanes (dsh profile bundle, pi native) stay client-authoritative by design.",
   "snapshotRender": "",
   "r": {
     "corpusTokens": 80000,
