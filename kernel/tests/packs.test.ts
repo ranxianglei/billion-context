@@ -170,6 +170,22 @@ test("lean acpTags carries BOTH the summary-trust guardrail and the post-compres
   );
 });
 
+test("lean acpTags names the receipt stop-signal: no further compress calls after dead-end receipts (#6930)", () => {
+  const pi = leanPack.surface.adapters?.pi as {
+    promptSections: Record<string, string | null>;
+  };
+  const tags = pi.promptSections.acpTags ?? "";
+  const marker =
+    'Compress receipts are authoritative stop signals: after a no-op, an "already compressed" receipt, or "No compressible ranges remain", issue no further compress calls until a receipt or nudge names ranges to fold or the user explicitly asks to compress.';
+  assert.ok(tags.includes(marker), "receipt stop-signal rule missing");
+  assert.ok(
+    tags.indexOf(marker) > tags.indexOf("Compress consumed history"),
+    "stop-signal rule sits directly after the standing compress bullet",
+  );
+  // The rule must not leak numbers the model could carry forward (§7.3d):
+  assert.ok(!/m\d{3,}/.test(marker), "no ref-shaped anchor in the new rule");
+});
+
 test("lean acpTags states ref stability across compression (no false renumbering claim, #417)", () => {
   const pi = leanPack.surface.adapters?.pi as {
     promptSections: Record<string, string | null>;
