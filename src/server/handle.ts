@@ -71,7 +71,7 @@ import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, 
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
-import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
+import { DSH_COMPACTION_MARKER_SNIFF, DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
@@ -535,8 +535,34 @@ async function handleRequest(
                 // pre-send byte budget. The probe is a cheap substring gate,
                 // so the text-dump rejection (#5794's shape) stays parse-free.
                 const ingestCap = protocol === "responses" ? 0 : knobLimitsIngestBytes();
+                // #6908: two dimensionally-motivated exemptions. The band's
+                // premise ("any parseable 32 MiB+ text body is ≥ ~8M tokens,
+                // beyond every window") equates INBOUND BYTES with MODEL INPUT —
+                // true for the outbound / incremental lanes, false for the dsh
+                // plugin lane, which re-sends the host's ENTIRE raw ledger every
+                // round on the OpenAI wire (no incremental lane there, #3433):
+                // the body is the host's history, not the model input, and bili's
+                // job is to fold it (field: 32.0 MiB inbound vs 446.4 KiB
+                // outbound, 70x). Refusing it 413s a healthy session forever, and
+                // the parse cost is the lane's structural cost — already paid
+                // every round below the cliff, so the gate only added a
+                // discontinuity at 32 MiB.
+                //   (A) x-bili-plugin: dsh → the body is fold substrate, exempt.
+                //   (B) the dsh compaction marker present → the call is the ONLY
+                //       action that shrinks the host's ledger via bili (#3733
+                //       answers it locally with the folded snapshot); rc.2
+                //       replays the full shadowed region (#2193), so the
+                //       self-heal itself crosses the band and must pass the gate
+                //       (self-lock otherwise). A 48-byte sniff decides; a false
+                //       positive (a turn that merely quotes the marker) just pays
+                //       the parse cost, identical to today's under-cliff behavior
+                //       — the full marker-decisive check (isDshCompactionCall)
+                //       still runs after parse.
+                const dshPluginLane = req.headers["x-bili-plugin"] === "dsh";
+                const dshCompactionSniff = decoded.body.includes(DSH_COMPACTION_MARKER_SNIFF);
                 if (ingestCap > 0 && decoded.body.byteLength > ingestCap
-                    && countImagesInRawBody(protocol, decoded.body) === 0) {
+                    && countImagesInRawBody(protocol, decoded.body) === 0
+                    && !dshPluginLane && !dshCompactionSniff) {
                     throw new IngestBodyTooLargeError(ingestCap, decoded.body.byteLength);
                 }
                 bodyBuffer = decoded.body;
@@ -561,7 +587,11 @@ async function handleRequest(
             return;
         }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError || err instanceof IngestBodyTooLargeError) {
-            log("warn", `413: request body exceeds ${err.limit} bytes`);
+            // #6908: the ingest 413 names the ACTUAL decoded byte count next to
+            // the cap — operators were comparing the host-json-parse inbound
+            // figure against the cap and an 8%+ unit gap hid how close the body
+            // was to the wall. The other two caps only carry the limit.
+            log("warn", `413: request body exceeds ${err.limit} bytes${err instanceof IngestBodyTooLargeError ? ` (actual ${err.bytes.toLocaleString("en-US")} B after decode)` : ""}`);
             res.writeHead(413, { "content-type": "application/json" });
             res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof IngestBodyTooLargeError ? "ingest" : err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
             return;

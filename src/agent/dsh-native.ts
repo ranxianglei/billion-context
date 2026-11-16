@@ -1589,7 +1589,12 @@ const bodyParseMemo = new WeakMap<object, BodyParseRecord>();
 let bodyParseRealCount = 0;
 
 function inboundBytesOf(raw: unknown): number {
-    if (typeof raw === "string") return raw.length;
+    // #6908: report BYTES, not UTF-16 code units — the field feeds the
+    // host-json-parse `inbound=…B` line and operators compare it against the
+    // ingest gate's UTF-8 byteLength; raw.length under-reports CJK-heavy bodies
+    // by the byte/char ratio (field: 31.0M "B" vs a 33.5M-byte gate, an 8%+
+    // gap that hid how close the body was to the wall).
+    if (typeof raw === "string") return Buffer.byteLength(raw, "utf8");
     if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) return raw.byteLength;
     return 0;
 }

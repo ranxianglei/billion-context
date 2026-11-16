@@ -204,3 +204,103 @@ test("e2e #5794 image doctrine: an over-band body carrying images is NOT refused
         rmrf(root);
     }
 });
+
+// #6908: the band's premise ("any parseable 32 MiB+ text body is ≥ ~8M tokens,
+// beyond every window") equates INBOUND BYTES with MODEL INPUT. On the dsh
+// plugin lane that is dimensionally wrong: the host re-sends its ENTIRE raw
+// ledger every round on the OpenAI wire (no incremental lane there, #3433), so
+// the body is the host's history — fold substrate, not model input — and bili's
+// job is to fold it (field: 32.0 MiB inbound vs 446.4 KiB outbound, 70x). Two
+// exemptions keep a healthy session from being 413'd forever: (A) the dsh
+// plugin lane, and (B) the dsh compaction call (the ONLY action that shrinks
+// the host's ledger via bili — rc.2 replays the full shadowed region, #2193, so
+// the self-heal itself crosses the band and must pass the gate or the session
+// self-locks). Both directions are pinned below.
+
+test("e2e #6908 (A): the dsh plugin lane (x-bili-plugin: dsh) is exempt from the ingest band — an over-band full-resend body is folded and forwarded, not 413 at ingest", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6908a-"));
+    const disarm = armIngestBand();
+    const { ctx, calls, close } = await setup();
+    try {
+        // A realistic dsh full-resend body: the host re-sends its ENTIRE raw
+        // ledger every round on the OpenAI wire (no incremental lane there,
+        // #3433). The bulk is OLD foldable history (tool call/result pairs);
+        // the core is a small recent user message. Total body is over the
+        // 1 MiB test band, but the core is tiny — so bili folds the history
+        // and forwards. Without the lane exemption the gate 413s it at ingest
+        // before any folding happens (the field's self-lock).
+        const messages: Array<Record<string, unknown>> = [];
+        for (let i = 0; i < 1500; i++) {
+            messages.push({ role: "assistant", content: "", tool_calls: [{ id: `call_${i}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: `/tmp/file_${i}.txt` }) } }] });
+            messages.push({ role: "tool", tool_call_id: `call_${i}`, content: "x".repeat(700) });
+        }
+        messages.push({ role: "user", content: "Summarize what you found." });
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers, "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "s-count-ingest" },
+            body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
+        });
+        const body = await r.text();
+        // The gate (ingest) must NOT refuse the dsh lane — the body is the
+        // host's fold substrate, not model input. A 200 SSE stream proves the
+        // body passed the ingest gate, was folded, and was forwarded upstream.
+        if (r.status !== 200) {
+            const parsed = JSON.parse(body) as { error?: { stage?: string } };
+            assert.notEqual(parsed.error?.stage, "ingest", `the dsh lane body must pass the ingest gate (got stage=${parsed.error?.stage}, status=${r.status}): ${body.slice(0, 300)}`);
+        }
+        assert.equal(r.status, 200, `the dsh lane body is folded and forwarded (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, "the dsh lane body reached the upstream");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #6908 (B): a dsh compaction call (marker present) passes the ingest band — the self-heal reaches the compaction guard, not a 413", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6908b-"));
+    const disarm = armIngestBand();
+    const { ctx, close } = await setup();
+    try {
+        // The final user message STARTS with the compaction instruction prefix
+        // (marker-decisive, #2193) and the body is over the 1 MiB band. Without
+        // the sniff exemption the gate 413s it BEFORE parse and the self-heal is
+        // blocked (self-lock). With it, the body reaches isDshCompactionCall and
+        // is answered by the compaction guard (422 refusal on a fresh session
+        // with no active fold blocks) — proving it got PAST the ingest gate.
+        const marker = "You are now acting as a compaction engine for this AI coding assistant";
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({ model: "gpt-test", stream: true, messages: [{ role: "user", content: marker + "x".repeat(3 * 1024 * 1024) }] }),
+        });
+        const body = await r.text();
+        assert.notEqual(r.status, 413, `compaction call must pass the ingest gate (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(r.status, 422, "the compaction guard answers it past the gate (proving it reached isDshCompactionCall)");
+        assert.match(body, /dsh_compaction_refused/, "the refusal is the compaction guard's, not the ingest band's");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #6908 negative: an over-band body with NO dsh plugin header and NO compaction marker is still refused 413 (the exemptions must not widen the band)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6908c-"));
+    const disarm = armIngestBand();
+    const { ctx, calls, close } = await setup();
+    try {
+        // Over the 1 MiB band, plain openai lane, no x-bili-plugin, no marker —
+        // the band's original behavior is preserved (the #5794 shape).
+        const r = await postMessages(ctx, "x".repeat(3 * 1024 * 1024));
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { type?: string; stage?: string } };
+        assert.equal(r.status, 413, `non-dsh over-band body must still be refused (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.stage, "ingest", "still the ingest stage");
+        assert.equal(calls.length, 0, "zero upstream calls — the band still holds for non-dsh lanes");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
