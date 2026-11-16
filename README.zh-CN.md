@@ -343,7 +343,7 @@ bili --config ~/my-bili.json # 用别的配置文件
 bili -c dsh-test             # 命名配置 → ~/.config/billion-context/dsh-test.json（按模型各放一份）
 bili update [version]        # 立即检查并安装新版本(跳过节流);带版本号则精确安装该已发布版本
 bili pin [duration]          # 固定当前版本(1h/12h/1d/7d/30d/forever):只报告新版本、不自动安装(#6804)
-bili unpin                   # 解除固定
+bili unpin                   # 解除固定(等价于: bili pin --clear)
 bili doctor --fix            # 把漂移的 dsh profile 三本账(manifest 声明 / lockfile 记录 / 盘上副本)收敛到盘上版本(#3496)
 bili --no-auto-update        # 本次启动禁用自动更新
 ```

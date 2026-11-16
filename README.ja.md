@@ -485,7 +485,7 @@ bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili update [version]        # check & install a newer version now (bypasses throttle); with a version, installs exactly that published version
 bili pin [duration]          # pin the current version (1h/12h/1d/7d/30d/forever): new versions are reported but not auto-installed (#6804)
-bili unpin                   # release the pin
+bili unpin                   # release the pin (same as: bili pin --clear)
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
 bili --auto-restart-on-update   # self-restart when a new version is installed (default off)
