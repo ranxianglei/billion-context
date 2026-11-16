@@ -1,11 +1,45 @@
 import type { CoreMessage } from "acp-kernel";
-import { anthropicToCore, baseIdOfCore, ClusterCounter, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
+import type { BiliMessage } from "acp-kernel/wire";
+import { anthropicToCore, canonicalToolArgs, ClusterCounter, deriveCanonicalMessageId, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 import { markDirty, type Session } from "../session.js";
 import { log as loggerLog } from "../logger.js";
 
 export const HANDOFF_REPLY_MAX_BYTES = 1_500_000;
 
 export type HandoffReply = ReturnType<typeof createHandoffReply>;
+
+/**
+ * #6947: canonical base id (WITHOUT the ClusterCounter `_N` suffix) re-derived
+ * from a core message's OWN fields — the inverse of what each protocol codec
+ * feeds deriveCanonicalMessageId (#3642). Lets the write-back pre-seed a
+ * ClusterCounter from the cores already stored, so appended reply ids number
+ * exactly as the next full codec pass over [stored…, reply…] would (the
+ * re-send then joins by (msg_id, identity) onto the SAME rows instead of
+ * retiring + re-ingesting). Host-side on purpose: the kernel boundary (#2092)
+ * is human-gated and the kernel already exports both seed helpers.
+ *
+ * Returns null when the base cannot be derived from core fields alone: image
+ * parts (the #3751 payload fingerprint lives in sidecars the handoff capture
+ * never sets — unreachable here, null is the honest answer) and unknown
+ * content types. Callers skip nulls: an under-count can only shift a cluster
+ * SUFFIX for an identical repeated identity, never mint a wrong bare id.
+ */
+function baseIdOfCore(m: BiliMessage): string | null {
+    const text = m.text ?? "";
+    switch (m.contentType) {
+        case "text":
+            if (m.imagePart) return null;
+            return deriveCanonicalMessageId(m.originalRole ?? m.role, "text", text);
+        case "reasoning":
+            return deriveCanonicalMessageId("assistant", "reasoning", text);
+        case "tool-call":
+            return deriveCanonicalMessageId("assistant", "tool-call", canonicalToolArgs(text), { toolName: m.toolName });
+        case "tool-result":
+            return deriveCanonicalMessageId("tool", "tool-result", text, { toolName: m.toolName });
+        default:
+            return null;
+    }
+}
 
 export function createHandoffReply(session: Session, canSave: () => boolean = () => true) {
     const request = session.stats.requests;
