@@ -387,8 +387,24 @@ async function runLane(agent) {
     // Small window is bili-side (provider context in bili.json); a manually
     // started proxy re-reads config only on restart (prefix lanes need a
     // fresh proxy per phase — Lane P rule). Returns the new proxy pid.
+    const claudeExtraModels = [];
+    const harvestClaudeModels = () => {
+      // bili's window lookup is keyed by the MODEL ID THE CLIENT REQUESTS
+      // (src/server/handle.ts resolveModelEntry) — claude-code sends its own
+      // defaults (claude-sonnet-4-5-*, claude-haiku-4-5-*), never MODEL1's
+      // upstream ids. A models map keyed only by MODEL_IDS silently misses
+      // (source=registry-peek 200k, no fold) — 2026-11-15 clauder run: all
+      // 3 fold assertions red. Same mechanism as plugin-lanes' harvestWireModels.
+      try {
+        for (const m of fs.readFileSync(biliLog, "utf8").matchAll(/\[window\] model=([^\s]+) source=/g)) {
+          if (!MODEL_IDS.includes(m[1]) && !claudeExtraModels.includes(m[1])) claudeExtraModels.push(m[1]);
+        }
+      } catch {}
+    };
     claudeSetWindow = async (w) => {
-      for (const m of Object.values(biliProviders[recUrl].models)) m.context = w;
+      harvestClaudeModels();
+      const allIds = [...new Set([...MODEL_IDS, ...claudeExtraModels])];
+      biliProviders[recUrl] = { models: Object.fromEntries(allIds.map((m) => [m, { context: w, output: 4096 }])) };
       fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
       const oldPid = claudeProxy ? claudeProxy.pid : null;
       await stopClaudeProxy();
