@@ -215,20 +215,21 @@ test("#6729: every compression sits on the line; a round's points sum to its rec
 
 test("#6729: the growth line plots one point per round (folded ÷ growth since the last fold)", () => {
     const svg = recoveryRoundSvg(EVENTS, LINES);
-    // three measurable growth rounds (R1 110%, R2 71.4%, R4 29%) → three thick-line dots
-    const gDots = (svg.match(/r="5\.5"/g) || []).length;
+    // three measurable growth rounds (R1 110%, R2 71.4%, R4 29%) → three thick-line dots,
+    // teal HOLLOW markers (blue #0969da is reserved for active-fold ticks / over-100 fold dots)
+    const gDots = (svg.match(/r="5" fill="#ffffff" stroke="#1b7c83" stroke-width="2"/g) || []).length;
     assert.equal(gDots, 3, "one growth point per round with folds");
-    assert.ok(svg.includes('stroke="#0969da" stroke-width="2"'), "thick blue growth line connects the rounds");
+    assert.ok(svg.includes('stroke="#1b7c83" stroke-width="2"'), "thick teal growth line connects the rounds");
     for (const lab of ["110%", "71.4%", "29%"]) assert.ok(svg.includes(lab), "growth label " + lab);
     assert.ok(svg.includes("growth 210 → folded 150 · 71.4%"), "R2 tooltip: floor is the post-R1 state");
     // R4: floor 2320 (the @20m sample, after R2's fold at T0+11m) → the ratchet reads 29%
     assert.ok(svg.includes("growth 1070 → folded 310 · 29%"), "R4 tooltip: floor measured after the previous round's last fold");
     // R1 at 110% is over the baseline → halo on its growth dot (fold dots use r=7, growth r=8)
-    assert.ok(svg.includes('r="8" fill="none" stroke="#0969da"'), "halo on the over-100% growth dot (R1 110%)");
+    assert.ok(svg.includes('r="8" fill="none" stroke="#1b7c83"'), "halo on the over-100% growth dot (R1 110%)");
     assert.ok(svg.includes("350%"), "axis = ceil(310*1.1/50)*50 (growth 110% is under it)");
     // no usage lines → the growth line is silently off, the rest still renders
     const noLines = recoveryRoundSvg(EVENTS, []);
-    assert.doesNotMatch(noLines, /r="5\.5"/);
+    assert.doesNotMatch(noLines, /#1b7c83/);
     assert.ok(noLines.includes("310%"), "per-fold points unaffected by missing lines");
     assert.ok(noLines.includes("growth data unavailable"), "legend note when the window has no usage samples");
 });
@@ -245,7 +246,7 @@ test("#6729: a round with no new growth marks the baseline (pure older-stock cle
     ];
     const svg = recoveryRoundSvg(flat, flatLines);
     assert.ok(svg.includes("no new growth this round"), "flat-round tooltip");
-    assert.ok(svg.includes('r="5" fill="none" stroke="#0969da"'), "hollow marker on the baseline");
+    assert.ok(svg.includes('r="5" fill="none" stroke="#1b7c83"'), "hollow marker on the baseline (teal, like the rest of the growth series)");
     // the flat marker carries NO fake % (the tooltip names the folded mass only)
     assert.doesNotMatch(svg, /no new growth this round[^<]*\d+(\.\d+)?%[^<]*<\/title>/);
 });

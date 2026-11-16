@@ -279,7 +279,7 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     const f = makeFmt(lang);
     const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
     const W = 920, PAD = 28;
-    const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa";
+    const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa", GROW = "#1b7c83"; // GROW: growth-recovery series — teal + hollow, kept apart from ACC (#0969da = active ticks / over-100 fold dots)
     const SANS = "ui-sans-serif,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
     const MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
     const body: string[] = [];
@@ -595,23 +595,22 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             });
             if (mainPts.length > 1) body.push('<polyline points="' + mainPts.join(" ") + '" fill="none" stroke="#57606a" stroke-width="1.5"/>');
             if (cumPts.length > 1) body.push('<polyline points="' + cumPts.join(" ") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="4 3"/>');
-            // growth line: thick blue, one point per round
+            // growth line: thick teal, one point per round (hollow dots — blue is reserved for active folds / over-100 fold dots)
             const gLinePts: string[] = [];
             gPts.forEach((gp) => { if (gp.pct !== null) gLinePts.push(TX(gp.at).toFixed(1) + "," + RY(gp.pct).toFixed(1)); });
-            if (gLinePts.length > 1) body.push('<polyline points="' + gLinePts.join(" ") + '" fill="none" stroke="' + ACC + '" stroke-width="2"/>');
+            if (gLinePts.length > 1) body.push('<polyline points="' + gLinePts.join(" ") + '" fill="none" stroke="' + GROW + '" stroke-width="2"/>');
             gPts.forEach((gp) => {
                 const x = TX(gp.at);
                 if (gp.pct === null) {
                     // no new growth → mark on the 0% axis (pure older-stock cleanup)
-                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + ACC + '"/><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title>");
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title>");
                     return;
                 }
                 const over = gp.pct > 100;
-                const dcol = over ? ACC : colFor(gp.pct);
-                if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + ACC + '"/>');
-                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="' + dcol + '" stroke="#ffffff" stroke-width="1"/><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title>");
+                if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + GROW + '"/>');
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"/><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title>");
                 const lx = x + 9 > right - 44 ? x - 9 : x + 9;
-                txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: dcol, anchor: lx < x ? "end" : "start", mono: true });
+                txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: GROW, anchor: lx < x ? "end" : "start", mono: true });
             });
             y += CH + 16;
         }

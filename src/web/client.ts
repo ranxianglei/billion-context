@@ -2334,28 +2334,30 @@ function changelogCatOf(rawLine) {
     lastLblX = labX;
     parts.push('<text x="' + labX.toFixed(1) + '" y="' + (fy - 9).toFixed(1) + '" text-anchor="middle" font-size="10" font-weight="600" fill="' + pc + '">' + f.pct + "%</text>");
   }
-  // ④b the growth line: thick blue, one point per round (folded ÷ growth since last fold)
+  // ④b the growth line: thick TEAL (#1b7c83), one point per round (folded ÷ growth
+  // since last fold). Teal + hollow dots on purpose — blue #0969da belongs to the
+  // active-fold ticks / over-100 fold dots, and a lone blue growth dot read as an
+  // "active compression" on a single-round session (user report, 2026-11-16).
   if (!uLines.length && episodes.some(function (ep) { return (ep.folded || 0) > 0; })) {
     parts.push('<text x="' + (W - PR) + '" y="' + (PT - 22) + '" text-anchor="end" font-size="10" fill="#6e7781">' + escapeHtml(t("det.rec_growth_noline")) + "</text>");
   }
   var gLine = [];
   for (var gl = 0; gl < gPts.length; gl++) if (gPts[gl].pct !== null) gLine.push(xx(gPts[gl].at).toFixed(1) + "," + yAt(gPts[gl].pct).toFixed(1));
-  if (gLine.length >= 2) parts.push('<path d="M' + gLine.join(" L") + '" fill="none" stroke="#0969da" stroke-width="2"/>');
+  if (gLine.length >= 2) parts.push('<path d="M' + gLine.join(" L") + '" fill="none" stroke="#1b7c83" stroke-width="2"/>');
   for (var gr = 0; gr < gPts.length; gr++) {
     var gq = gPts[gr];
     var gx2 = xx(gq.at);
     if (gq.pct === null) {
       // No new growth in the round → pure older-stock cleanup; mark on the 0% axis.
-      parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + (H - PB).toFixed(1) + '" r="5" fill="none" stroke="#0969da"><title>' + escapeHtml(t("det.rec_growth_flat", { s: fmtW(gq.s) })) + "</title></circle>");
+      parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + (H - PB).toFixed(1) + '" r="5" fill="none" stroke="#1b7c83"><title>' + escapeHtml(t("det.rec_growth_flat", { s: fmtW(gq.s) })) + "</title></circle>");
       continue;
     }
     var gy2 = yAt(gq.pct);
-    var gpc = gq.pct > 100 ? "#0969da" : colFor(gq.pct);
-    if (gq.pct > 100) parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="8" fill="none" stroke="#0969da"/>');
-    parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="5.5" fill="' + gpc + '"><title>' + escapeHtml(t("det.rec_growth_tip", { at: fmtDT(gq.at), g: fmtW(gq.g), s: fmtW(gq.s), pct: gq.pct })) + "</title></circle>");
+    if (gq.pct > 100) parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="8" fill="none" stroke="#1b7c83"/>');
+    parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="5" fill="#ffffff" stroke="#1b7c83" stroke-width="2"><title>' + escapeHtml(t("det.rec_growth_tip", { at: fmtDT(gq.at), g: fmtW(gq.g), s: fmtW(gq.s), pct: gq.pct })) + "</title></circle>");
     var glx = gx2 + 10, ganchor = "start";
     if (glx > W - PR - 40) { glx = gx2 - 10; ganchor = "end"; }
-    parts.push('<text x="' + glx.toFixed(1) + '" y="' + (gy2 + 3).toFixed(1) + '" text-anchor="' + ganchor + '" font-size="10" font-weight="700" fill="' + gpc + '">' + gq.pct + "%</text>");
+    parts.push('<text x="' + glx.toFixed(1) + '" y="' + (gy2 + 3).toFixed(1) + '" text-anchor="' + ganchor + '" font-size="10" font-weight="700" fill="#1b7c83">' + gq.pct + "%</text>");
   }
   // ⑤ round brackets (bottom): the per-nudge-round sums
   for (var bi = 0; bi < episodes.length; bi++) {
@@ -3549,7 +3551,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push(legendItem("background:#0969da", t("det.rec_leg_active")));
             parts.push('<span><span class="dot" style="background:none;border-top:2px dashed #8250df;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_cum") + "</span>");
             parts.push(legendItem("background:#57606a", t("det.rec_leg_pt")));
-            parts.push('<span><span class="dot" style="background:none;border-top:3px solid #0969da;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_growth") + "</span>");
+            parts.push('<span><span class="dot" style="background:none;border-top:3px solid #1b7c83;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_growth") + "</span>");
             parts.push("</div>");
             parts.push('<div class="hint" style="margin-top:6px">' + escapeHtml(t("det.rec_note_t1")) + "<br>" + escapeHtml(t("det.rec_note_burst")) + "</div>");
             parts.push("</div></div>");
