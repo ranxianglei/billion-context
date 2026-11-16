@@ -998,6 +998,19 @@ export function snapBasePlaneEnabled(protocol: string | undefined): boolean {
     return protocol !== undefined && snapBase.cohorts.includes(protocol);
 }
 
+/** #5874 v2 step 4 + #6785 review: re-cut cadence of the egress prefix
+ *  cache — a VALID cached row re-materializes once this many user turns
+ *  have landed past it (default 8; 1 restores the original per-user-turn
+ *  cuts). A performance knob, not a safety gate: invalidation always
+ *  bypasses it (a row rejected by the read side cuts immediately), and
+ *  malformed values fall back to the default — the worst direction is
+ *  paying the pre-cadence cost. Config-file only, same tier as the plane
+ *  gate. */
+export function snapBaseCutCadence(): number {
+    const v = loadConfigFile().storage?.snapBase?.cutEveryKUserTurns;
+    return typeof v === "number" && Number.isInteger(v) && v >= 1 ? v : 8;
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full | sqlite.
  *  Lives here per the env-var discipline — env tier BILI_STORAGE_UNIFIED
  *  (1/true = shadow, full/unified = full, sqlite = pure-sqlite, 0/false/legacy/

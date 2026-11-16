@@ -4,7 +4,7 @@ import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { listSessions, type Session } from "../session.js";
 import { loadConfigFile } from "../config.js";
-import { resolveSnapshotShadow, snapBasePlaneEnabled } from "../knobs.js";
+import { resolveSnapshotShadow, snapBaseCutCadence, snapBasePlaneEnabled } from "../knobs.js";
 import { createHash } from "node:crypto";
 
 /**
@@ -342,17 +342,40 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
             if (r.msg && r.msg.role === "user" && r.seq > cutWm) cutWm = r.seq;
         }
         if (snapBasePlaneEnabled(session.meta?.protocol) && cutWm > egressMaxSeq) {
-            try {
-                const prefixRows = rows.filter((r) => r.seq <= cutWm);
-                if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {
-                    store.egressCut(
-                        session.id,
-                        prefixRows.map((r) => r.msgId),
-                        JSON.stringify(prefixRows),
-                        Date.now(),
-                    );
+            // #6785 review (O(n²) re-cut): a cut re-hashes every pinned id,
+            // re-serializes the WHOLE prefix and writes a fresh CAS blob,
+            // and the prefix grows every turn — so cutting on EVERY user
+            // turn costs O(n²) over a session's life. A cut is only worth
+            // paying once enough NEW tail exists to amortize it: re-cut
+            // only when no row is valid for this turn (egressMaxSeq < 0 —
+            // the first cut, or any rejection: fold crossing, rewind, id
+            // drift — those cut immediately, exactly as before, so the
+            // cadence can never delay an invalidation) or when K user turns
+            // have landed past the last cut (config
+            // storage.snapBase.cutEveryKUserTurns, default 8; 1 restores
+            // the original per-turn behavior). Between cuts the session
+            // serves the still-valid old row and derives its short tail
+            // live — precisely what a session without the plane does.
+            const k = snapBaseCutCadence();
+            let userTurnsPastCut = 0;
+            if (egressMaxSeq >= 0) {
+                for (const r of rows) {
+                    if (r.seq > egressMaxSeq && r.msg && r.msg.role === "user") userTurnsPastCut++;
                 }
-            } catch { /* never fail the render for a cache write */ }
+            }
+            if (egressMaxSeq < 0 || userTurnsPastCut >= k) {
+                try {
+                    const prefixRows = rows.filter((r) => r.seq <= cutWm);
+                    if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {
+                        store.egressCut(
+                            session.id,
+                            prefixRows.map((r) => r.msgId),
+                            JSON.stringify(prefixRows),
+                            Date.now(),
+                        );
+                    }
+                } catch { /* never fail the render for a cache write */ }
+            }
         }
     }
     return { rows, blockSeeds, coveredSeqUnion };

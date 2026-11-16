@@ -99,6 +99,32 @@ function extendedSession(): LegacySessionLike {
     return base;
 }
 
+/** Folded session + `pairs` full turns past the fold: pair i is user
+ *  m(2i+6) / assistant m(2i+7). tailSession(1) === extendedSession(). */
+function tailSession(pairs: number): LegacySessionLike {
+    const base = foldedSession(["m5", "m6"]);
+    const messages = [...(base.lastMessages ?? [])];
+    for (let i = 1; i <= pairs; i++) {
+        const u = 2 * i + 6, a = 2 * i + 7;
+        messages.push({ id: `m${u}`, role: "user", text: `text ${u}`, contentType: "text" } as CoreMessage);
+        messages.push({ id: `m${a}`, role: "assistant", text: `text ${a}`, contentType: "text" } as CoreMessage);
+        const refs = base.state.messageRefs as { byRaw: Record<string, string>; byRef: Record<string, string> };
+        refs.byRaw[`m${u}`] = String(1000 + u); refs.byRef[String(1000 + u)] = `m${u}`;
+        refs.byRaw[`m${a}`] = String(1000 + a); refs.byRef[String(1000 + a)] = `m${a}`;
+    }
+    base.lastMessages = messages;
+    return base;
+}
+
+/** Client mirror of tailSession(pairs): CLIENT + the same turns. */
+function tailClient(pairs: number): BiliMessage[] {
+    const out = [...CLIENT];
+    for (let i = 1; i <= pairs; i++) {
+        out.push(msg(`m${2 * i + 6}`, `text ${2 * i + 6}`, "user"), msg(`m${2 * i + 7}`, `text ${2 * i + 7}`, "assistant"));
+    }
+    return out;
+}
+
 /** The client's re-sent history for the folded session: originals + summary. */
 const CLIENT: BiliMessage[] = [
     msg("m1", "text 1", "user"),
@@ -325,6 +351,95 @@ test("#5874-v2 L4: the cut advances to the newest user-message boundary past the
         // would still load [0, …] content.
         const warmViewIds = warm.map((m) => m.id);
         assert.ok(warmViewIds.includes("m8") && warmViewIds.includes("m9"), "tail above the cut rides verbatim");
+    } finally {
+        h.store.close();
+        rmSync(h.dir, { recursive: true, force: true });
+        _resetStoreForTest();
+        setSnapBaseConfig(null);
+    }
+});
+
+test("#5874-v2 L6: K-turn cadence — a valid row re-cuts every K user turns; invalidation never waits (+/-)", () => {
+    const h = setup(); // gate on, default K = 8
+    try {
+        // (0) Cold turn on the folded ledger: the FIRST cut is immediate
+        //     (no row yet) and lands on the fold watermark m6 (m7 is the
+        //     assistant summary).
+        maybeSnapshotView(makeSession(), CLIENT, { sessionId: "sess-es" });
+        const row0 = h.store.egressReadView("sess-es");
+        assert.ok(row0, "cold cut landed");
+        assert.equal(row0.lastStableId, "m6");
+
+        // (1) +2 user turns past the cut (m8, m10) — below K=8: the SAME row
+        //     keeps serving; the new tail derives live above it (exactly
+        //     what a session without the plane does).
+        assert.ok(h.store.ingestSession(planIngest(tailSession(2)), undefined, { completeLog: true }), "grow 2 turns");
+        const warm2 = maybeSnapshotView(makeSession(), tailClient(2), { sessionId: "sess-es" });
+        const row2 = h.store.egressReadView("sess-es");
+        assert.ok(row2 && row2.lastStableId === "m6" && row2.inputHash === row0.inputHash, "below K: no re-cut, the m6 row keeps serving");
+        const ids2 = warm2.map((m) => m.id);
+        assert.ok(ids2.includes("m8") && ids2.includes("m10") && ids2.includes("m11"), "the short tail rides live above the old cut");
+        const last2 = h.uncovered()[h.uncovered().length - 1];
+        assert.ok(last2.length > 0 && last2[0][0] === 0, "still splicing from seq 0 (the old row)");
+
+        // (2) Grow to K=8 user turns past the cut (m8..m22): the re-cut
+        //     fires exactly at K and lands on the newest user boundary.
+        assert.ok(h.store.ingestSession(planIngest(tailSession(8)), undefined, { completeLog: true }), "grow 8 turns");
+        const warm8 = maybeSnapshotView(makeSession(), tailClient(8), { sessionId: "sess-es" });
+        const row8 = h.store.egressReadView("sess-es");
+        assert.ok(row8 && row8.inputHash !== row0.inputHash, "at K: the re-cut materialized a new row");
+        assert.equal(row8.lastStableId, "m22", "re-cut lands on the newest USER boundary");
+        assert.deepEqual(JSON.stringify(maybeSnapshotView(makeSession(), tailClient(8), { sessionId: "sess-es" })), JSON.stringify(warm8), "warm ≡ warm after the re-cut");
+
+        // (±) Invalidation bypasses the cadence: only 1 new user turn
+        //     (m24) past the m22 row, but a pinned content move (m2)
+        //     rejects the row on the read side → the next render cuts
+        //     IMMEDIATELY, same as before the cadence existed.
+        assert.ok(h.store.ingestSession(planIngest(tailSession(9)), undefined, { completeLog: true }), "grow 1 more turn");
+        maybeSnapshotView(makeSession(), tailClient(9), { sessionId: "sess-es" });
+        const rowBelow = h.store.egressReadView("sess-es");
+        assert.ok(rowBelow && rowBelow.lastStableId === "m22", "1 user turn < K: still the m22 row");
+        const moved = tailSession(9);
+        (moved.lastMessages as Array<CoreMessage>)[1] = { id: "m2", role: "assistant", text: "text 2 REVISED", contentType: "text" } as CoreMessage;
+        assert.ok(h.store.ingestSession(planIngest(moved), undefined, { completeLog: true }), "move pinned content m2");
+        maybeSnapshotView(makeSession(), tailClient(9), { sessionId: "sess-es" });
+        const rowBypass = h.store.egressReadView("sess-es");
+        assert.ok(rowBypass && rowBypass.lastStableId === "m24", "pinned content move: re-cut IMMEDIATELY despite <K user turns");
+    } finally {
+        h.store.close();
+        rmSync(h.dir, { recursive: true, force: true });
+        _resetStoreForTest();
+        setSnapBaseConfig(null);
+    }
+});
+
+test("#5874-v2 L6b: the cadence knob — cutEveryKUserTurns is honored; malformed values fall back to 8 (+/-)", () => {
+    const h = setup();
+    setSnapBaseConfig({ storage: { snapBase: { enabled: true, cutEveryKUserTurns: 2 } } });
+    try {
+        maybeSnapshotView(makeSession(), CLIENT, { sessionId: "sess-es" });
+        const row0 = h.store.egressReadView("sess-es");
+        assert.ok(row0 && row0.lastStableId === "m6", "cold cut at the fold watermark");
+
+        // 1 user turn < K=2 → no re-cut.
+        assert.ok(h.store.ingestSession(planIngest(tailSession(1)), undefined, { completeLog: true }), "grow 1");
+        maybeSnapshotView(makeSession(), tailClient(1), { sessionId: "sess-es" });
+        const row1 = h.store.egressReadView("sess-es");
+        assert.ok(row1 && row1.lastStableId === "m6" && row1.inputHash === row0.inputHash, "1 turn < K=2: no re-cut");
+
+        // 2 user turns >= K=2 → re-cut at m10.
+        assert.ok(h.store.ingestSession(planIngest(tailSession(2)), undefined, { completeLog: true }), "grow 2");
+        maybeSnapshotView(makeSession(), tailClient(2), { sessionId: "sess-es" });
+        const row2 = h.store.egressReadView("sess-es");
+        assert.ok(row2 && row2.lastStableId === "m10", "at K=2: re-cut at the newest user boundary");
+
+        // (±) Malformed K (0) falls back to the default 8: from the m10 row,
+        //     2 further user turns (m12, m14) must NOT re-cut.
+        setSnapBaseConfig({ storage: { snapBase: { enabled: true, cutEveryKUserTurns: 0 } } });
+        assert.ok(h.store.ingestSession(planIngest(tailSession(4)), undefined, { completeLog: true }), "grow to 4");
+        maybeSnapshotView(makeSession(), tailClient(4), { sessionId: "sess-es" });
+        const row4 = h.store.egressReadView("sess-es");
+        assert.ok(row4 && row4.lastStableId === "m10" && row4.inputHash === row2.inputHash, "malformed K=0 → default 8: 2 turns still below");
     } finally {
         h.store.close();
         rmSync(h.dir, { recursive: true, force: true });
