@@ -163,6 +163,7 @@ billion-context/
 │   │   ├── runtime-status.ts     #   Runtime storage degradation status for status surfaces (#3040)
 │   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v12)
 │   │   ├── shadow.ts             #   Unified-storage sidecar: shadow double-write / full read flip
+│   │   ├── slim.ts               #   Slim CCR envelope (envelope-only column, CAS-served originals) + row-backed kstate split (#6785 steps 6/8)
 │   │   ├── snap.ts               #   Snapshot-plane storage primitives: l1_world stage-0 ledger, fold_journal rows, egress_snapshot cache (#5874 v2)
 │   │   ├── sqlite-errors.ts      #   Corruption-shaped SQLite error classification (#5108)
 │   │   ├── store.ts              #   UnifiedStore: index.db (WAL) + content blobs, one txn per mutation

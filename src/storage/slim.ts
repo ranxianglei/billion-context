@@ -17,7 +17,7 @@ import type { MessageContentStore, StoredEntry } from "acp-kernel";
  * Kernel invariant this leans on (content-store.ts storeOriginal):
  * byHash[entry.hash] === original text, entry.hash = hashContent(text).
  */
-export interface SlimCcrEnvelope {
+interface SlimCcrEnvelope {
     version: 1;
     ccrSlim: 1;
     byRef: Record<string, { hash: string }>;
@@ -69,7 +69,7 @@ export interface CcrLedgerRow {
  * are no rows at all — callers degrade to the file lane, never a partial
  * store.
  */
-export function hydrateCcrContentStore(
+function hydrateCcrContentStore(
     rows: readonly CcrLedgerRow[],
 ): MessageContentStore | null {
     if (rows.length === 0) return null;
