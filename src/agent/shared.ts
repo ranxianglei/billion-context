@@ -433,7 +433,7 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
  *  string `version (commit)` would never parse (parseSemVer rejects the
  *  suffix), which is exactly what silently killed the #3544 stale-proxy
  *  rotation on the dsh-native attach path. */
-export interface ProxyVersionParts {
+interface ProxyVersionParts {
     version: string;
     commit?: string;
 }
