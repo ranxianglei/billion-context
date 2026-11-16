@@ -76,6 +76,36 @@ function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): Readonly
     return out;
 }
 
+// Claude Code keeps MCP tools out of `tools` until the model loads them with
+// ToolSearch; until then a message lists them by name under this announcement.
+const DEFERRED_TOOLS_ANNOUNCEMENT = "deferred tools are now available via ToolSearch";
+
+function observeDeferredTools(parsed: unknown): ReadonlySet<string> {
+    const out = new Set<string>();
+    const messages = parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>)["messages"] : undefined;
+    if (!Array.isArray(messages)) return out;
+    const scan = (text: unknown): void => {
+        if (typeof text !== "string") return;
+        for (let at = text.indexOf(DEFERRED_TOOLS_ANNOUNCEMENT); at !== -1; at = text.indexOf(DEFERRED_TOOLS_ANNOUNCEMENT, at + 1)) {
+            const start = text.indexOf(":\n", at);
+            if (start === -1) return;
+            const end = text.indexOf("\n\n", start);
+            for (const line of text.slice(start + 2, end === -1 ? undefined : end).split("\n")) {
+                const name = line.trim();
+                if (/^[\w.:-]+$/.test(name)) out.add(name);
+            }
+        }
+    };
+    for (const m of messages) {
+        const content = m !== null && typeof m === "object" ? (m as Record<string, unknown>)["content"] : undefined;
+        if (typeof content === "string") scan(content);
+        else if (Array.isArray(content)) {
+            for (const part of content) if (part !== null && typeof part === "object") scan((part as Record<string, unknown>)["text"]);
+        }
+    }
+    return out;
+}
+
 // ①b WireClientProfile — proxy-lane clients carry no pluginAgent header;
 // their identity is OBSERVED from wire signals. Registry discipline as ①:
 // the wire-client header-name literals live ONLY here (the old
@@ -276,7 +306,14 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // was that same single-literal gate going stale when DSH 0.2.x renamed
     // the transport (12× ARMED-SUPPRESSED at 42% usage, pendingT1 10× over
     // threshold, fully silent).
-    const compressReachable = !input.pluginMode
+    const billingBlock = extractBillingAttributionBlock(systemOf(input.parsed));
+    const mcpCompressListed = declaredTools.has(mcpBiliToolName("compress")) || observeDeferredTools(input.parsed).has(mcpBiliToolName("compress"));
+    // A Claude Code agent whose tool allow-list leaves bili's tools out cannot
+    // fold, so it gets no compress prompt and no nudge. Only Claude Code
+    // stamps cc_version into its billing block.
+    const claudeCodeWithoutTool = input.pluginMode && billingBlock?.text.includes("cc_version=") === true
+        && !declaredTools.has("compress") && !mcpCompressListed;
+    const compressReachable = !claudeCodeWithoutTool && (!input.pluginMode
         || declaredTools.has("compress")
         || declaredTools.has(mcpBiliToolName("compress"))
         || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
@@ -288,10 +325,10 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
         // that). Headerless rounds keep the surface ON so the probe runs;
         // once degraded, proxy tool injection replaces the lane anyway.
         // (#4344's silent-bridge case always sends the header — unaffected.)
-        || (input.pluginMode && input.pluginHeaderPresent === false);
+        || (input.pluginMode && input.pluginHeaderPresent === false));
     const compressSurfaceOn = input.shouldInject && compressReachable;
-    const mcpDialect = input.pluginMode && declaredTools.has(mcpBiliToolName("compress")) && !declaredTools.has("compress");
-    const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
+    const mcpDialect = input.pluginMode && mcpCompressListed && !declaredTools.has("compress");
+    const billingBlockObserved = billingBlock !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;
     return Object.freeze({
         profile,
