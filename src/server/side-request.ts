@@ -20,6 +20,23 @@ import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 // (x-bili-plugin-agent) and a known side-request agent is a side req by
 // definition regardless of budget.
 export const SIDE_REQUEST_MAX_TOKENS = 200;
+
+/** #6880: the auxiliary purposes dsh's GenerateOptions.purpose carries on the
+ *  wire today: session-title (session-title-llm), compaction (compaction-basic
+ *  summarizer), auto-review (experimental/auto-review classifyRisk),
+ *  timeline-report (experimental/timeline summary). This set is DOCUMENTATION,
+ *  not a gate: dsh's contract is "ordinary conversation requests leave purpose
+ *  unset", so ANY non-empty declared purpose on a plugin-announced request
+ *  classifies it as a side request by declaration. A brand-new sidecar purpose
+ *  needs no bili recognizer anymore — the per-feature template chain
+ *  (#2503/#4438/#5656/#5584) stays only as the fallback for pre-#6880 plugin
+ *  installs. */
+export const KNOWN_AUXILIARY_PURPOSES = new Set([
+    "session-title",
+    "compaction",
+    "auto-review",
+    "timeline-report",
+]);
 // Persona ids whose requests are side requests by intent (#1699). Main personas
 // (build/plan/general/...) are deliberately absent — they are real turns.
 export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
@@ -73,6 +90,60 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
     return false;
 }
 
+// #6548: the Responses-wire analogue of isServerToolUtilityCall. pi-web-access
+// sends its xAI web-search backend as a deliberately minimal single-shot
+// Responses body — `{ model, input, tools: [{type:"web_search"},
+// {type:"x_search"}] }` — string input, no message history, no
+// prompt_cache_key, and it exposes no config knob for extra headers or a
+// session id, so the client cannot carry an identity here. That shape is NOT
+// a conversation turn: it has no history to fingerprint and creates no
+// session state, so the #286 refusal's rationale (content-fingerprint
+// sessions would silently orphan state) does not apply to it — the refusal
+// branch forwards it verbatim instead of hard-400ing.
+// Decisive conditions (all must hold):
+//   - `input` is a plain string (the single-shot prompt); an array input is
+//     message history, and a missing input is degenerate;
+//   - non-empty tools where EVERY entry's type is a Responses server-executed
+//     search type (`web_search`, `web_search_preview`, `x_search`) — mixing
+//     ANY client-side tool (`function`, `mcp`, ...) vetoes;
+//   - no identity/history signal in the body: `previous_response_id`,
+//     `session_id` or `prompt_cache_key` present means the call chains onto
+//     a conversation (or carries an identity the #286 path already honors);
+//   - tool_choice absent, "auto" or "required", or an object forcing a
+//     DECLARED server tool; "none" vetoes (a request that forbids tool use
+//     is not a tool call), as does forcing a client tool or an unrecognized
+//     shape.
+// Deliberately proto-safe by shape alone: the Anthropic detector above
+// requires `messages`, so a Responses body can never match it — and this one
+// requires string `input`, so an Anthropic body can never match it either.
+const RESPONSES_SERVER_SEARCH_TOOL_TYPES: ReadonlySet<string> = new Set(["web_search", "web_search_preview", "x_search"]);
+
+export function isResponsesServerToolSingleShot(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (typeof p.input !== "string") return false;
+    if (typeof p.previous_response_id === "string" && p.previous_response_id !== "") return false;
+    if (typeof p.session_id === "string" && p.session_id !== "") return false;
+    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key !== "") return false;
+    const tools = p.tools;
+    if (!Array.isArray(tools) || tools.length === 0) return false;
+    const declared = new Set<string>();
+    for (const t of tools) {
+        if (t === null || typeof t !== "object") return false;
+        const type = (t as { type?: unknown }).type;
+        if (typeof type !== "string" || !RESPONSES_SERVER_SEARCH_TOOL_TYPES.has(type)) return false;
+        declared.add(type);
+    }
+    const choice = p.tool_choice;
+    if (choice === undefined) return true;
+    if (choice === "auto" || choice === "required") return true;
+    if (choice !== null && typeof choice === "object") {
+        const c = choice as { type?: unknown };
+        if (typeof c.type === "string" && declared.has(c.type)) return true;
+    }
+    return false;
+}
+
 const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
 
 /** #5073: structural identification of a tool-less structured-output utility
@@ -101,10 +172,45 @@ export function isStructuredOutputCall(parsed: unknown): boolean {
     return typeof type === "string" && STRUCTURED_FORMAT_TYPES.has(type);
 }
 
-export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
+/** #6636: structural identification of a tool-less audio-output utility
+ *  call — a TTS request on the chat wire carries a top-level `audio` object
+ *  (`{voice, format}`, OpenAI chat-completions audio output) and no tools.
+ *  It is a one-shot media side call, not an agent turn: agent turns always
+ *  carry an action surface (#546), and a TTS model behind an
+ *  OpenAI-compatible endpoint rejects the ACP decoration outright — the
+ *  injected leading system prompt 400s ("messages[0] system role is not
+ *  allowed for TTS model", Xiaomi MiMo mimo-v2.5-tts) and the per-message
+ *  <acp> prefixes would be read aloud as text. Routed through the #388 side
+ *  passthrough like the #2500/#5073 utility shapes above, so the request
+ *  leaves the machine exactly as the client wrote it.
+ *  The no-tools veto is part of the predicate (same discipline as
+ *  isStructuredOutputCall): a tool-carrying request is a main turn even
+ *  when it asks for audio output. An empty `audio` object does not count —
+ *  it carries no media request. Residual, accepted: a tool-less plain chat
+ *  turn that asks for audio output (voice-mode chat with no tools) also
+ *  rides the side lane for that one turn — it forwards verbatim and its
+ *  fold state simply does not advance; the ACP decoration is never needed
+ *  for the reply to work, and the next tool-carrying turn rejoins the full
+ *  pipeline. */
+export function isAudioOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const audio = p.audio;
+    if (audio === null || typeof audio !== "object" || Array.isArray(audio)) return false;
+    return Object.keys(audio).length > 0;
+}
+
+export function isSideRequest(parsed: unknown, requestAgent?: string, purpose?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
     if (requestAgent === "main") return false;
+    // #6880: the DECLARED purpose outranks every body heuristic. It arrives
+    // pre-gated (plugin.ts only surfaces it behind the x-bili-plugin marker),
+    // so a non-empty value is the plugin telling us — from the dispatch
+    // options it itself controls — that this call is auxiliary: route it
+    // through the #388 verbatim passthrough without content matching.
+    if (purpose !== undefined && purpose.length > 0) return true;
     const p = parsed as Record<string, unknown>;
     // #2500: BEFORE the #546 rule — a server-tool-only utility call carries
     // non-empty tools but is not an agent turn. Routed through the #388 side
@@ -120,6 +226,12 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // pair with a 400. Routed through the #388 side passthrough like the #2500
     // server-tool shape above.
     if (isStructuredOutputCall(parsed)) return true;
+    // #6636: a tool-less request asking for audio output (top-level `audio`
+    // object — TTS on the chat wire) is a one-shot media side call, not an
+    // agent turn. The ACP decoration 400s it (leading system prompt) and
+    // would corrupt the spoken text (per-message tags), so it rides the
+    // #388 side passthrough verbatim like the utility shapes above.
+    if (isAudioOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);

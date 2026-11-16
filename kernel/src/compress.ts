@@ -1,4 +1,4 @@
-import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, orderedRefPair, refToIndex } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, refToIndex } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -203,36 +203,6 @@ function rangeError(
 function numericBlockId(id: string): number {
   const parsed = /^b(\d+)$/.exec(id);
   return parsed ? Number(parsed[1]) : 0;
-}
-
-function formatK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-}
-
-// #6661: the per-turn statusLine is built here in the kernel, so the dead-ref
-// filter the other offer surfaces apply never reached it — it advertised the
-// doomed ranges the gate then refused, contradicting the "recorded as DEAD"
-// receipt in the same message. Drop any offered range whose span contains a
-// dead ref. Canonicalize the span first (reversed storage, #5680) so a
-// descending pair is checked correctly. Conservative: drops the whole span
-// rather than splitting around the dead cell.
-export function filterDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
-  if (!deadRefs || deadRefs.length === 0) return ranges;
-  const deadNumbers: number[] = [];
-  for (const ref of deadRefs) {
-    const m = /^m(\d+)$/i.exec(ref);
-    if (m) deadNumbers.push(Number(m[1]));
-  }
-  if (deadNumbers.length === 0) return ranges;
-  return ranges.filter((range) => {
-    const s = /^m(\d+)$/i.exec(range.startRef);
-    const e = /^m(\d+)$/i.exec(range.endRef);
-    if (!s || !e) return true;
-    let lo = Number(s[1]);
-    let hi = Number(e[1]);
-    if (lo > hi) [lo, hi] = [hi, lo];
-    return !deadNumbers.some((n) => n >= lo && n <= hi);
-  });
 }
 
 function refGateDiagnostics(
@@ -1062,53 +1032,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
-    // #4521: between banner deliveries a compression round can stay armed for
-    // many requests (backoff, tier cadence, model-decided timing). During that
-    // window the model sees NO current refs and starts guessing beyond the
-    // highest allocated ref — every guess a failed round-trip. Emit a compact
-    // boundary line whenever a nudge plan carries offered ranges but its
-    // banner is not being delivered this turn; hosts append it as an ephemeral
-    // trailing user message (same carrier as the nudge, same cache safety).
-    let statusLine: string | undefined;
-    const nudge = result.effects.nudge;
-    // Two shapes authorize the refresh line: a real tiered arm whose banner
-    // is deferred this turn (tier !== null: pressure crossed a threshold but
-    // cadence/backoff holds it), or any plan after at least one banner was
-    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
-    // this line only refreshes them). A fresh session's below-threshold plan
-    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
-    // must stay fully silent: same regime promise as the nudge itself
-    // (#196 regime scoping, #3910 lane baseline).
-    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
-    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      // #6661: never offer a range the gate will refuse — drop any span that
-      // contains a dead ref. The "recorded as DEAD" receipt in the same message
-      // already says those ranges can't be anchored, so offering them makes the
-      // line contradict the receipt and the model loops re-issuing doomed
-      // ranges until the breaker trips.
-      const liveRanges = filterDeadRefRanges(nudge.compressibleRanges!, state.deadRefs);
-      if (liveRanges.length > 0) {
-        const highest = highestUsedIndex(state.messageRefs);
-        // #5680: after a generation reset the stored endpoints of a positional
-        // span can be numerically descending — canonicalize to ascending like
-        // every other display surface (formatRanges, acp_status) or the model
-        // reads the line as corrupt and skips compression.
-        const offered = liveRanges
-          .slice(0, 3)
-          .map((r) => {
-            const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
-            return `${lo}–${hi} (${formatK(r.tokens)})`;
-          })
-          .join(", ");
-        const extra = liveRanges.length > 3 ? `, +${liveRanges.length - 3} more` : "";
-        statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
-      }
-    }
+    // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
+    // emitted on turns where a nudge plan is armed but its banner is not
+    // delivered) is removed. It fired precisely when the banner was withheld,
+    // so its "compressible now" list was always below-gate residue — a
+    // standing fold directive contradicting the same turns' compress receipt
+    // ("named for visibility, not as fold suggestions" / "No compressible
+    // ranges remain"). Ref-guessing backstops remain: the compress receipt and
+    // the unknown-ref refusal both report the session's highest allocated ref.
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
-      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
