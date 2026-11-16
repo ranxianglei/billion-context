@@ -71,7 +71,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { buildCorpus, CODEWORDS } from "./plugin-lanes.mjs";
+import { buildCorpus, CODEWORDS, gateStorageCfg, gateRolloutCfg } from "./plugin-lanes.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const WORK = process.env.RESTART_LANES_WORK || path.join(process.env.WORKDIR || process.cwd(), "restart-lanes");
@@ -85,6 +85,8 @@ const MODEL1 = {
   key: process.env.MODEL1_API_KEY || "gate-local",
 };
 const MODEL_IDS = String(MODEL1.model).split(",").map((s) => s.trim()).filter(Boolean);
+
+const laneCfg = (providers) => ({ providers, compress: { preserveRecentTokens: 0 }, ...gateStorageCfg(), ...gateRolloutCfg() });
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS_R || process.env.GATE_AGENTS || "dsh,pi")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -287,7 +289,7 @@ async function runLane(agent) {
   const biliJson = path.join(xdgConfig, "billion-context", "billion-context.json");
   const biliProviders = { [recUrl]: { models: Object.fromEntries(MODEL_IDS.map((m) => [m, { context: BIG_WINDOW, output: 4096 }])) } };
   fs.mkdirSync(path.dirname(biliJson), { recursive: true });
-  fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
+  fs.writeFileSync(biliJson, JSON.stringify(laneCfg(biliProviders), null, 2));
   fs.writeFileSync(path.join(laneDir, "work", "corpus.md"), buildCorpus(CORPUS_TOKENS));
 
   const rec = spawn("node", [path.join(HERE, "upstream-recorder.mjs")], {
@@ -405,7 +407,7 @@ async function runLane(agent) {
       harvestClaudeModels();
       const allIds = [...new Set([...MODEL_IDS, ...claudeExtraModels])];
       biliProviders[recUrl] = { models: Object.fromEntries(allIds.map((m) => [m, { context: w, output: 4096 }])) };
-      fs.writeFileSync(biliJson, JSON.stringify({ providers: biliProviders, compress: { preserveRecentTokens: 0 } }, null, 2));
+      fs.writeFileSync(biliJson, JSON.stringify(laneCfg(biliProviders), null, 2));
       const oldPid = claudeProxy ? claudeProxy.pid : null;
       await stopClaudeProxy();
       await startClaudeProxy();

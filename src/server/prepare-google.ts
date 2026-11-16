@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
@@ -436,12 +437,6 @@ export async function prepareGoogle(
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
-        // #4521: armed-but-silent window — same carrier + rationale as the
-        // anthropic lane (ephemeral trailing user message, current refs
-        // instead of model-guessed ones).
-        if (turn.statusLine) {
-            rebuiltContents = [...rebuiltContents, { role: "user", parts: [{ text: turn.statusLine }] }];
-        }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
@@ -471,6 +466,7 @@ export async function prepareGoogle(
     // this revision; re-arm the debounce only if the session mutated since
     // (stats probes land at the next flush) or the flush never landed.
     if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 
