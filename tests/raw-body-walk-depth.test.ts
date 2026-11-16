@@ -76,7 +76,7 @@ test("shallow plumbing: exclusion set, key inheritance and bucket split stay int
     assert.equal(bd.system, t("system prompt text"));
     assert.equal(bd.tools, t("search") + t("find things fast"));
     assert.equal(bd.other, t("structural note"));
-    assert.equal(bd.total, bd.messages + bd.system + bd.tools + bd.other);
+    assert.equal(bd.total, bd.messages + bd.system + bd.tools + bd.input + bd.other);
     assert.equal(estimateRawBodyTokens(body), bd.total);
 });
 
