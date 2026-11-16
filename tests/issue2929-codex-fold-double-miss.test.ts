@@ -38,11 +38,12 @@ const NUDGE_MARKER = "Compressible ranges (";
 // and ~9KiB filler turns. Pre-#4521 (master) the injections landed on
 // requests {7,8,9}; since #4521 the armed-but-silent status line rides an
 // ephemeral carrier on the gated turns and its shown-marker feeds the nudge
-// gate back, so the schedule shifts to {4,6,8,9} — the fold/proxy-tool-round
-// mechanics under test are unchanged, only this probe's anchor re-calibrates
-// to the next nudge-carrying request pair (6 → tool round, 7 → fold round).
-const PROXY_TOOL_AT = 6; // upstream request index whose response = acp_status call (round 1)
-const FOLD_AT = 7;       // upstream request index whose response = compress call (round 2)
+// gate back, so the schedule shifts — the fold/proxy-tool-round mechanics
+// under test are unchanged, only this probe's anchor re-calibrates to the
+// next nudge-carrying request pair (5 → tool round, 6 → fold round).
+// Re-calibrated 2026-11-16: nudge now lands at {3,5,11,14} (was {4,6,8,9}).
+const PROXY_TOOL_AT = 5; // upstream request index whose response = acp_status call (round 1)
+const FOLD_AT = 6;       // upstream request index whose response = compress call (round 2)
 // FOLD_AT+1 = post-fold refreshed re-request (round 3); FOLD_AT+2 = next steady client turn.
 const TOTAL_TURNS = 13;
 
