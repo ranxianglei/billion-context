@@ -1053,10 +1053,15 @@ function changelogCatOf(rawLine) {
         const pdur = $("up-pin-duration");
         if (pdur) {
             const cur = pdur.value;
-            let opt = '<option value="">' + escapeHtml(t("up.pin_forever")) + "</option>";
+            // #6804 follow-up: the DEFAULT duration is 7d — "forever" means
+            // "never auto-update", which must be an explicit choice, so it is
+            // kept as the last option but no longer the default selection.
+            const fresh = pdur.options.length === 0;
+            let opt = "";
             ["1h", "12h", "1d", "7d", "30d"].forEach((d) => { opt += '<option value="' + d + '">' + d + "</option>"; });
+            opt += '<option value="">' + escapeHtml(t("up.pin_forever")) + "</option>";
             pdur.innerHTML = opt;
-            if (cur) pdur.value = cur;
+            pdur.value = fresh ? "7d" : cur;
         }
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
