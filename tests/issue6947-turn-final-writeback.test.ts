@@ -6,8 +6,9 @@
  * index.db and the /__bili web UI kept showing the previous reply.
  *
  * Fix: handoffReply.save() appends the captured messages back into
- * session.lastMessages with codec-derivable ids (deriveMessageId + cluster
- * numbering), so the debounced turn-end save persists them immediately.
+ * session.lastMessages with codec-derivable ids (the SAME canonical seed the
+ * codecs feed deriveCanonicalMessageId with, #3642, + cluster numbering), so
+ * the debounced turn-end save persists them immediately.
  * store.ts: when a full re-ingest joins a stored row whose ref is still NULL
  * (its ref was minted only once the client re-sent the tagged text), backfill
  * it — NULL only, never a rewrite, never the "BLOCKED" byRaw token.
@@ -27,7 +28,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { CoreMessage } from "acp-kernel";
-import { deriveMessageId, openaiToCore } from "acp-kernel/wire";
+import { canonicalToolArgs, deriveCanonicalMessageId, deriveMessageId, openaiToCore } from "acp-kernel/wire";
 import { createSession, type Session } from "../src/session.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
@@ -128,7 +129,35 @@ test("tool calls write back with toolName/toolCallId preserved and id-derivable"
     assert.equal(tool.contentType, "tool-call");
     assert.equal(tool.toolName, "search");
     assert.equal(tool.toolCallId, "call_1");
-    assert.equal(tool.id, deriveMessageId("assistant", "tool-call", "{\"q\":1}", { toolCallId: "call_1", toolName: "search" }));
+    // Canonical seed (#3642): toolCallId OUT of the id (transport plumbing),
+    // args canonicalized. Legacy deriveMessageId (toolCallId slot filled,
+    // raw args) would mint a DIFFERENT id than the re-send codec pass — the
+    // re-send then joins by (msg_id, identity) and the old row is retired,
+    // costing a full re-ingest per tool call on every turn. Pinned here so
+    // the exact-join property cannot regress to that shape.
+    assert.equal(tool.id, deriveCanonicalMessageId("assistant", "tool-call", canonicalToolArgs("{\"q\":1}"), { toolName: "search" }));
+});
+
+test("a client re-send of a TOOL-CALL reply through the production codec derives the SAME ids (store join stability)", () => {
+    const session = createSession("wb-tool-resend");
+    session.lastMessages = convo([{ role: "user", content: "go" }]);
+    session.stats.requests = 1;
+    const reply = createHandoffReply(session);
+    reply.append("0", "text", "looking");
+    reply.tool("1", "search", "call_1", " { \"q\" : 1 } ");
+    reply.save();
+    const stored = session.lastMessages!;
+    // The client re-sends the turn: assistant text + tool call + tool result.
+    // The codec sees the args as the client stored them (byte-identical — the
+    // client echoes what it received); canonicalToolArgs normalizes both sides.
+    const resent = openaiToCore({ messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: "looking", tool_calls: [{ id: "call_1", type: "function", function: { name: "search", arguments: " { \"q\" : 1 } " } }] },
+        { role: "tool", tool_call_id: "call_1", content: "found it" },
+    ] }).msgs as unknown as CoreMessage[];
+    assert.equal(resent[0].id, stored[0].id, "user id stable");
+    assert.equal(resent[1].id, stored[1].id, "reply text id must match the re-send derivation");
+    assert.equal(resent[2].id, stored[2].id, "tool-call id must match the re-send derivation (canonical join)");
 });
 
 test("folded snapshot: metadata is written but lastMessages is not grown", () => {

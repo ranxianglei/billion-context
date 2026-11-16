@@ -1,3 +1,4 @@
+import type { BiliMessage } from "./bili-message.js";
 import { hashId } from "./util.js";
 
 /**
@@ -117,6 +118,46 @@ export function deriveCanonicalMessageId(
  * Non-image ids never gain the sixth slot, so they stay byte-identical. */
 export function imageMediaFingerprint(base64OrUrl: string): string {
   return hashId(base64OrUrl);
+}
+
+/**
+ * Canonical base id (WITHOUT the ClusterCounter `_N` suffix) re-derived from
+ * a core message's own fields — the inverse of what each protocol codec feeds
+ * deriveCanonicalMessageId (#3642). Lets a host seed a ClusterCounter from
+ * the cores it already holds before minting ids for cores appended OUTSIDE a
+ * full conversion pass, so the appended ids number exactly as the next full
+ * pass over [stored…, appended…] would (a response-side ingest of a turn's
+ * just-streamed reply must not mint a second, differently-suffixed id for
+ * the same logical message the client will resend next turn).
+ *
+ * Returns null when the base cannot be derived from core fields alone: image
+ * parts (the #3751 payload fingerprint lives in sidecars the host may not
+ * have normalized) and unknown content types. Callers skip nulls: an
+ * under-count can only shift a cluster SUFFIX for an identical repeated
+ * identity, never mint a wrong bare id.
+ */
+export function baseIdOfCore(m: BiliMessage): string | null {
+  const text = m.text ?? "";
+  switch (m.contentType) {
+    case "text":
+      if (m.imagePart) return null;
+      return deriveCanonicalMessageId(m.originalRole ?? m.role, "text", text);
+    case "reasoning":
+      return deriveCanonicalMessageId("assistant", "reasoning", text);
+    case "tool-call":
+      return deriveCanonicalMessageId(
+        "assistant",
+        "tool-call",
+        canonicalToolArgs(text),
+        { toolName: m.toolName },
+      );
+    case "tool-result":
+      return deriveCanonicalMessageId("tool", "tool-result", text, {
+        toolName: m.toolName,
+      });
+    default:
+      return null;
+  }
 }
 
 /** Stable seed for opaque wire items (responses reasoning items without

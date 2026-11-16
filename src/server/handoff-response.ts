@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { anthropicToCore, deriveMessageId, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
+import { anthropicToCore, baseIdOfCore, ClusterCounter, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 import { markDirty, type Session } from "../session.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -54,27 +54,37 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
             // session's last turn never reached the store — the web UI kept
             // showing the previous (stale) reply forever. Append the captured
             // reply to the snapshot now, with ids derived EXACTLY as the next
-            // codec pass will derive them: same 5-slot seed
-            // (role|contentType|toolCallId|toolName|text) and same cluster
-            // numbering (Nth occurrence of the same base id, counted in
-            // arrival order over the snapshot). The re-send then JOINs these
-            // rows by msg_id+identity (#4390) and the #4182 stored-identity
-            // guard makes the worst case (client round-trip drift) one refused
-            // delta + one redundant full re-ingest — never wrong rows.
+            // codec pass will derive them: the SAME canonical seed the codecs
+            // feed deriveCanonicalMessageId (#3642 — role|contentType with the
+            // toolCallId slot pinned empty, toolName, and canonicalToolArgs for
+            // tool calls; wire toolCallIds are transport plumbing, never
+            // content identity) and the same cluster numbering (Nth occurrence
+            // of the same base, counted in arrival order over the snapshot).
+            // The re-send then JOINs these rows by msg_id+identity (#4390) on
+            // EVERY content type — including tool calls — so the #3133 delta
+            // fast path stays green (no per-tool-call refused-delta + O(n)
+            // full re-ingest + retired-row accumulation on long sessions).
+            // Legacy deriveMessageId (toolCallId slot filled, raw args text)
+            // would only join for plain text/reasoning — superseded.
+            // The #4182 stored-identity guard still makes the worst case
+            // (client round-trip drift) one refused delta + one redundant
+            // full re-ingest — never wrong rows.
             // Skipped when the snapshot is a bounded folded re-render: its
             // array is a pruned view, not the raw tail the store appends to.
             if (session.lastMessagesFolded !== true && Array.isArray(snapshot)) {
-                const clusterCounts = new Map<string, number>();
+                const clusters = new ClusterCounter();
                 for (const m of snapshot) {
-                    const base = baseIdentityId(m);
-                    clusterCounts.set(base, (clusterCounts.get(base) ?? 0) + 1);
+                    const b = baseIdOfCore(m);
+                    if (b !== null) clusters.next(b);
                 }
                 for (const entry of messages.values()) {
                     const m = entry.message;
-                    const base = baseIdentityId(m);
-                    const n = clusterCounts.get(base) ?? 0;
-                    snapshot.push({ ...m, id: n === 0 ? base : `${base}_${n}` });
-                    clusterCounts.set(base, n + 1);
+                    const b = baseIdOfCore(m);
+                    // b is null only for image-part cores (the #3751 payload
+                    // fingerprint lives in sidecars the capture never sets —
+                    // it has no imagePart); keep the synthetic id in that
+                    // unreachable case rather than mint a wrong content id.
+                    snapshot.push({ ...m, id: b !== null ? clusters.next(b) : m.id });
                 }
             }
             session.metadata.handoffResponse = { request, messages: [...messages.values()].map((entry) => entry.message) };
@@ -106,10 +116,3 @@ export function captureHandoffJson(reply: HandoffReply | undefined, protocol: st
     }
 }
 
-/** #6947: the base (cluster-0) content id a codec pass derives for `m` —
- *  the same 5-slot seed every lane feeds deriveMessageId with, computed from
- *  the core fields rather than the message's own id (capture-side ids are
- *  synthetic `reply_*` and must not leak into the stored rows). */
-function baseIdentityId(m: CoreMessage): string {
-    return deriveMessageId(m.role, m.contentType, m.text ?? "", { toolCallId: m.toolCallId, toolName: m.toolName });
-}
