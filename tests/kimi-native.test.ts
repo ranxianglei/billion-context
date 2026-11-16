@@ -348,6 +348,42 @@ test("scanKimiModelWindows keys windows by model id across all sections (#2954)"
     assert.deepEqual(scanKimiModelWindows(SAMPLE_CONFIG), {}, "no windows declared → empty map, nothing to feed");
 });
 
+for (const [literal, expected] of [
+    ["128_000", 128000],
+    ["+131072", 131072],
+    ["0x2_0000", 131072],
+    ["0o400_000", 131072],
+    ["0b10_0000_0000_0000_0000", 131072],
+    ["65536 # context limit", 65536],
+] as const) {
+    test(`Kimi preserves TOML integer limit ${literal} through routing and unroute`, () => {
+        const config = THINKING_CONFIG.replace("max_context_size = 65536", `max_context_size = ${literal}`)
+            .replace("max_output_size = 8192", "max_output_size = 8_192");
+        assert.deepEqual(scanKimiModelWindows(config), { "deepseek-r1": expected });
+        const route = okOf(resolveKimiRoute(config, {}));
+        assert.equal(route.contextWindow, expected);
+        assert.equal(route.maxOutput, 8192);
+        const applied = applyKimiManagedConfig(config, stateOf(route));
+        const reread = okOf(resolveKimiRoute(applied, {}));
+        assert.equal(reread.contextWindow, expected);
+        assert.equal(reread.maxOutput, 8192);
+        assert.equal(applyKimiManagedConfig(applied, stateOf(reread)), applied);
+        assert.ok(unrouteKimiConfig(applied).includes(`max_context_size = ${literal}`), "the user's literal survives uninstall");
+    });
+}
+
+for (const literal of ["1.5", "1e6", "2026-01-01", "128__000", "128_", "_128", "01", "0x_1", "1 trailing", "9007199254740993"]) {
+    test(`Kimi does not mistake ${literal} for an integer limit`, () => {
+        const config = THINKING_CONFIG.replace("max_context_size = 65536", `max_context_size = ${literal}`)
+            .replace("max_output_size = 8192", `max_output_size = ${literal}`);
+        assert.deepEqual(scanKimiModelWindows(config), {});
+        const route = okOf(resolveKimiRoute(config, {}));
+        assert.equal(route.contextWindow, undefined);
+        assert.equal(route.maxOutput, undefined);
+        assert.ok(!aliasSection(applyKimiManagedConfig(config, stateOf(route))).includes("max_"));
+    });
+}
+
 test("kimiConfigModelWindows hands both kimi proxy paths ONE windows source (#3436/#3557)", () => {
     const home = path.join(tmpdir(), `bili-kimi-win-${process.pid}-${Date.now()}`);
     mkdirSync(home, { recursive: true });

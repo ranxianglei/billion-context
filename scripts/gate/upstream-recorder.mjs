@@ -45,6 +45,7 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
     const my = ++seq;
+    const myStart = Date.now();
     const body = Buffer.concat(chunks);
     let parsed = null;
     try { parsed = JSON.parse(body.toString("utf8")); } catch { parsed = null; }
@@ -73,10 +74,27 @@ const server = http.createServer((req, res) => {
       (upRes) => {
         res.writeHead(upRes.statusCode, upRes.headers);
         let bytes = 0;
-        upRes.on("data", (c) => { bytes += c.length; res.write(c); });
+        // Keep a capped 256KiB rolling tail of the response body: usage /
+        // cached_tokens live in the FINAL chunk, and Lane R's cache-hit
+        // assertions read them from the recorded tail.
+        const tail = [];
+        let tailLen = 0;
+        const push = (c) => {
+          tail.push(c);
+          tailLen += c.length;
+          while (tailLen > 262144 && tail[0]) {
+            tailLen -= tail[0].length;
+            if (tailLen <= 0) tail.shift();
+          }
+        };
+        upRes.on("data", (c) => { bytes += c.length; push(c); res.write(c); });
         upRes.on("end", () => {
           res.end();
-          recordLine({ seq: my, tag: "resp", t: new Date().toISOString(), status: upRes.statusCode, bytes });
+          recordLine({
+            seq: my, tag: "resp", t: new Date().toISOString(), status: upRes.statusCode,
+            ms: Date.now() - myStart, bytes,
+            body: Buffer.concat(tail).toString("utf8").slice(-262144),
+          });
         });
       },
     );

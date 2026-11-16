@@ -699,6 +699,19 @@ fallback — read only while the section is absent, ignored once it exists.
 Full field table and the `PI_ACP_DELEGATE_*` env overrides:
 configuration.md → [`pi`](configuration.md#pi).
 
+**Nudge visibility (what the proxy injected, without model-context cost).**
+With the global debug switch on (`ACP_DEBUG=1`, or `"debug": true` in the
+config file), every nudge the proxy injects mid-compression is shown in the
+terminal — once per user turn, as a transient notification after the model
+has answered — with the VERBATIM wire text: exactly the ephemeral trailing
+user message the model reads that turn, byte for byte. The notification is
+terminal-only: it is never written to the session file and adds nothing to
+model context (the nudge reaching the model is the pre-existing mechanism's
+job; this view just lets a human see it happen). Pi inline mode only — in
+spawn/attach the proxy is a separate process and the view is unavailable.
+Covers the Anthropic and OpenAI wire lanes (the two pi reaches over HTTP); on
+hosts without `ui.notify` the feature degrades to absent.
+
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
 is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the
