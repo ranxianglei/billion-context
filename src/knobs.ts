@@ -984,11 +984,17 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
 /** #5874 v2: egress stable-prefix cache plane gate. storage.snapBase.enabled
  *  (default dormant) × cohorts (missing/empty = all). Config-file only —
  *  no env tier (#2030); tests drive the real path by writing the config
- *  file (loadConfigFile's cache is keyed on the raw text). */
+ *  file (loadConfigFile's cache is keyed on the raw text). Malformed
+ *  cohorts (present but not a string array) FAIL CLOSED — a typo'd cohort
+ *  list must narrow nothing, never silently widen the plane to every
+ *  protocol. */
 export function snapBasePlaneEnabled(protocol: string | undefined): boolean {
     const snapBase = loadConfigFile().storage?.snapBase;
     if (snapBase?.enabled !== true) return false;
-    if (!Array.isArray(snapBase.cohorts) || snapBase.cohorts.length === 0) return true;
+    if (snapBase.cohorts === undefined || snapBase.cohorts === null) return true;
+    if (!Array.isArray(snapBase.cohorts)) return false;
+    if (snapBase.cohorts.length === 0) return true;
+    if (snapBase.cohorts.some((c) => typeof c !== "string")) return false;
     return protocol !== undefined && snapBase.cohorts.includes(protocol);
 }
 
