@@ -2655,15 +2655,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // text protocol — it is a function tool there).
             const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-            // Match prepare-responses' devParts.join; other wires keep their
-            // existing plain separator. The adapter treats systemPrompt as one
-            // part, so it cannot repair separators already embedded here.
-            const sectionSeparator = prepared.protocol === "responses" ? "\n\n---\n\n" : "\n\n";
+            // Keep the same plain section separator as the steady prepare paths.
+            // Responses' adapter also uses it when adding the client system text.
             const absorbSection = absorbActive
-                ? `${sectionSeparator}${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
             const blockOpsSection = blockOpsActive
-                ? `${sectionSeparator}${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
+                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2683,7 +2681,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // between the compress prompt and the absorb section on every steady
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
-            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `${sectionSeparator}${GENERATION_BOUNDARY_NOTE}` : "";
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
             const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
             // #1295: commandcode keeps the internal protocol "openai" (request
             // shape is openai-completions) but speaks bare JSONL on the wire.

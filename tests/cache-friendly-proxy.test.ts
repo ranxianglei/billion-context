@@ -33,12 +33,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, buildBlockOpsSystemPrompt } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { buildAbsorbSystemPrompt, ABSORB_TOOL_NAME } from "../src/compress-tool.ts";
 import { GENERATION_BOUNDARY_NOTE } from "../src/generation-boundary.ts";
 
 type Item = Record<string, unknown>;
@@ -439,7 +440,7 @@ async function driveWire(wire: Wire, sessionId: string, model: string, ctx: numb
                     stream: true,
                     instructions: "You are a coding agent operating in a sandbox.\nFollow repo conventions strictly.\nRun tests before finishing.\nEnvironment notes: linux, node 22, repo at /workspace.",
                     tools: [{ type: "function", name: "shell", description: "run a shell command", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }],
-                    input: [...hist],
+                    input: [...(opts?.generationBoundary ? [{ type: "message", role: "developer", content: "Additional client instructions." }] : []), ...hist],
                 };
                 const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(body) });
                 if (!res.ok) throw new Error(`${wire} turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -598,9 +599,15 @@ for (const sections of [false, true]) test(`Responses generation-boundary develo
     const first = developer(parsed[0]!);
     assert.ok(first, "real Responses encoder emitted the developer head");
     assert.ok(JSON.stringify(first).includes(JSON.stringify(GENERATION_BOUNDARY_NOTE).slice(1, -1)), "standing note was actually detected");
+    const content = typeof first.content === "string" ? first.content : asArr(first.content).map(part => part.text).join("");
+    assert.ok(content.includes("repo at /workspace.\n\nAdditional client instructions.\n\n"), "client sections and compression prompt use plain double-newline joins");
+    const noteAt = content.indexOf(GENERATION_BOUNDARY_NOTE);
+    assert.equal(content.slice(noteAt - 2, noteAt), "\n\n", "generation note has a plain separator");
+    assert.notEqual(content.slice(noteAt - 7, noteAt), "\n\n---\n\n", "generation note must not have a divider separator");
     if (sections) {
         assert.ok(JSON.stringify(first).includes("[ACP absorb]"), "absorb section enabled");
         assert.ok(JSON.stringify(first).includes("BLOCK-LIFECYCLE MANAGEMENT"), "block-ops section enabled");
+        assert.ok(content.endsWith([GENERATION_BOUNDARY_NOTE, buildAbsorbSystemPrompt(ABSORB_TOOL_NAME), buildBlockOpsSystemPrompt("function")].join("\n\n")), "generation, absorb and block-ops sections use exactly plain double-newline joins");
     }
     for (const body of parsed) assert.deepEqual(developer(body), first, "complete developer item must remain identical, including separators");
     runChecks("responses", bodies);
