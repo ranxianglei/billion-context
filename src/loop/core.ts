@@ -364,7 +364,7 @@ export type ParsedStreamEvent =
     // in message_start, which the anthropic adapter forwards usage-neutral
     // (#1315), so only the synthetic terminal can deliver it to hosts that
     // derive their prompt-cache TTL from the breakdown.
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> }
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number }
     // #1766: keys on the upstream terminal frame that bili does not model
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
@@ -385,7 +385,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number };
     terminalExtra?: Record<string, unknown>;
 }
 
@@ -515,7 +515,7 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; contextTokens?: number },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
@@ -539,10 +539,10 @@ function recordUsage(
     const foldNew = ctx.session.stats.pendingFoldUsage === true;
     if (foldNew) ctx.session.stats.pendingFoldUsage = false;
     ctx.log(
-        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
+        `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${usage.contextTokens !== undefined ? ` context=${usage.contextTokens}` : ""}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
     if (total > 0 || reportedCached !== null) {
-        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined });
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined, context: usage.contextTokens });
     }
 }
 
@@ -884,7 +884,7 @@ export async function* runCompressLoop(
             const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown>; contextTokens?: number } = {};
             let finishReason: string | undefined;
             let streamError: string | undefined;
             let sawDone = false;
@@ -1033,6 +1033,7 @@ export async function* runCompressLoop(
                             creationTokens: ev.creationTokens,
                             declaredInclusive: ev.declaredInclusive,
                             cacheCreation: ev.cacheCreation,
+                            contextTokens: ev.contextTokens,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
