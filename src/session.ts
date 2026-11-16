@@ -1285,6 +1285,7 @@ function deepSizeOf(value: unknown): number {
         if (Buffer.isBuffer(v)) return 64 + v.byteLength;
         if (v instanceof LazyBlockContents && v.isDropped) return 64; // #3050 R3 ②b: folded away — measuring must not re-materialize it
         if (droppedMetadataProxies.has(v)) return 64; // #3050 R3 ②c: same for folded metadata records
+        if (droppedContentStoreProxies.has(v)) return 64;
         let bytes = 64;
         if (v instanceof Map) {
             for (const [key, item] of v) bytes += size(key) + size(item) + 32;
@@ -1310,6 +1311,10 @@ export function sessionWeight(session: Session): number {
     const bytes = deepSizeOf(session);
     residentWeights.set(session, { revision, bytes });
     return bytes;
+}
+
+export function invalidateResidentWeight(session: Session): void {
+    residentWeights.delete(session);
 }
 
 /** Per-field resident bytes for one session (#R3 diagnostics). The `total` leg

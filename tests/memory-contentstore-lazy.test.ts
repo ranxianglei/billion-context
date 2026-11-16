@@ -74,12 +74,11 @@ test("idle save folds the content store; first touch transparently re-materializ
         await store.writeNow(s);
 
         assert.ok(isDroppedContentStore(s.contentStore), "idle save swaps in the lazy proxy");
-        // NOTE: measuring deepSizeOf through the proxy IS a touch (one narrow
-        // read) — that is the design; RAM goes quiet only until first use.
-        // First touch: full set back, byte-identical to what was seeded.
+        assert.equal(residentBreakdown(s).contentStore, 64, "diagnostics count only the unloaded proxy");
+        assert.ok(isDroppedContentStore(s.contentStore), "measuring must not load persisted originals");
+        assert.equal(Object.keys(s.contentStore!.byRef).length, 30, "all refs visible through the proxy");
         const restored = residentBreakdown(s).contentStore;
         assert.ok(restored >= Math.floor(fullBytes * 0.9), `re-materialized set must match the seed (~${fullBytes}), got ${restored}`);
-        assert.equal(Object.keys(s.contentStore!.byRef).length, 30, "all refs visible through the proxy");
         assert.equal(Object.keys(s.contentStore!.byHash).length, 2, "deduped originals visible");
         const entry = s.contentStore!.byRef["m00001"];
         assert.equal(entry.rawId, "raw-1");
