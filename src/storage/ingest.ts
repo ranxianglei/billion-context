@@ -226,6 +226,33 @@ export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
     };
 }
 
+/** #6878: the raw ids already summarized by an ACTIVE block — the tail
+ *  (lastMessages) is the folded visible tail by contract, so rows whose
+ *  originals a live block covers must not ride the pointer sequence. A fork
+ *  child replays the parent's full raw history as its tail; without this
+ *  filter the adopted blocks' coverage is double-counted (block summaries +
+ *  the same raw text again), inflating the context estimate by orders of
+ *  magnitude and burning the preflight budget on bytes the blocks already
+ *  summarize. Rows stay in the LOG (interned) so block startSeq/endSeq and
+ *  ref resolution keep working; only the tail pointer drops them.
+ *
+ *  #2960 ⑤: applies ONLY to fork children (metadata.derivedFromSessionId
+ *  set by maybeAdoptForkBlocks). A normal session's raw tail (mid-turn) is
+ *  the durable record of everything the client ever sent — the unified table
+ *  must hold it in full even when the envelope truncates it (#2960 ⑤ pin).
+ *  The fork child's raw tail is a REPLAY of the parent's history, not the
+ *  child's own durable record, so the filter is safe there. */
+export function coveredTailIds(session: LegacySessionLike): Set<string> {
+    const derived = session.metadata?.derivedFromSessionId;
+    if (typeof derived !== "string" || derived.length === 0) return new Set();
+    const ids = new Set<string>();
+    for (const b of session.state.blocks) {
+        if (!b.active) continue;
+        for (const id of b.effectiveMessageIds) ids.add(id);
+    }
+    return ids;
+}
+
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
@@ -261,7 +288,14 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     // seqs so the stored log reads oldest-evidence-first.
     if (session.decompositionLog && session.decompositionLog.length > 0) session.decompositionLog.forEach(intern);
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
-    const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
+    // #6878: intern every tail row (the log must keep them for block
+    // startSeq/endSeq + ref resolution) but the POINTER sequence drops the
+    // rows an active block already covers — the tail is the folded visible
+    // tail, not the raw replay.
+    const covered = coveredTailIds(session);
+    const tailSeqs = session.lastMessages
+        ? session.lastMessages.map((m) => ({ seq: intern(m), id: m.id })).filter((e) => !covered.has(e.id)).map((e) => e.seq)
+        : null;
 
     return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
 }
@@ -372,6 +406,12 @@ export function planIngestDelta(
     const byRawRef = session.state.messageRefs.byRaw;
     const log: LogEntry[] = [];
     const appended: number[] = [];
+    // #6878: same tail-derivation rule as the full path — intern every new
+    // row (the log keeps them) but the pointer sequence drops the rows an
+    // active block already covers. The trusted prefix is the previous save's
+    // tailSeqs, which the full path already filtered; a pre-fix stored tail
+    // self-heals on the next full re-ingest.
+    const covered = coveredTailIds(session);
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
         const raw = serializeForStore(m);
@@ -382,7 +422,7 @@ export function planIngestDelta(
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
         const seq = watermark + 1 + log.length;
-        appended.push(seq);
+        if (!covered.has(m.id)) appended.push(seq);
         log.push({
             seq,
             msgId: m.id,
