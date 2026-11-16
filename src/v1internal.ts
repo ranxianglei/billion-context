@@ -106,7 +106,7 @@ export function isV1BackgroundSideRequest(meta: Record<string, unknown>, inner: 
 // conversation history as the initial request"). The token may ride the
 // envelope meta, the inner request root, or inner.generationConfig, in
 // camelCase or snake_case.
-export type V1Continuation = { location: "meta" | "inner" | "generationConfig"; key: string; value: string };
+type V1Continuation = { location: "meta" | "inner" | "generationConfig"; key: string; value: string };
 
 const CONTINUATION_TOKEN_KEYS = ["continuationToken", "continuation_token"] as const;
 
