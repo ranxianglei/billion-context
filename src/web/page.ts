@@ -162,10 +162,10 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </dl>
 <p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
 </div></div>
-<!-- #6804 follow-up: the notices list is long — collapsible card, collapsed
-by default; only #up-notices is re-rendered on refresh, so the user's
-expand/collapse choice survives. -->
-<details class="card cl-card" style="margin-top:16px"><summary class="cl-summary" data-i18n="up.notices">${zh("up.notices")}</summary><div class="card-b"><div id="up-notices" class="dim small">—</div></div></details>
+<!-- #6804 follow-up: the notices list is long — collapsible card, OPEN by
+default (user request); only #up-notices is re-rendered on refresh, so the
+user's expand/collapse choice survives after the first toggle. -->
+<details class="card cl-card" open style="margin-top:16px"><summary class="cl-summary" data-i18n="up.notices">${zh("up.notices")}</summary><div class="card-b"><div id="up-notices" class="dim small">—</div></div></details>
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.install">${zh("up.install")}</span></div><div class="card-b">
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
 <button id="up-upgrade-now" class="btn"><span id="up-upgrade-now-label" data-i18n="up.upgrade_none">${zh("up.upgrade_none")}</span></button>
