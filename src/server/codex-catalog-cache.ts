@@ -118,7 +118,9 @@ function awaitCatalogAbort<T>(pending: Promise<T>, signal: AbortSignal, onLate?:
         void pending.then(
             (value) => {
                 if (settled) {
-                    try { onLate?.(value); } catch {}
+                    // Round already settled (deadline or caller abort): late-response cleanup
+                    // is best-effort and must not surface past the settled outcome.
+                    try { onLate?.(value); } catch { /* best-effort cleanup */ }
                     return;
                 }
                 finish(() => resolve(value));
