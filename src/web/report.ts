@@ -54,7 +54,7 @@ interface ReportData {
             /** #6729 follow-up: one point per nudge round for the recovery line chart. */
             episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number; open?: boolean; credited?: number; extra?: number }>;
         };
-        lines?: Array<{ input?: number; cached?: number }>;
+        lines?: Array<{ at?: number; input?: number; cached?: number; seq?: number }>;
     }) | null;
 }
 
@@ -477,8 +477,52 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 const pct = ev.pct != null ? ev.pct : (p > 0 ? Math.round(((ev.folded || 0) / p) * 1000) / 10 : null);
                 return [{ at: ev.at, S: ev.folded || 0, p, pct, mode: ev.mode ?? "a" }];
             });
+            // Growth recovery (one point per round): folded ÷ context growth since the
+            // previous round's first sample. Answers "did the context actually come back
+            // down" — the ratchet meter (#6720). Needs the per-request usage samples.
+            const uLines = (lines || []).filter((l) => Boolean(l) && (l.at || 0) > 0).sort((a, b) => (a.at || 0) - (b.at || 0));
+            const gPts: Array<{ at: number; s: number; g: number; pct: number | null }> = [];
+            let gPrevEnd: number | null = null; // previous round's last fold — the floor is measured after it
+            eps.forEach((ep) => {
+                const folded = ep.folded || 0;
+                if (!folded) return;
+                const gs = ep.at ?? 0;
+                const nextNud = eps.find((e2, i2) => i2 > eps.indexOf(ep) && (e2.at ?? 0) > gs);
+                let ge: number | null = null;
+                revEvs.forEach((ev) => {
+                    if (ev.kind === "f" && ev.mode === "n" && ev.at >= gs && (nextNud == null || ev.at < (nextNud.at ?? Infinity)) && (ge === null || ev.at > ge)) ge = ev.at;
+                });
+                if (ge === null || !uLines.length) return;
+                const geT = ge;
+                // growth = pre-round floor → round peak. The FLOOR is the lowest input
+                // AFTER the previous round's last fold and BEFORE this round's nudge
+                // (fallback: the whole pre-round history for round one): a fold is itself
+                // a drop, so the min inside the peak window can sit right after an earlier
+                // fold and make "growth" look 10× larger. Peak window = [round start, last
+                // fold + 2 min]. Two conversations can share one session UUID (dsh-client
+                // #5792): sub-25%-of-peak samples are a different stream and are dropped
+                // before taking the min/max.
+                let preMin: number | null = null;
+                for (const pln of uLines) {
+                    if ((pln.at || 0) >= gs) break;
+                    if (gPrevEnd !== null && (pln.at || 0) <= gPrevEnd) continue;
+                    const pin = pln.input || 0;
+                    if (preMin === null || pin < preMin) preMin = pin;
+                }
+                const wAll = uLines.filter((ln) => (ln.at || 0) >= gs && (ln.at || 0) <= geT + 120000).map((ln) => ln.input || 0);
+                if (!wAll.length) return;
+                const gPeakAll = Math.max(...wAll);
+                const gPeak = Math.max(...wAll.filter((v) => v >= 0.25 * gPeakAll));
+                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : Math.min(...wAll.filter((v) => v >= 0.25 * gPeak));
+                const gGrow = Math.max(0, gPeak - gBase);
+                gPts.push({ at: geT, s: folded, g: gGrow, pct: gGrow > 0 ? Math.round(folded / gGrow * 1000) / 10 : null });
+                gPrevEnd = geT;
+            });
             // dynamic axis: 100% is the central reference; over-folds push the axis up (capped 400%)
-            const maxPct = fPts.reduce((mx, fp) => (fp.pct !== null && fp.pct > mx ? fp.pct : mx), 100);
+            const maxPct = Math.max(
+                fPts.reduce((mx, fp) => (fp.pct !== null && fp.pct > mx ? fp.pct : mx), 100),
+                gPts.reduce((mx, gp) => (gp.pct !== null && gp.pct > mx ? gp.pct : mx), 0)
+            );
             const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil(maxPct / 50) * 50);
             const RY = (pct: number): number => bot - (Math.max(0, Math.min(axisMax, pct)) / axisMax) * (bot - top);
             const colFor = (pct: number): string => pct >= 80 ? "#2da44e" : pct >= 40 ? AMB : RED;
@@ -551,6 +595,24 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             });
             if (mainPts.length > 1) body.push('<polyline points="' + mainPts.join(" ") + '" fill="none" stroke="#57606a" stroke-width="1.5"/>');
             if (cumPts.length > 1) body.push('<polyline points="' + cumPts.join(" ") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="4 3"/>');
+            // growth line: thick blue, one point per round
+            const gLinePts: string[] = [];
+            gPts.forEach((gp) => { if (gp.pct !== null) gLinePts.push(TX(gp.at).toFixed(1) + "," + RY(gp.pct).toFixed(1)); });
+            if (gLinePts.length > 1) body.push('<polyline points="' + gLinePts.join(" ") + '" fill="none" stroke="' + ACC + '" stroke-width="2"/>');
+            gPts.forEach((gp) => {
+                const x = TX(gp.at);
+                if (gp.pct === null) {
+                    // no new growth → mark on the 0% axis (pure older-stock cleanup)
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + ACC + '"/><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title>");
+                    return;
+                }
+                const over = gp.pct > 100;
+                const dcol = over ? ACC : colFor(gp.pct);
+                if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + ACC + '"/>');
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="' + dcol + '" stroke="#ffffff" stroke-width="1"/><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title>");
+                const lx = x + 9 > right - 44 ? x - 9 : x + 9;
+                txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: dcol, anchor: lx < x ? "end" : "start", mono: true });
+            });
             y += CH + 16;
         }
         tableHead(rcols);

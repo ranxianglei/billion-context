@@ -2133,7 +2133,7 @@ function changelogCatOf(rawLine) {
         if ((s.totalFolded || 0) > (s.totalPending || 0)) head += " · " + t("det.rec_over_stock");
         return '<div class="hint mono" style="margin:2px 0 4px 2px;font-size:12px">' + escapeHtml(head) + "</div>";
     }
-    function recoveryRoundSvg(events) {
+    function recoveryRoundSvg(events, lines) {
   if (!events || !events.length) return "";
   // Normalize both shapes: the server report carries {pending, folded}, the internal
   // fixtures {p, S}. Everything below speaks the internal shape.
@@ -2198,8 +2198,58 @@ function changelogCatOf(rawLine) {
     var qe = evs[q0];
     if (qe.kind === "f") fPts.push({ at: qe.at, S: qe.S, p: qe.p || 0, mode: qe.mode, pct: (qe.p || 0) > 0 ? Math.round(1000 * qe.S / qe.p) / 10 : null });
   }
+  // Growth recovery (one point per round): folded ÷ context growth since the previous
+  // round's last fold. The recommendation line answers "did it fold what it was told to";
+  // this answers "did the context actually come back down" — the ratchet meter (#6720).
+  // Needs the request-usage samples (the shared brush window); without them it is off.
+  var uLines = (lines || []).filter(function (l) { return Boolean(l) && l.at > 0; }).sort(function (a, b) { return a.at - b.at; });
+  var gPts = [];
+  var gPrevEnd = null; // previous round's last fold — the floor is measured after it
+  for (var gi = 0; gi < episodes.length; gi++) {
+    var gep = episodes[gi];
+    if (!gep || !(gep.folded || 0)) continue;
+    var gs = gep.at;
+    var nextNud = null;
+    for (var gn = 0; gn < evs.length; gn++) if (evs[gn].kind === "n" && evs[gn].at > gs) { nextNud = evs[gn].at; break; }
+    var ge = null;
+    for (var gf = 0; gf < evs.length; gf++) {
+      var gfe = evs[gf];
+      if (gfe.kind === "f" && gfe.mode === "n" && gfe.at >= gs && (nextNud === null || gfe.at < nextNud) && (ge === null || gfe.at > ge)) ge = gfe.at;
+    }
+    if (ge === null || !uLines.length) continue;
+    // growth = pre-round floor → round peak. The FLOOR is the lowest input BEFORE this
+    // round's nudge, not any in-round sample: a fold is itself a drop, so the min inside
+    // the window can sit right after an earlier fold and make "growth" look 10× larger.
+    // Peak window = [round start, last fold + 2 min]. Two conversations can share one
+    // session UUID (dsh-client #5792): sub-25%-of-peak samples are a different stream
+    // and are dropped before taking the min (applied to both floor and peak sets).
+    var preMin = null;
+    for (var gp = 0; gp < uLines.length; gp++) {
+      var pln = uLines[gp];
+      if (pln.at >= gs) break;
+      if (gPrevEnd !== null && pln.at <= gPrevEnd) continue;
+      var pin = pln.input || 0;
+      if (preMin === null || pin < preMin) preMin = pin;
+    }
+    var wSamples = [];
+    for (var gu = 0; gu < uLines.length; gu++) {
+      var gln = uLines[gu];
+      if (gln.at < gs || gln.at > ge + 120000) continue;
+      wSamples.push(gln.input || 0);
+    }
+    if (!wSamples.length) continue;
+    var gPeakAll = Math.max.apply(null, wSamples);
+    var gPeak = Math.max.apply(null, wSamples.filter(function (v) { return v >= 0.25 * gPeakAll; }));
+    var gBase;
+    if (preMin !== null && preMin >= 0.25 * gPeak) gBase = preMin;
+    else gBase = Math.min.apply(null, wSamples.filter(function (v) { return v >= 0.25 * gPeak; }));
+    var gGrow = Math.max(0, gPeak - gBase);
+    gPts.push({ at: ge, s: gep.folded || 0, g: gGrow, pct: gGrow > 0 ? Math.round(1000 * (gep.folded || 0) / gGrow) / 10 : null });
+    gPrevEnd = ge;
+  }
   var maxPct = 100;
   for (var q1 = 0; q1 < fPts.length; q1++) if (fPts[q1].pct !== null && fPts[q1].pct > maxPct) maxPct = fPts[q1].pct;
+  for (var qg = 0; qg < gPts.length; qg++) if (gPts[qg].pct !== null && gPts[qg].pct > maxPct) maxPct = gPts[qg].pct;
   var axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
   function yAt(pct) {
     var c = Math.max(0, Math.min(axisMax, pct));
@@ -2283,6 +2333,29 @@ function changelogCatOf(rawLine) {
     if (labX > W - PR - 30) labX = W - PR - 30;
     lastLblX = labX;
     parts.push('<text x="' + labX.toFixed(1) + '" y="' + (fy - 9).toFixed(1) + '" text-anchor="middle" font-size="10" font-weight="600" fill="' + pc + '">' + f.pct + "%</text>");
+  }
+  // ④b the growth line: thick blue, one point per round (folded ÷ growth since last fold)
+  if (!uLines.length && episodes.some(function (ep) { return (ep.folded || 0) > 0; })) {
+    parts.push('<text x="' + (W - PR) + '" y="' + (PT - 22) + '" text-anchor="end" font-size="10" fill="#6e7781">' + escapeHtml(t("det.rec_growth_noline")) + "</text>");
+  }
+  var gLine = [];
+  for (var gl = 0; gl < gPts.length; gl++) if (gPts[gl].pct !== null) gLine.push(xx(gPts[gl].at).toFixed(1) + "," + yAt(gPts[gl].pct).toFixed(1));
+  if (gLine.length >= 2) parts.push('<path d="M' + gLine.join(" L") + '" fill="none" stroke="#0969da" stroke-width="2"/>');
+  for (var gr = 0; gr < gPts.length; gr++) {
+    var gq = gPts[gr];
+    var gx2 = xx(gq.at);
+    if (gq.pct === null) {
+      // No new growth in the round → pure older-stock cleanup; mark on the 0% axis.
+      parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + (H - PB).toFixed(1) + '" r="5" fill="none" stroke="#0969da"><title>' + escapeHtml(t("det.rec_growth_flat", { s: fmtW(gq.s) })) + "</title></circle>");
+      continue;
+    }
+    var gy2 = yAt(gq.pct);
+    var gpc = gq.pct > 100 ? "#0969da" : colFor(gq.pct);
+    if (gq.pct > 100) parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="8" fill="none" stroke="#0969da"/>');
+    parts.push('<circle cx="' + gx2.toFixed(1) + '" cy="' + gy2.toFixed(1) + '" r="5.5" fill="' + gpc + '"><title>' + escapeHtml(t("det.rec_growth_tip", { at: fmtDT(gq.at), g: fmtW(gq.g), s: fmtW(gq.s), pct: gq.pct })) + "</title></circle>");
+    var glx = gx2 + 10, ganchor = "start";
+    if (glx > W - PR - 40) { glx = gx2 - 10; ganchor = "end"; }
+    parts.push('<text x="' + glx.toFixed(1) + '" y="' + (gy2 + 3).toFixed(1) + '" text-anchor="' + ganchor + '" font-size="10" font-weight="700" fill="' + gpc + '">' + gq.pct + "%</text>");
   }
   // ⑤ round brackets (bottom): the per-nudge-round sums
   for (var bi = 0; bi < episodes.length; bi++) {
@@ -2623,7 +2696,7 @@ function changelogCatOf(rawLine) {
     // #6729: the recovery chart joins the same brush link. makeChartZoom's visible()
     // filters recovery events to the zoomed [t0, t1]; this render callback re-derives the
     // per-round aggregates for whatever window it is given.
-    const recZoom = makeChartZoom({ elId: "rec-chart", statusId: "rec-status", resetId: "rec-reset", link: detailChartLink, render: (lines, folds, seams, recovery) => (recovery && recovery.events && recovery.events.length) ? recoveryRoundSvg(recovery.events) : "" });
+    const recZoom = makeChartZoom({ elId: "rec-chart", statusId: "rec-status", resetId: "rec-reset", link: detailChartLink, render: (lines, folds, seams, recovery) => (recovery && recovery.events && recovery.events.length) ? recoveryRoundSvg(recovery.events, lines) : "" });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -3476,6 +3549,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push(legendItem("background:#0969da", t("det.rec_leg_active")));
             parts.push('<span><span class="dot" style="background:none;border-top:2px dashed #8250df;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_cum") + "</span>");
             parts.push(legendItem("background:#57606a", t("det.rec_leg_pt")));
+            parts.push('<span><span class="dot" style="background:none;border-top:3px solid #0969da;height:0;border-radius:0;width:14px"></span>' + t("det.rec_leg_growth") + "</span>");
             parts.push("</div>");
             parts.push('<div class="hint" style="margin-top:6px">' + escapeHtml(t("det.rec_note_t1")) + "<br>" + escapeHtml(t("det.rec_note_burst")) + "</div>");
             parts.push("</div></div>");

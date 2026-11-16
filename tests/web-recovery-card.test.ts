@@ -35,6 +35,9 @@ const TIP_TEMPLATES: Record<string, string> = {
     "det.rec_bracket_open": "open round · {k} calls · {s}/{p} · {pct}",
     "det.rec_flag_tip": "nudge injected · {tier} · {at} · {p} recommended",
     "det.rec_norec": "no recommendation (non-T1) · {at} · folded {s}",
+    "det.rec_growth_tip": "growth {g} → folded {s} · {pct}%",
+    "det.rec_growth_flat": "no new growth this round (older-stock cleanup) · folded {s}",
+    "det.rec_growth_noline": "growth data unavailable in this window",
 };
 const T = (k: string, p?: Record<string, unknown>): string => {
     const tpl = TIP_TEMPLATES[k] || k;
@@ -59,10 +62,26 @@ const recoveryEpisodes = new Function(
 const recoveryRoundSvg = new Function(
     "t", "fmtW", "fmtDT", "escapeHtml", "TRAJ_W", "recoveryEpisodesFromEvents",
     `${extractFn(WEB_CLIENT, "recoveryWindowMeta")}\n${extractFn(WEB_CLIENT, "recoveryRoundSvg")}; return recoveryRoundSvg;`,
-)(T, FAKE_W, FAKE_DT, FAKE_ESC, 660, recoveryEpisodes) as (events: unknown[]) => string;
+)(T, FAKE_W, FAKE_DT, FAKE_ESC, 660, recoveryEpisodes) as (events: unknown[], lines?: unknown[]) => string;
 
 const T0 = 1_760_000_000_000;
 const MIN = 60_000;
+// Per-request usage samples (the shared brush window's lines). FLOOR = lowest input
+// AFTER the previous round's last fold and BEFORE this round's nudge (window min for
+// round one); PEAK = max over [round start, last fold + 2 min]; growth = peak − floor.
+// R1: floor 1000 (window min) → peak 1100 → growth 100,  folded 60+50=110 → 110% (over)
+// R2: floor 2100 (window min) → peak 2310 → growth 210,  folded 150        → 71.4% (under)
+// R4: floor 2320 (sample @20m, post-R2) → peak 3390 → growth 1070, folded 310 → 29% (ratchet)
+const LINES = [
+    { at: T0, input: 1000, cached: 500 },
+    { at: T0 + 1 * MIN, input: 1060, cached: 600 },
+    { at: T0 + 2 * MIN, input: 1100, cached: 700 },
+    { at: T0 + 10 * MIN, input: 2100, cached: 1500 },
+    { at: T0 + 11 * MIN, input: 2310, cached: 1600 },
+    { at: T0 + 20 * MIN, input: 2320, cached: 2000 },
+    { at: T0 + 30 * MIN, input: 3300, cached: 2500 },
+    { at: T0 + 31 * MIN, input: 3390, cached: 2600 },
+];
 // n1@T0(pending 100) → f1, f2 burst → n2@T0+10m(pending 200) → f3 → active f4 → n3@T0+20m(pending 0)
 // round 3 (pct null) then: n4@T0+30m(pending 100) → f5 310 (OVER-fold: 100 from the list + 210 old stock)
 const EVENTS = [
@@ -121,8 +140,9 @@ test("#6729: the chart draws the 100% baseline, an extended axis, per-fold point
     assert.ok(svg.includes("excess old stock"), "bracket shows the extra as old stock");
     assert.ok(svg.includes("(over-compression, includes old stock)"), "point tip marks over-compression");
     // axisMax for maxPct 310 = ceil(341/50)*50 = 350 → the axis extends well past the baseline
-    assert.ok(svg.includes("350%"), "axis extends past the baseline (axisMax 350)");
+    assert.ok(svg.includes("350%"), "axis extends past the baseline (axisMax 350 without lines → fPts only)");
     assert.ok(!svg.includes("400%"), "axis not pushed to the cap for this data");
+    assert.ok(svg.includes("growth data unavailable"), "note when the window has no usage samples");
 });
 
 test("#6729: windowed events re-derive per-round aggregates (the linked-zoom path)", () => {
@@ -193,6 +213,43 @@ test("#6729: every compression sits on the line; a round's points sum to its rec
     assert.ok(noRec.includes("no recommendation (non-T1)"), "its tooltip explains why");
 });
 
+test("#6729: the growth line plots one point per round (folded ÷ growth since the last fold)", () => {
+    const svg = recoveryRoundSvg(EVENTS, LINES);
+    // three measurable growth rounds (R1 110%, R2 71.4%, R4 29%) → three thick-line dots
+    const gDots = (svg.match(/r="5\.5"/g) || []).length;
+    assert.equal(gDots, 3, "one growth point per round with folds");
+    assert.ok(svg.includes('stroke="#0969da" stroke-width="2"'), "thick blue growth line connects the rounds");
+    for (const lab of ["110%", "71.4%", "29%"]) assert.ok(svg.includes(lab), "growth label " + lab);
+    assert.ok(svg.includes("growth 210 → folded 150 · 71.4%"), "R2 tooltip: floor is the post-R1 state");
+    // R4: floor 2320 (the @20m sample, after R2's fold at T0+11m) → the ratchet reads 29%
+    assert.ok(svg.includes("growth 1070 → folded 310 · 29%"), "R4 tooltip: floor measured after the previous round's last fold");
+    // R1 at 110% is over the baseline → halo on its growth dot (fold dots use r=7, growth r=8)
+    assert.ok(svg.includes('r="8" fill="none" stroke="#0969da"'), "halo on the over-100% growth dot (R1 110%)");
+    assert.ok(svg.includes("350%"), "axis = ceil(310*1.1/50)*50 (growth 110% is under it)");
+    // no usage lines → the growth line is silently off, the rest still renders
+    const noLines = recoveryRoundSvg(EVENTS, []);
+    assert.doesNotMatch(noLines, /r="5\.5"/);
+    assert.ok(noLines.includes("310%"), "per-fold points unaffected by missing lines");
+    assert.ok(noLines.includes("growth data unavailable"), "legend note when the window has no usage samples");
+});
+
+test("#6729: a round with no new growth marks the baseline (pure older-stock cleanup)", () => {
+    // the whole round's input stays flat → growth 0 → hollow baseline circle, no fake %
+    const flat = [
+        { at: T0, kind: "n", tier: 1, pending: 100, paired: true },
+        { at: T0 + MIN, kind: "f", S: 310, folded: 310, p: 100, mode: "n", pct: 310 },
+    ];
+    const flatLines = [
+        { at: T0, input: 100000, cached: 50000 },
+        { at: T0 + MIN, input: 100000, cached: 50000 },
+    ];
+    const svg = recoveryRoundSvg(flat, flatLines);
+    assert.ok(svg.includes("no new growth this round"), "flat-round tooltip");
+    assert.ok(svg.includes('r="5" fill="none" stroke="#0969da"'), "hollow marker on the baseline");
+    // the flat marker carries NO fake % (the tooltip names the folded mass only)
+    assert.doesNotMatch(svg, /no new growth this round[^<]*\d+(\.\d+)?%[^<]*<\/title>/);
+});
+
 test("#6729: empty window returns empty string (the render callback contract)", () => {
     assert.equal(recoveryRoundSvg([]), "");
     assert.equal(recoveryRoundSvg([null, undefined] as unknown[]), "");
@@ -204,8 +261,9 @@ test("#6729: client wires the recovery chart into the detail-chart brush link", 
     assert.match(WEB_CLIENT, /id=\\"?rec-chart\\"?|id="rec-chart"/);
     // third linked member with the same detailChartLink
     assert.match(WEB_CLIENT, /const recZoom = makeChartZoom\(\{ elId: "rec-chart", statusId: "rec-status", resetId: "rec-reset", link: detailChartLink/);
-    // render callback consumes the 4th (recovery) parameter visible() provides
-    assert.match(WEB_CLIENT, /render: \(lines, folds, seams, recovery\) => \(recovery && recovery\.events && recovery\.events\.length\) \? recoveryRoundSvg\(recovery\.events\) : ""/);
+    // render callback consumes the 4th (recovery) parameter visible() provides, and feeds
+    // the usage lines so the growth line (folded ÷ growth) can be derived client-side
+    assert.match(WEB_CLIENT, /render: \(lines, folds, seams, recovery\) => \(recovery && recovery\.events && recovery\.events\.length\) \? recoveryRoundSvg\(recovery\.events, lines\) : ""/);
     // bound on the same code path as the trajectory/hit-rate charts
     assert.match(WEB_CLIENT, /bindRecoveryChart\(d\);/);
     // the in-SVG header text is gone (it collided with the first nudge flag's label):
