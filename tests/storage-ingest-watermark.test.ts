@@ -739,3 +739,51 @@ test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () 
         rmBestEffort(dir);
     }
 });
+
+// ---------------------------------------------------------------------------
+// #6878 — fork child tail-derivation: the tail pointer sequence must exclude
+// rows whose originals an active block already covers. A fork child replays
+// the parent's full raw history as its tail; without the filter the adopted
+// blocks' coverage is double-counted (block summaries + the same raw text
+// again), inflating the context estimate by orders of magnitude.
+
+test("#6878 fork child: tailSeqs excludes covered rows (full path)", () => {
+    const s = mkLegacy("fork-child", [msg(0), msg(1), msg(2), msg(3), msg(4)]);
+    s.metadata = { derivedFromSessionId: "parent-abc" };
+    s.state.blocks = [
+        { blockId: "b1", active: true, effectiveMessageIds: ["h_msg0", "h_msg1"], directBlockIds: [], compressedTokens: 100 },
+    ] as never[];
+    const plan = planIngest(s);
+    const tailIds = plan.tailSeqs!.map((idx) => plan.messages[idx]!.msgId);
+    assert.deepEqual(tailIds, ["h_msg2", "h_msg3", "h_msg4"], "covered rows (h_msg0, h_msg1) excluded from the tail pointer");
+    assert.equal(plan.messages.length, 5, "all rows stay in the LOG (interned) for block startSeq/endSeq + ref resolution");
+});
+
+test("#6878 normal session: tailSeqs keeps all rows (no derivedFromSessionId)", () => {
+    const s = mkLegacy("normal", [msg(0), msg(1), msg(2)]);
+    s.state.blocks = [
+        { blockId: "b1", active: true, effectiveMessageIds: ["h_msg0"], directBlockIds: [], compressedTokens: 50 },
+    ] as never[];
+    const plan = planIngest(s);
+    const tailIds = plan.tailSeqs!.map((idx) => plan.messages[idx]!.msgId);
+    assert.deepEqual(tailIds, ["h_msg0", "h_msg1", "h_msg2"], "normal session keeps the full raw tail (#2960 ⑤ pin)");
+});
+
+test("#6878 fork child: delta path also filters covered rows from the new tail", () => {
+    const s = mkLegacy("fork-delta", [msg(0), msg(1), msg(2), msg(3)]);
+    s.metadata = { derivedFromSessionId: "parent-xyz" };
+    s.state.blocks = [
+        { blockId: "b1", active: true, effectiveMessageIds: ["h_msg2"], directBlockIds: [], compressedTokens: 80 },
+    ] as never[];
+    const boundary = msg(1);
+    const hBoundary = createHash("sha256").update(JSON.stringify(boundary)).digest("hex");
+    const plan = planIngestDelta(s, 1, [0, 1], { msgId: boundary.id, contentHash: hBoundary }, true);
+    assert.ok(plan, "delta plan is not null");
+    const tailJson = JSON.parse(plan!.session.tailJson!) as { tailSeqs: number[] };
+    // Trusted prefix (seqs 0, 1) kept; new tail = [h_msg2 (covered, seq 2), h_msg3 (uncovered, seq 3)].
+    // The filter excludes seq 2 from the appended seqs, so tailSeqs = [0, 1, 3].
+    assert.deepEqual(tailJson.tailSeqs, [0, 1, 3], "covered new row excluded from the tail pointer");
+    assert.equal(plan!.messages.length, 2, "both new rows are interned (log keeps them)");
+    assert.equal(plan!.messages[0]!.msgId, "h_msg2", "covered row stays in the LOG");
+    assert.equal(plan!.messages[1]!.msgId, "h_msg3", "uncovered row stays in the LOG");
+});
