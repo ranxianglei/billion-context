@@ -39,26 +39,28 @@ test("cold catalog deadline defaults to ten seconds and warm deadline stays four
     t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
         const cold = createCodexCatalogFetch({ directory: null });
-        let coldError: unknown;
-        void cold(never, url, init).catch((error: unknown) => { coldError = error; });
+        let coldSettled = false;
+        const coldFailure = cold(never, url, init).catch((error: unknown) => error).finally(() => { coldSettled = true; });
         t.mock.timers.tick(9999);
         await setImmediate();
-        assert.equal(coldError, undefined);
+        assert.equal(coldSettled, false);
         t.mock.timers.tick(1);
         await setImmediate();
+        assert.equal(coldSettled, true);
+        const coldError = await coldFailure;
         assert.ok(coldError instanceof Error && "code" in coldError && coldError.code === "ETIMEDOUT");
 
         const hot = createCodexCatalogFetch({ directory: null });
         await warm(hot);
-        let cached: FetchResult | undefined;
-        const waiting = hot(never, url, init).then((value) => { cached = value; });
+        let warmSettled = false;
+        const waiting = hot(never, url, init).finally(() => { warmSettled = true; });
         t.mock.timers.tick(3999);
         await setImmediate();
-        assert.equal(cached, undefined);
+        assert.equal(warmSettled, false);
         t.mock.timers.tick(1);
-        await waiting;
-        assert.equal(cached?.response.headers.get("x-bili-model-catalog"), "offline-cache");
-        assert.equal(await cached?.response.text(), catalog);
+        const cached = await waiting;
+        assert.equal(cached.response.headers.get("x-bili-model-catalog"), "offline-cache");
+        assert.equal(await cached.response.text(), catalog);
     } finally {
         t.mock.timers.reset();
     }
