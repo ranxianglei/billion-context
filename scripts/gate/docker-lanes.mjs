@@ -20,6 +20,7 @@
 // (default /gate/repo), GATE_SKIP (comma list, same semantics as the gate).
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -134,7 +135,22 @@ if (skip.includes("x")) {
 //      HOLD the pinned version while the registry serves a newer one;
 //   2. an explicit `bili update` breaks through, installs, and CLEARS the pin;
 //   3. re-pin → holds again → `bili unpin` → the auto-updater RESUMES on its own.
-const PIN_PORT = 18787; // host-network container: picked to avoid host collisions
+// host-network container: the port space is SHARED with the host — a
+// concurrent gate's plugin lanes roam the 18xxx range, so probe for a free
+// port instead of trusting a constant (18787 was held by a neighbor run and
+// the server came up alive-but-unreachable; #6804 gate run, 2026-11-16).
+let PIN_PORT = 0;
+const portFree = (port) => new Promise((resolve) => {
+  const srv = net.createServer();
+  srv.once("error", () => resolve(false));
+  srv.listen({ port, host: "127.0.0.1" }, () => srv.close(() => resolve(true)));
+});
+const pickPinPort = async () => {
+  for (const p of [18787, 18788, 18789, 18790, 18791, 18792, 18793, 18794, 18795, 18796]) {
+    if (await portFree(p)) return p;
+  }
+  throw new Error("no free pin-server port in 18787-18796 — rerun the gate without a concurrent run");
+};
 const PIN_SERVER_ENV = () => ({
   BILI_UPDATE_CHECK_INTERVAL_MS: "5000",
   BILI_UPDATE_STAGGER_MIN_MS: "0",
@@ -142,6 +158,8 @@ const PIN_SERVER_ENV = () => ({
 });
 if (!skip.includes("x") && NEXT) {
   log(`\n-- Lane Xp: pin policy (#6804) — hold / explicit break-through / unpin resume`);
+  PIN_PORT = await pickPinPort();
+  log(`[Xp] pin server port: ${PIN_PORT}`);
   const cacheHome = process.env.XDG_CACHE_HOME?.length ? process.env.XDG_CACHE_HOME : path.join(os.homedir(), ".cache");
   const pinFile = path.join(cacheHome, "billion-context", ".pin.json");
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
