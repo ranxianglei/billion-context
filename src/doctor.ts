@@ -285,6 +285,11 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
         verdict: laneVerdict({ installed: presence.installed, targetMissing: missingTargets.length > 0, frozen: false, copyVersion: presence.copyVersion, registryVersion }),
     };
     if (row.verdict === "broken") row.reason = missingTargets.map((t) => `target missing: ${t}`).join("; ");
+    if (presence.spawnWarnings !== undefined && presence.spawnWarnings.length > 0) {
+        // #6891: advisory spawn-command notes (e.g. zcode's bare-`node` entries)
+        // — the lane may still work, so they never touch the verdict.
+        row.warnings = [...(row.warnings ?? []), ...presence.spawnWarnings];
+    }
     if (agent === "opencode" && presence.installed && presence.form === "npm") {
         // #1234/#2199: the cache copy is bili-owned in place (self-updates via its
         // own proxy) — show the actual load path + disk version when resolvable so
