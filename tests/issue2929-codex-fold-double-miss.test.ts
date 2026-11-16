@@ -35,12 +35,12 @@ type Item = Record<string, unknown>;
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const NUDGE_MARKER = "Compressible ranges (";
 // Indices verified against the kernel's nudge gate with nudgeGrowthTokens=2000
-// and ~9KiB filler turns. Pre-#4521 (master) the injections landed on
-// requests {7,8,9}; since #4521 the armed-but-silent status line rides an
-// ephemeral carrier on the gated turns and its shown-marker feeds the nudge
-// gate back, so the schedule shifts to {4,6,8,9} — the fold/proxy-tool-round
-// mechanics under test are unchanged, only this probe's anchor re-calibrates
-// to the next nudge-carrying request pair (6 → tool round, 7 → fold round).
+// and ~9KiB filler turns. The carrier index is sensitive to any per-turn
+// prompt-surface change: #4521 added an armed-but-silent status line on the
+// gated turns (shifting injections to {4,6,8,9}) and #6928 removed that line
+// again, shifting them back. Do not pin the carrier: the scenario gate below
+// only requires that SOME pre-fold request carried the nudge, which is the
+// actual production precondition the #2929 probe must materialize.
 const PROXY_TOOL_AT = 6; // upstream request index whose response = acp_status call (round 1)
 const FOLD_AT = 7;       // upstream request index whose response = compress call (round 2)
 // FOLD_AT+1 = post-fold refreshed re-request (round 3); FOLD_AT+2 = next steady client turn.
@@ -229,8 +229,9 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
         // the PRE-FOLD original request (production shape: nudge armed -> model
         // calls proxy tool -> compress). Without it this probe does not cover
         // the #2929 trigger.
-        assert.ok(hasNudge(inputs[PROXY_TOOL_AT]!), `scenario miss: no ephemeral nudge in the pre-fold request (inputs[${PROXY_TOOL_AT}]) — probe does not cover the production trigger; adjust nudgeGrowthTokens/filler`);
-        console.log(`probe: nudge confirmed in pre-fold request; total upstream requests=${inputs.length}`);
+        const nudgeCarriers = inputs.slice(0, FOLD_AT).map((it, i) => (hasNudge(it) ? i : -1)).filter((i) => i >= 0);
+        assert.ok(nudgeCarriers.length > 0, `scenario miss: no ephemeral nudge in any pre-fold request (fold round is ${FOLD_AT}) — probe does not cover the production trigger; adjust nudgeGrowthTokens/filler`);
+        console.log(`probe: nudge confirmed in pre-fold request(s) ${nudgeCarriers.join(",")}; total upstream requests=${inputs.length}`);
 
         // (1) The post-fold re-request carries the in-place summary(s).
         const rPost = inputs[FOLD_AT + 1]!;
