@@ -427,25 +427,42 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
     return json as Record<string, unknown>;
 }
 
+/** #6900: the manifest's version + build commit, structured. `version` is the
+ *  clean, comparable semver; `commit` is display-only (undefined when the
+ *  manifest carries none). Version COMPARISON must use `version` — the display
+ *  string `version (commit)` would never parse (parseSemVer rejects the
+ *  suffix), which is exactly what silently killed the #3544 stale-proxy
+ *  rotation on the dsh-native attach path. */
+export interface ProxyVersionParts {
+    version: string;
+    commit?: string;
+}
+
+export async function fetchProxyVersionParts(proxyBase: string, init?: RequestInit): Promise<ProxyVersionParts | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const m = json as { version?: unknown; commit?: unknown };
+    const version = m.version;
+    if (typeof version !== "string" || version.length === 0) return undefined;
+    const commit = m.commit;
+    return { version, commit: typeof commit === "string" && commit.length > 0 ? commit : undefined };
+}
+
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
  *  conversation not seen yet" — an armed-but-idle state, not an error.
  *  #5167: `init` lets callers send Connection: close so the probe rides a
  *  FRESH connection — the drain-aware rotation wait relies on it (a pooled
  *  keep-alive socket keeps being answered by a resident that already closed
- *  its listener and is merely draining, which reads as a false "alive"). */
+ *  its listener and is merely draining, which reads as a false "alive").
+ *  #6900: this is the DISPLAY string (`version (commit)`); version COMPARISON
+ *  must use fetchProxyVersionParts().version — parseSemVer rejects the suffix. */
 export async function fetchProxyVersion(proxyBase: string, init?: RequestInit): Promise<string | undefined> {
-    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, init, STATUS_TIMEOUT_MS);
-    if (!ok || !json || typeof json !== "object") return undefined;
-    const m = json as { version?: unknown; commit?: unknown };
-    const version = m.version;
-    if (typeof version !== "string" || version.length === 0) return undefined;
+    const parts = await fetchProxyVersionParts(proxyBase, init);
+    if (parts === undefined) return undefined;
     // Append the build commit so status surfaces show WHICH build answers,
-    // matching /__bili/status and `--version` (they all include it). Consumers
-    // only display or liveness-check this string — none parses it.
-    const commit = m.commit;
-    if (typeof commit === "string" && commit.length > 0) return `${version} (${commit})`;
-    return version;
+    // matching /__bili/status and `--version` (they all include it).
+    return parts.commit !== undefined ? `${parts.version} (${parts.commit})` : parts.version;
 }
 
 /** #1603: one-line staleness warning for status UIs — the on-disk install is

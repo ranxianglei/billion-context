@@ -15,7 +15,8 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { BUILD_COMMIT } from "../src/version.ts";
-import { fetchProxyVersion } from "../src/agent/shared.ts";
+import { fetchProxyVersion, fetchProxyVersionParts } from "../src/agent/shared.ts";
+import { isVersionNewer } from "../src/update.ts";
 import { EXTERNAL_SUMMARY_CALL_ID_PREFIX, isExternalSummaryBlock } from "../src/external-summary-marker.ts";
 
 // Marker surfaces for externally-summarized blocks + version surfaces that
@@ -185,6 +186,26 @@ test("panel header and fetchProxyVersion both surface the build commit", async (
         assert.ok(version, "version probe answered");
         if (BUILD_COMMIT !== "unknown") {
             assert.match(version!, new RegExp(`\\(${BUILD_COMMIT}\\)$`));
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+test("fetchProxyVersionParts returns the clean semver separately from the commit (#6900)", async () => {
+    const h = await startHarness();
+    try {
+        const parts = await fetchProxyVersionParts(`http://127.0.0.1:${h.proxyPort}`);
+        assert.ok(parts, "version probe answered");
+        // The clean version must carry NO ` (commit)` suffix — the whole bug was
+        // that the display string's suffix defeated parseSemVer and silently
+        // killed the #3544 rotation.
+        assert.ok(!parts!.version.includes(" ("), "clean version has no commit suffix");
+        // The clean value must actually parse so the rotation can compare it —
+        // a 999.999.999 ceiling is newer than any real version.
+        assert.equal(isVersionNewer("999.999.999", parts!.version), true);
+        if (BUILD_COMMIT !== "unknown") {
+            assert.equal(parts!.commit, BUILD_COMMIT, "commit surfaced separately");
         }
     } finally {
         await h.close();

@@ -11,6 +11,22 @@ test("isVersionNewer compares numeric segments", () => {
     assert.equal(isVersionNewer("v1.2.3", "1.2.2"), true);
 });
 
+test("isVersionNewer tolerates the fetchProxyVersion ` (commit)` display suffix (#6900)", () => {
+    // The dsh-native #3544 rotation compares the resident's manifest version
+    // (rendered `X.Y.Z (hexcommit)` by fetchProxyVersion) against VERSION. A
+    // trailing commit suffix must not defeat the comparison — the regression
+    // that silently killed the rotation.
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 (abc123)"), true);
+    assert.equal(isVersionNewer("0.1.214 (abc123)", "0.1.215"), false);
+    assert.equal(isVersionNewer("0.1.215 (def456)", "0.1.214 (abc123)"), true);
+    // Equal versions with a suffix are NOT newer (strict comparison).
+    assert.equal(isVersionNewer("0.1.215 (abc123)", "0.1.215 (abc123)"), false);
+    // Clean semvers are unaffected by the tolerance (the strip is a no-op).
+    assert.equal(isVersionNewer("0.1.215", "0.1.214"), true);
+    // A non-hex parenthetical is NOT a commit suffix — still rejected.
+    assert.equal(isVersionNewer("0.1.215", "0.1.214 (notahex)"), false);
+});
+
 test("isVersionNewer handles prerelease ordering (pre < release, numeric pre parts)", () => {
     // A prerelease is OLDER than its release: 0.1.46-pr.202.1 < 0.1.46
     assert.equal(isVersionNewer("0.1.46", "0.1.46-pr.202.1"), true);
