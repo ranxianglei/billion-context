@@ -41,7 +41,41 @@ function baseIdOfCore(m: BiliMessage): string | null {
     }
 }
 
-export function createHandoffReply(session: Session, canSave: () => boolean = () => true) {
+/**
+ * #6947 join polish: re-stamp the sidecars each protocol codec would add on
+ * the NEXT re-send, so the write-back row's stored bytes join the re-send
+ * row's by identity (identityOfStoredContent strips only id/wireIndex —
+ * every other field counts). Without this, the re-send ingest lands a
+ * second row for the same logical message (tombstone churn + the content
+ * CAS storing the reply bytes twice) on long sessions:
+ *  - openai reasoning cores carry `reasoningContent` (the codec stamps the
+ *    reasoning text a second time — kernel/src/wire/openai.ts);
+ *  - openai clients (pi) re-serialize tool-call args with parse +
+ *    JSON.stringify (compact, key order preserved) and the anthropic codec
+ *    stores safeStringify(input) — both reduce to the same normalization
+ *    of the verbatim streamed args.
+ * Lanes whose codecs attach payload sidecars the text capture cannot
+ * reproduce (google rawGoogleParts / responses rawResponsesItem /
+ * anthropic thinkingSignature) keep the write-back row byte-distinct —
+ * accepted residual, same class as client round-trip drift.
+ */
+function restampForJoin(protocol: string | undefined, m: CoreMessage): CoreMessage {
+    const b = m as BiliMessage;
+    const text = b.text ?? "";
+    if (b.contentType === "reasoning" && protocol === "openai") {
+        const stamped: BiliMessage = { ...b, reasoningContent: text };
+        return stamped as CoreMessage;
+    }
+    if (b.contentType === "tool-call" && (protocol === "openai" || protocol === "anthropic")) {
+        try {
+            const parsed: unknown = JSON.parse(text);
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) return { ...m, text: JSON.stringify(parsed) };
+        } catch { /* non-JSON args: keep the verbatim bytes */ }
+    }
+    return m;
+}
+
+export function createHandoffReply(session: Session, canSave: () => boolean = () => true, protocol?: string) {
     const request = session.stats.requests;
     const snapshot = session.lastMessages;
     const messages = new Map<string, { message: CoreMessage; bytes: number; textBytes: number; lastCodeUnit: number }>();
@@ -112,7 +146,7 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
                     if (b !== null) clusters.next(b);
                 }
                 for (const entry of messages.values()) {
-                    const m = entry.message;
+                    const m = restampForJoin(protocol, entry.message);
                     const b = baseIdOfCore(m);
                     // b is null only for image-part cores (the #3751 payload
                     // fingerprint lives in sidecars the capture never sets —

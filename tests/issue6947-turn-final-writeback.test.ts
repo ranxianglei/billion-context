@@ -160,6 +160,84 @@ test("a client re-send of a TOOL-CALL reply through the production codec derives
     assert.equal(resent[2].id, stored[2].id, "tool-call id must match the re-send derivation (canonical join)");
 });
 
+/**
+ * #6947 join polish: ids matching is only HALF of the join — the store key
+ * is `${msg_id}\u0000${identity}` and identity covers EVERY stored field
+ * (id/wireIndex stripped). The raw capture lacks the sidecars the client's
+ * re-send codec stamps (openai `reasoningContent` on reasoning cores) and
+ * keeps the streamed args verbatim while clients like pi re-serialize them
+ * compact — so without restampForJoin the re-send lands a SECOND row for
+ * the same logical message: tombstone churn + the content CAS storing the
+ * reply bytes twice, on every reply of every turn of a long session.
+ */
+test("write-back bytes JOIN the client re-send by identity (openai lane: reasoning sidecar + compacted args)", () => {
+    const argsRaw = '{ "command" : "echo hi" }'; // streamed verbatim (host JSON style)
+    const session = createSession("wb-join");
+    session.lastMessages = convo([{ role: "user", content: "go" }]);
+    session.stats.requests = 1;
+    const reply = createHandoffReply(session, () => true, "openai");
+    reply.append("r", "reasoning", "let me think");
+    reply.append("0", "text", "looking");
+    reply.tool("1", "bash", "call_1", argsRaw);
+    reply.save();
+    const stored = session.lastMessages!;
+    const reasoning = stored.find((m) => m.contentType === "reasoning")!;
+    assert.equal((reasoning as { reasoningContent?: string }).reasoningContent, "let me think", "openai reasoning cores must carry the codec's reasoningContent sidecar");
+    const tool = stored.find((m) => m.contentType === "tool-call")!;
+    assert.equal(tool.text, '{"command":"echo hi"}', "tool-call args must be re-serialized the way clients (pi) re-send them: parse + JSON.stringify");
+
+    // The re-send: pi re-sends the reasoning via the reasoning_content field
+    // and the args as it re-serialized them (compact, order preserved).
+    const resent = openaiToCore({ messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", reasoning_content: "let me think", content: "looking", tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"echo hi"}' } }] },
+        { role: "tool", tool_call_id: "call_1", content: "hi" },
+    ] }).msgs as unknown as CoreMessage[];
+
+    const dir = tmpdir("bili-6947-join-");
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
+            // Turn-end save: write-back rows land (no refs minted yet).
+            assert.equal(store.ingestSession(planIngest(mkLegacy("sjoin", [stored[0], reasoning, stored.find((m) => m.contentType === "text" && m.role === "assistant")!, tool], {}))), true);
+            let rows = store.getMessages("sjoin");
+            assert.equal(rows.length, 4);
+            // Next request: the client re-sends the whole turn. The reply
+            // cores must JOIN the stored rows — no second rows, seq stable.
+            assert.equal(store.ingestSession(planIngest(mkLegacy("sjoin", [...convo([{ role: "user", content: "go" }]), ...resent], { [resent[1].id]: "m00002" }))), true);
+            rows = store.getMessages("sjoin");
+            assert.equal(rows.length, 5, `the re-send must join, not duplicate (got ${rows.length} rows: ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.retiredAt ?? "live"]))})`);
+            for (const m of resent) {
+                const storedRow = rows.find((r) => r.msgId === m.id);
+                assert.ok(storedRow, `re-send core ${m.contentType} must share the write-back row's id`);
+            }
+            const joinedTool = rows.find((r) => r.msgId === tool.id);
+            assert.ok(joinedTool);
+            const turnEndTool = rows.filter((r) => r.msgId === tool.id);
+            assert.equal(turnEndTool.length, 1, "tool-call: exactly one live row after the join");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("without the protocol hint the openai reasoning/tool-call join is NOT claimed (residual stays visible)", () => {
+    const session = createSession("wb-join-noproto");
+    session.lastMessages = convo([{ role: "user", content: "go" }]);
+    session.stats.requests = 1;
+    const reply = createHandoffReply(session); // no protocol → no restamp
+    reply.append("r", "reasoning", "let me think");
+    reply.tool("1", "bash", "call_1", '{ "command" : "echo hi" }');
+    reply.save();
+    const stored = session.lastMessages!;
+    const reasoning = stored.find((m) => m.contentType === "reasoning")!;
+    assert.equal((reasoning as { reasoningContent?: string }).reasoningContent, undefined, "no sidecar without the protocol hint");
+    const tool = stored.find((m) => m.contentType === "tool-call")!;
+    assert.equal(tool.text, '{ "command" : "echo hi" }', "args stay verbatim without the protocol hint");
+});
+
 test("folded snapshot: metadata is written but lastMessages is not grown", () => {
     const session = createSession("wb-folded");
     const tail = convo([{ role: "user", content: "hello" }]);
