@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
-import { renderNudgeText, viableRanges } from "acp-kernel";
+import { viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody, type AnthropicWireMessage, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
@@ -20,7 +20,7 @@ import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompac
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, renderHostNudgeText, withFirstSightDrain, withNudgeNotes, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -508,7 +508,9 @@ export async function prepareAnthropic(
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
+        const clientSystemLength = extractSystem(parsed.system).length;
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
+        const acpStandingText = extractSystem(systemOut).slice(clientSystemLength);
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
@@ -536,10 +538,10 @@ export async function prepareAnthropic(
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
+                    const rendered = renderHostNudgeText(turn.nudge, acpStandingText, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withNudgeNotes(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -562,7 +564,7 @@ export async function prepareAnthropic(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withNudgeNotes(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -575,10 +577,10 @@ export async function prepareAnthropic(
                 }
             } else {
                 try {
-                    const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
+                    const rendered = renderHostNudgeText(turn.nudge, acpStandingText, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withNudgeNotes(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), acpStandingText, externalSummaryEnabled(config), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
