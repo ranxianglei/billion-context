@@ -473,6 +473,44 @@ export function frontierClampNote(
     return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
 }
 
+/** #6855: the SUCCESS headline must name the range the kernel actually
+ *  folded. #4521 clamps an endId above the session's highest allocated ref
+ *  down to the highest visible message (the "aiming at the newest tail"
+ *  leniency), but the receipt's detail is built from the REQUESTED ranges —
+ *  so a clamped success taught the model a ceiling that was never minted
+ *  ("Compressed m03693–m03799" when only m03693–m03712 was folded), and its
+ *  next call anchored its START at requested-end+1, which #4521 refuses by
+ *  design (observed: session 01a1dd94, 22:13 clamp → 22:15 m03800 refusal ×2).
+ *  Re-state the effective end; the kernel's snapped warning (carried in
+ *  `warnings`) keeps the requested number for correlation.
+ *  Clamp the displayed end of a range only when the kernel's own warnings
+ *  carry the matching `endId="..."` clamped note — a range the kernel
+ *  hard-refused per-range (e.g. START also above the frontier) was NOT
+ *  folded and must stay shown exactly as requested, next to its
+ *  apply-error note. Missing note / unparseable endpoint = unchanged
+ *  (worst case reproduces the pre-fix receipt, never a wrong one). */
+export function effectiveCompressedDetail(
+    ranges: Array<{ startRef: string; endRef: string }>,
+    highest: number,
+    warnings: string[],
+): string {
+    if (ranges.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    return ranges
+        .map((rg) => {
+            const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+            const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+            const clamped =
+                highest > 0 &&
+                !!s && !!e &&
+                Number(s[1]) <= highest &&
+                Number(e[1]) > highest &&
+                warnings.some((w) => w.includes(`endId="${rg.endRef.trim()}"`));
+            return clamped ? `${rg.startRef.trim()}–${hi}` : `${rg.startRef}–${rg.endRef}`;
+        })
+        .join(", ");
+}
+
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
  *  the ref numbering restarted, so pre-rebase refs the model still cites can
  *  never resolve again. Name the rebase as the deterministic cause so the
@@ -1685,7 +1723,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible
         // whenever some other range in the batch succeeded — surface them on
         // the success line too, not only on total failure.
-        let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // #6855: headline echoes the EFFECTIVE (kernel-clamped) range, not the
+        // requested one — the requested number stays in `warn` for correlation.
+        const effectiveDetail = effectiveCompressedDetail(ranges, highestMappedRef(ctx.session.state), r.warnings);
+        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
