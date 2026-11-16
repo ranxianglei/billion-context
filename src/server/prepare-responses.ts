@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
@@ -598,12 +599,6 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
         }
-        // #4521: armed-but-silent window — same carrier + rationale as the
-        // anthropic lane (ephemeral trailing user item, current refs instead
-        // of model-guessed ones).
-        if (turn.statusLine && Array.isArray(rebuiltInput)) {
-            rebuiltInput = [...(rebuiltInput as ResponseInputItem[]), { type: "message", role: "user", content: turn.statusLine }];
-        }
         transformOk = true;
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
@@ -755,6 +750,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         separatorSlots,
         sentBodyStr,
     );
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return {
         body: sentBodyStr,
         parsedBody: rebuilt,

@@ -20,6 +20,23 @@ import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 // (x-bili-plugin-agent) and a known side-request agent is a side req by
 // definition regardless of budget.
 export const SIDE_REQUEST_MAX_TOKENS = 200;
+
+/** #6880: the auxiliary purposes dsh's GenerateOptions.purpose carries on the
+ *  wire today: session-title (session-title-llm), compaction (compaction-basic
+ *  summarizer), auto-review (experimental/auto-review classifyRisk),
+ *  timeline-report (experimental/timeline summary). This set is DOCUMENTATION,
+ *  not a gate: dsh's contract is "ordinary conversation requests leave purpose
+ *  unset", so ANY non-empty declared purpose on a plugin-announced request
+ *  classifies it as a side request by declaration. A brand-new sidecar purpose
+ *  needs no bili recognizer anymore — the per-feature template chain
+ *  (#2503/#4438/#5656/#5584) stays only as the fallback for pre-#6880 plugin
+ *  installs. */
+export const KNOWN_AUXILIARY_PURPOSES = new Set([
+    "session-title",
+    "compaction",
+    "auto-review",
+    "timeline-report",
+]);
 // Persona ids whose requests are side requests by intent (#1699). Main personas
 // (build/plan/general/...) are deliberately absent — they are real turns.
 export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
@@ -184,10 +201,16 @@ export function isAudioOutputCall(parsed: unknown): boolean {
     return Object.keys(audio).length > 0;
 }
 
-export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
+export function isSideRequest(parsed: unknown, requestAgent?: string, purpose?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
     if (requestAgent === "main") return false;
+    // #6880: the DECLARED purpose outranks every body heuristic. It arrives
+    // pre-gated (plugin.ts only surfaces it behind the x-bili-plugin marker),
+    // so a non-empty value is the plugin telling us — from the dispatch
+    // options it itself controls — that this call is auxiliary: route it
+    // through the #388 verbatim passthrough without content matching.
+    if (purpose !== undefined && purpose.length > 0) return true;
     const p = parsed as Record<string, unknown>;
     // #2500: BEFORE the #546 rule — a server-tool-only utility call carries
     // non-empty tools but is not an agent turn. Routed through the #388 side
