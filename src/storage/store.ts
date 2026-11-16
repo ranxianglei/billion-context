@@ -249,8 +249,9 @@ export interface CcrEntryRow {
      *  of the content store) — the slim ccr_json envelope has no bytes of
      *  its own, the CAS behind these rows is the content home. */
     origContent: string | null;
-    /** null with origContent null — a missing byHash entry; "" stays
-     *  reserved for a legitimate empty original. */
+    /** null with origContent null — the entry HAS a hash but its byHash
+     *  bytes are missing (the file lane stays authority); "" = hashless
+     *  entry (no original exists) or a legitimate empty original. */
     origHash: string | null;
 }
 

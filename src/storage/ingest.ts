@@ -467,7 +467,14 @@ function finishPlan(
               // keeps no bytes, so the CAS row must carry them.
               const entry = value as { hash?: unknown } | null;
               const origKey = entry !== null && typeof entry === "object" && typeof entry.hash === "string" ? entry.hash : null;
-              const stored = origKey !== null ? session.contentStore!.byHash[origKey] : undefined;
+              if (origKey === null) {
+                  // Hashless/null entry (fork-receipt stubs): no original
+                  // exists, so the row is complete as-is — "" keeps it
+                  // slim-hydratable (null would mark the WHOLE store
+                  // file-lane-authoritative and drop the orphan byHash half).
+                  return { ord, key, content, contentHash: sha256Hex(content), origContent: "", origHash: sha256Hex("") };
+              }
+              const stored = session.contentStore!.byHash[origKey];
               // A missing byHash entry (bytes absent from memory/sidecar)
               // must land as null, not "": "" would look like a legitimate
               // empty original and the slim store would reconstruct an
