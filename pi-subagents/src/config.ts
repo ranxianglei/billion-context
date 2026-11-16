@@ -83,6 +83,14 @@ export interface DelegateConfig {
    *  saw the result, so re-injecting it would only waste context.
    *  "always" — always inject the notification (previous behavior). */
   notifyIfRead?: "skip" | "always";
+  /** Deliver delegate notifications as a typed custom message that carries a
+   *  versioned `details` envelope (runId/status/agent plus launch provenance:
+   *  originToolCallId/sourceSessionId) alongside the SAME model-visible text.
+   *  Lets third-party UIs tie a notice to its launching turn without parsing
+   *  prose. Default: false — plain user-message delivery (byte-identical to
+   *  before). When true but the host lacks ExtensionAPI.sendMessage, delivery
+   *  falls back to the plain path automatically. See #5750. */
+  notifyStructured?: boolean;
   /** Keybinding for the interactive TUI shortcut that opens the acp_delegate
    *  fleet inspector (live list + transcript). Default: "ctrl+alt+d". Set to
    *  "" (empty string) to disable keyboard registration entirely — the
@@ -114,6 +122,9 @@ export interface DelegatePolicy {
   /** Whether to suppress the completion notification when the model already
    *  read the result file after the run finished. Always resolved ("skip" default). */
   notifyIfRead: "skip" | "always";
+  /** Whether notifications go out as a typed custom message with a versioned
+   *  details envelope (default false = plain user-message delivery). */
+  notifyStructured: boolean;
   /** Resolved TUI shortcut for the fleet inspector ("" = registration disabled). */
   fleetShortcut: string;
 }
@@ -128,6 +139,7 @@ export const DEFAULT_DELEGATE_POLICY: DelegatePolicy = {
   asyncTimeoutMs: 30 * 60_000,
   maxConcurrent: Infinity,
   notifyIfRead: "skip",
+  notifyStructured: false,
   fleetShortcut: DEFAULT_FLEET_SHORTCUT,
 };
 
@@ -183,7 +195,7 @@ export function resolveDelegate(adapter: SubagentsAdapterConfig): DelegatePolicy
       hint: "no-output watchdog is off; hung async runs must be cancelled manually via acp_delegate_cancel",
     });
   }
-  return { enabled, forceEnable, displayUsage, maxDepth, syncTimeoutMs, idleMs, asyncTimeoutMs, maxConcurrent, thinkingLevel: cfg.thinkingLevel, agents: cfg.agents, notifyIfRead: cfg.notifyIfRead ?? "skip", fleetShortcut: resolveFleetShortcut(cfg.fleetShortcut) };
+  return { enabled, forceEnable, displayUsage, maxDepth, syncTimeoutMs, idleMs, asyncTimeoutMs, maxConcurrent, thinkingLevel: cfg.thinkingLevel, agents: cfg.agents, notifyIfRead: cfg.notifyIfRead ?? "skip", notifyStructured: cfg.notifyStructured === true, fleetShortcut: resolveFleetShortcut(cfg.fleetShortcut) };
 }
 
 /** Resolve the fleet-inspector TUI shortcut: a string passes through verbatim
