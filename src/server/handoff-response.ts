@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
+import { anthropicToCore, deriveMessageId, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 import { markDirty, type Session } from "../session.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -48,6 +48,35 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
         discard,
         save() {
             if (discarded || !messages.size || session.stats.requests !== request || session.lastMessages !== snapshot || !canSave()) return;
+            // #6947 turn-final write-back: the reply rows historically only
+            // persisted when a LATER request re-sent them (snapshotMessages
+            // replaces lastMessages from the request array), so an idle
+            // session's last turn never reached the store — the web UI kept
+            // showing the previous (stale) reply forever. Append the captured
+            // reply to the snapshot now, with ids derived EXACTLY as the next
+            // codec pass will derive them: same 5-slot seed
+            // (role|contentType|toolCallId|toolName|text) and same cluster
+            // numbering (Nth occurrence of the same base id, counted in
+            // arrival order over the snapshot). The re-send then JOINs these
+            // rows by msg_id+identity (#4390) and the #4182 stored-identity
+            // guard makes the worst case (client round-trip drift) one refused
+            // delta + one redundant full re-ingest — never wrong rows.
+            // Skipped when the snapshot is a bounded folded re-render: its
+            // array is a pruned view, not the raw tail the store appends to.
+            if (session.lastMessagesFolded !== true && Array.isArray(snapshot)) {
+                const clusterCounts = new Map<string, number>();
+                for (const m of snapshot) {
+                    const base = baseIdentityId(m);
+                    clusterCounts.set(base, (clusterCounts.get(base) ?? 0) + 1);
+                }
+                for (const entry of messages.values()) {
+                    const m = entry.message;
+                    const base = baseIdentityId(m);
+                    const n = clusterCounts.get(base) ?? 0;
+                    snapshot.push({ ...m, id: n === 0 ? base : `${base}_${n}` });
+                    clusterCounts.set(base, n + 1);
+                }
+            }
             session.metadata.handoffResponse = { request, messages: [...messages.values()].map((entry) => entry.message) };
             markDirty(session);
         },
@@ -75,4 +104,12 @@ export function captureHandoffJson(reply: HandoffReply | undefined, protocol: st
         loggerLog("debug", `[handoff] JSON reply capture skipped (codec failed for protocol ${protocol ?? "unknown"}): ${err instanceof Error ? err.message : String(err)}`);
         reply.discard();
     }
+}
+
+/** #6947: the base (cluster-0) content id a codec pass derives for `m` —
+ *  the same 5-slot seed every lane feeds deriveMessageId with, computed from
+ *  the core fields rather than the message's own id (capture-side ids are
+ *  synthetic `reply_*` and must not leak into the stored rows). */
+function baseIdentityId(m: CoreMessage): string {
+    return deriveMessageId(m.role, m.contentType, m.text ?? "", { toolCallId: m.toolCallId, toolName: m.toolName });
 }
