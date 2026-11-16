@@ -55,7 +55,7 @@ import { prepareResponses, prepareResponsesCompact } from "./server/prepare-resp
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
 import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
@@ -2059,6 +2059,8 @@ export type Prepared = {
       * before delivery was attempted (suppression / breaker / gate off) —
       * consumers test for "injected" (+ "gated" where pressure counts). */
      nudgeOutcome?: "injected" | "vetoed" | "skipped" | "gated";
+     /** The nudge stamps before this turn, so a rejected request can un-show its nudge (rejectNudge). */
+     nudgeStampsBefore?: NudgeStamps;
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -4841,20 +4843,48 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
-        let aborted = false;
-        req.on("data", (c: Buffer) => {
-            if (aborted) return;
+        let settled = false;
+        const cleanup = () => {
+            settled = true;
+            chunks.length = 0;
+            req.off("data", onData);
+            req.off("end", onEnd);
+            req.off("error", onError);
+            req.off("close", onClose);
+        };
+        const onError = (error: unknown) => {
+            if (settled) return;
+            cleanup();
+            reject(error);
+        };
+        const onData = (c: Buffer) => {
+            if (settled) return;
             size += c.length;
-            if (size > knobLimitsReceiveBytes()) {
-                aborted = true;
+            const limit = knobLimitsReceiveBytes();
+            if (size > limit) {
+                onError(new BodyTooLargeError(limit));
                 req.destroy();
-                reject(new BodyTooLargeError(knobLimitsReceiveBytes()));
                 return;
             }
             chunks.push(c);
-        });
-        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
-        req.on("error", (e) => { if (!aborted) reject(e); });
+        };
+        const onEnd = () => {
+            if (settled) return;
+            try {
+                const body = Buffer.concat(chunks);
+                cleanup();
+                resolve(body);
+            } catch (error) {
+                onError(error);
+            }
+        };
+        // IncomingMessage also closes after a normal end, whose handler has
+        // already settled and removed this premature-close fallback.
+        const onClose = () => onError(new Error("request closed before body completed"));
+        req.on("data", onData);
+        req.on("end", onEnd);
+        req.on("error", onError);
+        req.on("close", onClose);
     });
 }
 
@@ -4864,6 +4894,6 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 }
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
+export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, anthropicBetaMessageThreads, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
+export { BILI_TOOL_NAMES, isAudioOutputCall, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";

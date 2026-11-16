@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
+import { onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
@@ -25,7 +26,7 @@ import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetch
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { allowPrivateHttpProviders, debugEnabled, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
 import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
@@ -860,6 +861,32 @@ export function __stashPiIncrementalOriginalForTests(conversationId: string, pay
     stashPiIncrementalOriginal(conversationId, payload);
 }
 
+// #4894 (pi lane): the declared context window of the session's CURRENT model,
+// recorded on every before_provider_headers event. The shared oversize arm in
+// directSendOrRefuse (native-intercept.ts) prefers the stamped
+// x-bili-plugin-context-window header — but this lane stamps that header only
+// on the proxy branch, so a request that finds NO live proxy (respawn failed /
+// spawn budget missed) carried none and the arm stayed disarmed in exactly the
+// state where an uncompressed egress is likeliest to blow the window: the raw
+// history then rode straight to the provider and came back as "input exceeds
+// the context window", unrecoverable while the proxy stayed down. Recorded
+// BEFORE the proxy-readiness early return below for the same reason.
+// `undefined` means UNKNOWN (no ctx.model / no window configured) and the arm
+// then fails open rather than guessing a window for this request.
+let piDeclaredWindow: number | undefined;
+
+/** #4894: window reader the native intercept arms as declaredWindowForDirect
+ *  (see pi-native.ts). Process-scoped: pi dispatches model requests
+ *  sequentially per session and subagents run in their own processes. */
+export function piDeclaredWindowForDirect(): number | undefined {
+    return piDeclaredWindow;
+}
+
+/** Test hook: forget the recorded window (fixtures share one process). */
+export function _resetPiDeclaredWindowForTest(): void {
+    piDeclaredWindow = undefined;
+}
+
 /** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
  *  it on its NativeInterceptState). A body that IS an incremental envelope
  *  was swapped by maybeIncrementalTurn → restore the stashed original
@@ -890,6 +917,20 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
         return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
     };
 }
+
+// Nudge-debug wiring guard: the bus subscription is process-global (the
+// emitters live in this same bundle in inline mode), so wire it at most once
+// even if a host ever re-invokes the factory.
+// Nudge debug surface (transient terminal view only) — module-level because
+// the bus subscription is process-singleton:
+//   nudgeDebugWired: the onNudgeInjected listener registered exactly once.
+//   nudgeFullPending: the latest injected nudge, consumed (and cleared) by the
+//       after_provider_response hook once the model has answered.
+//   nudgeNotifiedTurns: (sessionId → turnKey) dedup — emergency nudges
+//       re-inject on every LLM call of a turn; notify at most once per turn.
+let nudgeDebugWired = false;
+const nudgeNotifiedTurns = new Map<string, string>();
+let nudgeFullPending: NudgeDebugEvent | null = null;
 
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
@@ -1102,6 +1143,35 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 return box;
             });
         }
+        // Nudge debug view (transient only, gated on the debug switch —
+        // ACP_DEBUG / config `debug`): when the proxy injects a nudge (the
+        // ephemeral trailing user message the model reads), the VERBATIM wire
+        // text is shown once per user turn as a terminal notification after
+        // the model has answered. Nothing is persisted and nothing is added
+        // to model context. Engine-side emitter: same bundle/process in the
+        // default INLINE pi mode (spawn/attach proxies are separate processes
+        // — no bus listener, feature inert there; docs/clients.md).
+        if (agent === "pi") {
+            if (!nudgeDebugWired) {
+                nudgeDebugWired = true;
+                onNudgeInjected((event) => {
+                    nudgeFullPending = event;
+                });
+            }
+            pi.on("after_provider_response", ((_event: unknown, ctx: Ctx) => {
+                const pending = nudgeFullPending;
+                nudgeFullPending = null;
+                if (pending === null || !debugEnabled()) return;
+                if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
+                nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
+                try {
+                    const example = pending.topRange !== null ? `\n\nExample: compress({ content: [{ startId: "${pending.topRange.startRef}", endId: "${pending.topRange.endRef}", summary: "..." }] })` : "";
+                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}${example}`);
+                } catch {
+                    // host UI unavailable — best-effort display
+                }
+            }) as unknown as (...args: unknown[]) => void);
+        }
         const piCommands = piCommandsEnabled();
         if (typeof pi.registerCommand === "function") {
           if (piCommands.has("acp")) {
@@ -1308,6 +1378,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
+                // #4894: record this request's window FIRST — the
+                // proxy-readiness return right below is precisely the
+                // degraded direct-send path the guard measures against, so
+                // the window must not depend on the proxy being up.
+                const liveWindow = ctx.model?.contextWindow;
+                piDeclaredWindow = typeof liveWindow === "number" && Number.isFinite(liveWindow) && liveWindow > 0 ? Math.floor(liveWindow) : undefined;
                 // #1243: on the native lane the proxy origin lands via an async
                 // bootstrap that writes BILLION_CONTEXT_PROXY only after the spawn;
                 // a one-shot (-p) fires this event exactly once, inside that

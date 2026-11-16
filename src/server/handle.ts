@@ -56,7 +56,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -68,9 +68,9 @@ import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -91,6 +91,7 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
+import { featureEnabled } from "../rollout.js";
 import { BodyTooLargeError, buildForwardTarget, declPinConflictWarned, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { logRequestCost } from "./request-cost.js";
 import { normalizeVertexModelId } from "../vertex.js";
@@ -133,6 +134,12 @@ let bypassOverrideOffWarned = false;
 // deeper prefix-break kind is eligible; equal-depth replays (#1486) and
 // truncated subviews never adopt weakly regardless of ratio.
 const WEAK_ADOPT_MIN_PREFIX_RATIO = 0.8;
+
+// #6088: warn-once per (pre-fork) session when a request negotiates Anthropic
+// message threads — every turn then carries only the newest message(s), so the
+// session silently never compresses. Keyed by the base id so `|sub:` forks of
+// the same conversation do not repeat the line.
+const messageThreadsWarned = new Set<string>();
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
@@ -684,6 +691,9 @@ async function handleRequest(
             parsed = null;
         }
     }
+    // Capture the raw-wire verdict before unwrapping or preparing can mutate
+    // parsed. Only these scalars are needed for the post-forward bookkeeping.
+    const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
@@ -738,6 +748,12 @@ async function handleRequest(
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
     const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
+    // #5403/#5418: the plugin full-resend watermark fastpath (prepare-openai) needs
+    // the raw body text. #4753 released it unconditionally, which silently disabled
+    // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
+    // only on the wire+flag slice where the fastpath can fire; the strict gate in
+    // prepare-openai (pluginMode + !titleGen) remains authoritative.
+    if (!(protocol === "openai" && featureEnabled("pluginFullResendWatermark"))) bodyText = undefined;
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
@@ -1224,8 +1240,17 @@ async function handleRequest(
         // resolver — never opened globally.
         const ccTitleSidecar = sideAgent !== "main" && claudeAnthropicPersonaOrderApplies(req.headers)
             && isClaudeCodeTitleRequest(protocol, parsed);
+        // #6880: normalize the declared purpose for the SIDE classification
+        // (and the lane log below) — one parse, marker-gated. The
+        // "conversation" sentinel the post-#6883 plugin stamps on MAIN turns
+        // means "no declared auxiliary purpose", so it is indistinguishable
+        // from the absent header here (an aux dispatch never carries the
+        // sentinel: dsh leaves purpose unset for ordinary conversation and
+        // the plugin only stamps the real value).
+        const rawDeclaredPurpose = pluginPurposeHeader(req.headers);
+        const declaredPurpose = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION ? undefined : rawDeclaredPurpose;
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
-            && (isSideRequest(parsed, sideAgent)
+            && (isSideRequest(parsed, sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
@@ -1249,6 +1274,7 @@ async function handleRequest(
                  // anchor before the first main turn and exile the real
                  // conversation onto a persisted `|sub:<fp>` ghost.
                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && hasSingleShotBudget(parsed)
                      && isDshSingleShotSidecar(protocol, parsed))
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
@@ -1274,6 +1300,19 @@ async function handleRequest(
         // reviews fork; an empty system is non-anchoring (verbatim key), so
         // system-less auxiliary calls keep riding the main session.
         const dshPersona = dshPersonaFingerprintApplies(req.headers);
+        // #6880 terminal state: a request that CARRIES the purpose header in
+        // any value is from a conversation whose plugin declares every
+        // dispatch's purpose (post-#6883 dsh). For those, the persona-order
+        // ladder (claim races, fork rungs) is dead weight — dsh mints one
+        // UUID per session and never recycles an id (SESSION_ALREADY_EXISTS
+        // in its store), so the raw session id IS the complete identity and
+        // the main turn must key it verbatim. All auxiliary traffic from
+        // such a plugin is declared side above and never reaches the
+        // persona branches below. Pre-#6883 plugins stamp no header at all,
+        // so they keep the ladder byte-for-byte (rollout safety). The
+        // already-persisted |sub:<fp> lanes of old traffic become orphan
+        // history: new declared traffic simply never resolves onto them.
+        const dshDeclaredPersona = dshPersona && rawDeclaredPurpose !== undefined;
         const personaSystemText = protocol === "openai"
             ? openaiSystemTextForPersona(parsed as OpenAIRequestBody)
             : protocol === "anthropic"
@@ -1355,7 +1394,7 @@ async function handleRequest(
             // empty systemInstruction is non-anchoring (kernel anchor
             // semantics): ride the verbatim id — never route empty-tag
             // traffic through the order resolver.
-            ? (dshPersona && !sideRequestLike
+            ? (!dshDeclaredPersona && dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
                       : personaConversationOrder(
@@ -1380,7 +1419,7 @@ async function handleRequest(
               // across main and subagent sessions.
               (claudeSub !== undefined && opts.subagentSplit !== false
                   ? claudeSubagentSplit(anthropicIdentity?.value ?? anthropicSignal, req.headers, systemTextsForSplit)
-                  : dshPersona && !sideRequestLike
+                  : !dshDeclaredPersona && dshPersona && !sideRequestLike
                     // #2241: continuity-aware anchor — a system change whose
                     // history continues the raw key's prefix-affinity chain
                     // (model switch) MIGRATES the anchor instead of forking
@@ -1438,7 +1477,7 @@ async function handleRequest(
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
-              ? (dshPersona && !sideRequestLike && personaSystemText !== ""
+              ? (!dshDeclaredPersona && dshPersona && !sideRequestLike && personaSystemText !== ""
                     ? personaConversationOrder(
                           openaiIdentity?.value ?? openaiSignal,
                           (parsed as OpenAIRequestBody).messages,
@@ -1457,7 +1496,7 @@ async function handleRequest(
                 // kernel's empty-instructions non-anchoring path is left
                 // untouched for metadata-less clients).
                 ? codexTurn.value
-                 : dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
+                 : !dshDeclaredPersona && dshPersona && !sideRequestLike && ((parsed as ResponsesRequestBody).instructions ?? "") !== ""
                    // #2203/#2241: parity with the anthropic/openai lanes —
                    // dsh-over-Responses rides the same continuity-aware persona
                    // anchor: a model switch (history continues the raw key's
@@ -1610,6 +1649,19 @@ async function handleRequest(
         if (!clientProvided) {
             anonAffinity = prefixAffinity.resolve(affinityMessageList());
             if (!anonAffinity) {
+                // #6548: a single-shot server-tool-only Responses call (the
+                // pi-web-access xAI web search: string input, web_search /
+                // x_search tools, no history) is not a conversation turn — it
+                // carries no history to fingerprint and creates no session
+                // state, so the #286 refusal's rationale does not apply to
+                // it, and the client cannot carry an identity here. Forward
+                // it verbatim (same raw relay as the #1117 passthrough) so
+                // the search backend keeps working instead of hard-400ing.
+                if (protocol === "responses" && isResponsesServerToolSingleShot(parsed)) {
+                    log("info", `single-shot server-tool Responses call — no conversation identity possible; forwarding verbatim (#6548): ${maskUrlForLog(req.url ?? "")}`);
+                    await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
+                    return;
+                }
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify(protocol === "anthropic"
@@ -1657,6 +1709,13 @@ async function handleRequest(
         // embed the id manually. One statement, runs in this request's own
         // async context, so concurrent requests never cross-contaminate.
         enterSessionContext(sessionId);
+        if (protocol === "anthropic" && anthropicBetaMessageThreads(req.headers)) {
+            const baseId = sessionId.split("|sub:")[0];
+            if (!messageThreadsWarned.has(baseId)) {
+                messageThreadsWarned.add(baseId);
+                loggerLog("warn", `[${baseId}] Anthropic message threads are on (anthropic-beta message-threads-*): the upstream holds the history and each request carries only the newest message(s), so bili cannot compress this session; for OMP set PI_ANTHROPIC_MESSAGE_THREADS=0 (#6088)`);
+            }
+        }
         // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
         // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the
@@ -2390,6 +2449,22 @@ async function handleRequest(
         // not a main turn, and seeding outputBudgetHighWater from it would
         // poison the first starved restore (same class as the #1897 skip).
         const serverToolUtility = isServerToolUtilityCall(parsed);
+        // #5073: a toolless structured-output request (Hindsight fact extraction)
+        // is the same category — a host-internal utility call under the main
+        // session id. It rides the #388 side passthrough via isSideRequest, and
+        // must ALSO skip restoreOutputBudget here: its max_tokens (64000) sizes
+        // the extraction response, not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved restore
+        // (same class as the #1897/#2500 skip).
+        const structuredOutputUtility = isStructuredOutputCall(parsed);
+        // #6636: a tool-less audio-output request (TTS on the chat wire) is
+        // the same category — a one-shot utility call under the main session
+        // id. It rides the #388 side passthrough via isSideRequest, and must
+        // ALSO skip restoreOutputBudget here: its max_tokens sizes the
+        // spoken reply, not a main turn, and seeding
+        // outputBudgetHighWater from it would poison the first starved
+        // restore (same class as the #1897/#2500/#5073 skip).
+        const audioOutputUtility = isAudioOutputCall(parsed);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism). #1665/#1840: the
@@ -2401,7 +2476,7 @@ async function handleRequest(
         // outputBudgetHighWater from it would poison the first starved restore
         // (title requests arrive FIRST, at session start). Starved all-bili requests
         // never reach here demoted: stripLeakedBiliTools vetoes them per #546.
-        if (!demotedSide && !serverToolUtility) {
+        if (!demotedSide && !serverToolUtility && !structuredOutputUtility && !audioOutputUtility) {
             // #3438: the dsh host contract (pi-ai buildBaseOptions) stamps the model-declared
             // maxTokens on every main turn, so on this lane a below-ceiling tool-carrying
             // budget is a raw-history collapse, not intent — arm the mid-band rescue.
@@ -2432,7 +2507,24 @@ async function handleRequest(
         // is dsh-side, caught, and recoverable. Runs before the #388
         // side-request lane: the compaction call is a full-budget request, so
         // only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed)) {
+        // #6880: declaration-first compaction recognition. The post-#6880 dsh
+        // plugin stamps x-bili-plugin-purpose: compaction from the dispatch
+        // options itself, so the guard no longer depends on the INSTRUCTION
+        // text still matching the tracked template (the #2193 lesson — a
+        // stale shape goes silent and permanently loses the substrate). The
+        // marker-DECISIVE text check remains as the fallback for pre-#6880
+        // installs; dsh-only, like the text path's trust domain.
+        const declaredDshCompaction = pluginAgentHeader(req.headers) === "dsh"
+            && declaredPurpose === "compaction";
+        if (protocol !== null && (isDshCompactionCall(protocol, parsed) || declaredDshCompaction)) {
+            // #6880: the log must state the ACTUAL identification basis — a
+            // declared compaction is recognized by declaration even when the
+            // INSTRUCTION text has drifted (the exact case this declaration
+            // exists for), so claiming the text match there misleads the
+            // operator reading the lane.
+            const identifiedAs = declaredDshCompaction
+                ? "declared purpose=compaction (#6880)"
+                : "final user message = COMPACTION_INSTRUCTION";
             // #3733: AUTHORED compaction — when the knob is on and the session
             // holds active fold blocks, answer the call LOCALLY with our folded
             // snapshot instead of refusing: zero egress (autoModeForge #2740
@@ -2456,11 +2548,11 @@ async function handleRequest(
                 ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", forgeText, { inputTokens: Math.max(1, estimateCjkTokens(forgeText)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
                 : null;
             if (authored !== null) {
-                log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
+                log("info", `[${session.id}] dsh compaction call identified (${identifiedAs}, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
             } else if (session.metadata.dshCompactionRefused !== true) {
                 session.metadata.dshCompactionRefused = true;
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
-                log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
+                log("warn", `[${session.id}] dsh native compaction call identified (${identifiedAs}, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
             // #2490: remember the replayed envelope SIZE. The host's raw ledger is
             // invisible to bili's folded view (folds never shrink what dsh itself
@@ -2572,13 +2664,14 @@ async function handleRequest(
         // prompt-enhance-class calls ride the #388 passthrough (kernel
         // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
         // mirrors #4438 — the extension client can arrive unstamped.
-        const dshSingleShotSidecar = requestAgent !== "main" && isDshSingleShotSidecar(protocol, parsed)
+        const dshSingleShotSidecar = requestAgent !== "main" && hasSingleShotBudget(parsed)
+            && isDshSingleShotSidecar(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2602,7 +2695,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
@@ -2928,10 +3021,13 @@ async function handleRequest(
             // #5683: this round's merged three-level compress settings, captured
             // so the post-prepare gate stamp below can read the policy knobs.
             let preparedCs: CompressSettings | undefined;
-            const runPreparedPipeline = async (
+            // #4753: `let` + `| undefined` so releaseRequestInput below can drop
+            // the closure (and with it its captured input-only state) once the
+            // upstream response boundary is reached.
+            let runPreparedPipeline: ((
                 respondFailFast: boolean,
                 overflowWindow?: number,
-            ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
+            ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
                 const runPrepareInner = async (): Promise<Prepared> => {
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
@@ -3366,7 +3462,7 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
+            const pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an
@@ -3381,23 +3477,39 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
+                          const next = await withSessionLock(session, () => runPreparedPipeline!(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
                           return next;
                       }
                     : undefined;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
-                    logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
-                });
+                const releaseRequestInput = () => {
+                    // #4753: refolding is finished before streaming starts. Drop
+                    // the input-only bindings even if forward's wrapper retains
+                    // the callback; accepted outbound bodies still support
+                    // retries.
+                    bodyBuffer = Buffer.alloc(0);
+                    parsed = null;
+                    affinityMessagesCache = null;
+                    runPreparedPipeline = undefined;
+                };
+                try {
+                    await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
+                        logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
+                    }, releaseRequestInput);
+                } finally {
+                    // Transport failures and locally forged replies can return
+                    // before the upstream response boundary.
+                    releaseRequestInput();
+                }
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
                 // plugin tool call sees a consistent window.
                 if (pendingForward.prepared) {
                     const preparedToRemember = pendingForward.prepared;
-                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, bodyBuffer));
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge, rawWireMetadata));
                 }
             }
         } finally {
