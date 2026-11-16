@@ -9,6 +9,8 @@ type Entry = { key: string; savedAt: number; body: string; etag?: string; lastMo
 type Log = (level: "info" | "warn", message: string) => void;
 const MAX_BYTES = 1024 * 1024;
 const MAX_ENTRIES = 16;
+const WARM_DEADLINE_MS = 4000;
+const COLD_DEADLINE_MS = 10000;
 const TRANSIENT_CODES = new Set([
     "ECONNRESET",
     "ECONNREFUSED",
@@ -283,7 +285,7 @@ export function createCodexCatalogFetch(
         const deadline = new AbortController();
         const timeout = setTimeout(
             () => deadline.abort(Object.assign(new Error("model catalog deadline exceeded"), { name: "TimeoutError", code: "ETIMEDOUT" })),
-            options.deadlineMs ?? (entry ? 4000 : 10000),
+            options.deadlineMs ?? (entry ? WARM_DEADLINE_MS : COLD_DEADLINE_MS),
         );
         const linked = AbortSignal.any([...(signal ? [signal] : []), deadline.signal]);
         let result: FetchResult | undefined;
