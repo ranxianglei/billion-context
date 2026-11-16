@@ -242,7 +242,7 @@ export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
  *  must hold it in full even when the envelope truncates it (#2960 ⑤ pin).
  *  The fork child's raw tail is a REPLAY of the parent's history, not the
  *  child's own durable record, so the filter is safe there. */
-export function coveredTailIds(session: LegacySessionLike): Set<string> {
+ function coveredTailIds(session: LegacySessionLike): Set<string> {
     const derived = session.metadata?.derivedFromSessionId;
     if (typeof derived !== "string" || derived.length === 0) return new Set();
     const ids = new Set<string>();
