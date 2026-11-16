@@ -147,7 +147,7 @@ test("jsonWriter=off: only whitelisted .json files may be written in the session
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "off";
     try {
-        assert.equal(storageStatusLabel(), "storage: full (unified-only, json envelope off)");
+        assert.equal(storageStatusLabel(), "storage: sqlite (unified-only, json envelope off)");
         const seed = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jwgate-seed-"));
         // The ccr corpus case: a non-trivial content store, so any CCR write
         // regression shows up as bytes in the diff.

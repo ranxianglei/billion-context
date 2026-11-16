@@ -16,7 +16,8 @@ import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeInjectionBlocked } from "../net-progress-guard.js";
 import { compressBreakerArmed } from "../stream.js";
-import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
@@ -170,6 +171,7 @@ export async function prepareAnthropic(
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
+    let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let rebuiltMessages = parsed.messages;
     let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
     let clientCacheControls: Map<string, unknown> | undefined;
@@ -326,6 +328,15 @@ export async function prepareAnthropic(
         // intact history has no gap; a gap without framing falls through to
         // detectUnannouncedHistoryRewrite below). Title-gen side requests are
         // skipped like on the openai lane (same tiny-budget heuristic).
+        // #6061: honour a boundary armed on an earlier request. The detector in
+        // generation-boundary.ts arms it when stale above-frontier citations prove
+        // the persisted ledger is from a previous generation; the dsh branch below
+        // only fires on a client-side compaction signature, which a plain
+        // model/upstream switch does not produce — that left the two surfaces (nudge
+        // vs compress) permanently disagreeing about "highest allocated ref".
+        if (reconcileNativeCompactionBoundary(session)) {
+            log("info", `[${sessionId}] [acp-gen-boundary] ref ledger belongs to a previous generation — ACP compression state rebased onto the current one`);
+        }
         let dshRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
         if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
@@ -365,8 +376,11 @@ export async function prepareAnthropic(
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
+        nudgeStampsBefore = nudgeStampsOf(session);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
+        const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
+        if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
@@ -421,7 +435,7 @@ export async function prepareAnthropic(
         // #3482 Step 2.5: the ONE nudge gate. This lane has no compaction
         // trigger and no intercept health window — those differences are
         // explicit inputs on the responses lane.
-        const willInjectNudge = nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
@@ -607,6 +621,14 @@ export async function prepareAnthropic(
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
+    // #3397 durability-before-render: make this turn's ledger rows durable NOW
+    // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
+    // about to see are on disk BEFORE the response is sent. Without this, a
+    // crash before the debounced save (#5155) leaves rendered refs unbacked —
+    // the #3397 orphaned-generation gap that makes a later turn cite refs the
+    // gate rejects as "above the highest allocated ref". markDirty below keeps
+    // the JSON envelope debounced; this only moves the small row ingest ahead.
+    getStore().ingestRowsNow(session);
     markDirty(session);
 
     // [#5604] a preflight fold of the tail (soft protection relaxed to 0, or a
@@ -669,7 +691,7 @@ export async function prepareAnthropic(
     // main-scale tiebreak sees this request's own upper bound.
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";
