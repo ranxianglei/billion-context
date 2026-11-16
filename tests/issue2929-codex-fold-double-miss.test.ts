@@ -34,13 +34,12 @@ type Item = Record<string, unknown>;
 
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const NUDGE_MARKER = "Compressible ranges (";
-// Indices verified against the kernel's nudge gate with nudgeGrowthTokens=2000
-// and ~9KiB filler turns. Pre-#4521 (master) the injections landed on
-// requests {7,8,9}; since #4521 the armed-but-silent status line rides an
-// ephemeral carrier on the gated turns and its shown-marker feeds the nudge
-// gate back, so the schedule shifts to {4,6,8,9} — the fold/proxy-tool-round
-// mechanics under test are unchanged, only this probe's anchor re-calibrates
-// to the next nudge-carrying request pair (6 → tool round, 7 → fold round).
+const NUDGE_GROWTH_TOKENS = 2000;
+// Pin both the mass trigger and cadence to this small fixture's 2000-token
+// step; the production minGrowthFloor is independently owner-tuned. Six
+// ~9KiB warm-up turns give the pre-fold request a nudge and enough old refs
+// for both spans. The model then asks for status and compresses within that
+// same client turn before the next steady turn checks the folded prefix.
 const PROXY_TOOL_AT = 6; // upstream request index whose response = acp_status call (round 1)
 const FOLD_AT = 7;       // upstream request index whose response = compress call (round 2)
 // FOLD_AT+1 = post-fold refreshed re-request (round 3); FOLD_AT+2 = next steady client turn.
@@ -162,14 +161,17 @@ test("#2929: nudge + proxy-tool-round fold keeps re-request/next-turn byte-stabl
 
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
+        const kernelConfig = defaultConfig(200_000);
+        kernelConfig.nudge.minGrowthFloor = NUDGE_GROWTH_TOKENS;
+        kernelConfig.nudge.minGrowthRatio = 1;
         const opts: ProxyOptions = {
             port: 0,
             host: "127.0.0.1",
             upstream: "http://127.0.0.1",
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 200_000 } } } },
             modelContextLimit: 200_000,
-            kernelConfig: defaultConfig(200_000),
-            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 2000 },
+            kernelConfig,
+            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: NUDGE_GROWTH_TOKENS },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",
             log: true,
