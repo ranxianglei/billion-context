@@ -56,7 +56,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -1241,7 +1241,7 @@ async function handleRequest(
         const ccTitleSidecar = sideAgent !== "main" && claudeAnthropicPersonaOrderApplies(req.headers)
             && isClaudeCodeTitleRequest(protocol, parsed);
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
-            && (isSideRequest(parsed, sideAgent)
+            && (isSideRequest(parsed, sideAgent, pluginPurposeHeader(req.headers))
                 // #2503: dsh title sidecar — its output budget grew past the
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
@@ -2485,7 +2485,16 @@ async function handleRequest(
         // is dsh-side, caught, and recoverable. Runs before the #388
         // side-request lane: the compaction call is a full-budget request, so
         // only this guard can catch it.
-        if (protocol !== null && isDshCompactionCall(protocol, parsed)) {
+        // #6880: declaration-first compaction recognition. The post-#6880 dsh
+        // plugin stamps x-bili-plugin-purpose: compaction from the dispatch
+        // options itself, so the guard no longer depends on the INSTRUCTION
+        // text still matching the tracked template (the #2193 lesson — a
+        // stale shape goes silent and permanently loses the substrate). The
+        // marker-DECISIVE text check remains as the fallback for pre-#6880
+        // installs; dsh-only, like the text path's trust domain.
+        const declaredDshCompaction = pluginAgentHeader(req.headers) === "dsh"
+            && pluginPurposeHeader(req.headers) === "compaction";
+        if (protocol !== null && (isDshCompactionCall(protocol, parsed) || declaredDshCompaction)) {
             // #3733: AUTHORED compaction — when the knob is on and the session
             // holds active fold blocks, answer the call LOCALLY with our folded
             // snapshot instead of refusing: zero egress (autoModeForge #2740
@@ -2632,7 +2641,7 @@ async function handleRequest(
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, requestAgent, pluginPurposeHeader(req.headers)) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live

@@ -144,6 +144,17 @@ const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+/** #6880: the host's declared PURPOSE for the dispatch (dsh stamps
+ *  GenerateOptions.purpose verbatim — "session-title", "compaction",
+ *  "auto-review", "timeline-report", ...; its contract: ordinary
+ *  conversation requests leave it unset). Carries the side/main intent
+ *  that content-guessing used to approximate: a PLUGIN-ANNOUNCED request
+ *  with a non-empty purpose is a side request by declaration, no per-feature
+ *  template matching needed (the content recognizers stay as the fallback
+ *  for pre-#6880 plugin installs). Honored only behind the x-bili-plugin
+ *  marker, same trust discipline as the conversation header: an unannounced
+ *  client's purpose header is inert telemetry. */
+const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -210,6 +221,14 @@ function headerValue(headers: Record<string, string | string[] | undefined>, nam
     const s = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined;
     const t = s?.trim();
     return t && t.length > 0 ? t : undefined;
+}
+
+export function pluginPurposeHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    // #6880: purpose is a protocol-internal steering signal — honoring it
+    // without the plugin announcement would let any client that can reach
+    // the endpoint opt its traffic out of the session pipeline. A real
+    // plugin sends the marker and the purpose together.
+    return pluginAgentHeader(headers) !== undefined ? headerValue(headers, PLUGIN_PURPOSE_HEADER) : undefined;
 }
 
 export function pluginAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
