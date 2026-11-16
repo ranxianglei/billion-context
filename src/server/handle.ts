@@ -53,7 +53,7 @@ function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
-import { executeThreadsReforge } from "./threads-lane.js";
+import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -694,6 +694,17 @@ async function handleRequest(
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
+    // Only Claude Code answers the decline by dropping threads. It defers MCP tools behind tool
+    // search, so its bili MCP registration (keyed by its session id) counts when the tools are off the wire.
+    const ccSessionId = req.headers["x-claude-code-session-id"];
+    const biliCompressesThis = typeof ccSessionId === "string" && (declaresMcpBiliToolsOnWire(parsed) || consumePluginRegisterFor(ccSessionId) !== undefined);
+    const declinedThreadsBeta = protocol === "anthropic" ? threadsBetaToDecline(parsed, req.headers["anthropic-beta"], biliCompressesThis) : undefined;
+    if (declinedThreadsBeta !== undefined) {
+        log("info", `[threads] declined ${declinedThreadsBeta} for a session bili compresses — the client retries without threads and sends full history (#2701)`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `Unexpected value(s) \`${declinedThreadsBeta}\` for the \`anthropic-beta\` header. Please consult our documentation at docs.claude.com or try again without the header.` } }));
+        return;
+    }
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
