@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ExternalSummaryExecutor, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
+import { ExternalSummaryExecutor, externalSummaryFailureAdvice, type SummaryBudget, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 const work: SummaryWork = { content: "Historical task evidence", instructions: "Preserve constraints and unfinished work", reference: "Read-only current task" };
 const budget: SummaryBudget = { totalTimeoutMs: 2000, targetTimeoutMs: 500, maxSummaryBytes: 200 };
@@ -239,4 +240,34 @@ test("external summary: queued time does not spend the per-target dispatch budge
     assert.equal((await holder).status, "cancelled");
     leave.resolve("holder");
     assert.equal((await queued).status, "success");
+});
+
+test("external summary #6885: a non-fetch rejection keeps its safe cause in the attempt and logs once", async () => {
+    const lines: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") lines.push(msg); });
+    try {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary input exceeds the target context budget"); } }], budget);
+        assert.deepEqual(result, { status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary input exceeds the target context budget" }] });
+        assert.equal(lines.filter((line) => line.includes("External summary input exceeds the target context budget")).length, 1);
+    } finally { setLogCapture(null); }
+});
+
+test("external summary #6885: a post-fetch parse rejection is named, not swallowed", async () => {
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("External summary response did not complete"); } }], budget);
+    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error", detail: "External summary response did not complete" }]);
+});
+
+test("external summary #6885: an unknown candidate error stays opaque in the result", async () => {
+    const result = await new ExternalSummaryExecutor(1).execute(work, [{ summarize: async () => { throw new Error("private-key private-url source-content"); } }], budget);
+    assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+    assert.equal(JSON.stringify(result).includes("private"), false);
+});
+
+test("external summary #6885: failure advice names the budget on deadline, the cap on over-long replies", () => {
+    assert.match(externalSummaryFailureAdvice({ status: "deadline", results: [{ status: "deadline", attempts: [{ targetIndex: 0, outcome: "timeout", detail: "target-timeout 25000ms (elapsed 25002ms)" }] }] }), /budget\.totalTimeoutMs/);
+    assert.match(externalSummaryFailureAdvice({ status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "invalid_summary", detail: "summary 5 chars exceeds cap 4" }] }] }), /maxSummaryLength/);
+    const errorAdvice = externalSummaryFailureAdvice({ status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error", detail: "External summary input exceeds the target context budget" }] }] });
+    assert.equal(errorAdvice.includes("maxSummaryLength"), false);
+    assert.match(errorAdvice, /failing cause/);
+    assert.match(externalSummaryFailureAdvice({ status: "finished", results: [{ status: "failed", reason: "exhausted", attempts: [{ targetIndex: 0, outcome: "error" }] }] }), /attempt outcomes/);
 });
