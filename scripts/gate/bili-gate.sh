@@ -72,8 +72,11 @@ MIRROR=$(jget mirror "")
 GIT_PROXY=$(jget gitProxy "")
 NPM_REG=$(jget npmRegistry "https://registry.npmjs.org")
 TURN_MS=$(jget turnTimeoutMs "300000")
-AGENTS=$(jget agents "dsh,pi,codex,opencode,claude")
-AGENTS_R=$(jget agentsR "")
+AGENTS=$(jget agents "dsh,pi,codex,opencode,claude,dsh-google")
+AGENTS_R=$(jget agentsR "dsh,pi")
+SNAPBASE=$(jget snapBase "")
+LANE_SCRIPT=$(jget laneScript "")
+SNAP_RENDER=$(jget snapshotRender "")
 R_CORPUS=$(jget r.corpusTokens "80000")
 R_WINDOW=$(jget r.window "16384")
 R_CAP=$(jget r.capRatio "0.4")
@@ -109,6 +112,19 @@ mkdir -p "$OUT_DIR"
 # ---- docker run --------------------------------------------------------------
 RUN=(docker run --rm "${SRC_ARGS[@]}")
 if [ -n "$GIT_PROXY" ]; then RUN+=(-e GATE_GIT_PROXY="$GIT_PROXY"); fi
+# GATE_SNAPBASE: run the P/R lanes with the candidate's snapBase egress plane
+# ON in the gate's bili.json (value: "all" or openai,responses,anthropic,google).
+# Must be appended AFTER the RUN=(...) init above — an earlier append is wiped
+# by the reassignment.
+if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
+# GATE_LANE_SCRIPT: force the P-lane harness script copy (e.g. the bundled
+# /gate-tools/plugin-lanes.mjs when the candidate predates a harness fix —
+# the entrypoint prefers the candidate's OWN scripts/gate copy when present).
+if [ -n "$LANE_SCRIPT" ]; then RUN+=(-e GATE_LANE_SCRIPT="$LANE_SCRIPT"); fi
+# GATE_SNAPSHOT_RENDER: force the candidate's snapshotRender egress body
+# plane live in the P/R lane bili.json (config tier — the env tier never
+# reaches the lane proxies because cleanEnv() strips BILI_* by design).
+if [ -n "$SNAP_RENDER" ]; then RUN+=(-e GATE_SNAPSHOT_RENDER="$SNAP_RENDER"); fi
 if [ "$NETWORK" = "bridge" ]; then
   RUN+=(--add-host=host.docker.internal:host-gateway)
 else
@@ -121,9 +137,12 @@ RUN+=(-e MODEL1_BASE_URL="$M1_URL" -e MODEL1_MODEL="$M1_MODEL" -e MODEL1_API_KEY
   -e GATE_AGENTS="$AGENTS" -e GATE_AGENTS_R="${AGENTS_R}" \
   -e GATE_R_CORPUS_TOKENS="$R_CORPUS" -e GATE_R_WINDOW="$R_WINDOW" \
   -e GATE_R_CAP_RATIO="$R_CAP" -e GATE_R_CACHE_RATIO="$R_CACHE" \
+  -e GATE_CONCURRENT="${GATE_CONCURRENT:-1}" \
+  -e GATE_P_CONC="${GATE_P_CONC:-4}" -e GATE_R_CONC="${GATE_R_CONC:-2}" \
   -v bili-gate-npm-cache:/root/.npm \
   -v "$OUT_DIR:/work" \
   -e GATE_REV="$REV" -e GATE_SKIP="$SKIP" -e GATE_KEEP="$KEEP" \
+  -e GATE_UID="$(id -u)" -e GATE_GID="$(id -g)" \
   bili-gate)
 
 if [ "$DRY" = 1 ]; then
