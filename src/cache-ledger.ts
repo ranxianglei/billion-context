@@ -658,7 +658,8 @@ export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key",
  *  returns undefined when the lane sent no recognized credential header. */
 export function credentialFingerprint(headers: Record<string, string> | undefined | null): string | undefined {
     if (!headers) return undefined;
-    let cred: string | undefined;
+    const values = new Set<string>();
+    const fields = new Set<string>();
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
         if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
@@ -677,12 +678,18 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
                 // per request. The STABLE credential on that line is the
                 // Access key id — fingerprint only that.
                 const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
-                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
-                break;
+                const credential = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                values.add(credential);
+                fields.add(JSON.stringify([n, credential]));
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (values.size === 0) return undefined;
+    // Keep existing single-key identities, including aliases carrying the
+    // same key. Distinct credentials form an order-independent identity so
+    // header iteration order cannot bypass or cross-clear a throttle hold.
+    const cred = values.size === 1 ? values.values().next().value!
+        : `credential-set:${JSON.stringify([...fields].sort())}`;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 
@@ -1257,12 +1264,13 @@ export function getCacheLedger(session: Session): CacheLedger {
     return led;
 }
 
-function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">): void {
+function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">, closeFrom: number): void {
     // Freeze k = samples since each open fold (#1286): samples arrive in
     // order, so at this instant the count equals the batch-path
     // turnsToNextFold window (f.at < s.at <= nextFold.at); requestsAfter
     // keeps growing afterward to the full post-fold total.
-    for (const open of led.folds) {
+    for (let i = closeFrom; i < led.folds.length; i++) {
+        const open = led.folds[i];
         if (open.k === null) open.k = open.requestsAfter;
     }
     led.foldSeqCounter += 1;
@@ -1275,6 +1283,7 @@ function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "
 export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
     if (blocks.length === 0) return;
     const led = getCacheLedger(session);
+    let closeFrom = 0;
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
@@ -1286,7 +1295,10 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,
-        });
+        }, closeFrom);
+        // The first new fold closes every older open record. Within this
+        // synchronous batch, only the just-appended record can remain open.
+        closeFrom = led.folds.length - 1;
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
 }
@@ -1860,6 +1872,7 @@ export function settleUsageReport(
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        if (session.transient?.nudgeHeldAfterReject) delete session.transient.nudgeHeldAfterReject;
         session.stats.inputTokens += s.total;
         // #4899: USD spend ledger — input/cache-read/cache-write billed at the
         // per-request stamped price, in lockstep with the token counters above
@@ -2269,7 +2282,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             else byLo.set(lo, [l.hitPct]);
         }
         for (const [lo, hits] of [...byLo.entries()].sort((x, y) => x[0] - y[0]).slice(0, 24)) {
-            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: Math.min(...hits) });
+            sizeBuckets.push({ lo, hi: lo + SIZE_BUCKET_TOK, n: hits.length, hitMedian: median(hits) ?? 0, hitMin: hits.reduce((min, hit) => Math.min(min, hit), Infinity) });
         }
     }
     const lowGaps: number[] = [];

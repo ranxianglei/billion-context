@@ -155,7 +155,7 @@ test("mysql snapshot pins SQL, CAS and media hydration to its read-only connecti
             if (sql.includes("FROM content")) {
                 const bytes = values?.[0] === "msg" ? JSON.stringify({ imageBase64: { $media: mediaHash } })
                     : values?.[0] === mediaHash ? "image-bytes" : '{"text":"summary","count":1}';
-                return [[{ bytes }]];
+                return [[{ hash: values?.[0], bytes }]];
             }
             return [[]];
         },
