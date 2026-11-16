@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { EventEmitter } from "node:events";
+import { IncomingMessage } from "node:http";
+import { Socket } from "node:net";
 import { BodyTooLargeError, readBody } from "../src/server.ts";
 import { MAX_REQUEST_BYTES } from "../src/fetch-util.ts";
 
@@ -17,6 +19,60 @@ test("readBody: returns buffer for a normal request", async () => {
     const req = Readable.from([buf]) as never;
     const out = await readBody(req);
     assert.equal(out.toString("utf8"), "hello");
+});
+
+for (const outcome of ["success", "error"] as const) {
+    test(`readBody: releases its request listeners after ${outcome}`, async () => {
+        const req = new EventEmitter();
+        const externalListener = () => {};
+        const events = ["data", "end", "error", "close"] as const;
+        for (const event of events) req.on(event, externalListener);
+        const pending = readBody(req as never);
+        req.emit("data", Buffer.from("hello"));
+        if (outcome === "success") {
+            req.emit("end");
+            assert.equal((await pending).toString("utf8"), "hello");
+        } else {
+            const error = new Error("read failure");
+            const rejection = assert.rejects(pending, (actual: unknown) => actual === error);
+            req.emit("error", error);
+            await rejection;
+        }
+        for (const event of events) {
+            assert.deepEqual(req.listeners(event), [externalListener], `${event}: readBody must remove only its own listener`);
+        }
+    });
+}
+
+for (const withError of [false, true]) {
+    test(`readBody: real IncomingMessage cancellation ${withError ? "with" : "without"} an error settles and cleans up`, { timeout: 2000 }, async () => {
+        const req = new IncomingMessage(new Socket());
+        const error = withError ? new Error("client disconnected") : undefined;
+        const closed = new Promise<void>((resolve) => req.once("close", resolve));
+        const pending = readBody(req);
+        const rejection = assert.rejects(pending, (actual: unknown) => withError ? actual === error : actual instanceof Error);
+        req.push(Buffer.from("hello"));
+        setImmediate(() => req.destroy(error));
+        await rejection;
+        await closed;
+        for (const event of ["data", "end", "error", "close"]) assert.equal(req.listenerCount(event), 0, event);
+    });
+}
+
+test("readBody: a real IncomingMessage over the limit keeps BodyTooLargeError through destroy", { timeout: 2000 }, async (t) => {
+    const previousLimit = process.env.BILI_RECEIVE_BODY_BYTES;
+    process.env.BILI_RECEIVE_BODY_BYTES = "8";
+    t.after(() => { process.env.BILI_RECEIVE_BODY_BYTES = previousLimit; });
+    const req = new IncomingMessage(new Socket());
+    const closed = new Promise<void>((resolve) => req.once("close", resolve));
+    const pending = readBody(req);
+    const rejection = assert.rejects(pending, (error: unknown) => error instanceof BodyTooLargeError && error.limit === 8);
+    req.push(Buffer.from("1234"));
+    req.push(Buffer.from("56789"));
+    await rejection;
+    await closed;
+    assert.equal(req.destroyed, true);
+    for (const event of ["data", "end", "error", "close"]) assert.equal(req.listenerCount(event), 0, event);
 });
 
 test("readBody: rejects with BodyTooLargeError AND destroys socket when body exceeds MAX_REQUEST_BYTES", async () => {
