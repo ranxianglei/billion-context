@@ -1960,7 +1960,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
             child.pluginSnapshot = structuredClone(source!.slice(0, request.branchPoint.messageCount));
-            const forkView = prune(child.pluginSnapshot, child.state);
+            const parentEffective = parent.metadata["effectiveConfig"] as { preserveFirstUser?: boolean } | undefined;
+            const forkView = prune(child.pluginSnapshot, child.state, { preserveFirstUser: parentEffective?.preserveFirstUser });
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
                 rawIds.has(a.callMessageId) && rawIds.has(a.resultMessageId) && (
@@ -1981,7 +1982,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens", "egressAuthority"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
             child.metadata.parentRevision = request.parentRevision;
-            child.stats.contextTokens = prune(child.pluginSnapshot, child.state).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
+            child.stats.contextTokens = prune(child.pluginSnapshot, child.state, { preserveFirstUser: parentEffective?.preserveFirstUser }).reduce((sum, m) => sum + countMessageTokens(m), 0) + (typeof child.metadata.systemPromptTokens === "number" ? child.metadata.systemPromptTokens : 0);
             child.stats.contextTokensSource = "estimate";
             recordContextObservation(child, child.stats.contextTokens, "estimate");
             // Seed the nudge sizing fallback (#728 lane). The receipt starts

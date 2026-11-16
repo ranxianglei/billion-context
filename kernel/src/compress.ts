@@ -1375,6 +1375,7 @@ const pruneNode: PipelineNode = {
       ...io,
       messages: prune(io.messages, io.state, {
         isCompressTool: ctx.config.isCompressTool,
+        preserveFirstUser: ctx.config.preserveFirstUser,
       }),
       // #2663: keep the pre-prune resent array reachable so recommend can
       // judge foldability on the same input class applyCompression sees.

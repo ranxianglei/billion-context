@@ -640,6 +640,10 @@ export interface Config {
   preserveRecentTools?: string[];
   preserveRecentMessages: number;
   preserveRecentTokens: number;
+  /** Pin the very first user message unconditionally as the prefix-cache head
+   *  anchor (`true`, default) or dynamically allow pruning it once covered as
+   *  long as another uncovered user message survives (`false`). */
+  preserveFirstUser?: boolean;
   modelContextLimit: number;
   /** Instant tool-result absorption (see absorb.ts). Absent/disabled = feature off. */
   absorb?: AbsorbConfig;

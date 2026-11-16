@@ -309,6 +309,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedUserPatterns` | string[] | none | — | Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions. |
+| `compress.preserveFirstUser` | boolean | true | — | Pin the opening user message unconditionally as the prefix-cache head anchor; set false to allow dynamic pruning once covered while another uncovered user turn survives. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |

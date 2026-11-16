@@ -269,6 +269,13 @@ entries:
     desc_ja: "ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。"
     site_en: "Protect host-marked current-task prompts from folding (literal substrings)."
     site_zh: "保护 host 标记的当前任务 prompt 不被折叠（字面子串）。"
+  - key: compress.preserveFirstUser
+    type: boolean
+    default: "true"
+    group: compress
+    desc_en: "Pin the opening user message unconditionally as the prefix-cache head anchor; set false to allow dynamic pruning once covered while another uncovered user turn survives."
+    desc_zh: "默认无条件固定首条 user 消息作为前缀缓存头锚点；设为 false 时，只要后续仍有未覆盖 user 轮次，即可随折叠动态裁剪首条 user 消息。"
+    desc_ja: "最初の user メッセージをプレフィックスキャッシュ先頭アンカーとして無条件に固定する（デフォルト true）。false にすると、他の未カバー user ターンが残る限りフォールド済み先頭 user を動的にプルーニングできる。"
   - key: compress.protectedTools
     type: "string[]"
     default: "none"

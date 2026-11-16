@@ -87,6 +87,7 @@ export function mergeCompress(
         postComPressTail: pick("postComPressTail"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
+        preserveFirstUser: pick("preserveFirstUser"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         maxSummaryLength: pick("maxSummaryLength"),
         minSummaryLength: pick("minSummaryLength"),
@@ -422,6 +423,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         tiers,
         preserveRecentMessages: s.preserveRecentMessages ?? base.preserveRecentMessages,
         preserveRecentTokens: s.preserveRecentTokens ?? base.preserveRecentTokens,
+        ...(s.preserveFirstUser !== undefined
+            ? { preserveFirstUser: s.preserveFirstUser }
+            : (base as ResolvedKernelConfig).preserveFirstUser !== undefined
+              ? { preserveFirstUser: (base as ResolvedKernelConfig).preserveFirstUser }
+              : {}),
         compress: {
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
