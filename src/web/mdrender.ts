@@ -36,7 +36,8 @@ export function makeMdRender(): MdRenderApi {
 
     function inlineMd(s: string): string {
         let out = escape(s);
-        out = out.replace(/`([^`]+)`/g, (_m, code: string) => `<code>${code}</code>`);
+        out = out.replace(/`([^`]+)`/g, (_m, code: string) =>
+            `<code>${code.replace(/[*[\]]/g, (c) => `&#${c.charCodeAt(0)};`)}</code>`);
         // ![alt](url) — must run before the link rule so the image syntax is
         // consumed whole. Only published image sources survive: http(s), or the
         // panel's own bundled-asset route (/__bili/blog-assets/*, see
@@ -206,7 +207,7 @@ export function makeMdRender(): MdRenderApi {
                 html.push(`<pre><code>${escape(buf.map((l) => l.slice(cut)).join("\n"))}</code></pre>`);
                 continue;
             }
-            if (/^\s*&gt;\s?/.test(line) || /^\s*>\s?/.test(line)) {
+            if (/^\s*>\s?/.test(line)) {
                 const buf: string[] = [];
                 while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, "")); i += 1; }
                 html.push(`<blockquote><p>${inlineMd(buf.join(" "))}</p></blockquote>`);
