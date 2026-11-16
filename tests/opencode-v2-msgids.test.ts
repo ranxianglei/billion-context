@@ -88,3 +88,69 @@ test("v2 stamp budget: >4096 ids or >16KiB joined degrades without riding", () =
     assert.notEqual(opencodeV2MsgIdList(many), undefined, "list itself is valid at exactly the cap");
     assert.equal(stampedMsgIdsHeaderFromMessages(many), undefined, "join budget degrades the STAMP only");
 });
+
+// ---------------------------------------------------------------------------
+// #6785 review / KDD#17: PARITY PIN — the leading-run skip above is only
+// correct while the kernel's responsesToCore hoists EXACTLY the same run the
+// plugin skips. These tests run the SAME message shapes through both sides
+// and assert count parity (stamped ids === post-hoist core message count,
+// which is what validateMsgIds checks server-side). If the kernel's hoist
+// rule changes — the run boundary moves, a new head-neutral item type lands,
+// or mid-history system items stop being position-preserved — this build
+// breaks instead of every opencode v2 turn silently degrading to
+// content-derived ids.
+// ---------------------------------------------------------------------------
+import { responsesToCore } from "../kernel/src/wire/responses.ts";
+import type { ResponsesRequestBody } from "../kernel/src/wire/responses.ts";
+
+const wireBody = (roles: string[]): ResponsesRequestBody =>
+    ({ model: "test-model", input: roles.map((role) => ({ type: "message", role, content: `t-${role}` })) } as ResponsesRequestBody);
+
+const hostTurn = (roles: string[]) => roles.map((role, i) => ({ id: `msg_parity${i}`, role }));
+
+for (const roles of [
+    ["system", "developer", "user", "assistant"],
+    ["developer", "system", "system", "user"],
+    ["system", "user", "system", "user"], // mid-history system is a positioned sidecar core
+    ["user", "assistant", "user"],
+    ["developer", "user"],
+    ["user"],
+] as const) {
+    test(`v2 parity pin: ${JSON.stringify(roles)} → stamped ids align to the post-hoist core count`, () => {
+        const core = responsesToCore(wireBody([...roles]));
+        const ids = opencodeV2MsgIdList(hostTurn([...roles]));
+        assert.notEqual(ids, undefined, `the turn must stamp for ${JSON.stringify(roles)}`);
+        assert.equal(ids!.length, core.msgs.length, `stamped id count (${ids!.length}) must equal the kernel's post-hoist core count (${core.msgs.length}) — the server pins on exactly this`);
+    });
+}
+
+test("v2 parity pin: an all-leading-run turn hoists to ZERO core messages and the plugin stamps nothing", () => {
+    const core = responsesToCore(wireBody(["system", "system"]));
+    assert.equal(core.msgs.length, 0, "kernel: the whole run hoists into systemParts");
+    assert.equal(opencodeV2MsgIdList(hostTurn(["system", "system"])), undefined, "plugin: nothing left to pin → no stamp (aligned: there is no core count to match)");
+});
+
+test("v2 parity pin: a head-neutral tooling item keeps the kernel's head run OPEN — the plugin side CANNOT express that and must degrade", () => {
+    // Kernel side (pinned): additional_tools / mcp_list_tools inside the
+    // leading run do not break sysDevHead — the system after them still
+    // hoists. The plugin's contiguous-run skip cannot express this nuance,
+    // and that asymmetry is SAFE only because the head-neutral item carries
+    // no msg_ id: the whole turn degrades (no header) and the server never
+    // sees a miscounted list. Pin both halves of that contract.
+    const core = responsesToCore({
+        model: "test-model",
+        input: [
+            { type: "additional_tools", tools: [] },
+            { type: "message", role: "system", content: "s" },
+            { type: "message", role: "user", content: "u" },
+        ],
+    } as ResponsesRequestBody);
+    assert.equal(core.systemParts.length, 1, "kernel: the system AFTER the tooling item still hoists (head stayed open)");
+    // Plugin side: the same turn arrives as host messages; the tooling item
+    // has no msg_ id → poison → the whole turn degrades.
+    assert.equal(
+        opencodeV2MsgIdList([{ id: undefined, role: "additional_tools" }, { id: "msg_s1", role: "system" }, { id: "msg_u1", role: "user" }]),
+        undefined,
+        "plugin: the unexpressible nuance degrades the whole turn (no miscounted list ever rides)",
+    );
+});
