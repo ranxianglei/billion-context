@@ -1221,7 +1221,11 @@ function registerArmed(): Promise<void> {
 // log line each. Three states + per-endpoint cumulative counts make the
 // "dozens refused, one passed" distribution diagnosable at a glance.
 type GateAttribution =
-    | { state: "ok"; sid: string }
+    // #6880: `purpose` rides the dispatch's own options (GenerateOptions.purpose,
+    // dsh contract: set ONLY on auxiliary calls — ordinary conversation leaves
+    // it unset). Stamped as x-bili-plugin-purpose so the server classifies the
+    // request BY DECLARATION instead of content-guessing (#6880).
+    | { state: "ok"; sid: string; purpose?: string }
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
@@ -1247,6 +1251,7 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    purpose?: string;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
@@ -1341,7 +1346,7 @@ function attributionOf(ctx: PluginContext): GateAttribution {
             noticedScopedAttribution = true;
             persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
         }
-        return { state: "ok", sid: scoped.sid };
+        return { state: "ok", sid: scoped.sid, purpose: scoped.purpose };
     }
     try {
         const init = ctx.agents?.currentInitiator?.();
@@ -2079,13 +2084,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // #6880: capture the dispatch's declared purpose the same way
+                // (dsh sets it on every auxiliary call; conversation leaves it
+                // unset). Absent/odd values simply stay off the turn.
+                const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), purpose };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2600,6 +2609,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #6880: the declared purpose rides its own header (ASCII-gated like
+        // the model header below — an odd value degrades to no header, and
+        // the server falls back to its content heuristics). Post-#6883 this is
+        // stamped on EVERY dispatch: the real dsh purpose for auxiliary
+        // calls, or the "conversation" sentinel for main turns (dsh leaves
+        // GenerateOptions.purpose unset for ordinary conversation). PRESENCE
+        // is therefore the v2 declaration — the server routes declared aux by
+        // the header alone and keys declared main traffic on the raw session
+        // id (no persona-order ladder); the sentinel itself is not a side.
+        const declaredPurpose = attr.purpose ?? "conversation";
+        const purposeHeader = asciiHeaderValue(declaredPurpose);
+        if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
