@@ -1963,7 +1963,10 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
             fetch: async (url: string) => {
                 const u = String(url);
                 if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
-                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", viaFallback: true }) };
+                // #6968: the REAL wire key is `fallback` (src/plugin.ts), not
+                // `viaFallback` — the pre-fix test simulated a response the
+                // server never sends, so the ownership gate was never exercised.
+                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "sub-session-id", conversationId: "some-other-conversation", fallback: true }) };
                 if (u.endsWith("/__bili/?embed=1")) return htmlOk();
                 throw new Error(`unexpected fetch: ${u}`);
             },
@@ -1976,6 +1979,33 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.ok(ht.includes("暂无上下文数据"), "foreign fallback-resolved session never gets framed");
         assert.equal(findTag(hm.component() as ElementNode, "iframe"), undefined, "no frame for someone else's session");
         hm.runCleanups();
+    }
+    {
+        // #6968 negative direction (#3617): a fallback that resolves to OUR OWN
+        // session (conversationId === hostSessionId) is trusted — the ownership
+        // gate must NOT fire. The gate triggers on FOREIGN fallback rows only;
+        // pinning this direction stops a future over-tight gate from refusing
+        // our own fallback-resolved session (the pre-first-request case the
+        // fallback exists for).
+        const om = await mountClient({
+            __BILI__: { origin: ORIGIN },
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith(statusUrl)) return { ok: true, json: async () => ({ ok: true, panel: "x", sessionId: "own-session-id", conversationId: HOST_CONVERSATION_ID, fallback: true }) };
+                if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            ...noopTimers,
+        }, "conversation.view", { sessionId: HOST_CONVERSATION_ID });
+        om.resetHooks();
+        om.component();
+        await tick();
+        const ot = textOf(om.component() as ElementNode);
+        assert.ok(!ot.includes("暂无上下文数据"), "own-session fallback is framed, not the not-yet hint");
+        assert.ok(findTag(om.component() as ElementNode, "iframe") !== undefined, "frame for our own fallback-resolved session");
+        om.runCleanups();
     }
     {
         // The URL answered but not with our contract shape: degrade honestly.
