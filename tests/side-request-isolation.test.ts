@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
@@ -390,7 +390,7 @@ test("restoreOutputBudget: #3071 leaves the ceiling-known behavior unchanged (re
 });
 
 test("restoreOutputBudget: dsh-lane mid-band collapse is rescued when a ceiling is known (#3438)", () => {
-    _resetDshMidBandWarningsForTest();
+    _resetMidBandWarningsForTest();
     const lines: string[] = [];
     const log = (_lvl: string, msg: string): void => { lines.push(msg); };
     const tools = [{ type: "function", function: { name: "bash" } }];
@@ -413,7 +413,7 @@ test("restoreOutputBudget: dsh-lane mid-band collapse is rescued when a ceiling 
         assert.equal(s.metadata.outputBudgetHighWater, CEIL, "a collapsed value must NOT re-seed the high-water");
     }
     assert.ok(lines.some((l) => l.includes("output budget restored 2260 -> 393216")), "the restore is logged");
-    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band origin names itself in the log");
+    assert.ok(lines.some((l) => l.includes("#3438/#6955: mid-band collapse")), "the mid-band origin names itself in the log");
     // A mid-band value far above the starve gate is the same signature.
     const deep = { max_output_tokens: 25_484, tools, model: M };
     restoreOutputBudget(deep, s, log, CEIL, true);
@@ -436,6 +436,44 @@ test("restoreOutputBudget: dsh-lane mid-band collapse is rescued when a ceiling 
     assert.equal(starved.max_output_tokens, CEIL, "the <=200 entry point still rescues on the dsh lane");
 });
 
+test("restoreOutputBudget: pi-plugin-lane mid-band collapse is rescued when a ceiling is known (#6955)", () => {
+    _resetMidBandWarningsForTest();
+    const lines: string[] = [];
+    const log = (_lvl: string, msg: string): void => { lines.push(msg); };
+    const tools = [{ type: "function", function: { name: "bash" } }];
+    const M = "claude-opus-5-5";
+    const CEIL = 128_000;
+    // Incident replay (v0.1.215, pi plugin lane, anthropic wire): the session ran
+    // healthy at the model's declared maxTokens (128000), then pi-ai's
+    // clampMaxTokensToContext decayed the budget THROUGH the mid-band as the raw
+    // history approached the 1M window. Before #6955 every >200 value passed
+    // verbatim; the three observed collapses (441/435/271) all slipped past the
+    // <=200 starve gate, ending in thinking-only finish=max_tokens turns.
+    const s = metaSession("pi-incident");
+    const healthy = { max_tokens: CEIL, tools, model: M };
+    restoreOutputBudget(healthy, s, noopLog, CEIL, true);
+    assert.equal(healthy.max_tokens, CEIL, "at-ceiling value passes untouched");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the healthy value seeds the high-water");
+    for (const v of [441, 435, 271]) {
+        const body = { max_tokens: v, tools, model: M };
+        restoreOutputBudget(body, s, log, CEIL, true);
+        assert.equal(body.max_tokens, CEIL, `${v} restored to the known ceiling (#6955)`);
+        assert.equal(s.metadata.outputBudgetHighWater, CEIL, "a collapsed value must NOT re-seed the high-water");
+    }
+    assert.ok(lines.some((l) => l.includes("output budget restored 441 -> 128000")), "the restore is logged");
+    assert.ok(lines.some((l) => l.includes("#3438/#6955: mid-band collapse")), "the mid-band origin names itself in the log");
+    // A side request (no tools) on the same lane is NEVER touched — restoring it
+    // would break its side status — and it must not seed the high-water either.
+    const side = { max_tokens: 1024, model: M };
+    restoreOutputBudget(side, s, log, CEIL, true);
+    assert.equal(side.max_tokens, 1024, "tool-less mid-band passes verbatim");
+    assert.equal(s.metadata.outputBudgetHighWater, CEIL, "the side request did not poison the high-water");
+    // Below the starve gate the pre-existing rescue entry point still applies.
+    const starved = { max_tokens: 150, tools, model: M };
+    restoreOutputBudget(starved, s, log, CEIL, true);
+    assert.equal(starved.max_tokens, CEIL, "the <=200 entry point still rescues on the pi lane");
+});
+
 test("restoreOutputBudget: non-dsh lanes keep trusting a below-ceiling budget (#3438 scope guard)", () => {
     const tools = [{ name: "t" }];
     const s = metaSession("non-dsh");
@@ -453,7 +491,7 @@ test("restoreOutputBudget: non-dsh lanes keep trusting a below-ceiling budget (#
 });
 
 test("restoreOutputBudget: dsh-lane mid-band WITHOUT a ceiling forwards verbatim and warns once per session+model (#3438)", () => {
-    _resetDshMidBandWarningsForTest();
+    _resetMidBandWarningsForTest();
     const warns: string[] = [];
     const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
     const tools = [{ name: "t" }];
@@ -495,11 +533,11 @@ test("restoreOutputBudget: the <=200 starve log keeps its original wording, the 
     assert.ok(lines.some((l) => l.includes("#546: client shrank it from its raw-history estimate")), "the starve wording is byte-identical to before");
     const mid = { max_tokens: 872, tools, model: "m/x" };
     restoreOutputBudget(mid, s, log, 32_768, true);
-    assert.ok(lines.some((l) => l.includes("#3438: dsh-lane mid-band collapse")), "the mid-band restore names itself");
+    assert.ok(lines.some((l) => l.includes("#3438/#6955: mid-band collapse")), "the mid-band restore names itself");
 });
 
 test("restoreOutputBudget: a KNOWN ceiling with value >= ceiling is healthy — no spurious 'NO known output ceiling' warn (#4501)", () => {
-    _resetDshMidBandWarningsForTest();
+    _resetMidBandWarningsForTest();
     const warns: string[] = [];
     const log = (lvl: string, msg: string): void => { if (lvl === "warn") warns.push(msg); };
     const tools = [{ name: "t" }];
