@@ -932,6 +932,16 @@ let nudgeDebugWired = false;
 const nudgeNotifiedTurns = new Map<string, string>();
 let nudgeFullPending: NudgeDebugEvent | null = null;
 
+/** The pi-lane terminal notification for an injected nudge: a fixed label
+ *  prefix + the VERBATIM wire text the model read — nothing appended (strict
+ *  fidelity, owner direction 2026-11-17). A display-only "suggested call" used
+ *  to be tacked on here; unmarked, it read as part of the injection (and
+ *  advertised the non-canonical {startId,endId} array shape), which is exactly
+ *  what this surface must not do. */
+export function nudgeNotifyText(pending: Pick<NudgeDebugEvent, "emergency" | "text">): string {
+    return `[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}`;
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -1165,8 +1175,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
                 nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
                 try {
-                    const example = pending.topRange !== null ? `\n\nExample: compress({ content: [{ startId: "${pending.topRange.startRef}", endId: "${pending.topRange.endRef}", summary: "..." }] })` : "";
-                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}${example}`);
+                    ctx.ui?.notify?.(nudgeNotifyText(pending));
                 } catch {
                     // host UI unavailable — best-effort display
                 }
