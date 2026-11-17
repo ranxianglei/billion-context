@@ -138,12 +138,14 @@ type LoadedModule =
     | { ok: false; err: string };
 
 const moduleCache = new Map<string, LoadedModule>();
+let moduleGeneration = 0;
 
 /** Clear the loaded-module cache. Called on `POST /__bili/config/reload` so a
  *  plugin's code (and any newly-added/removed entry) takes effect on the next
  *  request without a restart. Modules stay stable WITHIN a generation so a
  *  running session never swaps transform behavior mid-flight. */
 export function resetEgressModuleCache(): void {
+    moduleGeneration++;
     moduleCache.clear();
 }
 
@@ -160,6 +162,7 @@ function coerceModule(def: unknown): EgressTransformModule | null {
 async function loadModule(absPath: string): Promise<LoadedModule> {
     const cached = moduleCache.get(absPath);
     if (cached) return cached;
+    const generation = moduleGeneration;
     let result: LoadedModule;
     try {
         if (!existsSync(absPath)) throw new Error(`module not found: ${absPath}`);
@@ -175,7 +178,7 @@ async function loadModule(absPath: string): Promise<LoadedModule> {
     } catch (e) {
         result = { ok: false, err: String(e instanceof Error ? e.message : e) };
     }
-    moduleCache.set(absPath, result);
+    if (generation === moduleGeneration) moduleCache.set(absPath, result);
     return result;
 }
 
