@@ -111,3 +111,48 @@ test("ws bridge: server close shuts every session down and terminates peers", as
         await new Promise<void>(resolve => upstream.close(() => resolve()));
     }
 });
+
+test("ws bridge: WS lane survives a post-bind ladder re-listen (#7047)", async () => {
+    const upstream = http.createServer();
+    await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+    const upstreamPort = (upstream.address() as AddressInfo).port;
+    const server = http.createServer((_req, res) => res.writeHead(404).end());
+    const handler = installWebSocketBridge(server, async (_req, res) => { res.writeHead(200).end(); }, () => {}, [fakeCodec]);
+    server.on("upgrade", (req, socket, head) => { if (!handler(req, socket, head)) socket.destroy(); });
+    try {
+        // First bind (the port that turns out to be shared with a foreign
+        // listener). attemptListen (server.ts:1561) strips all 'listening'
+        // listeners before each listen — mirror that here so the test exercises
+        // the real server path (a 'listening'-event re-arm would be invisible
+        // to this test without the strip).
+        server.removeAllListeners("listening");
+        await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+        // #2941 post-bind ladder (server.ts:1539): close the bound port, cut
+        // connections, and re-listen the SAME server object on the next port.
+        // The 'close' backstop runs wss.close() here — the ws library never
+        // reopens a closed WebSocketServer, so without re-arming every later
+        // upgrade would 503 (completeUpgrade: _state > RUNNING) for the rest
+        // of the process.
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        server.closeAllConnections?.();
+        server.removeAllListeners("listening");
+        await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+        const port = (server.address() as AddressInfo).port;
+        // The WS lane must still accept upgrades after the re-listen.
+        const socket = new WebSocket(`ws://127.0.0.1:${port}/bili/fake/http://127.0.0.1:${upstreamPort}/echo`, {
+            headers: { "x-bili-plugin": "fakehost", "x-bili-plugin-conversation": "ses_ladder_1" },
+        });
+        const received = new Promise<string>((resolve, reject) => {
+            socket.on("message", data => resolve(data.toString()));
+            socket.on("error", reject);
+            socket.on("close", () => reject(new Error("ws closed before echo")));
+        });
+        socket.on("open", () => socket.send("hello"));
+        assert.equal(await received, "echo:hello");
+        socket.close(1000);
+        await new Promise<void>(resolve => socket.on("close", resolve));
+    } finally {
+        if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+        await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+});
