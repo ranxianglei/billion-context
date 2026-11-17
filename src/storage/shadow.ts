@@ -1535,7 +1535,7 @@ interface DriftDiagnostics {
      *  converges the tables it owns; the sub-key names the actual residue. */
     stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
-    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint; /** #5677: top-level field names whose values disagree (names only). */ fields?: string[] };
+    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint; /** #5677: top-level field names whose values disagree (names only). */ fields?: string[]; /** #5589: for object-typed divergent fields, the inner keys that disagree (wire schema names only, capped). */ nestedFields?: Record<string, string[]> };
 }
 
 /** Compare the replay by component, retaining only message fingerprints across batches. */
@@ -1658,9 +1658,10 @@ class BatchedViewVerification {
                 this.changed(key);
                 if (key === "lastMessages" && expected && !this.tailSlot) {
                     const fields = diffFieldNames(expected[wantIndex], rec.raw);
+                    const nestedFields = diffNestedFieldKeys(expected[wantIndex], rec.raw, fields);
                     this.tailSlot = fields === undefined
                         ? { index, expect: want.slot, got: rec.sig.slot }
-                        : { index, expect: want.slot, got: rec.sig.slot, fields };
+                        : { index, expect: want.slot, got: rec.sig.slot, fields, ...(nestedFields ? { nestedFields } : {}) };
                 }
             }
             index++;
@@ -1743,6 +1744,39 @@ function diffFieldNames(a: unknown, b: unknown): string[] | undefined {
     return out.length > 0 ? out : undefined;
 }
 
+/** #5589: one level deeper than diffFieldNames — for each divergent top-level
+ *  field whose value is a PLAIN OBJECT on both legs, name the inner keys whose
+ *  canonicalized values disagree. Wire schema names only — values never leave
+ *  this function (same privacy contract as the #5677 field names). Bounded:
+ *  at most MAX_DRIFT_NESTED_KEYS inner keys per field, sorted. Fields absent on
+ *  one leg are NOT drilled (the top-level name already says "the sidecar
+ *  appeared/disappeared"); arrays are not drilled (index-level diffs are a
+ *  different shape). undefined when no field qualifies. */
+const MAX_DRIFT_NESTED_KEYS = 5;
+function diffNestedFieldKeys(a: unknown, b: unknown, fields: string[] | undefined): Record<string, string[]> | undefined {
+    if (!fields || !a || typeof a !== "object" || Array.isArray(a) || !b || typeof b !== "object" || Array.isArray(b)) return undefined;
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
+    const out: Record<string, string[]> = {};
+    for (const f of fields) {
+        const av = ao[f];
+        const bv = bo[f];
+        if (av === null || typeof av !== "object" || Array.isArray(av) || bv === null || typeof bv !== "object" || Array.isArray(bv)) continue;
+        const aobj = av as Record<string, unknown>;
+        const bobj = bv as Record<string, unknown>;
+        const inner: string[] = [];
+        for (const k of [...new Set([...Object.keys(aobj), ...Object.keys(bobj)])].sort()) {
+            if (ser(aobj[k]) !== ser(bobj[k])) {
+                inner.push(k);
+                if (inner.length >= MAX_DRIFT_NESTED_KEYS) break;
+            }
+        }
+        if (inner.length > 0) out[f] = inner;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
+
 // #3919: which dimensions disagree when the sampled verify detects drift —
 // the digest is a single hash and leaves classification to guesswork. Pure;
 // runs only on detected drift (rare). Fingerprints carry id/role/length/
@@ -1795,9 +1829,10 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
             const ea = index < et.length ? et[index] : null;
             const ga = index < gt.length ? gt[index] : null;
             const fields = diffFieldNames(ea, ga);
+            const nestedFields = diffNestedFieldKeys(ea, ga, fields);
             diagnostics.tailSlot = fields === undefined
                 ? { index, expect: fp(ea), got: fp(ga) }
-                : { index, expect: fp(ea), got: fp(ga), fields };
+                : { index, expect: fp(ea), got: fp(ga), fields, ...(nestedFields ? { nestedFields } : {}) };
         }
     }
     return diagnostics;
@@ -1808,8 +1843,10 @@ export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
     if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
-        const { index, expect: ex, got: go, fields } = d.tailSlot;
-        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}${fields ? `; fields: ${fields.join(",")}` : ""}`);
+        const { index, expect: ex, got: go, fields, nestedFields } = d.tailSlot;
+        let suffix = fields ? `; fields: ${fields.join(",")}` : "";
+        if (nestedFields) suffix += `; ${Object.entries(nestedFields).map(([f, ks]) => `${f}: ${ks.join(",")}`).join("; ")}`;
+        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}${suffix}`);
     }
     return " [" + parts.join("; ") + "]";
 }
