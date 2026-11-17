@@ -538,8 +538,11 @@ test("#1382: compaction cancel requires evidence the proxy carries this conversa
     await runOmpCase(true, true, "omp: proxy confirms carriage → announced auto compaction cancelled");
     await runOmpCase(false, false, "omp: proxy never saw the conversation → announced auto compaction proceeds");
 
-    // (H) omp identity fast path: a successful identity register is local
-    // evidence — the cancel holds even though the proxy reports unknown.
+    // (H) omp identity register is NOT carriage evidence (#7060): the
+    // proxy reports the conversation unknown, so the plugin must NOT claim
+    // ownership — native compaction proceeds even though the identity
+    // register succeeded (registration populates registeredIds without
+    // creating a tracked session).
     const identityProxy = await startFakeProxy({ statusOk: false });
     try {
         await withEnv({ BILLION_CONTEXT_PROXY: identityProxy.origin }, async () => {
@@ -551,7 +554,7 @@ test("#1382: compaction cancel requires evidence the proxy carries this conversa
             const payload = await omp.events.get("before_provider_request")!({ payload: { messages: [{ role: "user", content: "hi" }] } }, ctx);
             assert.equal((payload as { prompt_cache_key?: string })?.prompt_cache_key, "sess-omp-id", "identity registration completed with the request");
             omp.events.get("auto_compaction_start")!({}, undefined);
-            assert.deepEqual(await omp.events.get("session_before_compact")!({}, ctx), { cancel: true }, "identity-registered session is carried by construction");
+            assert.deepEqual(await omp.events.get("session_before_compact")!({}, ctx), undefined, "identity-registered session is NOT carried by construction — proxy reports unknown → native compaction proceeds");
         });
     } finally {
         await identityProxy.close();

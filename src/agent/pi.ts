@@ -1028,9 +1028,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // never runs once an earlier handler returned cancel. Accepted
         // evidence, in order: (1) local — we stamped
         // x-bili-plugin-conversation for this session id (tools registered
-        // AND a request routed through the proxy), or omp's identity register
-        // succeeded; (2) remote — the proxy confirms it carries the
-        // conversation id (/__bili/plugin/status ok). A non-http(s) baseUrl
+        // AND a request routed through the proxy) [pi only]; (2) remote — the
+        // proxy confirms it carries the conversation id (/__bili/plugin/status
+        // ok) [pi and omp]. omp's identity register is NOT carriage evidence
+        // (#7060: registration populates registeredIds without creating a
+        // tracked session, so a stamp-only claim cancels native compaction for
+        // a conversation the proxy never sees → overflow). A non-http(s) baseUrl
         // vetoes by default (opt-in via BILI_NON_HTTP_PROVIDERS below only
         // widens the candidate set; carriage evidence still decides). Hosts
         // exposing no stable session id keep the
@@ -1056,7 +1059,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return true;
-            if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return true;
+            if (agent === "pi" && state.carriedSids?.has(sid) === true) return true;
             try {
                 return (await fetchStatus(proxyBase, sid)) !== undefined;
             } catch (err) {
