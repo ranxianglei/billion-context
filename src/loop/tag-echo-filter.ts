@@ -1680,7 +1680,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
             // modes agree at true EOF.
             const cut = TRUNC_REF_CLOSE.exec(result);
             if (cut !== null) {
-                drop(result.slice(cut.index));
+                drop(result.slice(cut.index), true);
                 result = result.slice(0, cut.index);
             }
             // #4164: EOF resolves any still-held settle as prose — no tag ever
