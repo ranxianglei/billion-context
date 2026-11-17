@@ -1165,8 +1165,14 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
                 nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
                 try {
-                    const example = pending.topRange !== null ? `\n\nExample: compress({ content: [{ startId: "${pending.topRange.startRef}", endId: "${pending.topRange.endRef}", summary: "..." }] })` : "";
-                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}${example}`);
+                    // Strict fidelity (owner direction 2026-11-17): the
+                    // notification IS the wire text the model read — nothing
+                    // appended. A display-only "suggested call" used to be
+                    // added here; unmarked, it reads as part of the
+                    // injection (and advertised the non-canonical
+                    // {startId,endId} array shape), which is exactly what
+                    // this surface must not do.
+                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}`);
                 } catch {
                     // host UI unavailable — best-effort display
                 }
