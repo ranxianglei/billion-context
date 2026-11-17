@@ -73,6 +73,13 @@ interface IngestPlan extends IngestSessionInput {
     /** Resolved log seqs for pluginSnapshot entries (null when absent). */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+    /** #6947 direction C: how many TRAILING messages[] entries are non-tail
+     *  log rows (the stashed turn-final reply — persisted without ever
+     *  entering the resident window). The full path ignores the count (those
+     *  rows land like any other); the delta path uses it to keep the tail-seq
+     *  math on the view rows only and to JOIN the reply row in place when
+     *  the client re-send presents it as a normal tail message. */
+    nonTailCount: number;
 }
 
 /** #3133 test instrumentation: per-message JSON serializations performed by
@@ -174,6 +181,90 @@ function stringifyForStore(m: CoreMessage): string {
     }
 }
 
+/** #6947 direction C: the stashed turn-final reply rows the host parked in
+ *  `metadata.handoffReply` (see handoff-response.ts) — persisted through
+ *  metadata so BOTH views (legacy file, unified replay) see them, keeping
+ *  the #2960 digest pair equal. One row per captured reply message, built
+ *  by planStoredMessageRow with the id the NEXT codec pass will derive, so
+ *  the re-send joins it instead of duplicating it. */
+export interface HandoffReplyStashRow {
+    msgId: string;
+    content: string;
+    hash: string;
+    identity: string;
+    role: string;
+    kind: string;
+    media?: { hash: string; bytes: string }[];
+    ts?: number;
+}
+
+/** Plan-ready message row for a core the store has never seen through a
+ *  request — the turn-final handoff reply. Runs the EXACT serialization
+ *  chain the planners use (serializeForStore → splitMediaContent →
+ *  identityOfStoredContent), so the stored row's identity equals the one
+ *  the client re-send will derive: same join key, no duplicate row.
+ *  Exported so the host capture (handoff-response.ts) and the planners
+ *  cannot drift apart. */
+export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
+    const raw = serializeForStore(m);
+    ingestSerializations.count++;
+    const parsed = JSON.parse(raw) as { role?: unknown; contentType?: unknown };
+    const split = splitMediaContent(raw);
+    return {
+        msgId: m.id,
+        content: split.content,
+        hash: split.hash,
+        identity: identityOfStoredContent(split.content),
+        role: typeof parsed.role === "string" ? parsed.role : "assistant",
+        kind: typeof parsed.contentType === "string" ? parsed.contentType : "message",
+        ...(split.media.length > 0 ? { media: split.media } : {}),
+        ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+    };
+}
+
+/** Emits the handoffReply stash as TRAILING log rows (after every view row)
+ *  and returns how many landed. A stashed row whose msgId is already a VIEW
+ *  row of this save is skipped — the client re-send is planning the reply as
+ *  a normal tail message and the planner's own row is authoritative. Rows
+ *  carry whatever ref the ledger already knows for the id (null in the
+ *  normal case — the ref is minted by the kernel at the re-send, invariant 2
+ *  of direction C) and NEVER enter tailSeqs, so the reconstructed view stays
+ *  byte-equal to the session file's lastMessages. */
+function emitHandoffStash(
+    session: LegacySessionLike,
+    byRawRef: Record<string, string>,
+    log: LogEntry[],
+    viewIds: Set<string>,
+    seqBase: number,
+): number {
+    const stash = session.metadata["handoffReply"] as { rows?: unknown } | null | undefined;
+    if (!Array.isArray(stash?.rows)) return 0;
+    let emitted = 0;
+    for (const value of stash.rows as unknown[]) {
+        if (value === null || typeof value !== "object") continue;
+        const r = value as Partial<HandoffReplyStashRow>;
+        if (
+            typeof r.msgId !== "string" || typeof r.content !== "string" ||
+            typeof r.hash !== "string" || typeof r.identity !== "string"
+        ) continue;
+        if (viewIds.has(r.msgId)) continue;
+        log.push({
+            seq: seqBase + emitted,
+            msgId: r.msgId,
+            content: r.content,
+            hash: r.hash,
+            identity: r.identity,
+            role: typeof r.role === "string" ? r.role : "assistant",
+            kind: typeof r.kind === "string" ? r.kind : "message",
+            ref: byRawRef[r.msgId] ?? null,
+            ...(Array.isArray(r.media) && r.media.length > 0 ? { media: r.media } : {}),
+            ...(typeof r.ts === "number" ? { ts: r.ts } : {}),
+        });
+        emitted++;
+    }
+    return emitted;
+}
+
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
@@ -211,7 +302,12 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const pluginSnapshotSeqs = session.pluginSnapshot ? session.pluginSnapshot.map(intern) : null;
     const tailSeqs = session.lastMessages ? session.lastMessages.map(intern) : null;
 
-    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+    // #6947 direction C: the turn-final reply lands as trailing non-tail
+    // rows — persisted, but outside the view the tailSeqs reconstruct.
+    const viewIds = new Set(log.map((e) => e.msgId));
+    const nonTailCount = emitHandoffStash(session, byRawRef, log, viewIds, log.length);
+
+    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs, nonTailCount);
 }
 
 /** #3133 fast-path planner: build the ingest plan for a session whose
@@ -352,7 +448,12 @@ export function planIngestDelta(
     // holes included — folding removes log positions from the middle); the
     // delta path skips remapPlanToAbsolute by construction.
     const tailSeqs = [...trustedTailSeqs, ...appended];
-    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs);
+    // #6947 direction C (delta twin): a turn-end save is exactly an equal-
+    // length raw delta whose only payload is the stash — viewIds is the FULL
+    // tail (trusted prefix included) so a re-sent reply is never re-emitted.
+    const viewIds = new Set(tail.map((m) => m.id));
+    const nonTailCount = emitHandoffStash(session, byRawRef, log, viewIds, watermark + 1 + log.length);
+    return finishPlan(session, byRawRef, log, pluginSnapshotSeqs, tailSeqs, nonTailCount);
 }
 
 /** Shared plan tail (everything except the messages log): given the same
@@ -366,6 +467,7 @@ function finishPlan(
     log: LogEntry[],
     pluginSnapshotSeqs: number[] | null,
     tailSeqs: number[] | null,
+    nonTailCount = 0,
 ): IngestPlan {
     // Ref ledger: verbatim, ordered by the persisted map's key order.
     // Ghost ids (dead refs) have rows here and nowhere else — by design.
@@ -505,7 +607,7 @@ function finishPlan(
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs, nonTailCount };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */

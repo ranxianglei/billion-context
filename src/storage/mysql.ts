@@ -645,28 +645,68 @@ export class MysqlBackend implements StorageBackend {
                 if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
                     return false;
                 }
-                for (const m of input.messages) {
+                // Strictly-append guard, #6947 direction C (mirror of the
+                // sqlite lane): a hit at/BELOW the trusted tip or on a
+                // retired row refuses (full path re-dedups / reactivates);
+                // a LIVE hit above the tip is a row this lane stored without
+                // a view slot (the turn-end stash) — the re-send joins it in
+                // place: keep the stored seq, claim its NULL ref exactly like
+                // the full path's #6953 backfill.
+                const nonTailCount = input.nonTailCount ?? 0;
+                const tailCount = input.messages.length - nonTailCount;
+                const joinedSeq = new Map<number, number>();
+                const refClaims: { seq: number; ref: string; refNum: number | null }[] = [];
+                for (let i = 0; i < input.messages.length; i++) {
+                    const m = input.messages[i];
                     if (!m.contentHash) return false;
-                    // #4390: identity join; retired rows count as existing
-                    // (rewind-redo falls back to the full path).
+                    // #4390: identity join (position-independent).
                     const [hit] = (await c.query(
-                        "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ? LIMIT 1",
+                        "SELECT seq, retired_at FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ? LIMIT 1",
                         [s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content)],
                     )) as unknown as Row[][];
-                    if (hit.length > 0) return false;
+                    if (hit.length > 0) {
+                        const row = hit[0];
+                        if (
+                            Number(row.seq) <= delta.trustedSeq ||
+                            (row.retired_at !== null && row.retired_at !== undefined)
+                        ) {
+                            return false;
+                        }
+                        joinedSeq.set(i, Number(row.seq));
+                        if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null) {
+                            refClaims.push({ seq: Number(row.seq), ref: m.ref, refNum: m.refNum });
+                        }
+                        continue;
+                    }
                 }
-                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
+                if (refClaims.length > 0) {
+                    for (const claim of refClaims) {
+                        await c.query(
+                            "UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL",
+                            [claim.ref, claim.refNum, s.sessionId, claim.seq],
+                        );
+                    }
+                }
+                // JOINED rows keep their stored seq; the rest anchor at
+                // max(seq)+1 (re-read inside this transaction) — see the
+                // sqlite lane's renumber note.
+                let nextSeq = probe.maxSeq + 1;
+                messages = input.messages.map((m, i) => {
+                    const kept = joinedSeq.get(i);
+                    return kept !== undefined ? { ...m, seq: kept } : { ...m, seq: nextSeq++ };
+                });
+                const tailRows = messages.slice(0, tailCount);
                 const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
                 const prefixOk =
                     Array.isArray(tail.tailSeqs) &&
-                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
+                    tail.tailSeqs.length === delta.trustedTailSeqs.length + tailRows.length &&
                     delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
                 if (!prefixOk) return false;
                 s.tailJson = JSON.stringify({
                     ...tail,
-                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
+                    tailSeqs: [...delta.trustedTailSeqs, ...tailRows.map((m) => m.seq)],
                 });
-                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
+                watermark = tailRows.length > 0 ? tailRows[tailRows.length - 1].seq : delta.trustedSeq;
             } else {
                 // Remapping mutates tailJson; persist the same session object
                 // it updates, not the caller's separate plan-space snapshot.
