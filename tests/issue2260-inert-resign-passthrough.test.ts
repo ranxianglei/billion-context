@@ -63,6 +63,7 @@ test("#2260(B)/#2090: inert non-builtin passthrough key warns once at config loa
                 assert.ok(warns[0].msg.includes('resign["x-ofm-signature"].passthrough'), warns[0].msg);
                 assert.ok(warns[0].msg.includes('"sdk-hmac-sha256"'), warns[0].msg);
                 assert.ok(warns[0].msg.includes('enabled=false') && warns[0].msg.includes("BILI_RESIGN=0"), warns[0].msg);
+                assert.ok(!warns[0].msg.includes("until bili ships a re-signer"), `stale re-signer promise must be gone for policy-refused schemes (#4632): ${warns[0].msg}`);
 
                 const second = loadRoutes();
                 assert.equal(inertWarns(captured).length, 1, "identical dead-key set must not repeat the warning");
