@@ -108,7 +108,8 @@ export function parseAgentProviderReport(payload: unknown): { agent: string; reg
     if (typeof report.agent !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(report.agent)) throw new Error("Invalid agent name");
     if (!report.providers || typeof report.providers !== "object" || Array.isArray(report.providers)) throw new Error("Expected a providers object");
     const entries = Object.entries(report.providers as Record<string, unknown>);
-    if (entries.length === 0 || entries.length > 64) throw new Error("Expected 1 to 64 providers");
+    // An empty snapshot clears the named agent's previous in-memory recipes.
+    if (entries.length > 64) throw new Error("Expected at most 64 providers");
     const registered: Record<string, AgentProviderRecipe> = {};
     const skipped: Array<{ name: string; reason: string }> = [];
     for (const [name, value] of entries) {

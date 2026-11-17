@@ -238,7 +238,8 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         }
         providers[id] = { baseUrl, api: entry.api, apiKey, models };
     }
-    if (Object.keys(providers).length === 0) return true;
+    // A complete empty snapshot must clear previously reported recipes too.
+    // Hosts without the registry face returned above without making a claim.
     const res = await fetch(`${proxyBase}/__bili/agent-providers`, {
         method: "POST",
         headers: { "content-type": "application/json" },
