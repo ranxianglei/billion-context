@@ -183,3 +183,89 @@ test("#6936: clean sessions (no BLOCKED rows) render unchanged", () => {
     `clean foldable row must stay unflagged:\n${report}`,
   );
 });
+
+// #6936 acceptance cases from the Codex CLI 0.169.0 / Windows / 0.1.215
+// long-session audit (@xiaozhu1337): the span label must be named by its
+// resolvable endpoints regardless of WHERE the unrefed (BLOCKED) rows sit —
+// leading, trailing, or both ends. The existing fixture only covered the
+// trailing case; these pin the leading and both-ends cases.
+
+test("#6936: leading BLOCKED rows — span named from first resolvable ref", () => {
+  const messages: CoreMessage[] = [
+    mk("tc1", "assistant", "tool-call", { toolName: "compress", toolCallId: "c1" }),
+    mk("tr1", "tool", "tool-result", { toolCallId: "c1" }),
+    mk("u1", "user", "text"),
+    mk("a1", "assistant", "text"),
+  ];
+  const state = createInitialState();
+  state.messageRefs.byRaw["tc1"] = BLOCKED_REF;
+  state.messageRefs.byRaw["tr1"] = BLOCKED_REF;
+  state.messageRefs.byRaw["u1"] = "m00001";
+  state.messageRefs.byRef["m00001"] = "u1";
+  state.messageRefs.byRaw["a1"] = "m00002";
+  state.messageRefs.byRef["m00002"] = "a1";
+  const config = defaultConfig(100_000, {
+    preserveRecentMessages: 0,
+    preserveRecentTokens: 0,
+  });
+  const report = buildStatusReport(state, messages, defaultCountTokens, {
+    scope: "uncompressed",
+    view: "ranges",
+    config,
+    originalMessages: messages,
+  });
+  assert.ok(!report.includes("BLOCKED"), `sentinel leaked:\n${report}`);
+  assert.ok(!report.includes("refs unresolvable"), `panic phrase leaked:\n${report}`);
+  const row = report.split("\n").find((l) => l.includes("m00001–m00002"));
+  assert.ok(
+    row,
+    `expected m00001–m00002 (named from first resolvable ref, not the leading BLOCKED rows):\n${report}`,
+  );
+  assert.ok(row!.includes("(4 msgs"), `all 4 rows must stay counted: ${row}`);
+  assert.ok(
+    row!.includes("unrefed rows inside stay after fold"),
+    `foldable mixed span must note the unrefed rows: ${row}`,
+  );
+});
+
+test("#6936: BLOCKED at both ends, valid refs in the middle — span named from the middle", () => {
+  const messages: CoreMessage[] = [
+    mk("tc1", "assistant", "tool-call", { toolName: "compress", toolCallId: "c1" }),
+    mk("tr1", "tool", "tool-result", { toolCallId: "c1" }),
+    mk("u1", "user", "text"),
+    mk("a1", "assistant", "text"),
+    mk("tc2", "assistant", "tool-call", { toolName: "compress", toolCallId: "c2" }),
+    mk("tr2", "tool", "tool-result", { toolCallId: "c2" }),
+  ];
+  const state = createInitialState();
+  state.messageRefs.byRaw["tc1"] = BLOCKED_REF;
+  state.messageRefs.byRaw["tr1"] = BLOCKED_REF;
+  state.messageRefs.byRaw["u1"] = "m00001";
+  state.messageRefs.byRef["m00001"] = "u1";
+  state.messageRefs.byRaw["a1"] = "m00002";
+  state.messageRefs.byRef["m00002"] = "a1";
+  state.messageRefs.byRaw["tc2"] = BLOCKED_REF;
+  state.messageRefs.byRaw["tr2"] = BLOCKED_REF;
+  const config = defaultConfig(100_000, {
+    preserveRecentMessages: 0,
+    preserveRecentTokens: 0,
+  });
+  const report = buildStatusReport(state, messages, defaultCountTokens, {
+    scope: "uncompressed",
+    view: "ranges",
+    config,
+    originalMessages: messages,
+  });
+  assert.ok(!report.includes("BLOCKED"), `sentinel leaked:\n${report}`);
+  assert.ok(!report.includes("refs unresolvable"), `panic phrase leaked:\n${report}`);
+  const row = report.split("\n").find((l) => l.includes("m00001–m00002"));
+  assert.ok(
+    row,
+    `expected m00001–m00002 (named from the middle resolvable refs, not the BLOCKED ends):\n${report}`,
+  );
+  assert.ok(row!.includes("(6 msgs"), `all 6 rows must stay counted: ${row}`);
+  assert.ok(
+    row!.includes("unrefed rows inside stay after fold"),
+    `foldable mixed span must note the unrefed rows: ${row}`,
+  );
+});
