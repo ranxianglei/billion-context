@@ -528,7 +528,9 @@ export async function refForItemBytes(session: Session, mediaType: string, b64: 
         }
     }
     if (candidates.length === 0) return undefined;
-    if (candidates.length === 1) return candidates[0].ref;
+    // A resized outbound image can share its byte count with a different
+    // original. Size/MIME only narrow the search; even a sole candidate must
+    // still match its readable spill before the model is sent to that ref.
     let matched: string | undefined;
     for (const c of candidates) {
         try {
