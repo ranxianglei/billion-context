@@ -530,12 +530,15 @@ function modelInfoRetryCooldownMs(): number {
     const parsed = raw === undefined ? Number.NaN : Number(raw);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : MODEL_INFO_RETRY_COOLDOWN_MS;
 }
+// How long after a resolve starts a dispatch may wait on it before its first
+// fetch; a slow or hung resolver must never stall the stream beyond this.
+const MODEL_INFO_DISPATCH_WAIT_MS = 2_000;
 const modelInfo: {
     byKey: Map<string, ModelInfoEntry>;
-    refreshingKeys: Set<string>;
+    refreshingKeys: Map<string, Promise<void>>;
     retryAtByKey: Map<string, number>;
     services?: { llm?: PluginContext["llm"]; agentDefaultModel?: PluginContext["agentDefaultModel"] };
-} = { byKey: new Map(), refreshingKeys: new Set(), retryAtByKey: new Map() };
+} = { byKey: new Map(), refreshingKeys: new Map(), retryAtByKey: new Map() };
 
 function modelInfoKey(provider: string, model: string): string {
     return `${provider}\u0000${model}`;
@@ -560,8 +563,12 @@ function normalizeModelTarget(provider: unknown, model: unknown): { provider: st
 // #2381: the model THIS request routes to — the session's own live header
 // first (exact at fetch time, correct across per-session model switches), the
 // host's global default selection only as fallback. Any miss degrades to
-// pre-#2381 behavior; it never yields a wrong model.
+// pre-#2381 behavior; it never yields a wrong model. Inside an llm/stream
+// dispatch the model that dispatch itself streams to wins (auxiliary calls
+// may run on a different model than the session's).
 function sessionModelTargetOf(ctx: PluginContext): { provider: string; model: string } | undefined {
+    const scoped = dispatchScope.getStore()?.modelTarget;
+    if (scoped !== undefined) return scoped;
     try {
         const init = ctx.agents?.currentInitiator?.();
         const header = init?.session?.requestHeader?.();
@@ -619,7 +626,10 @@ export function bodyOverWindowDetail(
     return sharedBodyOverWindowDetail(body?.bytes, rawBodyStringOf(init), declaredWindow);
 }
 
-function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
+// Returns a wait handle for the target's in-flight resolve (settles when it
+// lands, or MODEL_INFO_DISPATCH_WAIT_MS after it started), undefined when
+// there is nothing to wait for.
+function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): Promise<void> | undefined {
     const svc = modelInfo.services;
     if (svc === undefined) return;
     const sel = target ?? globalModelTarget(svc);
@@ -634,7 +644,7 @@ function refreshModelInfo(origin: string | undefined, target?: { provider: strin
     if (cached !== undefined && cached.contextWindow !== undefined) return;
     const retryAt = modelInfo.retryAtByKey.get(key);
     if (cached !== undefined && retryAt !== undefined && Date.now() < retryAt) return;
-    if (modelInfo.refreshingKeys.has(key)) return;
+    if (modelInfo.refreshingKeys.has(key)) return modelInfo.refreshingKeys.get(key);
     // The host registers llm as a service object, so resolveModelInfo needs its
     // receiver; called detached below, this threw
     // "Cannot read properties of undefined (reading 'resolveModelInfoFor')"
@@ -646,9 +656,8 @@ function refreshModelInfo(origin: string | undefined, target?: { provider: strin
         evictModelInfoEntries();
         return;
     }
-    modelInfo.refreshingKeys.add(key);
     modelInfo.retryAtByKey.set(key, Date.now() + modelInfoRetryCooldownMs());
-    void Promise.resolve()
+    const flight = Promise.resolve()
         .then(() => resolve(provider, model))
         .then((info) => {
             // Per-key commit (#2381): the entry belongs to its OWN key, so a
@@ -688,6 +697,9 @@ function refreshModelInfo(origin: string | undefined, target?: { provider: strin
                 }).catch(() => {});
             }
         });
+    const waitable = Promise.race([flight, new Promise<void>((done) => { setTimeout(done, MODEL_INFO_DISPATCH_WAIT_MS).unref?.(); })]);
+    modelInfo.refreshingKeys.set(key, waitable);
+    return waitable;
 }
 
 function errMessage(err: unknown): string {
@@ -1260,6 +1272,7 @@ interface LlmDispatchScope {
     // #6880: the dispatch's declared purpose (dsh auxiliary calls; absent
     // for conversation turns).
     purpose?: string;
+    modelTarget?: { provider: string; model: string };
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
@@ -2196,7 +2209,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown; provider?: unknown; model?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
@@ -2206,7 +2219,12 @@ export async function apply(ctx: PluginContext): Promise<void> {
                 // (dsh sets it on every auxiliary call; conversation leaves it
                 // unset). Absent/odd values simply stay off the turn.
                 const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), messages: options?.messages, purpose };
+                // Size the dispatch against the model IT streams to (auxiliary
+                // calls may use another model than the session header names).
+                // GenerateOptions declares provider + model at the top level.
+                const modelTarget = normalizeModelTarget(options?.provider, options?.model)
+                    ?? sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), messages: options?.messages, purpose, modelTarget };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2220,7 +2238,14 @@ export async function apply(ctx: PluginContext): Promise<void> {
                 // latter; each also clears inherited fetch-chain re-entry
                 // state so a new operation never looks like mid-descent
                 // re-entry (#5614).
-                return runLlmDispatch(scope, () => wrapScopedIterable(next(), scope));
+                // A model's first dispatch would otherwise fetch before its
+                // window resolved and go out without it; wait (bounded) first.
+                const pending = refreshModelInfo(register.base ?? state.origin, modelTarget);
+                const stream: () => AsyncIterable<unknown> = pending === undefined ? next : async function* () {
+                    await pending;
+                    yield* next();
+                };
+                return runLlmDispatch(scope, () => wrapScopedIterable(stream(), scope));
             });
         });
     }
