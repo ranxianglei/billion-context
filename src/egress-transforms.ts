@@ -45,7 +45,8 @@ export type EgressTransformEntry = {
 /** Context handed to each plugin's `transform`. `headers` is a writable draft:
  *  successful direct mutations commit to the outgoing map before returned
  *  headers merge; failed or timed-out drafts are discarded. `body` is the
- *  current stage's outbound copy (string JSON text or Buffer). */
+ *  current stage's string or a private Buffer draft. Buffer edits take effect
+ *  only when the plugin successfully returns that draft as `body`. */
 export type EgressTransformCtx = {
     sessionId: string | undefined;
     upstreamUrl: string;
@@ -261,7 +262,7 @@ export async function applyEgressTransforms(
     for (const t of resolved) {
         if (!matchUpstream(t.match, base.upstreamUrl)) continue;
         const headers = { ...base.headers };
-        const ctx: EgressTransformCtx = { ...base, headers, body: current };
+        const ctx: EgressTransformCtx = { ...base, headers, body: Buffer.isBuffer(current) ? Buffer.from(current) : current };
         const inBytes = byteLen(current);
         let result: EgressTransformResult;
         try {
