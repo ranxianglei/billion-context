@@ -217,25 +217,39 @@ mitm: { enabled: false, domains: [] },
 }
 
 /** Opens a request, waits for the first body byte (or headers for JSON),
- *  then destroys the client socket — simulating a user hitting Ctrl-C. */
-function abortAfterFirstByte(url: string, headers: Record<string, string>, body: string): Promise<"header" | "first-byte"> {
+ *  then destroys the client socket — simulating a user hitting Ctrl-C.
+ *  `ready` (when given) must hold before the socket is destroyed: the abort
+ *  only has an upstream socket to tear down once the proxy has actually
+ *  forwarded, and the 400 ms fallback used to fire first on slow runners,
+ *  leaving requests=0 / closed=0 (#4599). The wait is capped so a genuine
+ *  forward hang still fails the teardown assertion. */
+function abortAfterFirstByte(url: string, headers: Record<string, string>, body: string, ready?: () => boolean): Promise<"header" | "first-byte"> {
     return new Promise((resolve, reject) => {
+        let done = false;
         const req = http.request(url, { method: "POST", headers }, (res) => {
-            res.once("data", () => {
-                req.destroy();
-                resolve("first-byte");
-            });
+            res.once("data", () => finish("first-byte"));
             // hang-json never sends a body — abort on headers after a beat.
-            res.once("end", () => resolve("header"));
+            res.once("end", () => finish("header"));
         });
         req.on("error", (e: NodeJS.ErrnoException) => {
-            if (e.code === "ECONNRESET") resolve("first-byte");
+            if (e.code === "ECONNRESET") finish("first-byte");
             else reject(e);
         });
-        setTimeout(() => {
-            req.destroy();
-            resolve("header");
-        }, 400).unref();
+        setTimeout(() => finish("header"), 400).unref();
+        function finish(outcome: "header" | "first-byte"): void {
+            if (done) return;
+            done = true;
+            const t0 = Date.now();
+            const destroy = (): void => {
+                req.destroy();
+                resolve(outcome);
+            };
+            const waitReady = (): void => {
+                if (!ready || ready() || Date.now() - t0 > 5000) destroy();
+                else setTimeout(waitReady, 25).unref();
+            };
+            waitReady();
+        }
         req.end(body);
     });
 }
@@ -267,7 +281,7 @@ test("abort x proxy-openai-sse: client abort mid-stream destroys the upstream re
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
-        const outcome = await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-oai" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
+        const outcome = await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-oai" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }), () => up.requests() >= 1);
         assert.ok(outcome === "first-byte" || outcome === "header");
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) must be destroyed after the client abort (closed=${up.socketsClosed()})`);
@@ -289,7 +303,7 @@ test("abort x proxy-anthropic-sse: client abort mid-stream destroys the upstream
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/messages`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-ant" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }), () => up.requests() >= 1);
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
@@ -309,7 +323,7 @@ test("abort x proxy-responses-sse: client abort mid-stream destroys the upstream
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/responses`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-resp" }, JSON.stringify({ model: "m-test", max_tokens: 1024, stream: true, instructions: "You are a test agent.", input: [{ type: "message", role: "user", content: "hi" }] }), () => up.requests() >= 1);
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
@@ -329,7 +343,7 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${up.port}/v1/chat/completions`;
-        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }));
+        await abortAfterFirstByte(url, { "content-type": "application/json", "x-acp-session": "mx-abort-json" }, JSON.stringify({ model: "m-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] }), () => up.requests() >= 1);
         await awaitUpstreamTeardown(up.socketsClosed);
         assert.ok(up.socketsClosed() >= 1, `upstream socket(s) destroyed after client abort (closed=${up.socketsClosed()})`);
     } finally {
