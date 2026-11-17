@@ -7,6 +7,8 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { SessionStore, _setStoreForTest, _resetStoreForTest } from "../src/persist.ts";
 import { recordCanonicalPointers } from "../src/incremental-lane.ts";
 
+process.env.BILI_STORAGE_UNIFIED = "full";
+
 const repeated = (id = "h_0123456789abcdef"): BiliMessage => ({ id, role: "assistant", contentType: "text", text: "ok" });
 
 test("repeated content consumes settled row pointers in order, including across incremental updates", (t) => {
