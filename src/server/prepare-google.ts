@@ -18,7 +18,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
-import { compressBreakerArmed } from "../stream.js";
+import { compressBreakerArmed, gateRefusalDamperArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -317,7 +317,7 @@ export async function prepareGoogle(
         // explicit inputs on the responses lane. The standalone `shouldInject`
         // conjunct is subsumed by compressSurfaceOn (=== shouldInject &&
         // compressReachable).
-        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && !gateRefusalDamperArmed(session) && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,

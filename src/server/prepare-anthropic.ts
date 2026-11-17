@@ -18,7 +18,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
-import { compressBreakerArmed } from "../stream.js";
+import { compressBreakerArmed, gateRefusalDamperArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, nudgeStampsOf, restoreNudgeStamps, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { getStore } from "../persist.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
@@ -488,7 +488,7 @@ export async function prepareAnthropic(
         // #3482 Step 2.5: the ONE nudge gate. This lane has no compaction
         // trigger and no intercept health window — those differences are
         // explicit inputs on the responses lane.
-        const willInjectNudge = !nudgeHeldAfterReject && nudgeOn({
+        const willInjectNudge = !nudgeHeldAfterReject && !gateRefusalDamperArmed(session) && nudgeOn({
             injectNudge: opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
