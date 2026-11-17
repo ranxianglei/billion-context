@@ -1,66 +1,84 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveLaneDecisions } from "../src/server/lane-decisions.ts";
+import { extractDeferredBiliToolNames, resolveLaneDecisions } from "../src/server/lane-decisions.ts";
+import { mcpBiliToolName } from "../src/compress-tool.ts";
 
-// Claude Code keeps MCP tools out of `tools` until the model loads them with
-// ToolSearch and lists them by name in a message instead (shape captured from
-// Claude Code 2.1.325). Workers told to call bare `compress` failed with
-// "No such tool available: compress"; research subagents whose allow-list
-// holds no bili tool were nudged 127 times without any way to fold.
+// #6958 — Claude Code defers its MCP tools: `mcp__bili__compress` never
+// appears in tools[] until the client's ToolSearch loads it; the request
+// messages carry the announcement instead ("The following deferred tools are
+// now available via ToolSearch … mcp__bili__compress …"). The decisions read
+// tools[] ONLY, so the dialect was always false for CC and the nudge
+// advertised the bare `compress`, which CC answers "No such tool available"
+// — 14 field workers hard-failed, 13 of them never folded, sessions pinned
+// at 133K–244K tokens (issue #6958, 81-worker sample).
+//
+// The fix: "the host has this tool" now means "declared in tools[] OR
+// announced deferred" for BOTH the #4344 dialect decision and compress
+// reachability, observed from this request's messages.
+//
+// Deliberately NOT the #6960 variant: its claudeCodeWithoutTool gate (no
+// compress anywhere → surface off) would also starve the #4372 zombie probe
+// on headerless rounds (the `pluginHeaderPresent === false` clause). That
+// trade needs its own discussion and is left out here.
 
-const BILLING = { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.325.382; cc_entrypoint=sdk-cli;" };
-const tool = (name: string) => ({ name, description: "d", input_schema: { type: "object", properties: {} } });
+const CC_ANNOUNCEMENT = [
+    "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded",
+    "into your tool list yet. Use ToolSearch with query \"select:<name>[,<name>...]\" to load",
+    "their schemas before calling them:",
+    mcpBiliToolName("compress"),
+    mcpBiliToolName("acp_status"),
+].join("\n");
 
-function announcement(names: string[]): string {
-    return "<system-reminder>\nThe following deferred tools are now available via ToolSearch. Their schemas are NOT loaded — calling them directly will fail with InputValidationError. Use ToolSearch with query \"select:<name>[,<name>...]\" to load tool schemas before calling them:\n"
-        + names.join("\n") + "\n\nAvailable agent types for the Agent tool:\n- claude: ...\n</system-reminder>";
-}
+const ccParsed = {
+    model: "m",
+    messages: [{ role: "user", content: CC_ANNOUNCEMENT + "\n\nNow finish the task." }],
+    tools: [],
+};
 
-function claudeBody(opts: { tools: string[]; deferred?: string[]; billing?: boolean }): unknown {
-    const messages: unknown[] = [];
-    if (opts.deferred) messages.push({ role: "user", content: [{ type: "text", text: announcement(opts.deferred) }, { type: "text", text: "hi" }] });
-    else messages.push({ role: "user", content: "hi" });
-    return {
-        model: "claude-haiku-5-5",
-        system: opts.billing === false ? [{ type: "text", text: "You are a helper." }] : [BILLING, { type: "text", text: "You are a Claude agent." }],
-        messages,
-        tools: opts.tools.map(tool),
-    };
-}
-
-const decide = (parsed: unknown, pluginHeaderPresent = false) =>
-    resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "mcp", parsed, shouldInject: true, pluginHeaderPresent });
-
-test("a deferred mcp__bili__compress names the MCP tool in the prompt", () => {
-    const d = decide(claudeBody({ tools: ["Bash", "Read", "ToolSearch"], deferred: ["WebFetch", "mcp__bili__acp_status", "mcp__bili__compress", "mcp__bili__decompress"] }));
+test("#6958: a CC deferred announcement flips the MCP dialect (the field repro)", () => {
+    // CC shape: plugin mode, no pluginAgent (wire-client identified), tools[]
+    // empty because every bili tool is deferred into the announcement.
+    const d = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: undefined, parsed: ccParsed, shouldInject: true });
+    assert.equal(d.mcpDialect, true, "announced mcp__bili__compress must enable the MCP dialect so the standing prompt teaches the name CC actually exposes");
+    assert.equal(d.toolsReachable.compress, true);
     assert.equal(d.compressSurfaceOn, true);
-    assert.equal(d.mcpDialect, true, "the model must be told to call mcp__bili__compress, not compress");
 });
 
-test("the dialect stays on once ToolSearch has loaded the tool", () => {
-    const d = decide(claudeBody({ tools: ["Bash", "ToolSearch", "mcp__bili__compress"], deferred: ["mcp__bili__compress"] }));
-    assert.equal(d.compressSurfaceOn, true);
-    assert.equal(d.mcpDialect, true);
+test("#6958: the deferred announcement counts as reachability on a host-scoped profile", () => {
+    // zcode declares toolsHostScopedByDefault:true — reachability is OBSERVED,
+    // never assumed. Pre-fix a deferred-only CC-style request read unreachable
+    // here; the announcement must count as "the host has this tool".
+    const withAnnounce = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: "zcode", parsed: ccParsed, shouldInject: true });
+    assert.equal(withAnnounce.toolsReachable.compress, true, "deferred announcement must satisfy the observed reachability gate");
+
+    const control = resolveLaneDecisions({ protocol: "openai", pluginMode: true, pluginAgent: "zcode", parsed: { model: "m", messages: [{ role: "user", content: "do the task" }], tools: [] }, shouldInject: true });
+    assert.equal(control.toolsReachable.compress, false, "control: nothing declared, nothing announced → unreachable (surface may go silent, #4344 discipline)");
 });
 
-test("a Claude Code agent with no bili tool anywhere gets no compress surface", () => {
-    const listedElsewhere = decide(claudeBody({ tools: ["Bash", "Read", "ToolSearch"], deferred: ["WebFetch", "WebSearch"] }));
-    assert.equal(listedElsewhere.compressSurfaceOn, false, "deferred list without bili tools");
-    assert.equal(listedElsewhere.mcpDialect, false);
-    const noList = decide(claudeBody({ tools: ["Bash", "Read", "Glob", "Grep", "WebFetch"] }));
-    assert.equal(noList.compressSurfaceOn, false, "allow-list agent with no deferred tools at all");
+test("#6958: a declared bare compress still wins over the deferred MCP name", () => {
+    const d = resolveLaneDecisions({
+        protocol: "openai", pluginMode: true, pluginAgent: undefined,
+        parsed: { model: "m", messages: [{ role: "user", content: CC_ANNOUNCEMENT }], tools: [{ type: "function", function: { name: "compress", description: "d" } }] },
+        shouldInject: true,
+    });
+    assert.equal(d.mcpDialect, false, "bare `compress` is directly callable — the dialect note must not rebrand it");
+    assert.equal(d.toolsReachable.compress, true);
 });
 
-test("the tool-less rule is Claude Code only and leaves bare compress alone", () => {
-    const other = decide(claudeBody({ tools: ["Bash"], billing: false }));
-    assert.equal(other.compressSurfaceOn, true, "a non-Claude-Code MCP lane keeps today's default");
-    assert.equal(other.mcpDialect, false);
-    const bare = decide(claudeBody({ tools: ["Bash", "compress"] }));
-    assert.equal(bare.compressSurfaceOn, true);
-    assert.equal(bare.mcpDialect, false, "a bare declaration needs no name mapping");
-});
+test("#6958: the extractor reads the announcement from both message content shapes", () => {
+    // openai string content
+    const fromString = extractDeferredBiliToolNames(ccParsed);
+    assert.ok(fromString.has(mcpBiliToolName("compress")));
+    assert.ok(fromString.has(mcpBiliToolName("acp_status")));
 
-test("an announcement inside a string message body is read too", () => {
-    const parsed = { system: [BILLING], messages: [{ role: "user", content: announcement(["mcp__bili__compress"]) }], tools: [tool("Bash")] };
-    assert.equal(decide(parsed).mcpDialect, true);
+    // anthropic block content
+    const fromBlocks = extractDeferredBiliToolNames({
+        model: "m",
+        messages: [{ role: "user", content: [{ type: "text", text: CC_ANNOUNCEMENT }] }],
+    });
+    assert.ok(fromBlocks.has(mcpBiliToolName("compress")));
+
+    // no announcement → empty (every non-CC host)
+    const none = extractDeferredBiliToolNames({ model: "m", messages: [{ role: "user", content: "plain text, no tools" }] });
+    assert.equal(none.size, 0);
 });
