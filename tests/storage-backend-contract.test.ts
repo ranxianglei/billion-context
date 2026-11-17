@@ -465,3 +465,63 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     assert.ok(verified.ok, `projections verified (${verified.ok ? verified.checks : verified.error})`);
     await backend.deleteSession(vSid);
 });
+
+for (const lane of lanes) {
+    for (const completeLog of [false, true]) {
+        test(`${lane.name}: sparse reactivation preserves absolute seqs and media (completeLog=${completeLog})`, async () => {
+            const dir = scratch();
+            const backend = await lane.open(dir);
+            const sid = `reactivation-${lane.name}-${completeLog}-${process.pid}-${Date.now()}`;
+            const other = `${sid}-other`;
+            const image = "QUJD".repeat(2048);
+            const messages = Array.from({ length: 400 }, (_, i) => i === 3
+                ? { ...mkMsg(`m-${i}`, `body ${i}`), contentType: "image", imageBase64: image, imageMediaType: "image/png" }
+                : mkMsg(`m-${i}`, `body ${i}`));
+            const save = (tail: CoreMsg[], full: boolean) => backend.ingestSession(planIngest(mkSession(sid, tail)), undefined, { completeLog: full });
+            try {
+                assert.ok(await save(messages, true));
+                await backend.ingestSession(planIngest(mkSession(other, messages.slice(0, 2))));
+                const untouched = await backend.getMessages(other, { includeRetired: true });
+                assert.ok(await save(messages.slice(-2), true));
+                const before = await backend.getMessages(sid, { includeRetired: true });
+                assert.equal(before.filter((m) => m.retiredAt !== null).length, 398);
+
+                assert.ok(await save([messages[399], messages[101], messages[3], messages[3]], completeLog));
+                const restored = await backend.getMessages(sid, { includeRetired: true });
+                assert.equal(restored.length, 400, "duplicate presented messages do not mint duplicate generations");
+                assert.deepEqual(restored.filter((m) => m.retiredAt === null).map((m) => m.seq), completeLog ? [3, 101, 399] : [3, 101, 398, 399]);
+                assert.deepEqual(JSON.parse(restored[3].content), messages[3], "retired image bytes hydrate after reactivation");
+                for (const row of restored) {
+                    assert.equal(row.seq, before[row.seq].seq);
+                    assert.equal(row.contentHash, before[row.seq].contentHash);
+                    if (![3, 101, 398, 399].includes(row.seq)) assert.equal(row.retiredAt, before[row.seq].retiredAt);
+                }
+
+                assert.ok(await save([mkMsg("m-101", "edited body")], true));
+                const edited = await backend.getMessages(sid, { includeRetired: true });
+                assert.equal(edited.length, 401);
+                assert.notEqual(edited[101].retiredAt, null, "the old edited generation remains retired");
+                assert.equal(edited[400].seq, 400);
+                assert.equal(edited[400].retiredAt, null);
+                assert.ok(await save([messages[101]], true));
+                const undone = await backend.getMessages(sid, { includeRetired: true });
+                assert.equal(undone[101].retiredAt, null, "undo recovers the original absolute sequence");
+                assert.notEqual(undone[400].retiredAt, null, "undo retires the superseded generation");
+
+                assert.ok(await save([], true));
+                assert.deepEqual(await backend.getMessages(sid), []);
+                assert.ok(await save([messages[3]], true));
+                const last = await backend.getMessages(sid);
+                assert.equal(last.length, 1);
+                assert.equal(last[0].seq, 3);
+                assert.deepEqual(JSON.parse(last[0].content), messages[3]);
+                assert.deepEqual(await backend.getMessages(other, { includeRetired: true }), untouched);
+            } finally {
+                await backend.deleteSession(sid);
+                await backend.deleteSession(other);
+                await backend.close();
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        });
+    }
+}
