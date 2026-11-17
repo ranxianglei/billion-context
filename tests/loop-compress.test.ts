@@ -54,6 +54,97 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
+test("successful compress keeps every message in a large refreshed history", async () => {
+    const ctx = withRefs(makeCtx(Array.from({ length: 7 }, (_, i) =>
+        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `original ${i} ${bigText(5000)}`),
+    )));
+    const refreshed = Array.from({ length: 250_000 }, (_, i) =>
+        textMsg(`folded_${i}`, i % 2 === 0 ? "user" : "assistant", `retained history ${i}`),
+    );
+    const logs: string[] = [];
+    ctx.log = (line) => logs.push(line);
+    let refreshCalls = 0;
+    ctx.refreshFolded = () => { refreshCalls++; return refreshed; };
+    const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "The first two messages were compressed; all remaining history must reach the next request." }] });
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        const out = await drain(new Response(fcEvents(0, "large_fold", "compress", args) + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(refreshCalls, 1, "the real compression succeeded");
+        assert.equal(requests.length, 1);
+        const history = requests[0]!.match(/retained history \d+/g) ?? [];
+        assert.equal(history.length, refreshed.length);
+        assert.equal(history[0], "retained history 0");
+        assert.equal(history.at(-1), "retained history 249999");
+        assert.equal(refreshed.length, 250_000, "the host-owned view is not mutated");
+        assert.equal(logs.some((line) => line.includes("fold refresh failed")), false);
+        assert.match(out, /response\.completed/);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("successful compress accepts a refresh hook returning its current view", async () => {
+    const ctx = withRefs(makeCtx(Array.from({ length: 7 }, (_, i) =>
+        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `identity history ${i} ${bigText(5000)}`),
+    )));
+    let refreshCalls = 0;
+    ctx.refreshFolded = (current) => { refreshCalls++; return current; };
+    const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "A successful compression with a host hook retaining its existing in-place view." }] });
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        await drain(new Response(fcEvents(0, "same_fold", "compress", args) + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(refreshCalls, 1);
+        assert.equal(requests.length, 1);
+        assert.ok(requests[0]!.includes("identity history 0"));
+        assert.ok(requests[0]!.includes("identity history 6"));
+        assert.ok(requests[0]!.includes("[Compressed m00001"));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("consumed-call cleanup preserves a large history during a proxy-tool round", async () => {
+    const history = Array.from({ length: 250_000 }, (_, i) =>
+        textMsg(`history_${i}`, i % 2 === 0 ? "user" : "assistant", `kept message ${i}`),
+    );
+    const ctx = makeCtx(history);
+    ctx.messages.push(
+        { id: "consumed_call", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "old_compress", text: "{}" },
+        { id: "consumed_result", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "old_compress", text: "obsolete compression result" },
+    );
+    ctx.session.state.sweptOrphanCallIds = ["old_compress"];
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (_url, init) => {
+        requests.push(String(init?.body));
+        return new Response(COMPLETED);
+    };
+    try {
+        await drain(new Response(fcEvents(0, "check_status", "acp_status", "{}") + COMPLETED).body!, ctx,
+            { model: "test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(requests.length, 1);
+        assert.equal((requests[0]!.match(/kept message \d+/g) ?? []).length, 250_000);
+        assert.match(requests[0]!, /kept message 0/);
+        assert.match(requests[0]!, /kept message 249999/);
+        assert.doesNotMatch(requests[0]!, /obsolete compression result/);
+        assert.equal(ctx.messages.length, 250_002, "the caller's history is not rewritten");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 const SYS_PROMPT = buildCompressSystemPrompt();
 
 async function drain(
