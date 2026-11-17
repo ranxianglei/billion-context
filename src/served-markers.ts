@@ -138,7 +138,7 @@ export interface ServedMarkerWriter {
     dispose(): void;
 }
 
-export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void, opts?: ServedMarkerOptions): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number> } {
+export function createServedMarkerWriter(identity: WriterIdentity, dir: string, log: (level: string, msg: string) => void, opts?: ServedMarkerOptions): ServedMarkerWriter & { __flushForTest(): void; __servedForTest(): Record<string, number>; __verdictCountForTest(): number } {
     const servedAt = new Map<string, number>();
     const verdicts = new Map<string, number>();
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -156,6 +156,11 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             for (const [id, at] of servedAt) if (at < oldestAt) { oldest = id; oldestAt = at; }
             if (oldest === undefined) break;
             servedAt.delete(oldest);
+        }
+        // Verdicts only throttle a tracked session inside their TTL. Keeping
+        // them after either lifetime ends retains every session ever served.
+        for (const [id, at] of verdicts) {
+            if (!servedAt.has(id) || now - at >= VERDICT_TTL_MS) verdicts.delete(id);
         }
     };
 
@@ -238,6 +243,9 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
         },
         __servedForTest(): Record<string, number> {
             return Object.fromEntries(servedAt);
+        },
+        __verdictCountForTest(): number {
+            return verdicts.size;
         },
     };
 }
