@@ -100,3 +100,39 @@ test("empty payload: no crash, still emits a titled report", () => {
     const sv = buildSessionReportSvg({});
     assert.ok(sv.svg.startsWith("<svg") && sv.svg.endsWith("</svg>") && sv.w === 920 && sv.h > 0);
 });
+
+// #6729: the report SVG's recovery chart must work with the ACTUAL server payload shape —
+// cache-ledger episodes carry no credited/extra fields, so the old-stock split has to be
+// derived at render time (an earlier revision read ep.credited and silently never rendered
+// the bracket).
+test("svg: recovery chart derives old-stock brackets from server-shaped episodes", () => {
+    const T0 = 1_760_000_000_000, MIN = 60_000;
+    const D2 = {
+        ...D,
+        ledger: {
+            ...D.ledger,
+            recovery: {
+                events: [
+                    { at: T0, kind: "n" as const, tier: 1, pending: 100, paired: true },
+                    { at: T0 + 1 * MIN, kind: "f" as const, folded: 60, mode: "n" as const, pct: 60 },
+                    { at: T0 + 2 * MIN, kind: "f" as const, folded: 50, mode: "n" as const, pct: 50 },
+                    { at: T0 + 30 * MIN, kind: "n" as const, tier: 1, pending: 100, paired: true },
+                    { at: T0 + 31 * MIN, kind: "f" as const, folded: 310, mode: "n" as const, pct: 310 }
+                ],
+                summary: { nudges: 2, folds: 3, nudgeFolds: 3, activeFolds: 0, totalPending: 200, totalFolded: 420, pct: 210 },
+                episodes: [
+                    { at: T0, tier: 1, pending: 100, folded: 110, pct: 110, activeFolds: 0 },
+                    { at: T0 + 30 * MIN, tier: 1, pending: 100, folded: 310, pct: 310, activeFolds: 0 }
+                ]
+            }
+        }
+    };
+    const svg = buildSessionReportSvg(D2).svg;
+    // pool: round 1 folds 110 of a 100 pool → +10 old stock; round 2 folds 310 of 100 → +210
+    assert.match(svg, /\+10 老存量/, "round 1 bracket shows the 10-token old stock");
+    assert.match(svg, /\+210 老存量/, "round 2 bracket shows the 210-token old stock");
+    assert.ok(svg.includes("基准 100%"), "the 100% baseline is drawn and labeled");
+    assert.ok(svg.includes("350%"), "dynamic axis extends past the baseline (maxPct 310 → 350)");
+    assert.ok(svg.includes("310%"), "true >100% value labeled");
+    assert.ok(svg.includes('r="6" fill="none" stroke="#0969da"'), "over-100% halo dot");
+});
