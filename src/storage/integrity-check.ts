@@ -277,6 +277,14 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
     noteCheckRun();
     let worker: Worker;
     try {
+        // stderr: true — capture the worker's own stderr instead of inheriting
+        // the host terminal (#5940): Node emits "ExperimentalWarning: SQLite is
+        // an experimental feature" once per thread on first node:sqlite use,
+        // and with default stdio that printed straight into the agent's TUI
+        // mid-session. attachWorkerStderr drops only that known notice block;
+        // every other line still reaches loggerLog diagnostics. Node-only:
+        // bun workers expose no capturable stderr (and bun:sqlite emits no
+        // such notice), so nothing is routed there.
         worker = new Worker(WORKER_SOURCE, {
             eval: true,
             workerData: { path: dbPath },
