@@ -136,6 +136,27 @@ test("summary pairs each nudge arm once; a never-folded arm counts fully in pend
     assert.equal(rec.summary.pct, Math.round((2000 / 13999) * 1000) / 10);
 });
 
+test("a model-active fold does NOT answer a nudge arm (#6729 pairing is nudge-attributed)", () => {
+    const session = makeSession();
+    const t0 = Date.now();
+    withClock(t0, () => recordNudgeInject(session, { tier: 1, breakdown: { pendingT1: 5000 } }));
+    // 45min later: the nudge is stale (>30min) → the fold is an active
+    // compression. It must not consume the arm — the "not folded" ratchet
+    // flag survives the model self-compressing after a nudge.
+    recordCacheFoldsFromBlocks(session, [block("b1", t0 + 45 * MIN, 2000)]);
+    const rec = buildSessionCacheReport(session).recovery;
+    assert.ok(rec);
+    const n = rec.events[0];
+    assert.equal(n.kind, "n");
+    assert.equal(n.paired, false, "active fold must not pair the nudge arm");
+    const f = rec.events[1];
+    assert.equal(f.kind, "f");
+    assert.equal(f.mode, "a");
+    assert.equal(rec.summary.nudgeFolds, 0);
+    assert.equal(rec.summary.activeFolds, 1);
+    assert.equal(rec.summary.totalFolded, 0, "never-nudge-folded arm contributes 0 folded");
+});
+
 test("no injections yet → recovery absent, report shape unchanged", () => {
     const session = makeSession();
     const report = buildSessionCacheReport(session);
