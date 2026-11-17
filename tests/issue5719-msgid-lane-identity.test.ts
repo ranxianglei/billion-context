@@ -112,8 +112,13 @@ test("#5719 T1: composite field failure + overlapping host ids re-anchor the raw
     );
     assert.equal(res.key, raw, `expected raw re-anchor, got ${res.key} (${res.action})`);
     assert.equal(res.action, "reanchor");
-    assert.match(res.reason ?? "", /msgid identity \(#5719\)/);
-    assert.match(res.reason ?? "", /1 host message id\(s\) match/);
+    // #5734 realignment (after 30a8bc2d): this incident cell carries the authored
+    // checkpoint's conv declaration, so the self-declaration rung now fires BEFORE
+    // the store-overlap rung — same outcome (reanchor on the raw key), earlier
+    // reason. Pre-#5734 the pin read /msgid identity \(#5719\)/ +
+    // /1 host message id\(s\) match/.
+    assert.match(res.reason ?? "", /self-authored checkpoint declares this raw id/);
+    assert.match(res.reason ?? "", /#5719/);
 });
 
 test("#5719 T2: same composite failure but DISJOINT ids still forks (owner rule 3 guard rail)", () => {
@@ -261,12 +266,15 @@ test("#5719 T7: personaConversationOrder forwards observer + ids + lazy lookup",
     assert.ok(lookups <= 1, `lazy contract: store queried at most once (got ${lookups})`);
 });
 
-test("#5719 T8: store unavailable (lookup → null) degrades to byte evidence only → fork", () => {
+test("#5719 T8: store unavailable (lookup → null) — self-declared checkpoint still re-anchors (#5734)", () => {
     resetSessionOrderForTest();
     const raw = "session-5719-t8";
     assert.equal(resolveSessionOrder(raw, chain(10, "h"), SYSTEM_A).key, raw);
-    // Overlapping ids WOULD prove identity — but the unified store view is
-    // null (latch-off / legacy epoch, #4407/#5536): degrade, never guess.
+    // Overlapping ids WOULD prove identity — and the unified store view is
+    // null (latch-off / legacy epoch, #4407/#5536). Pre-#5734 this degraded to
+    // byte evidence only → fork (action "derived-persona", key `${raw}|sub:`).
+    // #5734 (30a8bc2d): the checkpoint's conv declaration rides the WIRE, so the
+    // self-declaration rung re-anchors on the raw key even with a null store.
     const res = resolveSessionOrder(
         raw,
         incidentHistory(raw, uid("h", 3), "v".repeat(120)),
@@ -277,6 +285,7 @@ test("#5719 T8: store unavailable (lookup → null) degrades to byte evidence on
         ["s-1", "s-2", uid("h", 3), "s-3"],
         () => null,
     );
-    assert.equal(res.action, "derived-persona");
-    assert.ok(res.key.startsWith(`${raw}|sub:`), res.key);
+    assert.equal(res.action, "reanchor");
+    assert.equal(res.key, raw);
+    assert.match(res.reason ?? "", /self-authored checkpoint declares this raw id/);
 });

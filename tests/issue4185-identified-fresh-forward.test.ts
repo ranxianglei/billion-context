@@ -209,12 +209,26 @@ test("usage-backed session: over the headroom limit, zero compressible → forwa
     });
 });
 
+test("identified fresh session whose MEASURED body exceeds the native window but clears the 2MB byte floor → still fail-fast 413, nothing forwarded (#5000/#4185 measured tier)", async () => {
+    await withFixture(async (proxyPort, upstreamPort, calls) => {
+        // 300K chars of tool-result text ≈ ~75K measured tokens: over the 40K
+        // native window, but only ~300KB — ~7× under the 2MB core-text byte
+        // floor, which the old path alone let ride to a guaranteed 400.
+        const r = await post(proxyPort, upstreamPort, "s-4185-measured", incidentConversation(300_000));
+        const body = await r.text();
+        assert.equal(r.status, 413, `measured-over body must fail fast: ${body.slice(0, 300)}`);
+        assert.match(body, /outbound body measures ~[\d,]+ TEXT tokens even after preflight compression/, `measured diagnostic present: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom wording present: ${body.slice(0, 300)}`);
+        assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 0, "the giant payload was never forwarded");
+    });
+});
+
 test("identified fresh session with mathematically doomed bytes (>2MB core) → still fail-fast 413, nothing forwarded (#4185 negative)", async () => {
     await withFixture(async (proxyPort, upstreamPort, calls) => {
         const r = await post(proxyPort, upstreamPort, "s-4185-doomed", incidentConversation(2_100_000));
         const body = await r.text();
         assert.equal(r.status, 413, "doomed bytes must still fail fast");
-        assert.ok(body.includes("no upstream can accept it"), `doom diagnostic present: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom diagnostic present: ${body.slice(0, 300)}`);
         assert.equal(calls.length, 0, "nothing forwarded and no summarization spent");
     });
 });

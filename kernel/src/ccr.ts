@@ -5,7 +5,7 @@ import type {
   CoreMessage,
 } from "./types.js";
 import { refForRaw, BLOCKED_REF } from "./refs.js";
-import { ACP_TOOL_NAMES } from "./compress-tools.js";
+import { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES } from "./compress-tools.js";
 import {
   collectFailedCompressCallIds,
   collectProtectedToolCallIds,
@@ -488,9 +488,13 @@ export function storeLargeResults(
     if (placeholder && (!ref || placeholder.ref === ref)) return message;
     if (!message.toolCallId) return message;
     const toolName = message.toolName;
+    // #5765: opt-in block ops are out of ACP_TOOL_NAMES but still bili-owned
+    // receipts — they bypass ccr storage like every other ACP tool result.
     if (
       toolName &&
-      (ACP_TOOL_NAMES.has(toolName) || toolName === cfg.toolName)
+      (ACP_TOOL_NAMES.has(toolName) ||
+        BLOCK_OP_TOOL_NAMES.has(toolName) ||
+        toolName === cfg.toolName)
     ) {
       return message;
     }

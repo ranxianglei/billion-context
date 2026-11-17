@@ -6,7 +6,7 @@
 > this file holds the category table, hard rules, and rationale.
 
 Env vars are a **scarce surface**: every `BILI_*`/`ACP_*` variable is a
-permanent knob a user must discover, document (CONFIGURATION.md en + zh), and
+permanent knob a user must discover, document (../docs/configuration.md en + zh), and
 keep in sync. The default answer to "should this be an env var?" is **no** —
 the config file (`~/.config/billion-context/billion-context.json`) exists
 precisely so knobs don't bloat the environment. Precedence everywhere:
@@ -15,7 +15,7 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 
 > **Lifecycle vs. existence.** This file governs whether a knob MAY be an env var.
 > Whether an existing one is TEMPORARY (a cap / kill-switch / experiment with a
-> release condition) is tracked in [`LIFECYCLE.md`](../LIFECYCLE.md) (#3249) —
+> release condition) is tracked in [`../docs/lifecycle.md`](../docs/lifecycle.md) (#3249) —
 > every `BILI_*` read in `src/` must be registered there; CI enforces it via
 > `scripts/lifecycle-ledger-guard.mjs`.
 
@@ -23,7 +23,7 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 
 | Category | Home | Examples |
 |----------|------|----------|
-| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*`, `fakeCompletion.*`, `plugin.*` |
+| Behavior tunables (timeouts, caps, modes, diagnostics) | config-file key resolved through `src/knobs.ts`; env stays the override tier | `network.*`, `persist.*`, `sessions.*`, `update.*`, `diagnostics.*` (incl. `logRetentionHours` / `logBudgetBytes`), `fakeCompletion.*`, `plugin.*` |
 | Secrets / credentials | env only (never written to disk) | `BILI_LAUNCH_TOKEN`, `BILI_ENCRYPTION_KEY` |
 | Per-process channels (written by another bili component at spawn) | env only + comment at the read site naming the writer | `BILI_MCP_PROXY`, `BILI_PARENT_PID`, `BILI_STRICT_PORT`, `BILI_OPENCODE_ACP_SPEC`, `BILI_LAUNCHER_MODEL_*`, `PI_ACP_DELEGATE_*` (child-delegate propagation, #2230; file tier = `pi.subagents`) |
 | Host-side posture (read inside a third-party host process at bootstrap) | env only + comment at the read site | `BILLION_CONTEXT_PLUGIN*`, `BILI_NATIVE_*`, `BILI_RECLAIM_FETCH_PATCH` |
@@ -46,7 +46,7 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 3. **Env wins over file, always.** Test seams set env live after import;
    inverting the precedence breaks them.
 4. **Document or don't ship.** Every user-facing knob (either tier) is
-   documented in CONFIGURATION.md (en + zh) with its default and env-var
+   documented in ../docs/configuration.md (en + zh) with its default and env-var
    name.
 
 ## Rationale (why this shape)
@@ -77,7 +77,7 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 A small class of env vars exists purely for the local test harness — read by
 `scripts/*`, NEVER by `src/` or `src/knobs.ts`, and therefore NOT config-file
 knobs. They carry no provider/model dimension, are never shipped behavior, and
-stay OUT of CONFIGURATION.md (that surface is for user-facing knobs). They are
+stay OUT of ../docs/configuration.md (that surface is for user-facing knobs). They are
 documented HERE instead so the discipline ("document or don't ship") still
 holds without polluting the product config surface.
 

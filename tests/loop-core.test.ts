@@ -4,6 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
 import type { WireProtocol } from "../src/util.ts";
@@ -410,6 +411,28 @@ for (const completion of ["text", "tool"] as const) {
     }
 }
 
+test("#6329: OpenAI cache-field omission means zero cached tokens, not unmeasured", async () => {
+    const ctx = makeCtx([], "openai");
+    const body = { model: "m", messages: [], stream: true, stream_options: { include_usage: true } };
+    const raw = [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hello" } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 10, total_tokens: 1010 } })}\n\n`,
+        "data: [DONE]\n\n",
+    ].join("");
+    for await (const _chunk of runCompressLoop(
+        new Response(raw).body!, ctx, body, { url: "http://mock", headers: {} },
+        createOpenaiAdapter(body), buildCompressSystemPrompt(),
+    )) {}
+    assert.equal(ctx.session.stats.inputTokens, 1000);
+    assert.equal(ctx.session.stats.cachedTokens, 0);
+    assert.equal(ctx.session.stats.cacheSamples, 1);
+    const report = buildSessionCacheReport(ctx.session);
+    assert.equal(report.unmeasured.samples, 0);
+    assert.equal(report.unmeasured.inputTokens, 0);
+    assert.equal(report.totals.input, 1000);
+    assert.equal(report.totals.cached, 0);
+});
+
 test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
     const ctx = makeCtx();
     await drain(
@@ -562,6 +585,56 @@ test("isTransientUpstreamError: classifier matrix", () => {
     assert.equal(isTransientUpstreamError(503, "service unavailable"), true);
     assert.equal(isTransientUpstreamError(200, "captcha"), false, "2xx never classified");
     assert.equal(REPLAY_MAX_ATTEMPTS, 3);
+});
+
+// Regression guard for #3606: risk-control gateways return 400 whose body
+// machine-declares retryability (code 11101, actions:["RETRY"]) or uses the
+// canonical "Please retry" / 「请重试」 phrasing — none of which hit the
+// original seven markers, so every such rejection failed fast instead of
+// being replayed.
+const RETRY_DECLARED_400_BODY = JSON.stringify({ error: { message: JSON.stringify({
+    code: 11101,
+    msg: "Parse message failed: unsupported content type at index 0: tool_use",
+    requestId: "req-test",
+    displayMsg: { en: "Bad request.", zh: "请求不合法" },
+    actions: ["RETRY", "SUBMIT_FEEDBACK"],
+}) } });
+
+test("isTransientUpstreamError: explicit retry declarations (#3606)", () => {
+    assert.equal(isTransientUpstreamError(400, RETRY_DECLARED_400_BODY), true, 'JSON-string-wrapped actions:["RETRY"] 400 is transient');
+    assert.equal(isTransientUpstreamError(400, '{"code":11101,"actions":["RETRY","SUBMIT_FEEDBACK"]}'), true, "flat actions:[RETRY] 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"error":{"retryable":true,"message":"temporary"}}'), true, "nested retryable:true 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"message":"please retry later"}'), true, '"please retry" wording is transient');
+    assert.equal(isTransientUpstreamError(400, '{"displayMsg":{"en":"Invalid request. Please retry","zh":"请求内容不合法，请重试"},"msg":"x"}'), true, "Please retry / 请重试 wording is transient");
+    // negatives: only unambiguous machine signals or canonical phrasing count
+    assert.equal(isTransientUpstreamError(400, '{"message":"invalid api_key, do not retry"}'), false, '"do not retry" stays non-transient');
+    assert.equal(isTransientUpstreamError(400, '{"retryable":"true"}'), false, 'string "true" is not a boolean declaration');
+    assert.equal(isTransientUpstreamError(400, '{"actions":["SUBMIT_FEEDBACK"]}'), false, "actions without RETRY is not transient");
+    assert.equal(isTransientUpstreamError(400, "not json at all"), false, "non-JSON body without markers is not transient");
+});
+
+test("replay retry: upstream-declared transient 400 then success → retried (#3606)", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response(RETRY_DECLARED_400_BODY, { status: 400 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            replayCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "declared-transient 400 retried once");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
 });
 
 test("replayBackoffMs: exponential from env-tunable base", () => {

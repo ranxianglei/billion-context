@@ -92,6 +92,51 @@ function pnpmLockV9(spec: string, version: string): string {
     ].join("\n");
 }
 
+/** pnpm v9 lockfile where the importer's resolution carries a PEER SUFFIX —
+ *  what pnpm writes when billion-context (or a dependency of it) has a peer
+ *  that the profile satisfies: `version: 0.1.197(@types/node@16.9.1)`, with
+ *  the suffixed key under `snapshots:` and the bare key under `packages:`. */
+function pnpmLockV9Peer(spec: string, version: string, peerSuffix = "(@types/node@16.9.1)"): string {
+    return [
+        "lockfileVersion: '9.0'",
+        "",
+        "settings:",
+        "  autoInstallPeers: false",
+        "  excludeLinksFromLockfile: false",
+        "",
+        "importers:",
+        "",
+        "  .:",
+        "    dependencies:",
+        "      '@types/node':",
+        "        specifier: 16.9.1",
+        "        version: 16.9.1",
+        "      billion-context:",
+        `        specifier: ${spec}`,
+        `        version: ${version}${peerSuffix}`,
+        "      other-dep:",
+        "        specifier: ^1.2.3",
+        "        version: 1.2.3(@types/node@16.9.1)",
+        "",
+        "packages:",
+        "",
+        "  '@types/node@16.9.1':",
+        "    resolution: {integrity: sha512-fake==}",
+        "",
+        `  billion-context@${version}:`,
+        "    resolution: {integrity: sha512-fake==}",
+        "",
+        "snapshots:",
+        "",
+        "  '@types/node@16.9.1': {}",
+        "",
+        `  billion-context@${version}${peerSuffix}:`,
+        "    dependencies:",
+        "      '@types/node': 16.9.1",
+        "",
+    ].join("\n");
+}
+
 /** Flat pnpm ≤5.4 lockfile (same-line values). */
 function pnpmLockFlat(spec: string, version: string): string {
     return [
@@ -276,6 +321,94 @@ test("#3496: healthy triple — ZERO writes, byte-identical files", () => {
         rmrf(root);
         rmrf(__cacheRoot);
     }
+});
+
+test("#3496: healthy triple with a pnpm peer suffix on the lock version — no finding, ZERO writes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-peer-a-"));
+    try {
+        // `version: 0.1.197(@types/node@16.9.1)` IS v0.1.197 — the suffix names
+        // the peer set, not a different version. Reading it as one made every
+        // such profile a permanent copy-vs-lock finding, and made convergence
+        // strip the suffix (pointing the importer at a snapshots key that does
+        // not exist).
+        const dir = makeProfile(root, "peer", { spec: "^0.1.197", copyVersion: "0.1.197", pnpmLock: pnpmLockV9Peer("^0.1.197", "0.1.197") });
+        assert.equal(readDshLedgerState(dir).lockVersion, "0.1.197", "the peer suffix is not part of the resolved version");
+        assert.deepEqual(dshProfileLedgerFindings(dir), []);
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const res = convergeDshLedger(dir, "0.1.197");
+        assert.equal(res.error, undefined);
+        assert.deepEqual(res.changed, []);
+        assert.deepEqual(res.details, []);
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#3496: peer-suffixed lock version — real drift swaps the version part only, the suffix survives", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i3496-peer-b-"));
+    try {
+        const dir = makeProfile(root, "peerdrift", { spec: "^0.1.197", copyVersion: "0.1.197", pnpmLock: pnpmLockV9Peer("^0.1.196", "0.1.196") });
+        const findings = dshProfileLedgerFindings(dir);
+        assert.deepEqual(findings.map((f) => f.kind), ["copy-vs-lock", "manifest-vs-lock"]);
+        assert.equal(findings[0]!.lockVersion, "0.1.196", "findings name the version, not the peer set");
+        const before = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        const res = convergeDshLedger(dir, "0.1.197");
+        assert.equal(res.error, undefined);
+        assert.deepEqual(res.changed, ["pnpm-lock.yaml"]);
+        assert.deepEqual(res.details.map((d) => [d.field, d.before, d.after]), [
+            ["specifier", "^0.1.196", "^0.1.197"],
+            ["version", "0.1.196(@types/node@16.9.1)", "0.1.197(@types/node@16.9.1)"],
+        ]);
+        const after = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        // Exactly the two billion-context importer lines move; the version line
+        // stays bare (pnpm's own style — no quoting churn) and keeps its suffix.
+        const expected = before
+            .replace("        specifier: ^0.1.196", "        specifier: ^0.1.197")
+            .replace("        version: 0.1.196(@types/node@16.9.1)", "        version: 0.1.197(@types/node@16.9.1)");
+        assert.equal(after, expected);
+        assert.ok(after.includes("        version: 1.2.3(@types/node@16.9.1)"), "another dependency's suffixed version is not ours to touch");
+        assert.ok(after.includes("  billion-context@0.1.196(@types/node@16.9.1):"), "store bookkeeping sections stay untouched (#3570)");
+        assert.deepEqual(dshProfileLedgerFindings(dir), [], "re-audit after convergence must be clean");
+        // Second pass is a no-op: the suffixed record is already in step.
+        const mt = profileMtimes(dir);
+        const again = convergeDshLedger(dir, "0.1.197");
+        assert.deepEqual(again.changed, []);
+        assertZeroWrites(dir, profileFiles(dir), mt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#3496: patchPnpmLock peer suffix — multi-peer and quoted values keep their shape; v6–v8 nested entries too", () => {
+    // several peers chain their parentheses; the whole tail is the suffix
+    const multi = pnpmLockV9Peer("^0.1.196", "0.1.196", "(@types/node@16.9.1)(zod@4.1.8)");
+    const inStep = patchPnpmLock(multi, "^0.1.196", "0.1.196");
+    assert.equal(inStep.kind, "ok");
+    assert.deepEqual(inStep.kind === "ok" ? inStep.details : undefined, [], "same version + suffix is in step — no details, so no write");
+    const moved = patchPnpmLock(multi, "^0.1.196", "0.1.197");
+    assert.equal(moved.kind, "ok");
+    if (moved.kind === "ok") {
+        assert.ok(moved.next.includes("        version: 0.1.197(@types/node@16.9.1)(zod@4.1.8)\n"));
+        assert.deepEqual(moved.details.map((d) => [d.field, d.before, d.after]), [
+            ["version", "0.1.196(@types/node@16.9.1)(zod@4.1.8)", "0.1.197(@types/node@16.9.1)(zod@4.1.8)"],
+        ]);
+    }
+    // a quoted value keeps its quotes
+    const quoted = pnpmLockV9Peer("^0.1.196", "0.1.196").replace("version: 0.1.196(@types/node@16.9.1)", "version: '0.1.196(@types/node@16.9.1)'");
+    const q = patchPnpmLock(quoted, "^0.1.196", "0.1.197");
+    assert.equal(q.kind, "ok");
+    if (q.kind === "ok") assert.ok(q.next.includes("        version: '0.1.197(@types/node@16.9.1)'\n"));
+    // v6–v8: nested entries under the top-level dependencies map carry the same suffix form
+    const v6 = pnpmLockV6("^0.1.196", "0.1.196").replace("    version: 0.1.196", "    version: 0.1.196(@types/node@16.9.1)");
+    const v6Same = patchPnpmLock(v6, "^0.1.196", "0.1.196");
+    assert.deepEqual(v6Same.kind === "ok" ? v6Same.details : undefined, []);
+    const v6Moved = patchPnpmLock(v6, "^0.1.196", "0.1.197");
+    assert.equal(v6Moved.kind, "ok");
+    if (v6Moved.kind === "ok") assert.ok(v6Moved.next.includes("    version: 0.1.197(@types/node@16.9.1)\n"));
 });
 
 test("#3496: flat pnpm ≤5.4 lockfile converges both same-line sections", () => {

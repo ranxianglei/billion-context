@@ -362,8 +362,9 @@ export function resolveOwnFingerprint(spawnedValue: string | undefined, scriptPa
 
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
  *  write must never leave a half-file behind (#406 family). Shared by the
- *  proxy-origin record and every registry marker. */
-function atomicWriteJson(obj: unknown, filePath: string): void {
+ *  proxy-origin record, every registry marker, and the #5955 wedged-holder
+ *  ledger. */
+export function atomicWriteJson(obj: unknown, filePath: string): void {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
     let descriptor: number | undefined;

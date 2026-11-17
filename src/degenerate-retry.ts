@@ -1,5 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
-import { beginProvisionalUpstreamThrottle429, keyringModel429Scope, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, reserveUpstreamThrottleClassification, upstreamThrottleGate, type ThrottleClassificationReservation } from "./upstream-throttle.js";
+import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, reserveUpstreamThrottleClassification, throttle429ModelScope, upstreamThrottleGate, type ThrottleClassificationReservation } from "./upstream-throttle.js";
 import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
@@ -45,15 +45,17 @@ export const DEGENERATE_RETRY_NUDGE =
 
 /** The retry body: the forwarded body with the continuation nudge appended as a
  *  trailing user turn. Null when the body cannot carry one. */
-export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer): string | null {
-    return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE);
+export function injectContinuationNudge(protocol: WireProtocol, body: string | Buffer, model?: string): string | null {
+    return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE, model);
 }
 
 interface ContinuationRetryOpts {
     protocol: WireProtocol;
     /** The body that was forwarded upstream (the agent's own, in plugin mode). */
     body: string | Buffer;
-    /** Exact request model; required to isolate a matching KeyRing model refusal. */
+    /** Exact request model: isolates a matching KeyRing model refusal (throttle scope),
+     *  and is threaded into the continuation nudge so Claude-through-Google targets keep
+     *  tool_result-first part order (#5390). */
     model?: string;
     upstreamUrl: string;
     reqHeaders: Record<string, string>;
@@ -126,7 +128,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                 /* unparseable body: injectContinuationNudge below reports and skips */
             }
         }
-        const retryBody = injectContinuationNudge(opts.protocol, opts.body);
+        const retryBody = injectContinuationNudge(opts.protocol, opts.body, opts.model);
         if (retryBody === null) {
             opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry skipped: request body carries no turn array`);
             return null;
@@ -191,7 +193,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     // is the continuation callback's 250ms latency budget.
                     const bodyRead = readSmallThrottleErrorBody(r.response)
                         .then((errorBody) => {
-                            const modelScope = keyringModel429Scope(r.response.status, requestModel, errorBody);
+                            const modelScope = throttle429ModelScope(r.response.status, requestModel, errorBody);
                             settle(modelScope);
                         })
                         .catch(() => {

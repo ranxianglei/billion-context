@@ -403,6 +403,8 @@ function finishPlan(
         const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
+        const summaryJson = JSON.stringify(full);
+        const oneJson = one === null ? null : JSON.stringify(one);
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
         let startSeq = -1;
         let endSeq = -1;
@@ -420,8 +422,13 @@ function finishPlan(
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
-            summary: JSON.stringify(full),
-            one: one === null ? null : JSON.stringify(one),
+            summary: summaryJson,
+            one: oneJson,
+            // #5744: carry the digests so ingestSession can compare against the
+            // stored row BEFORE any CAS op (putContent with a precomputed hash
+            // recomputes nothing — same bytes, same utf8, same sha256).
+            summaryHash: sha256Hex(summaryJson),
+            oneHash: oneJson === null ? null : sha256Hex(oneJson),
             supersedesBlockId: null,
             active: b.active,
             createdAt: b.createdAt,
@@ -451,11 +458,10 @@ function finishPlan(
     }));
 
     const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => ({
-              ord,
-              key,
-              content: JSON.stringify(value),
-          }))
+        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => {
+              const content = JSON.stringify(value);
+              return { ord, key, content, contentHash: sha256Hex(content) };
+          })
         : [];
 
     const kstate: Record<string, unknown> = {};

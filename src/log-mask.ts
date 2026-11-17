@@ -179,7 +179,10 @@ function publishHomeRoots(): string[] {
 
 export function maskPathsForPublish(text: string): string {
     if (!text) return text;
-    const roots = publishHomeRoots();
+    const roots = [...new Set(publishHomeRoots().flatMap((root) => [
+        root,
+        JSON.stringify(root).slice(1, -1),
+    ]))].sort((a, b) => b.length - a.length);
     if (roots.length === 0) return text;
     const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
@@ -207,13 +210,15 @@ export function maskUrlForDiagnostics(url: string): string {
     try {
         const u = new URL(url);
         // Node keeps the brackets in hostname for bracketed IPv6 ([::1]).
-        // Loopback is returned VERBATIM (not re-serialized): URL.pathname
-        // normalizes pathless URLs by appending "/", which would drift
-        // byte-pinned local-origin lines for no security benefit — loopback
-        // identifies bili's own proxy, and secrets are scrubbed separately
-        // by redactSecretsInText upstream of every call site.
+        // Keep clean loopback URLs verbatim: URL.pathname would add "/" to
+        // pathless local-origin lines. The exemption covers host visibility,
+        // never userinfo/query/hash; generic text redaction cannot recognize
+        // arbitrary passwords or every query parameter carrying a secret.
         const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        if (h === "localhost" || isLoopbackIp(h)) return url;
+        if (h === "localhost" || isLoopbackIp(h)) {
+            if (!u.username && !u.password && !u.search && !u.hash) return url;
+            return `${u.protocol}//${u.host}${u.pathname}`;
+        }
     } catch {
         // unparseable — fall through to the generic masker
     }
@@ -354,7 +359,11 @@ export function redactSecretsInText(text: string): string {
     return text
         .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
+        // Groq (gsk_…) and Hugging Face (hf_…) keys, both on PUBLIC_HOST_SUFFIXES.
+        .replace(/(?<![A-Za-z0-9])(?:gsk|hf)_[A-Za-z0-9]{20,}/g, "<masked key>")
         .replace(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{20,}/g, "<masked key>")
         .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "<masked jwt>")
-        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
+        // The optional quote after the name covers JSON/dict keys ("api_key": "…"), the shape
+        // upstream error bodies and config dumps use; without it only key=value / key: value matched.
+        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b["']?\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
 }

@@ -1429,3 +1429,30 @@ withFullMode("R2.2 file-less rows: web list and detail survive a vanished legacy
     assert.equal(detail.blockDetails[0].blockId, "b1");
     assert.equal(detail.blockDetails[0].compressedTokens, 2500);
 });
+
+withSessionsDir("#5796: slow-session flag fires at/above threshold and stays off below", async (dir) => {
+    // SLOW_SESSION_REQUESTS_WARN = 5000 in src/web/sessions-data.ts (>= semantics).
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const long = makeSession("slow-5796", { protocol: "openai" }, { requests: 6000, inputTokens: 1_000_000, cachedTokens: 900_000, contextTokens: 120_000 });
+    await store.writeNow(long);
+    setSavedAt(dir, "slow-5796", Date.now() - 3_600_000);
+    const edge = makeSession("edge-5796", { protocol: "openai" }, { requests: 5000, inputTokens: 500_000, cachedTokens: 400_000, contextTokens: 60_000 });
+    await store.writeNow(edge);
+    setSavedAt(dir, "edge-5796", Date.now() - 5_400_000);
+    const short = makeSession("fast-5796", { protocol: "openai" }, { requests: 100, inputTokens: 20_000, cachedTokens: 10_000, contextTokens: 4000 });
+    await store.writeNow(short);
+    setSavedAt(dir, "fast-5796", Date.now() - 7_200_000);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    const slowRow = list.find((s) => s.id === "slow-5796");
+    assert.ok(slowRow, "above-threshold session is listed");
+    assert.deepEqual(slowRow.slowSession, { requests: 6000 }, "above threshold flags with its request count");
+    const edgeRow = list.find((s) => s.id === "edge-5796");
+    assert.ok(edgeRow, "at-threshold session is listed");
+    assert.deepEqual(edgeRow.slowSession, { requests: 5000 }, "exactly at threshold flags (>= boundary)");
+    const fastRow = list.find((s) => s.id === "fast-5796");
+    assert.ok(fastRow, "below-threshold session is listed");
+    assert.equal(fastRow.slowSession, undefined, "below threshold carries no flag");
+});

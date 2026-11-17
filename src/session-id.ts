@@ -69,6 +69,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // agent-session-id: goose stamps its sqlite sessions.id (default
+    // YYYYMMDD_<n>, stable across restarts) on every model request, BYOK and
+    // custom-provider paths included (#5825); a user-overridden header name
+    // simply degrades this lane. Client-specific name — same trust class as
+    // the headers above.
     // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
     // here on every model request, while x-session-affinity / X-Session-Id /
     // x-opencode-session all carry the INHERITED cache-routing affinity
@@ -80,8 +85,15 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // for 2.x traffic and is inert for 1.x (header absent); root sessions are
     // unchanged either way (affinity === own id). Client-specific name — same
     // trust class as the headers above.
+    // x-conversation-id: CodeBuddy (`bili n`) stamps its persisted
+    // conversation object id on every model request — measured 2.181.0 across
+    // fresh/-c/-r processes: stable across restarts, survives compaction
+    // (#5825, decision A: merge low-trust recognition; per-message identity
+    // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
+    // Client-specific name; placed AFTER every stricter client header and the
+    // affinity tier, before the bare generic `session-id` names.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];

@@ -137,6 +137,31 @@ test("byte-stable: same history → identical outbound bytes across cache states
     assert.equal(out2, out1, "two independent encodes of the same history must be byte-identical (upstream prefix-cache protection)");
 });
 
+for (const [firstDim, nextDim] of [[1600, 800], [800, 1600]]) {
+    test(`encode cache respects a changed dimension limit (${firstDim} to ${nextDim})`, async () => {
+        const { ctx } = ctxFor(`s-cache-dim-${firstDim}`);
+        const input = [anthropicImageMsg("msg_dim", BIG.b64)];
+        const first = await applyImageRescalePass(input, { ...ctx, maxDim: firstDim });
+        const next = await applyImageRescalePass(input, { ...ctx, maxDim: nextDim });
+        const imageData = (messages: BiliMessage[]) => (messages[0].rawAnthropicBlock as { source: { data: string } }).source.data;
+        const decoded = await Jimp.read(Buffer.from(imageData(next), "base64"));
+        assert.equal(decoded.width, nextDim, "cached encodes must use the current policy");
+        assert.notEqual(imageData(first), imageData(next));
+        assert.deepEqual(await applyImageRescalePass(input, { ...ctx, maxDim: nextDim }), next, "the same policy still reuses byte-identical output");
+        assert.equal(logLines.filter((line) => line.includes("[image-rescale]")).length, 2);
+    });
+}
+
+test("a cached low-benefit result does not suppress a later stricter resize", async () => {
+    const { ctx } = ctxFor("s-cache-null-dim");
+    const input = [anthropicImageMsg("msg_null_dim", BMP.b64, "image/bmp")];
+    assert.equal((await applyImageRescalePass(input, { ...ctx, maxDim: 1600 }))[0], input[0]);
+    const next = await applyImageRescalePass(input, { ...ctx, maxDim: 800 });
+    const block = next[0].rawAnthropicBlock as { source: { data: string } };
+    const decoded = await Jimp.read(Buffer.from(block.source.data, "base64"));
+    assert.equal(decoded.width, 800);
+});
+
 test("openai singular image_url converts to plural parts with inline note", async () => {
     const { session, ctx } = ctxFor("s-openai");
     session.state.messageRefs.byRaw["msg_o"] = "m20001";

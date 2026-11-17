@@ -461,12 +461,22 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
+        // #5608-D: cold load no longer aligns the citation space; drive one
+        // simulated fold-save so it settles onto the ledger exactly as the
+        // retired cold-load path used to (expected digest below still does).
+        session.pendingLedgerAlign = true;
+        assert.ok(store.flushSync(session), "post-fold save commits");
         store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
         let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
+            // #5609 CI red: the deferred-alignment high-water mark must ride
+            // kstate_json — dropping it diverged the second full-mode read
+            // from the legacy view on exactly this key.
+            const rowKstate = JSON.parse(probe.getSessionRow(meta.id)!.kstateJson) as Record<string, unknown>;
+            assert.equal(typeof rowKstate.timestampsHighWaterRefSeq, "number", "timestampsHighWaterRefSeq must persist through kstate_json (#5608-C)");
             // #4316 PR3/3: expected = legacy view of the same files + the
             // deterministic alignment against these very rows.
             expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
@@ -563,6 +573,10 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
+        // #5608-D: simulate the post-fold save that settles the citation
+        // space onto the ledger (cold-load alignment retired).
+        session.pendingLedgerAlign = true;
+        assert.ok(store.flushSync(session), "post-fold save commits");
         store.closeQuietly();
         const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
         let fileTierDigest = "";
@@ -944,5 +958,38 @@ test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their sta
     } finally {
         store.close();
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#6325: unchanged large session columns are not rewritten on delta ingest", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-6325-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const now = Date.now();
+        const makeSession = (id: string, text: string): LegacySessionLike => ({
+            id,
+            createdAt: now,
+            lastSeen: now,
+            meta: { protocol: "openai" },
+            stats: {},
+            metadata: { cacheLedger: { keep: "x".repeat(4096) } },
+            state: { blocks: [], nextBlockId: 1, nextRunId: 1, messageRefs: { byRaw: {}, byRef: {} } },
+            blockContents: new Map(),
+            lastMessages: [{ id: "m1", role: "user", contentType: "text", text } as unknown as CoreMessage],
+            lastMessagesFolded: false,
+            pluginSnapshot: undefined,
+            contentStore: undefined,
+        } as unknown as LegacySessionLike);
+        const session = makeSession("sess-6325", "hello");
+        const before = store.ingestSession(planIngest(session));
+        assert.ok(before);
+        const first = store.getSessionRow("sess-6325");
+        assert.ok(first?.metadataJson?.includes("cacheLedger"));
+        store.ingestSession(planIngest({ ...session, lastMessages: [{ id: "m2", role: "assistant", contentType: "text", text: "world" } as unknown as CoreMessage] }));
+        const second = store.getSessionRow("sess-6325");
+        assert.equal(second?.metadataJson, first?.metadataJson, "unchanged metadata_json should reuse the stored value");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
 });

@@ -50,7 +50,7 @@ export function warnIfLowIntegrityRuntime(): void {
         if (label !== "low" && label !== "untrusted") return;
         loggerLog(
             "warn",
-            `[integrity] this Node runtime carries a ${label.toUpperCase()} NTFS mandatory-integrity label (${process.execPath}) — a ${label}-integrity process cannot write Medium-labeled files, so startup-time writes (CA bundle, index.db) fail EPERM while every ACL looks correct (#5154, the #5096 crash-loop class). Fix: icacls "${process.execPath}" /setintegritylevel Medium (verify with icacls "${process.execPath}"). If the label came back inherited ("(I)" marker), a parent dir labeled "Low (OI)(CI)" re-applies it to every file placed inside — restore the dir root only: icacls "<dir>" /setintegritylevel Medium, no /T needed; children converge to (no label). See CONFIGURATION.md "Windows: node runtime labeled Low".`,
+            `[integrity] this Node runtime carries a ${label.toUpperCase()} NTFS mandatory-integrity label (${process.execPath}) — a ${label}-integrity process cannot write Medium-labeled files, so startup-time writes (CA bundle, index.db) fail EPERM while every ACL looks correct (#5154, the #5096 crash-loop class). Fix: icacls "${process.execPath}" /setintegritylevel Medium (verify with icacls "${process.execPath}"). If the label came back inherited ("(I)" marker), a parent dir labeled "Low (OI)(CI)" re-applies it to every file placed inside — restore the dir root only: icacls "<dir>" /setintegritylevel Medium, no /T needed; children converge to (no label). See docs/configuration.md "Windows: node runtime labeled Low".`,
         );
     });
 }
@@ -67,7 +67,7 @@ export function startupFailureHints(err: unknown): string | undefined {
         return [
             "bili: startup failed because the OS refused a file operation (a permission/lock issue, not a code fault):",
             '      - Windows: check the Node runtime\'s integrity label FIRST — icacls "<path-to-node.exe>"; a Low label makes every write to Medium-labeled files fail EPERM while ACLs look correct (#5154). Fix: icacls "<path-to-node.exe>" /setintegritylevel Medium.',
-            "      - Windows: exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus/Defender real-time scanning (CONFIGURATION.md, AV exclusions); OneDrive placeholder files under the profile dir cause the same refusal (#3823).",
+            "      - Windows: exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus/Defender real-time scanning (docs/configuration.md, AV exclusions); OneDrive placeholder files under the profile dir cause the same refusal (#3823).",
             "      - Transient boot-time lockers clear on their own — retrying after a minute often succeeds.",
         ].join("\n");
     }

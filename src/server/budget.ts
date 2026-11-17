@@ -4,9 +4,9 @@ import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
-import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
+import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
-export { readOutputBudget };
+export { outputBudgetField, readOutputBudget, writeOutputBudget };
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
@@ -395,6 +395,11 @@ export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefin
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
     if (nudge.contextUsage < escalationPct) return false;
+    // Phantom-pressure guard mirror: the kernel already deferred the pressure
+    // band because the meter was estimate-grade (no billing sample this
+    // cycle) — this early-advertising arm must not re-arm against the same
+    // bad reading. Hand-built decisions without the bit keep pre-fix semantics.
+    if ((nudge.breakdown?.pressureDeferredNoSample ?? 0) === 1) return false;
     if (!nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange)) return false;
     const b = nudge.breakdown;
     const minBenefit = b?.minPressureBenefit;

@@ -150,7 +150,7 @@ const unregistered = allFiles.filter(
 );
 if (unregistered.length > 0) {
     die(
-        `process-spawning test files missing from LIVE_FILES in scripts/run-ci-tests.mjs: ` +
+        `process-spawning test files missing from LIVE_FILES in scripts/live-files.mjs: ` +
             `${unregistered.join(", ")}. Register them there after reviewing their ` +
             `concurrency assumptions (#1248).`,
     );

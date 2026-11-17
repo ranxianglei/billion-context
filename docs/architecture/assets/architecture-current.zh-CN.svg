@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="984" viewBox="0 0 1560 984">
+  <style>
+    html,body { margin:0; padding:0; background:#fff; }
+    text { font-family: 'Noto Sans CJK SC','Droid Sans Fallback',sans-serif; }
+    .tt { font-size: 22px; font-weight: 700; fill: #0f172a; }
+    .sub { font-size: 13px; fill: #475569; }
+    .h  { font-size: 14px; font-weight: 700; fill: #0f172a; }
+    .b  { font-size: 12px; fill: #1e293b; }
+    .s  { font-size: 11px; fill: #475569; }
+    .chip { font-size: 11px; fill: #334155; }
+    .warn { font-size: 12px; fill: #7f1d1d; font-weight: 700; }
+    .warnb { font-size: 11px; fill: #991b1b; }
+    .num { font-size: 13px; font-weight: 700; fill: #b91c1c; }
+    .leg { font-size: 11px; fill: #334155; }
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#334155"/></marker>
+    <marker id="arra" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#b91c1c"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1560" height="984" fill="#ffffff"/>
+  <text x="30" y="42" class="tt">现状架构 · bili 上下文压缩代理（origin/master @ 2026-11-08，存储 schema v11）</text>
+  <text x="30" y="68" class="sub">四条车道各自为政 + kstate JSON 平行真源 —— 右侧红盒为三个结构性痛点（#5854 已把 v6 整线撤出 master；演进方向见 #5643）</text>
+
+  <!-- legend -->
+  <g>
+    <rect x="620" y="84" width="14" height="14" rx="3" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="640" y="95" class="leg">宿主/既有管道</text>
+    <rect x="740" y="84" width="14" height="14" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="760" y="95" class="leg">内核(不改)</text>
+    <rect x="850" y="84" width="14" height="14" rx="3" fill="#e0e7ff" stroke="#4f46e5"/>
+    <text x="870" y="95" class="leg">统一存储</text>
+    <rect x="950" y="84" width="14" height="14" rx="3" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="970" y="95" class="leg">结构性痛点</text>
+    <rect x="1070" y="84" width="14" height="14" rx="3" fill="#fff" stroke="#334155" stroke-width="2"/>
+    <text x="1090" y="95" class="leg">默认主路径</text>
+    <rect x="1190" y="84" width="14" height="14" rx="3" fill="#fff" stroke="#334155" stroke-dasharray="4 3"/>
+    <text x="1210" y="95" class="leg">实验性灰度车道</text>
+  </g>
+
+  <!-- hosts -->
+  <rect x="30" y="112" width="230" height="238" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="145" y="138" class="h" text-anchor="middle">宿主车道（今天已有身份采集）</text>
+  <text x="48" y="166" class="b">dsh — shim / 增量信封</text>
+  <text x="48" y="192" class="b">pi — entry-walker 采集</text>
+  <text x="48" y="218" class="b">opencode — transform 钩子</text>
+  <text x="48" y="244" class="b">codex — responses wire</text>
+  <text x="48" y="270" class="b">其他宿主 — 裸代理客户端</text>
+  <text x="48" y="300" class="s">请求头带 session id；插件车道</text>
+  <text x="48" y="316" class="s">信封里逐元素带宿主 msgid</text>
+  <text x="48" y="332" class="s">(#5842 采集器已就位)</text>
+
+  <!-- ingress -->
+  <rect x="330" y="148" width="250" height="72" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="176" class="h" text-anchor="middle">入站适配器 prepare-*</text>
+  <text x="455" y="200" class="s" text-anchor="middle">anthropic | openai | responses | google</text>
+  <!-- branching -->
+  <rect x="330" y="272" width="250" height="62" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="298" class="h" text-anchor="middle">lane-decisions 分轨</text>
+  <text x="455" y="320" class="s" text-anchor="middle">按请求形状 × 会话粘滞绑定</text>
+
+  <!-- lanes -->
+  <rect x="640" y="112" width="330" height="80" rx="8" fill="#eef2f7" stroke="#334155" stroke-width="2.5"/>
+  <text x="805" y="138" class="h" text-anchor="middle">legacy 全量重发路径（今天的默认主路径）</text>
+  <text x="805" y="160" class="s" text-anchor="middle">JSON.parse 全量 + openaiToCore 全量转换</text>
+  <text x="805" y="176" class="s" text-anchor="middle">lastMessages AST 钉在内存跨轮驻留（#5403 OOM 生产者）</text>
+
+  <rect x="640" y="214" width="330" height="64" rx="8" fill="#f8fafc" stroke="#64748b"/>
+  <text x="805" y="240" class="h" text-anchor="middle">增量 plugin-turn 车道</text>
+  <text x="805" y="262" class="s" text-anchor="middle">anthropic wire divert · x-bili-plugin-turn 回合</text>
+
+  <rect x="640" y="300" width="330" height="64" rx="8" fill="#ffffff" stroke="#334155" stroke-dasharray="5 4"/>
+  <text x="805" y="326" class="h" text-anchor="middle">v5 watermark 快路径（5% 灰度）</text>
+  <text x="805" y="348" class="s" text-anchor="middle">fastpath-scan 结构扫描 · x-bili-pf-seq 戳握手</text>
+
+  <rect x="640" y="386" width="330" height="64" rx="8" fill="#ffffff" stroke="#334155" stroke-dasharray="5 4"/>
+  <text x="805" y="412" class="h" text-anchor="middle">D-lane 快照渲染 #3756（≈0% 灰度）</text>
+  <text x="805" y="434" class="s" text-anchor="middle">服务端正史渲染出站前缀 · 失败整体回退 legacy</text>
+
+  <!-- kernel -->
+  <rect x="1030" y="128" width="250" height="252" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="1155" y="156" class="h" text-anchor="middle">acp-kernel 压缩内核</text>
+  <text x="1155" y="174" class="s" text-anchor="middle">（#5643 演进提案中零改动）</text>
+  <text x="1048" y="202" class="b">折叠判定 projectUnit（共享投影）</text>
+  <text x="1048" y="228" class="b">摘要生成 + 四条 prompts</text>
+  <text x="1048" y="254" class="b">nudge flat-50K 固定节拍</text>
+  <text x="1048" y="280" class="b">ref/msgid 账本（id 永不复用）</text>
+  <text x="1048" y="306" class="b">CompressionState：</text>
+  <text x="1048" y="324" class="s">blocks / refs / deadRefs / ckpt</text>
+  <text x="1048" y="342" class="s">tokenSnapshot / nextBlockId …</text>
+  <text x="1048" y="368" class="s">状态由谁水合、存哪 —— 见下</text>
+
+  <!-- egress -->
+  <rect x="1330" y="128" width="200" height="230" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="156" class="h" text-anchor="middle">出站映射 coreTo*</text>
+  <text x="1348" y="186" class="b">四线协议重新序列化</text>
+  <text x="1348" y="214" class="s">carrier 分支：</text>
+  <text x="1348" y="232" class="s">pluginMode：抑制 tool+nudge</text>
+  <text x="1348" y="250" class="s">proxy：acp_summary</text>
+  <text x="1348" y="268" class="s">revoice 为 user 消息</text>
+  <text x="1348" y="296" class="s">pf-*/信封头永不出代理</text>
+  <rect x="1330" y="402" width="200" height="60" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="426" class="h" text-anchor="middle">模型端点</text>
+  <text x="1430" y="444" class="s" text-anchor="middle">sglang / openai·responses</text>
+  <text x="1430" y="458" class="s" text-anchor="middle">anthropic / google</text>
+
+  <!-- storage band -->
+  <rect x="30" y="520" width="1300" height="240" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+  <text x="50" y="550" class="h">统一 SQLite · schema v11（#5539 FK 子索引）—— 行级真源只有一半</text>
+  <!-- table chips row1 -->
+  <g>
+    <rect x="50" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="588" class="chip" text-anchor="middle">sessions</text>
+    <rect x="178" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="588" class="chip" text-anchor="middle">content</text>
+    <rect x="306" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="365" y="588" class="chip" text-anchor="middle">messages</text>
+    <rect x="434" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="493" y="588" class="chip" text-anchor="middle">blocks / dead_refs</text>
+    <rect x="562" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="621" y="588" class="chip" text-anchor="middle">refs / checkpoints</text>
+    <rect x="690" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="749" y="588" class="chip" text-anchor="middle">ccr_entries</text>
+    <rect x="818" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="877" y="588" class="chip" text-anchor="middle">kv_store</text>
+    <rect x="946" y="568" width="150" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="1021" y="588" class="chip" text-anchor="middle">message_media / ext</text>
+  </g>
+  <g>
+    <rect x="50" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="628" class="chip" text-anchor="middle">conversations</text>
+    <rect x="178" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="628" class="chip" text-anchor="middle">session_ext</text>
+    <rect x="306" y="608" width="240" height="30" rx="5" fill="#fee2e2" stroke="#ef4444"/><text x="426" y="628" class="warn" text-anchor="middle">kstate JSON（hydration 字段清单）</text>
+  </g>
+  <text x="50" y="668" class="warnb">messages.msgId 列存的是 bili/内核规范 id —— 宿主 msgid 没有落点；sess_raw 无任何表承载。</text>
+  <text x="50" y="690" class="warnb">CompressionState 的存活字段由 src/state-hydration.ts mergeState() 单一定义，经 persist.ts 走 kstate JSON 存取。</text>
+  <text x="50" y="730" class="s">#5855（v6 re-land · PF 事务骨架）open，待人工合入 —— 新四表 DDL 必须叠在它落地之后。</text>
+
+  <!-- red warning boxes right -->
+  <rect x="1150" y="520" width="380" height="70" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="545" class="warn">⚠ 痛点① 状态三处住：进程内存 / 表 / kstate JSON</text>
+  <text x="1166" y="565" class="warnb">双写分叉是刚撤回那条线的根病；#5403 OOM 来自 lastMessages 整包驻留。</text>
+  <text x="1166" y="581" class="warnb">重启靠 mergeState 水合拼装，拼错即降级或烧会话。</text>
+  <rect x="1150" y="602" width="380" height="70" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="627" class="warn">⚠ 痛点② 身份不落盘：世界匹配永远冷启动</text>
+  <text x="1166" y="647" class="warnb">宿主 (sess_raw, msgid) 对 ingest 即剥掉，只在 in-flight 信封里活一轮。</text>
+  <text x="1166" y="663" class="warnb">「这元素见过没」跨进程/跨重启无法回答 ⇒ 每轮重探测、重武装。</text>
+  <rect x="1150" y="684" width="380" height="76" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="709" class="warn">⚠ 痛点③ 快路径各自打补丁，无统一快照表</text>
+  <text x="1166" y="729" class="warnb">v5 水位 / 增量车道 / D-lane 各管一段流量；缓存稳定性靠多层补丁堆叠，</text>
+  <text x="1166" y="745" class="warnb">任何一层失步就是缓存投毒或整体回退。缺一个单一存储真源。</text>
+
+  <!-- problem strip -->
+  <rect x="30" y="800" width="1500" height="100" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="830" class="h" fill="#b91c1c">演进目标（#5643 提案）：原始字节 → 协议转换 → 改写(压缩) → 快照表应用 → 出站映射 → 出站，六段固定链每轮全走完，单一存储真源。</text>
+  <text x="50" y="858" class="b">内核(折判定/摘要/prompts/ref 契约)零改动 · 有 session+msgid 的宿主全走此路 · 无 msgid 按 顺序&gt;hash 降级写同一套表。</text>
+  <text x="50" y="882" class="s">现状图对应物：左起入站 → 四车道（替代为本链第 0–1 段的身份化分轨）→ 内核（第 2 段，不动）→ 出站（第 4–5 段）；新增的第 0 段(L1 身份)与第 3 段(快照表)在现状中不存在。</text>
+
+  <!-- arrows -->
+  <g stroke="#334155" fill="none" stroke-width="1.6">
+    <path d="M260,200 H300 V184 H330" marker-end="url(#ar)"/>
+    <path d="M455,220 V272" marker-end="url(#ar)"/>
+    <path d="M580,303 H612"/>
+    <path d="M612,152 V418"/>
+    <path d="M612,152 H640" marker-end="url(#ar)"/>
+    <path d="M612,246 H640" marker-end="url(#ar)"/>
+    <path d="M612,332 H640" marker-end="url(#ar)"/>
+    <path d="M612,418 H640" marker-end="url(#ar)"/>
+    <path d="M970,152 H1002"/>
+    <path d="M970,246 H1002"/>
+    <path d="M970,332 H1002"/>
+    <path d="M970,418 H1002"/>
+    <path d="M1002,152 V418"/>
+    <path d="M1002,265 H1030" marker-end="url(#ar)"/>
+    <path d="M1280,243 H1330" marker-end="url(#ar)"/>
+    <path d="M1430,358 V402" marker-end="url(#ar)"/>
+  </g>
+  <!-- state dual-channel arrows to storage -->
+  <g stroke="#b91c1c" fill="none" stroke-width="1.4" stroke-dasharray="5 4">
+    <path d="M1155,380 V520" marker-end="url(#arra)"/>
+  </g>
+  <text x="1163" y="470" class="warnb">状态读写 = kstate JSON + 表 双通道（分叉点）</text>
+</svg>

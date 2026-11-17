@@ -35,6 +35,7 @@ import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
 import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { formatContextAnalysis } from "./context-analysis.js";
 
 interface AcpStatusCtx {
     core: CompressionCore;
@@ -244,6 +245,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (keepalive.lastHitAt !== undefined) kaLine += ` · last-hit ${Math.max(0, Math.round((Date.now() - keepalive.lastHitAt) / 60_000))}m ago`;
         extra.push("");
         extra.push(kaLine);
+    }
+    // Context analysis: init size, nudge cadence, harvest (acceptance) rate and
+    // the plain-language verdict — the question that used to take hours of
+    // manual log forensics (session-aedc188c investigation, 2026-11-08).
+    const caLines = formatContextAnalysis(ctx.session.id);
+    if (caLines && caLines.length > 0) {
+        extra.push("");
+        extra.push("CONTEXT ANALYSIS (this process's lifetime):");
+        extra.push(...caLines);
     }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and

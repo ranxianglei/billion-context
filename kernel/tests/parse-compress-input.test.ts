@@ -1386,3 +1386,25 @@ test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separa
   assert.equal(single.ranges[0]?.startRef, "m00150");
   assert.equal(single.ranges[0]?.endRef, "m00150");
 });
+
+// ---------------------------------------------------------------------------
+// stringified single entry (#5949 field)
+// ---------------------------------------------------------------------------
+
+test("content string encoding ONE entry object is salvaged (refs inside the JSON)", () => {
+  const parsed = parseCompressArgs({
+    content: JSON.stringify({ startId: "m00150", endId: "m00220", summary: "investigated the loop; fixed the gate" }),
+  });
+  assert.equal(parsed.diagnostics.ok, true);
+  assert.equal(parsed.diagnostics.contentSalvage, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.equal(parsed.ranges[0]?.startRef, "m00150");
+  assert.equal(parsed.ranges[0]?.endRef, "m00220");
+  assert.equal(parsed.ranges[0]?.summary, "investigated the loop; fixed the gate");
+});
+
+test("stringified object without range bounds still rejects (content-not-array)", () => {
+  const parsed = parseCompressArgs({ content: JSON.stringify({ note: "not a range" }) });
+  assert.equal(parsed.diagnostics.ok, false);
+  assert.equal(parsed.diagnostics.kind, "content-not-array");
+});

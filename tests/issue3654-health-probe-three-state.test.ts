@@ -41,6 +41,7 @@ after(() => {
 });
 
 const { probeLiveness, tcpConnectable } = await import("../src/liveness.ts");
+const { defaultLogFile } = await import("../src/paths.ts");
 const { decideEaddrinuse, eaddrinuseExitCode, TWIN_ADOPT_EXIT_CODE } = await import("../src/listen-policy.ts");
 const { writeSpawnPortLog } = await import("../src/instance.ts");
 const { createLiveOriginResolver } = await import("../src/agent/native-intercept.ts");
@@ -579,4 +580,54 @@ test("F: an under-window body still goes direct when nothing is routable (fail-o
     };
     await route(e, s);
     assert.equal(s.proxyBase, undefined, "direct send — no proxy target pinned");
+});
+
+// #5823/#5449: after a busy-window exhaustion "lets go" and respawns, the
+// attach-mode respawn may come back to the SAME instance it just released —
+// the log must say re-attach, not "replacement", or the operator reads a
+// recovery that never happened. Both directions asserted (gate discipline).
+test("B: busy exhaustion whose respawn re-adopts the SAME origin logs re-attach, not replacement", async () => {
+    const HELD = "http://127.0.0.1:18910";
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        origin: HELD,
+        ready: Promise.resolve(undefined),
+        respawn: async () => { respawnCalls++; state.origin = HELD; return HELD; },
+    };
+    const { probe } = scriptedProbe([], () => BUSY);
+    const resolve = createLiveOriginResolver(state, { probe, probeTtlMs: 1_000, busyWaitCapMs: 150, busyReprobeBaseMs: 30 });
+    const logFile = defaultLogFile();
+    const before = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+    const got = await resolve();
+    assert.equal(got, HELD, "the live-but-busy origin must still be routed to");
+    assert.equal(respawnCalls, 1);
+    const tail = Buffer.from(fs.readFileSync(logFile)).subarray(before).toString("utf8");
+    assert.ok(tail.includes(`liveness: ${HELD} still BUSY after let-go`), `re-attach line names the released origin; got:\n${tail}`);
+    const reattachLine = tail.split("\n").find((l) => l.includes("still BUSY after let-go"));
+    assert.ok(reattachLine?.includes("[warn]"), "the disclosed info→warn level change is pinned on the re-attach line; got:\n" + reattachLine);
+    assert.ok(tail.includes("bootstrap returned the SAME origin we just released"), "the operator must see no different endpoint surfaced");
+    assert.ok(!tail.includes(`replacement ${HELD} BUSY`), "a same-origin re-attach must not be logged as a replacement");
+});
+
+test("B: busy exhaustion whose respawn lands a DIFFERENT origin keeps the replacement wording", async () => {
+    const HELD = "http://127.0.0.1:18912";
+    const REPL = "http://127.0.0.1:18913";
+    let respawnCalls = 0;
+    const state: NativeInterceptState = {
+        origin: HELD,
+        ready: Promise.resolve(undefined),
+        respawn: async () => { respawnCalls++; state.origin = REPL; return REPL; },
+    };
+    const { probe } = scriptedProbe([], () => BUSY);
+    const resolve = createLiveOriginResolver(state, { probe, probeTtlMs: 1_000, busyWaitCapMs: 150, busyReprobeBaseMs: 30 });
+    const logFile = defaultLogFile();
+    const before = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+    const got = await resolve();
+    assert.equal(got, REPL);
+    assert.equal(respawnCalls, 1);
+    const tail = Buffer.from(fs.readFileSync(logFile)).subarray(before).toString("utf8");
+    assert.ok(tail.includes(`liveness: replacement ${REPL} BUSY`), `a genuine different-origin adoption keeps its wording; got:\n${tail}`);
+    const replLine = tail.split("\n").find((l) => l.includes(`replacement ${REPL} BUSY`));
+    assert.ok(replLine?.includes("[info]"), "a genuine replacement stays info-level; got:\n" + replLine);
+    assert.ok(!tail.includes("still BUSY after let-go"), "no re-attach claim for a different endpoint");
 });

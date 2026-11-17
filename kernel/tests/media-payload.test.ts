@@ -7,7 +7,7 @@ import {
   hasUnrecoverableMediaPayload,
 } from "../src/protected.js";
 import { assignRefs, BLOCKED_REF } from "../src/refs.js";
-import { MEDIA_REFS_MARKER } from "../src/media-refs.js";
+import { MEDIA_REFS_MARKER, collectFoldMediaRefs } from "../src/media-refs.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
 import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
@@ -1201,4 +1201,16 @@ test("openai: non-array single-object content never throws (legacy empty-text co
     Array.isArray(back) && back.length >= 1,
     "round-trip renders",
   );
+});
+
+test("collectFoldMediaRefs applies the ephemeral filter to carried-forward block refs (#5865 review)", () => {
+  // An OLDER build recorded a signed S3 URL in its block's MEDIA REFS section
+  // (pre-#5620 semantics). The carry-forward into a merged block must drop
+  // it — the URL is dead and no live message holds it — while keeping the
+  // durable handle next to it.
+  const signed = "https://bucket.s3.amazonaws.com/img.png?X-Amz-Expires=3600&X-Amz-Signature=abc";
+  const durable = "https://cdn.example.com/img.png";
+  const oldBlockSummary = `analysis summarized\n\n${MEDIA_REFS_MARKER}\n- ${signed}\n- ${durable}`;
+  const carried = collectFoldMediaRefs([], [{ id: "b1", summary: oldBlockSummary } as never]);
+  assert.deepEqual(carried, [durable]);
 });

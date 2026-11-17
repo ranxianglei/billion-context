@@ -35,6 +35,7 @@ import {
     throttle429Enabled,
     throttle429MaxConsecutive,
     throttle429MaxDelayMs,
+    throttle429Scope,
 } from "./knobs.js";
 
 /** Bounded state table (same posture as MAX_CIRCUITS in upstream-alerts.ts). */
@@ -216,10 +217,34 @@ function scanRequestModel(body: string | Uint8Array): string | undefined {
     return undefined;
 }
 
+/** #5865-P2 (throttle review F1): the pre-ingest early-hold gate (handle.ts)
+ *  and the full 429 gate (relay.ts) both need the top-level "model" of the
+ *  SAME request body; walking the multi-MiB document twice per request
+ *  (~1 ms/MiB each) was pure overhead on every proxied POST. Callers that
+ *  share one request-scoped host object (the IncomingMessage) pass it as
+ *  `cacheHost`; the first scan memoizes {body identity, model} on it and the
+ *  second gate returns the memoized model without re-walking. Identity-
+ *  checked on the body itself, so a rewritten/re-encoded body just re-scans
+ *  (correctness before caching). */
+const bodyModelMemo = new WeakMap<object, { body: string | Uint8Array; model: string | undefined }>();
+/** Test surface (resetSessionOrderForTest precedent): count of real scans —
+ *  pins "one scan, two consumers" without a perf harness. */
+let requestModelScanCount = 0;
+export function requestModelScanCountForTest(): number {
+    return requestModelScanCount;
+}
+
 /** Read the top-level request model without materializing a large passthrough body. */
-export function requestModelFromBody(body: string | Uint8Array): string | undefined {
+export function requestModelFromBody(body: string | Uint8Array, cacheHost?: object): string | undefined {
+    if (cacheHost !== undefined) {
+        const memo = bodyModelMemo.get(cacheHost);
+        if (memo !== undefined && memo.body === body) return memo.model;
+    }
+    requestModelScanCount++;
     const model = scanRequestModel(body);
-    return typeof model === "string" && model.length > 0 ? model : undefined;
+    const out = typeof model === "string" && model.length > 0 ? model : undefined;
+    if (cacheHost !== undefined) bodyModelMemo.set(cacheHost, { body, model: out });
+    return out;
 }
 
 /**
@@ -239,6 +264,27 @@ export function keyringModel429Scope(
     if (error.code === KEYRING_MODEL_LIMIT_CODE) return requestModel;
     if (error.code === "bili_throttle_hold" && error.scope === "model") return requestModel;
     return undefined;
+}
+
+/**
+ * The hold scope for an observed 429, combining #5696's marker discipline with
+ * the #5199/#5853 knob: a recognized KeyRing / bili-relay marker wins exactly
+ * as before; otherwise, when network.throttle429Scope is "model" and the send
+ * carried an identifiable request model, a marker-less gateway 429 (RPM/quota
+ * text, opaque relay-rewritten bodies — LiteLLM/one-api/opencode.ai shapes
+ * where one model's pool exhaustion must not freeze its siblings) settles
+ * model-scoped instead of credential-wide. Model-less sends keep the legacy
+ * credential key, so worst-case protection never widens beyond legacy.
+ */
+export function throttle429ModelScope(
+    status: number,
+    requestModel: string | undefined,
+    responseBody: string | Uint8Array | null | undefined,
+): string | undefined {
+    const recognized = keyringModel429Scope(status, requestModel, responseBody);
+    if (recognized !== undefined) return recognized;
+    if (status !== 429 || throttle429Scope() !== "model") return undefined;
+    return requestModel !== undefined && requestModel.length > 0 ? requestModel : undefined;
 }
 
 function modelHoldKey(key: string, model: string): string {
@@ -292,7 +338,7 @@ const NOOP_CLASSIFICATION_RESERVATION: ThrottleClassificationReservation = {
     release(): void {},
 };
 
-interface ThrottleLocalReject {
+export interface ThrottleLocalReject {
     /** 429 while under budget (Retry-After attached); 424 terminal. */
     status: 429 | 424;
     code: "bili_throttle_hold" | "bili_throttle_terminal";
@@ -651,6 +697,38 @@ export function upstreamThrottleGate(
     return { probeToken };
 }
 
+/**
+ * #5795: read-only counterpart of upstreamThrottleGate's REJECT branch.
+ * Returns the local rejection a send to this url+headers would receive RIGHT
+ * NOW, without minting probe tokens or mutating any hold state — the real
+ * gate in forward() still owns admission and probe accounting. Used by the
+ * pre-ingest fast path in server/handle.ts to refuse held sends BEFORE they
+ * pay the O(history) parse/convert/pin cost of a request that will not
+ * egress anyway. The reject loop is deliberately duplicated rather than
+ * shared: the gate's loop and its mutation are atomic, while this one must
+ * never mutate — a flag-based shared loop would couple the two.
+ */
+export function upstreamThrottlePeekReject(
+    url: string,
+    headers: Record<string, string>,
+    now: number = Date.now(),
+    requestModel?: string,
+): ThrottleLocalReject | undefined {
+    if (!throttle429Enabled()) return undefined;
+    const { key } = holdKey(url, headers);
+    let rejectState: HoldState | undefined;
+    for (const state of holds.values()) {
+        if (state.accountKey !== key) continue;
+        if (!state.provisional && state.model !== undefined && state.model !== requestModel) continue;
+        if (slotBlocked(state, now)) rejectState = strongerReject(rejectState, state);
+    }
+    for (const group of provisionalGroups.values()) {
+        const state = group.state;
+        if (state.accountKey !== key) continue;
+        if (slotBlocked(state, now)) rejectState = strongerReject(rejectState, state);
+    }
+    return rejectState === undefined ? undefined : makeReject(rejectState, now);
+}
 
 /** Observe a classified upstream 429 verdict for this send. */
 export function noteUpstreamThrottle429(
@@ -669,7 +747,14 @@ export function noteUpstreamThrottle429(
     const previous = holds.get(stateKey);
     const observedState = createHoldState(key, host, cred, retryAfterHeader, now, previous, scopeModel, false);
     if (previous === undefined) {
-        if (!storeHold(stateKey, observedState, scopeModel !== undefined)) return;
+        if (!storeHold(stateKey, observedState, scopeModel !== undefined)) {
+            // #5199/#5889: the hold map is saturated (MAX_HOLDS full, nothing
+            // model-scoped to evict) — the 429 stays ungoverned instead of
+            // silently pretending a hold exists. Say so: this is the one
+            // condition where marker-less 429 protection quietly disappears.
+            loggerLog("warn", `[acp-proxy] [429-hold] ${host}${scopeModel !== undefined ? ` model "${scopeModel}"` : ""}: 429 hold NOT stored — hold map saturated at ${MAX_HOLDS} with no evictable model-scoped hold; this 429 is ungoverned and requests pass through (#5199)`);
+            return;
+        }
     } else {
         holds.set(stateKey, observedState);
     }

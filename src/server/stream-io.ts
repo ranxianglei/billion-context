@@ -74,16 +74,28 @@ export function awaitDrain(res: DrainableResponse): Promise<void> {
 
 export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
     const reader = stream.getReader();
+    let completed = false;
+    const cancel = (): void => { void reader.cancel().catch(() => {}); };
+    res.once("close", cancel);
+    res.once("error", cancel);
     try {
+        if (res.destroyed || res.writableEnded) return;
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                completed = true;
+                break;
+            }
             if (res.destroyed || res.writableEnded) break;
             if (!res.write(Buffer.from(value))) {
                 await awaitDrain(res);
             }
         }
     } finally {
+        res.removeListener("close", cancel);
+        res.removeListener("error", cancel);
+        // A tee branch can wait for its sibling's cancellation. Do not hold cleanup on it.
+        if (!completed) cancel();
         reader.releaseLock();
         res.end();
     }
@@ -92,21 +104,12 @@ export async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.
 export async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string, name: string): Promise<void> {
     const { mkdirSync, createWriteStream } = await import("node:fs");
     const { join } = await import("node:path");
+    const { pipeline } = await import("node:stream/promises");
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
-        ws.on("error", (e) => { logDumpFailure("SSE stream dump", e); });
-        const reader = stream.getReader();
-        try {
-            for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                ws.write(Buffer.from(value));
-            }
-        } finally {
-            reader.releaseLock();
-            ws.end(() => gcDumpDirIfConfigured(dir));
-        }
+        await pipeline(stream, ws);
+        gcDumpDirIfConfigured(dir);
     } catch (err) {
         logDumpFailure("SSE stream dump", err);
     }

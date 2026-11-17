@@ -29,6 +29,7 @@ export interface WriterIdentity {
     /** #3923/#3959: this instance's lane (e.g. "pi", "dsh") — additive;
      *  markers written by older builds carry none and stay valid. */
     lane?: string;
+    startedAt?: number;
 }
 
 interface WriterMarkerFile {
@@ -38,6 +39,7 @@ interface WriterMarkerFile {
     origin: string;
     version: string;
     lane?: string;
+    startedAt?: number;
     /** Set only by a graceful dispose(): this instance recorded its FINAL
      *  marker and will never commit again. Peers skip such markers outright —
      *  a positively-known dead predecessor is not a concurrent writer, even
@@ -92,9 +94,19 @@ const PEER_FILE_FRESH_MS = 30_000;
 /** reapStaleWriterMarkers removes files whose pid is dead AND whose mtime is
  *  older than this. */
 const STALE_REAP_MS = 60 * 60_000;
+/** Same-PID markers that predate this process's boot by more than this margin
+ *  belong to an earlier container generation (the PID was reused, not shared)
+ *  — the margin absorbs clock/rounding skew between generations (#3923). */
+const SAME_PID_GENERATION_MARGIN_MS = 1_000;
 
 export function writerMarkerDir(stateDirPath: string): string {
     return path.join(stateDirPath, "writers");
+}
+
+/** This process's boot time (ms epoch), derived from uptime against the
+ *  caller's clock so tests can pin it. */
+export function processStartMs(now: number): number {
+    return now - Math.round(process.uptime() * 1000);
 }
 
 let tmpSeq = 0;
@@ -157,6 +169,7 @@ export function createServedMarkerWriter(identity: WriterIdentity, dir: string, 
             origin: identity.origin,
             version: identity.version,
             ...(identity.lane === undefined || identity.lane === "" ? {} : { lane: identity.lane }),
+            ...(typeof identity.startedAt === "number" ? { startedAt: identity.startedAt } : {}),
             ...(stoppedAt === undefined ? {} : { stoppedAt }),
             servedAt: Object.fromEntries(servedAt),
             ...(final ? { disposedAt: now } : {}),
@@ -250,7 +263,9 @@ function contestedServedAt(raw: Partial<WriterMarkerFile>, selfInstanceId: strin
  *  window by a LIVE foreign instance (pid alive or file fresh). Markers
  *  carrying a graceful-stop stamp (`stoppedAt`, or the `disposedAt` alias,
  *  #4626) are skipped unconditionally — a restart flow's predecessor died
- *  seconds ago and must not raise an alarm. Malformed or tearing files are
+ *  seconds ago and must not raise an alarm. Same-PID markers from an earlier
+ *  container generation (booted before this process) are likewise skipped —
+ *  the PID was reused, not shared (#3923). Malformed or tearing files are
  *  skipped silently — a marker is observability, not data. */
 export function findContestedWriters(dir: string, selfInstanceId: string, sessionId: string, now: number): Array<WriterIdentity & { servedAt: number }> {
     let entries: fs.Dirent[];
@@ -266,6 +281,14 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
         try {
             const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<WriterMarkerFile>;
             const mtimeMs = fs.statSync(file).mtimeMs;
+            // #3923: in containers PID is typically 1 across restarts. A marker
+            // that shares our PID but predates this process's boot belongs to a
+            // prior container generation, not a live twin (older builds carry no
+            // startedAt — the marker mtime then stands in for their last write).
+            const samePid = typeof raw.pid === "number" && raw.pid === process.pid;
+            const peerStartedAt = typeof raw.startedAt === "number" ? raw.startedAt : mtimeMs;
+            if (samePid && peerStartedAt < processStartMs(now) - SAME_PID_GENERATION_MARGIN_MS) continue;
+
             const at = contestedServedAt(raw, selfInstanceId, sessionId, mtimeMs, now);
             if (at === null || typeof raw.instanceId !== "string") continue;
             out.push({
@@ -274,6 +297,7 @@ export function findContestedWriters(dir: string, selfInstanceId: string, sessio
                 origin: typeof raw.origin === "string" ? raw.origin : "unknown",
                 version: typeof raw.version === "string" ? raw.version : "unknown",
                 lane: typeof raw.lane === "string" && raw.lane !== "" ? raw.lane : undefined,
+                ...(typeof raw.startedAt === "number" ? { startedAt: raw.startedAt } : {}),
                 servedAt: at,
             });
         } catch {
