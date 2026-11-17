@@ -396,7 +396,7 @@ test("hook entrypoint: run() receives the FULL stdin payload only after drain", 
     const payloadJson = JSON.stringify({ source: "fork", session_id: "11111111-2222-3333-4444-555555555555" });
     const runs: string[] = [];
     const exits: number[] = [];
-    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c) });
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c), backstopMs: 20 });
     // The synchronous-call-site bug: at this point run() must NOT have fired
     // yet — and the payload below arrives asynchronously, exactly like a real
     // claude SessionStart pipe.
@@ -410,6 +410,8 @@ test("hook entrypoint: run() receives the FULL stdin payload only after drain", 
     while (runs.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
     assert.equal(runs.length, 1, "run() fires exactly once");
     assert.equal(runs[0], payloadJson, "run() sees the complete payload (the old wiring passed \"\")");
+    const exitDeadline = Date.now() + 2_000;
+    while (exits.length === 0 && Date.now() < exitDeadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(exits, [0]);
 });
 
@@ -418,7 +420,7 @@ test("hook entrypoint: a never-closed stdin still fires via the drain timeout", 
     const payloadJson = JSON.stringify({ source: "fork", session_id: "11111111-2222-3333-4444-555555555555" });
     const runs: string[] = [];
     const exits: number[] = [];
-    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c), drainTimeoutMs: 40 });
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c), drainTimeoutMs: 40, backstopMs: 20 });
     input.write(payloadJson);
     // No end(): only the timeout safety net may release the hook — claude
     // waits for this process to exit, so a hang here would stall the session.
@@ -426,6 +428,8 @@ test("hook entrypoint: a never-closed stdin still fires via the drain timeout", 
     while (runs.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
     assert.equal(runs.length, 1);
     assert.equal(runs[0], payloadJson, "timeout path still carries the buffered payload");
+    const exitDeadline = Date.now() + 2_000;
+    while (exits.length === 0 && Date.now() < exitDeadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
     assert.deepEqual(exits, [0]);
 });
 
@@ -433,7 +437,7 @@ test("hook entrypoint: empty stdin (end with no data) exits cleanly", async () =
     const input = new PassThrough();
     const runs: string[] = [];
     const exits: number[] = [];
-    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c) });
+    hookMainWithDeps({ input, runImpl: async (p) => { runs.push(p); }, exit: (c) => exits.push(c), backstopMs: 20 });
     input.end();
     const deadline = Date.now() + 2_000;
     while (exits.length === 0 && Date.now() < deadline) await new Promise<void>((resolve) => setTimeout(resolve, 10));
