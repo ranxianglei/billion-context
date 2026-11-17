@@ -2411,6 +2411,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         reply,
                         opts.streamErrorShape,
                         hostOwnsTruncationRecovery,
+                        opts.degenerateTurn,
                     );
                 }
             } else {
@@ -2636,6 +2637,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     reply,
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
+                    opts.degenerateTurn,
                 );
             }
         } else if (
