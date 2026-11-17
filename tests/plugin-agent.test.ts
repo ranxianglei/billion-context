@@ -1079,19 +1079,29 @@ test("#6080: after the backoff window expires, exactly one more attempt is made"
         makeDroppingRegister(pi, { stuck: true });
         pi.tools.length = 0; // host rebuilt its registry while our map was unreadable
 
-        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 2, "attempt 1 fired");
-            // Inside the window: suppressed.
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 2, "suppressed inside the backoff window");
-            // After expiry: exactly ONE more attempt — then a fresh window opens.
-            await sleep(80);
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 4, "exactly one more attempt after expiry");
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 4, "suppressed again after the second failed attempt");
-        });
+        // Drive the clock explicitly so the 40ms backoff window is deterministic —
+        // a loaded runner can drift a real sleep(80) past (or short of) the window.
+        const origNow = Date.now.bind(Date);
+        let fakeNow = 1_000_000;
+        Date.now = () => fakeNow;
+        try {
+            await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "attempt 1 fired");
+                // Inside the window: suppressed (clock frozen → still within 40ms).
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "suppressed inside the backoff window");
+                // Advance past the backoff window: exactly ONE more attempt.
+                fakeNow += 80;
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 4, "exactly one more attempt after expiry");
+                // Inside the new window: suppressed (clock frozen again).
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 4, "suppressed again after the second failed attempt");
+            });
+        } finally {
+            Date.now = origNow;
+        }
 
         const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
         const backoffLines = logText.split("\n").filter((l) => l.includes("re-registration did not take effect"));
@@ -1115,27 +1125,35 @@ test("#6080: a host that starts accepting registrations converges and goes quiet
         makeDroppingRegister(pi, stuckRef);
         pi.tools.length = 0; // host rebuilt its registry while our map was unreadable
 
-        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
-            // Episode start: burst fails, backoff engaged.
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 2, "first attempt fired");
-            // The host heals (e.g. pi finishes its reload and our instance map is read
-            // again). The next attempt lands after the short window expires…
-            stuckRef.stuck = false;
-            await sleep(80);
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.tools.length, 2, "the re-registration now sticks");
-            assert.equal(pi.registerCalls, before + 4, "converged with one extra attempt");
-            // …and the session is quiet from then on.
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.registerCalls, before + 4, "no churn after convergence");
-            // A LATER transient drop (a new episode) must still heal immediately —
-            // the earlier backoff episode must not suppress it.
-            pi.tools.length = 0;
-            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
-            assert.equal(pi.tools.length, 2, "a later drop heals on the very next turn");
-            assert.equal(pi.registerCalls, before + 6, "immediate heal — no stale backoff suppression");
-        });
+        // Drive the clock explicitly so the 40ms backoff window is deterministic.
+        const origNow = Date.now.bind(Date);
+        let fakeNow = 1_000_000;
+        Date.now = () => fakeNow;
+        try {
+            await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+                // Episode start: burst fails, backoff engaged.
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "first attempt fired");
+                // The host heals (e.g. pi finishes its reload and our instance map is read
+                // again). Advance past the short window…
+                stuckRef.stuck = false;
+                fakeNow += 80;
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.tools.length, 2, "the re-registration now sticks");
+                assert.equal(pi.registerCalls, before + 4, "converged with one extra attempt");
+                // …and the session is quiet from then on.
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 4, "no churn after convergence");
+                // A LATER transient drop (a new episode) must still heal immediately —
+                // the earlier backoff episode must not suppress it.
+                pi.tools.length = 0;
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.tools.length, 2, "a later drop heals on the very next turn");
+                assert.equal(pi.registerCalls, before + 6, "immediate heal — no stale backoff suppression");
+            });
+        } finally {
+            Date.now = origNow;
+        }
 
         const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
         const backoffLines = logText.split("\n").filter((l) => l.includes("re-registration did not take effect"));
