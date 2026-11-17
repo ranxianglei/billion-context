@@ -202,3 +202,87 @@ test("#6949: assignRefs mints a numeric ref (not BLOCKED) for the item", () => {
   assert.notEqual(ref, BLOCKED_REF, "no longer BLOCKED");
   assert.match(ref, /^m\d{5}$/, "numeric mNNNNN ref");
 });
+
+// Acceptance follow-up (field audit on Codex CLI 0.169.0, #6949 thread):
+// the three CLI plain-text classes that were observed pinned — host skill
+// instructions, deferred tool namespaces, turn-aborted notices — all carry
+// the same shape (valid id + metadata object + input_text parts) and must
+// fold. The predicate is shape-based, so one row per class pins the real
+// metadata variants.
+test("#6949 acceptance: CLI's three plain-text classes fold (skills / deferred namespaces / turn-aborted)", () => {
+  const classes = [
+    {
+      kind: "additional_content.host_skills.instructions",
+      text: "host skill instructions: before entering a review loop, read its SKILL.md and follow the loop steps",
+    },
+    {
+      kind: "additional_content.tools.deferred_namespaces",
+      text: "deferred tool namespaces: mcp__search, mcp__files (loaded on demand)",
+    },
+    {
+      kind: "additional_content.generic.turn_aborted",
+      text: "the previous turn was aborted by the user before a final answer was produced",
+    },
+  ];
+  for (const { kind, text } of classes) {
+    const { mid } = midSystemCore([
+      { type: "message", role: "user", content: "q" },
+      {
+        type: "message",
+        id: `msg_cli_${kind}`,
+        role: "developer",
+        content: [{ type: "input_text", text }],
+        internal_chat_message_metadata_passthrough: {
+          turn_id: "turn_cli",
+          content_item_kinds: [kind],
+          content_item_metadata: [{ provenance: { type: "harness", hook: false } }],
+        },
+      },
+    ]);
+    assert.equal(hasUnrecoverableMediaPayload(mid), false, `${kind} must fold`);
+  }
+});
+
+// Acceptance follow-up (field audit, #6949 thread): sessions that ALREADY
+// carry a stale BLOCKED ref for one of these items must recover on the next
+// ref-assignment pass after the upgrade — no new session required. This pins
+// the #2607 stale-BLOCKED migration on the exact shape that produced it.
+test("#6949 acceptance: pre-existing BLOCKED ref migrates to a numeric ref on re-assignment", () => {
+  const flat = responsesToCore({
+    model: "m",
+    input: [
+      { type: "message", role: "user", content: "turn 1" },
+      {
+        type: "message",
+        id: "msg_example",
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: "<codex_apps_open_page_instructions>page rules</codex_apps_open_page_instructions>",
+          },
+        ],
+        internal_chat_message_metadata_passthrough: METADATA,
+      },
+      { type: "message", role: "user", content: "turn 2" },
+    ],
+  } as ResponsesRequestBody);
+  const [u1, dev, u2] = flat.msgs;
+  assert.equal(dev?.role, "system");
+  // Pre-fix session state: neighbors hold numeric refs, the developer item
+  // was pinned BLOCKED.
+  const existing = {
+    byRaw: { [u1!.id]: "m00001", [dev!.id]: BLOCKED_REF, [u2!.id]: "m00002" },
+    byRef: { m00001: u1!.id, m00002: u2!.id },
+  };
+  const result = assignRefs(flat.msgs as CoreMessage[], {
+    existing,
+    nextIndex: 3,
+    isProtected: (m) => hasUnrecoverableMediaPayload(m),
+  });
+  assert.deepEqual(result.migratedIds, [dev!.id]);
+  assert.equal(result.map.byRaw[dev!.id], "m00003", "stale BLOCKED mints a fresh numeric ref");
+  assert.equal(result.map.byRef["m00003"], dev!.id);
+  assert.equal(result.map.byRaw[u1!.id], "m00001", "neighbors keep their refs");
+  assert.equal(result.map.byRaw[u2!.id], "m00002", "neighbors keep their refs");
+});
