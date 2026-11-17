@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.214",
+  "version": "0.1.216",
   "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -68,6 +68,7 @@
     "jimp": "1.6.1"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "^22.0.0",

@@ -247,6 +247,34 @@ const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
 const MANGLED_OPEN = new RegExp("\x3c" + NAME + "\\s*=\\s*[^<>]*>");
 const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c" + NAME + "=|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
+// #6557: a model-emitted opening whose `type` names a TOOL lane
+// (`type="tool:acp_cache"`) is not prose wearing tags. The kernel renders tool
+// results under that type, so a model writing one in assistant TEXT is
+// inventing a tool result: the body between the tags is fabricated output, not
+// its own words. The #1720/#2023 rule — "content that is not refs-only is
+// prose wearing tags: the tags go, the content stays" — was written for
+// `type="text"`, where the body IS the model's prose; applied to a tool-typed
+// echo it commits the fabricated result into the assistant turn, and the model
+// then imitates "tag + that body" at the head of every later reply
+// (production session, #6557: the same JSON block 25 times in 23 minutes). So
+// a tool-typed span dies WHOLE — attrs through the close, or through the end
+// of the field when the imitation never closes — in the whole-text path
+// (TOOL_TYPED_PAIR) and in the streaming swallow (swallowReleases, below). A
+// self-closing imitation is a complete unit, not an opening — it dies in place
+// via SELF_CLOSE, prose after it surviving.
+// Case folds per #1731: an echoed type drifts casing the same way an echoed
+// name does. The quote after `type=` is part of the match, so a `type=` that
+// appears inside another attribute's VALUE (an unquoted-looking `data-x=a
+// type=tool:` run) cannot be mistaken for the attribute itself.
+const TOOL_TYPE_ATTR = "\\s+[tT][yY][pP][eE]\\s*=\\s*[\"']\\s*[tT][oO][oO][lL]:";
+const TOOL_TYPE_ATTR_RE = new RegExp(TOOL_TYPE_ATTR);
+// The `[^/<>]` before the final `>` excludes the SELF-CLOSING form
+// (`<acp …/>`): that is a complete unit, not an opening, so it must not be
+// read as one and made to own the rest of the field. It falls through to the
+// SELF_CLOSE pass (killed in place) — the same verdict the streaming path
+// reaches via candidate order, keeping both paths split-invariant (#4178/#4210).
+const TOOL_TYPED_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*?)?" + TOOL_TYPE_ATTR + "[^<>]*[^/<>]>");
+const TOOL_TYPED_PAIR = new RegExp(TOOL_TYPED_OPEN.source + "[\\s\\S]*?\x3c\\/" + NAME + ">");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
 const HOLD_LIMIT = 128;
@@ -468,6 +496,24 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
         if (wrapped === null) break;
         out = out.slice(0, wrapped.start) + out.slice(wrapped.end);
     }
+    // #6557: a tool-typed echo dies WHOLE (see TOOL_TYPE_ATTR). RUNS BEFORE the
+    // paired/lone-open passes for the same reason the wrapped span does: either
+    // of those would strip the markup alone and leave the fabricated tool
+    // result as assistant text — the exact residue this channel exists to
+    // prevent. An opening with no close in the field owns the rest of it: the
+    // imitation was never terminated, so everything after it is its payload
+    // (the wrapped-turn EOF rule, reused).
+    for (;;) {
+        const open = TOOL_TYPED_OPEN.exec(out);
+        if (open === null) break;
+        const pair = TOOL_TYPED_PAIR.exec(out);
+        if (pair !== null && pair.index === open.index) {
+            out = out.slice(0, pair.index) + out.slice(pair.index + pair[0].length);
+            continue;
+        }
+        out = out.slice(0, open.index);
+        break;
+    }
     out = out.replace(new RegExp(PAIRED.source, "g"), "");
     // #2023: a refs run sitting directly against an UNMATCHED close is residue
     // (its open was consumed elsewhere or never came) and goes with the close.
@@ -546,9 +592,10 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
  * so entry-vs-exit comparisons never false-positive on shapes one side
  * legitimately removed. Single source of truth by construction — when the
  * filter family grows, the judge's normalization grows with it. Content-
- * preserving for prose (paired shapes keep their payload; only tag bytes go),
- * and the tool-call emission span is deliberately NOT touched (args are user
- * intent, #1039). */
+ * preserving for prose (paired shapes keep their payload — except a tool-typed
+ * span, whose body is a fabricated tool result and dies with the tags, #6557;
+ * otherwise only tag bytes go), and the tool-call emission span is
+ * deliberately NOT touched (args are user intent, #1039). */
 export function normalizeEchoArtifacts(text: string): string {
     if (
         !containsRenderTagText(text) &&
@@ -1007,7 +1054,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     };
 }
 
-export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
+export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boolean) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
     /** Settled prose deferred alongside a NON-definite tag-head tail: it
      *  carries a dead ref-close unit whose verdict is content-determined
@@ -1055,25 +1102,37 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
     // the cap drops repeatedly until its close. swallowSessionCounted keeps
     // any one swallow session at exactly one count.
     let swallowSessionCounted = false;
-    const recordDrop = (snippet: string) => {
+    // #5192: a drain drop is a different event from an ordinary strip — the
+    // stream ended while the filter still held bytes, so the one-shot notice
+    // below (spent by the response's FIRST drop) left it with no line at all.
+    // It gets its own one-shot budget so a held head at EOF is always audible.
+    let drainNoticed = false;
+    const recordDrop = (snippet: string, duringDrain = false) => {
         droppedAny = true;
+        if (duringDrain) {
+            if (onDrop && !drainNoticed) {
+                drainNoticed = true;
+                onDrop(snippet, true);
+            }
+            return;
+        }
         if (onDrop && !notified) {
             notified = true;
             onDrop(snippet);
         }
     };
     /** One self-contained artifact resolved by a single drop call. */
-    const drop = (snippet: string) => {
+    const drop = (snippet: string, duringDrain = false) => {
         dropCount += 1;
-        recordDrop(snippet);
+        recordDrop(snippet, duringDrain);
     };
     /** Any drop inside a live swallow session — the session counts once. */
-    const dropSwallowSpan = (snippet: string) => {
+    const dropSwallowSpan = (snippet: string, duringDrain = false) => {
         if (!swallowSessionCounted) {
             dropCount += 1;
             swallowSessionCounted = true;
         }
-        recordDrop(snippet);
+        recordDrop(snippet, duringDrain);
     };
     /** #2862: strip dead ref-close units (ref + unterminated close head) from
      *  a span about to be RELEASED as prose; each unit is one self-contained
@@ -1430,9 +1489,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // than released at the #644 budget. Every genuine opening has
                 // balanced quotes: `tokens="1" type="text"`.
                 const wrapped = ((m[0].match(/"/g) ?? []).length & 1) === 1;
+                // #6557: a tool-typed opening frames a FABRICATED tool result,
+                // not the model's prose (see TOOL_TYPE_ATTR) — its body is
+                // discarded on the attested-imitation budget instead of being
+                // released at the #644 one, in both the closed and the
+                // never-closed (EOF) shape. Gated to attrs-bearing openings: a
+                // bare opening carries no type at all, so its #1881
+                // release-as-prose path is untouched.
+                const toolTyped = !bare && TOOL_TYPE_ATTR_RE.test(m[0]);
                 swallowUntilClose = true;
-                swallowLimit = wrapped ? IMITATION_SWALLOW_CAP : SWALLOW_CAP;
-                swallowReleases = !wrapped;
+                swallowLimit = wrapped || toolTyped ? IMITATION_SWALLOW_CAP : SWALLOW_CAP;
+                swallowReleases = !wrapped && !toolTyped;
                 swallowBareOpen = bare;
                 swallowed = "";
             } else {
@@ -1522,7 +1589,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // imitation (never released, #1720), or an attrs-bearing
                 // opening whose tail never closed — that tail is tag content
                 // (a ref, possibly truncated), not prose (#644 EOF rule).
-                if (rest.length > 0) dropSwallowSpan(rest);
+                if (rest.length > 0) dropSwallowSpan(rest, true);
                 result = "";
             } else if (wasSwallowing) {
                 // A BARE opening (#1881): prose may genuinely wear one, so an
@@ -1531,15 +1598,15 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 // truncated open/close tail is dead markup.
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    dropSwallowSpan(t[0]);
+                    dropSwallowSpan(t[0], true);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        dropSwallowSpan(tc[0]);
+                        dropSwallowSpan(tc[0], true);
                         result = rest.slice(0, tc.index);
                     } else if (REFS_ONLY.test(rest)) {
-                        dropSwallowSpan(rest);
+                        dropSwallowSpan(rest, true);
                         result = "";
                     } else {
                         // Payload accumulated under the session may carry
@@ -1564,13 +1631,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                             if (payload === "") break;
                             const t2 = new RegExp(TRUNC_OPEN.source).exec(payload);
                             if (t2 !== null) {
-                                dropSwallowSpan(t2[0]);
+                                dropSwallowSpan(t2[0], true);
                                 r += payload.slice(0, t2.index);
                                 break;
                             }
                             const tc2 = new RegExp(TRUNC_CLOSE.source).exec(payload);
                             if (tc2 !== null) {
-                                dropSwallowSpan(tc2[0]);
+                                dropSwallowSpan(tc2[0], true);
                                 r += payload.slice(0, tc2.index);
                                 break;
                             }
@@ -1579,7 +1646,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                             // ahead of a refs tail was emitted, the tail is a
                             // prose-cited ref and must be released (#1760).
                             if (r === "" && REFS_ONLY.test(payload)) {
-                                dropSwallowSpan(payload);
+                                dropSwallowSpan(payload, true);
                                 break;
                             }
                             if (payload === prev || guard >= 64) {
@@ -1596,12 +1663,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             } else {
                 const t = new RegExp(TRUNC_OPEN.source).exec(rest);
                 if (t) {
-                    drop(t[0]);
+                    drop(t[0], true);
                     result = rest.slice(0, t.index);
                 } else {
                     const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
                     if (tc) {
-                        drop(tc[0]);
+                        drop(tc[0], true);
                         result = rest.slice(0, tc.index);
                     } else {
                         result = rest;
@@ -1613,7 +1680,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // modes agree at true EOF.
             const cut = TRUNC_REF_CLOSE.exec(result);
             if (cut !== null) {
-                drop(result.slice(cut.index));
+                drop(result.slice(cut.index), true);
                 result = result.slice(0, cut.index);
             }
             // #4164: EOF resolves any still-held settle as prose — no tag ever

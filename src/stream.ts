@@ -415,6 +415,17 @@ function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number 
     return highest;
 }
 
+/** #6712: number-preserving scrub marker for a stale requested ref. `m00010`
+ *  becomes `[stale-ref:00010]` — the digits stay in the receipt so the caller
+ *  can tell which ref it used (and the `range …:` diagnostic line stays
+ *  readable), while the bare `mNNNNN` token never reaches the client-persisted
+ *  receipt, so the #2146 echo channel stays dead. Non-m ids (unreachable when
+ *  `beyond` fires, which requires m-refs) fall back to the bare marker. */
+function staleRefMarker(id: string): string {
+    const m = /^m(\d+)$/i.exec(id.trim());
+    return m ? `[stale-ref:${m[1]}]` : "[stale-ref]";
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -460,6 +471,44 @@ export function frontierClampNote(
     const hi = `m${String(highest).padStart(5, "0")}`;
     const list = over.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
     return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
+}
+
+/** #6855: the SUCCESS headline must name the range the kernel actually
+ *  folded. #4521 clamps an endId above the session's highest allocated ref
+ *  down to the highest visible message (the "aiming at the newest tail"
+ *  leniency), but the receipt's detail is built from the REQUESTED ranges —
+ *  so a clamped success taught the model a ceiling that was never minted
+ *  ("Compressed m03693–m03799" when only m03693–m03712 was folded), and its
+ *  next call anchored its START at requested-end+1, which #4521 refuses by
+ *  design (observed: session 01a1dd94, 22:13 clamp → 22:15 m03800 refusal ×2).
+ *  Re-state the effective end; the kernel's snapped warning (carried in
+ *  `warnings`) keeps the requested number for correlation.
+ *  Clamp the displayed end of a range only when the kernel's own warnings
+ *  carry the matching `endId="..."` clamped note — a range the kernel
+ *  hard-refused per-range (e.g. START also above the frontier) was NOT
+ *  folded and must stay shown exactly as requested, next to its
+ *  apply-error note. Missing note / unparseable endpoint = unchanged
+ *  (worst case reproduces the pre-fix receipt, never a wrong one). */
+export function effectiveCompressedDetail(
+    ranges: Array<{ startRef: string; endRef: string }>,
+    highest: number,
+    warnings: string[],
+): string {
+    if (ranges.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    return ranges
+        .map((rg) => {
+            const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+            const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+            const clamped =
+                highest > 0 &&
+                !!s && !!e &&
+                Number(s[1]) <= highest &&
+                Number(e[1]) > highest &&
+                warnings.some((w) => w.includes(`endId="${rg.endRef.trim()}"`));
+            return clamped ? `${rg.startRef.trim()}–${hi}` : `${rg.startRef}–${rg.endRef}`;
+        })
+        .join(", ");
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -1068,7 +1117,34 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
     if (gate?.requireNudge && !gate.armed) {
         ctx.log("[acp-proxy: refused unprompted compress — no live nudge credit (window expired or never minted) (compress.requireNudge)]");
-        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.]`, "refused", 0, "unprompted");
+        // #6728: gate refusals charge the failure ledger like every other
+        // reject path — otherwise a model re-submitting the same range gets
+        // byte-identical receipts forever and the breaker never arms.
+        const specKey =
+          parsed.ranges.length > 0
+            ? normalizedSpecKey(parsed.ranges)
+            : "unprompted";
+        // The spec-repeat guard text recordCompressFailure returns is dropped
+        // by the collapse below (one counter, stated once — same as the scope
+        // gate under it); only the ledger charge matters here.
+        recordCompressFailure(ctx.session, specKey);
+        const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+        const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
+        // #6728: repeat-collapse, same shape as the parse-failure one-liner
+        // below — the first refusal keeps the full teaching receipt; every
+        // repeat gets one line pointing back at it.
+        if (trackLoop && occurrences >= 2) {
+            ctx.log(
+                `[acp-proxy: unprompted-gate receipt collapsed to one-liner (attempt ${occurrences})]`,
+            );
+            return compressResult(
+                `[Compression REFUSED again — this exact call has now been refused ${occurrences} time(s) the same way (compress.requireNudge); nothing was compressed. The full refusal and its conditions are in the FIRST refused receipt above — do not re-send this call verbatim.${loopGuard}]`,
+                "refused",
+                0,
+                "unprompted",
+            );
+        }
+        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.${loopGuard}]`, "refused", 0, "unprompted");
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -1220,7 +1296,36 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (offending.length > 0) {
             const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
-            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.]`, "refused", 0, "out-of-recommendation");
+            // #6728: charge the ledger (see the nudge gate above). The
+            // spec-repeat guard text recordCompressFailure returns is dropped
+            // on purpose (one counter, stated once — the collapse below says
+            // it); only the ledger charge matters here.
+            const specKey = normalizedSpecKey(ranges);
+            recordCompressFailure(ctx.session, specKey);
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
+            const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
+            if (trackLoop && occurrences >= 2) {
+                ctx.log(
+                    `[acp-proxy: out-of-recommendation receipt collapsed to one-liner (attempt ${occurrences})]`,
+                );
+                return compressResult(
+                    `[Compression REFUSED again — span(s) ${listed} have now been refused ${occurrences} time(s) the same way (compress.requireRecommendation); nothing was compressed. The full refusal and the current compressible ranges are in the FIRST refused receipt above — do not re-send this call verbatim.${loopGuard}]`,
+                    "refused",
+                    0,
+                    "out-of-recommendation",
+                );
+            }
+            // #6728: when nothing is recommended at all — no prepare-time
+            // offer and no live ranges — "call acp_status and stay within
+            // them" is a dead end; the context is already at its minimum,
+            // so say so plainly (#4812-style terminal wording) instead.
+            const recommendedEmpty =
+                recommendedIntervals(ctx).length === 0 &&
+                (liveCompressionRanges(ctx)?.ranges.length ?? 0) === 0;
+            const advice = recommendedEmpty
+                ? " No compressible ranges remain — the context is already at its minimum; continue the task without compressing. Compression happens again only when there is genuinely new content to fold."
+                : " Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.";
+            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding.${advice}${loopGuard}]`, "refused", 0, "out-of-recommendation");
         }
     }
     if (ctx.messages.length > 0) {
@@ -1494,10 +1599,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // keeps the real refs for the operator. Live refs are untouched:
             // when the note fires, every requested ref exceeds the session's
             // highest mapped ref, so no live snapshot number can collide.
+            // #6712: the scrub must not erase WHICH ref was requested — a bare
+            // `[stale-ref]` leaves the caller unable to tell what it asked
+            // for, so it cannot self-correct. The marker keeps the ref number
+            // (`[stale-ref:00010]`) while never emitting the bare `mNNNNN`
+            // token, so the #2146 echo channel stays dead.
             if (beyond !== "") {
                 for (const rg of ranges) {
                     for (const id of [rg.startRef, rg.endRef]) {
-                        receipt = receipt.split(id).join("[stale-ref]");
+                        receipt = receipt.split(id).join(staleRefMarker(id));
                     }
                 }
             }
@@ -1613,7 +1723,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1495: apply-layer per-range errors (unknown refs, …) were invisible
         // whenever some other range in the batch succeeded — surface them on
         // the success line too, not only on total failure.
-        let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // #6855: headline echoes the EFFECTIVE (kernel-clamped) range, not the
+        // requested one — the requested number stays in `warn` for correlation.
+        const effectiveDetail = effectiveCompressedDetail(ranges, highestMappedRef(ctx.session.state), r.warnings);
+        let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
@@ -1643,10 +1756,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return prev === undefined || prev !== b.summary;
         });
         syncSubagentSessions(ctx.session, changedBlocks, ctx.compressMessages ?? ctx.messages);
-        // #4313 toggle (PR #5236): the [start – end] coverage span rides the
-        // same flag as the wire tags — default OFF keeps receipts byte-identical
-        // to pre-feature master. Storage still stamps unconditionally; this only
-        // gates the display span.
+        // #4313 toggle (PR #5236; default-on follow-up): the [start – end]
+        // coverage span rides the same flag as the wire tags — default ON; the
+        // opt-out (file `compress.messageTimestamps: false` or env "0") keeps
+        // receipts byte-identical to pre-feature master. Storage still stamps
+        // unconditionally; this only gates the display span.
         const messageTimestampsOn = resolveMessageTimestamps(loadConfigFile().compress);
         const subagentMap = subagentSessionsOf(ctx.session);
         for (const b of changedBlocks) {
