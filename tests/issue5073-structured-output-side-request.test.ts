@@ -52,6 +52,7 @@ test("isStructuredOutputCall: positives — both documented carriers, toolless",
     // Responses-wire carrier: text.format { type }.
     assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: { type: "json_object" } }, input: [{ role: "user", content: "hi" }] }), true, "responses text.format json_object");
     assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: { type: "json_schema", schema: {} } }, input: [{ role: "user", content: "hi" }] }), true, "responses text.format json_schema");
+    assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: { type: "json_object" } } }), true, "responses carrier needs no top-level message array");
 });
 
 test("isStructuredOutputCall: negatives — every veto keeps the request on the main pipeline", () => {
@@ -72,7 +73,6 @@ test("isStructuredOutputCall: negatives — every veto keeps the request on the 
     assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: { type: "text" } }, input: [{ role: "user", content: "hi" }] }), false, "responses text.format with a non-structured type does not match");
     assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: "json_object" }, input: [{ role: "user", content: "hi" }] }), false, "responses text.format as a bare string does not match");
     assert.equal(isStructuredOutputCall({ model: MODEL, text: "json_object", input: [{ role: "user", content: "hi" }] }), false, "text itself is not an object");
-    assert.equal(isStructuredOutputCall({ model: MODEL, text: { format: { type: "json_object" } } }), true, "responses carrier needs no top-level message array");
 });
 
 test("isSideRequest: the structured shape is a side request; intent and #546 still outrank it", () => {
