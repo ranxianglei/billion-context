@@ -1342,10 +1342,12 @@ export class MysqlBackend implements StorageBackend {
      *  entry, then retire the column. */
     private async applyOrphanBlocksOn(c: PoolConnection | Pool, sessionId: string, incomingJson: string | null): Promise<void> {
         const [col] = (await c.query("SELECT orphans_json FROM sessions WHERE session_id = ?", [sessionId])) as unknown as Row[][];
+        const colRaw = col.length > 0 ? col[0].orphans_json : null;
+        const hadColumn = colRaw !== null && colRaw !== undefined;
         const all: Record<string, unknown> = {};
-        if (col.length > 0 && col[0].orphans_json !== null && col[0].orphans_json !== undefined) {
+        if (hadColumn) {
             try {
-                const parsed = JSON.parse(str(col[0].orphans_json)) as unknown;
+                const parsed = JSON.parse(str(colRaw)) as unknown;
                 if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) Object.assign(all, parsed as Record<string, unknown>);
             } catch {
                 /* corrupt journal → start fresh */
@@ -1359,6 +1361,7 @@ export class MysqlBackend implements StorageBackend {
                 /* corrupt incoming → keep existing only */
             }
         }
+        if (Object.keys(all).length === 0 && !hadColumn && incomingJson === null) return; // steady state: nothing to merge, nothing to migrate (PR#6785 review)
         for (const [blockId, view] of Object.entries(all)) {
             const v = view as { one?: unknown; full?: unknown };
             await c.query(
@@ -1367,7 +1370,9 @@ export class MysqlBackend implements StorageBackend {
                 [sessionId, blockId, v.one === undefined ? null : JSON.stringify(v.one), JSON.stringify(v.full)],
             );
         }
-        await c.query("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?", [sessionId]);
+        if (hadColumn) {
+            await c.query("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?", [sessionId]);
+        }
     }
 
     /** #6785 step 7 (MySQL twin of UnifiedStore.getOrphanViews). */

@@ -460,6 +460,59 @@ test("M3.1: the latch roster lists the stuck sids and the clear PERSISTS (surviv
     assert.equal(b.snapR3LatchClear("no-such-sid"), null, "no row → null (the route reports persistedRowCleared=false)");
 });
 
+// #6785 review (fix): the unlatch PLACEHOLDER trap. snapR3LatchWrite can run
+// BEFORE the first stage-0 round — the placeholder row carries
+// ledger_id = sessRaw and witness_probe "" (legitimate rows always carry a
+// hashed probe). For a conversation-bound session the raw id ≠ the ledger
+// sid, so without a self-heal the placeholder would map sessRaw → a
+// DIFFERENT ledger forever and 400 every turn after the operator unlatched.
+test("M3.2: unlatching an R3 LATCH PLACEHOLDER self-heals — the next stage-0 rebinds to the real ledger (no permanent 400)", () => {
+    const p = path.join(hermetic, "m3.2", "index.db");
+    const a = openPlane(p);
+    // Conversation binding: ledger sid "sid-cb" → raw conversation id "conv-cb".
+    const db = (a as unknown as { db: DbLike }).db;
+    db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'conv-cb', 'sid-cb', 0)");
+    // The latch fires on the real sid — the placeholder row is keyed by the
+    // resolved raw id and carries ledger_id = sessRaw (the real sid unknown).
+    a.snapR3Latch("sid-cb");
+    let row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
+    assert.equal(row.ledger_id, "conv-cb", "placeholder: the ledger id IS the raw id (the real sid was unknown at latch time)");
+    assert.equal(row.witness_probe, "", "placeholder: no witness probe yet (legitimate rows always carry a hash)");
+    // The operator unlatches (POST /__bili/snapshot/r3-unlatch {sessRaw}).
+    assert.equal(a.snapR3LatchClear("conv-cb"), "conv-cb");
+    // The next turn: BEFORE the fix this threw FoundationRejectError (red)
+    // forever. Now the placeholder is rebindable — stage-0 succeeds and the
+    // row anchors the REAL ledger.
+    const d = a.snapStage0("sid-cb", ["m1"]);
+    assert.ok(d, "stage-0 completed — no R3 400 after unlatch");
+    row = db.prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?").get("conv-cb") as { ledger_id: string; witness_probe: string };
+    assert.equal(row.ledger_id, "sid-cb", "the placeholder was rebound to the real ledger sid");
+    assert.notEqual(row.witness_probe, "", "the rebased row carries a real witness probe");
+    // And the FOLLOWING round is a clean echo (the mapping is stable now).
+    assert.doesNotThrow(() => a.snapStage0("sid-cb", ["m1"]));
+});
+
+// #6785 review (regression guard for the self-heal): a REAL ledger row
+// (hashed witness probe) under a different sid must STILL hard-400 — the
+// placeholder marker (probe "") is the ONLY rebindable shape.
+test("M3.2b: a REAL ledger mapping still red 400s after unlatch (the self-heal never masks a genuine R3 conflict)", () => {
+    const p = path.join(hermetic, "m3.2b", "index.db");
+    const a = openPlane(p);
+    const db = (a as unknown as { db: DbLike }).db;
+    // Real ledger "s1" (no conversation binding → raw = ledger) issues its
+    // l1 row with a hashed witness probe.
+    assert.equal(a.snapStage0("s1", ["a", "b"]).decision.mode, "issue");
+    // A conversation-bound session whose raw id collides with that ledger.
+    db.exec("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 's1', 's2', 0)");
+    a.snapR3Latch("s2"); // latch write is a no-op on the ledger fields (COALESCE keeps "s1")
+    a.snapR3LatchClear("s1");
+    assert.throws(
+        () => a.snapStage0("s2", ["a", "b"]),
+        (e: unknown) => e instanceof FoundationRejectError && /l1 ledger conflict/.test(String(e)),
+        "genuine conflict (real probe, different ledger) still hard-rejects",
+    );
+});
+
 // ── HTTP e2e (real proxy + fake upstream) ───────────────────────────────────
 
 import http from "node:http";

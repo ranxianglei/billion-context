@@ -968,7 +968,13 @@ export class UnifiedStore {
             if (row && row.one_json === oneJson && row.full_json === fullJson) continue;
             upsert.run(sessionId, blockId, oneJson, fullJson);
         }
-        this.db.prepare("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?").run(sessionId);
+        if (col !== null) {
+            // Only the legacy migration step writes; steady-state columns are
+            // already NULL (PR#6785 review: the unconditional UPDATE made
+            // every ingest a sessions-row writer, contradicting the
+            // steady-state zero-write design).
+            this.db.prepare("UPDATE sessions SET orphans_json = NULL WHERE session_id = ?").run(sessionId);
+        }
         return null;
     }
 
@@ -1727,10 +1733,29 @@ export class UnifiedStore {
         const now = Date.now();
         const l1 = snapL1Record(this.db, sessRaw, sid, this.snapWitnessProbe(sid), now);
         if (l1 === "red") {
-            // Session-level identity conflict (R3): the raw host id maps to a
-            // DIFFERENT ledger. Hard-reject BEFORE any kernel side effect —
-            // snapL1Record wrote nothing on this path.
-            throw new FoundationRejectError(`l1 ledger conflict: sess_raw=${sessRaw} maps to another ledger (R3)`);
+            // PR#6785 review: an R3 LATCH PLACEHOLDER row is not a real
+            // ledger — snapR3LatchWrite created it BEFORE the first stage-0
+            // run with ledger_id = sessRaw (the real sid unknown; legitimate
+            // rows never carry witness_probe "" because snapWitnessProbe
+            // always hashes). After the operator unlatches
+            // (POST /__bili/snapshot/r3-unlatch), the placeholder would keep
+            // mapping sess_raw → a DIFFERENT ledger forever and 400 every
+            // turn for a conversation-bound session (snapSessRawOf(sid) ≠
+            // sid). Rebind it to the real sid instead (the mapping is the
+            // identity anchor; a placeholder is no anchor yet).
+            const row = this.db
+                .prepare("SELECT ledger_id, witness_probe FROM l1_world WHERE sess_raw = ?")
+                .get(sessRaw) as { ledger_id: string; witness_probe: string } | undefined;
+            if (row && row.ledger_id === sessRaw && row.witness_probe === "") {
+                this.db
+                    .prepare("UPDATE l1_world SET ledger_id = ?, witness_probe = ? WHERE sess_raw = ?")
+                    .run(sid, this.snapWitnessProbe(sid), sessRaw);
+            } else {
+                // Session-level identity conflict (R3): the raw host id maps
+                // to a DIFFERENT ledger. Hard-reject BEFORE any kernel side
+                // effect — snapL1Record wrote nothing on this path.
+                throw new FoundationRejectError(`l1 ledger conflict: sess_raw=${sessRaw} maps to another ledger (R3)`);
+            }
         }
         // The gone-set: stored messages whose ids legally vanish from the
         // envelope head because a LIVE fold block covers them (the covered
