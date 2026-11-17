@@ -2560,6 +2560,11 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             for (let j = i + 1; j < recEvents.length; j++) {
                 const f = recEvents[j];
                 if (f.kind === "n") break;
+                // A model-active fold (mode "a") is NOT the answer to a nudge
+                // arm — pairing is nudge-attributed by design (#6729), else the
+                // "not folded" ratchet flag is silently lost when the model
+                // happens to self-compress after a nudge.
+                if (f.mode !== "n") continue;
                 if (paired.has(j)) continue;
                 paired.add(j);
                 recEvents[i].paired = true;
