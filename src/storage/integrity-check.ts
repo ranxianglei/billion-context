@@ -367,6 +367,13 @@ export function unrefIntegrityWorkers(): void {
     }
 }
 
+/** Test seam (#6987): the in-flight worker for dbPath, or undefined when no
+ * background check is running. Lets a test pin the shutdown unref by observing
+ * the worker's ref state (Worker exposes no hasRef() in current Node). */
+export function integrityWorkerForTests(dbPath: string): Worker | undefined {
+    return inflightWorkers.get(dbPath);
+}
+
 // --- test seams ------------------------------------------------------------
 
 let checkRuns = 0;
