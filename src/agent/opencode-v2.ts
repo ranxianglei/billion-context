@@ -50,7 +50,7 @@
 
 import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
+import { opencodeV2MsgIdList, stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { harvestOpencodeMsgIds } from "./opencode-msgids.js";
@@ -406,7 +406,12 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 } catch {
                     forkBody = undefined;
                 }
-                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody });
+                // #6785 owner ruling (2026-11-17): the fork branch point is the
+                // host-msgid prefix — feed the SAME ids the turn stamp sends
+                // (x-bili-msg-ids above), so the child compares against exactly
+                // the ids the parent ledger was pinned with. Unresolvable →
+                // undefined → tryForkAdoption degrades (hash track deleted).
+                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody, msgIds: opencodeV2MsgIdList(e.messages) });
             }
             // #3248 phase 2: incremental-turn divert (native adapters only —
             // the body swap must land after routing/stamping so the marker

@@ -1661,27 +1661,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return;
-            // #6262 principle 1: host msgids for the msgid identity track — the
-            // SAME gates the incremental pin uses (anthropic wire only, every
-            // message content-pinnable, ids aligned to the full wire). A lane
-            // that can't resolve stable ids yields undefined → the byte track
-            // carries the fork (today's behavior). No new validation: laneMsgIdsForWire
-            // is the parity-pinned collector.
+            // #6262 → #6785 owner ruling (2026-11-17): the fork branch point is
+            // the host-msgid prefix, so the ids MUST be the same ones the
+            // ledger was pinned with — reuse the full-resend turn-stamp
+            // collector (openai/anthropic/responses; core-aligned via the
+            // kernel wireIndex proof). It bails to undefined when pairing is
+            // not provable → tryForkAdoption degrades (the hash track is
+            // deleted, so an unresolvable lane simply does not fork).
             const payload = (event as { payload?: unknown } | undefined)?.payload;
-            let forkMsgIds: string[] | undefined;
-            if (payload !== null && typeof payload === "object") {
-                const messages = (payload as { messages?: unknown }).messages;
-                if (wireMessagesLookAnthropic(messages)) {
-                    let branch: unknown;
-                    try {
-                        branch = ctx.sessionManager?.getBranch?.();
-                    } catch {
-                        branch = undefined;
-                    }
-                    const ids = laneMsgIdsForWire(messages, branch);
-                    if (ids !== undefined && ids.length === messages.length && messages.every((m) => lanePinnableContent(m.content))) forkMsgIds = ids;
-                }
-            }
+            const forkMsgIds = payload !== null && typeof payload === "object" ? resolveEnvelopeIdsForFullResend(payload as Record<string, unknown>, ctx) : undefined;
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });
         }
         pi.on("before_provider_request", async (event, ctx) => {

@@ -79,7 +79,15 @@ export function runStage0(opts: Stage0Input): Stage0Result {
         log("debug", `[${sessionId}] [2x2:${lane}] sid is R3-latched — legacy path this turn`);
     }
     let pinned: BiliMessage[] | null = null;
-    if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
+    // #6785 owner ruling (2026-11-17): the pin runs on watermark-hit turns TOO.
+    // The fork lane matches by host msgid against the ledger's rawIds — a
+    // hit turn that skipped the pin wrote h_ rows the child's host ids can
+    // never equal, and such parents are un-forkable by identity. The stamped
+    // array is captured pre-watermark (prepare-openai:83) and aligns to the
+    // FULL view length on hit exactly as on miss, so validation and the pin
+    // are unchanged; only the R3 consequences stay behind the `armed` gate
+    // (armed0 keeps wpHit === undefined — the 2×2 plane arms on full resends).
+    if (pluginMode && incomingMsgIds !== undefined) {
         if (rollout) {
             const v = validateMsgIds(incomingMsgIds, msgs.length);
             if (v.ok) {
