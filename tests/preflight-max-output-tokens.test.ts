@@ -378,13 +378,27 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
             `every model A retry must drop the cap, got ${JSON.stringify(astraSummaries)}`,
         );
 
-        // Same session, different model: preflight must fire again (grown
-        // over-window) and model B's summary keeps the cap.
+        // Same session, different model: the cross-model usage baseline is
+        // demoted (#6430), so the trigger fires on the payload's own estimate
+        // and the #2313 forward-once escape acquires model B's evidence first —
+        // the request forwards WITHOUT folding, no summary on this turn.
         const callsBefore = calls.length;
         const r2 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-standard", longResponsesInput(24));
         assert.equal(r2.status, 200, `second request (model B) must succeed, got ${r2.status}`);
-        const standardSummaries = calls.slice(callsBefore).filter((c) => c.summary);
-        assert.ok(standardSummaries.length >= 1, "second request triggered preflight summaries");
+        assert.ok(calls.slice(callsBefore).length >= 1, "second request reached the upstream");
+        assert.ok(
+            calls.slice(callsBefore).every((c) => !c.summary),
+            `cross-model request must forward once for evidence without folding (#6430 demotion → #2313), got ${JSON.stringify(calls.slice(callsBefore))}`,
+        );
+
+        // Third request (same model, still over-window): the fresh model-B
+        // usage baseline is trusted, preflight folds, and model B's summary
+        // keeps the cap.
+        const callsBefore3 = calls.length;
+        const r3 = await driveResponsesPreflight(proxyPort, upstreamPort, "s663-resp-d", "gpt-6-standard", longResponsesInput(24));
+        assert.equal(r3.status, 200, `third request (model B) must succeed, got ${r3.status}`);
+        const standardSummaries = calls.slice(callsBefore3).filter((c) => c.summary);
+        assert.ok(standardSummaries.length >= 1, "third request triggered preflight summaries");
         assert.ok(
             standardSummaries.every((c) => c.model === "gpt-6-standard" && typeof c.maxOutputTokens === "number" && c.maxOutputTokens <= 32768),
             `model B summaries must keep the output cap (<= 32768; #987 may clamp it), got ${JSON.stringify(standardSummaries)}`,
