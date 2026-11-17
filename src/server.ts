@@ -1569,8 +1569,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // callback stacks on the server and a later successful bind fires ALL
         // accumulated claimOrAnnounce closures at once (double announce,
         // double registration, MaxListenersExceededWarning on long waits).
-        // Only our own callbacks ever use this event.
         server.removeAllListeners("listening");
+        server.on("listening", installProcessHandlers);
         server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
@@ -1719,7 +1719,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Node 20+ aborts the process on these by default. Log loudly and flush.
     let suppressedWriteErrors = 0;
     let suppressedRaceErrors = 0;
-    process.on("uncaughtException", (err) => {
+    const onUncaughtException = (err: Error): void => {
         if (isStreamWriteError(err)) {
             // Belt-and-suspenders for #1233: the logger's own stderr path is
             // guarded and never reaches here; a stream-write error that does
@@ -1744,10 +1744,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             return;
         }
         log("error", `uncaughtException: ${String(err?.stack ?? err)}`);
-    });
-    process.on("unhandledRejection", (reason) => {
+    };
+    const onUnhandledRejection = (reason: unknown): void => {
         log("error", `unhandledRejection: ${String(reason)}`);
-    });
+    };
     // Graceful shutdown: flush all dirty sessions to disk so a restart does
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
@@ -1821,14 +1821,33 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
     engine.lifecycleHooks.requestShutdown = (reason) => shutdown(reason);
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    // Windows never delivers SIGTERM (Node can listen but the kernel won't
-    // raise it). Ctrl+Break (and most service managers / `taskkill` / NSSM)
-    // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
-    if (process.platform === "win32") {
-        process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    const onSigterm = () => shutdown("SIGTERM");
+    const onSigint = () => shutdown("SIGINT");
+    const onSigbreak = () => shutdown("SIGBREAK");
+    let processHandlersInstalled = false;
+    function installProcessHandlers(): void {
+        if (processHandlersInstalled) return;
+        processHandlersInstalled = true;
+        process.on("uncaughtException", onUncaughtException);
+        process.on("unhandledRejection", onUnhandledRejection);
+        process.on("SIGTERM", onSigterm);
+        process.on("SIGINT", onSigint);
+        // Windows service managers deliver SIGBREAK instead of SIGTERM.
+        if (process.platform === "win32") process.on("SIGBREAK", onSigbreak);
     }
+    const removeProcessHandlers = (): void => {
+        if (!processHandlersInstalled) return;
+        processHandlersInstalled = false;
+        process.removeListener("uncaughtException", onUncaughtException);
+        process.removeListener("unhandledRejection", onUnhandledRejection);
+        process.removeListener("SIGTERM", onSigterm);
+        process.removeListener("SIGINT", onSigint);
+        if (process.platform === "win32") process.removeListener("SIGBREAK", onSigbreak);
+    };
+    // A closed embedded server must not retain signal-driven shutdown of the
+    // hosting process. Port-claim retries can close and re-listen this server.
+    installProcessHandlers();
+    server.on("close", removeProcessHandlers);
     // Launcher children have no console and TerminateProcess leaves no room
     // for a flush (#414): they watch the launcher pid and run the graceful
     // path themselves when it disappears (≤2s after the parent exits).
