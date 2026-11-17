@@ -125,7 +125,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -4058,9 +4058,9 @@ export async function preflightCompressIfNeeded(
         // A measured-token tier lives at the gates where a forward is
         // arbitration of a body preflight already tried to shrink: the #1839
         // forward-once arm below, the #3146/#4185 post-fold block further down,
-        // and the egress fuse in relay.ts — not here, where the 400 of a probe
-        // is the designed #2313 evidence (refusal record, model/origin-scoped,
-        // TTL) rather than a guaranteed waste.
+        // and the egress fuse in relay.ts. A probe that the local egress fuse
+        // would block cannot acquire upstream evidence: use the normal fold
+        // path instead, without recording a persistent route refusal.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4079,10 +4079,18 @@ export async function preflightCompressIfNeeded(
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
+        const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
+            ? session.metadata.effectiveContextLimit : 0;
+        const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
+            ? measuredOutbound(prepared) : undefined;
+        const probeBlockedByEgress = probeMeasurement !== undefined
+            && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
+        } else if (probeBlockedByEgress) {
+            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
         } else {
             log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
             return prepared;
