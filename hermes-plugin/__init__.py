@@ -193,21 +193,44 @@ def sidecar_path() -> Path:
     return Path(__file__).resolve().parent / "bili.json"
 
 
+def bundled_dist() -> Optional[Path]:
+    """A host-managed copy of the package: `hermes plugins install` runs npm in this
+    plugin's own directory when its package.json declares billion-context."""
+    dist = Path(__file__).resolve().parent / "node_modules" / "billion-context" / "dist" / "index.js"
+    return dist if dist.is_file() else None
+
+
+def path_dist() -> Optional[Path]:
+    """The reference lane (#1196): the global install's dist, reached through the `bili`
+    entry point on PATH — an executable symlink onto dist/index.js."""
+    exe = shutil.which("bili")
+    if not exe:
+        return None
+    real = Path(os.path.realpath(exe))
+    return real if real.is_file() and real.suffix == ".js" else None
+
+
 def load_sidecar() -> Optional[Dict[str, str]]:
-    """The installer's sidecar: which bili dist + node binary to spawn."""
+    """Which bili dist + node binary to spawn. First hit wins, nothing is ever written:
+    1. bili.json, the sidecar `bili plugin install hermes` drops (reference lane);
+    2. this plugin's node_modules, when the host installed the package itself;
+    3. the global install's dist, via `bili` on PATH."""
     try:
         data = json.loads(sidecar_path().read_text(encoding="utf-8"))
     except Exception:
-        return None
+        data = {}
     if not isinstance(data, dict):
-        return None
-    script = data.get("proxyScript")
+        data = {}
     node = data.get("nodePath") or shutil.which("node")
-    if not script or not isinstance(script, str) or not Path(script).is_file():
-        return None
     if not node or not isinstance(node, str):
         return None
-    return {"script": script, "node": node}
+    script = data.get("proxyScript")
+    if not script or not isinstance(script, str) or not Path(script).is_file():
+        script = ""
+    found = Path(script) if script else (bundled_dist() or path_dist())
+    if found is None:
+        return None
+    return {"script": str(found), "node": node}
 
 
 # — gating --------------------------------------------------------------------
@@ -1211,7 +1234,11 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 # — runtime effects -------------------------------------------------------------
 
 # The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
-_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# The HTTP pair and NO_PROXY are here too, so a plain-http provider is unrouted with the rest.
+_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                    "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+# Loopback stays direct, as the launcher's own plain-http routes do (LAUNCHER_LOOPBACK_NO_PROXY).
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
 
 
 def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
@@ -1231,6 +1258,13 @@ def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = 
                 _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
+        # A plain-http provider base_url (a LAN llama.cpp / vLLM / ollama server) is only routed
+        # by HTTP_PROXY; with the HTTPS pair alone its traffic bypasses the proxy entirely and
+        # the session gets no compression. The proxy forwards absolute-form http requests.
+        os.environ["HTTP_PROXY"] = origin
+        os.environ["http_proxy"] = origin
+        os.environ.setdefault("NO_PROXY", _LOOPBACK_NO_PROXY)
+        os.environ.setdefault("no_proxy", _LOOPBACK_NO_PROXY)
         ca_dir = data_dir() / "ca"
         root = ca_dir / "root-ca.pem"
         if root.is_file():
@@ -1860,8 +1894,9 @@ def register(ctx: Any) -> None:
             return
         sidecar = load_sidecar()
         if not sidecar:
-            logger.warning("billion-context: no usable bili.json sidecar next to the hermes plugin "
-                           "(run `bili plugin install hermes`) — staying inert")
+            logger.warning("billion-context: no bili dist found (no usable bili.json sidecar, no "
+                           "node_modules/billion-context, no `bili` on PATH) — run `bili plugin "
+                           "install hermes` — staying inert")
             return
         # 1) Everything cheap and blocking-free goes in FIRST. The host caps import+register() at
         #    its load deadline (10s) and ABANDONS the load on timeout — every registration made

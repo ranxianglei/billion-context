@@ -180,6 +180,31 @@ async function walkSessionFiles(dir: string): Promise<string[]> {
     return out;
 }
 
+/** Preserve arbitrary basename suffixes, including legacy cross-namespace names.
+ *  Build only when a companion needs matching, and retain disk-walk probe order. */
+function sessionSuffixLookup(files: string[]): (stem: string) => string[] {
+    let index: Array<{ reversed: string; file: string; order: number }> | undefined;
+    const reverse = (name: string): string => name.split("").reverse().join("");
+    return (stem) => {
+        if (!index) {
+            index = files.map((file, order) => ({ reversed: reverse(path.basename(file)), file, order }));
+            index.sort((a, b) => a.reversed < b.reversed ? -1 : a.reversed > b.reversed ? 1 : 0);
+        }
+        const prefix = reverse(stem + ".json");
+        let low = 0;
+        let high = index.length;
+        while (low < high) {
+            const middle = low + Math.floor((high - low) / 2);
+            if (index[middle].reversed < prefix) low = middle + 1;
+            else high = middle;
+        }
+        const matches: typeof index = [];
+        for (let i = low; i < index.length && index[i].reversed.startsWith(prefix); i++) matches.push(index[i]);
+        matches.sort((a, b) => a.order - b.order);
+        return matches.map((entry) => entry.file);
+    };
+}
+
 interface GcResult {
     removed: number;
     kept: number;
@@ -214,6 +239,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         if (f.endsWith(companionSuffix)) companions.push(f);
         else sessionFiles.push(f);
     }
+    const matchingSessions = sessionSuffixLookup(sessionFiles);
     const deletedSessions = new Set<string>();
     const coDeleted = new Set<string>();
     for (const file of sessionFiles) {
@@ -316,9 +342,8 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             // until the twin is swept, then the orphan pass collects them.
             const stem = path.basename(file, ".json");
             let keepCompanion = false;
-            for (const sf of sessionFiles) {
+            for (const sf of matchingSessions(stem)) {
                 if (sf === file || deletedSessions.has(sf)) continue;
-                if (!path.basename(sf).endsWith(stem + ".json")) continue;
                 let twinHasOwnStore = false;
                 try {
                     const s2 = await stat(sf.slice(0, -".json".length) + companionSuffix);
@@ -370,12 +395,10 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         // would false-orphan (delete live store bytes) across that move.
         const stem = path.basename(companion).slice(0, -companionSuffix.length);
         let referenced = false;
-        for (const sf of sessionFiles) {
+        for (const sf of matchingSessions(stem)) {
             if (deletedSessions.has(sf)) continue;
-            if (path.basename(sf).endsWith(stem + ".json")) {
-                referenced = true;
-                break;
-            }
+            referenced = true;
+            break;
         }
         if (referenced) {
             result.kept++;
