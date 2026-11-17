@@ -82,11 +82,13 @@ function sweep(now: number): void {
         let oldestKey: string | undefined;
         let oldestAt = Infinity;
         for (const [laneKey, perLane] of lanes) {
+            let latestAt = -Infinity;
             for (const entry of perLane.values()) {
-                if (entry.at < oldestAt) {
-                    oldestAt = entry.at;
-                    oldestKey = laneKey;
-                }
+                latestAt = Math.max(latestAt, entry.at);
+            }
+            if (latestAt < oldestAt) {
+                oldestAt = latestAt;
+                oldestKey = laneKey;
             }
         }
         if (oldestKey === undefined) break;
@@ -200,8 +202,7 @@ export function learnConversation(laneKey: string, sid: string, boundaryFp: stri
     }
     perLane.set(sid, { sid, boundaryFp, at: now });
     stats.learned++;
-    stats.lanes = lanes.size;
-    stats.sessions = [...lanes.values()].reduce((n, l) => n + l.size, 0);
+    sweep(now);
 }
 
 /**
