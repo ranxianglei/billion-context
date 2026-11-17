@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 process.env.NODE_ENV = "test";
 
-import type { NudgeDecision } from "acp-kernel";
+import type { CompressibleRange, NudgeBreakdown, NudgeDecision } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { _setStoreForTest } from "../src/persist.ts";
 import {
@@ -26,7 +26,14 @@ const s = () => _setStoreForTest(null as never); // no-op store; markDirty only 
 
 type R = { startRef: string; endRef: string };
 
-const ranges = (pairs: Array<[string, string]>): R[] => pairs.map(([startRef, endRef]) => ({ startRef, endRef }));
+const ranges = (pairs: Array<[string, string]>): CompressibleRange[] =>
+    pairs.map(([startRef, endRef]) => ({ startRef, endRef, count: 1, tokens: 100, toolPct: 0, textPct: 100 }));
+
+const breakdown = (o: Partial<NudgeBreakdown> = {}): NudgeBreakdown => ({
+    usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0,
+    growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0,
+    pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0, ...o,
+});
 
 function turn(nudge: Partial<NudgeDecision>): { nudge?: NudgeDecision | null } {
     return { nudge: nudge as NudgeDecision };
@@ -102,7 +109,7 @@ test("applyFoldTaintToTurn: partial taint shrinks the advertised menu, keeps tie
         tier: 1,
         shouldInject: true,
         reason: "growth",
-        breakdown: {},
+        breakdown: breakdown(),
         compressibleRanges: ranges([
             ["m00351", "m00373"],
             ["m00380", "m00500"],
@@ -124,7 +131,7 @@ test("applyFoldTaintToTurn: whole T1 menu tainted → nudge dropped for the roun
         tier: 1,
         shouldInject: true,
         reason: "growth",
-        breakdown: {},
+        breakdown: breakdown(),
         compressibleRanges: ranges([
             ["m00310", "m00340"],
             ["m00350", "m00380"],
@@ -146,7 +153,7 @@ test("applyFoldTaintToTurn: EMERGENCY (rangeless) and T2/T3 (block-id) nudges ar
         tier: 1,
         shouldInject: true,
         reason: "pressure",
-        breakdown: { emergencyOverride: 1 },
+        breakdown: breakdown({ emergencyOverride: 1 }),
         compressibleRanges: ranges([["m00310", "m00320"]]),
     });
     assert.equal(applyFoldTaintToTurn(emergency, session), 0);
@@ -155,7 +162,7 @@ test("applyFoldTaintToTurn: EMERGENCY (rangeless) and T2/T3 (block-id) nudges ar
         tier: 2,
         shouldInject: true,
         reason: "t2",
-        breakdown: {},
+        breakdown: breakdown(),
         compressibleRanges: ranges([["m00310", "m00320"]]),
         tierTargetBlocks: [],
     });
