@@ -603,12 +603,12 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 const x = TX(gp.at);
                 if (gp.pct === null) {
                     // no new growth → mark on the 0% axis (pure older-stock cleanup)
-                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title>");
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title></circle>");
                     return;
                 }
                 const over = gp.pct > 100;
                 if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + GROW + '"/>');
-                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"/><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title>");
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title></circle>");
                 const lx = x + 9 > right - 44 ? x - 9 : x + 9;
                 txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: GROW, anchor: lx < x ? "end" : "start", mono: true });
             });
