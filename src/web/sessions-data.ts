@@ -785,6 +785,10 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
             costUsd: validCostUsd(stats.costUsd),
+            // #5647: the row path must carry the unpriced ledger too — full-mode
+            // list rows (and shadow fresh-row adoption) build summaries from
+            // this projection, not from summaryFromRecord.
+            unpricedTokens: validUnpricedTokens(stats.unpricedTokens),
         },
         metadata,
         state: { blocks },

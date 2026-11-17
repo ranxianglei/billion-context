@@ -27,7 +27,7 @@ process.env.BILI_CONFIG_FILE = path.join(
 );
 
 interface Stats {
-    requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; cacheSamples: number; lastInputTokens: number; contextTokens: number; retrieveCalls: number; retrieveHits: number; retrieveMisses: number; storedBytes: number; storeBytesSaved: number; compressCreditTokens: number; rangeRestores: number; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number;
+    requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; cacheSamples: number; lastInputTokens: number; contextTokens: number; retrieveCalls: number; retrieveHits: number; retrieveMisses: number; storedBytes: number; storeBytesSaved: number; compressCreditTokens: number; rangeRestores: number; wholeBlockRestores?: number; wholeBlockRestoresPreciseAvailable?: number; unpricedTokens?: { input: number; cacheRead: number; cacheWrite: number; output: number };
 }
 
 function zeroStats(): Stats {
@@ -118,6 +118,40 @@ test("#4990 persistence-disabled engine store degrades to file walk (BILI_PERSIS
         assert.ok(ids.includes("has-file"), "envelope-bearing session survives via file walk");
         assert.ok(!ids.includes("fileless"), "row-only session drops while persistence is off (disclosed degradation)");
         assert.equal(_diskScanStatsForTest().decodedTotal, 1, "surviving session served by decoding its file");
+    } finally {
+        _resetDiskCacheForTest();
+        if (prevDir === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevDir;
+        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevMode;
+        rmrf(dir);
+    }
+});
+
+test("#5647 full-mode row path surfaces the unpricedTokens ledger (summaryFromRow)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-4990-unpriced-"));
+    const prevDir = process.env.BILI_SESSIONS_DIR;
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    try {
+        // Full mode + vanished JSON twin: the list row can only come from the
+        // unified-index projection (summaryFromRow), not summaryFromRecord —
+        // the seam where #5647's ledger was first dropped.
+        process.env.BILI_STORAGE_UNIFIED = "full";
+        const seeder = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await seeder.writeNow(makeSession("unpriced-row", { protocol: "openai", title: "Unpriced Row" }, {
+            requests: 2, contextTokens: 300,
+            unpricedTokens: { input: 1_100, cacheRead: 400, cacheWrite: 100, output: 2_000 },
+        }));
+        seeder.closeQuietly();
+        rmSync(path.join(dir, relPathFor("unpriced-row", "openai")), { force: true });
+
+        const engine = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        process.env.BILI_SESSIONS_DIR = dir;
+        _resetDiskCacheForTest();
+        _setStoreForTest(engine);
+
+        const list = await buildSessionList();
+        assert.deepEqual(list.map((s) => s.id), ["unpriced-row"], "row-only session listed from the sidecar");
+        assert.deepEqual(list[0].unpricedTokens, { input: 1_100, cacheRead: 400, cacheWrite: 100, output: 2_000 },
+            "row path carries unpricedTokens exactly like the file-decode path");
     } finally {
         _resetDiskCacheForTest();
         if (prevDir === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevDir;
