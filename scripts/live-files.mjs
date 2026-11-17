@@ -147,6 +147,11 @@ export const LIVE_FILES = [
     // Native-zstd absence is simulated in an isolated Node child; it binds
     // no sockets and changes only that child's built-in module exports.
     "tests/content-encoding-zstd.test.ts",
+    // #7003: the only real child is ONE `node --use-system-ca --import tsx -e`
+    // (linux-only, skipped elsewhere) that reads fixture CAs and prints — no
+    // ports, no network I/O, 10s timeout; the in-process HTTPS rows are
+    // listen(0) — the entry is for the tripwire alone, like #3890/#5114
+    "tests/upstream-ca-default-trust.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
