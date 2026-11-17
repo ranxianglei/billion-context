@@ -521,37 +521,44 @@ export interface RawBodyBreakdown {
      *  fields (telemetry uploads, config scalars) sit in `other` but NOT here.
      *  0 when no promptKeys were supplied to the walk. */
     prompt: number;
+    /** #6844: per-top-level-field token counts inside the `other` bucket,
+     *  descending by tokens — the field dominating `other` is the actionable
+     *  signal in a measured-doom 413 (which host-attached field carries the
+     *  non-prompt mass) without manual arithmetic. Empty when `other` is empty. */
+    otherTop: Array<{ field: string; tokens: number }>;
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlySet<string>): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     let prompt = 0;
-    const pending: [unknown, string | undefined, number, boolean][] = [];
+    const otherByField = new Map<string, number>();
+    const pending: [unknown, string | undefined, number, boolean, string | undefined][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             const isPrompt = promptKeys ? promptKeys.has(k) : false;
-            pending.push([v, k, bucket, isPrompt]);
+            pending.push([v, k, bucket, isPrompt, bucket === 3 ? k : undefined]);
         }
     } else {
-        pending.push([parsed, undefined, 3, false]);
+        pending.push([parsed, undefined, 3, false, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket, isPrompt] = pending.pop()!;
+        const [value, key, bucket, isPrompt, field] = pending.pop()!;
         if (typeof value === "string") {
             if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
                 const t = defaultCountTokens(value);
                 buckets[bucket] += t;
                 if (isPrompt) prompt += t;
+                if (bucket === 3 && field !== undefined) otherByField.set(field, (otherByField.get(field) ?? 0) + t);
             }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket, isPrompt]);
+            for (const item of value) pending.push([item, key, bucket, isPrompt, field]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, isPrompt]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket, isPrompt, field]);
         }
     }
     return {
@@ -561,6 +568,7 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
         system: buckets[2],
         other: buckets[3],
         prompt,
+        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens })).sort((a, b) => b.tokens - a.tokens),
     };
 }
 

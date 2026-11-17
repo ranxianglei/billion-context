@@ -3794,9 +3794,17 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste). #7013: `other` is non-prompt mass (the
-// 413 gate prices messages/tools/system only) — the clause says so.
+// 413 gate prices messages/tools/system only) — the clause says so. #6844:
+// when `other` is non-empty the clause also names the top-level field
+// dominating it, so the operator sees WHICH host-attached field carries the
+// non-prompt mass without manual arithmetic (the incident's 88%-`other` body
+// took a body dump to attribute).
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget)`;
+    const top = b.otherTop[0];
+    const other = b.other > 0 && top
+        ? `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")})`
+        : `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget)`;
+    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · ${other}`;
 }
 
 export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown; protocol: WireProtocol }): MeasuredOutbound | undefined {
