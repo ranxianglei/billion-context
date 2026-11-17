@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultCountTokens } from "acp-kernel";
 import { estimateRawBodyBreakdown, estimateRawBodyTokens, PROMPT_BODY_KEYS } from "../src/preflight.ts";
+import { measuredBreakdownClause } from "../src/server.ts";
 
 // #6038: client-controlled request bodies may nest far beyond safe recursion
 // depth; the raw-body token walks must survive them without changing any
@@ -81,8 +82,71 @@ test("shallow plumbing: exclusion set, key inheritance and bucket split stay int
 
 test("non-object top-level bodies land whole in the other bucket", () => {
     const bd = estimateRawBodyBreakdown("plain string body");
-    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body"), prompt: 0 });
+    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body"), prompt: 0, otherTop: [] });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
+});
+
+// #6844: the `other` bucket is a catch-all — the 413 breakdown must attribute
+// it to the TOP-LEVEL field carrying the mass, so the operator sees which
+// host-attached field is metered without manual arithmetic.
+
+test("#6844: otherTop attributes the other bucket to its top-level fields, descending", () => {
+    const extra = "E".repeat(50_000);
+    const body = {
+        messages: [{ role: "user", content: "hello message" }],
+        model: "deepseek-flash",
+        custom_extension: extra,
+        metadata: { note: "note x" },
+    };
+    const bd = estimateRawBodyBreakdown(body);
+    assert.deepEqual(bd.otherTop, [
+        { field: "custom_extension", tokens: t(extra) },
+        { field: "model", tokens: t("deepseek-flash") },
+        { field: "metadata", tokens: t("note x") },
+    ], "per-field attribution, largest first");
+    assert.equal(bd.otherTop.reduce((sum, e) => sum + e.tokens, 0), bd.other, "otherTop sums to the other bucket");
+});
+
+test("#6844: otherTop inherits the top-level field through nesting", () => {
+    const nested = "N".repeat(1000);
+    const body = {
+        messages: [{ role: "user", content: "hi" }],
+        dsh_session_log: { entries: [{ seq: 1, text: nested }] },
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic);
+    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(nested) }], "only the string leaf counts, attributed to the top-level field");
+    assert.equal(bd.other, bd.otherTop[0]!.tokens);
+});
+
+test("#6844: empty other stays empty; messages/tools/system fields never appear in otherTop", () => {
+    assert.deepEqual(estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }] }).otherTop, []);
+    const bd = estimateRawBodyBreakdown({
+        messages: [{ role: "user", content: "hello" }],
+        tools: [{ name: "n", description: "d" }],
+        system: "s",
+        model: "m",
+    });
+    assert.deepEqual(bd.otherTop, [{ field: "model", tokens: t("m") }], "only the other-bucket field is attributed");
+});
+
+test("#6844: measuredBreakdownClause names the field dominating other", () => {
+    const extra = "E".repeat(50_000);
+    const bd = estimateRawBodyBreakdown({
+        messages: [{ role: "user", content: "hello" }],
+        custom_extension: extra,
+    });
+    const clause = measuredBreakdownClause(bd);
+    assert.match(clause, /other ~[\d,]+ \(non-prompt, excluded from the window budget; top field: custom_extension ~[\d,]+\)/, `the clause must name the dominating field, got: ${clause}`);
+    assert.match(clause, /^messages ~[\d,]+ · tools\[\] ~[\d,]+ · system ~[\d,]+ · other /, "the four-bucket shape is unchanged");
+});
+
+test("#6844: measuredBreakdownClause stays bare when other is empty", () => {
+    const bd = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }] });
+    assert.equal(
+        measuredBreakdownClause(bd),
+        `messages ~${bd.messages.toLocaleString("en-US")} · tools[] ~0 · system ~0 · other ~0 (non-prompt, excluded from the window budget)`,
+        "no top-field suffix when other has nothing to attribute",
+    );
 });
 
 // #7013: the wire-format's PROMPT mass is what a window-fit gate prices.
