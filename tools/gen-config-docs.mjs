@@ -12,6 +12,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SEED_DIR = join(ROOT, "website", "config-reference");
 const MD_EN = join(ROOT, "docs/configuration.md");
 const MD_ZH = join(ROOT, "docs/configuration.zh-CN.md");
+const MD_JA = join(ROOT, "docs/configuration.ja.md");
 const MAIN_JS = join(ROOT, "website", "main.js");
 const DOCS_HTML = join(ROOT, "website", "docs", "index.html");
 const HOME_HTML = join(ROOT, "website", "index.html");
@@ -23,16 +24,16 @@ const JOPEN = (id) => "/* bili:gen " + id + " */";
 const JCLOSE = "/* /bili:gen */";
 
 const GROUPS = [
-  ["core", "Server & core", "服务与核心"],
-  ["upstream", "Upstream & billing", "上游与计费"],
-  ["behavior", "Behavior toggles", "行为开关"],
-  ["mitm", "MITM lane", "MITM 通道"],
-  ["process", "Process & persistence", "进程级配置块"],
-  ["updates", "Updates & advisories", "更新与公告"],
-  ["diagnostics", "Diagnostics & tuning", "诊断与调优"],
-  ["compress", "Compression (global level)", "压缩（全局层级）"],
-  ["providers", "Provider route fields", "路由表字段"],
-  ["envonly", "Environment-only variables", "仅环境变量（无配置文件键）"],
+  ["core", "Server & core", "服务与核心", "サーバー & コア"],
+  ["upstream", "Upstream & billing", "上游与计费", "アップストリーム & 課金"],
+  ["behavior", "Behavior toggles", "行为开关", "挙動トグル"],
+  ["mitm", "MITM lane", "MITM 通道", "MITM レーン"],
+  ["process", "Process & persistence", "进程级配置块", "プロセス & 永続化"],
+  ["updates", "Updates & advisories", "更新与公告", "更新 & アドバイズリー"],
+  ["diagnostics", "Diagnostics & tuning", "诊断与调优", "診断 & チューニング"],
+  ["compress", "Compression (global level)", "压缩（全局层级）", "圧縮（グローバルレベル）"],
+  ["providers", "Provider route fields", "路由表字段", "プロバイダールートフィールド"],
+  ["envonly", "Environment-only variables", "仅环境变量（无配置文件键）", "環境変数のみ（設定ファイルキーなし）"],
 ];
 
 const SITE_GROUPS = [
@@ -110,7 +111,7 @@ function parseSeed(text, file) {
 function validate(entries, file, idMap) {
   for (const e of entries) {
     const ctx = file + ":" + e.key;
-    for (const f of ["type", "default", "group", "desc_en", "desc_zh"]) {
+    for (const f of ["type", "default", "group", "desc_en", "desc_zh", "desc_ja"]) {
       if (typeof e[f] !== "string" || e[f] === "") fail(ctx + ": missing or empty field " + f);
     }
     if (!GROUPS.some((g) => g[0] === e.group)) fail(ctx + ': unknown group "' + e.group + '"');
@@ -161,23 +162,28 @@ function replaceBlock(text, id, body, open, close) {
 
 function genParamRef(entries, lang) {
   const out = [];
-  out.push(
-    lang === "zh"
-      ? "以下索引由 `website/config-reference/*.yaml` 生成——改种子后运行 `node tools/gen-config-docs.mjs generate`，不要手改本区块。"
-      : "This index is generated from `website/config-reference/*.yaml` — edit the seed, then run `node tools/gen-config-docs.mjs generate`; do not hand-edit this block."
-  );
+  if (lang === "zh") {
+    out.push("以下索引由 `website/config-reference/*.yaml` 生成——改种子后运行 `node tools/gen-config-docs.mjs generate`，不要手改本区块。");
+  } else if (lang === "ja") {
+    out.push("以下インデックスは `website/config-reference/*.yaml` から生成 — シードを編集してから `node tools/gen-config-docs.mjs generate` を実行；このブロックを手で編集しないこと。");
+  } else {
+    out.push("This index is generated from `website/config-reference/*.yaml` — edit the seed, then run `node tools/gen-config-docs.mjs generate`; do not hand-edit this block.");
+  }
   out.push("");
-  for (const [gid, enL, zhL] of GROUPS) {
+  for (const [gid, enL, zhL, jaL] of GROUPS) {
     const rows = entries.filter((e) => e.group === gid);
     if (!rows.length) continue;
-    out.push("**" + (lang === "zh" ? zhL : enL) + "**");
+    out.push("**" + (lang === "zh" ? zhL : lang === "ja" ? jaL : enL) + "**");
     out.push("");
-    out.push("| Key | Type | Default | Env | Description |");
+    if (lang === "ja") out.push("| キー | 型 | デフォルト | 環境変数 | 説明 |");
+    else out.push("| Key | Type | Default | Env | Description |");
     out.push("|-----|------|---------|-----|-------------|");
     for (const e of rows) {
-      const dep = e.deprecated === true ? (lang === "zh" ? " _(已弃用)_" : " _(deprecated)_") : "";
+      const dep = e.deprecated === true
+        ? (lang === "zh" ? " _(已弃用)_" : lang === "ja" ? " _(非推奨)_" : " _(deprecated)_")
+        : "";
       const envCol = e.kind === "env-only" ? "—" : e.env && e.env.length ? e.env.join(", ") : "—";
-      const desc = lang === "zh" ? e.desc_zh : e.desc_en;
+      const desc = lang === "zh" ? e.desc_zh : lang === "ja" ? e.desc_ja : e.desc_en;
       const def = lang === "zh" && typeof e.default_zh === "string" ? e.default_zh : e.default;
       out.push("| `" + e.key + "` | " + mdCell(e.type) + " | " + mdCell(def) + " | " + mdCell(envCol) + " | " + mdCell(desc) + dep + " |");
     }
@@ -194,7 +200,9 @@ function genEnvMap(entries, lang) {
   }
   rows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : 1));
   const out = [];
-  out.push(lang === "zh" ? "| 环境变量 | 配置文件键 | 默认值 |" : "| Env var | Config key | Default |");
+  if (lang === "zh") out.push("| 环境变量 | 配置文件键 | 默认值 |");
+  else if (lang === "ja") out.push("| 環境変数 | 設定ファイルキー | デフォルト |");
+  else out.push("| Env var | Config key | Default |");
   out.push("|---------|------------|--------|");
   for (const [n, k, d] of rows) out.push("| `" + n + "` | `" + k + "` | " + mdCell(d) + " |");
   return out.join("\n");
@@ -262,6 +270,11 @@ function writeBlocks(entries) {
   mdZh = replaceBlock(mdZh, "env-map", genEnvMap(entries, "zh"), OPEN("env-map"), CLOSE);
   writeFileSync(MD_ZH, mdZh);
 
+  let mdJa = readFileSync(MD_JA, "utf8");
+  mdJa = replaceBlock(mdJa, "param-ref", genParamRef(entries, "ja"), OPEN("param-ref"), CLOSE);
+  mdJa = replaceBlock(mdJa, "env-map", genEnvMap(entries, "ja"), OPEN("env-map"), CLOSE);
+  writeFileSync(MD_JA, mdJa);
+
   let js = readFileSync(MAIN_JS, "utf8");
   js = replaceBlock(js, "site-dict-en", genSiteDict(entries, "en"), JOPEN("site-dict-en"), JCLOSE);
   js = replaceBlock(js, "site-dict-zh", genSiteDict(entries, "zh"), JOPEN("site-dict-zh"), JCLOSE);
@@ -274,7 +287,7 @@ function writeBlocks(entries) {
   h = replaceBlock(h, "top-list", genTopList(entries, "en"), OPEN("top-list"), CLOSE);
   writeFileSync(DOCS_HTML, h);
 
-  console.log("[gen-config-docs] wrote 10 blocks from " + entries.length + " seed entries");
+  console.log("[gen-config-docs] wrote 12 blocks from " + entries.length + " seed entries");
 }
 
 function dictKeys(slice) {

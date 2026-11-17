@@ -325,6 +325,11 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // wire carries the MCP-prefixed compress reads reachable, same as #3401's
     // bare-name observation on dsh.
     { name: "dsh mcp__bili__compress keeps the surface (#4344 dialect is lane-independent)", lane: "dsh", tools: ["mcp__bili__compress"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #5592: a Codex calling-convention hint does not prove an MCP binding exists.
+    ...["exec", "functions", "functions.exec"].map((name) => ({
+        name: `dsh ${name} alone does not prove compression reachability (#5592)`,
+        lane: "dsh" as const, tools: [name], expect: () => ({ nudge: false, standingPrompt: false }),
+    })),
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {

@@ -129,7 +129,7 @@ test("malformed/empty/oversized successful catalog is forwarded but never rescue
 
 test("temporary HTTP outages recover; a NEGOTIATED 304 revalidation is a complete 200 catalog", async () => {
     const f = createCodexCatalogFetch({ directory: null });
-    await send(f, async () => result());
+    await send(f, async () => result(text, 200, { etag: '"synthetic-v1"' }));
     for (const status of [500, 502, 503, 504]) assert.equal(await (await send(f, async () => result("outage", status))).response.text(), text);
     // The client revalidated (conditional header on the request), so the
     // 304 replays the cached catalog as a full 200.
