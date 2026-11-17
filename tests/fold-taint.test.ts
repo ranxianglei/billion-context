@@ -175,5 +175,8 @@ test("unparseable refs fail open (kept)", () => {
     const session = { id: "t9", metadata: {} } as unknown as Session;
     recordFoldTaintRefusal(session, "m00300..m00400");
     recordFoldTaintRefusal(session, "m00300..m00400");
-    assert.deepEqual(filterTaintedRanges([{ startRef: "b7", endRef: "b9" }] as unknown as R[], session), [{ startRef: "b7", endRef: "b9" }]);
+    // No digit run at all → refNum 0 → the containment check never runs.
+    // (b7/b9 would NOT hit this branch: refNum extracts the first digit run,
+    // so "b7" parses to 7 and is kept by containment, not by fail-open.)
+    assert.deepEqual(filterTaintedRanges([{ startRef: "abc", endRef: "def" }] as unknown as R[], session), [{ startRef: "abc", endRef: "def" }]);
 });
