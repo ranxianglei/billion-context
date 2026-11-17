@@ -28,7 +28,11 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
-    const requestText = JSON.stringify(ctx.messages);
+    const containsEcho = (text: string): boolean => containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || (absorbArmed && containsToolCallEmissionText(text));
+    // Capture request evidence before a yielded proxy tool can change the context.
+    const requestText = absorbArmed && parts.some(part => part && typeof part === "object"
+        && (part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text))
+        ? JSON.stringify(ctx.messages) : undefined;
     for (const part of parts) {
         if (!part || typeof part !== "object") continue;
         const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
@@ -45,7 +49,7 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
         // #1960/KDD#10: a thought part carries a thoughtSignature the client
         // echoes back verbatim — rewriting its text desyncs the signature and
         // bricks replay. Strip prose only from non-thought parts.
-        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text) || (absorbArmed && containsToolCallEmissionText(part.text)))) {
+        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text)) {
             ctx.log(`[tag-echo] stripped: non-stream google output ACP echo (render tags/markers/internal artifacts): ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAcpTags(part.text, absorbArmed, requestText);
         }

@@ -342,6 +342,10 @@ function piRun(
             cwd: ctx.piCwd,
             env: {
                 ...cleanEnv(opts.extraEnv),
+                // Pure-SQLite is the default storage writer now (2026-11-13):
+                // this lane asserts the JSONL session envelopes — pin dual-write
+                // so coverage does not depend on the default.
+                BILI_STORAGE_JSON_WRITER: "1",
                 PI_CODING_AGENT_DIR: ctx.piAgentDir,
                 XDG_CONFIG_HOME: ctx.xdg.config,
                 XDG_CACHE_HOME: ctx.xdg.cache,
