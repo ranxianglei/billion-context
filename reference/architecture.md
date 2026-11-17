@@ -135,6 +135,7 @@ billion-context/
 │   ├── compat-drop.ts            # compat.dropFields validation
 │   ├── codex-compact.ts          # Codex compact mode intercept/pass (knob-resolved)
 │   ├── codex-checkpoint.ts       # dsh-codex-subscription cloud-checkpoint header truth (parse/dedupe/record)
+│   ├── responses-system-sections.ts # Shared developer-section joiner so injected sections never fork the cached prefix (#6922)
 │   ├── codex-models.ts           # Codex bundled model-table snapshot
 │   ├── codex-models-snapshot.json # Bundled codex model table data (openai/codex main snapshot)
 │   ├── registry.ts               # models.dev context-window registry (live-first, snapshot floor)
