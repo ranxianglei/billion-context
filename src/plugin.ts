@@ -3066,13 +3066,13 @@ export async function pipePluginChatWithStrip(
             // proxy lane and the responses wire already take for this
             // condition (they never had this fatal branch).
             if (degenerateTurn === "passthrough") {
-                log?.(`[plugin] degenerate terminal turn again after the retry: passing the empty turn through (compat.degenerateTurn="passthrough", #4913): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}`);
+                log?.(`[plugin] degenerate terminal turn again after the retry: passing the empty turn through (compat.degenerateTurn="passthrough", #4913): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
                 return false;
             }
             // #4913: name the signal that qualified the attempt. The
             // accumulators now measure this attempt only (reset below when the
             // retry takes over), so "again" is measured, not inherited.
-            log?.(`[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}`);
+            log?.(`[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, stalledTail=${stalledTail}, visibleTextChars=${visibleTextChars}, answerChars=${answerChars}, finishReason=${reason}`);
             // #5958: the terminal shape follows the configured streamErrorShape
             // (default protocol → a native error frame the host records as a
             // failure) instead of the old hard-wired completed-turn shape, which
