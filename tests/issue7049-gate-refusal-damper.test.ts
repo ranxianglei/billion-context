@@ -22,7 +22,10 @@ function makeCtx() {
     return { core, config, session };
 }
 
-function compressARange() {
+// Land the base fold (m00001–m00002 → one active block) and hand back the
+// live ctx. The view is left INTACT — tests that refold by ref then
+// decompress + clear it themselves (compressARange).
+function foldFirstRange() {
     const { core, config, session } = makeCtx();
     const msgs: CoreMessage[] = [];
     for (let i = 0; i < 12; i++) {
@@ -40,6 +43,14 @@ function compressARange() {
     assert.match(out, /Compressed m00001–m00002 → 1 block\(s\)/, `compress must succeed: ${out}`);
     const block = [...session.state.blocks].slice(-1)[0]!;
     return { ctx, core, config, session, msgs, block };
+}
+
+function compressARange() {
+    const r = foldFirstRange();
+    resolveDecompress({ blockId: r.block.blockId }, r.ctx as never);
+    r.ctx.messages = [];
+    r.ctx.compressMessages = [];
+    return r;
 }
 
 // A refold summary deliberately longer than the existing one → net delta < 0
@@ -103,6 +114,17 @@ test("#7049: a successful commit clears the gate-refusal damper", () => {
     assert.equal(gateRefusalDamperArmed(session), false, "damper cleared on successful commit");
 });
 
+test("#7049: preflight backstop folds (loopTracking:false) do not feed the damper", () => {
+    const { ctx, session } = compressARange();
+    for (let i = 0; i < 3; i++) {
+        const r = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: GROW_SUMMARY }] }), ctx as never, { loopTracking: false });
+        assert.equal(r.outcome, "refused", `refusal ${i + 1}: ${r.text}`);
+        assert.equal(r.reason, "gate:no-net-shrink");
+    }
+    assert.equal(gateRefusalDamperArmed(session), false, "internal folds never arm the model-loop damper");
+    assert.equal(compressBreakerArmed(session), false, "#2146 breaker also not armed");
+});
+
 test("#7049: gate-refusal damper decays after 10 min quiet", () => {
     const { ctx, session } = compressARange();
     // Simulate a stale streak (11 min old) → reads as disarmed.
@@ -114,15 +136,30 @@ test("#7049: gate-refusal damper decays after 10 min quiet", () => {
     assert.equal(gateRefusalDamperArmed(session), true, "fresh streak (1 min) reads as armed");
 });
 
-test("#7049: coverage-regression refusals also feed the damper", () => {
-    const { ctx, session, block } = compressARange();
-    // Simulate 3 consecutive coverage-regression refusals by writing the
-    // streak directly (the actual path requires a complex fixture with
-    // overlapping blocks that lose coverage).
+test("#7049: coverage-regression refusals also feed the damper (real gate path)", () => {
+    const { ctx, core, session, block } = foldFirstRange();
+
+    // The real #3322 incident shape (same fixture as
+    // tests/issue3322-coverage-regression-guard.test.ts): the kernel hands
+    // back a state in which the NEW block lost every inherited id → the
+    // coverage guard refuses the commit. Driving it through applyRanges pins
+    // the noteGateRefusal feed line on the coverage-regression path.
+    const realApply = core.applyCompression.bind(core);
+    core.applyCompression = (args) => {
+        const out = realApply(args);
+        const beforeIds = new Set(session.state.blocks.map((b) => b.blockId));
+        for (const b of out.state.blocks) {
+            if (!beforeIds.has(b.blockId)) b.effectiveMessageIds = [];
+        }
+        return out;
+    };
+
+    assert.equal(gateRefusalDamperArmed(session), false, "damper starts disarmed");
     for (let i = 1; i <= 3; i++) {
-        session.metadata["compressGateRefusalStreak"] = { n: i, lastAt: Date.now() };
+        const r = applyRanges(parseCompressInput({ content: [{ startId: block.blockId, endId: block.blockId, summary: "Distilled: the initial phase details merged into the running context." }] }), ctx as never);
+        assert.equal(r.outcome, "refused", `refusal ${i}: ${r.text}`);
+        assert.equal(r.reason, "gate:coverage-regression", `refusal ${i} reason: ${r.reason}`);
     }
-    assert.equal(gateRefusalDamperArmed(session), true, "damper arms after 3 coverage-regression refusals (simulated)");
+    assert.equal(gateRefusalDamperArmed(session), true, "damper arms after 3 consecutive coverage-regression refusals");
     assert.equal(compressBreakerArmed(session), false, "#2146 breaker not armed");
-    void block;
 });
