@@ -7,7 +7,7 @@ import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, 
 import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown, PROMPT_BODY_KEYS } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -635,7 +635,10 @@ test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) wi
 test("sideRequestGuard: raw-body fit against declared ∩ armed window minus output headroom (#554)", () => {
     const txt = "z".repeat(8000);
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
-    const est = estimateRawBodyTokens(body);
+    // #7013: the guard prices the wire-format's prompt mass (PROMPT_BODY_KEYS) —
+    // model/max_tokens/stream are non-prompt config scalars, so the reference is
+    // the prompt mass, not the whole-body total.
+    const est = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic).prompt;
     assert.ok(est > 0);
     assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1).blocked, false, "fits");
@@ -647,7 +650,7 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     // reserved. #4205: the reservation policy is passed from the call site —
     // these rows pin the reserving direction explicitly.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
-    const oaEst = estimateRawBodyTokens(oa);
+    const oaEst = estimateRawBodyBreakdown(oa, PROMPT_BODY_KEYS.openai).prompt;
     const oaLimit = Math.floor(oaEst / 1.15);
     const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1, 0, undefined, true);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
@@ -666,13 +669,13 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
         { type: "text", text: "z".repeat(4000) },
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
-    const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
+    const imgEst = estimateRawBodyBreakdown(imgBody, PROMPT_BODY_KEYS.anthropic).prompt + Math.ceil(8000 / 4);
     assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, undefined, 1).blocked, true, "image cost included at boundary");
     // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
     // so a CJK-heavy payload estimated at ~110% of the window must forward —
     // the upstream's real overflow 400 arms the evidence that blocks re-sends.
     const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
-    const cjkEst = estimateRawBodyTokens(cjkBody);
+    const cjkEst = estimateRawBodyBreakdown(cjkBody, PROMPT_BODY_KEYS.anthropic).prompt;
     assert.ok(cjkEst >= 4000, "CJK counted per-char");
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
