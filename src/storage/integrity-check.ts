@@ -259,6 +259,12 @@ function attachWorkerStderr(worker: Worker, dbPath: string): void {
  * defers to the worker's own completion write). */
 const inflight = new Set<string>();
 
+/** In-flight workers keyed by dbPath (#6987: shutdown must not wait for a
+ * worker stuck in a long synchronous PRAGMA quick_check — a 10 GB store's
+ * scan takes ~45 min and the main thread futex-waits on it). Unref'd on
+ * shutdown so the worker does not hold the event loop open. */
+const inflightWorkers = new Map<string, Worker>();
+
 /** Fire-and-forget background quick_check on a second read-only connection
  * (#4609). Records the outcome for the operator's alarms (ok or fail —
  * 2026-10-30 owner policy: background findings are ALARMS ONLY, never
@@ -271,19 +277,12 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
     noteCheckRun();
     let worker: Worker;
     try {
-        // stderr: true — capture the worker's own stderr instead of inheriting
-        // the host terminal (#5940): Node emits "ExperimentalWarning: SQLite is
-        // an experimental feature" once per thread on first node:sqlite use,
-        // and with default stdio that printed straight into the agent's TUI
-        // mid-session. attachWorkerStderr drops only that known notice block;
-        // every other line still reaches loggerLog diagnostics. Node-only:
-        // bun workers expose no capturable stderr (and bun:sqlite emits no
-        // such notice), so nothing is routed there.
         worker = new Worker(WORKER_SOURCE, {
             eval: true,
             workerData: { path: dbPath },
             ...(isBunRuntime() ? {} : { stderr: true }),
         });
+        inflightWorkers.set(dbPath, worker);
         attachWorkerStderr(worker, dbPath);
     } catch (err) {
         inflight.delete(dbPath);
@@ -292,6 +291,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
     }
     const finish = (fn: () => void): void => {
         inflight.delete(dbPath);
+        inflightWorkers.delete(dbPath);
         try {
             fn();
         } finally {
@@ -345,6 +345,18 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
 /** Test seam: true when a background check for dbPath is still running. */
 export function backgroundIntegrityInflightForTests(dbPath: string): boolean {
     return inflight.has(dbPath);
+}
+
+/** #6987: unref every in-flight background quick_check worker so a clean
+ * shutdown can exit without waiting for a worker stuck in a long synchronous
+ * PRAGMA quick_check (a 10 GB store's scan takes ~45 min; the main thread
+ * futex-waits on it and the process never exits until SIGKILL). The next boot
+ * re-scans anyway (no PASS is cached while the check is in flight), so
+ * abandoning the worker here loses nothing. */
+export function unrefIntegrityWorkers(): void {
+    for (const worker of inflightWorkers.values()) {
+        worker.unref();
+    }
 }
 
 // --- test seams ------------------------------------------------------------
