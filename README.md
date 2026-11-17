@@ -45,7 +45,7 @@
 
 ---
 
-> **Cache health at a glance:** a healthy session keeps a **95–97%** prefix-cache hit rate — compression itself costs ≤2%. Sustained lower? Check attribution with `/acp` or `/acp-cache` (see [FAQ](#faq)); usual causes, in order: upstream cache TTL expiry · model switch · a bili bug (please report) · other/unknown.
+> **Cache health at a glance:** a healthy session keeps a **96–99%** prefix-cache hit rate — compression itself costs ≤2%. Sustained lower? Check attribution with `/acp` or `/acp-cache` (see [FAQ](#faq)); usual causes, in order: upstream cache TTL expiry · model switch · a bili bug (please report) · other/unknown.
 
 ## Community
 
@@ -360,7 +360,7 @@ an explicit `HEALTHY` verdict; misses decomposed into new content /
 compress re-pay / upstream-ttl-or-client-rewrite) · **FOLD ECONOMICS** (per-fold
 economics: net tokens saved, paid-back verdicts) · **LINE ITEMS** (anomalies
 only: hit<85% or miss≥5000). Rule of thumb: **compression itself costs ≤2%** —
-a healthy session sits at **95–97%**. When you see less, the attribution tells
+a healthy session sits at **96–99%**. When you see less, the attribution tells
 you which of the usual suspects it was, in this order: ① upstream cache TTL
 expiry (shows up as stable-prefix misses — the top-spikes line names idle
 times), ② a model switch, ③ a bili bug (report it with the page attached),
@@ -501,6 +501,7 @@ bili --host 0.0.0.0           # listen on all interfaces (see host note below)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
+bili -c dsh-test             # named config → ~/.config/billion-context/dsh-test.json (per-model files)
 bili update                  # check & install a newer version now (bypasses throttle)
 bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
@@ -567,7 +568,8 @@ providers, compression tuning, environment variables — lives in
 ### Config file
 
 One JSON document at `~/.config/billion-context/billion-context.json`
-(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`).
+(`$XDG_CONFIG_HOME/billion-context/`; override the path with `BILI_CONFIG_FILE`; a bare name
+selects a sibling file, e.g. `-c dsh-test` → `~/.config/billion-context/dsh-test.json`).
 Precedence when several sources set the same knob: **CLI flag (where one exists) > env var > config file > built-in default** — every env var keeps working as the override tier.
 
 What's inside (details in docs/configuration.md):
