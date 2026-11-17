@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, PROMPT_BODY_KEYS, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -3746,7 +3746,15 @@ export function buildWindowShrinkNote(args: {
 // tokens are charged separately by the caller (they sit in binary-carrying
 // keys the walk excludes by design). Unparseable bodies return undefined —
 // callers keep the byte-floor fallback for them.
+// #7013: the meter prices only the wire-format's PROMPT mass (PROMPT_BODY_KEYS)
+// — what the upstream tokenizer counts against the model window. Non-prompt
+// fields (telemetry uploads like DSH's dsh_session_log, config scalars) ride the
+// wire but consume no window; pricing them made a ~100K-token prompt with an
+// 8 MiB upload field 413. The full-body `total` is still reported in the
+// breakdown for the 413 message, so the operator sees where the mass is.
 interface MeasuredOutbound {
+    /** #7013: the wire-format's prompt mass (PROMPT_BODY_KEYS) — the value the
+     *  window-fit gates compare against the model window. */
     tokens: number;
     breakdown: RawBodyBreakdown;
 }
@@ -3754,12 +3762,13 @@ interface MeasuredOutbound {
 // #5000 item 3: dimension clause for the measured-doom messages — which part
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
-// mass is tools[], not a giant paste).
+// mass is tools[], not a giant paste). #7013: `other` is non-prompt mass (the
+// 413 gate prices messages/tools/system only) — the clause says so.
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget)`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown; protocol: WireProtocol }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
@@ -3769,8 +3778,8 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
             return undefined;
         }
     }
-    const breakdown = estimateRawBodyBreakdown(parsed);
-    return { tokens: breakdown.total, breakdown };
+    const breakdown = estimateRawBodyBreakdown(parsed, PROMPT_BODY_KEYS[prepared.protocol]);
+    return { tokens: breakdown.prompt, breakdown };
 }
 
 export async function preflightCompressIfNeeded(
@@ -4486,15 +4495,18 @@ export async function preflightCompressIfNeeded(
     // the #554 side-request guard's own: it walks every string field of the
     // serialized body (system + tools + arguments + messages, CJK-aware), so
     // unlike the m.text byte floor it sees the mass that actually rides the
-    // wire. Parse failure leaves both readings undefined — the byte-floor
-    // fallbacks stay binding for those bodies.
+    // wire. #7013: it prices only the wire-format's PROMPT mass (PROMPT_BODY_KEYS
+    // for outbound.protocol) — non-prompt fields (telemetry uploads like DSH's
+    // dsh_session_log, config scalars) ride the wire but consume no window, so
+    // they must not doom a fitting prompt. Parse failure leaves both readings
+    // undefined — the byte-floor fallbacks stay binding for those bodies.
     let outboundBudgetTokens: number | undefined;
     let outboundRawTokens: number | undefined;
     let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundBreakdown = estimateRawBodyBreakdown(outBody);
-        outboundRawTokens = outboundBreakdown.total;
+        outboundBreakdown = estimateRawBodyBreakdown(outBody, PROMPT_BODY_KEYS[outbound.protocol]);
+        outboundRawTokens = outboundBreakdown.prompt;
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
         if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
@@ -4524,13 +4536,15 @@ export async function preflightCompressIfNeeded(
         // Images are NOT part of this comparison: an image-dominated overage is
         // the #496/#1800 billing-arbitration domain (forward, let upstream bill
         // or 400 for real evidence), not a doom — #857's screenshot turn pins
-        // that. The #554 meter excludes image payloads (image_url/data/url/...),
-        // so `outboundRawTokens` is text-only by construction.
+        // that. The #554 meter excludes image payloads (image_url/data/url/...)
+        // and, #7013, prices only the wire-format's prompt keys — so
+        // `outboundRawTokens` is prompt-text-only by construction (non-prompt
+        // telemetry uploads like DSH's dsh_session_log never doom here).
         const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
         if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            const measuredDoomMessage = `rebuilt outbound prompt measures ~${outboundRawTokens.toLocaleString("en-US")} tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857; non-prompt fields in the other bucket are excluded from the window budget — #7013) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the prompt ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
@@ -4627,12 +4641,14 @@ export async function preflightCompressIfNeeded(
         // false-refuse a natively-fitting body), the headroom limit as
         // fallback. Measured tier first, byte floor below stays as the
         // fallback for unparseable bodies.
-        // Same text-only rule as the #1839 arm above: image-dominated overage
-        // belongs to the #496/#1800 billing arbitration, never to a local doom.
+        // Same prompt-text-only rule as the #1839 arm above (#7013): image-
+        // dominated overage belongs to the #496/#1800 billing arbitration, and
+        // non-prompt telemetry uploads (DSH's dsh_session_log) never doom a
+        // fitting prompt, never to a local doom.
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
         if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            const measuredDoomMessage = `outbound prompt measures ~${outboundRawTokens.toLocaleString("en-US")} tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857; non-prompt fields in the other bucket are excluded from the window budget — #7013) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the prompt ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
