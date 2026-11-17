@@ -56,7 +56,13 @@ the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
 `snapBase` (P/R lanes only: run the candidate's snapBase egress plane ON in the
 gate's bili.json — `"all"` = every protocol cohort, `"openai,responses,anthropic,google"`
 subset = explicit cohorts, absent/`"off"` = off, byte-identical gate; for
-candidate-branch verification, e.g. #6785), `r.{corpusTokens,window,capRatio,
+candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
+specific harness-script copy, e.g. the bundled `/gate-tools/plugin-lanes.mjs` —
+needed when the candidate checkout predates a harness fix; default is the
+candidate's OWN `scripts/gate/plugin-lanes.mjs`, bundled copy as fallback),
+`snapshotRender` (`"1"` writes `rollout.features.snapshotRender=true` into the
+P/R lane bili.json — config tier, beats the 0% rollout default; plugin-mode
+lanes stay client-authoritative by design), `r.{corpusTokens,window,capRatio,
 cacheRatio}`, `network` (`host` | `bridge`; bridge is the Docker-Desktop
 shape — point the config URLs at `host.docker.internal`), `outDir`, `keep`.
 
@@ -185,8 +191,11 @@ Two known facts:
     turn dies on a ValidationError. The whole lane drops out of the gate; it
     auto-promotes when the client ships the protocol — no script change needed.
 
-Not in the default GATE_AGENTS set; runs only when explicitly listed:
-`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-google,dsh-proxy`.
+Not in the default GATE_AGENTS set — runs only when explicitly listed (e.g.
+`GATE_AGENTS=dsh,dsh-responses,dsh-anthropic,dsh-proxy`): `dsh-responses`,
+`dsh-anthropic`, `dsh-proxy`. `dsh-google` IS in the default set — it degrades
+to CLIENT-BLOCKED and is excluded from the tally when the client can't express
+the protocol, so listing it there costs nothing.
 
 ## Lane flow
 
