@@ -378,7 +378,7 @@ async function forwardCaptured(
 // client socket still open?" — a client that hangs up on the terminal frame
 // (pi's shape) must not lose the finished reply. Partial turns (no terminal)
 // are still never captured.
-const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => true, prepared.protocol) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
