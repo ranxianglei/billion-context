@@ -3,6 +3,7 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { anthropicToCore, canonicalToolArgs, ClusterCounter, deriveCanonicalMessageId, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
 import { markDirty, type Session } from "../session.js";
 import { log as loggerLog } from "../logger.js";
+import { planStoredMessageRow, type HandoffReplyStashRow } from "../storage/ingest.js";
 
 export const HANDOFF_REPLY_MAX_BYTES = 1_500_000;
 
@@ -116,27 +117,33 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
         discard,
         save() {
             if (discarded || !messages.size || session.stats.requests !== request || session.lastMessages !== snapshot || !canSave()) return;
-            // #6947 turn-final write-back: the reply rows historically only
-            // persisted when a LATER request re-sent them (snapshotMessages
-            // replaces lastMessages from the request array), so an idle
-            // session's last turn never reached the store — the web UI kept
-            // showing the previous (stale) reply forever. Append the captured
-            // reply to the snapshot now, with ids derived EXACTLY as the next
-            // codec pass will derive them: the SAME canonical seed the codecs
-            // feed deriveCanonicalMessageId (#3642 — role|contentType with the
-            // toolCallId slot pinned empty, toolName, and canonicalToolArgs for
-            // tool calls; wire toolCallIds are transport plumbing, never
-            // content identity) and the same cluster numbering (Nth occurrence
-            // of the same base, counted in arrival order over the snapshot).
-            // The re-send then JOINs these rows by msg_id+identity (#4390) on
-            // EVERY content type — including tool calls — so the #3133 delta
-            // fast path stays green (no per-tool-call refused-delta + O(n)
-            // full re-ingest + retired-row accumulation on long sessions).
-            // Legacy deriveMessageId (toolCallId slot filled, raw args text)
-            // would only join for plain text/reasoning — superseded.
-            // The #4182 stored-identity guard still makes the worst case
-            // (client round-trip drift) one refused delta + one redundant
-            // full re-ingest — never wrong rows.
+            // #6947 turn-final write-back (direction C — persistence is
+            // separated from the session identity ledger): the reply rows
+            // historically only persisted when a LATER request re-sent them
+            // (snapshotMessages replaces lastMessages from the request
+            // array), so an idle session's last turn never reached the store
+            // — the web UI kept showing the previous (stale) reply forever.
+            // We must NOT append the reply to the snapshot: lastMessages is
+            // the single source of truth for the resident window (digest
+            // parity, web view, fork refs), and the reply's REF is minted by
+            // the kernel only when a request presents it — pushing it here
+            // created a window where fork/snapshot saw a message with no
+            // ref and 409'd (review regression, #6953).
+            // Instead the captured reply is stashed as plan-ready rows in
+            // metadata.handoffReply (persisted → both views digest-equal).
+            // Ids are derived EXACTLY as the next codec pass will derive
+            // them: the SAME canonical seed the codecs feed
+            // deriveCanonicalMessageId (#3642 — role|contentType with the
+            // toolCallId slot pinned empty, toolName, and canonicalToolArgs
+            // for tool calls; wire toolCallIds are transport plumbing, never
+            // content identity) and the same cluster numbering (Nth
+            // occurrence of the same base, counted in arrival order over the
+            // snapshot). The planners turn the stash into trailing
+            // NON-TAIL log rows (never tailSeqs), and the re-send — full or
+            // delta path — JOINs them in place by msg_id+identity (#4390)
+            // on EVERY content type, so the #3133 fast path stays green.
+            // Worst case (client round-trip drift): one refused delta + one
+            // redundant full re-ingest — never wrong rows.
             // Skipped when the snapshot is a bounded folded re-render: its
             // array is a pruned view, not the raw tail the store appends to.
             if (session.lastMessagesFolded !== true && Array.isArray(snapshot)) {
@@ -145,15 +152,26 @@ export function createHandoffReply(session: Session, canSave: () => boolean = ()
                     const b = baseIdOfCore(m);
                     if (b !== null) clusters.next(b);
                 }
+                const rows: HandoffReplyStashRow[] = [];
                 for (const entry of messages.values()) {
                     const m = restampForJoin(protocol, entry.message);
                     const b = baseIdOfCore(m);
                     // b is null only for image-part cores (the #3751 payload
                     // fingerprint lives in sidecars the capture never sets —
-                    // it has no imagePart); keep the synthetic id in that
-                    // unreachable case rather than mint a wrong content id.
-                    snapshot.push({ ...m, id: b !== null ? clusters.next(b) : m.id });
+                    // it has no imagePart). Skip the row in that unreachable
+                    // case: without a content-derived id the row could never
+                    // join the re-send and would only ever be a duplicate —
+                    // the reply then persists on re-send, as pre-#6947.
+                    if (b === null) continue;
+                    rows.push(planStoredMessageRow({ ...m, id: clusters.next(b) }));
                 }
+                // Each turn's save() overwrites the stash; after the re-send
+                // presents the reply as a view row the planner gates it out
+                // by msgId — no explicit consumption needed. The row bytes
+                // duplicate metadata.handoffResponse for one turn (both
+                // bounded by the HANDOFF_REPLY_MAX_BYTES cap) — accepted to
+                // close the idle-persistence gap without touching the view.
+                if (rows.length > 0) session.metadata["handoffReply"] = { request, rows };
             }
             session.metadata.handoffResponse = { request, messages: [...messages.values()].map((entry) => entry.message) };
             markDirty(session);
