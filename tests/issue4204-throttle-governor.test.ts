@@ -50,6 +50,42 @@ function withKnobs(vars: Partial<Record<(typeof KNOB_ENVS)[number], string>>, fn
     }
 }
 
+for (const model of [undefined, "limited-model"]) {
+    for (const retryAfter of [null, "1", "invalid"]) {
+        test(`a later ${model ? "model" : "account"} 429 with Retry-After ${String(retryAfter)} keeps the existing longer hold`, () => {
+            withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "8", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+                _resetUpstreamThrottleForTest();
+                noteUpstreamThrottle429(URL_A, H_CRED_A, "300", T0, model);
+                noteUpstreamThrottle429(URL_A, H_CRED_A, retryAfter, T0 + 1000, model);
+                const hold = activeThrottleHolds()[0]!;
+                assert.equal(hold.nextAttemptAt, T0 + 300_000);
+                assert.equal(hold.streak, 2);
+                const rejected = upstreamThrottleGate(URL_A, H_CRED_A, T0 + 20_000, model).reject;
+                assert.ok(rejected, "concurrent responses must not admit an early provider probe");
+                assert.equal(rejected.status, 429);
+                assert.equal(rejected.retryAfterSec, 280);
+                assert.equal(upstreamThrottleGate(URL_A, H_CRED_B, T0 + 20_000, model).reject, undefined);
+                if (model) assert.equal(upstreamThrottleGate(URL_A, H_CRED_A, T0 + 20_000, "other-model").reject, undefined);
+                const probe = upstreamThrottleGate(URL_A, H_CRED_A, hold.nextAttemptAt, model);
+                assert.equal(probe.reject, undefined);
+                assert.equal(typeof probe.probeToken, "symbol");
+                noteUpstreamThrottleResolved(URL_A, H_CRED_A, 200, hold.nextAttemptAt + 1, model, probe.probeToken);
+                assert.equal(activeThrottleHolds().length, 0);
+            });
+        });
+    }
+}
+
+test("a later HTTP-date Retry-After can extend an existing hold", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "8", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_CRED_A, "30", T0);
+        const deadline = T0 + 120_000;
+        noteUpstreamThrottle429(URL_A, H_CRED_A, new Date(deadline).toUTCString(), T0 + 1000);
+        assert.equal(activeThrottleHolds()[0]!.nextAttemptAt, deadline);
+    });
+});
+
 test("#4204: request model extraction is not limited by the error-body cap", () => {
     const model = "deepseek-v4.1-flash";
     const body = JSON.stringify({ model, messages: [{ content: "x".repeat(20 * 1024) }] });
