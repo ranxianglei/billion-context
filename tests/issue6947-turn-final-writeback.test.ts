@@ -1,41 +1,40 @@
 /**
- * #6947 (direction C — persistence separated from the session identity
+ * #6947 (direction C1 — persistence separated from the session identity
  * ledger): the turn-final reply was captured (handoffResponse) but only
  * written to the store when the NEXT request re-sent the conversation, so an
  * idle session's last reply never reached index.db and the /__bili web UI
  * kept showing the previous reply.
  *
- * Fix (direction C): handoffReply.save() must NOT append the reply to
- * session.lastMessages — that array is the single source of truth for the
- * resident window (digest parity, web view, fork raw/ref check), and the
- * reply's REF is minted by the kernel only when a request presents it.
- * Pushing the reply there created a window where fork/snapshot saw a
- * message with no ref and 409'd (the #6953 regression). Instead:
+ * Fix (direction C1): the reply is stashed as plan-ready rows in
+ * `metadata.handoffReply` — OUTSIDE the messages table, on purpose:
  *
- *  - the captured reply is stashed as plan-ready rows in
- *    metadata.handoffReply (persisted → both views digest-equal), with ids
- *    derived EXACTLY as the next codec pass derives them (SAME canonical
- *    seed the codecs feed deriveCanonicalMessageId, #3642, + cluster
- *    numbering);
- *  - the planners (ingest.ts) turn the stash into trailing NON-TAIL log
- *    rows — never tailSeqs — so the reconstructed view stays equal to the
- *    session file's lastMessages;
- *  - store.ts: the full path joins the re-send onto the stored row by
- *    msg_id+identity and backfills the NULL ref (#6953, NULL only, never
- *    BLOCKED); the delta path (this PR's join extension) joins a stored row
- *    ABOVE the trusted tip in place (keep seq, claim the NULL ref), so the
- *    #3133 fast path stays green across the turn-end → re-send boundary
- *    instead of paying a refused delta + O(n) full re-ingest per turn.
+ *  - `session.lastMessages` is the single source of truth for the resident
+ *    window (digest parity, web view, fork raw/ref check) and the reply's
+ *    REF is minted by the kernel only when a request presents it; appending
+ *    the reply there created a window where fork/snapshot saw a message
+ *    with no ref and 409'd (the original #6953 regression).
+ *  - the messages table's seq space is the ref-ledger substrate: on the
+ *    first fold `persist.maybeRestampToLedger` aligns every live ref onto
+ *    the store row's seq+1 (#4316), so a non-view row interleaved in the
+ *    table would desync every post-fold ref (golden wire drift).
+ *
+ * metadata_json is persisted in BOTH the legacy file and the unified DB,
+ * identical in both views ⇒ digest-equal — so the reply still lands
+ * durably in the database for #6947's "anything reading the DB loses the
+ * turn's final reply" concern, without touching the view, the ledger, or
+ * any wire. A client re-send then persists the reply as a normal view row
+ * (kernel-minted ref) exactly as before #6947.
  *
  * Invariants pinned here:
  *  1. lastMessages is NEVER touched by the write-back (fork invariant);
  *  2. stash ids are byte-identical to what the production codec derives on
- *     re-send → the store join hits and the UNIQUE constraint keeps exactly
- *     one row;
- *  3. cluster numbering matches a full codec pass (repeated reply text);
- *  4. folded snapshots and stale guards suppress the stash too;
- *  5. ref backfill is idempotent and one-directional (NULL → minted only);
- *  6. the delta fast path stays green across turn-end stash + re-send join.
+ *     re-send (DB readers can dedup the stash against view rows by id);
+ *  3. stash row identity equals the planner identity of the re-sent core
+ *     (same join key, should readers ever join them);
+ *  4. cluster numbering matches a full codec pass (repeated reply text);
+ *  5. folded snapshots and stale guards suppress the stash too;
+ *  6. the stash NEVER reaches the messages table: ingests of a session
+ *     carrying the stash produce exactly the view's rows, refs included.
  */
 
 import { test } from "node:test";
@@ -48,7 +47,7 @@ import { canonicalToolArgs, deriveCanonicalMessageId, deriveMessageId, openaiToC
 import { createSession, type Session } from "../src/session.ts";
 import { createHandoffReply } from "../src/server/handoff-response.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
-import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 // Same hermeticity pin as the other storage suites.
@@ -77,9 +76,9 @@ function capturedIds(session: Session): string[] {
     return (session.metadata.handoffResponse as { messages?: CoreMessage[] } | undefined)?.messages?.map((m) => m.id) ?? [];
 }
 
-/** The stashed turn-final reply rows (direction C) decoded back to cores —
+/** The stashed turn-final reply rows (direction C1) decoded back to cores —
  *  row.content is the exact planner serialization, so parsing recovers the
- *  core the store will see. */
+ *  core a re-send would present. */
 function stashCores(session: Session): CoreMessage[] {
     const stash = session.metadata.handoffReply as { rows?: Array<{ msgId: string; content: string }> } | undefined;
     return (stash?.rows ?? []).map((r) => JSON.parse(r.content) as CoreMessage);
@@ -105,7 +104,7 @@ test("turn-final reply is stashed for persistence WITHOUT touching lastMessages 
     assert.equal(session.lastMessages, tail, "lastMessages must stay the exact resident window (invariant 1)");
     assert.equal(messages.length, 1, "the reply must NOT land in lastMessages — the view is the ledger's territory");
     const stashed = stashCores(session);
-    assert.equal(stashed.length, 1, "the reply must be stashed for the store");
+    assert.equal(stashed.length, 1, "the reply must be stashed for the DB");
     const row = stashed[0];
     assert.ok(row, "the stash row must exist");
     assert.equal(row.role, "assistant");
@@ -117,7 +116,7 @@ test("turn-final reply is stashed for persistence WITHOUT touching lastMessages 
     assert.deepEqual(capturedIds(session), ["reply_0"]);
 });
 
-test("a client re-send through the production codec derives the SAME ids (store join stability)", () => {
+test("a client re-send through the production codec derives the SAME ids (join stability)", () => {
     const session = createSession("wb-resend");
     session.lastMessages = convo([{ role: "user", content: "hello" }]);
     withReply(session, "héllo world");
@@ -163,14 +162,12 @@ test("tool calls stash with toolName/toolCallId preserved and id-derivable", () 
     assert.equal(tool.toolCallId, "call_1");
     // Canonical seed (#3642): toolCallId OUT of the id (transport plumbing),
     // args canonicalized. Legacy deriveMessageId (toolCallId slot filled,
-    // raw args) would mint a DIFFERENT id than the re-send codec pass — the
-    // re-send then joins by (msg_id, identity) and the old row is retired,
-    // costing a full re-ingest per tool call on every turn. Pinned here so
-    // the exact-join property cannot regress to that shape.
+    // raw args) would mint a DIFFERENT id than the re-send codec pass.
+    // Pinned here so the exact-match property cannot regress to that shape.
     assert.equal(tool.id, deriveCanonicalMessageId("assistant", "tool-call", canonicalToolArgs("{\"q\":1}"), { toolName: "search" }));
 });
 
-test("a client re-send of a TOOL-CALL reply through the production codec derives the SAME ids (store join stability)", () => {
+test("a client re-send of a TOOL-CALL reply through the production codec derives the SAME ids (join stability)", () => {
     const session = createSession("wb-tool-resend");
     session.lastMessages = convo([{ role: "user", content: "go" }]);
     session.stats.requests = 1;
@@ -198,11 +195,12 @@ test("a client re-send of a TOOL-CALL reply through the production codec derives
  * (id/wireIndex stripped). The raw capture lacks the sidecars the client's
  * re-send codec stamps (openai `reasoningContent` on reasoning cores) and
  * keeps the streamed args verbatim while clients like pi re-serialize them
- * compact — so without restampForJoin the re-send lands a SECOND row for
- * the same logical message: tombstone churn + the content CAS storing the
- * reply bytes twice, on every reply of every turn of a long session.
+ * compact — so without restampForJoin a DB reader deduping the stash
+ * against view rows would miss the match. The stash rows therefore carry
+ * the same restamped bytes the re-send will present, and their identity
+ * equals the planner identity of the re-sent cores.
  */
-test("stash bytes JOIN the client re-send by identity (openai lane: reasoning sidecar + compacted args)", () => {
+test("stash rows JOIN the client re-send by identity (openai lane: reasoning sidecar + compacted args)", () => {
     const argsRaw = '{ "command" : "echo hi" }'; // streamed verbatim (host JSON style)
     const session = createSession("wb-join");
     session.lastMessages = convo([{ role: "user", content: "go" }]);
@@ -227,37 +225,27 @@ test("stash bytes JOIN the client re-send by identity (openai lane: reasoning si
         { role: "tool", tool_call_id: "call_1", content: "hi" },
     ] }).msgs as unknown as CoreMessage[];
 
-    const dir = tmpdir("bili-6947-join-");
-    try {
-        const store = UnifiedStore.open(path.join(dir, "index.db"));
-        try {
-            const user = session.lastMessages![0];
-            // Turn-end save: the view is [user] ONLY; the stash rows land as
-            // non-tail log rows (never tailSeqs), no refs minted yet.
-            assert.equal(store.ingestSession(planIngest(mkLegacy("sjoin", [user], {}, stashMetadata(session)))), true);
-            let rows = store.getMessages("sjoin");
-            assert.equal(rows.length, 4, `user + 3 stash rows (got ${rows.length}: ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.retiredAt ?? "live"]))})`);
-            for (const m of stashed) {
-                const row = rows.find((r) => r.msgId === m.id);
-                assert.ok(row, `stash row for ${m.contentType} must exist after the turn-end save`);
-                assert.equal(row.ref, null, "no ref until the re-send (invariant 2)");
-            }
-            // Next request: the client re-sends the whole turn. The reply
-            // cores must JOIN the stash rows — no second rows, seq stable.
-            assert.equal(store.ingestSession(planIngest(mkLegacy("sjoin", [...convo([{ role: "user", content: "go" }]), ...resent], { [resent[1].id]: "m00002" }, stashMetadata(session)))), true);
-            rows = store.getMessages("sjoin");
-            assert.equal(rows.length, 5, `the re-send must join, not duplicate (got ${rows.length} rows: ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.retiredAt ?? "live"]))})`);
-            for (const m of resent) {
-                const storedRow = rows.find((r) => r.msgId === m.id);
-                assert.ok(storedRow, `re-send core ${m.contentType} must share the stash row's id`);
-            }
-            const turnEndTool = rows.filter((r) => r.msgId === tool.id);
-            assert.equal(turnEndTool.length, 1, "tool-call: exactly one live row after the join");
-        } finally {
-            store.close();
-        }
-    } finally {
-        rmBestEffort(dir);
+    // DB-reader join key: (msgId, identity). The stash must present the SAME
+    // key the planner derives for the re-sent cores — verified by planning a
+    // session whose view IS the re-send (no stash involvement in the planner).
+    const plan = planIngest({
+        id: "sjoinplan",
+        createdAt: 1_000,
+        lastSeen: 2_000,
+        meta: { protocol: "openai" },
+        stats: { requests: 1 },
+        metadata: {},
+        state: { blocks: [], messageRefs: { byRaw: { [resent[1].id]: "m00002" }, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+        blockContents: new Map(),
+        lastMessages: [convo([{ role: "user", content: "go" }])[0], resent[1], resent[2], resent[3]],
+        lastMessagesFolded: false,
+    } as unknown as LegacySessionLike);
+    assert.ok(plan, "planner must accept the re-send view");
+    for (const m of stashed) {
+        const row = plan.messages.find((e) => e.msgId === m.id);
+        assert.ok(row, `re-send view must contain a row for stash msgId ${m.id}`);
+        const stashRow = (stashMetadata(session).handoffReply as { rows: { msgId: string; identity: string }[] }).rows.find((r) => r.msgId === m.id)!;
+        assert.equal(row.identity, stashRow.identity, `stash identity === planner identity for ${m.contentType} (same join key)`);
     }
 });
 
@@ -339,31 +327,26 @@ function turnFinalPair(): { user: CoreMessage; reply: CoreMessage; metadata: Rec
     return { user, reply, metadata: stashMetadata(session) };
 }
 
-test("store: turn-final row lands once, ref backfilled on the re-send ingest (NULL only)", () => {
-    const dir = tmpdir("bili-6947-backfill-");
+/**
+ * #6947 × #4316: the messages table's seq space is the ref-ledger substrate
+ * (on the first fold, live refs are restamped onto row seq+1). The stash
+ * must therefore NEVER materialize as a table row — a stray row would
+ * desync every post-fold ref (golden wire drift). What lands in the DB is
+ * `sessions.metadata_json.handoffReply`; the messages table stays exactly
+ * the view.
+ */
+test("store: the stash never reaches the messages table; the view's rows are exactly the view", () => {
+    const dir = tmpdir("bili-6947-table-");
     try {
         const store = UnifiedStore.open(path.join(dir, "index.db"));
         try {
             const { user, reply, metadata } = turnFinalPair();
-            // Turn-end save: the view is [user]; the stash row lands, its ref
-            // is not minted yet, and it is NOT in tailSeqs (view parity).
+            // Turn end: the session carries the stash in metadata; the
+            // planner must ignore it — table rows == view rows == [user].
             assert.equal(store.ingestSession(planIngest(mkLegacy("s6947", [user], {}, metadata))), true);
             let rows = store.getMessages("s6947");
-            assert.equal(rows.length, 2, "user row + one stash row");
-            const first = rows.find((r) => r.msgId === reply.id);
-            assert.ok(first, "the turn-final row must exist after the turn-end save");
-            assert.equal(first.ref, null);
-
-            // Next request: the client re-sends the tagged reply; the ref is
-            // minted. A full re-ingest joins the stored row and backfills.
-            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947", [user, reply], { [reply.id]: "m00002" }, metadata))), true);
-            rows = store.getMessages("s6947");
-            assert.equal(rows.length, 2, "re-send must not duplicate the turn-final row");
-            const joined = rows.find((r) => r.msgId === reply.id);
-            assert.ok(joined);
-            assert.equal(joined.seq, first.seq, "seq stability (D4-1) across the join");
-            assert.equal(joined.ref, "m00002", "minted ref backfilled into the NULL row");
-            assert.equal(rows.find((r) => r.msgId === user.id)?.ref, null, "unminted rows stay untouched");
+            assert.equal(rows.length, 1, `only the user row may exist (got ${rows.length}: ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.ref ?? "null"]))})`);
+            assert.equal(rows[0].msgId, user.id);
         } finally {
             store.close();
         }
@@ -372,88 +355,47 @@ test("store: turn-final row lands once, ref backfilled on the re-send ingest (NU
     }
 });
 
-test("store: backfill never rewrites an already-stored ref and never writes BLOCKED", () => {
-    const dir = tmpdir("bili-6947-guard-");
+test("store: the re-send lands as a normal view row with the kernel-minted ref", () => {
+    const dir = tmpdir("bili-6947-resend-");
     try {
         const store = UnifiedStore.open(path.join(dir, "index.db"));
         try {
             const { user, reply, metadata } = turnFinalPair();
-            // Ref minted at insert time (the common flow).
-            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947g", [user, reply], { [reply.id]: "m00002" }, metadata))), true);
-            // A later ingest with a different minted ref must NOT rewrite it.
-            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947g", [user, reply], { [reply.id]: "m00009" }, metadata))), true);
-            let row = store.getMessages("s6947g").find((r) => r.msgId === reply.id);
-            assert.equal(row?.ref, "m00002", "stored ref is frozen (index-time projection)");
+            // Next request: the client re-sends the reply; it becomes a
+            // normal view row with the kernel-minted ref — pre-#6947
+            // behavior, no stash involvement.
+            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947r", [user, reply], { [reply.id]: "m00002" }, metadata))), true);
+            const rows = store.getMessages("s6947r");
+            assert.equal(rows.length, 2, `both view rows exist (got ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.ref ?? "null"]))})`);
+            assert.equal(rows.find((r) => r.msgId === reply.id)?.ref, "m00002", "kernel-minted ref lands at insert time");
+            assert.equal(rows.find((r) => r.msgId === user.id)?.seq, 0, "view row seqs stay contiguous (ledger substrate)");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
 
-            // BLOCKED is a byRaw-only token: it must not land in messages.ref.
+test("store: ref backfill never rewrites a stored ref and never writes BLOCKED", () => {
+    const dir = tmpdir("bili-6947-guard-");
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        try {
             const session = createSession("wb-store-blocked");
             session.lastMessages = convo([{ role: "user", content: "install it" }]);
             withReply(session, "blocked reply");
             const u2 = session.lastMessages![0];
             const r2 = stashCores(session)[0];
             const md2 = stashMetadata(session);
-            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947b", [u2], {}, md2))), true);
-            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947b", [u2, r2], { [r2.id]: "BLOCKED" }, md2))), true);
-            row = store.getMessages("s6947b").find((r) => r.msgId === r2.id);
-            assert.equal(row?.ref, null, "BLOCKED must stay out of messages.ref");
-        } finally {
-            store.close();
-        }
-    } finally {
-        rmBestEffort(dir);
-    }
-});
-
-/**
- * #3133 × #6947: the delta fast path must stay green across the turn-end →
- * re-send boundary. Turn end is an equal-length raw delta whose only payload
- * is the stash (non-tail rows); the re-send then presents the reply as a
- * NORMAL tail message that joins the stored stash row in place (seq kept,
- * NULL ref claimed) instead of tripping the strictly-append guard into an
- * O(n) full re-ingest on every turn of every long session.
- */
-test("store: delta fast path survives the turn-end stash save and the re-send join", () => {
-    const dir = tmpdir("bili-6947-delta-");
-    try {
-        const store = UnifiedStore.open(path.join(dir, "index.db"));
-        try {
-            const session = createSession("wb-delta");
-            const u1 = convo([{ role: "user", content: "install it" }])[0];
-            session.lastMessages = [u1];
-            withReply(session, "done: installed");
-            const reply = stashCores(session)[0];
-            const md = stashMetadata(session);
-
-            // Request N (full path primes the watermark at the user row).
-            assert.equal(store.ingestSession(planIngest(mkLegacy("sd", [u1], {}))), true);
-            const boundary = store.probeIngestBoundary("sd", 0);
-            assert.ok(boundary, "watermark probe must find the user row at seq 0");
-
-            // Turn N end: equal-length raw delta, payload = the stash row.
-            const turnEnd = planIngestDelta({ ...(mkLegacy("sd", [u1], {}, md) as object) } as LegacySessionLike, 0, [0], { msgId: boundary.msgId, contentHash: boundary.contentHash }, true, null);
-            assert.ok(turnEnd, "the turn-end save must take the delta fast path (not the full re-ingest)");
-            assert.equal(turnEnd.nonTailCount, 1, "the stash row is the only payload and it is non-tail");
-            assert.deepEqual(turnEnd.tailSeqs, [0], "the stash row must NOT extend tailSeqs (view parity)");
-            assert.equal(store.ingestSession(turnEnd, { trustedSeq: 0, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: [0] }), true, "the turn-end delta must commit");
-            let rows = store.getMessages("sd");
-            assert.equal(rows.length, 2, "user + stash row");
-            assert.equal(rows.find((r) => r.msgId === reply.id)?.ref, null, "still no ref at turn end");
-            const stashSeq = rows.find((r) => r.msgId === reply.id)!.seq;
-
-            // Request N+1: the client re-sends [u1, reply] plus a new user
-            // turn. The reply is a TAIL row now and joins the stored stash
-            // row in place; the new row appends.
-            const u2 = convo([{ role: "user", content: "next" }])[0];
-            const resend = { ...(mkLegacy("sd", [u1, reply, u2], { [reply.id]: "m00002" }, md) as object) } as LegacySessionLike;
-            const resendPlan = planIngestDelta(resend, 0, [0], { msgId: boundary.msgId, contentHash: boundary.contentHash }, true, null);
-            assert.ok(resendPlan, "the re-send must take the delta fast path (join in place, no full re-ingest)");
-            assert.equal(resendPlan.nonTailCount, 0, "the stash is gated out once the reply is a view row");
-            assert.equal(store.ingestSession(resendPlan, { trustedSeq: 0, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: [0] }), true, "the re-send delta must commit");
-            rows = store.getMessages("sd");
-            assert.equal(rows.length, 3, `no duplicate rows after the join (got ${rows.length}: ${JSON.stringify(rows.map((r) => [r.seq, r.msgId, r.ref ?? "null"]))})`);
-            const joined = rows.find((r) => r.msgId === reply.id)!;
-            assert.equal(joined.seq, stashSeq, "the joined row keeps its stored seq");
-            assert.equal(joined.ref, "m00002", "the NULL ref was claimed on the join");
+            // Ref minted at insert time (the common flow).
+            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947g", [u2, r2], { [r2.id]: "m00002" }, md2))), true);
+            // A later ingest presenting the same row under a BLOCKED token
+            // (or any other ref) must NOT rewrite the stored projection:
+            // the backfill only claims NULL refs (#6953 guard).
+            assert.equal(store.ingestSession(planIngest(mkLegacy("s6947g", [u2, r2], { [r2.id]: "BLOCKED" }, md2))), true);
+            const row = store.getMessages("s6947g").find((r) => r.msgId === r2.id)!;
+            assert.equal(row.ref, "m00002", "stored ref is frozen (index-time projection); backfill never rewrites");
         } finally {
             store.close();
         }

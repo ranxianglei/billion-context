@@ -344,13 +344,6 @@ export interface IngestSessionInput {
      *  absolute seqs before insert — see remapPlanSeqs. */
     pluginSnapshotSeqs?: number[] | null;
     tailSeqs?: number[] | null;
-    /** #6947 direction C: count of TRAILING `messages` entries that are
-     *  non-tail log rows (the stashed turn-final reply — in the log, never
-     *  in tailSeqs). The full path ignores it (those rows land like any
-     *  other); the delta path keeps its tail-seq math on the view rows only
-     *  and joins them in place when their row already exists (the client
-     *  re-send presents the reply as a normal tail message). */
-    nonTailCount?: number;
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
@@ -975,80 +968,43 @@ export class UnifiedStore {
                     return false;
                 }
                 // Strictly-append guard: a delta message whose identity
-                // already has a row must not be silently skipped by the
-                // UNIQUE(session_id, msg_id, content_hash) constraint — its
-                // tailSeqs slot would point at nothing and the read view
-                // would drop it. One indexed probe per NEW message.
-                // #6947 direction C narrows "hit" into two classes:
-                //  - hit at/BELOW the trusted tip (seq <= trustedSeq) or a
-                //    retired row → a rewind/redone tail: refuse, full path
-                //    reactivates tombstones and re-dedups (unchanged);
-                //  - hit ABOVE the tip, live → a row this lane stored itself
-                //    without a view slot (the turn-end stash, above the
-                //    watermark): the re-send is ABOUT to present it as a
-                //    normal tail message — JOIN in place (keep the stored
-                //    seq, claim its NULL ref exactly like the full path's
-                //    #6953 backfill). Semantically identical to the full
-                //    path's identity dedup, so the #3133 fast path stays
-                //    green across the turn-end → re-send boundary.
-                const nonTailCount = input.nonTailCount ?? 0;
-                const tailCount = input.messages.length - nonTailCount;
+                // already has a row (rewound/re-derived tail) must not be
+                // silently skipped by the UNIQUE(session_id, msg_id,
+                // content_hash) constraint — its tailSeqs slot would point
+                // at nothing and the read view would drop it. One indexed
+                // probe per NEW message; any hit → full ingest instead.
                 const existingIdentity = this.db.prepare(
-                    "SELECT seq, ref, ref_num, retired_at FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ?",
+                    "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ?",
                 );
-                const joinedSeq = new Map<number, number>();
-                const refClaims: { seq: number; ref: string; refNum: number | null }[] = [];
-                for (let i = 0; i < input.messages.length; i++) {
-                    const m = input.messages[i];
+                for (const m of input.messages) {
                     if (!m.contentHash) return false;
-                    // #4390: join on identity (position-independent).
-                    const hit = existingIdentity.get(
-                        s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content),
-                    ) as { seq: number; retired_at: number | null } | undefined;
-                    if (hit) {
-                        if (Number(hit.seq) <= delta.trustedSeq || hit.retired_at !== null && hit.retired_at !== undefined) return false;
-                        joinedSeq.set(i, Number(hit.seq));
-                        if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null) {
-                            refClaims.push({ seq: Number(hit.seq), ref: m.ref, refNum: m.refNum });
-                        }
-                        continue;
-                    }
+                    // #4390: join on identity (position-independent). Retired
+                    // rows count as existing — a rewind-redo falls back to the
+                    // full path, which reactivates the tombstone in place.
+                    if (existingIdentity.get(s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content))) return false;
                 }
-                if (refClaims.length > 0) {
-                    const claim = this.db.prepare(
-                        "UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL",
-                    );
-                    for (const c of refClaims) claim.run(c.ref, c.refNum, s.sessionId, c.seq);
-                }
-                // Placeholder→absolute renumber: JOINED rows keep their stored
-                // seq (the re-send's tailSeqs slot points at the row the
-                // turn-end save already wrote); the rest anchor at the
-                // CURRENT max(seq)+1 (re-read inside this transaction) so slot
-                // collisions are structurally impossible — identical to the
-                // full path's nextSeq discipline, and it keeps the delta valid
-                // even when a fold left rows above the trusted tip.
-                let nextSeq = probe.maxSeq + 1;
-                messages = input.messages.map((m, i) => {
-                    const kept = joinedSeq.get(i);
-                    return kept !== undefined ? { ...m, seq: kept } : { ...m, seq: nextSeq++ };
-                });
-                // tailSeqs math runs on the VIEW rows only — trailing stash
-                // rows (if any) have no view slot by construction.
-                const tailRows = messages.slice(0, tailCount);
+                // Placeholder→absolute renumber: the plan emitted
+                // watermark+1.. under the aligned assumption; anchoring at
+                // the CURRENT max(seq)+1 (re-read inside this transaction)
+                // is what makes slot collisions structurally impossible —
+                // identical to the full path's nextSeq discipline, and it
+                // keeps the delta valid even when a fold left rows above
+                // the trusted tip.
+                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
                 const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
                 // Defense: the plan's tailSeqs prefix must be exactly the
                 // trusted prefix the watermark read produced (same-tick by
                 // construction; disagreement means a stale plan).
                 const prefixOk =
                     Array.isArray(tail.tailSeqs) &&
-                    tail.tailSeqs.length === delta.trustedTailSeqs.length + tailRows.length &&
+                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
                     delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
                 if (!prefixOk) return false;
                 s.tailJson = JSON.stringify({
                     ...tail,
-                    tailSeqs: [...delta.trustedTailSeqs, ...tailRows.map((m) => m.seq)],
+                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
                 });
-                watermark = tailRows.length > 0 ? tailRows[tailRows.length - 1].seq : delta.trustedSeq;
+                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
             } else {
                 const full = this.remapPlanToAbsolute(input);
                 messages = full.messages;
