@@ -194,10 +194,6 @@ const WORDINGS: Record<Exclude<Personality, "lenient" | "strict" | "openrouter">
     tamper: "Invalid signature: thinking blocks cannot be modified",
 };
 
-// #6988 — OpenRouter's full 400 envelope for a signature-less thinking block
-// (the Zod complaint rides inside metadata.raw, path ending in "signature").
-const OPENROUTER_ZOD_BODY = OPENROUTER_ZOD;
-
 function bodyHasUnsignedThinking(raw: string): boolean {
     try {
         const p = JSON.parse(raw) as Record<string, unknown>;
@@ -248,17 +244,20 @@ async function startRig(): Promise<Rig> {
                 case "mandatory-thinking":
                     rejectWith(WORDINGS["mandatory-thinking"]);
                     break;
-                    case "tamper":
-                        rejectWith(WORDINGS.tamper);
-                        break;
-                    case "openrouter":
-                        if (bodyHasUnsignedThinking(raw)) {
-                            res.writeHead(400, { "content-type": "application/json" });
-                            res.end(OPENROUTER_ZOD_BODY);
-                        }
-                        break;
-                    default:
-                        break;
+                case "tamper":
+                    rejectWith(WORDINGS.tamper);
+                    break;
+                case "openrouter":
+                    // #6988 — OpenRouter's full 400 envelope for a signature-less
+                    // thinking block (the Zod complaint rides inside metadata.raw,
+                    // path ending in "signature").
+                    if (bodyHasUnsignedThinking(raw)) {
+                        res.writeHead(400, { "content-type": "application/json" });
+                        res.end(OPENROUTER_ZOD);
+                    }
+                    break;
+                default:
+                    break;
             }
             if (res.writableEnded) return;
             res.writeHead(200, { "content-type": "text/event-stream" });
