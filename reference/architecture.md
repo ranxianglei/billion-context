@@ -19,7 +19,7 @@ billion-context/
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── handle.ts             #   Proxy request pipeline (route triage, compat relay, compress orchestration) (#1440 P2 cut 3)
-│   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots
+│   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots; turn-final reply stashed in metadata.handoffReply for durable DB persistence (never lastMessages/messages table — the view is the ref-ledger's territory, #6947)
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
 │   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
@@ -28,6 +28,7 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── rejection-diagnostics.ts #   Bounded terminal-cause diagnostic for a relayed upstream rejection: one nested attempts[].details.error.message, scrubbed + bounded, appended to the relay log line (#4452)
 │   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
 │   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
@@ -183,6 +184,7 @@ billion-context/
 │   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
+│   ├── toml-integer.ts           # Shared strict TOML integer reader for model token limits
 │   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)
 │   ├── plugin-install.ts         # `bili plugin install` driving host channels
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)
@@ -288,6 +290,7 @@ billion-context/
 │   ├── notice-store.ts           # Notice dismissal receipts in unified kv_store, legacy file fallback (#5548)
 │   ├── notices.ts                # Built-in notice registry: activity predicates + i18n key table (#5548)
 │   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
+│   ├── nudge-debug.ts            # Nudge-injection bus: mirrors the exact wire nudge text to the pi lane's debug terminal notify (transient, never in LLM context, never persisted)
 │   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
 │   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
 │   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)
@@ -301,6 +304,7 @@ billion-context/
 │   ├── remote-notices.ts         # Remote announcement feed watcher: fail-open polling, last-known-good snapshot (#5548)
 │   ├── request-membership.ts     # Settle-side membership probe: is this usage report ours (#4805)
 │   ├── resolver-wedge.ts         # Persistent local DNS resolver wedge detector + alarm (#5221)
+│   ├── responses-system-sections.ts # Single source of truth for the Responses-wire developer-section join: steady prepare + round-2 rebuild share one separator (#6922)
 │   ├── responses-tool-output.ts  # Responses tool-output image parts: projection + patch helpers
 │   ├── rollout.ts                # Feature rollout: per-install uuid, basis-point buckets, nested cohorts (#3062)
 │   ├── runaway-guard.ts          # Intrinsic stream terminator for runaway tag/codepoint enumeration (#2346)

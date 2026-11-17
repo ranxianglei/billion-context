@@ -168,3 +168,60 @@ test("a corrupt small store still fails open synchronously and writes no ok-cach
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test("malformed verdict records are cache misses", () => {
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath);
+        store.close();
+        const valid = readIntegrityCache(dbPath);
+        assert.ok(valid !== null);
+        const malformed: unknown[] = [
+            null,
+            [],
+            { v: 1, ok: true },
+            { ...valid, db: null },
+            { ...valid, db: [] },
+            { ...valid, db: { ...valid.db, s: -1 } },
+            { ...valid, db: { ...valid.db, s: "0" } },
+            { ...valid, db: { ...valid.db, m: null } },
+            { ...valid, wal: {} },
+            { ...valid, wal: { s: 1, m: "today" } },
+            { ...valid, schema: "11" },
+            { ...valid, at: null },
+            { ...valid, detail: {} },
+        ];
+        for (const value of malformed) {
+            writeFileSync(integrityCachePath(dbPath), JSON.stringify(value));
+            assert.equal(readIntegrityCache(dbPath), null, JSON.stringify(value));
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a damaged verdict cache cannot prevent a healthy store from reopening", () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath);
+        store.setKv("test", "kept", { message: "still here" });
+        store.close();
+        const before = integrityCheckRunsForTests();
+        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ v: 1, ok: true, db: null }));
+
+        const again = UnifiedStore.open(dbPath);
+        try {
+            assert.deepEqual(again.getKv("test", "kept"), { message: "still here" });
+            assert.equal(integrityCheckRunsForTests(), before + 1);
+        } finally {
+            again.close();
+        }
+        assert.equal(readIntegrityCache(dbPath)?.ok, true);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
