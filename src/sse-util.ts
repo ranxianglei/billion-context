@@ -30,3 +30,52 @@ export function finalizeSseLineEndings(buf: string): string {
     if (buf.indexOf("\r") === -1) return buf;
     return buf.replace(/\r\n|\r/g, "\n");
 }
+
+/** Data fields of one already-framed, LF-normalized SSE event form ONE
+ * payload, joined by LF. Remove only the optional first space after `:`;
+ * indentation and empty fields are part of the payload. */
+export function sseEventData(frame: string): string | null {
+    const parts: string[] = [];
+    for (const line of frame.split("\n")) {
+        if (line === "data") parts.push("");
+        else if (line.startsWith("data:")) parts.push(line.slice(5).replace(/^ /, ""));
+    }
+    return parts.length > 0 ? parts.join("\n") : null;
+}
+
+/** Replace the complete payload while preserving event/id/retry/comments.
+ * Call only when an event needs rewriting; unedited frames stay verbatim. */
+export function replaceSseEventData(frame: string, data: string): string {
+    const out: string[] = [];
+    let replaced = false;
+    for (const line of frame.split("\n")) {
+        if (line === "data" || line.startsWith("data:")) {
+            if (!replaced) for (const part of data.split("\n")) out.push(`data: ${part}`);
+            replaced = true;
+        } else out.push(line);
+    }
+    return out.join("\n");
+}
+
+/** Read buffered SSE event payloads. Multiple data fields belong to ONE
+ *  event and are joined with LF before a consumer parses JSON. Keep the final
+ *  residual available: callers retain their own framing/terminal validity
+ *  checks (Responses may trust a completed terminal without a blank line). */
+export function* bufferedSseEvents(text: string): Generator<{ event: string; data: string }> {
+    let event = "";
+    let data: string[] = [];
+    for (const line of finalizeSseLineEndings(text).split("\n")) {
+        if (line === "") {
+            if (data.length) yield { event, data: data.join("\n") };
+            event = "";
+            data = [];
+        } else {
+            const colon = line.indexOf(":");
+            const field = colon < 0 ? line : line.slice(0, colon);
+            const value = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "");
+            if (field === "event") event = value;
+            else if (field === "data") data.push(value);
+        }
+    }
+    if (data.length) yield { event, data: data.join("\n") };
+}

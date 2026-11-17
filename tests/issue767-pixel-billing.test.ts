@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
+import { Jimp } from "jimp";
 
 process.env.NODE_ENV = "test";
 
@@ -61,6 +62,20 @@ function bmpB64(w: number, h: number): string {
     b.writeUInt32LE(40, 14);
     b.writeInt32LE(w, 18);
     b.writeInt32LE(h, 22);
+    return b.toString("base64");
+}
+
+function bmpCoreB64(w: number, h: number): string {
+    const stride = Math.ceil(w * 3 / 4) * 4;
+    const b = Buffer.alloc(26 + stride * h);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(b.length, 2);
+    b.writeUInt32LE(26, 10);
+    b.writeUInt32LE(12, 14);
+    b.writeUInt16LE(w, 18);
+    b.writeUInt16LE(h, 20);
+    b.writeUInt16LE(1, 22);
+    b.writeUInt16LE(24, 24);
     return b.toString("base64");
 }
 
@@ -145,11 +160,69 @@ test("#767 unit: decodeImageDims parses container headers without full decode", 
     assert.equal(decodeImageDims(Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64")), undefined, "truncated header → fallback");
 });
 
+for (const before of ["APP0", "SOF0"] as const) {
+    test(`JPEG marker fill before ${before} retains dimensions and pixel billing`, async () => {
+        const original = await new Jimp({ width: 40, height: 24, color: 0x123456ff }).getBuffer("image/jpeg");
+        const offset = before === "APP0" ? 2 : original.findIndex((byte, i) => byte === 0xff && original[i + 1] === 0xc0);
+        assert.ok(offset >= 2);
+        // T.81 B.1.1.2 allows FF fill bytes before any marker. Keep the
+        // encoded image intact, adding one or several bytes at that boundary.
+        const padded = Buffer.concat([original.subarray(0, offset), Buffer.alloc(before === "APP0" ? 1 : 3, 0xff), original.subarray(offset)]);
+        const decoded = await Jimp.read(padded);
+        assert.equal(decoded.bitmap.width, 40, "independent full decoder accepts the padded JPEG");
+        assert.equal(decoded.bitmap.height, 24);
+        const b64 = padded.toString("base64");
+        assert.deepEqual(decodeImageDims(b64), { w: 40, h: 24 });
+        const body = { input: [{ role: "user", content: [{ type: "input_image", image_url: `data:image/jpeg;base64,${b64}` }] }] };
+        assert.equal(imageTokensInParsedBody("responses", body, "pixels"), pixelTileEstimate(40, 24), "legal marker fill must not trigger the 16K fallback");
+        assert.deepEqual(decodeImageDims(original.toString("base64")), { w: 40, h: 24 }, "ordinary marker parsing is unchanged");
+    });
+}
+
+test("JPEG fill without a complete frame header still falls back within the scan budget", () => {
+    const onlyFill = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(300_000, 0xff)]);
+    assert.equal(decodeImageDims(onlyFill.toString("base64")), undefined);
+    const truncatedSof = Buffer.from([0xff, 0xd8, 0xff, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00]);
+    assert.equal(decodeImageDims(truncatedSof.toString("base64")), undefined);
+});
+
 test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", () => {
     assert.equal(pixelTileEstimate(100, 100), 765, "small square scales up to 768×768 = 4 tiles");
     assert.equal(pixelTileEstimate(2048, 2048), 2805, "max-size square = 16 tiles (the ceiling)");
     assert.equal(pixelTileEstimate(3584, 1024), 1445, "long side capped at 2048 → 4×2 tiles");
     assert.equal(pixelTileEstimate(1000, 200), 765, "double scale: up short side, then cap long side");
+});
+
+test("BMP core headers use 16-bit dimensions without reading plane/depth fields as height", () => {
+    assert.deepEqual(decodeImageDims(bmpCoreB64(64, 128)), { w: 64, h: 128 });
+    assert.deepEqual(decodeImageDims(bmpCoreB64(1, 1)), { w: 1, h: 1 });
+});
+
+test("BMP core dimensions and billing match an independently encoded image", () => {
+    // ImageMagick 7.1.1-43: magick -size 1x2 xc:black BMP2:core.bmp
+    const b64 = "Qk0iAAAAAAAAABoAAAAMAAAAAQACAAEAGAAAAAAAAAAAAA==";
+    assert.deepEqual(decodeImageDims(b64), { w: 1, h: 2 });
+    const body = { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/bmp;base64,${b64}` } }] }] };
+    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), pixelTileEstimate(1, 2));
+});
+
+test("BMP core pixel billing uses the actual aspect ratio", () => {
+    const b64 = bmpCoreB64(64, 128);
+    const body = { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/bmp;base64,${b64}` } }] }] };
+    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), pixelTileEstimate(64, 128));
+});
+
+test("BMP info headers reject negative width while preserving top-down height", () => {
+    assert.equal(decodeImageDims(bmpB64(-640, 480)), undefined);
+    assert.deepEqual(decodeImageDims(bmpB64(640, -480)), { w: 640, h: 480 });
+});
+
+test("BMP headers with an unsupported layout or zero dimensions use the fallback", () => {
+    const unsupported = Buffer.from(bmpB64(640, 480), "base64");
+    unsupported.writeUInt32LE(13, 14);
+    assert.equal(decodeImageDims(unsupported.toString("base64")), undefined);
+    assert.equal(decodeImageDims(bmpCoreB64(0, 128)), undefined);
+    assert.equal(decodeImageDims(bmpCoreB64(64, 0)), undefined);
 });
 
 test("#767 unit: resolveImageBilling — explicit bytes wins, everything else resolves to pixels (#1843)", () => {

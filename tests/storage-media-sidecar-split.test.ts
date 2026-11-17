@@ -125,3 +125,36 @@ test("#4069: small payloads (<2 KiB) stay inline — no CAS row, no join", () =>
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test("many distinct sidecar payloads retain first-seen order, deduplication and byte-exact hydration", () => {
+    const payloads = Array.from({ length: 512 }, (_, i) => {
+        const prefix = Buffer.alloc(6);
+        prefix.writeUInt32BE(i, 2);
+        return prefix.toString("base64") + "A".repeat(2040);
+    });
+    const original = JSON.stringify({
+        id: "m00001",
+        role: "user",
+        contentType: "text",
+        text: "many images",
+        imageBase64: payloads[17],
+        rawOpenaiContentParts: [...payloads, payloads[0], payloads[17], payloads[511]].map((payload) => ({
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${payload}` },
+        })),
+    });
+    const dir = mkdtempSync(join(tmpdir(), "msp-many-"));
+    const store = UnifiedStore.open(join(dir, "index.db"));
+    try {
+        const plan = planIngest(sessionOf("media-split-many", [JSON.parse(original)]));
+        const entry = plan.messages[0];
+        const expected = [payloads[17], ...payloads.filter((_, i) => i !== 17)];
+        assert.deepEqual(entry.media?.map((m) => m.hash), expected.map(sha256));
+        assert.deepEqual(entry.media?.map((m) => m.bytes), expected);
+        store.ingestSession(plan);
+        assert.equal(store.getMessages("media-split-many")[0].content, original);
+    } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});

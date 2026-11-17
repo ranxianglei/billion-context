@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
 import { vertexEnabled } from "./vertex.js";
+import { nonNegativeTomlInteger } from "./toml-integer.js";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
@@ -720,7 +721,7 @@ export function parseCodexToml(text: string): CodexConfig {
             continue;
         }
         const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(line);
         if (strMatch) {
             const key = strMatch[1];
             const val = strMatch[2] !== undefined ? strMatch[2] : strMatch[3];
@@ -733,9 +734,11 @@ export function parseCodexToml(text: string): CodexConfig {
                 result.providers[curProvider].baseUrl = val;
             }
         } else if (numMatch && table === "") {
-            if (numMatch[1] === "model_context_window") codexContextWindow = Number(numMatch[2]);
-            else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = Number(numMatch[2]);
-            else if (numMatch[1] === "model_max_output_tokens") codexMaxOutput = Number(numMatch[2]);
+            const numVal = nonNegativeTomlInteger(numMatch[2]);
+            if (numVal === undefined) continue;
+            if (numMatch[1] === "model_context_window") codexContextWindow = numVal;
+            else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = numVal;
+            else if (numMatch[1] === "model_max_output_tokens") codexMaxOutput = numVal;
         }
     }
     if (codexModel) result.model = codexModel;
@@ -1079,11 +1082,11 @@ export function parseKimiToml(text: string): KimiConfig {
             continue;
         }
         const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(line);
         if (!strMatch && !numMatch) continue;
         const key = (strMatch ?? numMatch)![1];
         const strVal = strMatch ? (strMatch[2] !== undefined ? strMatch[2] : strMatch[3]) : undefined;
-        const numVal = numMatch ? Number(numMatch[2]) : undefined;
+        const numVal = numMatch ? nonNegativeTomlInteger(numMatch[2]) : undefined;
         if (parts.length === 0) {
             if (key === "default_model" && strVal !== undefined) result.defaultModel = strVal;
         } else if (parts[0] === "providers") {

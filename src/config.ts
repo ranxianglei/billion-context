@@ -544,6 +544,18 @@ export type CompressSettings = {
          *  old behavior of marking any result ≥ minToolTokens. */
         mediaOnly?: boolean;
     };
+    /** [#5765] Block-lifecycle tools (kernel `Config.blockOps`,
+     *  acp-kernel >= 0.0.194): acp_retire / acp_restore move compressed
+     *  blocks out of (back into) the resident view; acp_rewrite replaces a
+     *  block's stored summary with supplied text. When `enabled` the three
+     *  tools are advertised, injected and prompted for; when off (default)
+     *  they are absent from every surface and a stray call gets a
+     *  "not enabled" receipt. Off unless explicitly enabled at some level.
+     *  Merged sub-field-wise across the three levels like `absorb`. */
+    blockOps?: {
+        /** Enable the block-lifecycle tools for this scope. Absent/false = off. */
+        enabled?: boolean;
+    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -1938,6 +1950,13 @@ export interface PiSubagentsFileConfig {
     /** "skip" (default) — suppress the completion notification when the
      *  model already read the result file; "always" — always inject. */
     notifyIfRead?: "skip" | "always";
+    /** Deliver acp_delegate notifications as a typed custom message carrying a
+     *  versioned details envelope (run identity + launch provenance) alongside
+     *  the SAME model-visible text, so third-party UIs tie a notice to its
+     *  launching turn without parsing prose (#5750). Default false — plain
+     *  user-message delivery, byte-identical to before; hosts without
+     *  ExtensionAPI.sendMessage fall back to the plain path automatically. */
+    notifyStructured?: boolean;
     /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
      *  disables keyboard registration (/acp-fleet still works). */
     fleetShortcut?: string;
@@ -2546,7 +2565,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
@@ -3421,6 +3440,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.absorb = cleaned;
+        }
+    }
+    if ("blockOps" in obj && obj.blockOps !== undefined) {
+        const b = obj.blockOps;
+        if (!b || typeof b !== "object" || Array.isArray(b)) {
+            ok = false;
+        } else {
+            const bo = b as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["blockOps"]> = {};
+            for (const key of ["enabled"] as const) {
+                if (!(key in bo)) continue;
+                const v = bo[key];
+                if (typeof v !== "boolean") { ok = false; continue; }
+                cleaned.enabled = v;
+            }
+            if (ok) out.blockOps = cleaned;
         }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {

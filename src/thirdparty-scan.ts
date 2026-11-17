@@ -7,7 +7,8 @@
 // always install OTHER third-party context-compression plugins alongside
 // bili — nothing detects that today. This module scans the client's plugin
 // registry (best-effort, read-only, cached) for:
-//   1. known conflicting entries (bili's siblings, when not absorbed by design);
+//   1. known conflicting entries (bili's siblings, when not absorbed by design,
+//      plus dsh's dsh-live-compact takeover compaction engine, #5984);
 //   2. suspected compression plugins by name keyword (compress*/compact*/acp/
 //      summar*) — flagged for user confirmation, never auto-fixed.
 // Callers: launcher pre-launch warning, proxy first-request-per-session
@@ -30,7 +31,10 @@ import { isLegacyBcpEntry } from "./agent/native-bootstrap.js";
 import { isCodexClient } from "./codex-compact.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 
-type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+export type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+/** Runtime membership list for the same union (announcement `requiresScan`
+ *  validation, #5984) — keep in sync with the switch in scanClientPlugins. */
+export const SCAN_CLIENTS: readonly ScanClient[] = ["opencode", "pi", "omp", "kimi", "hermes", "dsh", "claude"];
 
 export interface ThirdPartyFinding {
     client: ScanClient;
@@ -190,6 +194,17 @@ export function isOpencodeAcpEntry(entry: string): boolean {
     const trimmed = entry.trim();
     const bare = trimmed.replace(/^npm:/, "");
     return bare === "opencode-acp" || /^opencode-acp@/.test(bare) || /(^|[/\\])opencode-acp([/\\]|$)/.test(trimmed);
+}
+
+/** #5984: dsh-live-compact entry identity — bare name, npm spec (with or
+ *  without a version), or any path whose segments contain dsh-live-compact.
+ *  Bounded segment match mirroring isOpencodeAcpEntry's discipline so
+ *  lookalikes ("dsh-live-compact-viewer") stay out of the known tier and at
+ *  most keyword-suspected. */
+export function isDshLiveCompactEntry(entry: string): boolean {
+    const trimmed = entry.trim();
+    const bare = trimmed.replace(/^npm:/, "");
+    return bare === "dsh-live-compact" || /^dsh-live-compact@/.test(bare) || /(^|[/\\])dsh-live-compact([/\\]|$)/.test(trimmed);
 }
 
 // #2324/#2545/#2969: third-party plugins VERIFIED to never compress the model
@@ -430,6 +445,19 @@ function scanDsh(env: NodeJS.ProcessEnv): ScanResult {
             if (!deps || typeof deps !== "object" || Array.isArray(deps)) continue;
             for (const dep of Object.keys(deps as Record<string, unknown>)) {
                 if (dep === "billion-context") continue;
+                if (isDshLiveCompactEntry(dep)) {
+                    // #5984: a competing compaction engine, not a keyword
+                    // suspicion. Its bundled cordis.patch.yml disables the
+                    // stock compaction-basic row and registers its own engine
+                    // row (compaction-spine / dsh-live-compact), and its preset
+                    // takeover renames the preset's compaction row to itself —
+                    // bili's load-time compaction-disable overlay (#3354)
+                    // recognizes only the stock row names, so this plugin is
+                    // structurally invisible to it and its checkpoints land
+                    // outside bili's knowledge.
+                    add(c, { client: "dsh", entry: dep, source: file, match: "known", knownId: "dsh-live-compact" });
+                    continue;
+                }
                 if (isKnownDisplayOnlyPlugin(dep)) continue;
                 if (KEYWORD_RE.test(dep)) add(c, { client: "dsh", entry: dep, source: file, match: "keyword" });
             }

@@ -163,9 +163,12 @@ function writeSnapshotLegacy(): void {
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
  *  union), merge ours in per the #1724 rule, re-apply the cap, write back.
  *  Writes are chained so back-to-back schedules never lose updates. */
-function persistUnifiedNow(): void {
+function persistUnifiedNow(): Promise<void> {
+    // This batch now owns its queued write; later mutations need a fresh
+    // debounce window even while the store is still settling this one.
+    pendingSince = null;
     const store = kvStore();
-    if (!store) return;
+    if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
         let live: AffinitySnapshotEntry[] | null = null;
         try {
@@ -186,6 +189,7 @@ function persistUnifiedNow(): void {
         // (subsequent timer/flush writes there), matching the warning.
         kvReady = false;
     });
+    return kvChain;
 }
 
 /** Presence check independent of content (an empty-but-present row still

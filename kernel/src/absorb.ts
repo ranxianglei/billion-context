@@ -1,5 +1,5 @@
 import { rawForRef, refForRaw, BLOCKED_REF } from "./refs.js";
-import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME } from "./compress-tools.js";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES } from "./compress-tools.js";
 import { isStoredPlaceholderText } from "./ccr.js";
 import {
   collectFailedCompressCallIds,
@@ -81,7 +81,9 @@ function isAcpOrConfiguredTool(
 ): boolean {
   if (!toolName) return false;
   if (toolName === cfg.toolName) return true;
-  return ACP_TOOL_NAMES.has(toolName);
+  // #5765: opt-in block ops are out of ACP_TOOL_NAMES but still bili-owned —
+  // their receipts must not become absorb candidates when the feature is on.
+  return ACP_TOOL_NAMES.has(toolName) || BLOCK_OP_TOOL_NAMES.has(toolName);
 }
 
 const NO_PROTECTED_CALLS = new Set<string>();
