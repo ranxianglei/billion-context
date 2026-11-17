@@ -762,6 +762,19 @@ def mitm_domains_from_config() -> List[str]:
             if data.get(key):
                 add(data[key])
                 break
+        # The `model:` block nests the active endpoint under model: (Hermes 0.23+ shape, #7063):
+        #   model:
+        #     provider: Deepseek
+        #     base_url: https://api.deepseek.com/v1
+        # Same additive rule as the top-level shape — a host missing here blind-tunnels, so read the
+        # block's endpoint even when a providers map also exists. A scalar `model:` (a bare model
+        # name) is not a block and is skipped by the dict guard.
+        model_block = data.get("model")
+        if isinstance(model_block, dict):
+            for key in ("base_url", "url", "api"):
+                if model_block.get(key):
+                    add(model_block[key])
+                    break
     return hosts
 
 
@@ -815,6 +828,20 @@ def _provider_base_url(provider: Any) -> Optional[str]:
                     found = pick(entry)
                     if found:
                         return found
+    # The `model:` block nests the active endpoint under model: (Hermes 0.23+ shape, #7063):
+    #   model:
+    #     provider: Deepseek
+    #     base_url: https://api.deepseek.com/v1
+    # It answers the model's provider's request — an unnamed one included, since the hook surface
+    # often carries no provider kwarg — and never some other named provider's. It precedes the
+    # top-level shape: the block is the newer, more specific active-endpoint declaration.
+    model_block = data.get("model")
+    if isinstance(model_block, dict):
+        model_active = str(model_block.get("provider") or "").strip()
+        if not name or name == model_active:
+            found = pick(model_block)
+            if found:
+                return found
     # Top-level base_url/url/api overrides the ACTIVE provider's endpoint (#6022). It answers the
     # active provider's request — an unnamed one included, since the hook surface often carries no
     # provider kwarg — and never some other named provider's.
