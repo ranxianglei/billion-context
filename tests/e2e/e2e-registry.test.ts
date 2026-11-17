@@ -168,13 +168,22 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
         const res = runBili(installDir, ["plugin", "install", "opencode"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url, BILI_CLIENT_BIN: ocBin });
         assert.equal(res.code, 0, `plugin install failed:\n${res.stdout}\n${res.stderr}`);
         const cfg = JSON.parse(fs.readFileSync(opencodeCfgPath(work), "utf8")) as Record<string, unknown>;
-        // Master semantics: npm-form install writes the bare package name and
-        // an already-correct entry is left untouched (idempotent).
+        // Master semantics (#3976): the fixture probes a 2.x host
+        // (fakeOpencodeBin prints 2.4.0 → key "plugins"), so even an npm-form
+        // install lands as the machine-local shim dir; the seeded legacy bare
+        // entry migrates to it and the shim re-export follows this root.
         // TODO(#1143): once the pinned-entry change lands, replace these with
         // entry === `billion-context@${NEW_VERSION}` (the re-pin assertion).
-        assert.deepEqual(cfg.plugins, ["billion-context"]);
+        const shimDir = path.join(work, "config", "opencode", "plugins", "billion-context");
+        assert.deepEqual(cfg.plugins, [shimDir]);
         assert.deepEqual(cfg.compaction, { auto: false });
-        assert.match(res.stdout, /plugins present/);
+        const shimIdx = path.join(shimDir, "index.js");
+        assert.equal(
+            fs.readFileSync(shimIdx, "utf8"),
+            `export { default } from ${JSON.stringify(path.join(installDir, "dist", "agent", "opencode-native.js"))};\n`,
+            "shim re-export points at the installed dist root",
+        );
+        assert.match(res.stdout, /plugins -> .*(replaced billion-context)/);
     });
 });
 

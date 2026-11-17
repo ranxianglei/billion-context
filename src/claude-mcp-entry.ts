@@ -14,6 +14,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveProxyOrigin, runMcpStdio } from "./mcp.js";
 import { configureLogger, log as teeLog } from "./logger.js";
+import { configureLogRetention } from "./log-retention.js";
+import { logRetentionPolicy } from "./knobs.js";
 import { defaultLogFile } from "./paths.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, healthUrl } from "./launcher.js";
 import { chooseWatchdogParentPid, planClaudeNativeBootstrap } from "./claude-native-bootstrap.js";
@@ -123,6 +125,9 @@ export function startWatchdog(state: MutableWatchdogState, plan: { port: number;
 
 export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}): Promise<void> {
     if (process.env.NODE_TEST_CONTEXT !== undefined) return;
+    // Same resolved policy as the proxy's startup boundary: this entry writes the
+    // SAME default log, so it must not rotate it under different budget rules.
+    configureLogRetention(logRetentionPolicy());
     configureLogger(defaultLogFile());
     const log = (msg: string) => teeLog("info", `[bili-claude-mcp] ${msg}`);
     const plan = planClaudeNativeBootstrap(process.env);

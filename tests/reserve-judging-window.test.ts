@@ -49,6 +49,8 @@ function reserveWindow(
         nativeWindow: window,
         headroomCap: 0.25,
         nativeFromFallback: false,
+        codexWindowNetsOutput: false,
+        operatorHeadroomCap: false,
         parsed: { model, max_tokens: 64_000 },
         req: { headers: {} } as unknown as http.IncomingMessage,
         opts: { routes: [], sessionHeader: "x-session-id" } as unknown as ProxyOptions,

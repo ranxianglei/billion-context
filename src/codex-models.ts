@@ -166,6 +166,19 @@ export function readCodexModelWindow(model: string, codexHome: string): number |
     return readCodexLiveModelWindow(model, codexHome)?.window;
 }
 
+/** True when a codex-aligned window ALREADY nets out codex's own output
+ *  headroom: the live table sources multiply by effective_context_window_percent,
+ *  which codex defines as the share "usable for inputs, after reserving headroom
+ *  for system prompts, tool overhead, and model output". Reserving bili's output
+ *  headroom on top of such a window counts the output budget twice and puts the
+ *  preflight wall below the point where codex itself auto-compacts (90% of the
+ *  raw window), so a long codex session hits an unrecoverable 413 before codex
+ *  ever compacts it. Other sources (client metadata, config.toml window, bundled
+ *  snapshot, 272K fallback) are raw windows and keep the reservation. */
+export function codexWindowNetsOutputHeadroom(source: string | undefined): boolean {
+    return source === "codex-catalog" || source === "codex-models-cache";
+}
+
 function alignedResult(limit: number, w: number, source: CodexWindowSource): { limit: number; clamped: boolean; source: CodexWindowSource } {
     return limit > w ? { limit: w, clamped: true, source } : { limit, clamped: false, source };
 }

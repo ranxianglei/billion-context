@@ -65,6 +65,11 @@ test("mechanism: every field of a fresh state is covered by the derived list (no
             `createInitialState emits "${key}" but COMPRESSION_STATE_FIELDS lacks it — add it to mergeState's literal (src/state-hydration.ts)`,
         );
     }
-    // And the list is exactly the merge output — nothing stale either.
-    assert.deepEqual([...COMPRESSION_STATE_FIELDS], Object.keys(mergeState(createInitialState())));
+    // And the list is exactly what mergeState can EMIT — fresh fields plus
+    // conditionally-spread ones (timestampsHighWaterRefSeq is undefined on a
+    // fresh state but must still be listed or kstate drops it, #4192 class).
+    // Nothing stale either. Mirrors the derivation probe in src/state-hydration.ts.
+    const probe = createInitialState();
+    probe.timestampsHighWaterRefSeq = 0;
+    assert.deepEqual([...COMPRESSION_STATE_FIELDS], Object.keys(mergeState(probe)));
 });

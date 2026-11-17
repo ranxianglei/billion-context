@@ -5,13 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import test, { after } from "node:test";
+import test from "node:test";
 import WebSocket from "ws";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { setLogCapture } from "../src/logger.ts";
 import type { ProxyOptions } from "../src/config.ts";
 
 // #3342: a Codex Responses-over-WebSocket client talking to a supplier that
@@ -27,14 +28,6 @@ const testHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ws-httpfb-home-"));
 process.env.XDG_STATE_HOME = testHome;
 process.env.XDG_DATA_HOME = testHome;
 process.env.XDG_CACHE_HOME = testHome;
-
-// Each full bili server leaves a ref'd undici idle-watchdog per fallback leg
-// (released only via clearTimer, which the WS sink path never calls) plus
-// phase-aligned unref'd peer-rescan ticks that outlive the assertions. Every
-// test already reports (30s test + 15s exchange timeouts catch real hangs), so
-// force a clean exit once the suite is done to keep the hermetic shard from
-// being held open by teardown residue.
-after(() => { process.exit(process.exitCode ?? 0); });
 
 const user = (text: string): Item => ({ type: "message", role: "user", content: [{ type: "input_text", text }] });
 const developer = (text: string): Item => ({ type: "message", role: "developer", content: [{ type: "input_text", text }] });
@@ -59,6 +52,7 @@ async function fixture() {
     let failMode: FailMode = "ok";
     let toolArguments: string | undefined;
     let stallNext = false;
+    let stallMidstreamNext = false;
     const heldRequests: Array<{ aborted: boolean }> = [];
     const upstream = http.createServer((req, res) => {
         if (req.method !== "POST") { res.writeHead(404).end(); return; }
@@ -67,15 +61,23 @@ async function fixture() {
         req.on("end", () => {
             const parsed = JSON.parse(body) as Item;
             httpRows.push({ request: parsed, headers: req.headers });
-            if (stallNext) {
-                // Hold the request open without responding — pins that a client
-                // disconnect aborts the in-flight HTTP egress instead of pinning it.
+            if (stallNext || stallMidstreamNext) {
+                // Hold the request open without finishing — pins that a client
+                // disconnect aborts the in-flight HTTP egress instead of pinning it,
+                // both before the supplier answers and while it is still generating.
+                const midstream = stallMidstreamNext;
                 stallNext = false;
+                stallMidstreamNext = false;
                 const held = { aborted: false };
                 heldRequests.push(held);
                 const markAborted = (): void => { held.aborted = true; };
                 req.on("aborted", markAborted);
                 res.on("close", markAborted);
+                if (midstream) {
+                    const id = `resp_http_${++serial}`;
+                    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+                    res.write(`event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id, status: "in_progress", output: [] } })}\n\n`);
+                }
                 return;
             }
             // Connection: close stops undici from pooling the socket; without it
@@ -171,8 +173,10 @@ async function fixture() {
         resetFailMode: (): void => { failMode = "ok"; },
         get heldAbortedCount(): number { return heldRequests.filter(h => h.aborted).length; },
         setStallNext: (v: boolean): void => { stallNext = v; },
+        setStallMidstreamNext: (v: boolean): void => { stallMidstreamNext = v; },
         close: async (): Promise<void> => {
             peer.terminate();
+            upstream.closeAllConnections();
             await Promise.all([new Promise<void>(r => proxy.close(() => r())), new Promise<void>(r => upstream.close(() => r()))]);
         },
     };
@@ -357,6 +361,44 @@ test("a client disconnect aborts an in-flight HTTP fallback egress instead of pi
         const turn = fx.turn([user("stall")]);
         const rejected = assert.rejects(turn, /WS client closed/);
         await until(() => fx.httpRows.length >= 1);
+        fx.peer.terminate();
+        await rejected;
+        await until(() => fx.heldAbortedCount === 1);
+        assert.equal(_liveUpstreamTimersForTest(), baseline, "no idle-watchdog timer left behind by the aborted egress");
+    } finally {
+        await fx.close();
+    }
+});
+
+test("closing the client after its turn has finished is not treated as a mid-turn disconnect", { timeout: 30000 }, async () => {
+    const fx = await fixture();
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => { lines.push(msg); });
+    try {
+        const baseline = _liveUpstreamTimersForTest();
+        completed(await fx.turn([user("finish first")]));
+        // The egress watchdog is released once the relay has read the supplier's EOF.
+        await until(() => _liveUpstreamTimersForTest() === baseline);
+        fx.peer.terminate();
+        await until(() => lines.some(l => l.includes("client closed phase=")));
+        assert.ok(lines.some(l => l.includes("client closed phase=idle")), "the exchange had ended before the client left");
+        assert.equal(lines.filter(l => l.includes("client disconnected mid-stream")).length, 0, "a finished exchange is not aborted");
+    } finally {
+        setLogCapture(null);
+        await fx.close();
+    }
+});
+
+test("a client disconnect mid-stream aborts the HTTP fallback egress while the supplier is still generating", { timeout: 30000 }, async () => {
+    const fx = await fixture();
+    try {
+        fx.setStallMidstreamNext(true);
+        const baseline = _liveUpstreamTimersForTest();
+        let frames = 0;
+        fx.peer.on("message", () => { frames++; });
+        const turn = fx.turn([user("stall mid-stream")]);
+        const rejected = assert.rejects(turn, /WS client closed/);
+        await until(() => frames >= 1);
         fx.peer.terminate();
         await rejected;
         await until(() => fx.heldAbortedCount === 1);

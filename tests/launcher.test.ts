@@ -734,6 +734,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     const prevUserProfile = process.env.USERPROFILE;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    const prevThreads = process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+    delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
@@ -750,9 +752,11 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     if (distExisted) fs.renameSync(distAgent, distBackup);
 
     const clientArgsSeen: string[][] = [];
-    const spawnImpl: SpawnFn = (cmd, args) => {
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === process.env.BILI_CLIENT_BIN) {
             clientArgsSeen.push([...args]);
+            childEnv = options.env;
             const child = makeFakeChild(0);
             const orig = child.on!.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -793,6 +797,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
         assert.equal(fs.existsSync(`${ompHome}-bili`), false, "still no overlay dir");
         assert.deepEqual(exitCalls, [0]);
+        // #6088: OMP message threads would send only the newest message per turn
+        assert.equal(childEnv?.PI_ANTHROPIC_MESSAGE_THREADS, "0", "omp message threads defaulted off");
     } finally {
         process.exit = prevExit;
         if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
@@ -802,6 +808,8 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         else process.env.USERPROFILE = prevUserProfile;
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (prevThreads === undefined) delete process.env.PI_ANTHROPIC_MESSAGE_THREADS;
+        else process.env.PI_ANTHROPIC_MESSAGE_THREADS = prevThreads;
         if (distExisted) fs.renameSync(distBackup, distAgent);
         rmrf(home);
     }
@@ -4153,6 +4161,72 @@ test("parseHermesYaml: v12 dict base_url/url forms + base_url wins over api", ()
     assert.equal(priority.providers.p?.api, "http://fresh:1/v1", "base_url beats api (hermes priority)");
 });
 
+test("parseHermesYaml: top-level base_url next to provider: is the stock config shape (#6022)", () => {
+    // Stock Hermes config: no providers map — provider + endpoint at the root.
+    const stock = parseHermesYaml([
+        "provider: nous",
+        "model: qwen3.8-27b",
+        'base_url: "https://inference-api.example.com/v1"',
+    ].join("\n"));
+    assert.equal(stock.providers.nous?.api, "https://inference-api.example.com/v1",
+        "top-level base_url attributes to the active provider");
+
+    // No provider name → synthetic entry; url/api key forms work too.
+    const unnamed = parseHermesYaml("url: https://u.example.com/v1\n");
+    assert.equal(unnamed.providers["top-level"]?.api, "https://u.example.com/v1");
+    const apiForm = parseHermesYaml("provider: p\napi: http://a:1/v1\n");
+    assert.equal(apiForm.providers.p?.api, "http://a:1/v1");
+
+    // Coexists with a providers map: keep BOTH hosts routable rather than
+    // guessing which shape wins (a missing whitelist entry = blind tunnel).
+    const mixed = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  beta:",
+        "    base_url: https://beta.example.com/v1",
+        "base_url: https://alpha.example.com/v1",
+    ].join("\n"));
+    assert.equal(mixed.providers.beta?.api, "https://beta.example.com/v1");
+    assert.equal(mixed.providers.alpha?.api, "https://alpha.example.com/v1",
+        "active provider has no own entry → top-level URL lands under its name");
+
+    // Active provider DOES have an entry with a different URL: never overwrite.
+    const both = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://map.example.com/v1",
+        "base_url: https://top.example.com/v1",
+    ].join("\n"));
+    assert.equal(both.providers.alpha?.api, "https://map.example.com/v1", "existing entry survives");
+    assert.equal(both.providers["top-level"]?.api, "https://top.example.com/v1");
+
+    // Same URL in both shapes → deduped to one entry.
+    const dup = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://same.example.com/v1",
+        "base_url: https://same.example.com/v1",
+    ].join("\n"));
+    assert.deepEqual(Object.keys(dup.providers).sort(), ["alpha"]);
+});
+
+test("parseHermesYaml: quoted endpoint values survive (new URL() rejects quotes)", () => {
+    const q = parseHermesYaml([
+        "providers:",
+        "  bili:",
+        '    base_url: "http://127.0.0.1:8199/v1"',
+        "custom_providers:",
+        "  - name: sg",
+        "    url: 'http://s:1/v1'",
+        '  - api: "http://inline:1/v1"',
+    ].join("\n"));
+    assert.equal(q.providers.bili?.api, "http://127.0.0.1:8199/v1", "dict nested, double-quoted");
+    assert.equal(q.providers.sg?.api, "http://s:1/v1", "list nested, single-quoted");
+    assert.equal(q.providers["custom-1"]?.api, "http://inline:1/v1", "list inline, double-quoted");
+});
+
 test("readHermesConfig + resolveHermesHome", () => {
     assert.equal(resolveHermesHome({ HERMES_HOME: "/tmp/hh" }), "/tmp/hh");
     assert.ok(resolveHermesHome({}).endsWith(path.join(".hermes")));
@@ -5779,6 +5853,54 @@ test("runLaunch codex: old binary without --no-daemon launches unchanged (#1867)
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        rmrf(home);
+    }
+});
+
+test("runLaunch claude: the injected --mcp-config does not swallow a positional prompt", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-prompt-"));
+    const prevHome = process.env.HOME;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevPlugin = process.env.BILI_LAUNCHER_PLUGIN;
+    process.env.HOME = home;
+    delete process.env.BILI_LAUNCHER_PLUGIN;
+    const fakeClaude = path.join(home, process.platform === "win32" ? "fake-claude.exe" : "fake-claude");
+    fs.writeFileSync(fakeClaude, "");
+    process.env.BILI_CLIENT_BIN = fakeClaude;
+    const clientArgs: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeClaude) {
+            clientArgs.push([...(args ?? [])]);
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "claude", clientArgs: ["say hi", "-p"], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgs.length, 1);
+        const args = clientArgs[0]!;
+        // Claude Code's --mcp-config is variadic: a bare flag takes every following word as a config file.
+        assert.equal(args.includes("--mcp-config"), false, `bare --mcp-config would eat the prompt: ${JSON.stringify(args)}`);
+        assert.ok(args.some((a) => a.startsWith("--mcp-config=")), "bili's MCP config is still passed");
+        assert.ok(args.includes("say hi"));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevPlugin !== undefined) process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
         rmrf(home);
     }
 });

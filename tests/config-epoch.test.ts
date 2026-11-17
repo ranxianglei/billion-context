@@ -84,6 +84,31 @@ test("config epoch: a retired externalSummary chain cannot ride a stale stamp (t
     }
 });
 
+test("config epoch: a live externalSummary chain survives the stale window with its provider recipes (#5912)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-epoch-ext-live-"));
+    const file = pinnedConfigFile(dir);
+    const providers = { sumprov: { baseUrl: "https://sum.example", api: "openai", apiKeyEnv: "SUM_KEY", models: { summodel: {} } } };
+    writeFileSync(file, JSON.stringify({ providers, compress: { externalSummary: { enabled: true, targets: ["sumprov/summodel"] } } }));
+    process.env.BILI_CONFIG_FILE = file;
+    try {
+        const session = makeSession();
+        const stamped = defaultConfig(200_000) as Config & { externalSummary?: { enabled: boolean } };
+        stamped.externalSummary = { enabled: true };
+        storeEffectiveConfig(session, stamped);
+        assert.equal(externalSummaryEnabled(effectiveConfig(session, defaultConfig(200_000))), true, "precondition: chain on while the file still declares it");
+        // Any other edit moves the epoch into the stale-overlay window; the
+        // provider table and the chain itself are untouched.
+        writeFileSync(file, JSON.stringify({ providers, compress: { externalSummary: { enabled: true, targets: ["sumprov/summodel"] }, nudgeGrowthTokens: 512 } }));
+        const read = effectiveConfig(session, defaultConfig(200_000)) as Config & { externalSummary?: { enabled?: boolean; targets?: Array<{ model?: string; credentialRef?: string }> } };
+        assert.equal(externalSummaryEnabled(read), true, "the stale window must not disable a valid chain");
+        assert.equal(read.externalSummary?.targets?.[0]?.model, "summodel", "the target expands against the live named-provider table");
+        assert.equal(read.externalSummary?.targets?.[0]?.credentialRef, "env:SUM_KEY", "the credential reference rides the expanded target");
+    } finally {
+        delete process.env.BILI_CONFIG_FILE;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("config epoch: byte-identical files at different paths are the same source (cross-lane stamps validate)", () => {
     const dirA = mkdtempSync(path.join(tmpdir(), "bili-epoch-laneA-"));
     const dirB = mkdtempSync(path.join(tmpdir(), "bili-epoch-laneB-"));

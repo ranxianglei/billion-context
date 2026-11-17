@@ -125,10 +125,18 @@ function collectRefs(): Set<string> {
     // #5345: the pack editor builds its <option> labels through a pair-array
     // (t(pair[1])), so those catalog keys are only referenced via bare quoted
     // strings — accept any dot-qualified identifier that appears verbatim in
-    // the sources as a live reference too.
+    // the sources as a live reference too. Filenames share the dotted shape
+    // (package.json / config.json in notices.ts) but are not keys: drop tokens
+    // whose final segment is a file extension. Segments already proven to be
+    // key suffixes (summary.key, det.log) stay out of the exclusion, and those
+    // keys are referenced through the explicit t()/data-i18n rules above anyway.
+    const fileExt = new Set(["json", "jsonl", "js", "mjs", "cjs", "ts", "tsx", "map", "db", "sqlite", "sqlite3", "pem", "crt", "cert", "txt", "md", "yml", "yaml", "toml", "lock", "html", "css", "sh", "bat", "ps1", "png", "jpg", "jpeg", "gif", "svg", "ico", "woff", "woff2", "ttf"]);
     for (const src of [pageSrc, clientSrc, reportSrc, noticesSrc]) {
         for (const m of src.matchAll(/"([a-z][\w]*\.[\w.]+)"/g)) {
-            if (/^[a-z][\w]*(\.[\w]+)+$/.test(m[1]) && !m[1].includes("..")) refs.add(m[1]);
+            const token = m[1];
+            if (!/^[a-z][\w]*(\.[\w]+)+$/.test(token) || token.includes("..")) continue;
+            if (fileExt.has(token.slice(token.lastIndexOf(".") + 1))) continue;
+            refs.add(token);
         }
     }
     return refs;

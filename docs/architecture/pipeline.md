@@ -1,6 +1,6 @@
 # Module: request pipeline (`src/server` + `src/loop`)
 
-> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-08, master
+> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-10, master
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (bitmap fallback: [pipeline.en.png](./assets/pipeline.en.png))
@@ -25,13 +25,13 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Unified loop (`src/loop`).** A protocol-neutral core with four wire adapters performs tool adjudication and the prose tag-echo filter (`tag-echo-filter.ts` — prose only, arguments untouched). This is where the two compression modes keep the same code path (KDD #7): plugin mode suppresses tool + nudge injection because the agent owns compression; proxy mode emits the `acp_summary` carrier, re-voiced as a user message so strict backends keep a stable prefix.
 
-**Egress.** `stream-*` rewrites the upstream SSE per wire (chunk framing, cache-control breakpoints #1637, `wire-body` trailing-user-turn append). Protocol headers (pf-*/envelope) never leave the proxy — the upstream hop-header list strips them.
+**Egress.** `stream-*` rewrites the upstream SSE per wire (chunk framing, cache-control breakpoints #1637, `wire-body` trailing-user-turn append). On the request side, a user-registerable `egressTransforms[]` pipeline (`src/egress-transforms.ts`, #6003) runs ESM plugins over every outbound model-request body after session processing and before re-sign/v1Wrap — fail-open per plugin, hot-reloadable via `/__bili/config/reload`, an exact no-op when unconfigured. Protocol headers (pf-*/envelope) never leave the proxy — the upstream hop-header list strips them.
 
 **Gates & recovery.** `preflight.ts` (hold grace, dead-end cooldown), `reasoning-guard` (signed payloads are never fold inputs), `request-body-budget` (receive/decode/send byte caps, availability over performance #3128), `content-encoding` (decompression-bomb guard, 413). Error shapes: `stream-error` (minimal SSE error + finish), `fake-completion` (opt-in retry hint), `degenerate-turn` / `degenerate-retry`, and `exit-matrix` (wire-exit × concerns, #588).
 
 ## Key entries
 
-`src/server/handle.ts` (triage) · `src/server/prepare-*.ts` (per-wire request prep) · `src/marker/` (inbound tag strip) · `src/loop/` (unified core + adapters) · `src/server/stream-*.ts` (per-wire egress) · `src/server/preflight.ts` · `src/server/exit-matrix.ts`
+`src/server/handle.ts` (triage) · `src/server/prepare-*.ts` (per-wire request prep) · `src/marker/` (inbound tag strip) · `src/loop/` (unified core + adapters) · `src/server/stream-*.ts` (per-wire egress) · `src/egress-transforms.ts` (user egress body-rewrite plugins, #6003) · `src/server/preflight.ts` · `src/server/exit-matrix.ts`
 
 ## Related
 

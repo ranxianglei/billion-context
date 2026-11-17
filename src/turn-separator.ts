@@ -5,7 +5,7 @@
 // session.ts re-exports these for its existing consumers.
 
 /** #2627: bili-synthesized Responses turn separators (repairResponsesAssistantOrdering,
- *  src/server.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
+ *  src/server/responses-ordering.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
  *  ever contains them, so they can never anchor or be covered. When a
  *  separator-bearing view reached applyCompression (the plugin lane handed its
  *  processed view straight in), their ids were registered into new blocks'

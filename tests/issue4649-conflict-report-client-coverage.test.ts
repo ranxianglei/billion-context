@@ -17,15 +17,17 @@ import { clientFamilyOf, recentClientUas, recordClientUa, _resetClientUaRegistry
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 
 /** Pin every path-relevant env var (unset ones deleted, so homedir fallbacks
- * can never reach the real machine's dirs); restored in finally. */
-function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+ * can never reach the real machine's dirs); restored in finally. Async because
+ * buildDiagnostics is async since the retained-generation log reader landed —
+ * the env must stay pinned until the report is materialized. */
+async function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T | Promise<T>): Promise<T> {
     const saved: Record<string, string | undefined> = {};
     for (const k of ENV_KEYS) {
         saved[k] = process.env[k];
         if (overrides[k] !== undefined) process.env[k] = overrides[k];
         else delete process.env[k];
     }
-    try { return fn(); } finally {
+    try { return await fn(); } finally {
         for (const k of ENV_KEYS) {
             if (saved[k] === undefined) delete process.env[k];
             else process.env[k] = saved[k];
@@ -61,14 +63,14 @@ const NON_CONFLICT_LINES = [
 // Pre-existing dsh coverage must survive the extension verbatim.
 const DSH_LOG_LINE = "[ses_dsh1] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, 42 msgs) — REFUSED, not forwarded (#1729)";
 
-test("#4649 codex conflict signatures are captured; unrelated and dsh behavior unchanged", (t) => {
+test("#4649 codex conflict signatures are captured; unrelated and dsh behavior unchanged", async (t) => {
     const root = makeRoot("bili-diag-4649-log-");
     t.after(() => rmSync(root, { recursive: true, force: true }));
     _resetClientUaRegistryForTest();
     writeFileSync(path.join(root, "state", "billion-context", "bili.log"),
         [...CODEX_LOG_LINES, DSH_LOG_LINE, ...NON_CONFLICT_LINES].join("\n") + "\n");
-    const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
-        () => buildDiagnostics("conflict-banner")).blob;
+    const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
+        () => buildDiagnostics("conflict-banner"))).blob;
 
     assert.ok(blob.includes("--- recent conflict-related log lines ---"), "log section present");
     assert.ok(blob.includes("codex compaction_trigger request not intercepted"), "not-intercepted forward captured (handle.ts site)");
@@ -82,7 +84,7 @@ test("#4649 codex conflict signatures are captured; unrelated and dsh behavior u
     }
 });
 
-test("#4649 observed UA registry feeds the host client versions section", (t) => {
+test("#4649 observed UA registry feeds the host client versions section", async (t) => {
     const root = makeRoot("bili-diag-4649-ua-");
     t.after(() => rmSync(root, { recursive: true, force: true }));
     _resetClientUaRegistryForTest();
@@ -91,8 +93,8 @@ test("#4649 observed UA registry feeds the host client versions section", (t) =>
     recordClientUa({ "user-agent": "curl/8.5.0" });
     // #4648 scenario: NO dsh profiles on this machine — the observed UAs must
     // still be published (the old early-return dropped the whole section body).
-    const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
-        () => buildDiagnostics("conflict-banner")).blob;
+    const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
+        () => buildDiagnostics("conflict-banner"))).blob;
     const section = blob.slice(blob.indexOf("--- host client versions ---"));
     assert.ok(section.includes("observed client user-agents: codex: codex_cli_rs/0.162.1"), `codex UA published despite missing dsh profiles:\n${section}`);
     assert.ok(section.includes("observed client user-agents: claude: claude-cli/1.0.55 (external, cli)"), "claude UA published");
@@ -124,7 +126,7 @@ test("#4649 registry: dedupe, per-family cap, truncation, honest empty note", (t
     assert.ok(longObs!.ua.length <= 120, `UA truncated to the ingest bound, got ${longObs!.ua.length}`);
 });
 
-test("#4649 registry: display cap keeps the blob pasteable", (t) => {
+test("#4649 registry: display cap keeps the blob pasteable", async (t) => {
     t.after(() => _resetClientUaRegistryForTest());
     _resetClientUaRegistryForTest();
     // 3 families × 8 UAs = 24 observations > the 12-line display budget
@@ -138,8 +140,8 @@ test("#4649 registry: display cap keeps the blob pasteable", (t) => {
     assert.equal(recentClientUas().length, 24, "registry holds all observations");
     const root = makeRoot("bili-diag-4649-cap-");
     t.after(() => rmSync(root, { recursive: true, force: true }));
-    const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
-        () => buildDiagnostics()).blob;
+    const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
+        () => buildDiagnostics())).blob;
     const uaLineCount = blob.split("\n").filter((l) => l.startsWith("observed client user-agents: ") && !l.includes("more observation")).length;
     assert.equal(uaLineCount, 12, "display capped at 12 lines");
     assert.ok(blob.includes("more observation(s)"), "overflow noted honestly");
@@ -168,13 +170,13 @@ test("#4649 registry: family cap bounds hostile churn", (t) => {
     assert.ok(obs.some((o) => o.family === "agent-30"), "most recently seen family survives");
 });
 
-test("#4649 publish discipline: credential-shaped UA bytes never reach the blob", (t) => {
+test("#4649 publish discipline: credential-shaped UA bytes never reach the blob", async (t) => {
     const root = makeRoot("bili-diag-4649-pub-");
     t.after(() => { rmSync(root, { recursive: true, force: true }); _resetClientUaRegistryForTest(); });
     _resetClientUaRegistryForTest();
     recordClientUa({ "user-agent": "codex_cli_rs/1.0.0 sk-live-abcdefgh123456789" });
-    const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
-        () => buildDiagnostics()).blob;
+    const blob = (await withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: path.join(root, "state"), XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root },
+        () => buildDiagnostics())).blob;
     assert.ok(!blob.includes("sk-live-abcdefgh123456789"), "credential shape scrubbed by the sink net (#4427)");
     assert.ok(blob.includes("observed client user-agents: codex: codex_cli_rs/1.0.0"), "the UA itself still publishes");
 });
