@@ -1164,6 +1164,73 @@ test("#6080: a host that starts accepting registrations converges and goes quiet
     }
 });
 
+test("#6080: a tree navigation clears the reassert backoff so a new episode heals immediately", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi", { retryIntervalMs: 10, reassertBackoffMs: 60_000 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        makeDroppingRegister(pi, { stuck: true });
+        pi.tools.length = 0; // host rebuilt its registry while our map was unreadable
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            // Episode start: ineffective re-registration → backoff engaged.
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 2, "first attempt fired, backoff engaged");
+            // A /tree rewind rebuilds the host's view — an instance map that was
+            // dead may be live again, so the backoff must clear and a new episode
+            // heals immediately instead of waiting out the window.
+            await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 4, "the tree navigation cleared the backoff — a new attempt fires immediately");
+        });
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#6080: a fresh registration for a new sid clears the reassert backoff", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    const origNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi", { retryIntervalMs: 10, reassertBackoffMs: 40 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        const stuckRef = { stuck: true };
+        makeDroppingRegister(pi, stuckRef);
+        pi.tools.length = 0;
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            // Episode start on the first sid: ineffective re-registration → backoff engaged.
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 2, "first attempt fired, backoff engaged");
+            // The host heals and a new session registers — the fresh registration
+            // clears the backoff, so a later drop on the new sid heals immediately
+            // instead of waiting out the window.
+            stuckRef.stuck = false;
+            await pi.events.get("before_agent_start")!({ prompt: "hi" }, fakeCtx(proxy, "sess-B"));
+            assert.equal(pi.registerCalls, before + 4, "fresh registration for the new sid (registry healthy — no reassert)");
+            stuckRef.stuck = true;
+            pi.tools.length = 0;
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy, "sess-B"));
+            assert.equal(pi.registerCalls, before + 6, "backoff cleared by the fresh registration — a new attempt fires immediately");
+        });
+    } finally {
+        Date.now = origNow;
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
 test("#3542: a /tree rewind that resets the active loadout self-heals on session_tree", async () => {
     const proxy = await startFakeProxy();
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
