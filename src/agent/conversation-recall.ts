@@ -180,7 +180,6 @@ export function recallBoundaryOfMessages(messages: unknown): string | undefined 
 /** Learn (attribution ok): this session's latest dispatch boundary on this lane. */
 export function learnConversation(laneKey: string, sid: string, boundaryFp: string): void {
     const now = Date.now();
-    sweep(now);
     let perLane = lanes.get(laneKey);
     if (perLane === undefined) {
         perLane = new Map();
