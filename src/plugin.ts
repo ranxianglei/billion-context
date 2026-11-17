@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -144,6 +144,27 @@ const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+/** #6880: the host's declared PURPOSE for the dispatch (dsh stamps
+ *  GenerateOptions.purpose verbatim — "session-title", "compaction",
+ *  "auto-review", "timeline-report", ...; its contract: ordinary
+ *  conversation requests leave it unset). Carries the side/main intent
+ *  that content-guessing used to approximate: a PLUGIN-ANNOUNCED request
+ *  with a non-empty purpose is a side request by declaration, no per-feature
+ *  template matching needed (the content recognizers stay as the fallback
+ *  for pre-#6880 plugin installs). Honored only behind the x-bili-plugin
+ *  marker, same trust discipline as the conversation header: an unannounced
+ *  client's purpose header is inert telemetry. */
+const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
+/** #6880 v2 wire: the post-#6883 dsh plugin stamps this sentinel for MAIN
+ *  turns (dsh leaves GenerateOptions.purpose unset for ordinary conversation,
+ *  so no real dsh purpose can collide with it). PRESENCE of the header in any
+ *  value is the declaration that this conversation's plugin announces every
+ *  dispatch's purpose — main traffic then keys the raw session id directly
+ *  (dsh mints one UUID per session, ids never recycle) instead of routing
+ *  through the persona-order ladder, and its auxiliary traffic is a declared
+ *  side request by the header alone. The sentinel itself is NOT a side:
+ *  handle.ts normalizes it back to "absent" before the side classification. */
+export const PLUGIN_PURPOSE_CONVERSATION = "conversation";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -210,6 +231,14 @@ function headerValue(headers: Record<string, string | string[] | undefined>, nam
     const s = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined;
     const t = s?.trim();
     return t && t.length > 0 ? t : undefined;
+}
+
+export function pluginPurposeHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    // #6880: purpose is a protocol-internal steering signal — honoring it
+    // without the plugin announcement would let any client that can reach
+    // the endpoint opt its traffic out of the session pipeline. A real
+    // plugin sends the marker and the purpose together.
+    return pluginAgentHeader(headers) !== undefined ? headerValue(headers, PLUGIN_PURPOSE_HEADER) : undefined;
 }
 
 export function pluginAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -1800,17 +1829,17 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.lastPassIds = prefix.map((m) => m.rawId);
             child.state.rules = structuredClone(parent.state.rules);
             child.state.nextRuleId = parent.state.nextRuleId;
-            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => prefix.some((m) => m.ref === ref));
+            const forkRefs = new Set(prefix.map((m) => m.ref));
+            child.state.hiddenOrphanRefs = parent.state.hiddenOrphanRefs?.filter((ref) => forkRefs.has(ref));
             // #3939 ③: only latch entries whose messages rode the forked
             // prefix — the child never sees the others, so their entries
             // would be dead weight (and retire on the next latch pass anyway).
-            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => prefix.some((m) => m.ref === e.ref));
+            child.state.emergencyTruncateLatch = parent.state.emergencyTruncateLatch?.filter((e) => forkRefs.has(e.ref));
             // #3939 ②: deferred refs are content-keyed (byRaw ids) — keep only
             // the ones whose carrier rode the forked prefix.
-            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => prefix.some((m) => m.ref === r));
+            child.state.renderDeferredRefs = parent.state.renderDeferredRefs?.filter((r) => forkRefs.has(r));
             // #3939 ⑤: view-latch entries are ref-keyed — keep only the
             // carriers that rode the forked prefix.
-            const forkRefs = new Set(prefix.map((m) => m.ref));
             if (parent.state.viewLatches) {
                 child.state.viewLatches = Object.fromEntries(
                     Object.entries(parent.state.viewLatches).filter(([r]) => forkRefs.has(r)),
@@ -1835,7 +1864,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).
-            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !prefix.some((m) => m.ref === ref));
+            child.state.deadRefs = parent.state.deadRefs?.filter((ref) => !forkRefs.has(ref));
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
@@ -2810,10 +2839,11 @@ export async function pipePluginChatWithStrip(
     // write through the request logger landed in the SAME tee file, doubling
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -3288,7 +3318,10 @@ export async function pipePluginChatWithStrip(
         // #1595: clean completion but no input usage sample — name it (the
         // cut-stream paths below have sawTerminal=false, so they stay
         // distinguishable from transport failures).
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -3832,7 +3865,10 @@ export async function pipePluginChatWithStrip(
         // structured or user data (#1039) and are excluded from the audit.
         if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // #5848 twin on the google lane: a frame carrying only empty parts has
+        // nothing a held tail must precede, and draining on it split a render tag
+        // so the remainder reached the host as prose (the #5192 shape).
+        if (!hadText && anyPending() && googleFrameHasNonText(ev)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     try {
@@ -4066,9 +4102,11 @@ export async function pipePluginJsonlWithStrip(
     // delta as a whole line, so the filters' held tails are only resolved at
     // the terminal frame / EOF / read failure — never per line (a per-line
     // flush destroys the cross-delta tag/marker state this filter exists for).
-    const onStrip = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onStrip = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode plugin mode)";
+        const head = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] ${head}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
     const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
@@ -4386,8 +4424,9 @@ export async function pipePluginResponsesWithStrip(
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {
@@ -4528,7 +4567,10 @@ export async function pipePluginResponsesWithStrip(
             markDirty(session);
         }
         // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -5263,7 +5305,10 @@ export async function pipePluginJson(
             }
         }
         // #1595: parsed success body carrying no input usage report — name it.
-        if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        if (session && !sawInputSample) {
+            diagnoseSuccessWithoutUsage(session, "plugin-json");
+            releaseNudgeHold(session);
+        }
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).

@@ -77,7 +77,10 @@ export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
  * conversations, side lanes) — the shape is the final word, so a marker'd
  * ordinary body replays through the normal pipeline untouched. */
 export function incrementalTurnBodyShape(raw: Buffer): boolean {
-    if (raw.length < 2 || raw.length > 64 * 1024 * 1024) return false;
+    // readBody already enforces the receive-size budget before this check.
+    // A large lane-only envelope must not fall through to ordinary upstream
+    // relay merely because its seed crosses a second, unrelated size limit.
+    if (raw.length < 2) return false;
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw.toString("utf8"));
@@ -421,8 +424,8 @@ function stableMessageKey(m: Record<string, unknown>): string {
  *  handful of fresh rows instead of walking the whole table every turn.
  *  Any miss → leave the previous pointers untouched (never a partial list);
  *  with the debounced save this is the common case right after a turn — a
- *  later settled turn records them. */
-function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
+ *  later settled turn records them. Exposed for unit tests (#6490). */
+export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l: string, m: string) => void): void {
     try {
         const store = getStore();
         const prevPtrs = readCanonicalPointers(sessionId);
@@ -430,7 +433,10 @@ function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], log: (l
         let rows: { seq: number; content: string; ts: number | null }[] | null;
         if (prevPtrs !== null && prevPtrs.length <= msgs.length) {
             ptrs = [...prevPtrs];
-            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? Math.max(...ptrs) : -1);
+            // reduce, not Math.max(...spread): a long session's pointer list
+            // outgrows V8's argument-spread limit (~65K-125K depending on
+            // build; measured 125K ok / 130K throws on Node 22 x64) → RangeError (#6490).
+            rows = store.unifiedRawMessages(sessionId, ptrs.length > 0 ? ptrs.reduce((m, p) => (p > m ? p : m), 0) : -1);
         } else {
             ptrs = [];
             rows = store.unifiedRawMessages(sessionId);
