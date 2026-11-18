@@ -284,7 +284,11 @@ export async function prepareAnthropic(
                 log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
             }
         }
-        if (featureEnabled("pluginMsgIdIncremental") && msgidPinMode !== null) {
+        // #6785 review fix: "incremental" is gated on the flag (the upgrade
+        // never travels while it is off); the "full" DOWNGRADE travels even
+        // when the flag is off — the rollback self-heal (an already upgraded
+        // client must be told to send the full form again).
+        if (msgidPinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && msgidPinMode !== null)) {
             msgidModeHeaders = { [MSGID_MODE_HEADER]: msgidPinMode };
         }
         // #3756 snapshot render: outbound prefix from the unified transcript

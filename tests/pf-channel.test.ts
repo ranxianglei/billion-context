@@ -19,6 +19,11 @@ function learn(headersIn: Record<string, string>, seq: string | null | undefined
     pfChannel.pfLearnStamp(headersIn, status, respHeaders);
 }
 
+// #6785 review fix tests: n distinct short ids (the steady-state shape)
+function gen(n: number, prefix = "m"): string[] {
+    return Array.from({ length: n }, (_, i) => `${prefix}${i + 1}`);
+}
+
 test("pf-channel: no stamp yet ⇒ no headers", () => {
     assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: "sid-fresh-1" }), {});
     assert.deepEqual(pfChannel.pfRequestHeaders({}), {});
@@ -347,7 +352,11 @@ test("pf-channel: 'incremental' signal ⇒ the full msgid list stops riding the 
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false);
     // the signal rides WITH the seq stamp (the server stamps both)
     learn(inH, "10", 200, "incremental");
+    // #6785 review fix: suppression requires the CARRIER to be capturable —
+    // production always captures this turn's ids before the stamp decision
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true, "wireCount == learned total ⇒ steady state");
+    pfChannel.pfCaptureIds(sid, gen(12));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 12), true, "growing wire ⇒ still steady state");
     // a mode without a usable seq total is inert (structural coupling to the
     // watermark cohort — the server only stamps the signal there)
@@ -360,12 +369,15 @@ test("pf-channel: 'full' signal ⇒ the full list keeps riding (no suppression)"
     const sid = "sid-mode-full-1";
     const inH = { [CONVO]: sid };
     learn(inH, "10", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
     // a degraded turn tells the client to go full again
     learn(inH, "10", 200, "full");
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "'full' overwrites 'incremental'");
     // the client can grow back into steady state once pins succeed again
     learn(inH, "11", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(11));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 11), true);
 });
 
@@ -373,12 +385,16 @@ test("pf-channel: shrink (wire shorter than the learned total) ⇒ clear + send 
     const sid = "sid-mode-shrink-1";
     const inH = { [CONVO]: sid };
     learn(inH, "10", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
     // compaction/rewind: the wire shrank — the stale anchor cannot be pinned
+    pfChannel.pfCaptureIds(sid, gen(7));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 7), false, "shrinking turn sends the full list");
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "the mode is CLEARED, not just skipped for one turn");
     // a fresh incremental signal re-arms it
     learn(inH, "7", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(7));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 7), true);
 });
 
@@ -386,11 +402,46 @@ test("pf-channel: a >=4xx response clears the learned mode immediately", () => {
     const sid = "sid-mode-4xx-1";
     const inH = { [CONVO]: sid };
     learn(inH, "10", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
     learn(inH, null, 400);
+    pfChannel.pfCaptureIds(sid, gen(10));
     assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "4xx ⇒ back to full until a 2xx restamps");
     // 4xx on an unknown sid is a no-op
     learn({ [CONVO]: "sid-mode-4xx-unknown" }, null, 429);
+});
+
+// #6785 review fix (2026-11-19): suppression is coupled to the CARRIER. The
+// two stuck states below used to strand a session pin-less FOREVER (the
+// server sees neither form ⇒ sends no mode signal ⇒ the client keeps
+// suppressing): a list over the 2048 capture ceiling, and a tail whose
+// encoded bytes exceed the header budget.
+test("pf-channel: list over the capture ceiling ⇒ no tail header AND no suppression (full form keeps riding)", () => {
+    const sid = "sid-mode-oversize-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "3000", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(3000)); // > MAX_IDS ⇒ the store refuses
+    const h = pfChannel.pfRequestHeaders(inH);
+    assert.equal(h["x-bili-pf-count"], "3000");
+    assert.equal(h["x-bili-pf-tail-ids"], undefined, "refused list ⇒ count-only headers");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 3000), false, "no carrier ⇒ the full form rides (pre-§8 behavior, pins fine)");
+});
+
+test("pf-channel: tail payload over the byte budget ⇒ no tail header AND no suppression", () => {
+    const sid = "sid-mode-budget-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "1", 200, "incremental");
+    // one turn adds 500 cores × ~29 chars ⇒ encoded tail ≈ 15 KB > the 8 KB
+    // header budget (a 431 would kill the WHOLE model request)
+    pfChannel.pfCaptureIds(sid, Array.from({ length: 500 }, (_, i) => `${"a".repeat(28)}${i}`));
+    const h = pfChannel.pfRequestHeaders(inH);
+    assert.equal(h["x-bili-pf-count"], "1");
+    assert.equal(h["x-bili-pf-tail-ids"], undefined, "over budget ⇒ the whole request must not 431");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 500), false, "no carrier ⇒ full form rides");
+    // within budget again ⇒ steady state resumes
+    pfChannel.pfCaptureIds(sid, gen(500));
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], gen(500).join(","), "short ids ⇒ the tail goes out");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 500), true);
 });
 
 // #7064 §8 phase 2: pfIdTailForm — the client-side tail derivation for

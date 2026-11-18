@@ -299,11 +299,15 @@ export async function prepareResponses(
         // taken between the cursor write and the flush otherwise reads a
         // STALE parent revision and lands the child on the wrong lane.
         if (s0.anchorAdvanced) markDirty(session);
-        // #7064 §8 phase 2: the pin-mode signal (what the client may send
-        // NEXT turn) rides this lane's response headers — the responses
-        // lane has no watermark plane, so it is stamped independently of
+        // #7064 §8: the pin-mode signal (what the client may send NEXT
+        // turn) rides this lane's response headers — the responses lane
+        // has no watermark plane, so it is stamped independently of
         // x-bili-pf-seq (the client's pfIdTailForm reads mode only).
-        if (featureEnabled("pluginMsgIdIncremental") && s0.pinMode !== null) {
+        // #6785 review fix: "incremental" is gated on the flag (the upgrade
+        // never travels while it is off); the "full" DOWNGRADE travels even
+        // when the flag is off — the rollback self-heal (an already
+        // upgraded client must be told to send the full form again).
+        if (s0.pinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && s0.pinMode !== null)) {
             msgidModeHeaders = { [MSGID_MODE_HEADER]: s0.pinMode };
         }
         // #3756 snapshot render: outbound prefix from the unified transcript

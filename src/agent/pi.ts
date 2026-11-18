@@ -1787,8 +1787,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // ledger was pinned with — reuse the full-resend turn-stamp
             // collector (openai/anthropic/responses; core-aligned via the
             // kernel wireIndex proof). It bails to undefined when pairing is
-            // not provable → tryForkAdoption degrades (the hash track is
-            // deleted, so an unresolvable lane simply does not fork).
+            // not provable → tryForkAdoption degrades to the hash verdict
+            // (#6785 review fix of a wrong comment: the hash track is KEPT
+            // as the floor — #6262; the id track only EXTENDS the
+            // hash-matched branch point, so an unresolvable lane degrades to
+            // the hash track, and a lane with no hash match does not fork).
             const payload = (event as { payload?: unknown } | undefined)?.payload;
             const forkMsgIds = payload !== null && typeof payload === "object" ? resolveEnvelopeIdsForFullResend(payload as Record<string, unknown>, ctx) : undefined;
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: payload, msgIds: forkMsgIds });

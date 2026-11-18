@@ -739,9 +739,14 @@ export async function prepareOpenai(
         });
         // #7064 §8: the pin-mode signal rides WITH the watermark headers —
         // the client relearns the mode exactly when it relearns T (same
-        // chokepoint, one round-trip). Gated on the flag: off = no new
-        // response bytes anywhere.
-        if (featureEnabled("pluginMsgIdIncremental") && s0PinMode !== null) {
+        // chokepoint, one round-trip). "incremental" is gated on the flag
+        // (off ⇒ the upgrade never travels); the "full" DOWNGRADE signal
+        // travels even when the flag is off — that is the rollback
+        // self-heal (#6785 review fix): an already-upgraded client must be
+        // told to go back to the full form when the flag is rolled back,
+        // or it keeps suppressing the full list while the server pins
+        // nothing (silent pin loss until compaction/restart).
+        if (s0PinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && s0PinMode !== null)) {
             wpResponseHeaders[MSGID_MODE_HEADER] = s0PinMode;
         }
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;

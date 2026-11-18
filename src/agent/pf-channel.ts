@@ -47,6 +47,14 @@ const RESERVED_PREFIX = "acp_summary_";
 const BAD_ID_CHARS = /[\s\p{C}]/u;
 const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
 const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
+// #6785 review fix (2026-11-19): byte budget for the tail-ids HEADER value.
+// Node's default maxHeaderSize covers the WHOLE header block (16 KB), and
+// post-§8 this header is the sole id carrier on the openai lane — an
+// oversized value (hundreds of new cores in one turn) would 431 the entire
+// model request. Over budget ⇒ the tail is not emitted and the full form is
+// NOT suppressed either (the pre-§8 body send pins fine; one turn of extra
+// bytes beats a dead request).
+const TAIL_MAX_BYTES = 8 * 1024;
 
 type Tracked = {
     t?: number;
@@ -160,11 +168,25 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const k = slot.t;
     if (k < 1) return {};
     const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
-    const ids = slot.ids;
-    if (ids !== undefined && ids.length >= k) {
-        out[TAIL_IDS_HEADER] = ids.slice(k - 1).map(encodeURIComponent).join(",");
-    }
+    const tail = tailPayloadFor(slot);
+    if (tail !== undefined) out[TAIL_IDS_HEADER] = tail;
     return out;
+}
+
+/** #6785 review fix: the encoded tail-ids payload this turn, or undefined
+ *  when the carrier must stay off (not enough captured ids, or the joined
+ *  value exceeds TAIL_MAX_BYTES). The SAME verdict feeds the header emit
+ *  (pfRequestHeaders) and the full-form suppression (pfSuppressFullMsgIds):
+ *  suppressing the body while the header carrier is absent strands the
+ *  session pin-less FOREVER — the server sees neither form, sends no mode
+ *  signal, and the client keeps suppressing (the >2048-id regime pfCaptureIds
+ *  refuses to store). */
+function tailPayloadFor(slot: Tracked): string | undefined {
+    const t = slot.t;
+    const ids = slot.ids;
+    if (t === undefined || t < 1 || ids === undefined || ids.length < t) return undefined;
+    const payload = ids.slice(t - 1).map(encodeURIComponent).join(",");
+    return payload.length <= TAIL_MAX_BYTES ? payload : undefined;
 }
 
 /** #7064 §8: whether the full msgid list may be SUPPRESSED on THIS outbound
@@ -183,7 +205,11 @@ export function pfSuppressFullMsgIds(sid: string, wireCount: number): boolean {
         slot.mode = undefined; // shrink ⇒ reanchor next turn — never suppress on the shrinking turn
         return false;
     }
-    return true;
+    // #6785 review fix: suppression is coupled to the CARRIER actually going
+    // out this turn (see tailPayloadFor) — a session whose list exceeds
+    // MAX_IDS (or whose tail exceeds TAIL_MAX_BYTES) keeps sending the full
+    // form: the pre-§8 behavior, which pins fine, instead of pin-less.
+    return tailPayloadFor(slot) !== undefined;
 }
 
 /** #7064 §8 phase 2 (owner ruling 2026-11-18): the TAIL form for lanes
