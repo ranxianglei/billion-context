@@ -90,23 +90,63 @@ test("loadDeclaredModelEndpoints: reads the global config file", async () => {
     }
 });
 
-test("loadDeclaredModelEndpoints: missing file or malformed config degrades to empty (never throws)", async () => {
+/** Collect console.error lines emitted while `fn` runs. */
+async function captureStderr<T>(fn: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map((a) => String(a)).join(" ")); };
+    try {
+        const result = await fn();
+        return { result, lines };
+    } finally {
+        console.error = original;
+    }
+}
+
+test("loadDeclaredModelEndpoints: a host with no config file is the default state and stays silent", async () => {
     const saved = process.env.BILI_CONFIG_FILE;
     _resetLoadWarningForTest();
     try {
         process.env.BILI_CONFIG_FILE = path.join(os.tmpdir(), `bili-model-ep-absent-${process.pid}-${Date.now()}.json`);
-        assert.deepEqual(await loadDeclaredModelEndpoints(), []);
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-model-ep-"));
+        const { result, lines } = await captureStderr(() => loadDeclaredModelEndpoints());
+        assert.deepEqual(result, []);
+        assert.deepEqual(lines, [], "a never-configured host must not look broken on first boot");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = saved;
+        _resetLoadWarningForTest();
+    }
+});
+
+test("loadDeclaredModelEndpoints: a present but unusable config warns once, naming the reason", async () => {
+    const saved = process.env.BILI_CONFIG_FILE;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-model-ep-"));
+    _resetLoadWarningForTest();
+    try {
         const bad = path.join(dir, "billion-context.json");
         fs.writeFileSync(bad, "{ not json");
         process.env.BILI_CONFIG_FILE = bad;
-        assert.deepEqual(await loadDeclaredModelEndpoints(), []);
+        const first = await captureStderr(() => loadDeclaredModelEndpoints());
+        assert.deepEqual(first.result, []);
+        assert.equal(first.lines.length, 1, "a malformed config is worth exactly one line");
+        assert.match(first.lines[0]!, /is not a usable billion-context config/);
+        assert.match(first.lines[0]!, /billion-context\.json/, "the line must point at the file");
+
+        // Still one-shot: a second load in the same process adds nothing.
+        const second = await captureStderr(() => loadDeclaredModelEndpoints());
+        assert.deepEqual(second.result, []);
+        assert.deepEqual(second.lines, []);
+
         const badEntry = path.join(dir, "bad-entry.json");
         fs.writeFileSync(badEntry, JSON.stringify({ modelEndpointPatterns: [{ wire: "openai" }] }));
         process.env.BILI_CONFIG_FILE = badEntry;
-        assert.deepEqual(await loadDeclaredModelEndpoints(), []);
-        fs.rmSync(dir, { recursive: true, force: true });
+        _resetLoadWarningForTest();
+        const third = await captureStderr(() => loadDeclaredModelEndpoints());
+        assert.deepEqual(third.result, []);
+        assert.equal(third.lines.length, 1, "structurally invalid declarations are the same class of problem");
+        assert.match(third.lines[0]!, /modelEndpointPatterns\[0\]/);
     } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
         if (saved === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = saved;
         _resetLoadWarningForTest();
