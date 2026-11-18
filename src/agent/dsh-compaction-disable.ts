@@ -221,7 +221,7 @@ export function detectCompactionOverlayGap(ctx: CompactionDisableHost): Compacti
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
     return null;
 }
-export type HostPlaneEntry = {
+type HostPlaneEntry = {
     options?: { id?: unknown; name?: unknown; disabled?: unknown; config?: unknown } | undefined;
 };
 
