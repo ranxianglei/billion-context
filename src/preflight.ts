@@ -500,12 +500,24 @@ export interface RawBodyBreakdown {
     other: number;
 }
 
+// #7175: the foldable message array and the system prompt sit under WIRE-SPECIFIC
+// top-level keys — `messages` (OpenAI chat / Anthropic), `input` (Responses),
+// `contents` (Google) for messages; `system` (Anthropic), `instructions`
+// (Responses), `systemInstruction` (Google) for the system prompt. Bucketing on
+// `messages`/`system` alone dropped the Responses/Google message array into
+// "other", which the #7167 irreducible gate then read as "dimensions folding
+// cannot touch" and 413'd an entirely-foldable body (the #3686/#488-B
+// Responses regressions). `total` is the sum of the buckets either way, so the
+// doom verdicts that price `total` are untouched by this re-split.
+const MESSAGE_ARRAY_KEYS = new Set(["messages", "input", "contents"]);
+const SYSTEM_PROMPT_KEYS = new Set(["system", "instructions", "systemInstruction"]);
+
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            const bucket = MESSAGE_ARRAY_KEYS.has(k) ? 0 : k === "tools" ? 1 : SYSTEM_PROMPT_KEYS.has(k) ? 2 : 3;
             pending.push([v, k, bucket]);
         }
     } else {
