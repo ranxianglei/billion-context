@@ -174,6 +174,49 @@ function stringifyForStore(m: CoreMessage): string {
     }
 }
 
+/** A persisted turn-final reply row. Stored under the session's
+ *  `metadata.handoffReply` (see src/server/handoff-response.ts) — OUTSIDE the
+ *  messages table on purpose: the table's seq space is the ref-ledger
+ *  substrate (persist.maybeRestampToLedger aligns live refs onto row seq+1,
+ *  #4316), so non-view rows would desync every post-fold ref. metadata_json
+ *  is persisted in both the legacy file and the unified DB (identical in
+ *  both views ⇒ digest-equal), so the reply still lands durably in the DB —
+ *  #6947 — without touching the view, the ledger, or any wire. */
+export interface HandoffReplyStashRow {
+    msgId: string;
+    content: string;
+    hash: string;
+    identity: string;
+    role: string;
+    kind: string;
+    media?: { hash: string; bytes: string }[];
+    ts?: number;
+}
+
+/** Plan-ready representation of a core the store has never seen through a
+ *  request — the turn-final handoff reply. Runs the EXACT serialization
+ *  chain the planners use (serializeForStore → splitMediaContent →
+ *  identityOfStoredContent), so the row's identity equals the one a client
+ *  re-send of the same reply would derive — DB readers can dedup the stash
+ *  against view rows by (msgId, identity) if they ever join. Exported so the
+ *  host capture (handoff-response.ts) and this module cannot drift apart. */
+export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
+    const raw = serializeForStore(m);
+    ingestSerializations.count++;
+    const parsed = JSON.parse(raw) as { role?: unknown; contentType?: unknown };
+    const split = splitMediaContent(raw);
+    return {
+        msgId: m.id,
+        content: split.content,
+        hash: split.hash,
+        identity: identityOfStoredContent(split.content),
+        role: typeof parsed.role === "string" ? parsed.role : "assistant",
+        kind: typeof parsed.contentType === "string" ? parsed.contentType : "message",
+        ...(split.media.length > 0 ? { media: split.media } : {}),
+        ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
+    };
+}
+
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
  *  assert the mapping itself. seq assignment: first-seen over the ordered
  *  union (pluginSnapshot first — frozen raw prefix — then fresh tail ids). */
