@@ -86,7 +86,7 @@ test("#3354 registerCompactionDisable: degrades per layer without throwing", () 
     assert.equal(seen.length, 1);
 });
 
-test("#3806 detectCompactionOverlayGap: latched when all three capabilities are present", () => {
+test("#3806 detectCompactionOverlayGap: latched when both capabilities are present", () => {
     assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} }, inject: () => {} }), null);
 });
 
@@ -99,8 +99,8 @@ test("#3806 detectCompactionOverlayGap: missing service provide -> no-service-pr
     assert.equal(detectCompactionOverlayGap({ on: () => {}, inject: () => {} }), "no-service-provide");
 });
 
-test("#7169 detectCompactionOverlayGap: missing inject -> no-preset-register-hook", () => {
-    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} } }), "no-preset-register-hook");
+test("#7169 detectCompactionOverlayGap: missing inject is NOT a gap — the loader-path overlay still latches without it, so the boot alarm must not over-claim", () => {
+    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} } }), null);
 });
 
 test("#3354 registerCompactionDisable: transform honors the entry predicate and preserves siblings", () => {

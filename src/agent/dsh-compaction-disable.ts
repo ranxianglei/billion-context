@@ -289,20 +289,23 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
 }
 
-type CompactionOverlayGap = "no-config-hook" | "no-service-provide" | "no-preset-register-hook";
+type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
 
 /** Why the #3354 load-time overlay cannot latch on this host (null = latched).
  *  Mirrors registerCompactionDisable's own capability checks: without `on` the
- *  internal/config transform never installs, without reflect.provide the
- *  preset inject latch never opens, and without `inject` the runtime
- *  agentPresets.register() wrapper (#7169) never installs — any of the three
- *  leaves dsh native basic compaction ARMED for at least one preset class.
- *  Exposed so the caller can turn the SILENT fail-safe degradation into a
- *  loud boot-time alarm (#3806) instead of letting the user discover an
- *  armed compactor days later through a destroyed fold base. */
+ *  internal/config transform never installs, and without reflect.provide the
+ *  preset inject latch never opens — either way dsh native basic compaction
+ *  stays ARMED. Exposed so the caller can turn the SILENT fail-safe degradation
+ *  into a loud boot-time alarm (#3806) instead of letting the user discover an
+ *  armed compactor days later through a destroyed fold base.
+ *  #7169: an absent `inject` is deliberately NOT a gap — the loader-path
+ *  overlay (the internal/config hook) still latches without it, so the
+ *  "could not latch / likely ARMED" alarm would over-claim. Hosts that predate
+ *  the inject API also predate the runtime agentPresets.register() surface,
+ *  and the wire-level refusal guard (#1729) stays their backstop; the wrapper
+ *  state is observable through the telemetry/coverage text instead. */
 export function detectCompactionOverlayGap(ctx: CompactionDisableHost): CompactionOverlayGap | null {
     if (typeof ctx.on !== "function") return "no-config-hook";
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
-    if (typeof ctx.inject !== "function") return "no-preset-register-hook";
     return null;
 }
