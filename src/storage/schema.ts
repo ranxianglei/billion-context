@@ -1,3 +1,5 @@
+import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
+
 /**
  * Unified storage schema v1 (#2671, 6-OVERALL-DESIGN.md §schema).
  *
@@ -357,7 +359,17 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)
  *  per-element msgid ENVELOPE ({id, pos} canon, #6181 §4.0) — the committed
  *  element-level world M2 delta inbound (src/snapshot/identity.ts matchWorld)
  *  reads/writes; the R3 breaker latch (r3_latched_at, #6181 M3) persists so a
- *  proxy restart does not re-arm a misbehaving host's envelope. */
+ *  proxy restart does not re-arm a misbehaving host's envelope.
+ *
+ *  #7064 msgid-storage slimming (owner ruling 2026-11-17): the per-element
+ *  world is a BOOKKEEPING CURSOR, not a full canon — tail_json/head_json
+ *  hold the last/first id windows of the previous turn's host array
+ *  (WORLD_TAIL_K/WORLD_HEAD_K, src/snapshot/identity.ts), count its length,
+ *  max_pos the append-only pos frontier. The full {id,pos} envelope
+ *  (envelope_json/envelope_checksum) is GONE: D1 (an id verdict never
+ *  diverges) and D2 (conversation-bound sessions skip the verdict) made the
+ *  full canon unnecessary. Pre-slimming rows migrate on first open
+ *  (probe below). */
 const SNAPBASE_DDL_V12 = `-- #5874 snapshot foundation v2 (P0 schema, l1_world identity ledger).
 CREATE TABLE IF NOT EXISTS l1_world (
     sess_raw       TEXT PRIMARY KEY,
@@ -365,8 +377,10 @@ CREATE TABLE IF NOT EXISTS l1_world (
     witness_probe  TEXT NOT NULL,
     issued_at      INTEGER NOT NULL,
     armed_at       INTEGER,
-    envelope_json  TEXT,
-    envelope_checksum TEXT,
+    tail_json      TEXT,
+    head_json      TEXT,
+    count          INTEGER,
+    max_pos        INTEGER,
     r3_latched_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
@@ -382,10 +396,14 @@ CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
  *  time — the "poor-man's S4": the egress read re-derives the same
  *  aggregate and any mismatch (content rewrite, rewind crossing the fold,
  *  row loss) degrades the round to the legacy derive path instead of
- *  serving a stale view. covered_ids pins the id set the hash ran over
- *  (re-derivation needs it; a fold whose ids all retired keeps its row —
- *  the journal is append-only and rows are never rewritten or deleted
- *  except by the session cascade). Probed separately from l1_world: a db
+ *  serving a stale view. #7064 slimming: the hash scope is the RANGE
+ *  [start_seq, end_seq] itself — the id list (covered_ids) is dropped;
+ *  re-derivation range-scans the live rows in the interval (tombstones
+ *  hold their seq, re-mints keep seq with a new content_hash, so the range
+ *  is a faithful re-derivation of the fold's input set). A fold whose rows
+ *  all retired keeps its row — the journal is append-only and rows are
+ *  never rewritten or deleted except by the session cascade. Probed
+ *  separately from l1_world: a db
  *  already at v12 with l1_world but no fold_journal (a dev window between
  *  the two landings) upgrades with this one CREATE, no version bump. */
 const FOLD_JOURNAL_DDL = `-- #5874 v2: append-only fold journal (fold decisions + input aggregate hash).
@@ -396,7 +414,6 @@ CREATE TABLE IF NOT EXISTS fold_journal (
     block_id TEXT NOT NULL,
     start_seq INTEGER NOT NULL,
     end_seq INTEGER NOT NULL,
-    covered_ids TEXT NOT NULL,
     input_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, jseq),
@@ -407,23 +424,22 @@ CREATE TABLE IF NOT EXISTS fold_journal (
 /** #5874 v2 (pure-incremental, step 3): the EGRESS SNAPSHOT — one append-
  *  only row per CUT pinning the derived stable prefix as a content-CAS
  *  reference (prefix_ref, nullable for a hash-only pin) plus the input
- *  aggregate (input_hash) it was derived from, the pinned id set (ids_json —
- *  the read re-derives the aggregate over exactly those ids, ALL generations,
- *  so a content rewrite or new-generation row degrades the round) and the
- *  prefix boundary (watermark = max live seq of the pinned set at cut time).
- *  watermark is informational for the cut-point choice, NOT a hash scope
- *  (see src/storage/snap.ts egressInputHash). Only the newest row per
- *  session is ever served; superseded rows are trimmed by the writer in the
- *  same transaction (releasing their CAS refs) — the table is a cache, not a
- *  journal. Probed separately from fold_journal (same probe-first discipline,
- *  no version bump). */
+ *  aggregate (input_hash) it was derived from and the prefix boundary
+ *  (watermark = max live seq of the pinned set at cut time). #7064
+ *  slimming: the hash scope IS the watermark — the read re-derives the
+ *  aggregate over the LIVE rows with seq <= watermark (ids_json dropped;
+ *  a content rewrite or a new-generation row within the scope degrades the
+ *  round exactly as before). Only the newest row per session is ever
+ *  served; superseded rows are trimmed by the writer in the same
+ *  transaction (releasing their CAS refs) — the table is a cache, not a
+ *  journal. Probed separately from fold_journal (same probe-first
+ *  discipline, no version bump). */
 const EGRESS_SNAPSHOT_DDL = `-- #5874 v2: cut-point materialized egress prefix (CAS-referenced, verify-then-serve).
 CREATE TABLE IF NOT EXISTS egress_snapshot (
     session_id TEXT NOT NULL,
     snap_seq INTEGER NOT NULL,
     watermark INTEGER NOT NULL,
     input_hash TEXT NOT NULL,
-    ids_json TEXT NOT NULL,
     prefix_ref TEXT,
     last_stable_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
@@ -496,6 +512,13 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fold_journal'")
         .get();
     if (!hasFoldJournal) db.exec(FOLD_JOURNAL_DDL);
+    // #7064 slimming: covered_ids is redundant with [start_seq, end_seq]
+    // (probe-first DROP — fresh tables have no such column).
+    if (hasFoldJournal) {
+        const fjCols = (db.prepare("PRAGMA table_info(fold_journal)").all() as unknown as { name?: unknown }[])
+            .map((c) => c.name);
+        if (fjCols.includes("covered_ids")) db.exec("ALTER TABLE fold_journal DROP COLUMN covered_ids");
+    }
     // #5874 v2 (step 3): the egress snapshot is its OWN probe (a db written
     // between the fold_journal and egress_snapshot landings picks it up here;
     // fresh dbs pass through — same discipline, no version bump).
@@ -503,6 +526,13 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_snapshot'")
         .get();
     if (!hasEgressSnapshot) db.exec(EGRESS_SNAPSHOT_DDL);
+    // #7064 slimming: ids_json is redundant with the watermark (probe-first
+    // DROP — fresh tables have no such column).
+    if (hasEgressSnapshot) {
+        const esCols = (db.prepare("PRAGMA table_info(egress_snapshot)").all() as unknown as { name?: unknown }[])
+            .map((c) => c.name);
+        if (esCols.includes("ids_json")) db.exec("ALTER TABLE egress_snapshot DROP COLUMN ids_json");
+    }
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).
@@ -525,8 +555,40 @@ export function migrateSchema(db: {
     const l1Cols = (db.prepare("PRAGMA table_info(l1_world)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
     if (l1Cols.length > 0) {
-        if (!l1Cols.includes("envelope_json")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_json TEXT");
-        if (!l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world ADD COLUMN envelope_checksum TEXT");
+        if (!l1Cols.includes("tail_json")) db.exec("ALTER TABLE l1_world ADD COLUMN tail_json TEXT");
+        if (!l1Cols.includes("head_json")) db.exec("ALTER TABLE l1_world ADD COLUMN head_json TEXT");
+        if (!l1Cols.includes("count")) db.exec("ALTER TABLE l1_world ADD COLUMN count INTEGER");
+        if (!l1Cols.includes("max_pos")) db.exec("ALTER TABLE l1_world ADD COLUMN max_pos INTEGER");
+        // #7064 slimming migration: a pre-slimming row's full envelope
+        // (envelope_json) reshapes onto the window columns once — the
+        // checksum column is dropped with it (D1: no verdict reads it).
+        // Rows whose JSON does not parse degrade to a BLANK cursor (the
+        // next turn re-issues the world; D1: bookkeeping, never a reject).
+        if (l1Cols.includes("envelope_json")) {
+            const legacy = (db.prepare(
+                "SELECT sess_raw, envelope_json FROM l1_world WHERE envelope_json IS NOT NULL AND (tail_json IS NULL OR count IS NULL)"
+            ).all() as unknown as { sess_raw: string, envelope_json: string | null }[]);
+            for (const row of legacy) {
+                let tail = "[]";
+                let head = "[]";
+                let count = 0;
+                let maxPos = 0;
+                try {
+                    const win = parseLegacyEnvelopeToWindow(row.envelope_json ?? "[]");
+                    tail = JSON.stringify(win.tailIds);
+                    head = JSON.stringify(win.headIds);
+                    count = win.count;
+                    maxPos = win.maxPos;
+                } catch {
+                    // blank cursor — world re-issues on the next turn
+                }
+                db.prepare(
+                    "UPDATE l1_world SET tail_json = ?, head_json = ?, count = ?, max_pos = ? WHERE sess_raw = ?"
+                ).run(tail, head, count, maxPos, row.sess_raw);
+            }
+            db.exec("ALTER TABLE l1_world DROP COLUMN envelope_json");
+            if (l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world DROP COLUMN envelope_checksum");
+        }
         // #6181 M3: the R3 breaker latch PERSISTS (a proxy restart must not
         // re-arm a misbehaving host's sid and re-400 the same broken
         // envelope); NULL/0 = not latched, else the epoch-ms of the latch.

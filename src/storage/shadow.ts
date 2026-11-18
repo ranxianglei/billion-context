@@ -994,6 +994,12 @@ export class UnifiedShadow {
         this.sync.snapStage0Reset(sessionId);
     }
 
+    /** #7064 D2: conversation-bound check (see UnifiedStore.snapConvBound). */
+    snapConvBound(sessionId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.snapConvBound(sessionId);
+    }
+
     /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
     snapR3Latched(sessionId: string): boolean {
         if (this.sync === null) return false;

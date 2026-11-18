@@ -11,19 +11,19 @@
  * the R3 gate) with its paired ± pins.
  *
  * Unit scope:
- *   W*  the world verdicts — echo/probe/scatter/issue/diverge/resync ± pairs
- *       (acceptance 5), the B1 origin-immutability trap, matchAppend.
- *   A*  store seam — M2 seqs-carrier gating (±), #7 resync one-round
+ *   W*  the world verdicts — echo/extend/shrink/reanchor/issue/resync ± pairs
+ *       (acceptance 5, #7064 D1: NO verdict diverges), matchAppendWindow.
+ *   A*  store seam — M2 seqs-carrier gating (±), #7 reanchor one-round
  *       convergence (acceptance 7), M4 codec-level pin.
  *   R*  red gates — R3 identity fault (400 + zero side effects + breaker),
- *       R2 diverge zero side effects.
+ *       reanchor one cheap UPDATE (no reject).
  *   S*  the stage-0 store seam — M1 seed → M2 append → M1 echo round trip
  *       through SQLite.
  *   B*  HTTP e2e — R3 400 funnel, pure-continuation passthrough.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
+import fs, { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -32,18 +32,21 @@ import { openaiToCore } from "acp-kernel/wire";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import {
-    matchWorld,
-    matchAppend,
+    matchAppendWindow,
+    matchWindow,
+    windowOf,
 } from "../src/snapshot/identity.ts";
-import type { WorldEnvelopeEntry } from "../src/snapshot/types.ts";
-import { envelopeChecksum } from "../src/snapshot/checksums.ts";
+import type { WorldWindow } from "../src/snapshot/types.ts";
 import {
     FoundationRejectError,
     R3FaultTracker,
     checkR3Identity,
+    r3FaultTracker,
     stage0Decide,
 } from "../src/snapshot/plane.ts";
-import { snapL1Lookup, snapL1EnvelopeRead, snapL1Record, type DbLike } from "../src/storage/snap.ts";
+import { runStage0 } from "../src/snapshot/stage0.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { snapL1Lookup, snapL1WindowRead, snapL1Record, type DbLike } from "../src/storage/snap.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5874-p3-"));
@@ -54,18 +57,17 @@ fs.writeFileSync(configPath, "{}");
 // Fixtures
 // ---------------------------------------------------------------------------
 
-type StoredCanon = {
+type StoredWorld = {
     ledgerId: string;
-    envelope: WorldEnvelopeEntry[];
-    envelopeChecksum: string;
+    window: WorldWindow;
     issuedAt: number;
     armedAt?: number;
 };
 
 interface WorldMatchInputLocal {
-    stored: StoredCanon | null;
+    stored: WorldWindow | null;
+    issuedAt: number;
     incoming: string[];
-    explainedGone?: Set<string>;
     sessRaw: string;
     ledgerId: string;
     now: number;
@@ -74,21 +76,21 @@ interface WorldMatchInputLocal {
 
 const now0 = 1_700_000_000_000;
 
-/** A stored element envelope (canon) for ids 0..n-1 (1-based ids m1..
- *  1-based pos, the issue/resync shape). */
-function canon(n: number): StoredCanon {
+/** A stored world cursor (windows) for ids 0..n-1 (1-based ids m1.., 1-based
+ *  pos, the issue/resync shape). */
+function world(n: number): StoredWorld {
     const ids = Array.from({ length: n }, (_, i) => `m${i + 1}`);
     return {
         ledgerId: "sid-t",
-        envelope: ids.map((id, i) => ({ id, pos: i + 1 })),
-        envelopeChecksum: envelopeChecksum(ids),
+        window: windowOf(ids, n),
         issuedAt: now0,
     };
 }
 
-function matchInput(stored: StoredCanon | null, incoming: string[], extra: Partial<WorldMatchInputLocal> = {}): WorldMatchInputLocal {
+function matchInput(stored: StoredWorld | null, incoming: string[], extra: Partial<WorldMatchInputLocal> = {}): WorldMatchInputLocal {
     return {
-        stored,
+        stored: stored === null ? null : stored.window,
+        issuedAt: stored === null ? 0 : stored.issuedAt,
         incoming,
         sessRaw: "sess-t",
         ledgerId: "sid-t",
@@ -144,85 +146,87 @@ function plainSession(id: string, n: number): LegacySessionLike {
 // W — the world verdicts (acceptance 5: each verdict with paired +/- tests)
 // ---------------------------------------------------------------------------
 
-test("W1 echo: the same envelope checksums → echo, canon untouched, B1 origin frozen", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["m1", "m2", "m3", "m4"]));
+test("W1 echo: the same window state → echo, cursor untouched, B1 origin frozen", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["m1", "m2", "m3", "m4"]));
     assert.equal(d.mode, "echo");
-    assert.deepEqual(d.envelope, stored.envelope, "the stored canon is returned VERBATIM (B1: origin ids never re-minted)");
-    assert.equal(d.envelopeChecksum, stored.envelopeChecksum);
+    assert.equal(d.window, stored.window, "the stored cursor is returned VERBATIM (B1: origin ids never re-minted)");
     assert.deepEqual(d.newIdPos, []);
 });
 
-test("W2 echo +/- : one id changed → NOT echo (the checksum is content-binding)", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["m1", "m2", "X", "m4"]));
+test("W2 echo +/- : one id changed → NOT echo (a middle rewrite is a reanchor, D1: never a reject)", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["m1", "m2", "X", "m4"]));
     assert.notEqual(d.mode, "echo");
+    assert.equal(d.mode, "reanchor");
 });
 
-test("W3 probe: a tail extension → probe, fresh pos at maxPos+1", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["m1", "m2", "m3", "m4", "m5"]));
-    assert.equal(d.mode, "probe");
+test("W3 extend: a tail extension → extend, fresh pos at maxPos+1", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["m1", "m2", "m3", "m4", "m5"]));
+    assert.equal(d.mode, "extend");
     assert.deepEqual(d.newIdPos, [{ id: "m5", pos: 5 }]);
 });
 
-test("W4 probe +/- : the extension with a GAP in the middle → scatter", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["m1", "m3", "m5"]));
-    assert.equal(d.mode, "scatter");
+test("W4 extend +/- : the extension with a GAP in the middle → reanchor (D1: no scatter reject)", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["m1", "m3", "m5"]));
+    assert.equal(d.mode, "reanchor");
 });
 
-test("W5 issue: no stored canon → issue, fresh pos 0.., armed now", () => {
-    const d = matchWorld(matchInput(null, ["a", "b"]));
+test("W5 issue: no stored cursor → issue, fresh pos 0.., issued now", () => {
+    const d = matchWindow(matchInput(null, ["a", "b"]));
     assert.equal(d.mode, "issue");
     assert.deepEqual(d.newIdPos, [{ id: "a", pos: 1 }, { id: "b", pos: 2 }]);
-    assert.equal(d.armedAt, now0 + 1);
+    assert.equal(d.issuedAt, now0 + 1);
 });
 
-test("W6 issue +/- : resync with a stored canon → re-issue pos 1.. from the client array", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["X", "Y", "Z"], { resync: true }));
+test("W6 issue +/- : resync with a stored cursor → re-issue pos 1.. from the client array", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["X", "Y", "Z"], { resync: true }));
     assert.equal(d.mode, "resync");
     assert.deepEqual(d.newIdPos, [{ id: "X", pos: 1 }, { id: "Y", pos: 2 }, { id: "Z", pos: 3 }]);
 });
 
-test("W7 diverge: head moved → diverge, canon untouched", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["OTHER", "m1", "m2", "m3"]));
-    assert.equal(d.mode, "diverge");
+test("W7 head swap → reanchor (D1: NEVER diverge — the cursor re-issues, nothing is rejected)", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["OTHER", "m1", "m2", "m3"]));
+    assert.equal(d.mode, "reanchor");
 });
 
-test("W8 diverge: survivor order broken → diverge", () => {
-    const stored = canon(4);
-    const d = matchWorld(matchInput(stored, ["m1", "m3", "m2", "m4"]));
-    assert.equal(d.mode, "diverge");
+test("W8 survivor order broken → reanchor (D1: never diverge)", () => {
+    const stored = world(4);
+    const d = matchWindow(matchInput(stored, ["m1", "m3", "m2", "m4"]));
+    assert.equal(d.mode, "reanchor");
 });
 
-test("W9 diverge +/- : a fold-explained gone at the head is NOT a head move", () => {
-    const stored = canon(4);
-    // m1 is covered by a live fold (legally vanished); the rest are intact.
-    const d = matchWorld(matchInput(stored, ["m2", "m3", "m4"], { explainedGone: new Set(["m1"]) }));
-    assert.equal(d.mode, "probe");
+test("W9 fold-explained head drop → shrink (legal, no new ids)", () => {
+    const stored = world(4);
+    // m1 vanished (covered by a live fold); the rest are intact — the whole
+    // incoming is a suffix of the stored tail.
+    const d = matchWindow(matchInput(stored, ["m2", "m3", "m4"]));
+    assert.equal(d.mode, "shrink");
     assert.deepEqual(d.newIdPos, []);
+    assert.deepEqual(d.goneIds, ["m1"], "the windowed gone-set sees the dropped head anchor");
 });
 
-test("W10 matchAppend: pure M2 addition — canon order preserved, whole-sequence checksum", () => {
-    const stored = canon(4);
-    const d = matchAppend(stored, ["m5", "m6"]);
-    assert.equal(d.mode, "probe");
+test("W10 matchAppendWindow: pure M2 addition — head unchanged, tail extended", () => {
+    const stored = world(4);
+    const d = matchAppendWindow(stored.window, ["m5", "m6"]);
+    assert.equal(d.mode, "extend");
     assert.deepEqual(d.newIdPos, [{ id: "m5", pos: 5 }, { id: "m6", pos: 6 }]);
     assert.deepEqual(
-        d.envelope.map((e) => e.id),
+        d.window.tailIds,
         ["m1", "m2", "m3", "m4", "m5", "m6"],
         "the stored order is preserved, new ids appended",
     );
-    assert.equal(d.envelopeChecksum, envelopeChecksum(["m1", "m2", "m3", "m4", "m5", "m6"]));
+    assert.equal(d.window.count, 6);
 });
 
-test("W11 matchAppend +/- : the next M1 full resend echoes (the round-trip)", () => {
-    const stored = canon(4);
-    const app = matchAppend(stored, ["m5"]);
-    const re = matchWorld(matchInput({ ...stored, envelope: app.envelope, envelopeChecksum: app.envelopeChecksum }, ["m1", "m2", "m3", "m4", "m5"]));
+test("W11 matchAppendWindow +/- : the next M1 full resend echoes (the round-trip)", () => {
+    const stored = world(4);
+    const app = matchAppendWindow(stored.window, ["m5"]);
+    const re = matchWindow({ ...matchInput(stored, ["m1", "m2", "m3", "m4", "m5"]), stored: app.window });
     assert.equal(re.mode, "echo");
     assert.deepEqual(re.newIdPos, []);
 });
@@ -237,25 +241,25 @@ function storeWithRows(n: number, sid: string): UnifiedStore {
     return store;
 }
 
-test("A1b #2 +/- : the M2 branch REQUIRES the seqs carrier (no seqs → matchWorld path)", () => {
+test("A1b #2 +/- : the M2 branch REQUIRES the seqs carrier (no seqs → matchWindow path)", () => {
     const sid = "a1b";
     const store = storeWithRows(10, sid);
     store.snapStage0(sid, Array.from({ length: 10 }, (_, i) => `m${i + 1}`));
-    // All-unknown WITHOUT seqs: a full (re-minted) envelope → matchWorld →
-    // the old canon ids are gone → head moved → diverge (never guess).
+    // All-unknown WITHOUT seqs: a full (re-minted) array → matchWindow →
+    // no anchor overlap → reanchor (D1: the cursor re-issues, never rejects).
     const d = store.snapStage0(sid, ["m11"]);
-    assert.equal(d.decision.mode, "diverge");
+    assert.equal(d.decision.mode, "reanchor");
 });
 
-test("A1c #2 +/- : a non-contiguous seqs run falls back to matchWorld", () => {
+test("A1c #2 +/- : a non-contiguous seqs run falls back to matchWindow", () => {
     const sid = "a1c";
     const store = storeWithRows(10, sid);
     store.snapStage0(sid, Array.from({ length: 10 }, (_, i) => `m${i + 1}`));
     const d = store.snapStage0(sid, ["m11"], { seqs: [15] });
-    assert.notEqual(d.decision.mode, "probe", "seqs[0]=15 != frontier+1=11 → not the M2 append");
+    assert.notEqual(d.decision.mode, "extend", "seqs[0]=15 != frontier+1=11 → not the M2 append");
 });
 
-test("A4 #7 resync: diverge → zero side effects (the canon is untouched), resync one-round convergence", () => {
+test("A4 #7 reanchor: a structural change re-issues the cursor, one-round convergence (D1: no reject)", () => {
     const sid = "a4";
     const store = storeWithRows(10, sid);
     const ten = Array.from({ length: 10 }, (_, i) => `m${i + 1}`);
@@ -263,26 +267,21 @@ test("A4 #7 resync: diverge → zero side effects (the canon is untouched), resy
     assert.equal(seed.decision.mode, "issue");
     const db = (store as unknown as { db: DbLike }).db;
     const sessRaw = sid; // plainSession id == conversation id
-    const before = snapL1EnvelopeRead(db, sessRaw);
-    assert.ok(before && before.envelopeChecksum);
+    const before = snapL1WindowRead(db, sessRaw);
+    assert.ok(before && before.window, "the seed cursor is persisted");
 
     const d = store.snapStage0(sid, ["OTHER", "m1", "m2"]);
-    assert.equal(d.decision.mode, "diverge");
-    assert.equal(d.diverge, true);
+    assert.equal(d.decision.mode, "reanchor", "D1: a head swap re-anchors — it never rejects");
+    assert.deepEqual(d.decision.window.tailIds, ["OTHER", "m1", "m2"], "the new cursor follows the incoming");
 
-    // Zero side effects: the diverge turn persisted nothing.
-    const after = snapL1EnvelopeRead(db, sessRaw);
-    assert.equal(after!.envelopeChecksum, before!.envelopeChecksum, "the diverge wrote nothing");
+    // The next turn with the same array converges to echo (one-round).
+    const re = store.snapStage0(sid, ["OTHER", "m1", "m2"]);
+    assert.equal(re.decision.mode, "echo");
 
-    // The resync: reset + re-issue from the client's CURRENT array →
-    // one-round convergence.
-    store.snapStage0Reset(sid);
-    const re = store.snapStage0(sid, ["OTHER", "m1", "m2"], { resync: true });
-    assert.equal(re.decision.mode, "resync");
-    assert.deepEqual(
-        re.decision.envelope.map((e) => e.id),
-        ["OTHER", "m1", "m2"],
-    );
+    // An explicit re-baseline still re-issues from the client array.
+    const rs = store.snapStage0(sid, ["OTHER", "m1", "m2"], { resync: true });
+    assert.equal(rs.decision.mode, "resync");
+    assert.deepEqual(rs.decision.window.tailIds, ["OTHER", "m1", "m2"]);
 });
 
 test("A4b #7 +/- : a plain issue is the NORMAL seed (not a resync)", () => {
@@ -363,25 +362,26 @@ test("R4 R3 +/- : the window expires (a new window restarts the strike count)", 
     assert.equal(t.isLatched("s"), false);
 });
 
-test("R5 R2: diverge = zero side effects (stage0Decide writes nothing on a structural disagreement)", () => {
+test("R5 R2: reanchor = one cheap cursor re-issue (stage0Decide NEVER rejects a structural disagreement)", () => {
     const dir = path.join(hermetic, "r5");
     fs.mkdirSync(dir, { recursive: true });
     const db = (openPlane(path.join(dir, "index.db")) as unknown as { db: DbLike }).db;
     // The l1 row is recorded by the store facade before stage0 (the lane
     // path) — do it here so the pure function has its world to match.
     snapL1Record(db, "s5", "s5", "witness", now0);
-    // Seed the world: issue a 3-id envelope.
+    // Seed the world: issue a 3-id cursor.
     const seed = stage0Decide({ db, sessRaw: "s5", ledgerId: "s5", incoming: ["a", "b", "c"], maxSeq: 0, explainedGone: new Set(), now: now0 });
     assert.equal(seed.decision.mode, "issue");
-    // A structural disagreement (head moved): the verdict is diverge and the
-    // stored envelope is UNCHANGED (zero side effects — the lane runs the
-    // legacy round and the client converges next turn).
+    // A structural disagreement (head swap): the verdict is reanchor — the
+    // cursor re-issues (D1: no reject, no lane reset; middle-tamper is the
+    // ledger probes' job, not the cursor's).
     const d = stage0Decide({ db, sessRaw: "s5", ledgerId: "s5", incoming: ["OTHER", "a", "b"], maxSeq: 0, explainedGone: new Set(), now: now0 + 1 });
-    assert.equal(d.diverge, true);
+    assert.equal(d.decision.mode, "reanchor");
     const l1 = snapL1Lookup(db, "s5");
     assert.ok(l1, "the seed l1 row exists");
-    const env = snapL1EnvelopeRead(db, "s5");
-    assert.equal(env!.envelopeChecksum, seed.decision.envelopeChecksum, "the diverge persisted nothing");
+    const env = snapL1WindowRead(db, "s5");
+    assert.ok(env && env.window, "the reanchor persisted the new cursor");
+    assert.deepEqual(env!.window!.tailIds, ["OTHER", "a", "b"], "the re-issued cursor follows the incoming");
 });
 
 // ---------------------------------------------------------------------------
@@ -402,16 +402,16 @@ test("S1 the full M1→M2 round trip: seed (issue) → M1 probe → M2 append �
     // M1 tail extension: full resend + one new id (1-based pos: seed is 1..3
     // → m4 lands at pos 4).
     const m1 = store.snapStage0(sid, ["m1", "m2", "m3", "m4"]);
-    assert.equal(m1.decision.mode, "probe");
+    assert.equal(m1.decision.mode, "extend");
     assert.deepEqual(m1.decision.newIdPos, [{ id: "m4", pos: 4 }]);
 
     // M2: ONLY the new id + the seqs carrier (3 live rows seq 1..3 →
     // frontier 3, the next seq is 4).
     store.ingestSession(planIngest(plainSession(sid, 4)));
     const m2 = store.snapStage0(sid, ["m5"], { seqs: [4] });
-    assert.equal(m2.decision.mode, "probe", "the M2 append");
+    assert.equal(m2.decision.mode, "extend", "the M2 append");
     assert.deepEqual(m2.decision.newIdPos, [{ id: "m5", pos: 5 }]);
-    assert.deepEqual(m2.decision.envelope.map((e) => e.id), ["m1", "m2", "m3", "m4", "m5"]);
+    assert.deepEqual(m2.decision.window.tailIds, ["m1", "m2", "m3", "m4", "m5"]);
 
     // The next M1 full resend must ECHO the matchAppend canon.
     const echo = store.snapStage0(sid, ["m1", "m2", "m3", "m4", "m5"]);
@@ -520,7 +520,6 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 function listenT(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -669,4 +668,163 @@ test("B3: a plugin chained round with EMPTY input is a pure continuation — the
         },
         {},
     );
+});
+
+// ---------------------------------------------------------------------------
+// D2/D3 — the #7064 lane-level contracts (runStage0, both-wire shared)
+// ---------------------------------------------------------------------------
+// D2: a conversation-bound sid (host identity registered) NEVER takes the
+//     R3 fault path — a short/missing declared array degrades to
+//     content-derived ids instead of 400/latch, on miss AND hit turns.
+// D3: the world cursor (tail anchor) stays LIVE across watermark-hit runs —
+//     a hit turn with a valid declared array refreshes the cursor.
+
+type DLog = { level: string, msg: string };
+
+function d23Harness(t: test.TestContext) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "bili-5874-d23-"));
+    const prevEnv: Record<string, string | undefined> = {};
+    for (const k of ["BILI_STORAGE_UNIFIED", "BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) {
+        prevEnv[k] = process.env[k];
+        process.env[k] = k.startsWith("XDG") ? dir : (k === "BILI_STORAGE_UNIFIED" ? "full" : "1");
+    }
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    // runStage0 talks to the store through the SessionStore seam — give it
+    // the three snap delegates, delegating to the real UnifiedStore.
+    _setStoreForTest({
+        setSessionCommitListener() { /* the seam only needs the three snap delegates */ },
+        snapStage0: (sid: string, ids: string[], opts?: { seqs?: number[] | null }) => store.snapStage0(sid, ids, opts),
+        snapConvBound: (sid: string) => store.snapConvBound(sid),
+        snapR3Latched: (sid: string) => store.snapR3Latched(sid),
+    } as unknown as Parameters<typeof _setStoreForTest>[0]);
+    t.after(() => {
+        for (const [k, v] of Object.entries(prevEnv)) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    });
+    return { dir, store };
+}
+
+function dMsgs(n: number): BiliMessage[] {
+    const arr: { role: string, content: string }[] = [{ role: "system", content: "sys" }];
+    for (let i = 1; i <= n; i++) arr.push({ role: i % 2 ? "user" : "assistant", content: `c${i}` });
+    return (openaiToCore({ messages: arr } as never)).msgs;
+}
+
+test("#7064 D2: a conversation-bound sid never takes the R3 fault path", async (t) => {
+    const { store } = d23Harness(t);
+    const sid = "d2-sid";
+    const db = store as unknown as { db: DbLike };
+    db.db.prepare(`INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES ('default', 'd2-conv', ?, 0)`).run(sid);
+    const logs: DLog[] = [];
+    const log = (level: string, msg: string) => logs.push({ level, msg });
+    try {
+        assert.ok(store.snapConvBound(sid), "the conversations row makes the sid conversation-bound");
+        // a non-bound sid with the SAME fault 400s (control):
+        assert.throws(() => runStage0({
+            sessionId: "d2-sid-nobound",
+            lane: "openai",
+            msgs: dMsgs(5),
+            incomingMsgIds: ["a", "b"], // 2 ids for 6 messages
+            incomingSeqs: null,
+            pluginMode: true,
+            log,
+        }), FoundationRejectError, "non-bound sid: R3 fault 400s");
+        const r = runStage0({
+            sessionId: sid,
+            lane: "openai",
+            msgs: dMsgs(5),
+            incomingMsgIds: ["a", "b"], // the same fault — bound: no throw
+            incomingSeqs: null,
+            pluginMode: true,
+            log,
+        });
+        assert.equal(r.pinned, null, "the pin is rejected — content-derived ids");
+        assert.ok(logs.some((l) => l.level === "warn" && l.msg.includes("conversation-bound sid skips the R3 fault")), `the degrade is logged: ${logs.map((l) => l.msg).join(" | ")}`);
+        // and a watermark-HIT turn: same degrade, no throw, no latch (D3 arm).
+        r3FaultTracker.clearLatched(sid);
+        const r2 = runStage0({
+            sessionId: sid,
+            lane: "openai",
+            msgs: dMsgs(5),
+            incomingMsgIds: ["a"], // worse: 1 id for 6
+            incomingSeqs: null,
+            pluginMode: true,
+            wpHit: { view: [] as BiliMessage[], lastSeq: 5 },
+            log,
+        });
+        assert.equal(r2.pinned, null);
+        assert.ok(!r3FaultTracker.isLatched(sid), "no fault was recorded for the bound sid");
+        // store seam: a bound sid whose pin DID apply skips the id verdict
+        // entirely — mode "anchor", no reject possible (D1 floor).
+        const msgs = dMsgs(2);
+        const res = store.snapStage0(sid, msgs.map((m) => m.id), {});
+        assert.ok(res !== null, "stage0 ran");
+        assert.equal(res.decision.mode, "anchor");
+        assert.equal(res.decision.witness, "anchor: conversation-bound, id verdict skipped");
+        assert.equal(snapL1WindowRead(db.db, sid)?.window ?? null, null, "anchor persists nothing — the ledger rows are the identity");
+    } finally {
+        r3FaultTracker.clearLatched(sid);
+        r3FaultTracker.clearLatched("d2-sid-nobound");
+    }
+});
+
+test("#7064 D3: the tail anchor stays live across watermark-hit runs", async (t) => {
+    const { store } = d23Harness(t);
+    const sid = "d3-sid";
+    const db = store as unknown as { db: DbLike };
+    const logs: DLog[] = [];
+    const log = (level: string, msg: string) => logs.push({ level, msg });
+    try {
+        const msgs1 = dMsgs(4);
+        const ids1 = msgs1.map((m) => m.id);
+        const r1 = runStage0({
+            sessionId: sid,
+            lane: "openai",
+            msgs: msgs1,
+            incomingMsgIds: ids1,
+            incomingSeqs: null,
+            pluginMode: true,
+            log,
+        });
+        assert.notEqual(r1.pinned, null, "turn 1 pins the host ids");
+        assert.equal(r1.anchorAdvanced, true, "the cursor issued");
+        assert.equal(snapL1WindowRead(db.db, sid)?.window?.maxPos ?? -1, ids1.length, "cursor issued at the full array length");
+        // turn 2 is a watermark HIT (wpHit stubbed) and the host appended one
+        // message — pre-slimming this turn would have skipped stage-0 and the
+        // cursor would have gone stale.
+        const msgs2 = dMsgs(5);
+        const ids2 = msgs2.map((m) => m.id);
+        const r2 = runStage0({
+            sessionId: sid,
+            lane: "openai",
+            msgs: msgs2,
+            incomingMsgIds: ids2,
+            incomingSeqs: null,
+            pluginMode: true,
+            wpHit: { view: msgs1, lastSeq: ids1.length },
+            log,
+        });
+        assert.notEqual(r2.pinned, null, "the hit turn pins too (c3623bf1)");
+        assert.equal(r2.anchorAdvanced, true, "the hit turn refreshes the cursor (D3 尾锚常活)");
+        const w = snapL1WindowRead(db.db, sid)?.window;
+        assert.ok(w !== null && w !== undefined, "the window was refreshed");
+        assert.equal(w.maxPos, ids2.length, "the cursor now spans the hit turn's array");
+        assert.deepEqual(w.tailIds.slice(-1), [ids2[ids2.length - 1]], "the new tail id is in the window");
+        // a plain echo still reports no advance (epoch bump stays quiet).
+        const r3 = runStage0({
+            sessionId: sid,
+            lane: "openai",
+            msgs: msgs2,
+            incomingMsgIds: ids2,
+            incomingSeqs: null,
+            pluginMode: true,
+            wpHit: { view: msgs2, lastSeq: ids2.length },
+            log,
+        });
+        assert.equal(r3.anchorAdvanced, false, "an echo turn does not bump the epoch");
+    } finally {
+        r3FaultTracker.clearLatched(sid);
+    }
 });

@@ -2,26 +2,28 @@
  * #5874 / 2×2 — stage 0 (identity / world match) decision glue.
  *
  * Sits at the head of the chain (raw bytes → **stage 0** → protocol
- * conversion → kernel → egress). It runs the pure `matchWorld`
- * (identity.ts) on the l1_world element envelope and carries the R3 identity
+ * conversion → kernel → egress). It runs the pure `matchWindow`
+ * (identity.ts) on the l1_world world cursor and carries the R3 identity
  * fault policy (red gate R3):
  *
  *   - a cohort host that DECLARED the dual-channel (per-element msgids) but
  *     did not collect them all → the request is HARD-REJECTED (400) BEFORE
  *     any table/kernel side effect, and the fault feeds a fastpath-style
  *     breaker (10-minute window, 3 strikes → a persistent per-sid latch that
- *     keeps rejecting until an operator clears it).
+ *     keeps rejecting until an operator clears it). #7064 D1/D2: the fault
+ *     path NEVER fires for CONVERSATION-BOUND sessions (the host conversation
+ *     identity IS the identity) — the cursor is bookkeeping there.
  *
  * The decision itself is pure (identity.ts); this module adds the storage
- * glue (read the stored envelope, persist the new canon) — and ONLY for
- * non-diverge verdicts (a diverge turn has zero side effects by
- * construction). The gone-set and the ledger frontier are COMPUTED by the
- * store (messages × blocks coverage, max live seq) and passed in: the pure
- * core never touches a table (pure-incremental redesign: there is no
+ * glue (read the stored cursor, persist the new window) — and only for
+ * verdicts that moved the cursor (echo/replay persist nothing: no write per
+ * steady-state turn). The gone-set and the ledger frontier are COMPUTED by
+ * the store (messages × blocks coverage, max live seq) and passed in: the
+ * pure core never touches a table (pure-incremental redesign: there is no
  * per-row plane to read).
  */
-import { matchAppend, matchWorld, parseEnvelope } from "./identity.ts";
-import { snapL1EnvelopeRead, snapL1EnvelopeUpsert, snapL1Lookup } from "../storage/snap.ts";
+import { matchAppendWindow, matchWindow, windowOf } from "./identity.ts";
+import { snapL1Lookup, snapL1WindowRead, snapL1WindowUpsert } from "../storage/snap.ts";
 import type { DbLike } from "../storage/snap.ts";
 import type { WorldDecision } from "./types.ts";
 
@@ -124,26 +126,27 @@ interface Stage0Input {
     resync?: boolean;
     maxSeq: number;
     explainedGone: Set<string>;
+    /** D2 (#7064): the session carries a host conversation identity — the
+     *  per-turn id verdict is skipped entirely (the cursor follows the
+     *  incoming unconditionally; no replay guard, no R3 fault). */
+    convBound?: boolean;
     now?: number;
 }
 
 export interface Stage0Result {
     /** The pure world-match verdict (identity.ts). */
     decision: WorldDecision;
-    /** True when the verdict is `diverge` — the caller runs this turn on the
-     *  legacy path with ZERO identity side effects (the canon is untouched;
-     *  the client converges one turn later). */
-    diverge: boolean;
     /** The fold-explained gone set — exposed for the reconcile and tests. */
     explainedGone: Set<string>;
 }
 
-/** Run stage 0: read the stored element envelope, match the incoming ids
- *  against it (with the store-computed gone set + frontier), and (for every
- *  verdict except `diverge`) persist the new canon. A `diverge` turn writes
- *  NOTHING (zero side effects).
+/** Run stage 0: read the stored world cursor, match the incoming ids
+ *  against it (with the store-computed gone set + frontier), and persist
+ *  the new window whenever it moved (echo/replay write nothing). #7064
+ *  D1: NO verdict rejects or resets — the strongest move is `reanchor`
+ *  (re-issue the cursor from the incoming, one cheap UPDATE).
  *
- *  The pos values the verdict issues are the LOGICAL append-only envelope
+ *  The pos values the verdict issues are the LOGICAL append-only cursor
  *  positions (maxPos+1..); the physical ledger seq is assigned by the
  *  ingest in the same incoming order, so the two agree for tail-appends.
  *  For scatter (middle insertion) the ingest re-homes in the same
@@ -151,69 +154,83 @@ export interface Stage0Result {
 export function stage0Decide(input: Stage0Input): Stage0Result {
     const now = input.now ?? Date.now();
     const l1 = snapL1Lookup(input.db, input.sessRaw);
-    const env = snapL1EnvelopeRead(input.db, input.sessRaw);
+    const read = snapL1WindowRead(input.db, input.sessRaw);
     const explainedGone = input.explainedGone;
     const planeMaxSeq = input.maxSeq;
 
-    const stored =
-        l1 && env && env.envelopeJson !== null && env.envelopeChecksum !== null
-            ? {
-                  ledgerId: l1.ledgerId,
-                  envelope: parseEnvelope(env.envelopeJson).envelope,
-                  envelopeChecksum: env.envelopeChecksum,
-                  issuedAt: l1.issuedAt,
-                  armedAt: l1.armedAt ?? undefined,
-              }
-            : null;
+    const storedWindow = l1 && read !== null && read.window !== null ? read.window : null;
+    const storedIssuedAt = l1 ? (read !== null ? read.issuedAt : l1.issuedAt) : 0;
 
     let decision: WorldDecision;
     const seqs = input.seqs ?? null;
-    const storedSet = stored !== null ? new Set(stored.envelope.map((e) => e.id)) : null;
-    // Review-round-2 Residual 1b: the host re-sent a body this proxy already
-    // processed — every id is already in the stored canon and the carrier
-    // seqs (when present) sit at/below the ledger frontier (the original
-    // turn's in-request flush stamped them before its response left). Zero
-    // side effects: the canon is kept as-is, the lane re-renders the SAME
-    // world (an idempotent kernel round). Without this guard the M2 retry
-    // ([m5] vs head m1) would headMove → diverge → envelope reset: a
-    // harmless retry would WIPE the identity canon.
-    if (
-        stored !== null &&
-        storedSet !== null &&
-        !input.resync &&
-        input.incoming.length > 0 &&
-        input.incoming.every((id) => storedSet.has(id)) &&
-        (seqs === null || seqs.every((s) => s <= planeMaxSeq))
-    ) {
+    const storedSet = storedWindow !== null
+        ? new Set([...storedWindow.headIds, ...storedWindow.tailIds])
+        : null;
+
+    // D2 (#7064): conversation-bound sessions skip the id verdict — the
+    // host conversation identity IS the identity; the cursor follows the
+    // incoming unconditionally (bookkeeping, never a reject).
+    if (input.convBound) {
+        const known = storedWindow !== null
+            ? new Map<string, number>(storedWindow.tailIds.map((id, i) => [id, storedWindow.maxPos - storedWindow.tailIds.length + 1 + i]))
+            : null;
+        const incomingSet = new Set(input.incoming);
+        let pos = storedWindow?.maxPos ?? 0;
+        const newIdPos: Array<{ id: string; pos: number }> = [];
+        for (const id of input.incoming) {
+            if (known === null || known.get(id) === undefined) {
+                pos += 1;
+                newIdPos.push({ id, pos });
+            }
+        }
         decision = {
-            mode: "echo",
-            replay: true,
-            envelope: stored.envelope,
-            envelopeChecksum: stored.envelopeChecksum,
-            newIdPos: [],
-            goneIds: [],
-            issuedAt: stored.issuedAt,
-            witness: `replay: all ${input.incoming.length} ids known (maxSeq ${seqs ? Math.max(...seqs) : "-"} <= frontier ${planeMaxSeq})`,
+            mode: "anchor",
+            window: { ...windowOf(input.incoming, 0), maxPos: pos },
+            newIdPos,
+            goneIds: storedWindow !== null ? storedWindow.tailIds.filter((id) => !incomingSet.has(id)) : [],
+            issuedAt: storedIssuedAt || now,
+            witness: "anchor: conversation-bound, id verdict skipped",
         };
     } else {
-        // M2 pure append: the client sent ONLY new elements — every
-        // incoming id is unknown to the canon — and the seqs carrier says
-        // they land as a contiguous run starting exactly after the ledger
-        // frontier. That is the 世界匹配定位序列位置 evidence: issue
-        // append-only pos (maxPos+1..) without any head/order risk.
-        // Anything less certain (missing seqs, a gap, a known id mixed in)
-        // falls through to matchWorld — an all-unknown full array there is
-        // usually a re-mint and diverges → resync, one-round convergence.
-        // Never guess.
-        const m2Candidate =
-            stored !== null &&
+        // Review-round-2 Residual 1b: the host re-sent a body this proxy
+        // already processed — every id is already in the stored windows and
+        // the carrier seqs (when present) sit at/below the ledger frontier
+        // (the original turn's in-request flush stamped them before its
+        // response left). Zero side effects: the cursor is kept as-is, the
+        // lane re-renders the SAME world (an idempotent kernel round).
+        const replay =
+            storedWindow !== null &&
+            storedSet !== null &&
             !input.resync &&
             input.incoming.length > 0 &&
-            seqs !== null &&
-            seqs.length === input.incoming.length;
-        if (m2Candidate) {
-            const allUnknown = input.incoming.every((id) => !storedSet!.has(id));
-            let contig = seqs![0] === planeMaxSeq + 1;
+            input.incoming.every((id) => storedSet.has(id)) &&
+            (seqs === null || seqs.every((s) => s <= planeMaxSeq));
+        if (replay) {
+            decision = {
+                mode: "echo",
+                replay: true,
+                window: storedWindow,
+                newIdPos: [],
+                goneIds: [],
+                issuedAt: storedIssuedAt,
+                witness: `replay: all ${input.incoming.length} ids known (maxSeq ${seqs ? Math.max(...seqs) : "-"} <= frontier ${planeMaxSeq})`,
+            };
+        } else {
+            // M2 pure append: the client sent ONLY new elements — every
+            // incoming id is unknown to the windows — and the seqs carrier
+            // says they land as a contiguous run starting exactly after the
+            // ledger frontier. That is the 世界匹配定位序列位置 evidence:
+            // issue append-only pos (maxPos+1..) without any head/order
+            // risk. Anything less certain (missing seqs, a gap, a known id
+            // mixed in) falls through to matchWindow — D1: the worst
+            // outcome there is a reanchor, one cheap re-issue.
+            const m2Candidate =
+                storedWindow !== null &&
+                !input.resync &&
+                input.incoming.length > 0 &&
+                seqs !== null &&
+                seqs.length === input.incoming.length;
+            let contig = m2Candidate && seqs![0] === planeMaxSeq + 1;
             if (contig) {
                 for (let i = 1; i < seqs!.length; i++) {
                     if (seqs![i] !== seqs![i - 1] + 1) {
@@ -222,41 +239,30 @@ export function stage0Decide(input: Stage0Input): Stage0Result {
                     }
                 }
             }
-            decision = allUnknown && contig
-                ? matchAppend(stored, input.incoming)
-                : matchWorld({
-                      stored,
-                      incoming: input.incoming,
-                      explainedGone,
-                      sessRaw: input.sessRaw,
-                      ledgerId: input.ledgerId,
-                      now,
-                      resync: input.resync,
-                  });
-        } else {
-            decision = matchWorld({
-                stored,
-                incoming: input.incoming,
-                explainedGone,
-                sessRaw: input.sessRaw,
-                ledgerId: input.ledgerId,
-                now,
-                resync: input.resync,
-            });
+            if (m2Candidate && contig && input.incoming.every((id) => !storedSet!.has(id))) {
+                const appended = matchAppendWindow(storedWindow, input.incoming);
+                decision = { ...appended, issuedAt: storedIssuedAt };
+            } else {
+                decision = matchWindow({
+                    stored: storedWindow,
+                    issuedAt: storedIssuedAt || now,
+                    incoming: input.incoming,
+                    sessRaw: input.sessRaw,
+                    ledgerId: input.ledgerId,
+                    now,
+                    resync: input.resync,
+                });
+            }
         }
     }
 
-    // Persist the canon for every verdict EXCEPT diverge (zero side effects).
-    if (decision.mode !== "diverge") {
-        snapL1EnvelopeUpsert(
-            input.db,
-            input.sessRaw,
-            JSON.stringify(decision.envelope),
-            decision.envelopeChecksum,
-        );
+    // Persist the window whenever it MOVED (echo/replay: no write per
+    // steady-state turn — the cursor is unchanged by construction).
+    if (decision.mode !== "echo") {
+        snapL1WindowUpsert(input.db, input.sessRaw, decision.window);
     }
 
-    return { decision, diverge: decision.mode === "diverge", explainedGone };
+    return { decision, explainedGone };
 }
 
 /** The R3 identity check for a cohort host that DECLARED the dual-channel:

@@ -11,8 +11,8 @@ import {
 } from "../src/storage/schema.js";
 import {
     foldInputHash,
+    foldJournalRows,
     foldUnpins,
-    type FoldJournalRow,
 } from "../src/storage/snap.js";
 import { openSqliteDatabase, type SqliteDatabase } from "../src/storage/driver.js";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.js";
@@ -108,8 +108,18 @@ function rawDb(path: string): SqliteDatabase {
 
 
 const JSEQ_ROWS = (db: SqliteDatabase, sid: string) =>
-    (db.prepare("SELECT jseq, block_id, start_seq, end_seq, covered_ids, input_hash FROM fold_journal WHERE session_id = ? ORDER BY jseq").all(sid) as unknown) as
-        Array<{ jseq: number; block_id: string; start_seq: number; end_seq: number; covered_ids: string; input_hash: string }>;
+    (db.prepare("SELECT jseq, block_id, start_seq, end_seq, input_hash FROM fold_journal WHERE session_id = ? ORDER BY jseq").all(sid) as unknown) as
+        Array<{ jseq: number; block_id: string; start_seq: number; end_seq: number; input_hash: string }>;
+
+/** The live seq range [min, max] of the given ids (#7064: the journal row's
+ *  bounds REPLACE the covered-id list — the range is how the read side
+ *  re-derives everything the id list used to say). */
+const SEQ_RANGE = (db: SqliteDatabase, sid: string, ids: string[]): [number, number] => {
+    const row = db.prepare(
+        `SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")})`,
+    ).get(sid, ...ids) as { lo: number; hi: number };
+    return [row.lo, row.hi];
+};
 
 const LIVE_IDS = (db: SqliteDatabase, sid: string) =>
     (db.prepare("SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq").all(sid) as unknown) as Array<{ msg_id: string }>;
@@ -141,8 +151,10 @@ test("#5874 T1: fold_journal lands probe-first on fresh and l1-only v12 dbs (no 
             "  witness_probe TEXT NOT NULL,\n" +
             "  issued_at INTEGER NOT NULL,\n" +
             "  armed_at INTEGER,\n" +
-            "  envelope_json TEXT,\n" +
-            "  envelope_checksum TEXT,\n" +
+            "  tail_json TEXT,\n" +
+            "  head_json TEXT,\n" +
+            "  count INTEGER,\n" +
+            "  max_pos INTEGER,\n" +
             "  r3_latched_at INTEGER\n" +
             ")",
     );
@@ -183,9 +195,11 @@ test("#5874 T2: a new fold block writes exactly one journal row; re-ingest is id
     assert.equal(rows.length, 1, "exactly one journal row");
     const r = rows[0];
     assert.equal(r.block_id, blockId);
-    assert.equal(r.start_seq, 0);
-    assert.equal(r.end_seq, 3);
-    assert.deepEqual(JSON.parse(r.covered_ids), covered);
+    // #7064: no covered_ids column — the bounds ARE the coverage. The range
+    // of the covered ids' live rows is exactly [r.start_seq, r.end_seq].
+    const [lo, hi] = SEQ_RANGE(raw, "sess-fj", covered);
+    assert.equal(r.start_seq, lo, "start_seq = min live seq of the covered ids");
+    assert.equal(r.end_seq, hi, "end_seq = max live seq of the covered ids");
     assert.ok(r.input_hash.length >= 64, "input_hash is a sha256 digest");
     // Steady state: the covered rows stay LIVE (tagged in the transcript);
     // only the summary is new.
@@ -206,7 +220,7 @@ test("#5874 T2: a new fold block writes exactly one journal row; re-ingest is id
     raw.close();
 });
 
-test("#5874 T3: the stored input_hash re-derives over retired rows and moves on a new generation (+/-)", () => {
+test("#5874 T3: the stored input_hash re-derives over the RANGE and moves on a new generation (+/-) (#7064)", () => {
     const dir = mkdtempSync(join(tmpdir(), "fj-t3-"));
     const path = join(dir, "snap.db");
     const store = open(dir);
@@ -218,55 +232,99 @@ test("#5874 T3: the stored input_hash re-derives over retired rows and moves on 
 
     let raw = rawDb(path);
     const stored = (JSEQ_ROWS(raw, "sess-fj")[0]).input_hash;
-    // Steady state (-): re-derivation matches the stored anchor byte for
-    // byte — the aggregate spans ALL generations of the covered ids.
-    assert.equal(foldInputHash(raw, "sess-fj", covered), stored, "hash stable at steady state");
+    // Steady state (-): re-derivation over the STORED bounds (no id list
+    // anywhere) matches the stored anchor byte for byte.
+    const r0 = JSEQ_ROWS(raw, "sess-fj")[0];
+    assert.equal(foldInputHash(raw, "sess-fj", r0.start_seq, r0.end_seq), stored, "hash stable at steady state (range re-derivation)");
     raw.close();
 
-    // The user revises an EARLIER message (m2): same id, new bytes → a new
-    // identity lands a SECOND generation row for m2 — the aggregate must
-    // move, which is the unpin detector.
+    // The user revises an EARLIER message (m2): same id, new bytes → the old
+    // in-range generation is retired and the new one lands past the range —
+    // the range aggregate must move, which is the unpin detector.
     const revised = plainSession("sess-fj", 7);
     (revised.lastMessages as unknown as Array<{ id: string; text: string }>).find((m) => m.id === "m2")!.text = "m2-REVISED";
     assert.ok(store.ingestSession(planIngest(revised), undefined, { completeLog: true }));
 
     raw = rawDb(path);
-    const moved = foldInputHash(raw, "sess-fj", covered);
-    assert.notEqual(moved, stored, "hash moves when a covered id gains a new generation");
+    const r1 = JSEQ_ROWS(raw, "sess-fj")[0];
+    // #7064: the hash is a BYTE-FAITHFUL range fingerprint — it re-derives
+    // over the covered rows as they are stored (no retired filter: a
+    // retired row's bytes still belong to the fold's input record). The
+    // EDIT signal is the unpin detector (foldUnpins), not the hash: the
+    // rewrite retires the in-range m2 generation and mints the new one
+    // PAST end_seq — a covered id re-emerging past the range unpins the
+    // fold (its covered originals no longer render verbatim).
+    const stillLiveInRange = raw.prepare(
+        "SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id = 'm2' AND seq BETWEEN ? AND ?",
+    ).get("sess-fj", r1.start_seq, r1.end_seq) as { n: number };
+    assert.equal(stillLiveInRange.n, 0, "the in-range m2 generation is retired by the rewrite");
+    const pastRange = raw.prepare(
+        "SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id = 'm2' AND seq > ?",
+    ).get("sess-fj", r1.end_seq) as { n: number };
+    assert.ok(pastRange.n >= 1, "the new m2 generation lands past the range");
+    const un = foldUnpins(raw, foldJournalRows(raw, "sess-fj"), new Set(["blk-f1"]));
+    assert.ok(un.has("blk-f1"), "past-range re-emergence of a covered id unpins the fold");
     raw.close();
 });
 
-test("#5874 T4: foldUnpins — the four +/- verdicts (pure)", () => {
-    const mkRow = (blockId: string, ids: string[], startSeq: number, endSeq: number): FoldJournalRow => ({
-        sessionId: "s",
-        jseq: 1,
-        blockId,
-        startSeq,
-        endSeq,
-        coveredIds: ids,
-        inputHash: "h",
-        createdAt: 1,
-    });
-    const journal = [mkRow("blk", ["m1", "m2"], 1, 2)];
-    const allRetired: Array<{ msgId: string; seq: number }> = [];
-    const ACTIVE = new Set(["blk"]);
+test("#5874 T4: foldUnpins — the four +/- verdicts (db range probes, #7064)", () => {
+    // Build a store with a 6-message session and one active fold over m1-m2
+    // (bounds 1..2). The journal comes straight out of the table — no id
+    // lists anywhere (the range is the coverage).
+    const dir = mkdtempSync(join(tmpdir(), "fj-t4-"));
+    const path = join(dir, "snap.db");
+    const store = open(dir);
+    assert.ok(store.ingestSession(planIngest(plainSession("sess-fj", 6)), undefined, { completeLog: true }));
+    const { session, blockId } = foldBlock(["m1", "m2", "m3", "m4", "m5", "m6"], ["m1", "m2"]);
+    assert.ok(store.ingestSession(planIngest(session), undefined, { completeLog: true }));
 
-    // (-) steady state: active block, every covered row retired → stays pinned.
-    assert.equal(foldUnpins(journal, allRetired, ACTIVE).size, 0);
+    const db = rawDb(path);
+    // The raw driver handle shares the file, but the store holds its own
+    // connection — run the probes through the store's engine via the
+    // exported helper (it takes any DbLike-shaped handle). foldJournalRows
+    // maps the snake_case row to the camelCase FoldJournalRow surface.
+    const journal = foldJournalRows(db, "sess-fj");
+    // The raw driver handle shares the file, but the store holds its own
+    // connection — run the probes through the store's engine via the
+    // exported helper (it takes any DbLike-shaped handle).
+    const retire = (id: string) =>
+        db.prepare("UPDATE messages SET retired_at = 1 WHERE session_id = 'sess-fj' AND msg_id = ? AND retired_at IS NULL").run(id);
+    const revive = (id: string) =>
+        db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = 'sess-fj' AND msg_id = ?").run(id);
+    const ACTIVE = new Set([blockId]);
 
-    // (+1) the block died (superseded/reaped) → unpin: the ids were never
-    // replaced in history; they are live again and the summary is gone.
-    assert.deepEqual(foldUnpins(journal, allRetired, new Set<string>()), new Set(["blk"]));
+    try {
+        // Steady state of the PRODUCTION shape: the covered rows are still
+        // live (tagged in the transcript) → the fold is UNPINNED (the
+        // originals still render).
+        assert.deepEqual(foldUnpins(db, journal, ACTIVE), new Set([blockId]), "covered rows live in-range → unpinned (still render)");
 
-    // (+2) a covered id is live AGAIN WITHIN the interval — the #4390 in-place
-    // reactivation: a rewind rewrote history back through the fold.
-    const inInterval = [{ msgId: "m2", seq: 2 }];
-    assert.deepEqual(foldUnpins(journal, inInterval, ACTIVE), new Set(["blk"]));
+        // (+) the block died (superseded/reaped) → unpin regardless of the
+        //  row state.
+        assert.deepEqual(foldUnpins(db, journal, new Set<string>()), new Set([blockId]), "inactive block → unpinned");
 
-    // (+3) a covered id re-emerges past end_seq — an edit produced a new
-    // generation for a message the fold claimed.
-    const pastEnd = [{ msgId: "m1", seq: 9 }];
-    assert.deepEqual(foldUnpins(journal, pastEnd, ACTIVE), new Set(["blk"]));
+        // PINNED state: the covered rows retire (a later log drops them) and
+        // nothing re-emerges → everything stays pinned.
+        retire("m1");
+        retire("m2");
+        assert.equal(foldUnpins(db, journal, ACTIVE).size, 0, "retired covered rows, no re-emergence → pinned");
+
+        // (+2) a row is live AGAIN WITHIN the interval (a #4390 in-place
+        //  reactivation — a rewind rewrote history back through the fold).
+        revive("m2");
+        assert.deepEqual(foldUnpins(db, journal, ACTIVE), new Set([blockId]), "in-range live row → unpinned");
+        retire("m2");
+
+        // (+3) a covered id re-emerges PAST end_seq — an edit produced a new
+        //  generation for a message the fold claimed.
+        const re = plainSession("sess-fj", 7);
+        (re.lastMessages as unknown as Array<{ id: string; text: string }>).find((m) => m.id === "m1")!.text = "m1-REVISED";
+        assert.ok(store.ingestSession(planIngest(re), undefined, { completeLog: true }));
+        assert.deepEqual(foldUnpins(db, journal, ACTIVE), new Set([blockId]), "past-range live row for a range id → unpinned");
+    } finally {
+        db.close();
+        store.close();
+    }
 });
 
 test("#5874 T5: deleteSession cascades the journal (T6-style)", () => {

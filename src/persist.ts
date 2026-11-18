@@ -2491,6 +2491,15 @@ export class SessionStore {
         this.liveShadow().snapStage0Reset(sessionId);
     }
 
+    /** #7064 D2: whether this sid is CONVERSATION-BOUND — the host already
+     *  declared a conversation identity (a conversations row for this sid),
+     *  so the per-turn R3 identity-fault policy never fires for it: the
+     *  session IS the identity, the stage-0 cursor is bookkeeping. */
+    snapConvBound(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapConvBound(sessionId);
+    }
+
     /** #6181 M3: whether this sid's R3 breaker latch persisted from a
      *  previous process (a restart must not re-arm a misbehaving host). */
     snapR3Latched(sessionId: string): boolean {

@@ -226,6 +226,12 @@ export async function prepareOpenai(
             msgs = s0.pinned;
             originalMessages = msgs;
         }
+        // #7064 D3 (尾锚常活): the stage-0 cursor may have advanced BEFORE
+        // processTurn — bump the session revision so the per-turn snapshot
+        // flush below (snapFlush epoch proof) observes the advance. A fork
+        // taken between the cursor write and the flush otherwise reads a
+        // STALE parent revision and lands the child on the wrong lane.
+        if (s0.anchorAdvanced) markDirty(session);
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.

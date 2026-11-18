@@ -4,71 +4,67 @@
  * TYPE-ONLY surface. Depends on nothing but the kernel's public types so it
  * can be imported from any layer (storage, server, tests) without a cycle.
  *
- * Aligned to the reference implementation (#6155 `src/snapshot/`) — the stage-0
- * world-match / hydrate / lane decision vocabulary is shared verbatim. The
- * original message-level plane (one row per ledger element) was retired before
- * merge in favor of the append-only substrate (#5874 v2); the storage-side row
- * types live in `src/storage/snap.ts` (fold journal + egress cache) and are
- * not re-declared here.
+ * #7064 msgid-storage slimming (owner ruling 2026-11-17): the stage-0 world
+ * state is a BOOKKEEPING CURSOR, not an identity gate — the server keeps only
+ * the head and tail of the last seen host-id array plus the count. The
+ * middle is deliberately invisible (client compression removes ids freely —
+ * D1: an id verdict NEVER diverges; a middle rewrite surfaces via the ledger
+ * probes, not here). Every verdict is bookkeeping: the worst outcome is
+ * `reanchor` (re-issue the cursor), never a reject.
  */
 
-/** One entry in the standing canon envelope: a host msgid bound to the
- *  append-only ledger pos it was first issued at (pos is never reused — the
- *  DDL invariant). The canon is stored as an ordered [{id, pos}] list so the
- *  L1 table is self-contained (world = id + pos, §4.0 ruling G). */
-export interface WorldEnvelopeEntry {
-    id: string;
-    pos: number;
+/** The stored world anchor: the head + tail id windows of the last seen host
+ *  array (host order) plus its length and the append-only pos frontier. */
+export interface WorldWindow {
+    /** The last min(TAIL, count) ids, host order. */
+    tailIds: string[];
+    /** The first min(HEAD, count) ids, host order. */
+    headIds: string[];
+    /** The full array length this window was cut from. */
+    count: number;
+    /** The largest append-only pos issued so far (never reused). */
+    maxPos: number;
 }
 
-/** World-match verdicts for stage 0 (§4.0). Executed in order; first hit
- *  wins. `pos` is append-only: a middle insertion does NOT shift stored rows.
- *  - `echo`: the incoming id sequence matches the stored one positionally.
- *  - `probe`: the stored id sequence is a strict PREFIX of the incoming one
- *    (tail append — the common, v5-proven shape) or a canon shrink.
- *  - `scatter`: known ids keep their relative order but NEW ids are inserted
- *    in the middle / at any position (the span-parse case, T5 byte pin).
- *  - `issue`: no stored world for this sess_raw → fresh ledger identity + arm.
- *  - `diverge`: the live head changed, or a KNOWN id changed its relative
- *    order (history rewrite) → this turn runs legacy and re-stamps; the canon
- *    is NOT updated (the client converges in one turn).
- *  - `resync`: an explicit re-baseline (mode switch / ledger re-issue).
+/** Stage-0 verdicts (post-slimming). Executed in order; first hit wins.
+ *  - `echo`:     head + count + tail all agree — nothing moved.
+ *  - `extend`:   the stored anchor is contained in the incoming tail — new
+ *                ids appended (the common shape).
+ *  - `shrink`:   the incoming is a suffix of the stored tail — the client
+ *                dropped head elements (a fold; D1: legal, never divergent).
+ *  - `reanchor`: no anchor relation (head swap / middle rewrite / re-mint) —
+ *                the cursor is RE-ISSUED (D1: bookkeeping, never a reject).
+ *  - `issue`:    no stored world for this sess_raw → fresh ledger identity +
+ *                arm.
+ *  - `resync`:   an explicit re-baseline (mode switch).
+ *  - `anchor`:   D2 — the session carries a host conversation identity, the
+ *                id verdict is skipped entirely; the cursor follows the
+ *                incoming unconditionally.
  *
- *  Deletions (a stored id absent from the incoming) are orthogonal to the mode
- *  and are reported via `goneIds` → the reconcile turns them into `delete`
- *  events (not a divergence while the head + survivor order are unchanged). */
-type WorldMode = "echo" | "probe" | "scatter" | "issue" | "diverge" | "resync";
+ *  Deletions of windowed ids are reported via `goneIds` (the reconcile turns
+ *  them into `delete` events) — orthogonal to the mode. */
+export type WorldMode = "echo" | "extend" | "shrink" | "reanchor" | "issue" | "resync" | "anchor";
 
 export interface WorldDecision {
     mode: WorldMode;
-    /** The canon envelope to persist after this turn (host ids in host order,
-     *  each bound to its append-only pos). For `diverge` this is the UNCHANGED
-     *  stored canon. */
-    envelope: WorldEnvelopeEntry[];
-    /** sha256 of the id sequence (host order) — the fast mismatch before the
-     *  positional walk. */
-    envelopeChecksum: string;
-    /** The NEW ids issued this turn (id → fresh pos), in incoming order.
-     *  Empty for echo / diverge. */
+    /** The world anchor to persist after this turn. */
+    window: WorldWindow;
+    /** The NEW ids issued this turn (id → fresh append-only pos), in
+ *  incoming order. Empty for echo / reanchor-class verdicts. */
     newIdPos: Array<{ id: string; pos: number }>;
-    /** The stored ids ABSENT from the incoming (client deletions) — the
-     *  reconcile turns these into `delete` events. Empty for issue / echo. */
+    /** The STORED windowed ids ABSENT from the incoming (client deletions) —
+ *  the reconcile turns these into `delete` events. Empty for issue/echo. */
     goneIds: string[];
     /** For `issue`: the freshly issued ledger identity (the existing sid
-     *  keyspace, ruling D). Absent otherwise. */
+ *  keyspace, ruling D). Absent otherwise. */
     issuedLedgerId?: string;
     /** The world origin (issued_at) — carried so the caller can preserve it
-     *  on a plain update (B1 trap: it never moves except on issue/resync). */
+ *  on a plain update (B1 trap: it never moves except on issue/resync). */
     issuedAt: number;
-    /** The arming-turn marker set on `issue`/`resync`. */
-    armedAt?: number;
-    /** Diagnostic witness sample (echo spot-check) — warn stream only. */
+    /** Diagnostic witness sample — warn stream only. */
     witness?: string;
     /** Review-round-2 Residual 1b: the host re-sent a body this proxy ALREADY
-     *  processed (every id known, carrier seqs at/below the frontier) — an
-     *  upstream-200 retry. The lane must neither wipe the plane (the diverge
-     *  this would otherwise cause) nor strip the chain id (the egress no-op
-     *  classification does the continuation). Zero side effects. */
+ *  processed (every id known, carrier seqs at/below the frontier) — an
+ *  upstream-200 retry. Zero side effects: the cursor is kept as-is. */
     replay?: boolean;
 }
-

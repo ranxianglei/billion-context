@@ -20,6 +20,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { WorldWindow } from "../snapshot/types.js";
 
 /** Minimal db surface so the identity ledger stays type-coupled to the
  *  storage driver without importing it (same contract as the driver's
@@ -121,43 +122,44 @@ export function snapL1Lookup(db: DbLike, sessRaw: string): L1Entry | null {
 }
 
 // ---------------------------------------------------------------------------
-// 2×2 (proposal §4.0) — the element-level WORLD ENVELOPE on the same row.
+// 2×2 (proposal §4.0) — the element-level WORLD CURSOR on the same row.
 //
 // The session-level path above (snapL1Record/snapL1Lookup) is the identity
 // ANCHOR (sess_raw → ledger_id + one-round arming). The 2×2 stage 0 adds,
-// on the same row, the per-element msgid envelope: an ordered [{id, pos}]
-// canon binding every host msgid to its append-only ledger pos. The stage-0
-// decision function (src/snapshot/identity.ts matchWorld) runs on this
-// envelope; M2 delta inbound parses only the new spans it commits.
+// on the same row, the per-element world cursor: the head + tail id windows
+// of the previous turn's host array plus its length and the append-only pos
+// frontier (#7064 slimming — the full {id,pos} envelope is gone). The
+// stage-0 decision function (src/snapshot/identity.ts matchWindow) runs on
+// this cursor; M2 delta inbound appends onto it.
 // ---------------------------------------------------------------------------
 
-interface L1Envelope {
-    /** The canon envelope JSON: an array of {id, pos} in host order.
-     *  Null when the session is still on the session-level v1 path (the
-     *  2×2 element world has not been issued for it yet). */
-    envelopeJson: string | null;
-    /** sha256 of the canonical envelope (fast mismatch before the walk). */
-    envelopeChecksum: string | null;
-}
-
-/** Read the element-level envelope for a raw session id (null when the l1
- *  row is absent; envelopeJson null when present but not yet 2×2-issued). */
-export function snapL1EnvelopeRead(db: DbLike, sessRaw: string): L1Envelope | null {
+/** Read the element-level world cursor for a raw session id (null when the
+ *  l1 row is absent; window null when present but not yet issued). */
+export function snapL1WindowRead(db: DbLike, sessRaw: string): { window: WorldWindow | null, issuedAt: number } | null {
     const r = db
-        .prepare("SELECT envelope_json, envelope_checksum FROM l1_world WHERE sess_raw = ?")
-        .get(sessRaw) as { envelope_json: string | null; envelope_checksum: string | null } | undefined;
+        .prepare("SELECT tail_json, head_json, count, max_pos, issued_at FROM l1_world WHERE sess_raw = ?")
+        .get(sessRaw) as { tail_json: string | null; head_json: string | null; count: number | null; max_pos: number | null; issued_at: number } | undefined;
     if (!r) return null;
-    return { envelopeJson: r.envelope_json, envelopeChecksum: r.envelope_checksum };
+    if (r.tail_json === null || r.count === null) return { window: null, issuedAt: r.issued_at };
+    return {
+        window: {
+            tailIds: JSON.parse(r.tail_json) as string[],
+            headIds: JSON.parse(r.head_json ?? "[]") as string[],
+            count: r.count,
+            maxPos: r.max_pos ?? r.count,
+        },
+        issuedAt: r.issued_at,
+    };
 }
 
-/** Persist the element-level envelope for a raw session id (UPDATE only —
- *  the l1 row itself is created by snapL1Record; a missing row is a
+/** Persist the element-level world cursor for a raw session id (UPDATE only
+ *  — the l1 row itself is created by snapL1Record; a missing row is a
  *  programming error and is surfaced, not silently created). */
-export function snapL1EnvelopeUpsert(db: DbLike, sessRaw: string, envelopeJson: string, envelopeChecksum: string): void {
+export function snapL1WindowUpsert(db: DbLike, sessRaw: string, window: WorldWindow): void {
     const res = db
-        .prepare("UPDATE l1_world SET envelope_json = ?, envelope_checksum = ? WHERE sess_raw = ?")
-        .run(envelopeJson, envelopeChecksum, sessRaw) as { changes: number };
-    if (res.changes === 0) throw new Error(`snapL1EnvelopeUpsert: no l1_world row for sess_raw ${sessRaw.slice(0, 12)}… (record it first)`);
+        .prepare("UPDATE l1_world SET tail_json = ?, head_json = ?, count = ?, max_pos = ? WHERE sess_raw = ?")
+        .run(JSON.stringify(window.tailIds), JSON.stringify(window.headIds), window.count, window.maxPos, sessRaw) as { changes: number };
+    if (res.changes === 0) throw new Error(`snapL1WindowUpsert: no l1_world row for sess_raw ${sessRaw.slice(0, 12)}… (record it first)`);
 }
 
 /** #6181 M3: read the persisted R3 breaker latch (true when the sid's
@@ -233,29 +235,32 @@ export interface FoldJournalRow {
     blockId: string;
     startSeq: number;
     endSeq: number;
-    coveredIds: string[];
     inputHash: string;
     createdAt: number;
 }
 
-/** Re-derive the fold input aggregate over the covered ids' rows — ALL
- *  generations (no retired filter: the fold's own ingest retires the
- *  covered rows in the same transaction, so the aggregate must survive
- *  retirement to verify against later). Order-stable (ORDER BY seq) and
- *  covers seq too, so any source movement changes the digest — a new
- *  generation row (edit/rewind re-issue), an in-place content swap, or row
- *  loss. null when the id set is empty or no rows exist at all. */
+/** Re-derive the fold input aggregate over the fold's ROW RANGE — all
+ *  generations in [startSeq, endSeq] (no retired filter: the fold's own
+ *  ingest retires the covered rows in the same transaction, so the
+ *  aggregate must survive retirement to verify against later; tombstones
+ *  hold their seq, in-place swaps change content_hash at the same seq —
+ *  any source movement in the range changes the digest). #7064 slimming:
+ *  the scope is the RANGE itself — the id list (covered_ids) is gone; an
+ *  id re-emerging live PAST end_seq moves the fold to the derive path via
+ *  the foldUnpins predicate instead (same safe direction). Order-stable
+ *  (ORDER BY seq) and covers seq too. null when the range is empty. */
 export function foldInputHash(
     db: DbLike,
     sessionId: string,
-    coveredIds: readonly string[],
+    startSeq: number,
+    endSeq: number,
 ): string | null {
-    if (coveredIds.length === 0) return null;
+    if (endSeq < startSeq) return null;
     const rows = db
         .prepare(`SELECT seq, msg_id, content_hash FROM messages
-                  WHERE session_id = ? AND msg_id IN (${coveredIds.map(() => "?").join(", ")})
+                  WHERE session_id = ? AND seq BETWEEN ? AND ?
                   ORDER BY seq`)
-        .all(sessionId, ...coveredIds) as Array<{ seq: number; msg_id: string; content_hash: string }>;
+        .all(sessionId, startSeq, endSeq) as Array<{ seq: number; msg_id: string; content_hash: string }>;
     if (rows.length === 0) return null;
     const h = createHash("sha256");
     for (const r of rows) h.update(`${r.seq}\u0000${r.msg_id}\u0000${r.content_hash}\n`);
@@ -275,28 +280,26 @@ export function appendFoldJournal(
     blockId: string,
     startSeq: number,
     endSeq: number,
-    coveredIds: readonly string[],
     inputHash: string | null,
     nowMs: number,
 ): void {
     db.prepare(
-        `INSERT OR IGNORE INTO fold_journal (session_id, jseq, kind, block_id, start_seq, end_seq, covered_ids, input_hash, created_at)
-         VALUES (?, (SELECT COALESCE(MAX(jseq), 0) + 1 FROM fold_journal WHERE session_id = ?), 'fold', ?, ?, ?, ?, ?, ?)`,
-    ).run(sessionId, sessionId, blockId, startSeq, endSeq, JSON.stringify(coveredIds), inputHash ?? "", nowMs);
+        `INSERT OR IGNORE INTO fold_journal (session_id, jseq, kind, block_id, start_seq, end_seq, input_hash, created_at)
+         VALUES (?, (SELECT COALESCE(MAX(jseq), 0) + 1 FROM fold_journal WHERE session_id = ?), 'fold', ?, ?, ?, ?, ?)`,
+    ).run(sessionId, sessionId, blockId, startSeq, endSeq, inputHash ?? "", nowMs);
 }
 
 /** All fold rows for a session, jseq order (the journal IS the order). */
 export function foldJournalRows(db: DbLike, sessionId: string): FoldJournalRow[] {
     const rows = db
-        .prepare("SELECT session_id, jseq, block_id, start_seq, end_seq, covered_ids, input_hash, created_at FROM fold_journal WHERE session_id = ? ORDER BY jseq")
-        .all(sessionId) as Array<{ session_id: string; jseq: number; block_id: string; start_seq: number; end_seq: number; covered_ids: string; input_hash: string; created_at: number }>;
+        .prepare("SELECT session_id, jseq, block_id, start_seq, end_seq, input_hash, created_at FROM fold_journal WHERE session_id = ? ORDER BY jseq")
+        .all(sessionId) as Array<{ session_id: string; jseq: number; block_id: string; start_seq: number; end_seq: number; input_hash: string; created_at: number }>;
     return rows.map((r) => ({
         sessionId: r.session_id,
         jseq: r.jseq,
         blockId: r.block_id,
         startSeq: r.start_seq,
         endSeq: r.end_seq,
-        coveredIds: JSON.parse(r.covered_ids) as string[],
         inputHash: r.input_hash,
         createdAt: r.created_at,
     }));
@@ -306,41 +309,47 @@ export function foldJournalRows(db: DbLike, sessionId: string): FoldJournalRow[]
  *  UNPINNED iff any of:
  *   1. its block is not currently active (deactivated, superseded, or the
  *      row is gone — compaction cleanup, session prune);
- *   2. a covered id has a LIVE row at ANY seq — the steady state of an
+ *   2. a covered id has a LIVE row again — the steady state of an
  *      ACTIVE fold is that every covered row is RETIRED (the fold's own
  *      ingest retires them: the presented history carries the summary, not
- *      the originals), so any covered row live again means the fold's
- *      summary anchor no longer exclusively owns that id's history — either
- *      a RE-EMERGENCE past end_seq (new generation: the old one was
- *      tombstoned and the id re-issued further down the log — an edit or a
- *      rewind re-covering the id beyond the fold) or an IN-INTERVAL live
- *      row (a #4390 in-place reactivation: a rewind unwound the fold and
- *      the D-lane's tail authority now carries those messages, not the
- *      summary). A host shape that legitimately keeps a covered row live
- *      after the fold degrades such sessions to the derive path (safe
- *      direction, no byte risk — it is exactly today's flag-off behavior).
- *  Pure: no db, no writes — callers feed it the live rows (session-wide is
- *  fine; the predicate intersects with the covered ids) and the active
- *  block ids they already loaded. Returns the set of UNPINNED block ids
- *  (empty = everything still pinned). */
+ *      the originals). #7064 slimming re-expresses the check without the
+ *      covered-id list, by RANGE: (a) any row LIVE in [startSeq, endSeq]
+ *      (a #4390 in-place reactivation — a rewind unwound the fold and the
+ *      D-lane's tail authority now carries those messages, not the
+ *      summary); (b) any id that had a row in the range holding a LIVE row
+ *      PAST end_seq (re-emergence: the old generation was tombstoned and
+ *      the id re-issued further down the log — an edit or a rewind
+ *      re-covering the id beyond the fold). Both are the same safe
+ *      direction as before: degrade to the derive path, no byte risk.
+ *  Takes the db directly (two small range probes per fold). Returns the set
+ *  of UNPINNED block ids (empty = everything still pinned). */
 export function foldUnpins(
+    db: DbLike,
     journal: readonly FoldJournalRow[],
-    liveRows: readonly { msgId: string; seq: number }[],
     activeBlocks: ReadonlySet<string>,
 ): Set<string> {
     const unpinned = new Set<string>();
-    const liveMsgIds = new Set<string>();
-    for (const r of liveRows) liveMsgIds.add(r.msgId);
+    const liveIn = db.prepare(
+        "SELECT 1 FROM messages WHERE session_id = ? AND retired_at IS NULL AND seq BETWEEN ? AND ? LIMIT 1",
+    );
+    const reEmerged = db.prepare(
+        `SELECT 1 FROM messages m
+         WHERE m.session_id = ? AND m.retired_at IS NULL AND m.seq > ?
+           AND m.msg_id IN (SELECT msg_id FROM messages k
+                            WHERE k.session_id = ? AND k.seq BETWEEN ? AND ?)
+         LIMIT 1`,
+    );
     for (const f of journal) {
         if (!activeBlocks.has(f.blockId)) {
             unpinned.add(f.blockId);
             continue;
         }
-        for (const id of f.coveredIds) {
-            if (liveMsgIds.has(id)) {
-                unpinned.add(f.blockId);
-                break;
-            }
+        if (liveIn.get(f.sessionId, f.startSeq, f.endSeq) !== undefined) {
+            unpinned.add(f.blockId);
+            continue;
+        }
+        if (reEmerged.get(f.sessionId, f.endSeq, f.sessionId, f.startSeq, f.endSeq) !== undefined) {
+            unpinned.add(f.blockId);
         }
     }
     return unpinned;
@@ -356,15 +365,18 @@ export function foldUnpins(
 // aggregate BEFORE trusting the bytes; a mismatch degrades the round to the
 // live derive (never sticky, never partial).
 //
-// Aggregate semantics (egressInputHash): with a NON-EMPTY id set it covers
-// ALL generations of exactly those ids (no retired filter, no seq bound) —
-// a content rewrite or a new-generation row (edit/rewind re-issue) moves it,
-// while a pure retirement (the fold's own sweep) or TAIL growth beyond the
-// prefix does not. With an EMPTY id set it covers the live rows at
-// seq <= watermark (the "whole prefix window" probe). The fold-CROSSING gate
-// (a fold that lands after the cut covering a prefix id re-renders the
-// bytes) is applied by the lane, which alone knows fold timing relative to
-// the cut — the store primitive here verifies bytes only.
+// Aggregate semantics (egressInputHash, #7064 slimming): the scope is the
+// WATERMARK itself — the LIVE rows with seq <= watermark, order-stable. At
+// cut time the watermark is the max live seq of the pinned set, so the hash
+// covers exactly the prefix rows; on re-read any change relevant to the
+// prefix moves the digest (an edit retires the old in-range row and mints
+// the new one past the watermark; an in-place swap changes content_hash at
+// the same seq; a rewind crossing the prefix retires/reactivates in-range
+// rows), while pure TAIL growth beyond the watermark does not. A
+// fold-CROSSING re-render (a fold landing after the cut over the prefix)
+// is applied by the lane via foldUnpins/foldJournalRows, which alone knows
+// fold timing relative to the cut — the store primitive here verifies
+// bytes only.
 // ---------------------------------------------------------------------------
 
 export interface EgressSnapshotRow {
@@ -372,7 +384,6 @@ export interface EgressSnapshotRow {
     snapSeq: number;
     watermark: number;
     inputHash: string;
-    ids: string[];
     prefixRef: string | null;
     lastStableId: string;
     createdAt: number;
@@ -387,26 +398,18 @@ export interface EgressReadHit {
     inputHash: string;
 }
 
-/** The egress input aggregate over the pinned id set (all generations, seq
- *  order) — or, with an empty id set, over the live rows at seq <= watermark.
- *  null when no rows exist at all. */
+/** The egress input aggregate over the live rows at seq <= watermark
+ *  (order-stable, seq + msg_id + content_hash). null when no rows exist. */
 export function egressInputHash(
     db: DbLike,
     sessionId: string,
     watermark: number,
-    ids: readonly string[],
 ): string | null {
-    const rows: Array<{ seq: number; msg_id: string; content_hash: string }> = ids.length === 0
-        ? (db.prepare(
-            `SELECT seq, msg_id, content_hash FROM messages
-             WHERE session_id = ? AND retired_at IS NULL AND seq <= ?
-             ORDER BY seq`,
-        ).all(sessionId, watermark) as Array<{ seq: number; msg_id: string; content_hash: string }>)
-        : (db.prepare(
-            `SELECT seq, msg_id, content_hash FROM messages
-             WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(",")})
-             ORDER BY seq`,
-        ).all(sessionId, ...ids) as Array<{ seq: number; msg_id: string; content_hash: string }>);
+    const rows = db.prepare(
+        `SELECT seq, msg_id, content_hash FROM messages
+         WHERE session_id = ? AND retired_at IS NULL AND seq <= ?
+         ORDER BY seq`,
+    ).all(sessionId, watermark) as Array<{ seq: number; msg_id: string; content_hash: string }>;
     if (rows.length === 0) return null;
     const h = createHash("sha256");
     for (const r of rows) h.update(`${r.seq}\u0000${r.msg_id}\u0000${r.content_hash}\n`);
@@ -420,7 +423,6 @@ export function appendEgressSnapshot(
     sessionId: string,
     watermark: number,
     inputHash: string,
-    ids: readonly string[],
     prefixRef: string | null,
     lastStableId: string,
     createdAt: number,
@@ -429,9 +431,9 @@ export function appendEgressSnapshot(
         .get(sessionId) as { m: number };
     const snapSeq = row.m + 1;
     db.prepare(
-        `INSERT INTO egress_snapshot (session_id, snap_seq, watermark, input_hash, ids_json, prefix_ref, last_stable_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(sessionId, snapSeq, watermark, inputHash, JSON.stringify(ids), prefixRef, lastStableId, createdAt);
+        `INSERT INTO egress_snapshot (session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(sessionId, snapSeq, watermark, inputHash, prefixRef, lastStableId, createdAt);
     return snapSeq;
 }
 
@@ -439,16 +441,15 @@ export function appendEgressSnapshot(
  *  or null. */
 export function egressLatestRow(db: DbLike, sessionId: string): EgressSnapshotRow | null {
     const row = db.prepare(
-        `SELECT session_id, snap_seq, watermark, input_hash, ids_json, prefix_ref, last_stable_id, created_at
+        `SELECT session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at
          FROM egress_snapshot WHERE session_id = ? ORDER BY snap_seq DESC LIMIT 1`,
-    ).get(sessionId) as { session_id: string; snap_seq: number; watermark: number; input_hash: string; ids_json: string; prefix_ref: string | null; last_stable_id: string; created_at: number } | undefined;
+    ).get(sessionId) as { session_id: string; snap_seq: number; watermark: number; input_hash: string; prefix_ref: string | null; last_stable_id: string; created_at: number } | undefined;
     if (!row) return null;
     return {
         sessionId: row.session_id,
         snapSeq: row.snap_seq,
         watermark: row.watermark,
         inputHash: row.input_hash,
-        ids: JSON.parse(row.ids_json) as string[],
         prefixRef: row.prefix_ref,
         lastStableId: row.last_stable_id,
         createdAt: row.created_at,

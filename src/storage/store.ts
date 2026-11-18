@@ -32,7 +32,6 @@ import {
     foldInputHash,
     foldJournalRows,
     foldUnpins,
-    snapL1EnvelopeRead,
     snapL1Record,
     snapR3LatchedRead,
     snapR3LatchClear,
@@ -41,7 +40,6 @@ import {
     type EgressReadHit,
     type EgressSnapshotRow,
 } from "./snap.js";
-import { parseEnvelope } from "../snapshot/identity.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
@@ -1531,21 +1529,18 @@ export class UnifiedStore {
             // #5874 v2: fold journal — one append-only row per NEW compression
             // block (the fold decision point). A re-ingest of the same block
             // is a no-op (the UNIQUE(session_id, block_id) constraint), and
-            // the input hash over the covered live rows is the anchor the
-            // egress read re-derives (foldInputHash). Blocks that arrived via
-            // a dump import have no row: the read side derives them lazily
-            // (journal absence is "derive", never an error).
+            // the input hash over the fold's ROW RANGE is the anchor the
+            // egress read re-derives (foldInputHash; #7064 slimming dropped
+            // the covered-id list — the range re-derives the same set).
+            // Blocks that arrived via a dump import have no row: the read
+            // side derives them lazily (journal absence is "derive", never
+            // an error).
             for (const b of input.blocks) {
                 if (storedBlocks.get(b.blockId) !== undefined) continue;
                 if (!b.active) continue;
                 const [fStart, fEnd] = boundsForCovered(b.payloadJson);
                 if (fStart < 0) continue;
-                let ids: string[] = [];
-                try {
-                    const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
-                    ids = [...new Set([...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])])];
-                } catch { /* malformed payload: empty id set, hash null → unverifiable sentinel */ }
-                appendFoldJournal(this.db, s.sessionId, b.blockId, fStart, fEnd, ids, foldInputHash(this.db, s.sessionId, ids), b.createdAt);
+                appendFoldJournal(this.db, s.sessionId, b.blockId, fStart, fEnd, foldInputHash(this.db, s.sessionId, fStart, fEnd), b.createdAt);
             }
 
             // dead_refs: tombstones can be LIFTED (backing message
@@ -1768,7 +1763,7 @@ export class UnifiedStore {
         // The ledger frontier: the max live stamped seq (0 for an empty
         // ledger) — the M2 contiguity evidence anchors on it.
         const maxSeq = (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL").get(sid) as { m: number }).m;
-        return stage0Decide({ db: this.db, sessRaw, ledgerId: sid, incoming, seqs: opts?.seqs ?? null, resync: opts?.resync, maxSeq, explainedGone, now });
+        return stage0Decide({ db: this.db, sessRaw, ledgerId: sid, incoming, seqs: opts?.seqs ?? null, resync: opts?.resync, maxSeq, explainedGone, now, convBound: this.snapConvBound(sid) });
     }
 
     /** The stage-0 resync (brief red gate R4 / the resync ruling): clear the
@@ -1781,8 +1776,24 @@ export class UnifiedStore {
     snapStage0Reset(sid: string): void {
         const sessRaw = this.snapSessRawOf(sid);
         this.db
-            .prepare("UPDATE l1_world SET envelope_json = NULL, envelope_checksum = NULL WHERE sess_raw = ?")
+            .prepare("UPDATE l1_world SET tail_json = NULL, head_json = NULL, count = NULL, max_pos = NULL WHERE sess_raw = ?")
             .run(sessRaw);
+    }
+
+    /** D2 (#7064): whether this sid is CONVERSATION-BOUND — the host already
+     *  declared a conversation identity (a conversations row for this sid),
+     *  so the per-turn id verdict is skipped entirely and the R3 fault path
+     *  (400 / latch) never fires for id mismatch: the session IS the
+     *  identity. */
+    snapConvBound(sid: string): boolean {
+        // The claim INSERT at ingest time writes a `proxy`-namespace row for
+        // EVERY session (conversation_id = session_id — a self-claim, not a
+        // host identity). D2 applies only to HOST-namespace claims (the
+        // agent registered a real conversation): namespace <> 'proxy'.
+        const row = this.db
+            .prepare("SELECT 1 FROM conversations WHERE session_id = ? AND namespace <> 'proxy' LIMIT 1")
+            .get(sid);
+        return row !== undefined;
     }
 
     /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
@@ -1847,17 +1858,14 @@ export class UnifiedStore {
     }
 
     /** #5874 v2 (step 3): one EGRESS CUT — pin the derived stable prefix
-     *  (CAS bytes; undefined for a hash-only pin) plus the input aggregate
-     *  over the pinned id set. Supersedes the previous row (trimmed in the
-     *  same transaction, its CAS ref released). The FOLD-CROSSING gate runs
-     *  on the READ side (egressReadView): a journal row newer than this cut
-     *  that is pinned and crosses the id set degrades that round — the cut
-     *  itself never fails on fold timing.
-     *  null for an empty id set or an unpinnable aggregate (no rows at all). */
+     *  (CAS bytes; undefined for a hash-only pin). #7064 slimming: the hash
+     *  scope IS the watermark (max live seq of the pinned set) — live rows
+     *  at seq <= wm; the stored id list is gone. Supersedes the previous
+     *  row (trimmed in the same transaction, its CAS ref released). The
+     *  FOLD-CROSSING gate runs on the READ side (egressReadView). null for
+     *  an empty id set or an unpinnable aggregate (no rows at all). */
     egressCut(sessionId: string, ids: string[], prefixJson: string | undefined, nowMs: number): EgressSnapshotRow | null {
         if (ids.length === 0) return null;
-        const inputHash = egressInputHash(this.db, sessionId, 0, ids);
-        if (!inputHash) return null;
         const last = this.db.prepare(
             `SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")}) ORDER BY seq DESC LIMIT 1`,
         ).get(sessionId, ...ids) as { msg_id: string } | undefined;
@@ -1865,11 +1873,13 @@ export class UnifiedStore {
         const wm = this.db.prepare(
             `SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")})`,
         ).get(sessionId, ...ids) as { m: number };
+        const inputHash = egressInputHash(this.db, sessionId, wm.m);
+        if (!inputHash) return null;
         const newRef = prefixJson != null ? this.putContent(prefixJson) : null;
         const prev = egressLatestRow(this.db, sessionId);
         try {
             this.db.transaction(() => {
-                const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, ids, newRef, lastStableId, nowMs);
+                const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, newRef, lastStableId, nowMs);
                 this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ? AND snap_seq < ?").run(sessionId, snapSeq);
             });
         } catch (err) {
@@ -1885,19 +1895,20 @@ export class UnifiedStore {
 
     /** #5874 v2 (step 3): the egress READ — serve the newest cut row's CAS
      *  bytes ONLY if the input aggregate re-derives identically over the
-     *  stored id set (a miss degrades the round to the live derive — never
-     *  sticky, never partial) AND no PINNED post-cut fold crosses the
-     *  prefix: an active fold that landed after the cut and whose covered
-     *  rows are all retired (pinned, summary in render) replaces the
+     *  watermark scope (live rows at seq <= watermark — #7064 slimming;
+     *  a miss degrades the round to the live derive — never sticky, never
+     *  partial) AND no PINNED post-cut fold crosses the prefix scope: an
+     *  active fold that landed after the cut and whose row range reaches
+     *  into seq <= watermark (pinned, summary in render) replaces the
      *  originals with the summary, so the materialized bytes are stale;
-     *  an UNPINNED crossing fold (covered rows re-emerged live, #4390 /
-     *  rewind past the boundary) renders the originals again — the old
-     *  bytes are valid, serve them. Any fault ⇒ null (legacy derive). */
+     *  an UNPINNED crossing fold (rows re-emerged live, #4390 / rewind
+     *  past the boundary) renders the originals again — the old bytes are
+     *  valid, serve them. Any fault ⇒ null (legacy derive). */
     egressReadView(sessionId: string, _ids?: string[]): EgressReadHit | null {
         try {
             const row = egressLatestRow(this.db, sessionId);
             if (!row || row.prefixRef == null) return null;
-            const recomputed = egressInputHash(this.db, sessionId, row.watermark, row.ids);
+            const recomputed = egressInputHash(this.db, sessionId, row.watermark);
             if (recomputed !== row.inputHash) return null;
             const content = this.getContent(row.prefixRef);
             if (content == null) return null;
@@ -1907,15 +1918,11 @@ export class UnifiedStore {
                     (this.db.prepare("SELECT block_id FROM blocks WHERE session_id = ? AND active = 1").all(sessionId) as { block_id: string }[])
                         .map((r) => r.block_id),
                 );
-                const liveRows = (this.db.prepare(
-                    "SELECT msg_id, seq FROM messages WHERE session_id = ? AND retired_at IS NULL",
-                ).all(sessionId) as Array<{ msg_id: string; seq: number }>).map((r) => ({ msgId: r.msg_id, seq: r.seq }));
-                const unpinned = foldUnpins(journal, liveRows, activeBlocks);
-                const prefixIds = new Set(row.ids);
+                const unpinned = foldUnpins(this.db, journal, activeBlocks);
                 for (const f of journal) {
                     if (f.createdAt <= row.createdAt) continue; // baked into these bytes
                     if (!activeBlocks.has(f.blockId) || unpinned.has(f.blockId)) continue;
-                    if (f.coveredIds.some((id) => prefixIds.has(id))) return null; // pinned fold crossed the prefix
+                    if (f.startSeq <= row.watermark) return null; // pinned fold crossed the prefix scope
                 }
             }
             return { prefix: content, lastStableId: row.lastStableId, inputHash: row.inputHash };

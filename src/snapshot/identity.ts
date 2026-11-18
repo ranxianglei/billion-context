@@ -1,66 +1,44 @@
 /**
- * #5874 — snapshot-table compression foundation: stage 0 (identity / world
- * match).
+ * #5874 — snapshot-table compression foundation: stage 0 (world cursor).
  *
- * The host's `(sess_raw, msgid[])` pair is the identity channel (§4.0). The
- * `l1_world` table is the server's standing canon: for a raw session id it
- * records the canonical host-msgid ENVELOPE — an ordered list of
- * `{id, pos}` where `pos` is the APPEND-ONLY ledger position the msgid was
- * first issued at (never reused, the DDL invariant) — plus the ledger
- * identity it was issued under.
+ * #7064 msgid-storage slimming (owner ruling 2026-11-17) reshaped this file:
+ * the standing state is a BOOKKEEPING CURSOR — the head + tail id windows of
+ * the last seen host array plus its count and the append-only pos frontier —
+ * not a full canon. The middle is deliberately invisible:
  *
- * Every turn the incoming envelope (host msgids in host order) is matched
- * against the stored canon:
+ *   - D1 (永不判分叉): an id verdict NEVER diverges. Client compression
+ *     removes ids freely; a head drop is a `shrink`, a middle rewrite or a
+ *     head swap is a `reanchor` (re-issue the cursor). The worst outcome is
+ *     one cheap re-issue — never a reject. Middle-TAMPER detection is the
+ *     ledger's job ((msg_id, identity) probes), not the cursor's.
+ *   - D2: sessions with a host conversation identity skip the id verdict
+ *     entirely (`anchor` mode — the cursor follows the incoming
+ *     unconditionally).
+ *   - D3: the cursor refreshes on watermark-hit turns too (the hit view is
+ *     the same canonical id space — the envelope is space-stable).
  *
- *   - echo    — the id sequence matches positionally → all known.
- *   - probe   — the stored id sequence is a strict PREFIX of the incoming →
- *               tail append (the common, v5-proven shape).
- *   - scatter — known ids keep their relative order but NEW ids are inserted
- *               at any position → the span-parse case (T5 byte pin).
- *   - issue   — no stored world → issue a fresh ledger identity + arm.
- *   - diverge — the LIVE head changed, or a KNOWN id changed its relative
- *               order (history rewrite) → this turn legacy + re-stamp; the
- *               canon is NOT updated (the client converges in one turn).
- *   - resync  — an explicit re-baseline (mode switch).
- *
- * Deletions (a stored id absent from the incoming) are NOT a divergence while
- * the live head and the survivors' relative order are unchanged: they are
- * reported via `goneIds` and the reconcile turns them into `delete` events.
- *
- * THE LIVE HEAD: after a fold the client's envelope starts at the first
- * SURVIVING element while the canon still lists the covered head entries
- * (their pos is never reused). A head change is a divergence only when the
- * first stored id that is NOT fold-explained (`explainedGone`) differs from
- * the incoming head — a legal post-fold shrink therefore keeps the plane
- * green, while a host that drops its head WITHOUT fold evidence diverges.
- * (Middle deletions without fold evidence stay legal — reconcile emits the
- * `delete` events and the egress skips the row.)
- *
- * NEW ids are issued fresh append-only pos (maxPos+1.., in incoming order), so
- * a middle insertion never shifts a stored row — the rows (and the prefix
- * cache) stay put.
+ * pos stays APPEND-ONLY (never reused): a re-anchored id is the SAME id at
+ * the same pos (it survives the re-anchor by identity), only genuinely new
+ * ids draw fresh pos from maxPos+1.
  */
-import { envelopeChecksum } from "./checksums.ts";
-import type { WorldDecision, WorldEnvelopeEntry } from "./types.ts";
+
+import type { WorldDecision, WorldMode, WorldWindow } from "./types.ts";
+
+/** Tail window width (the anchor chain). ~32 KiB JSON at ~60-char ids — the
+ *  long-session cost this slimming exists to bound. */
+export const WORLD_TAIL_K = 512;
+/** Head window width (the origin anchor — fork/resume-parent confusion is
+ *  only detectable at the head; a small number suffices). */
+export const WORLD_HEAD_K = 32;
 
 interface WorldMatchInput {
-    /** The stored L1 world for this sess_raw, or null when none exists. */
-    stored: {
-        ledgerId: string;
-        /** The stored canon (ordered {id, pos}). */
-        envelope: WorldEnvelopeEntry[];
-        envelopeChecksum: string;
-        issuedAt: number;
-        armedAt?: number;
-    } | null;
-    /** The incoming host envelope (per-element msgids, in host order). For a
-     *  non-cohort host this is the sequence-derived pseudo-envelope. */
+    /** The stored world anchor for this sess_raw, or null when none exists. */
+    stored: WorldWindow | null;
+    /** The stored world origin (issued_at); 0 when no stored world. */
+    issuedAt: number;
+    /** The incoming host ids (host order) — full-resend lanes send the whole
+     *  array; M2 incremental sends only the new tail (matchAppendWindow). */
     incoming: string[];
-    /** Stored ids whose absence a fold already explains (their row is
-     *  inactive with a coverRef). Only such ids may legally vanish from the
-     *  HEAD of the envelope; any other gone id is a client-side drop
-     *  (legal in the middle, divergent at the head). */
-    explainedGone?: ReadonlySet<string>;
     /** The raw session key (host value, never truncated, P9). */
     sessRaw: string;
     /** The bili canonical ledger identity to issue when no world exists
@@ -71,215 +49,197 @@ interface WorldMatchInput {
     resync?: boolean;
 }
 
-/** Match the incoming envelope against the stored canon. Pure — returns the
- *  verdict; the persistence (upsertL1World) is done by the caller so a
- *  `diverge` turn has ZERO side effects (the canon is not touched). */
-export function matchWorld(input: WorldMatchInput): WorldDecision {
-    const incoming = Array.from(input.incoming);
-    const incomingCk = envelopeChecksum(incoming);
+function sameArr(a: readonly string[], b: readonly string[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
 
-    // Explicit re-baseline always re-issues the canon (the mode changed).
-    if (input.resync) {
-        const env: WorldEnvelopeEntry[] = incoming.map((id, i) => ({ id, pos: i + 1 }));
-        return {
-            mode: "resync",
-            envelope: env,
-            envelopeChecksum: incomingCk,
-            newIdPos: env.map((e) => ({ id: e.id, pos: e.pos })),
-            goneIds: [],
-            issuedLedgerId: input.ledgerId,
-            issuedAt: input.now,
-            armedAt: input.now,
-        };
-    }
-
-    if (input.stored === null) {
-        // No world yet: issue a fresh ledger identity, pay one arming turn.
-        const env: WorldEnvelopeEntry[] = incoming.map((id, i) => ({ id, pos: i + 1 }));
-        return {
-            mode: "issue",
-            envelope: env,
-            envelopeChecksum: incomingCk,
-            newIdPos: env.map((e) => ({ id: e.id, pos: e.pos })),
-            goneIds: [],
-            issuedLedgerId: input.ledgerId,
-            issuedAt: input.now,
-            armedAt: input.now,
-        };
-    }
-
-    const stored = input.stored;
-    const storedIds = stored.envelope.map((e) => e.id);
-
-    // 1. echo: the id sequence matches positionally → all known.
-    if (stored.envelopeChecksum === incomingCk && stored.envelope.length === incoming.length) {
-        return {
-            mode: "echo",
-            envelope: stored.envelope.map((e) => ({ id: e.id, pos: e.pos })),
-            envelopeChecksum: incomingCk,
-            newIdPos: [],
-            goneIds: [],
-            issuedAt: stored.issuedAt, // B1 trap: origin never moves on echo
-        };
-    }
-
-    // Known-id bookkeeping.
-    const storedPos = new Map<string, number>();
-    for (const e of stored.envelope) storedPos.set(e.id, e.pos);
-    const incomingSet = new Set(incoming);
-    const goneIds: string[] = [];
-    for (const id of storedIds) if (!incomingSet.has(id)) goneIds.push(id);
-
-    // A KNOWN id that changed its relative order (or the LIVE head changed)
-    // is a history rewrite → diverge (the canon is not updated; the turn
-    // runs legacy and re-stamps so the client converges in one turn).
-    // The live head = the first stored id that a fold did NOT absorb:
-    // after a post-fold shrink the incoming envelope legitimately starts at
-    // the first surviving element, not at the (covered) canon head.
-    const aliveStored = storedIds.filter((id) => !input.explainedGone?.has(id));
-    const headMoved = aliveStored.length > 0 && incoming.length > 0 && incoming[0] !== aliveStored[0];
-    let orderBroken = false;
-    if (!headMoved) {
-        // The survivor ids must appear in the same relative order as stored.
-        const survivorsStored = storedIds.filter((id) => incomingSet.has(id));
-        const survivorsIncoming = incoming.filter((id) => storedPos.has(id));
-        if (survivorsStored.length !== survivorsIncoming.length) {
-            orderBroken = true;
-        } else {
-            for (let i = 0; i < survivorsStored.length; i++) {
-                if (survivorsStored[i] !== survivorsIncoming[i]) {
-                    orderBroken = true;
-                    break;
-                }
-            }
-        }
-    }
-    if (headMoved || orderBroken) {
-        return {
-            mode: "diverge",
-            envelope: stored.envelope.map((e) => ({ id: e.id, pos: e.pos })),
-            envelopeChecksum: stored.envelopeChecksum,
-            newIdPos: [],
-            goneIds: [],
-            issuedAt: stored.issuedAt,
-            witness: `head ${storedIds[0] ?? "-"} -> ${incoming[0] ?? "-"}; orderBroken=${orderBroken}`,
-        };
-    }
-
-    // Head stable + survivor order preserved → a legal extension (probe or
-    // scatter). Issue fresh pos to every NEW id (maxPos+1.., incoming order).
-    let maxPos = 0;
-    for (const e of stored.envelope) maxPos = Math.max(maxPos, e.pos);
-    const newIdPos: Array<{ id: string; pos: number }> = [];
-    const posMap = new Map<string, number>();
-    for (const e of stored.envelope) posMap.set(e.id, e.pos);
-    for (const id of incoming) {
-        if (!posMap.has(id)) {
-            maxPos += 1;
-            posMap.set(id, maxPos);
-            newIdPos.push({ id, pos: maxPos });
-        }
-    }
-    const envelope: WorldEnvelopeEntry[] = incoming.map((id) => ({ id, pos: posMap.get(id)! }));
-
-    // probe = stored is a strict prefix of incoming (tail append only);
-    // scatter = new ids are interleaved.
-    let isPrefix = storedIds.length < incoming.length;
-    if (isPrefix) {
-        for (let i = 0; i < storedIds.length; i++) {
-            if (incoming[i] !== storedIds[i]) {
-                isPrefix = false;
-                break;
-            }
-        }
-    }
-    const mode = newIdPos.length > 0
-        ? (isPrefix ? "probe" : "scatter")
-        : goneIds.length > 0
-            ? "probe" // canon shrink (deletions only)
-            : "echo";
-
+/** Cut the (tail, head) windows of an array. head = the first min(HEAD_K, n)
+ *  ids; tail = the last min(TAIL_K, n) ids. */
+export function windowOf(ids: readonly string[], maxPos: number): WorldWindow {
     return {
-        mode,
-        envelope,
-        envelopeChecksum: incomingCk,
+        tailIds: ids.slice(-WORLD_TAIL_K),
+        headIds: ids.slice(0, WORLD_HEAD_K),
+        count: ids.length,
+        maxPos,
+    };
+}
+
+/** Count the longest run of stored-tail elements that sit at the START of
+ *  the incoming array — the chain-containment measure. Pure extension
+ *  (incoming continues the stored array) → the whole stored tail counts;
+ *  equality (echo) → also the whole tail; a head swap or a middle rewrite
+ *  caps the run at the first mismatch. (A tail-vs-tail overlap would count
+ *  the same arrays and miss every pure extension — the verdict the W3
+ *  round trip needs.) */
+function prefixContainLen(storedTail: readonly string[], incoming: readonly string[]): number {
+    const cap = Math.min(storedTail.length, incoming.length);
+    let k = 0;
+    for (let i = 0; i < cap; i++) {
+        if (storedTail[i] !== incoming[i]) break;
+        k++;
+    }
+    return k;
+}
+
+/** Match the incoming host-id array against the stored cursor. Pure — returns
+ *  the verdict; persistence is the caller's. D1: NO verdict rejects; the
+ *  strongest move is `reanchor` (re-issue from the incoming). */
+export function matchWindow(input: WorldMatchInput): WorldDecision {
+    const incoming = Array.from(input.incoming);
+    const fresh = (mode: WorldMode, witness?: string): WorldDecision => {
+        const n = incoming.length;
+        return {
+            mode,
+            window: windowOf(incoming, n),
+            newIdPos: incoming.map((id, i) => ({ id, pos: i + 1 })),
+            goneIds: [],
+            issuedLedgerId: input.ledgerId,
+            issuedAt: input.now,
+            witness,
+        };
+    };
+
+    // Explicit re-baseline always re-issues (the mode changed).
+    if (input.resync) return fresh("resync");
+    // No world yet: issue (one arming turn is charged at the session level).
+    if (input.stored === null) return fresh("issue");
+
+    const s = input.stored;
+    const incomingSet = new Set(incoming);
+    // Windowed gone-set: stored TAIL ids absent from the incoming (only what
+    // the window can see — the middle is invisible by design).
+    const goneIds = s.tailIds.filter((id) => !incomingSet.has(id));
+
+    // No overlap at all → total re-mint → re-issue (D1: bookkeeping).
+    if (s.tailIds.length === 0 || incoming.length === 0) {
+        return {
+            mode: "reanchor",
+            window: windowOf(incoming, s.maxPos + incoming.length),
+            newIdPos: incoming.map((id, i) => ({ id, pos: s.maxPos + i + 1 })),
+            goneIds,
+            issuedAt: input.issuedAt,
+            witness: `no overlap (stored ${s.count}, incoming ${incoming.length})`,
+        };
+    }
+
+    const k = prefixContainLen(s.tailIds, incoming);
+    // The stored anchor fully contained in the incoming tail: the chain
+    // extends (or holds).
+    if (k >= s.tailIds.length) {
+        // head + count + tail all agree → nothing moved (the middle is
+        // invisible by design — head digest + count is the strongest claim
+        // the windows can make).
+        if (incoming.length === s.count && sameArr(s.headIds, incoming.slice(0, WORLD_HEAD_K))) {
+            return {
+                mode: "echo",
+                window: s,
+                newIdPos: [],
+                goneIds: [],
+                issuedAt: input.issuedAt,
+            };
+        }
+        // Extension: ids beyond the stored array length are new. The count
+        // cannot shrink across a full chain containment, so pos accounting
+        // is exact.
+        const newIdPos = incoming.slice(s.count).map((id, i) => ({ id, pos: s.count + i + 1 }));
+        return {
+            mode: "extend",
+            // The head must track the INCOMING array — the next M1 full
+            // resend re-compares against it (the W11 round trip): preserving
+            // the stored head here would never echo again.
+            window: { ...windowOf(incoming, s.maxPos), maxPos: s.maxPos + newIdPos.length },
+            newIdPos,
+            goneIds,
+            issuedAt: input.issuedAt,
+        };
+    }
+    // The whole incoming is a SUFFIX of the stored tail → the client dropped
+    // head elements (a fold). D1: legal shrink, never divergent.
+    if (incoming.length < s.count && incoming.every((id, i) => s.tailIds[s.tailIds.length - incoming.length + i] === id)) {
+        return {
+            mode: "shrink",
+            window: windowOf(incoming, s.maxPos),
+            newIdPos: [],
+            goneIds,
+            issuedAt: input.issuedAt,
+            witness: `head drop: ${s.count} -> ${incoming.length}`,
+        };
+    }
+    // No anchor relation (partial overlap / head swap / middle rewrite /
+    // re-mint): re-issue the cursor. Ids that SURVIVE keep their pos via the
+    // stored tail; everything else is counted as new (pos is bookkeeping —
+    // M2 contiguity anchors on ledger seqs, not on this counter).
+    // pos reconstruction: the tail ids hold maxPos-tailLen+1 .. maxPos in
+    // order — the only positions the window knows exactly.
+    const storedPos = new Map<string, number>();
+    const base = s.maxPos - s.tailIds.length + 1;
+    for (let i = 0; i < s.tailIds.length; i++) storedPos.set(s.tailIds[i], base + i);
+    let pos = s.maxPos;
+    const newIdPos: Array<{ id: string; pos: number }> = [];
+    for (const id of incoming) {
+        const p = storedPos.get(id);
+        if (p === undefined) {
+            pos += 1;
+            newIdPos.push({ id, pos });
+        }
+    }
+    return {
+        mode: "reanchor",
+        window: { ...windowOf(incoming, pos), maxPos: pos },
         newIdPos,
         goneIds,
-        issuedAt: stored.issuedAt, // B1 trap: origin never moves on extend
+        issuedAt: input.issuedAt,
+        witness: `chain broke (overlap ${k}/${s.tailIds.length}; stored ${s.count}, incoming ${incoming.length})`,
     };
 }
 
 /**
- * #5874 2×2 (brief 19544722, Part A) — the M2 INCREMENTAL envelope:
- * the client sends ONLY the new elements (with msgids), so the incoming
- * list shares NO ids with the stored canon (a pure addition). The caller
- * has ALREADY located the sequence position (世界匹配定位序列位置) via the
- * seqs carrier — the incoming ledger seqs are contiguous and start exactly
- * after the plane's max stamped seq — so every incoming id gets a fresh
- * append-only pos (maxPos+1.., in incoming order) and the envelope is the
- * stored canon ++ the new tail.
- *
- * This is the "probe" shape of a client that never re-sends: the covered
- * (fold-explained) canon entries stay in the canon (the caller prunes them
- * from the kernel-input walk via explainedGone — the plane keeps serving
- * them as covered rows until GC).
+ * #5874 2×2 M2 INCREMENTAL window: the client sends ONLY the new elements
+ * (with msgids) — the caller has ALREADY located them at the ledger frontier
+ * (contiguous seqs starting exactly after maxSeq, all ids unknown). The new
+ * cursor = stored cursor ++ the new tail; the head is unchanged.
  */
-export function matchAppend(
-    stored: {
-        ledgerId: string;
-        envelope: WorldEnvelopeEntry[];
-        envelopeChecksum: string;
-        issuedAt: number;
-        armedAt?: number;
-    },
-    incoming: string[],
-): WorldDecision {
-    const incomingCk = envelopeChecksum(incoming);
-    let maxPos = 0;
-    const posMap = new Map<string, number>();
-    for (const e of stored.envelope) {
-        maxPos = Math.max(maxPos, e.pos);
-        posMap.set(e.id, e.pos);
-    }
-    const newIdPos: Array<{ id: string, pos: number }> = [];
-    for (const id of incoming) {
-        if (posMap.has(id)) continue; // defensive: the caller guarantees a pure addition
-        maxPos += 1;
-        posMap.set(id, maxPos);
-        newIdPos.push({ id, pos: maxPos });
-    }
-    const envelope: WorldEnvelopeEntry[] = [
-        ...stored.envelope.map((e) => ({ id: e.id, pos: e.pos })),
-        ...incoming.map((id) => ({ id, pos: posMap.get(id)! })),
-    ];
+export function matchAppendWindow(stored: WorldWindow, incoming: string[]): WorldDecision {
+    const ids = Array.from(incoming);
+    const all = [...stored.tailIds, ...ids];
+    const prior = new Set(stored.tailIds);
+    const newIdPos = ids
+        .map((id, i) => ({ id, pos: stored.maxPos + i + 1, fresh: !prior.has(id) }))
+        .filter((e) => e.fresh)
+        .map(({ id, pos }) => ({ id, pos }));
     return {
-        mode: "probe",
-        envelope,
-        // The stored canon's checksum covers the WHOLE envelope sequence
-        // (the next M1 full resend must echo against it), not just the new
-        // tail.
-        envelopeChecksum: envelopeChecksum(envelope.map((e) => e.id)),
+        mode: "extend",
+        window: {
+            // head + tail both track the COMBINED array — the next M1 full
+            // resend re-compares against it (the W11 round trip).
+            tailIds: all.slice(-WORLD_TAIL_K),
+            headIds: all.slice(0, WORLD_HEAD_K),
+            count: stored.count + ids.length,
+            maxPos: stored.maxPos + ids.length, // M2 appends sequentially — every appended id takes the next pos, known or not
+        },
         newIdPos,
         goneIds: [],
-        issuedAt: stored.issuedAt, // B1 trap: origin never moves on extend
+        issuedAt: 0, // the caller preserves the stored origin
     };
 }
 
-/** Parse the persisted element envelope (the l1_world envelope_json column —
- *  `JSON.stringify(WorldEnvelopeEntry[])`, host order). Validated: a
- *  malformed canon is a storage-corruption signal and throws (the lane
- *  maps it to a resync — the client converges in one round) rather than
- *  being silently re-issued over a half-read canon. */
-export function parseEnvelope(envelopeJson: string | null): { envelope: WorldEnvelopeEntry[] } {
-    if (envelopeJson === null) return { envelope: [] };
+/** Parse a LEGACY persisted envelope (`JSON.stringify({id,pos}[])` — the
+ *  pre-slimming l1_world.envelope_json) into the new window shape. Used by
+ *  the schema migration ONLY (fresh rows store the window columns directly).
+ *  Throws on malformed data (the migration degrades that row to a blank
+ *  cursor instead of crashing the open). */
+export function parseLegacyEnvelopeToWindow(envelopeJson: string): WorldWindow {
     const parsed: unknown = JSON.parse(envelopeJson);
-    if (!Array.isArray(parsed)) throw new Error("parseEnvelope: the canon is not an array (corrupted l1_world row)");
-    const envelope: WorldEnvelopeEntry[] = parsed.map((e, i) => {
+    if (!Array.isArray(parsed)) throw new Error("legacy envelope is not an array");
+    const ids: string[] = [];
+    let maxPos = 0;
+    for (const e of parsed) {
         const entry = e as { id?: unknown, pos?: unknown };
-        if (typeof entry.id !== "string" || !Number.isInteger(entry.pos) || (entry.pos as number) < 0) {
-            throw new Error(`parseEnvelope: canon entry ${i} is not a {id, pos} pair (corrupted l1_world row)`);
-        }
-        return { id: entry.id, pos: entry.pos as number };
-    });
-    return { envelope };
+        if (typeof entry.id !== "string") throw new Error("legacy envelope entry is not {id, pos}");
+        ids.push(entry.id);
+        if (typeof entry.pos === "number" && entry.pos > maxPos) maxPos = entry.pos;
+    }
+    return windowOf(ids, maxPos || ids.length);
 }

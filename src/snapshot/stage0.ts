@@ -1,4 +1,4 @@
-// #5874 2×2 stage 0 (#6181): identity gate + world match for cohort
+// #5874 2×2 stage 0 (#6181): identity gate + world cursor for cohort
 // (dual-channel DECLARED) plugin traffic. SHARED by the openai and
 // responses lanes so both carry the same red gate and the same
 // one-round-convergence contract.
@@ -7,21 +7,25 @@
 // (R3) carries ZERO kernel side effects. Every other fault → the legacy
 // full path (degrade, never guess — one-round convergence).
 //
-// Contract (brief 19544722 + review 2026-11-12):
+// Contract (#7064 slimming, owner ruling 2026-11-17):
 //  - armed = pluginMode + dual-channel DECLARED (msgids present) + the
 //    pluginLaneServerHistory rollout (M1: the red gate must be unreachable
-//    wherever the pin is unreachable) + no R3 latch on the sid (in-memory
-//    window OR the persisted latch, M3).
+//    wherever the pin is unreachable). D3: the arm no longer excludes
+//    watermark-HIT turns — the cursor refreshes on hit turns too (the hit
+//    view is the same canonical id space; the tail anchor stays live).
 //  - R3: declared but incomplete → checkR3Identity is the single arbiter
 //    (M2: it is CALLED here, in both lanes); an unlatched fault throws
 //    FoundationRejectError → the server maps it to 400 (B1); 3 faults in a
 //    10-minute window latch the sid to the legacy path and the latch
-//    PERSISTS across proxy restarts (snapR3Latch).
-//  - stage 0: snapStage0 → diverge / explicit re-baseline → envelope reset
-//    + legacy this turn (one-round convergence); otherwise the envelope
-//    canon is persisted and the lane renders its usual view (the stored
-//    envelope — not a row table — is what the M2 delta-inbound evidence
-//    anchors on).
+//    PERSISTS across proxy restarts (snapR3Latch). D2: the fault path
+//    NEVER fires for conversation-bound sids — the host conversation
+//    identity IS the identity, the cursor is bookkeeping there.
+//  - D1 永不判分叉: the stage-0 verdict NEVER rejects or resets — the
+//    strongest move is `reanchor` (re-issue the world cursor from the
+//    incoming array, one cheap UPDATE). The pre-slimming diverge/envelope
+//    reset path is gone: a structural disagreement re-anchors in the same
+//    turn and the NEXT same-array turn echoes (one-round convergence, now
+//    a property of the cursor, not a lane reset).
 
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
@@ -41,7 +45,9 @@ export interface Stage0Input {
      *  already applied them to msgs when non-null). */
     incomingSeqs: number[] | null;
     pluginMode: boolean;
-    /** The openai fast-path watermark hit; the responses lane has none. */
+    /** The openai fast-path watermark hit; the responses lane has none.
+     *  (D3: a hit turn still refreshes the cursor — this field is now
+     *  informational for logs only.) */
     wpHit?: unknown;
     log: (level: string, msg: string) => void;
 }
@@ -50,23 +56,30 @@ export interface Stage0Result {
     /** Pinned msg array when the pin applied — the lane adopts it
      *  (`msgs = pinned; originalMessages = msgs`). null otherwise. */
     pinned: BiliMessage[] | null;
-    /** True when the cohort armed and RAN (gate passed, envelope matched
-     *  or resynced) — the lane keeps its per-turn guards keyed on it. */
+    /** True when the cohort armed and RAN (gate passed) — the lane keeps
+     *  its per-turn guards keyed on it. */
     cohortRan: boolean;
-    /** True when stage 0 reset the envelope this turn (diverge / explicit
-     *  re-baseline) — one-round convergence: the NEXT turn re-issues the
-     *  envelope from the client's current array. */
-    resynced: boolean;
+    /** True when the world cursor MOVED this turn (extend/reanchor/
+     *  shrink/issue/resync/anchor — anything but a plain echo). The lane
+     *  bumps the session's revisionEpoch so the per-turn snapshot flush
+     *  (snapFlush epoch proof) observes the stage-0 advance — a fork
+     *  taken between the cursor write and the flush otherwise reads a
+     *  STALE parent revision (plugin-fork lane regression, #6785 WIP). */
+    anchorAdvanced: boolean;
 }
 
 export function runStage0(opts: Stage0Input): Stage0Result {
     const { sessionId, lane, msgs, incomingMsgIds, incomingSeqs, pluginMode, wpHit, log } = opts;
+    void wpHit; // D3: the arm no longer keys on the hit state (logs only)
     const rollout = featureEnabled("pluginLaneServerHistory");
     const declared = Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0;
     // M1: the arm rides the SAME rollout as the pin — under the default
     // (rollout off) the whole 2×2 path is unreachable, so R3 is not dead
-    // code waiting for a rollout that never arms it.
-    const armed0 = rollout && wpHit === undefined && pluginMode && declared;
+    // code waiting for a rollout that never arms it. #7064 D3: the
+    // wpHit === undefined exclusion is GONE — the cursor refreshes on
+    // hit turns too (尾锚常活: the hit view is the same canonical id
+    // space, so the tail anchor stays live across hit runs).
+    const armed0 = rollout && pluginMode && declared;
     const persistedLatch = (() => {
         try {
             return getStore()?.snapR3Latched(sessionId) ?? false;
@@ -85,19 +98,28 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     // never equal, and such parents are un-forkable by identity. The stamped
     // array is captured pre-watermark (prepare-openai:83) and aligns to the
     // FULL view length on hit exactly as on miss, so validation and the pin
-    // are unchanged; only the R3 consequences stay behind the `armed` gate
-    // (armed0 keeps wpHit === undefined — the 2×2 plane arms on full resends).
+    // are unchanged; only the R3 consequences stay behind the `armed` gate.
     if (pluginMode && incomingMsgIds !== undefined) {
         if (rollout) {
             const v = validateMsgIds(incomingMsgIds, msgs.length);
             if (v.ok) {
                 pinned = applyMsgIdPin(msgs, v.ids);
             } else if (armed) {
-                // #6181 M2: checkR3Identity is the single arbiter of the
-                // identity fault (declared + element count mismatched) —
-                // validateMsgIds' shape verdicts are its evidence, not a
-                // second gate.
-                if (!checkR3Identity(true, msgs.length, Array.isArray(incomingMsgIds) ? (incomingMsgIds as string[]) : null)) {
+                // #7064 D2: conversation-bound sids never take the R3 fault
+                // path — the host conversation identity IS the identity and
+                // the cursor is bookkeeping; a short/missing msgid array
+                // degrades to content-derived ids (the log below) instead of
+                // 400/latch.
+                const convBound = (() => {
+                    try {
+                        return getStore()?.snapConvBound(sessionId) ?? false;
+                    } catch {
+                        return false; // a store fault must not OPEN the fault path
+                    }
+                })();
+                if (convBound) {
+                    log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — conversation-bound sid skips the R3 fault, content-derived ids this turn`);
+                } else if (!checkR3Identity(true, msgs.length, Array.isArray(incomingMsgIds) ? (incomingMsgIds as string[]) : null)) {
                     // R3: a cohort host that DECLARED the dual-channel but
                     // did not collect every element → hard 400 BEFORE any
                     // kernel side effect; the fault feeds the breaker
@@ -122,6 +144,8 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                         log("warn", `[${sessionId}] [2x2:${lane}] R3 identity fault — strike ${strike}/${r3FaultTracker.strikeCap} in window (${v.reason}) — 400 sent; the sid latches to the legacy path after ${r3FaultTracker.strikeCap - strike} more`);
                         throw new FoundationRejectError(`inbound msgid envelope failed validation (${v.reason})`);
                     }
+                } else {
+                    log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
                 }
             } else {
                 log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
@@ -130,36 +154,41 @@ export function runStage0(opts: Stage0Input): Stage0Result {
             log("info", `[${sessionId}] [msgid] ${lane}-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
         }
     }
-    let resynced = false;
-    if (armed) {
+    let anchorAdvanced = false;
+    // D3: the cursor (world anchor) refreshes whenever the host declared +
+    // the pin APPLIED — hit or miss turns alike. A rejected pin leaves
+    // content-derived ids on the array and must NOT touch the host-id
+    // cursor. The verdict is PURE bookkeeping (D1): it can only re-issue,
+    // never reject.
+    if (pinned !== null) {
         try {
             const store = getStore();
-            const stage0 = store?.snapStage0(sessionId, msgs.map((m) => m.id), { seqs: incomingSeqs ?? undefined });
-            if (stage0 && stage0.diverge) {
-                // Structural disagreement (diverge) or an explicit
-                // re-baseline: clear the envelope; THIS turn runs the
-                // legacy full path — the NEXT turn re-issues the envelope
-                // from the client's current array (one-round convergence).
-                store!.snapStage0Reset(sessionId);
-                resynced = true;
-                log("warn", `[${sessionId}] [2x2:${lane}] stage-0 ${stage0.decision.mode} — envelope reset, this turn legacy (one-round convergence)`);
-            } else if (stage0) {
-                log("info", `[${sessionId}] [2x2:${lane}] stage-0 ${stage0.decision.mode} (new=${stage0.decision.newIdPos.length}, gone=${stage0.decision.goneIds.length})`);
+            const stage0 = store?.snapStage0(sessionId, pinned.map((m) => m.id), { seqs: incomingSeqs ?? undefined });
+            if (stage0) {
+                anchorAdvanced = stage0.decision.mode !== "echo";
+                log(anchorAdvanced ? "info" : "debug", `[${sessionId}] [2x2:${lane}] stage-0 ${stage0.decision.mode} (new=${stage0.decision.newIdPos.length}, gone=${stage0.decision.goneIds.length})${stage0.decision.witness ? ` — ${stage0.decision.witness}` : ""}`);
             }
         } catch (err) {
-            if (err instanceof FoundationRejectError) throw err; // R3 outranks the fallback
-            const why = err instanceof Error ? err.message : String(err);
-            // A stage-0 storage fault (ledger behind / schema edge —
-            // R4-shaped): clear the envelope best-effort and take the
-            // legacy path this turn (one-round convergence).
-            if (why.includes("[snapshot") || why.includes("SQLITE") || why.includes("no such")) {
-                try {
-                    getStore()?.snapStage0Reset(sessionId);
-                } catch { /* the reset is best-effort — the legacy path is the floor */ }
-                resynced = true;
+            if (err instanceof FoundationRejectError) {
+                // An R3-class fault (l1 ledger conflict — a real mapping
+                // under a different ledger sid) rejects the request on
+                // EVERY wire: the conflict is a durable ledger state, not a
+                // per-request glitch (the M3.2b contract).
+                throw err;
+            } else {
+                const why = err instanceof Error ? err.message : String(err);
+                // A stage-0 storage fault (corrupt cursor row / schema edge —
+                // R4-shaped): clear the cursor best-effort and take the
+                // legacy path this turn (one-round convergence: the next
+                // turn re-issues the cursor from the client's array).
+                if (why.includes("[snapshot") || why.includes("SQLITE") || why.includes("no such")) {
+                    try {
+                        getStore()?.snapStage0Reset(sessionId);
+                    } catch { /* the reset is best-effort — the legacy path is the floor */ }
+                }
+                log("warn", `[${sessionId}] [2x2:${lane}] stage-0 failed (${why}) — legacy full path`);
             }
-            log("warn", `[${sessionId}] [2x2:${lane}] stage-0 failed (${why}) — legacy full path`);
         }
     }
-    return { pinned, cohortRan: armed, resynced };
+    return { pinned, cohortRan: armed, anchorAdvanced };
 }

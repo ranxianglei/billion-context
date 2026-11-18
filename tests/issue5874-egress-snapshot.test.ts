@@ -4,16 +4,17 @@
 // Shape: one cache row per CUT (fold boundary / every-K / user-message
 // boundary — the latter is step 4). A row pins the DERIVED stable prefix
 // (D-lane buildView output up to the seam, anchors included) into the content
-// CAS plus the input aggregate the prefix was derived from. The input
-// aggregate is id-bound: sha256 over (seq, msg_id, content_hash) of ALL
-// generations of the pinned id set (a content rewrite or new generation of a
-// pinned id moves it; a pure retirement or tail growth does NOT). The egress
-// read re-derives the aggregate BEFORE trusting the bytes; a miss degrades
-// the round to the live derive (never sticky, never partial). A PINNED
-// post-cut fold that crosses the prefix also degrades: its summary replaces
-// the originals in the render, so the materialized bytes are stale; an
-// UNPINNED crossing fold (covered rows re-emerged live) re-renders the
-// originals — the old bytes stay valid.
+// CAS plus the input aggregate the prefix was derived from. #7064: the
+// aggregate is WATERMARK-bound — sha256 over (seq, msg_id, content_hash) of
+// the LIVE rows at seq <= watermark (the ids list is gone; the watermark IS
+// the scope). A content rewrite (new generation retires the in-window row)
+// or an in-window retirement moves it; a pure tail growth beyond the
+// watermark does NOT. The egress read re-derives the aggregate BEFORE
+// trusting the bytes; a miss degrades the round to the live derive (never
+// sticky, never partial). A PINNED post-cut fold crossing the prefix also
+// degrades: its summary replaces the originals in the render, so the
+// materialized bytes are stale; an UNPINNED crossing fold (covered rows
+// re-emerged live) re-renders the originals — the old bytes stay valid.
 //
 // Fold fixture shape (production, per tests/issue5874-fold-journal.test.ts):
 // the folded log keeps EVERY original message (the kernel tags the covered
@@ -125,7 +126,7 @@ test("#5874-v2 T2: the input aggregate is STABLE across an unrelated fold (+/-)"
         const ids = ["m1", "m2", "m3", "m4"];
         const before = st.egressCut("sess-es", ids, undefined, 1000);
         assert.ok(before, "cut writes a row");
-        assert.equal(before.ids.length, 4);
+        assert.equal(before.watermark, 3, "the watermark is the max seq of the pinned live rows (stored seqs are 0-based: m1..m4 = 0..3)");
         assert.equal(before.lastStableId, "m4");
         // The fold lands over m5/m6 (outside the pinned set); the folded log
         // keeps every original, so m1..m4 are untouched: re-deriving over the
@@ -146,27 +147,44 @@ test("#5874-v2 T3: content move ⇒ aggregate move (the verify gate)", () => {
         const st = open(dir);
         assert.ok(st.ingestSession(planIngest(plainSession(6))), "seed");
         const raw = openSqliteDatabase(path).db as unknown as SqliteDatabase;
-        // (+) window probe: a retirement inside the window moves it.
-        const hashOf = () => egressInputHash(raw, "sess-es", 5, []);
+        // (+) watermark probe: a retirement inside the window moves the
+        //  live-row aggregate.
+        const hashOf = () => egressInputHash(raw, "sess-es", 5);
         const before = hashOf();
         assert.ok(before);
+        // the scope-2 aggregate BEFORE anything retires: rows 0..2 = m1, m2, m3
+        const idHash = () => egressInputHash(raw, "sess-es", 2);
+        const idBefore = idHash();
+        assert.ok(idBefore);
         raw.prepare(
             "UPDATE messages SET retired_at = 2000 WHERE session_id = 'sess-es' AND msg_id = 'm2' AND retired_at IS NULL",
         ).run();
         assert.notEqual(hashOf(), before, "in-window retirement moves the window aggregate");
-        // (+) id-bound aggregate: a new generation of a pinned id (via the
-        //  real ingest path — a same-id content rewrite) moves it.
-        const idHash = () => egressInputHash(raw, "sess-es", 0, ["m1", "m2"]);
-        const idBefore = idHash();
-        assert.ok(idBefore);
+        // (+) a new generation of a pinned id (via the real ingest path — a
+        //  same-id content rewrite retires the in-window row) keeps the
+        //  m2-free aggregate stable.
         const revised = plainSession(6);
         (revised.lastMessages as unknown as Array<{ id: string; text: string }>).find((m) => m.id === "m2")!.text = "m2-REVISED";
         assert.ok(st.ingestSession(planIngest(revised), undefined, { completeLog: true }), "rewrite m2");
-        assert.notEqual(idHash(), idBefore, "new generation of a pinned id moves the id aggregate");
-        // (-) a pure tail growth (new id m7) moves the id aggregate NOT.
+        // the scope-2 aggregate holds the m2-free value (row 1 retired at
+        // step 1; the rewrite minted the new m2 past the window at seq 6).
+        assert.notEqual(idHash(), idBefore, "the retired in-window generation leaves the scope-2 aggregate at the m2-free value");
+        // (+) the m2-free value differs from the PRE-retirement scope-2 aggregate —
+        //  the retirement is what moved it.
+        const preRetireScope2 = egressInputHash(raw, "sess-es", 2);
+        raw.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = 'sess-es' AND seq = 1").run();
+        assert.notEqual(egressInputHash(raw, "sess-es", 2) ?? "", preRetireScope2 ?? "", "reactivating the in-window m2 generation moves it back");
+        raw.prepare("UPDATE messages SET retired_at = 2000 WHERE session_id = 'sess-es' AND seq = 1").run();
+        // (-) a pure tail growth (new id m7) moves the aggregate NOT. The
+        //  growth session carries the same m2-REVISED bytes: re-presenting
+        //  the ORIGINAL m2 identity would legitimately revive its row at seq
+        //  1 (the #4390 rewind-redo rule — a presented identity reactivates
+        //  in place), which is a real in-window change, not pure growth.
         const idAfter = idHash();
-        assert.ok(st.ingestSession(planIngest(plainSession(7)), undefined, { completeLog: true }), "tail growth");
-        assert.equal(idHash(), idAfter, "tail growth leaves the id aggregate alone");
+        const grown = plainSession(7);
+        (grown.lastMessages as unknown as Array<{ id: string; text: string }>).find((m) => m.id === "m2")!.text = "m2-REVISED";
+        assert.ok(st.ingestSession(planIngest(grown), undefined, { completeLog: true }), "tail growth");
+        assert.equal(idHash(), idAfter, "tail growth beyond the watermark leaves the aggregate alone");
         st.close();
     } finally { rm(dir); }
 });

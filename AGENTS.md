@@ -61,6 +61,10 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 
 身份信号来源只有三类：**宿主写入**（msgid body 字段 / 信封 `msgIds` / pf 头）、**宿主盖戳头**（opencode V2 `x-bili-msg-ids`）、**自包含采集器**（`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器；双门：env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest`，均默认关 × 仅回环来源）。**消费者（#5719 归属档 / pin-行链路 / membership / 水位）只从统一缝取数**：handle 入口每请求按「body 字段 > 盖戳头 > 采集」取一次快照——绝不新增「逐调用点单独取数」。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；适配器自包含、整轮退化（任一环节不判定 ⇒ 该轮整体回退接线前路径，绝不做部分映射）。车道状态表与信任边界：docs/identity-channels.md；身份判定逻辑：docs/session-identity-resolution.md。Full text: design-decisions.md #18.
 
+### #20 — id 存储去重与 msgid 生命周期梳理（#7064, owner 裁定 2026-11-17） (Tier B)
+
+msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_snapshot` 里的 id 清单 JSON 全是投影，已全部降级为「区间引用 + 防伪指纹」：l1_world = 尾 512/头 32 id 窗 + count + max_pos（身份闸门→记账游标，中段不可见）；fold_journal = [start_seq,end_seq] + input_hash（原文行防伪指纹，按区间重扫重推）；egress_snapshot = 水位线以下存活行聚合指纹。**D1 永不判分叉**（判决最强动作是 reanchor 一条 UPDATE，永不 reject/400/reset）；**D2 conversation-bound 跳过 id 判定**（宿主身份行的 sid 游标纯记账，R3 故障永不触发，短/缺 msgid 只降级 + 日志）；**D3 尾锚常活**（水位命中轮同样 pin + 刷新游标；stage-0 推进 bump revisionEpoch，snapFlush epoch 证明看见推进——fork 拿不到过期父 revision）。改 l1/fold_journal/egress 任何一处前先读 discussion #7064 与本条目——三表回答的是同一个问题（「我缓存的和账本还对得上吗」），不需要 id 清单本身。Full text: design-decisions.md #20.
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:
