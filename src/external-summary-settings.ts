@@ -133,15 +133,34 @@ function parseConcurrency(settings: Record<string, unknown>): { concurrency?: nu
     return { concurrency: value };
 }
 
-function parseBudget(raw: unknown): SummaryBudget {
+function parseBudget(raw: unknown, targetCount: number): SummaryBudget {
     const rawBudget = raw === undefined ? {} : object(raw);
     knownKeys(rawBudget, ["totalTimeoutMs", "targetTimeoutMs", "maxSummaryBytes"]);
     // totalTimeoutMs bounds the WHOLE batch (one shared deadline across every
-    // chunk); a big-session fold runs a dozen or more chunks, so the cap needs
-    // real headroom. Long waits are safe — preflight holds the client with SSE
-    // keep-alives past its undici body timeout (#2484/#1647).
-    const totalTimeoutMs = integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 600_000);
-    const targetTimeoutMs = integer(rawBudget.targetTimeoutMs, Math.min(SUMMARY_DEFAULT_BUDGET.targetTimeoutMs, totalTimeoutMs), 100, totalTimeoutMs);
+    // target, which run sequentially); a big-session fold runs a dozen or more
+    // chunks, so the cap needs real headroom. Long waits are safe — preflight
+    // holds the client with SSE keep-alives past its undici body timeout
+    // (#2484/#1647).
+    // #7100: a lone targetTimeoutMs must not be rejected just because the
+    // default total (50_000) is smaller — validate the target against the
+    // GLOBAL cap (600_000) first, then derive the default total to accommodate
+    // it (target × targetCount, floored at the default total, capped at the
+    // global cap) so each sequential target gets its full window. Only an
+    // EXPLICIT total smaller than the target is a genuine contradiction.
+    const hasTarget = rawBudget.targetTimeoutMs !== undefined;
+    const hasTotal = rawBudget.totalTimeoutMs !== undefined;
+    const explicitTarget = hasTarget
+        ? integer(rawBudget.targetTimeoutMs, SUMMARY_DEFAULT_BUDGET.targetTimeoutMs, 100, 600_000)
+        : undefined;
+    const totalTimeoutMs = hasTotal
+        ? integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 600_000)
+        : explicitTarget !== undefined
+            ? Math.min(600_000, Math.max(SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, explicitTarget * targetCount))
+            : SUMMARY_DEFAULT_BUDGET.totalTimeoutMs;
+    const targetTimeoutMs = explicitTarget !== undefined
+        ? explicitTarget
+        : Math.min(SUMMARY_DEFAULT_BUDGET.targetTimeoutMs, totalTimeoutMs);
+    if (targetTimeoutMs > totalTimeoutMs) throw new Error(`Invalid external summary budget: targetTimeoutMs ${targetTimeoutMs} exceeds totalTimeoutMs ${totalTimeoutMs}`);
     const maxSummaryBytes = integer(rawBudget.maxSummaryBytes, SUMMARY_DEFAULT_BUDGET.maxSummaryBytes, 128, 1024 * 1024);
     return { totalTimeoutMs, targetTimeoutMs, maxSummaryBytes };
 }
@@ -190,7 +209,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
         if (slash <= 0 || slash === target.length - 1) throw new Error(`External summary target "${target}" must reference a provider and model as "provider/model"`);
         return target;
     });
-    return { enabled, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
+    return { enabled, targets, budget: parseBudget(settings.budget, targets.length), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 /** Expand chain references against the named providers table. THROWS on an
@@ -301,7 +320,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         }
         return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
     });
-    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
+    return { enabled: true, targets, budget: parseBudget(settings.budget, targets.length), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 const seenExpansionWarnings = new Set<string>();
