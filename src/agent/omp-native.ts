@@ -22,11 +22,11 @@
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
-import { createBiliPlugin } from "./pi.js";
+import { createBiliPlugin, createOmpDirectSendGuard } from "./pi.js";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
-import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
@@ -214,8 +214,10 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
 
 state.beforeSend = ompIncrementalBeforeSend;
 // #3304: the omp swap stamps the turn id atomically with the body, so the
-// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
-state.prepareDirectSend = createPrepareDirectSend();
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally. A
+// direct send also drops the prompt_cache_key the plugin stamped (no proxy
+// strips it on that path).
+state.prepareDirectSend = createOmpDirectSendGuard();
 
 export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
     const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
