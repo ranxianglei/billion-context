@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
 import { setLogCapture } from "../src/logger.ts";
 import {
@@ -222,6 +223,84 @@ test("a damaged verdict cache cannot prevent a healthy store from reopening", ()
         }
         assert.equal(readIntegrityCache(dbPath)?.ok, true);
     } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// #7156: the close-time cache refresh used to be unconditional on
+// lastIntegrityOk — a process that booted healthy (cache hit or sync ok) but
+// whose file was then corrupted by a CONCURRENT second writer (the incident:
+// a wedged predecessor still holding index.db when its replacement opened it)
+// stamped a FRESH "ok" verdict onto the corrupted stats at close, so every
+// later boot hit the poisoned cache, skipped the rescan, and died on the
+// first write. The refresh is now gated on there being no live foreign
+// writer: with one present, close() leaves the verdict untouched so the next
+// boot re-scans fresh.
+test("close skips the integrity-cache refresh while a live foreign writer holds the lock (#7156)", { timeout: 30_000 }, async (t) => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    // A live foreign process whose pid we plant in <db>.lock BEFORE open —
+    // the #7156 shape (a predecessor still holding index.db when the
+    // replacement boots). open() captures it as the foreign lock holder,
+    // then overwrites the file with its own pid.
+    const holder = spawn(process.execPath, ["--input-type=module", "-e", "setTimeout(() => {}, 30000);"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch { /* gone */ } });
+    await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const tick = () => {
+            if (holder.pid !== undefined) return resolve();
+            if (Date.now() > deadline) return reject(new Error("holder pid never assigned"));
+            setTimeout(tick, 10);
+        };
+        tick();
+    });
+    try {
+        const dbPath = join(dir, "index.db");
+        writeFileSync(dbPath + ".lock", JSON.stringify({ pid: holder.pid, boot: Date.now() }));
+        let skipping = "";
+        let bootCache: { at: number; ok: boolean } | null = null;
+        setLogCapture((level, m) => { if (level === "info" && m.includes("skipping the close-time integrity-cache refresh")) skipping = m; });
+        try {
+            const store = UnifiedStore.open(dbPath);
+            bootCache = readIntegrityCache(dbPath);
+            assert.ok(bootCache !== null && bootCache.ok === true, "boot cached an ok verdict");
+            store.setKv("test", "key", { x: 1 }); // a write — lands in the -wal
+            await new Promise((r) => setTimeout(r, 30)); // separate the boot/close timestamps
+            store.close();
+        } finally {
+            setLogCapture(null);
+        }
+        assert.ok(skipping.length > 0, "close() reported skipping the cache refresh for the live foreign writer");
+        const afterClose = readIntegrityCache(dbPath);
+        assert.ok(afterClose !== null, "the boot-time verdict is still present (not clobbered)");
+        assert.equal(afterClose.at, bootCache!.at, "the verdict still carries the BOOT timestamp — close() did not refresh it onto post-checkpoint stats");
+    } finally {
+        setIntegritySyncThresholdForTests(null);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// Control: with NO foreign writer, close() still refreshes the cache onto the
+// post-checkpoint stats (the #4609 fast path is preserved — the gate must not
+// regress the normal single-writer case).
+test("close still refreshes the integrity cache when no foreign writer is present (#7156 control)", { timeout: 30_000 }, async () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath);
+        const bootCache = readIntegrityCache(dbPath);
+        assert.ok(bootCache !== null && bootCache.ok === true, "boot cached an ok verdict");
+        store.setKv("test", "key", { x: 1 });
+        await new Promise((r) => setTimeout(r, 30));
+        store.close();
+        const afterClose = readIntegrityCache(dbPath);
+        assert.ok(afterClose !== null, "the verdict is present after close");
+        assert.ok(afterClose.at > bootCache!.at, "close() refreshed the verdict onto the post-checkpoint stats (fast path preserved)");
+    } finally {
+        setIntegritySyncThresholdForTests(null);
         rmSync(dir, { recursive: true, force: true });
     }
 });

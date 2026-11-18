@@ -755,8 +755,26 @@ export class UnifiedStore {
         // are alarm-only by owner policy (2026-10-30) and are never cached,
         // so there is nothing else to carry here. Deferred while a background
         // check is still in flight (its own completion writes the cache).
+        // #7156: the refresh must NOT run while a live foreign writer is present.
+        // lastIntegrityOk is a boot-time flag that is never invalidated, so a
+        // store that booted healthy but whose file was corrupted by a concurrent
+        // second writer (the #7156 dual-writer incident: the wedged predecessor
+        // shut down 7s AFTER its replacement had already opened index.db) would
+        // otherwise stamp a FRESH ok verdict onto the corrupted file's stats at
+        // close — and every boot after that skips the rescan (cache hit) and
+        // dies on the first write. A live foreign writer means the file may have
+        // moved outside this process's verified writes: skip the refresh so the
+        // next boot re-scans fresh. A read-only foreign opener is a safe false
+        // positive (it only costs one extra rescan, never a wrong verdict).
         if (!backgroundIntegrityInflightForTests(this.dbPath)) {
-            if (this.lastIntegrityOk) writeIntegrityCache(this.dbPath, true);
+            if (this.lastIntegrityOk) {
+                const foreign = this.activeForeignWriter();
+                if (foreign === null) {
+                    writeIntegrityCache(this.dbPath, true);
+                } else {
+                    loggerLog("info", `[storage] skipping the close-time integrity-cache refresh for ${this.dbPath}: live foreign writer pid ${foreign} present — the file may have changed outside this process's verified writes, so the next boot re-scans fresh (#7156)`);
+                }
+            }
         }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a
@@ -2986,25 +3004,35 @@ export class UnifiedStore {
      *  compressed-token sum). Replaces the bounded envelope-file decode the
      *  disk index performs per refresh. */
     webSummaryRows(): WebSummaryRow[] {
+        // #7156: a corrupt/empty payload_json (e.g. left by an interrupted
+        // .recover) made json_extract throw "malformed JSON" and fail the WHOLE
+        // .all() — the panel then silently fell back to 0 historical sessions.
+        // Guard each extract with json_valid so a bad row degrades to NULL
+        // (skipped by the filters, ignored by SUM) instead of killing the list.
         const rows = this.db
             .prepare(
-                `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
+                `WITH bl AS (
+                     SELECT b.session_id, b.ord, b.active,
+                            CASE WHEN json_valid(b.payload_json) THEN b.payload_json END AS payload
+                     FROM blocks b
+                 )
+                 SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
                         s.stats_json AS statsJson, s.metadata_json AS metadataJson,
-                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                        (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
-                          WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
-                          ORDER BY b.ord LIMIT 1) AS firstTopic,
-                        (SELECT json_extract(b.payload_json, '$.summary') FROM blocks b
-                          WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
-                          ORDER BY b.ord LIMIT 1) AS firstSummary,
-                        (SELECT COALESCE(SUM(json_extract(b.payload_json, '$.compressedTokens')), 0)
-                          FROM blocks b WHERE b.session_id = s.session_id AND b.active = 1) AS activeCompressed
-                 FROM sessions s`,
+                        (SELECT COUNT(*) FROM bl WHERE bl.session_id = s.session_id) AS blocks,
+                        (SELECT json_extract(bl.payload, '$.topic') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstTopic,
+                        (SELECT json_extract(bl.payload, '$.summary') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstSummary,
+                        (SELECT COALESCE(SUM(json_extract(bl.payload, '$.compressedTokens')), 0)
+                          FROM bl WHERE bl.session_id = s.session_id AND bl.active = 1) AS activeCompressed
+                  FROM sessions s`,
             )
             .all() as Array<{
                 sessionId: string;
