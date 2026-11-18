@@ -214,8 +214,6 @@ export function localMachineIps(): Set<string> {
                 if (ni.address) ips.add(ni.address.toLowerCase());
             }
         }
-        // The whole 127/8 loopback range routes to this machine.
-        for (let i = 0; i <= 255; i++) ips.add(`127.0.0.${i}`);
         localAddrCache = { at: now, ips };
     }
     return localAddrCache.ips;
@@ -355,8 +353,13 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     // destination routes to the local host, so our own port through them is
     // a self-loop even though neither literal sits in the interface set.
     if (ctx.selfPort !== undefined && port === ctx.selfPort) {
-        const mine = (ctx.localIps ?? localMachineIps)();
-        if (ips.some((ip) => ip === "0.0.0.0" || ip === "::" || mine.has(ip.toLowerCase()) || mine.has(`::ffff:${ip.toLowerCase()}`))) {
+        const mine = new Set(Array.from((ctx.localIps ?? localMachineIps)(), normalizeIpLiteral));
+        if (ips.some((address) => {
+            const ip = normalizeIpLiteral(address);
+            // Loopback is a range, not a list of configured interfaces. DNS
+            // answers also need the mapped-IPv4 normalization literals get.
+            return ip === "0.0.0.0" || classifyIp(ip) === "loopback" || mine.has(ip);
+        })) {
             return { ok: false, code: "self", message: "the bili tunnel may not target the proxy itself" };
         }
     }
