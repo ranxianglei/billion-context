@@ -146,6 +146,20 @@ export function _resetDshCompactionGateTelemetryForTest(): void {
     delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_GATE_TELEMETRY_KEY];
 }
 
+/** #6770: one-line coverage summary shared by the durable profile notes (#3962)
+ *  and bili-native's first-request log line. Pure over the record; "no entry
+ *  rewritten" is the honest frame because preset configs resolve lazily.
+ *  #7169: also reports the runtime agentPresets.register() wrapper state, so
+ *  a zero-rewrite process can still show the runtime hook is in place. */
+export function compactionCoverageText(telemetry: DshCompactionGateTelemetry | null = dshCompactionGateTelemetry()): string {
+    const hook = telemetry?.runtimePresetHookInstalled ? " (runtime agentPresets.register() wrapper installed)" : "";
+    if (telemetry === null || telemetry.covered.length === 0) {
+        return `no preset entry rewritten in this process${hook} (preset configs resolve lazily — zero at this point does not mean zero later)`;
+    }
+    const entries = telemetry.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+    return `${telemetry.covered.length} preset ${telemetry.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})${hook}`;
+}
+
 type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
 
 /** #7169: the minimal shape of the dsh agentPresets service the gate wraps.
