@@ -1,4 +1,4 @@
-﻿// Native-mode fetch interception (#519): a globalThis.fetch patch that
+// Native-mode fetch interception (#519): a globalThis.fetch patch that
 // silently routes model-API requests through a bili proxy that the extension
 // itself spawned (see pi-native.ts). Verified end-to-end on pi 0.83.6: pi's
 // provider stack (pi-stable-ai → Anthropic/OpenAI SDKs) resolves its fetch
