@@ -22,6 +22,7 @@ const __cacheRoot = mkdtempSync(path.join(tmpdir(), "bc-desktop-inplace-cache-")
 process.env.XDG_CACHE_HOME = path.join(__cacheRoot, "cache");
 const { installViaTarball, readDiskVersion, refreshDshDesktopCopy, dshDesktopCopyPathMatches } = await import("../src/update.ts");
 import { refreshDshProfileBundles, syncDshProfileManifestSpec } from "../src/dsh-channel.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
@@ -95,6 +96,158 @@ test("desktop profile copy: link displaced, real dir laid down, .pnpm store unto
         for (const entry of readdirSync(path.dirname(flat))) {
             assert.ok(!entry.startsWith("billion-context.pnpm-"), `leftover displaced link: ${entry}`);
         }
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+// #7125: fail-soft lock planning must not destroy the rollback source. When
+// the target version's SRI is unknown (legacy SHA-1-only registry doc), the
+// v9 lock patch refuses to write — the source packages: entry carries an
+// integrity the clone cannot replace. The ledgers then stay on the old
+// version while the copy stands at the new one, and the displaced pnpm link
+// is the only way back: it must SURVIVE a divergent convergence, and still
+// be unlinked when the convergence succeeds.
+function buildLedgerFixture(root: string): { dshHome: string; profileDir: string; storeCopy: string; flat: string } {
+    const dshHome = path.join(root, "dsh-home");
+    const profileDir = path.join(dshHome, "profiles", "desktop");
+    const storeCopy = path.join(profileDir, ".pnpm", "billion-context@1.2.3", "node_modules", "billion-context");
+    const flat = path.join(profileDir, "node_modules", "billion-context");
+    writePkg(storeCopy, "1.2.3");
+    mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
+    makePnpmLink(storeCopy, flat);
+    // The two ledgers at the OLD version: manifest spec + v9 lockfile record.
+    writeFileSync(
+        path.join(profileDir, "package.json"),
+        JSON.stringify({ name: "@dsh/profile-desktop", dependencies: { "billion-context": "^1.2.3" } }, null, 2) + "\n",
+    );
+    writeFileSync(path.join(profileDir, "pnpm-lock.yaml"), [
+        "lockfileVersion: '9.0'",
+        "",
+        "settings:",
+        "  autoInstallPeers: true",
+        "  excludeLinksFromLockfile: false",
+        "",
+        "importers:",
+        "",
+        "  .:",
+        "    dependencies:",
+        "      billion-context:",
+        "        specifier: ^1.2.3",
+        "        version: 1.2.3",
+        "",
+        "packages:",
+        "",
+        "  billion-context@1.2.3:",
+        "    resolution: {integrity: sha512-old==}",
+        "",
+        "snapshots:",
+        "",
+        "  billion-context@1.2.3: {}",
+        "",
+    ].join("\n"));
+    return { dshHome, profileDir, storeCopy, flat };
+}
+
+function makeTgzFor(root: string, version: string): Buffer {
+    const src = path.join(root, "pkg", "package");
+    writePkg(src, version);
+    const tgzPath = path.join(root, "pkg.tgz");
+    tar.c({ cwd: path.join(root, "pkg"), file: tgzPath, gzip: true, sync: true }, ["package"]);
+    return readFileSync(tgzPath);
+}
+
+test("desktop profile copy: divergent ledger convergence keeps the displaced pnpm link as rollback source (#7125)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-divergent-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        setLogCapture(null);
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildLedgerFixture(root);
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const tgz = makeTgzFor(root, "2.0.0");
+        // Legacy registry doc: SHA-1 shasum only, no SRI — the lock patch
+        // cannot produce the new packages: integrity and must refuse.
+        const shasum = crypto.createHash("sha1").update(tgz).digest("hex");
+
+        globalThis.fetch = (() => Promise.resolve(new Response(tgz))) as unknown as typeof fetch;
+        const lines: string[] = [];
+        setLogCapture((level, msg) => { lines.push(`${level}: ${msg}`); });
+        const r = await installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.flat, undefined, shasum);
+        assert.equal(r.ok, true, r.error ?? "a ledger-sync failure must not fail the install");
+
+        // The copy moved to 2.0.0 and the ledgers stayed at 1.2.3 ...
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), false, "the pnpm link must be replaced, not followed");
+        assert.equal(await readDiskVersion(fx.flat), "2.0.0");
+        assert.match(readFileSync(path.join(fx.profileDir, "pnpm-lock.yaml"), "utf8"), /version: 1\.2\.3/, "the lockfile must be untouched");
+        // ... so the displaced link survives as the rollback source.
+        const kept = readdirSync(path.dirname(fx.flat)).filter((e) => e.startsWith("billion-context.pnpm-"));
+        assert.equal(kept.length, 1, `exactly one displaced link kept: ${kept.join(", ")}`);
+        assert.ok(
+            lines.some((l) => l.startsWith("warn:") && l.includes(kept[0]!) && l.includes("rollback source")),
+            `the warn must name the kept link: ${lines.join(" | ")}`,
+        );
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("desktop profile copy: converged ledgers unlink the displaced pnpm link as before (#7125 control)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-converged-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        setLogCapture(null);
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildLedgerFixture(root);
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const tgz = makeTgzFor(root, "2.0.0");
+
+        globalThis.fetch = (() => Promise.resolve(new Response(tgz))) as unknown as typeof fetch;
+        const lines: string[] = [];
+        setLogCapture((level, msg) => { lines.push(`${level}: ${msg}`); });
+        const r = await installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.flat, integrityField(tgz));
+        assert.equal(r.ok, true, r.error ?? "install failed without reason");
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), false, "the pnpm link must be replaced, not followed");
+        assert.equal(await readDiskVersion(fx.flat), "2.0.0");
+        // Both ledgers converged to 2.0.0 — the lock patch could produce the
+        // new integrity, so nothing must be kept back.
+        const lock = readFileSync(path.join(fx.profileDir, "pnpm-lock.yaml"), "utf8");
+        assert.match(lock, /version: 2\.0\.0/);
+        assert.ok(lock.includes(`integrity: ${integrityField(tgz)}`), `the new integrity must be recorded in the cloned entry`);
+        assert.match(readFileSync(path.join(fx.profileDir, "package.json"), "utf8"), /\^2\.0\.0/);
+        for (const entry of readdirSync(path.dirname(fx.flat))) {
+            assert.ok(!entry.startsWith("billion-context.pnpm-"), `leftover displaced link: ${entry}`);
+        }
+        assert.ok(!lines.some((l) => l.startsWith("warn:")), `unexpected warns: ${lines.join(" | ")}`);
     } catch (e) {
         if (String(e).includes("EPERM")) {
             t.skip("creating directory symlinks requires elevated privileges on this platform");

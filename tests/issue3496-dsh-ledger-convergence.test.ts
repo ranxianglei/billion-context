@@ -821,6 +821,147 @@ test("#7125: dep-map cross-check — an ambiguous store entry fails soft, zero w
     }
 });
 
+test("#7125: dep-map cross-check — a surviving entry whose resolution contradicts the new declaration fails soft, zero writes", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-e-"));
+    try {
+        // The 0.1.196 snapshot resolved zod to 4.1.8; the on-disk copy
+        // (0.1.197) declares EXACT 4.6.7 — the dependency's spec changed
+        // between versions without the name or bucket moving. Cloning the old
+        // resolution would record a dep the new manifest contradicts (a frozen
+        // install would faithfully install the wrong zod), so the patch must
+        // refuse instead.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      zod: 4.1.8",
+            "",
+            "  zod@4.1.8: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "depchange", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { zod: "4.6.7" } } });
+        const before = profileFiles(dir);
+        const beforeMt = profileMtimes(dir);
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.ok(res.error !== undefined, "a contradicting cloned resolution must fail the patch");
+        assert.ok(res.error!.includes("zod"), `reason must name the dep: ${res.error}`);
+        assert.ok(res.error!.includes("4.1.8") && res.error!.includes("4.6.7"), `reason must carry both versions: ${res.error}`);
+        assertZeroWrites(dir, before, beforeMt);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — a surviving entry whose resolution SATISFIES the new declaration clones through", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-f-"));
+    try {
+        // Negative gate: the range spec still admits the old resolution — no
+        // false positive, the clone proceeds as before.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      mysql2: 3.15.5",
+            "",
+            "  mysql2@3.15.5: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "depsat", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { mysql2: "^3.15.3" } } });
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined, `satisfying resolution must not fail the patch: ${res.error}`);
+        const out = readFileSync(path.join(dir, "pnpm-lock.yaml"), "utf8");
+        assert.match(out, /billion-context@0\.1\.197:\n    dependencies:\n      mysql2: 3\.15\.5/);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
+test("#7125: dep-map cross-check — an unjudgeable declared spec (dist-tag) stays silent", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-i7125-g-"));
+    try {
+        // Same "err on fewer false positives" discipline as specAdmits: a
+        // dist-tag declaration cannot be semver-checked, so the clone
+        // proceeds as before.
+        const lock = [
+            "lockfileVersion: '9.0'",
+            "",
+            "settings:",
+            "  autoInstallPeers: true",
+            "  excludeLinksFromLockfile: false",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^0.1.196",
+            "        version: 0.1.196",
+            "",
+            "packages:",
+            "",
+            "  billion-context@0.1.196:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@0.1.196:",
+            "    dependencies:",
+            "      some-dep: 2.0.0",
+            "",
+            "  some-dep@2.0.0: {}",
+            "",
+        ].join("\n");
+        const dir = makeProfile(root, "deptest", { spec: "^0.1.196", copyVersion: "0.1.197", pnpmLock: lock, copyDeps: { dependencies: { "some-dep": "latest" } } });
+        const res = convergeDshLedger(dir, "0.1.197", { integrity: "sha512-new==" });
+        assert.equal(res.error, undefined, `unjudgeable spec must not fail the patch: ${res.error}`);
+    } finally {
+        rmrf(root);
+        rmrf(__cacheRoot);
+    }
+});
+
 // — pure patchers ————————————————————————————————————————————————————————————————
 
 test("#3496: patchPnpmLock structural failures — no partial result", () => {

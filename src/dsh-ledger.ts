@@ -22,6 +22,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import semver from "semver";
 import { DSH_DESKTOP_PROFILE, DSH_PACKAGE, dshProfileDepSpec, isRegistryDepSpec, planDshProfileManifestSpec } from "./dsh-channel.js";
 
 type LedgerLockKind = "pnpm" | "npm" | "none";
@@ -73,6 +74,12 @@ interface LedgerConvergenceResult {
     notes: string[];
     /** Set when the state is not safely convergable — NOTHING was written. */
     error?: string;
+    /** Set with `error` when at least one ledger (manifest spec / lockfile
+     *  record) exists and still records the OLD version after the copy moved
+     *  — the caller must not destroy the displaced copy (the only rollback
+     *  source). Absent/false = no ledgers to diverge from (nothing to
+     *  converge) or convergence succeeded. */
+    divergent?: boolean;
 }
 
 const PKG_ESCAPED = DSH_PACKAGE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -590,10 +597,27 @@ function resolveDepFromStore(lines: string[], section: "packages" | "snapshots",
     return found.length === 1 ? found[0] : undefined;
 }
 
+/** Does the store entry's resolved version satisfy the spec the on-disk copy
+ *  declares for that dep? A cloned store block carries the SOURCE version's
+ *  resolution data — when the dependency's DECLARED spec changed between
+ *  versions (zod 4.1.8 → exact 4.6.7, #7125), the clone would record a
+ *  resolution the new manifest contradicts, and a frozen install would
+ *  faithfully install the wrong dep. undefined = unjudgeable (dist-tag / URL
+ *  / workspace spec, non-semver value) — the caller stays silent, same
+ *  "err on fewer false positives" discipline as specAdmits; false = a proven
+ *  contradiction → the patch fails soft. */
+function depResolutionAdmits(spec: string, resolved: string): boolean | undefined {
+    if (semver.valid(resolved) === null) return undefined;
+    if (semver.validRange(spec) === null) return undefined;
+    return semver.satisfies(resolved, spec);
+}
+
 /** Cross-check the cloned store block's dep map against the on-disk copy's
  *  direct deps (the NEW version's authoritative declaration): declared deps
  *  missing from the map are resolved from the store (exactly one candidate —
- *  ambiguity fails soft); names no longer declared are dropped. */
+ *  ambiguity fails soft); names no longer declared are dropped; a surviving
+ *  entry whose recorded resolution contradicts the new declaration fails soft
+ *  (the resolution data predates a dependency change). */
 function crossCheckDepMaps(lines: string[], block: string[], section: "packages" | "snapshots", deps: PnpmLockPatchOpts["deps"]): { kind: "ok"; lines: string[] } | { kind: "fail"; reason: string } {
     if (deps === undefined) return { kind: "ok", lines: block };
     const declared: Record<string, "dependencies" | "optionalDependencies"> = {};
@@ -625,8 +649,19 @@ function crossCheckDepMaps(lines: string[], block: string[], section: "packages"
     const drop: number[] = [];
     for (const bucket of Object.keys(headerIdx)) {
         for (const [name, idx] of Object.entries(entryIdx[bucket]!)) {
-            if (declared[name] === undefined || declared[name] !== bucket) drop.push(idx);
-            else surviving[name] = bucket;
+            if (declared[name] === undefined || declared[name] !== bucket) {
+                drop.push(idx);
+                continue;
+            }
+            const spec = (bucket === "dependencies" ? deps.dependencies : deps.optionalDependencies)![name];
+            const vm = block[idx]!.match(/^[ \t]+[^\s:][^:]*:[ \t]*(\S.*)$/);
+            if (vm !== null) {
+                const resolved = unquote(splitPeerSuffix(vm[1])[0]);
+                if (depResolutionAdmits(spec, resolved) === false) {
+                    return { kind: "fail", reason: `the cloned ${section} entry carries '${name}: ${resolved}' but the on-disk copy declares '${name}: ${spec}' — the store's resolution data predates the dependency change; let pnpm record the new resolution (install) and rerun` };
+                }
+            }
+            surviving[name] = bucket;
         }
     }
     for (const idx of drop.sort((a, b) => b - a)) out.splice(idx, 1);
@@ -871,7 +906,11 @@ function atomicWriteText(file: string, content: string): string | undefined {
 export function convergeDshLedger(profileDir: string, targetVersion: string, opts?: { integrity?: string }): LedgerConvergenceResult {
     const notes: string[] = [];
     const state = readDshLedgerState(profileDir);
-    const fail = (error: string): LedgerConvergenceResult => ({ changed: [], details: [], notes, error });
+    // A failed convergence leaves every ledger that EXISTS still recording the
+    // old version while the copy moved — that divergence is what keeps the
+    // displaced copy alive as the rollback source (the caller reads it).
+    const ledgersPresent = state.spec !== undefined || state.lockKind !== "none";
+    const fail = (error: string): LedgerConvergenceResult => ({ changed: [], details: [], notes, error, divergent: ledgersPresent });
 
     const spec = state.spec;
     if (spec === undefined) return fail("no billion-context dependency declared in the profile manifest — nothing to converge");
@@ -935,14 +974,14 @@ export function convergeDshLedger(profileDir: string, targetVersion: string, opt
     const details: LedgerChangeDetail[] = [];
     if (plan.action === "rewrite") {
         const err = atomicWriteText(path.join(profileDir, "package.json"), plan.nextRaw ?? "");
-        if (err !== undefined) return { changed, details, notes, error: `manifest write failed: ${err}` };
+        if (err !== undefined) return { changed, details, notes, error: `manifest write failed: ${err}`, divergent: ledgersPresent };
         changed.push("package.json");
         details.push({ file: "package.json", field: "dependencies[billion-context]", before: spec, after: finalSpec });
     }
     if (lockNext !== undefined) {
         const lockFile = state.lockKind === "pnpm" ? "pnpm-lock.yaml" : "package-lock.json";
         const err = atomicWriteText(path.join(profileDir, lockFile), lockNext);
-        if (err !== undefined) return { changed, details, notes, error: `lockfile write failed: ${err}${changed.length > 0 ? ` (package.json already updated — rerun to finish)` : ""}` };
+        if (err !== undefined) return { changed, details, notes, error: `lockfile write failed: ${err}${changed.length > 0 ? ` (package.json already updated — rerun to finish)` : ""}`, divergent: ledgersPresent };
         changed.push(lockFile);
         details.push(...lockDetails);
     }
