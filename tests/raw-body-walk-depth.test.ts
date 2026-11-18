@@ -3,6 +3,7 @@ import test from "node:test";
 import { defaultCountTokens } from "acp-kernel";
 import { estimateRawBodyBreakdown, estimateRawBodyTokens, PROMPT_BODY_KEYS } from "../src/preflight.ts";
 import { measuredBreakdownClause } from "../src/server.ts";
+import type { WireProtocol } from "../src/util.ts";
 
 // #6038: client-controlled request bodies may nest far beyond safe recursion
 // depth; the raw-body token walks must survive them without changing any
@@ -283,4 +284,16 @@ test("#7013: a giant dsh_session_log upload does not inflate the prompt mass", (
     // The window-fit gate compares bd.prompt (not bd.total) against the window,
     // so a fitting prompt no longer 413s on the upload.
     assert.ok(bd.prompt < 200_000, "prompt mass stays within a realistic window");
+});
+
+test("#7013: PROMPT_BODY_KEYS has a non-empty entry for every WireProtocol member", () => {
+    // The Record<WireProtocol, …> type enforces existence at compile time; this
+    // adds the runtime non-empty guard so a future protocol added with an empty
+    // keys table (which would silently price 0 and OPEN the gate) fails here.
+    const protocols: WireProtocol[] = ["anthropic", "openai", "responses", "google"];
+    for (const p of protocols) {
+        const keys = PROMPT_BODY_KEYS[p];
+        assert.ok(keys, `PROMPT_BODY_KEYS must have an entry for ${p}`);
+        assert.ok(keys.size > 0, `PROMPT_BODY_KEYS[${p}] must be non-empty`);
+    }
 });

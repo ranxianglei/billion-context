@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, PROMPT_BODY_KEYS, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, promptMassForProtocol, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -3817,8 +3817,8 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
             return undefined;
         }
     }
-    const breakdown = estimateRawBodyBreakdown(parsed, PROMPT_BODY_KEYS[prepared.protocol]);
-    return { tokens: breakdown.prompt, breakdown };
+    const { tokens, breakdown } = promptMassForProtocol(parsed, prepared.protocol);
+    return { tokens, breakdown };
 }
 
 export async function preflightCompressIfNeeded(
@@ -4552,8 +4552,9 @@ export async function preflightCompressIfNeeded(
     let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundBreakdown = estimateRawBodyBreakdown(outBody, PROMPT_BODY_KEYS[outbound.protocol]);
-        outboundRawTokens = outboundBreakdown.prompt;
+        const pm = promptMassForProtocol(outBody, outbound.protocol);
+        outboundBreakdown = pm.breakdown;
+        outboundRawTokens = pm.tokens;
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
         if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;

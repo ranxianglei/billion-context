@@ -1,5 +1,5 @@
 import type { WireProtocol } from "../util.js";
-import { estimateRawBodyBreakdown, PROMPT_BODY_KEYS } from "../preflight.js";
+import { promptMassForProtocol } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
@@ -1049,6 +1049,6 @@ export function sideRequestGuard(
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     // #7013: price the wire-format's prompt mass (PROMPT_BODY_KEYS[protocol]) —
     // non-prompt fields (telemetry uploads, config scalars) consume no window.
-    const estimate = estimateRawBodyBreakdown(parsed, PROMPT_BODY_KEYS[protocol]).prompt + imageMass;
+    const estimate = promptMassForProtocol(parsed, protocol).tokens + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }

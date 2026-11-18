@@ -606,6 +606,18 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
     };
 }
 
+// #7013 hardening: the prompt mass for a wire protocol, fail-closed. When the
+// protocol has no PROMPT_BODY_KEYS entry (a future protocol added to
+// WireProtocol without a keys table), price the WHOLE body (breakdown.total)
+// instead of 0 — a silent 0 would OPEN the gate. The enumeration test in
+// tests/raw-body-walk-depth.test.ts pins that every current WireProtocol
+// member has an entry, so this fallback is unreachable today.
+export function promptMassForProtocol(parsed: unknown, protocol: WireProtocol): { tokens: number; breakdown: RawBodyBreakdown } {
+    const promptKeys = PROMPT_BODY_KEYS[protocol];
+    const breakdown = estimateRawBodyBreakdown(parsed, promptKeys);
+    return { tokens: promptKeys ? breakdown.prompt : breakdown.total, breakdown };
+}
+
 // #553: upper-bound variant of estimateCoreMessages — every character counts
 // as one token. A BPE token covers >=1 char (Latin/code) and CJK is already
 // ~1 token/char, so this never undershoots the real count, unlike
