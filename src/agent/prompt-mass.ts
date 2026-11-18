@@ -21,7 +21,6 @@
  */
 
 import { estimateRawBodyTokens } from "../preflight.js";
-import { imageTokensInParsedBody } from "../image-tokens.js";
 import type { WireProtocol } from "../util.js";
 
 /** Top-level keys that carry prompt mass, per wire protocol.
@@ -37,10 +36,10 @@ const PROMPT_KEYS: Record<WireProtocol, readonly string[]> = {
 interface WirePromptMass {
     /** Lane the body shape was recognized as; only used for reporting. */
     protocol: WireProtocol;
-    /** CJK-aware token mass of the prompt fields (turns + system + tools). */
+    /** CJK-aware token mass of the prompt fields (turns + system + tools).
+     *  Inline images are deliberately excluded: the text walk skips image
+     *  keys (media stays uncounted, #4111). */
     promptTokens: number;
-    /** Token mass of inline images, which the text walk deliberately skips. */
-    imageTokens: number;
 }
 
 /** Recognize the lane from the body shape. */
@@ -73,6 +72,5 @@ export function promptMassOfWireBody(raw: string | undefined): WirePromptMass | 
     return {
         protocol,
         promptTokens: estimateRawBodyTokens(promptOnly),
-        imageTokens: imageTokensInParsedBody(protocol, body),
     };
 }

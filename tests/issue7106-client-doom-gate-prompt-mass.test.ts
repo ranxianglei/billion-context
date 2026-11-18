@@ -53,8 +53,9 @@ test("#7106: a prompt that really is over the window still dooms, priced by prom
 });
 
 test("#7106: the prompt/named-bucket comparison uses CJK-aware text counting", () => {
-    // 400K CJK chars count ~1 token each 鈥?over the window on their own, even
-    // though they are only 1.2 MB of bytes.
+    // 1.1M CJK chars count ~1 token each, so they are over the window on their
+    // own even though they are only ~3.3 MB of bytes (a byte/4 estimate would
+    // have measured ~0.8M and let this through).
     const cjk = "\u61C9".repeat(1_100_000);
     const raw = wire({ messages: [{ role: "user", content: cjk }] });
     const doom = bodyOverWindowDetail(Buffer.byteLength(raw, "utf8"), raw, WINDOW);
@@ -85,7 +86,7 @@ test("#7106: bodies we cannot price by shape keep the byte estimate", () => {
     assert.equal(doom.floorTokens, Math.ceil(9_000_000 / 4));
 });
 
-test("#7106: an image-carrying prompt adds the image mass back", () => {
+test("#7106: image bytes are excluded from the prompt mass (media uncounted, #4111)", () => {
     const raw = wire({
         messages: [{
             role: "user",
@@ -99,7 +100,6 @@ test("#7106: an image-carrying prompt adds the image mass back", () => {
     const doom = bodyOverWindowDetail(Buffer.byteLength(raw, "utf8"), raw, WINDOW);
     assert.equal(doom, undefined, "base64 image bytes are not text prompt mass");
 });
-
 
 test("#7106 review: a shape-priced prompt below the window is NOT doomed (no double calibration)", () => {
     // 1.0M CJK chars price at ~1.0M tokens already (direct CJK-aware count).
