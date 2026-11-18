@@ -205,7 +205,7 @@ export function detectCompactionOverlayGap(ctx: CompactionDisableHost): Compacti
     return null;
 }
 
-export type ReconcileEntry = {
+type ReconcileEntry = {
     options?: { id?: unknown; name?: unknown; config?: unknown } | undefined;
     update?: (options: { config: unknown }, create?: boolean, force?: boolean) => unknown;
 };
