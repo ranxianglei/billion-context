@@ -107,22 +107,44 @@ export function matchModelEndpoint(patterns: readonly ModelEndpointPattern[] | n
 // Client-side (in-host process) loader. Unlike the proxy's loadOptions this
 // NEVER throws: a missing or unreadable config file is the normal state for
 // hosts that never configure custom endpoints, and a broken config must not
-// take down the host process. Best-effort + one warning on failure.
+// take down the host process. Best-effort + at most one warning, and only for
+// a config that is actually PRESENT but unusable — see below.
 let loadWarned = false;
+function warnOnce(message: string): void {
+    if (loadWarned) return;
+    loadWarned = true;
+    // console.error is deliberate here: this loader runs inside HOST
+    // processes (the agent-side fetch interceptor), where the proxy's
+    // loggerLog has no meaningful sink — stderr is the only channel the
+    // host user will ever see. Same policy as the agent-side modules.
+    console.error(message);
+}
 export async function loadDeclaredModelEndpoints(): Promise<ModelEndpointPattern[]> {
+    const file = configFile();
+    let text: string;
     try {
-        const text = await readFile(configFile(), "utf8");
+        text = await readFile(file, "utf8");
+    } catch (err) {
+        // (#7126) No config file at all is the documented default for a host
+        // that never declared custom endpoints. Saying anything here made a
+        // fresh install read as a failure on its very first boot, so ENOENT is
+        // silent; anything else (EACCES, EISDIR, …) is a real condition and
+        // gets the one-shot line.
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code !== "ENOENT") {
+            warnOnce(`bili-native: cannot read ${file} (${code ?? "unknown error"}); declared endpoints stay unclaimed until it becomes readable`);
+        }
+        return [];
+    }
+    try {
         const json = JSON.parse(text.replace(/^\uFEFF/, "")) as Record<string, unknown>;
         return parseModelEndpointPatterns(json.modelEndpointPatterns);
-    } catch {
-        if (!loadWarned) {
-            loadWarned = true;
-            // console.error is deliberate here: this loader runs inside HOST
-            // processes (the agent-side fetch interceptor), where the proxy's
-            // loggerLog has no meaningful sink — stderr is the only channel the
-            // host user will ever see. Same policy as the agent-side modules.
-            console.error(`bili-native: could not resolve modelEndpointPatterns from ${configFile()}; declared endpoints stay unclaimed until the host restarts with a readable config`);
-        }
+    } catch (err) {
+        // The file EXISTS but is not a usable declaration (malformed JSON, or a
+        // structurally invalid modelEndpointPatterns). That one is worth a line,
+        // with the reason, so the readout points at the file instead of looking
+        // like the plugin itself failed.
+        warnOnce(`bili-native: ${file} is not a usable billion-context config (${(err as Error)?.message ?? "invalid"}); declared endpoints stay unclaimed`);
         return [];
     }
 }
