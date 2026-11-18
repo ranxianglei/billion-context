@@ -460,10 +460,11 @@ export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], 
                 // unparseable row -> skip; a miss keeps the previous pointers
             }
         }
+        for (const bucket of byStable.values()) bucket.reverse();
         for (let i = ptrs.length; i < msgs.length; i++) {
             const m = msgs[i]!;
             const bucket = byStable.get(stableMessageKey(m as unknown as Record<string, unknown>).replace(CLUSTER_ID_SUFFIX_RE, "$1"));
-            const seq = bucket === undefined ? undefined : bucket.shift();
+            const seq = bucket?.pop();
             if (seq === undefined) {
                 // #5155: with the debounced save the unsettled tail is the
                 // common case right after a turn — record the settled prefix

@@ -98,8 +98,10 @@ type ExtensionAPI = {
     // catalog BEFORE extensions load, and its registerProvider — unlike
     // pi's _refreshCurrentModelFromRegistry — never re-resolves the live
     // session model, so the extension must re-pin it via setModel (see the
-    // session_start handler below). Optional because pi hosts lack it.
+    // session_start handler below). Optional on older hosts.
     setModel?: (model: Record<string, unknown> & { baseUrl?: string }) => Promise<boolean | void> | boolean | void;
+    getThinkingLevel?: () => string;
+    setThinkingLevel?: (level: string) => void;
     // Persistent transcript output (rendered by TUI and web hosts like
     // pi-web); notify() is a transient toast — only the fallback for hosts
     // without sendMessage (issue #359).
@@ -1015,6 +1017,16 @@ let nudgeDebugWired = false;
 const nudgeNotifiedTurns = new Map<string, string>();
 let nudgeFullPending: NudgeDebugEvent | null = null;
 
+/** The pi-lane terminal notification for an injected nudge: a fixed label
+ *  prefix + the VERBATIM wire text the model read — nothing appended (strict
+ *  fidelity, owner direction 2026-11-17). A display-only "suggested call" used
+ *  to be tacked on here; unmarked, it read as part of the injection (and
+ *  advertised the non-canonical {startId,endId} array shape), which is exactly
+ *  what this surface must not do. */
+export function nudgeNotifyText(pending: Pick<NudgeDebugEvent, "emergency" | "text">): string {
+    return `[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}`;
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -1248,8 +1260,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
                 nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
                 try {
-                    const example = pending.topRange !== null ? `\n\nExample: compress({ content: [{ startId: "${pending.topRange.startRef}", endId: "${pending.topRange.endRef}", summary: "..." }] })` : "";
-                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}${example}`);
+                    ctx.ui?.notify?.(nudgeNotifyText(pending));
                 } catch {
                     // host UI unavailable — best-effort display
                 }
@@ -1444,6 +1455,35 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             });
           }
         }
+        // Pi fingerprints the uncompressed history before our transport runs.
+        // A native continuation therefore cannot carry our rewritten history.
+        const useFullAnthropicRequests = async (ctx: Ctx): Promise<void> => {
+            if (agent !== "pi" || typeof pi.setModel !== "function") return;
+            const model = ctx.model;
+            if (model?.api !== "anthropic-messages" || proxyBaseForCtx(ctx) === undefined) return;
+            const base = model.baseUrl;
+            if (typeof base !== "string" || !/^https?:\/\//i.test(base)) return;
+            if (!destinationRoutedThroughProxy(base) && !(nativeInterceptInstalled() && isModelApiUrl(`${base.replace(/\/+$/, "")}/v1/messages`))) return;
+            const compat = model.compat;
+            if (compat !== undefined && (compat === null || typeof compat !== "object" || Array.isArray(compat))) return;
+            const settings = compat as Record<string, unknown> | undefined;
+            if (settings?.supportsMessageThreads === false) return;
+            const thinking = pi.getThinkingLevel?.();
+            const fullModel = { ...model, compat: { ...settings, supportsMessageThreads: false } };
+            try {
+                if (await pi.setModel(fullModel) === false) {
+                    logHostEvent("warn", "[native-client]", "bili-plugin(pi): could not disable native Anthropic threads for this session (model authentication unavailable)");
+                }
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(pi): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
+            } finally {
+                if (ctx.model === fullModel && thinking !== undefined && pi.getThinkingLevel?.() !== thinking) pi.setThinkingLevel?.(thinking);
+            }
+        };
+        if (agent === "pi") {
+            pi.on("session_start", (_event, ctx) => useFullAnthropicRequests(ctx));
+            pi.on("model_select", (_event, ctx) => useFullAnthropicRequests(ctx));
+        }
         // Await tool registration in before_agent_start so cold-start native
         // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
         // active tool loadout and <codemode_catalog> system prompt. Without this,
@@ -1457,6 +1497,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 await registerTools(pi, ctx, state, agent);
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+            try {
+                await useFullAnthropicRequests(ctx);
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
             }
         });
         pi.on("before_provider_headers", async (event, ctx) => {
@@ -1504,6 +1549,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #6884: pi's leg of the #6880/#6883 declaration (cross-agent
+                    // session-id audit, discussions/6884): pi has NO auxiliary
+                    // LLM calls — no title-gen, no compaction summarizer, no
+                    // auto-review — and subagents/forks mint FRESH session ids
+                    // (their parentSession file header points back at the
+                    // parent), so EVERY dispatch through this plugin is the
+                    // session's main conversation turn. Stamp the "conversation"
+                    // sentinel on every dispatch (the plugin.ts
+                    // PLUGIN_PURPOSE_CONVERSATION wire constant, inlined like
+                    // dsh-native) and the server classifies by declaration:
+                    // the body heuristics (budget <= 200 demotion, single-shot
+                    // shapes) can no longer demote a real turn to the #388 side
+                    // passthrough — a one-shot `pi -p` with a small maxTokens
+                    // and no tools would otherwise never enter the kernel
+                    // pipeline and silently lose compression state.
+                    headers["x-bili-plugin-purpose"] = "conversation";
                     // #3248: when the lane advertises incremental turns, declare
                     // the divert intent. Declaring is safe — the lane shape-tests
                     // the body, so full-resend turns (retries, dead conversations,
