@@ -11,12 +11,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
+import { onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents, piCommandsEnabled } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
 import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
@@ -25,7 +26,7 @@ import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetch
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { allowPrivateHttpProviders, debugEnabled, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
 import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
@@ -96,8 +97,10 @@ type ExtensionAPI = {
     // catalog BEFORE extensions load, and its registerProvider — unlike
     // pi's _refreshCurrentModelFromRegistry — never re-resolves the live
     // session model, so the extension must re-pin it via setModel (see the
-    // session_start handler below). Optional because pi hosts lack it.
+    // session_start handler below). Optional on older hosts.
     setModel?: (model: Record<string, unknown> & { baseUrl?: string }) => Promise<boolean | void> | boolean | void;
+    getThinkingLevel?: () => string;
+    setThinkingLevel?: (level: string) => void;
     // Persistent transcript output (rendered by TUI and web hosts like
     // pi-web); notify() is a transient toast — only the fallback for hosts
     // without sendMessage (issue #359).
@@ -550,7 +553,39 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
     if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
     const sid = sessionIdOf(ctx);
     if (sid === undefined || sid.length === 0) return undefined;
+    rememberStampedPromptCacheKey(sid);
     return { ...p, prompt_cache_key: sid };
+}
+
+// Values this process stamped as prompt_cache_key. The proxy strips the field
+// before it forwards; a request that degrades to a direct send never reaches
+// the proxy, so the omp direct-send guard drops the stamp itself — only a
+// value recorded here, never a key the host set. Bounded, oldest first out.
+const STAMPED_PROMPT_CACHE_KEYS_MAX = 1024;
+const stampedPromptCacheKeys = new Set<string>();
+
+function rememberStampedPromptCacheKey(sid: string): void {
+    stampedPromptCacheKeys.delete(sid);
+    stampedPromptCacheKeys.add(sid);
+    if (stampedPromptCacheKeys.size > STAMPED_PROMPT_CACHE_KEYS_MAX) {
+        const oldest = stampedPromptCacheKeys.values().next().value;
+        if (oldest !== undefined) stampedPromptCacheKeys.delete(oldest);
+    }
+}
+
+/** The JSON body without the prompt_cache_key this process stamped, or
+ *  undefined when the body carries no such stamp (unchanged, send as-is). */
+function withoutStampedPromptCacheKey(text: string): string | undefined {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const { prompt_cache_key: key, ...rest } = parsed as Record<string, unknown>;
+    if (typeof key !== "string" || !stampedPromptCacheKeys.has(key)) return undefined;
+    return JSON.stringify(rest);
 }
 
 function fmtTok(n: number): string {
@@ -917,6 +952,52 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
     };
 }
 
+// Nudge-debug wiring guard: the bus subscription is process-global (the
+// emitters live in this same bundle in inline mode), so wire it at most once
+// even if a host ever re-invokes the factory.
+// Nudge debug surface (transient terminal view only) — module-level because
+// the bus subscription is process-singleton:
+//   nudgeDebugWired: the onNudgeInjected listener registered exactly once.
+//   nudgeFullPending: the latest injected nudge, consumed (and cleared) by the
+//       after_provider_response hook once the model has answered.
+//   nudgeNotifiedTurns: (sessionId → turnKey) dedup — emergency nudges
+//       re-inject on every LLM call of a turn; notify at most once per turn.
+let nudgeDebugWired = false;
+const nudgeNotifiedTurns = new Map<string, string>();
+let nudgeFullPending: NudgeDebugEvent | null = null;
+/** #3304 prepareDirectSend for the omp lane: the shared incremental guard
+ *  (restore a swapped body or refuse), then drop the prompt_cache_key the
+ *  plugin stamped — on a direct send no proxy strips it, and strict upstreams
+ *  reject the unknown field with a 400. */
+export function createOmpDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    const shared = createPrepareDirectSend();
+    return async (url, input, init) => {
+        const prep = await shared(url, input, init);
+        if (prep.outcome === "unrestorable") return prep;
+        let text: string | undefined = prep.outcome === "restored" ? prep.body : undefined;
+        if (text === undefined) {
+            try {
+                if (typeof init?.body === "string") text = init.body;
+                else if (input instanceof Request) text = await input.clone().text();
+            } catch {
+                text = undefined; // unreadable body — send as the shared guard decided
+            }
+        }
+        const cleaned = text === undefined ? undefined : withoutStampedPromptCacheKey(text);
+        return cleaned === undefined ? prep : { outcome: "restored", body: cleaned };
+    };
+}
+
+/** The pi-lane terminal notification for an injected nudge: a fixed label
+ *  prefix + the VERBATIM wire text the model read — nothing appended (strict
+ *  fidelity, owner direction 2026-11-17). A display-only "suggested call" used
+ *  to be tacked on here; unmarked, it read as part of the injection (and
+ *  advertised the non-canonical {startId,endId} array shape), which is exactly
+ *  what this surface must not do. */
+export function nudgeNotifyText(pending: Pick<NudgeDebugEvent, "emergency" | "text">): string {
+    return `[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}`;
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -1128,6 +1209,34 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 return box;
             });
         }
+        // Nudge debug view (transient only, gated on the debug switch —
+        // ACP_DEBUG / config `debug`): when the proxy injects a nudge (the
+        // ephemeral trailing user message the model reads), the VERBATIM wire
+        // text is shown once per user turn as a terminal notification after
+        // the model has answered. Nothing is persisted and nothing is added
+        // to model context. Engine-side emitter: same bundle/process in the
+        // default INLINE pi mode (spawn/attach proxies are separate processes
+        // — no bus listener, feature inert there; docs/clients.md).
+        if (agent === "pi") {
+            if (!nudgeDebugWired) {
+                nudgeDebugWired = true;
+                onNudgeInjected((event) => {
+                    nudgeFullPending = event;
+                });
+            }
+            pi.on("after_provider_response", ((_event: unknown, ctx: Ctx) => {
+                const pending = nudgeFullPending;
+                nudgeFullPending = null;
+                if (pending === null || !debugEnabled()) return;
+                if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
+                nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
+                try {
+                    ctx.ui?.notify?.(nudgeNotifyText(pending));
+                } catch {
+                    // host UI unavailable — best-effort display
+                }
+            }) as unknown as (...args: unknown[]) => void);
+        }
         const piCommands = piCommandsEnabled();
         if (typeof pi.registerCommand === "function") {
           if (piCommands.has("acp")) {
@@ -1317,6 +1426,35 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             });
           }
         }
+        // Pi fingerprints the uncompressed history before our transport runs.
+        // A native continuation therefore cannot carry our rewritten history.
+        const useFullAnthropicRequests = async (ctx: Ctx): Promise<void> => {
+            if (agent !== "pi" || typeof pi.setModel !== "function") return;
+            const model = ctx.model;
+            if (model?.api !== "anthropic-messages" || proxyBaseForCtx(ctx) === undefined) return;
+            const base = model.baseUrl;
+            if (typeof base !== "string" || !/^https?:\/\//i.test(base)) return;
+            if (!destinationRoutedThroughProxy(base) && !(nativeInterceptInstalled() && isModelApiUrl(`${base.replace(/\/+$/, "")}/v1/messages`))) return;
+            const compat = model.compat;
+            if (compat !== undefined && (compat === null || typeof compat !== "object" || Array.isArray(compat))) return;
+            const settings = compat as Record<string, unknown> | undefined;
+            if (settings?.supportsMessageThreads === false) return;
+            const thinking = pi.getThinkingLevel?.();
+            const fullModel = { ...model, compat: { ...settings, supportsMessageThreads: false } };
+            try {
+                if (await pi.setModel(fullModel) === false) {
+                    logHostEvent("warn", "[native-client]", "bili-plugin(pi): could not disable native Anthropic threads for this session (model authentication unavailable)");
+                }
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(pi): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
+            } finally {
+                if (ctx.model === fullModel && thinking !== undefined && pi.getThinkingLevel?.() !== thinking) pi.setThinkingLevel?.(thinking);
+            }
+        };
+        if (agent === "pi") {
+            pi.on("session_start", (_event, ctx) => useFullAnthropicRequests(ctx));
+            pi.on("model_select", (_event, ctx) => useFullAnthropicRequests(ctx));
+        }
         // Await tool registration in before_agent_start so cold-start native
         // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
         // active tool loadout and <codemode_catalog> system prompt. Without this,
@@ -1330,6 +1468,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 await registerTools(pi, ctx, state, agent);
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+            try {
+                await useFullAnthropicRequests(ctx);
+            } catch (err) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): native thread compatibility negotiation failed (${err instanceof Error ? err.message : String(err)})`);
             }
         });
         pi.on("before_provider_headers", async (event, ctx) => {
@@ -1377,6 +1520,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #6884: pi's leg of the #6880/#6883 declaration (cross-agent
+                    // session-id audit, discussions/6884): pi has NO auxiliary
+                    // LLM calls — no title-gen, no compaction summarizer, no
+                    // auto-review — and subagents/forks mint FRESH session ids
+                    // (their parentSession file header points back at the
+                    // parent), so EVERY dispatch through this plugin is the
+                    // session's main conversation turn. Stamp the "conversation"
+                    // sentinel on every dispatch (the plugin.ts
+                    // PLUGIN_PURPOSE_CONVERSATION wire constant, inlined like
+                    // dsh-native) and the server classifies by declaration:
+                    // the body heuristics (budget <= 200 demotion, single-shot
+                    // shapes) can no longer demote a real turn to the #388 side
+                    // passthrough — a one-shot `pi -p` with a small maxTokens
+                    // and no tools would otherwise never enter the kernel
+                    // pipeline and silently lose compression state.
+                    headers["x-bili-plugin-purpose"] = "conversation";
                     // #3248: when the lane advertises incremental turns, declare
                     // the divert intent. Declaring is safe — the lane shape-tests
                     // the body, so full-resend turns (retries, dead conversations,

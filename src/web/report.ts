@@ -47,7 +47,14 @@ interface ReportData {
         };
         stability?: { paired?: number; equal?: number; diverged?: number; head?: number; append?: number; mid?: number; unknownOffset?: number };
         folds?: Array<{ seq?: number | null; at?: number; S?: number; sigma?: number; hPct?: number | null; T?: number }>;
-        lines?: Array<{ input?: number; cached?: number }>;
+        /** #6729: nudge-recommended vs actually-folded recovery events + summary. */
+        recovery?: {
+            events?: Array<{ at?: number; kind?: "n" | "f"; tier?: number | null; pending?: number; folded?: number | null; foldSeq?: number | null; mode?: "n" | "a" | null; pct?: number | null; paired?: boolean }>;
+            summary?: { nudges?: number; folds?: number; nudgeFolds?: number; activeFolds?: number; totalPending?: number; totalFolded?: number; pct?: number | null };
+            /** #6729 follow-up: one point per nudge round for the recovery line chart. */
+            episodes?: Array<{ at?: number; tier?: number | null; pending?: number; folded?: number; pct?: number | null; activeFolds?: number; open?: boolean; credited?: number; extra?: number }>;
+        };
+        lines?: Array<{ at?: number; input?: number; cached?: number; seq?: number }>;
     }) | null;
 }
 
@@ -128,11 +135,13 @@ function readLedger(d: ReportData) {
     const seam = led.seam && typeof led.seam === "object" ? led.seam : null;
     const st = led.stability && typeof led.stability === "object" ? led.stability : null;
     const folds = Array.isArray(led.folds) ? led.folds : [];
+    // #6729: sparse on pre-upgrade ledgers.
+    const rec = led.recovery && Array.isArray(led.recovery.events) && led.recovery.events.length ? led.recovery : null;
     const lines = Array.isArray(led.lines) ? led.lines : [];
     const seamEvents = seam && Array.isArray(seam.events) ? seam.events.filter((e) => e && (e.at ?? 0) > 0) : [];
     const ctxBest = (d.contextBest && d.contextBest.tokens) ? d.contextBest.tokens : (Number(d.contextTokens) || 0);
     const win = Number(d.contextWindow) || 0;
-    return { led, tot, seam, st, folds, lines, seamEvents, ctxBest, win };
+    return { led, tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec };
 }
 
 export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): string {
@@ -140,7 +149,7 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
     const lang = opts.lang === "en" ? "en" : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
-    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
     const NL = String.fromCharCode(10);
     const L: string[] = [];
     L.push("# billion-context session report");
@@ -233,6 +242,33 @@ export function buildSessionReportMd(d: ReportData, opts: ReportOpts = {}): stri
         L.push("|---|---|---|---|---|---|");
         folds.forEach((fd, i) => { L.push("| " + (fd.seq != null ? fd.seq : i + 1) + " | " + (fd.at ? f.DT(fd.at) : "-") + " | " + f.W(fd.S) + " | " + f.W(fd.sigma) + " | " + (fd.hPct == null ? "-" : fd.hPct.toFixed(1) + "%") + " | " + f.W(fd.T) + " |"); });
     }
+    if (rec) {
+        const s = rec.summary || {};
+        const evs = rec.events || [];
+        L.push("");
+        L.push("### " + t("det.rec_title"));
+        L.push("");
+        L.push("- " + t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: f.W(s.totalPending || 0), s: f.W(s.totalFolded || 0) }) + (((s.totalFolded || 0) > (s.totalPending || 0)) ? " · " + t("det.rec_over_stock") : "") + " · " + t("det.rec_rate") + ": " + (s.pct != null ? s.pct.toFixed(1) + "%" : f.none));
+        L.push("- " + t("det.rec_note_t1"));
+        L.push("- " + t("det.rec_note_burst"));
+        const eps = rec.episodes || [];
+        if (eps.length) {
+            L.push("");
+            L.push("- " + t("det.rec_line_title") + ":");
+            eps.forEach((ep, i) => {
+                L.push("  " + (i + 1) + ". T" + (ep.tier != null ? ep.tier : "?") + " · " + (ep.at ? f.DT(ep.at) : "-") + " · " + f.W(ep.pending || 0) + "→" + f.W(ep.folded || 0) + " · " + (ep.pct != null ? ep.pct.toFixed(1) + "%" : f.none) + ((ep.activeFolds || 0) > 0 ? " · +" + (ep.activeFolds || 0) + " " + t("det.rec_kind_active") : ""));
+            });
+        }
+        L.push("");
+        L.push("| # | " + t("det.fold_time") + " | " + t("det.rec_kind") + " | " + t("det.rec_rec") + " | " + t("det.rec_folded") + " | " + t("det.rec_pct") + " |");
+        L.push("|---|---|---|---|---|---|");
+        evs.slice(-30).forEach((ev, i) => {
+            const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");
+            const pct = ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-";
+            L.push("| " + (i + 1) + " | " + (ev.at ? f.DT(ev.at) : "-") + " | " + kind + " | " + f.W(ev.pending || 0) + " | " + (ev.folded != null ? f.W(ev.folded) : "-") + " | " + pct + " |");
+        });
+        if (evs.length > 30) { L.push("- " + t("det.rec_note_window", { n: 30 })); L.push("… +" + (evs.length - 30) + " earlier events"); }
+    }
     return L.join(NL);
 }
 
@@ -241,9 +277,9 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     const lang = opts.lang === "en" ? "en" : "zh-CN";
     const t = (k: string, a?: Record<string, string | number>) => tr(lang, k, a);
     const f = makeFmt(lang);
-    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win } = readLedger(d);
+    const { tot, seam, st, folds, lines, seamEvents, ctxBest, win, rec } = readLedger(d);
     const W = 920, PAD = 28;
-    const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa";
+    const INK = "#1f2328", MUT = "#6e7681", LINEC = "#d0d7de", ACC = "#0969da", RED = "#cf222e", AMB = "#bf8700", SOFT = "#f6f8fa", GROW = "#1b7c83"; // GROW: growth-recovery series — teal + hollow, kept apart from ACC (#0969da = active ticks / over-100 fold dots)
     const SANS = "ui-sans-serif,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
     const MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
     const body: string[] = [];
@@ -398,6 +434,193 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
             if (folds.length > 15) noteLine("… +" + (folds.length - 15) + " earlier folds (see .md)");
         }
     } else noteLine(t("common.empty"));
+    if (rec) {
+        section(t("det.rec_title"));
+        const s = rec.summary || {};
+        noteLine(t("det.rec_head2", { n: s.nudges || 0, f: s.folds || 0, nf: s.nudgeFolds || 0, a: s.activeFolds || 0, p: f.W(s.totalPending || 0), s: f.W(s.totalFolded || 0) }) + (((s.totalFolded || 0) > (s.totalPending || 0)) ? " · " + t("det.rec_over_stock") : ""));
+        statRow([
+            [t("det.rec_nudge"), String(s.nudges || 0)],
+            [t("det.rec_active"), String(s.activeFolds || 0)],
+            [t("det.rec_rec_total"), f.W(s.totalPending || 0)],
+            [t("det.rec_fold_total"), f.W(s.totalFolded || 0)]
+        ]);
+        noteLine(t("det.rec_note_t1"));
+        noteLine(t("det.rec_note_burst"));
+        const revs = (rec.events || []).slice(-10);
+        const rcols = [{ t: "#", w: 48 }, { t: t("det.fold_time"), w: 120 }, { t: t("det.rec_kind"), w: 150 }, { t: t("det.rec_rec"), w: 120 }, { t: t("det.rec_folded"), w: 120 }, { t: t("det.rec_pct"), w: W - PAD * 2 - 558 }];
+        // #6729 follow-up v7: the recovery LINE is the compressions — one point per
+        // compress() call (folded ÷ the nudge recommendation outstanding for it),
+        // connected in time order; none skipped. >100% = also folded older stock (true
+        // value, axis extends past the 100% baseline). Nudges are ▼ markers; rounds keep
+        // their brackets (a round's points sum to its recovery). Compressions without a
+        // measurable recommendation (active / non-T1) stay as blue/grey axis ticks.
+        const eps = rec.episodes || [];
+        type RevEv = { at: number; kind: "n" | "f"; tier?: number | null; pending?: number | null; folded?: number | null; mode?: "n" | "a"; pct?: number | null; paired?: boolean };
+        const revEvs: RevEv[] = [];
+        (rec.events || []).forEach((ev) => {
+            if (!ev || ev.at == null || !(ev.at > 0) || (ev.kind !== "n" && ev.kind !== "f")) return;
+            revEvs.push({ at: ev.at, kind: ev.kind, tier: ev.tier ?? null, pending: ev.pending ?? null, folded: ev.folded ?? null, mode: ev.mode ?? undefined, pct: ev.pct ?? null, paired: ev.paired });
+        });
+        if (revEvs.length > 0) {
+            const CH = 240, CPL = 40, CPR = 14, CPT = 30, CPB = 44;
+            const left = PAD + CPL, right = W - PAD - CPR, top = y + CPT, bot = y + CH - CPB;
+            const times = revEvs.map((ev) => ev.at);
+            const t0 = Math.min(...times), t1 = Math.max(...times);
+            const TX = (at: number): number => left + (t1 > t0 ? ((at - t0) / (t1 - t0)) * (right - left) : (right - left) / 2);
+            // per-fold points: denominator = the latest nudge's recommendation before the fold
+            let lastP = 0;
+            const fPts = revEvs.flatMap((ev) => {
+                if (ev.kind === "n") { lastP = ev.pending || 0; return []; }
+                const p = ev.pending || 0;
+                // The server payload may carry the per-fold pct directly (the ledger's p field
+                // is only set on newer ledgers); prefer it and fall back to pending-derived.
+                const pct = ev.pct != null ? ev.pct : (p > 0 ? Math.round(((ev.folded || 0) / p) * 1000) / 10 : null);
+                return [{ at: ev.at, S: ev.folded || 0, p, pct, mode: ev.mode ?? "a" }];
+            });
+            // Growth recovery (one point per round): folded ÷ context growth since the
+            // previous round's first sample. Answers "did the context actually come back
+            // down" — the ratchet meter (#6720). Needs the per-request usage samples.
+            const uLines = (lines || []).filter((l) => Boolean(l) && (l.at || 0) > 0).sort((a, b) => (a.at || 0) - (b.at || 0));
+            const gPts: Array<{ at: number; s: number; g: number; pct: number | null }> = [];
+            let gPrevEnd: number | null = null; // previous round's last fold — the floor is measured after it
+            eps.forEach((ep) => {
+                const folded = ep.folded || 0;
+                if (!folded) return;
+                const gs = ep.at ?? 0;
+                const nextNud = eps.find((e2, i2) => i2 > eps.indexOf(ep) && (e2.at ?? 0) > gs);
+                let ge: number | null = null;
+                revEvs.forEach((ev) => {
+                    if (ev.kind === "f" && ev.mode === "n" && ev.at >= gs && (nextNud == null || ev.at < (nextNud.at ?? Infinity)) && (ge === null || ev.at > ge)) ge = ev.at;
+                });
+                if (ge === null || !uLines.length) return;
+                const geT = ge;
+                // growth = pre-round floor → round peak. The FLOOR is the lowest input
+                // AFTER the previous round's last fold and BEFORE this round's nudge
+                // (fallback: the whole pre-round history for round one): a fold is itself
+                // a drop, so the min inside the peak window can sit right after an earlier
+                // fold and make "growth" look 10× larger. Peak window = [round start, last
+                // fold + 2 min]. Two conversations can share one session UUID (dsh-client
+                // #5792): sub-25%-of-peak samples are a different stream and are dropped
+                // before taking the min/max.
+                let preMin: number | null = null;
+                for (const pln of uLines) {
+                    if ((pln.at || 0) >= gs) break;
+                    if (gPrevEnd !== null && (pln.at || 0) <= gPrevEnd) continue;
+                    const pin = pln.input || 0;
+                    if (preMin === null || pin < preMin) preMin = pin;
+                }
+                const wAll = uLines.filter((ln) => (ln.at || 0) >= gs && (ln.at || 0) <= geT + 120000).map((ln) => ln.input || 0);
+                if (!wAll.length) return;
+                const gPeakAll = Math.max(...wAll);
+                const gPeak = Math.max(...wAll.filter((v) => v >= 0.25 * gPeakAll));
+                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : Math.min(...wAll.filter((v) => v >= 0.25 * gPeak));
+                const gGrow = Math.max(0, gPeak - gBase);
+                gPts.push({ at: geT, s: folded, g: gGrow, pct: gGrow > 0 ? Math.round(folded / gGrow * 1000) / 10 : null });
+                gPrevEnd = geT;
+            });
+            // dynamic axis: 100% is the central reference; over-folds push the axis up (capped 400%)
+            const maxPct = Math.max(
+                fPts.reduce((mx, fp) => (fp.pct !== null && fp.pct > mx ? fp.pct : mx), 100),
+                gPts.reduce((mx, gp) => (gp.pct !== null && gp.pct > mx ? gp.pct : mx), 0)
+            );
+            const axisMax = maxPct <= 100 ? 150 : Math.min(400, Math.ceil((maxPct * 1.1) / 50) * 50);
+            const RY = (pct: number): number => bot - (Math.max(0, Math.min(axisMax, pct)) / axisMax) * (bot - top);
+            const colFor = (pct: number): string => pct >= 80 ? "#2da44e" : pct >= 40 ? AMB : RED;
+            const gStep = axisMax > 200 ? 50 : 25;
+            for (let g = 0; g <= axisMax; g += gStep) {
+                body.push('<line x1="' + left + '" y1="' + RY(g).toFixed(1) + '" x2="' + right + '" y2="' + RY(g).toFixed(1) + '" stroke="' + LINEC + '" stroke-width="1"/>');
+                txt(left - 6, RY(g) + 3, g + "%", { size: 9.5, color: MUT, anchor: "end", mono: true });
+            }
+            const yB = RY(100);
+            body.push('<line x1="' + left + '" y1="' + yB.toFixed(1) + '" x2="' + right + '" y2="' + yB.toFixed(1) + '" stroke="#57606a" stroke-width="1.3"/>');
+            txt(right, yB - 4, t("det.rec_line_base"), { size: 8.5, color: "#57606a", anchor: "end", mono: true });
+            revEvs.filter((ev) => ev.kind === "n").forEach((nv) => {
+                const x = TX(nv.at);
+                body.push('<path d="M' + x.toFixed(1) + ',' + (top - 6) + ' L' + (x - 5).toFixed(1) + ',' + (top - 15) + ' L' + (x + 5).toFixed(1) + ',' + (top - 15) + ' Z" fill="#d29922"/>');
+                txt(x, top - 19, "T" + (nv.tier != null ? nv.tier : "?") + " · " + f.W(nv.pending || 0), { size: 8.5, color: "#d29922", anchor: "middle", mono: true });
+            });
+            // axis ticks for compressions without a measurable recommendation
+            let tickLines = "";
+            fPts.forEach((fp) => {
+                if (fp.pct !== null) return;
+                const x = TX(fp.at);
+                tickLines += '<line x1="' + x.toFixed(1) + '" y1="' + (bot - 13).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + bot.toFixed(1) + '" stroke="' + (fp.mode === "a" ? ACC : MUT) + '" stroke-width="2"/>';
+            });
+            body.push(tickLines);
+            // main line + points + cumulative (mass-weighted running Σfolded ÷ Σrecommended)
+            let cpSum = 0, cfSum = 0;
+            const cumPts: string[] = [];
+            const mainPts: string[] = [];
+            const measCount = fPts.filter((fp) => fp.pct !== null).length;
+            const showEvery = measCount > 8 ? 2 : 1;
+            let shown = 0;
+            fPts.forEach((fp) => {
+                if (fp.pct === null) return;
+                const x = TX(fp.at);
+                const over = fp.pct > 100;
+                const dcol = over ? ACC : colFor(fp.pct);
+                if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(fp.pct).toFixed(1) + '" r="6" fill="none" stroke="' + ACC + '" stroke-width="1.5"/>');
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(fp.pct).toFixed(1) + '" r="3.5" fill="' + dcol + '" stroke="#ffffff" stroke-width="1"/>');
+                if (shown++ % showEvery === 0) txt(x, RY(fp.pct) - 7, fp.pct.toFixed(fp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "600", color: dcol, anchor: "middle", mono: true });
+                cpSum += fp.p; cfSum += fp.S;
+                mainPts.push(x.toFixed(1) + "," + RY(fp.pct).toFixed(1));
+                if (cpSum > 0) cumPts.push(x.toFixed(1) + "," + RY((cfSum / cpSum) * 100).toFixed(1));
+            });
+            // per-round brackets (round sums; a round's point values add up to its pct)
+            // old-stock pool: each round adds its pending, folds consume to a floor of 0
+            let recPool = 0;
+            const epExtra = eps.map((ep) => {
+                recPool += ep.pending || 0;
+                const folded = ep.folded || 0;
+                const credited = Math.min(folded, recPool);
+                recPool -= credited;
+                return Math.max(0, folded - credited);
+            });
+            eps.forEach((ep, i) => {
+                const epAt = ep.at ?? 0;
+                let end = epAt, k = 0;
+                revEvs.filter((ev) => ev.kind === "f" && ev.mode === "n").forEach((fd) => {
+                    if (fd.at >= epAt && (i + 1 >= eps.length || fd.at < (eps[i + 1].at ?? Infinity))) { k++; if (fd.at > end) end = fd.at; }
+                });
+                const x = TX(t1 > t0 ? (epAt + end) / 2 : epAt);
+                if (ep.pct != null) {
+                    const over = ep.pct > 100;
+                    const dcol = over ? ACC : colFor(ep.pct);
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(Math.min(axisMax, ep.pct)).toFixed(1) + '" r="2.5" fill="' + dcol + '"/>');
+                }
+                const extra = epExtra[i] || 0;
+                const x0 = TX(epAt), yb = bot + 14 + (i % 2) * 15;
+                body.push('<path d="M' + x0.toFixed(1) + ',' + (yb - 4) + ' L' + x0.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + yb + ' L' + x.toFixed(1) + ',' + (yb - 4) + '" fill="none" stroke="' + MUT + '" stroke-width="1"/>');
+                txt((x0 + x) / 2, yb + 10, t(ep.open ? "det.rec_bracket_open" : "det.rec_bracket", ep.open ? { k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" } : { i: i + 1, k, s: f.W(ep.folded || 0), p: f.W(ep.pending || 0), pct: ep.pct != null ? ep.pct.toFixed(ep.pct >= 100 ? 0 : 1) + "%" : "-" }) + (extra > 0 ? t("det.rec_bracket_over", { s: f.W(extra) }) : ""), { size: 8.5, color: MUT, anchor: "middle", mono: true });
+            });
+            if (mainPts.length > 1) body.push('<polyline points="' + mainPts.join(" ") + '" fill="none" stroke="#57606a" stroke-width="1.5"/>');
+            if (cumPts.length > 1) body.push('<polyline points="' + cumPts.join(" ") + '" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="4 3"/>');
+            // growth line: thick teal, one point per round (hollow dots — blue is reserved for active folds / over-100 fold dots)
+            const gLinePts: string[] = [];
+            gPts.forEach((gp) => { if (gp.pct !== null) gLinePts.push(TX(gp.at).toFixed(1) + "," + RY(gp.pct).toFixed(1)); });
+            if (gLinePts.length > 1) body.push('<polyline points="' + gLinePts.join(" ") + '" fill="none" stroke="' + GROW + '" stroke-width="2"/>');
+            gPts.forEach((gp) => {
+                const x = TX(gp.at);
+                if (gp.pct === null) {
+                    // no new growth → mark on the 0% axis (pure older-stock cleanup)
+                    body.push('<circle cx="' + x.toFixed(1) + '" cy="' + bot.toFixed(1) + '" r="4" fill="none" stroke="' + GROW + '"><title>' + t("det.rec_growth_flat", { s: f.W(gp.s) }) + "</title></circle>");
+                    return;
+                }
+                const over = gp.pct > 100;
+                if (over) body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="7" fill="none" stroke="' + GROW + '"/>');
+                body.push('<circle cx="' + x.toFixed(1) + '" cy="' + RY(gp.pct).toFixed(1) + '" r="4.5" fill="#ffffff" stroke="' + GROW + '" stroke-width="1.8"><title>' + t("det.rec_growth_tip", { at: f.DT(gp.at), g: f.W(gp.g), s: f.W(gp.s), pct: gp.pct }) + "</title></circle>");
+                const lx = x + 9 > right - 44 ? x - 9 : x + 9;
+                txt(lx, RY(gp.pct) + 3, gp.pct.toFixed(gp.pct >= 100 ? 0 : 1) + "%", { size: 9, weight: "700", color: GROW, anchor: lx < x ? "end" : "start", mono: true });
+            });
+            y += CH + 16;
+        }
+        tableHead(rcols);
+        revs.forEach((ev, i) => {
+            const kind = ev.kind === "n" ? t("det.rec_kind_nudge") + (ev.tier != null ? " T" + ev.tier : "") : ev.mode === "a" ? t("det.rec_kind_active") : t("det.rec_kind_nf");
+            tableRow([String(i + 1), ev.at ? f.DT(ev.at) : "-", kind, f.W(ev.pending || 0), ev.folded != null ? f.W(ev.folded) : "-", ev.pct != null ? ev.pct.toFixed(1) + "%" : ev.kind === "n" && ev.paired === false ? t("det.rec_unfolded_short") : "-"], [rcols[0].w, rcols[1].w, rcols[2].w, rcols[3].w, rcols[4].w, rcols[5].w]);
+        });
+        if ((rec.events || []).length > 10) { noteLine(t("det.rec_note_window", { n: 10 })); noteLine("… +" + ((rec.events || []).length - 10) + " earlier events (see .md)"); }
+    }
     y += 24;
     const H = Math.ceil(y);
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">'
