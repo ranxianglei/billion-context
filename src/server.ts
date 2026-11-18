@@ -1837,6 +1837,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     }
     const removeProcessHandlers = (): void => {
         if (!processHandlersInstalled) return;
+        // #7026 review: the close event fires when the listener stops accepting,
+        // i.e. BEFORE the session flush in finishDrain. Stripping the handlers
+        // here would leave a second Ctrl+C during the flush window unhandled —
+        // the process would die with unflushed compression state. Keep them
+        // until the process actually exits; a closed embedded server that never
+        // shut down (port-ladder retry path) still cleans up normally.
+        if (shuttingDown) return;
         processHandlersInstalled = false;
         process.removeListener("uncaughtException", onUncaughtException);
         process.removeListener("unhandledRejection", onUnhandledRejection);
