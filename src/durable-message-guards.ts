@@ -153,13 +153,18 @@ export function dshMcpCatalogPath(msg: CoreMessage): string | undefined {
  *  carriers (see dshSkillCatalogPath).
  *  #7085: dsh 0.2.2-rc.3 reworded the populated snapshot — it no longer
  *  contains "Current runtime context" but opens with the lead-in "The
- *  following information describes your current session:" (wrapped in
- *  \x3csystem-reminder\x3e). The old literal stays because cross-form
- *  transition sessions carry BOTH shapes; the cleared form still uses the
- *  old literal, so dropping it would blind the invalidation notice. */
+ *  following information describes your current session" (wrapped in
+ *  \x3csystem-reminder\x3e). The lead-in has TWO continuations: the first
+ *  snapshot ends it with ":" while re-sends after a context change continue
+ *  it with ". It replaces earlier versions of this context, including any
+ *  retained in conversation summaries." — the marker is the shared prefix
+ *  WITHOUT the trailing colon so both forms classify. The old literal stays
+ *  because cross-form transition sessions carry BOTH shapes; the cleared form
+ *  still uses the old literal, so dropping it would blind the invalidation
+ *  notice. */
 export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
     return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string"
-        && (msg.text.includes("Current runtime context") || msg.text.includes("The following information describes your current session:"))
+        && (msg.text.includes("Current runtime context") || msg.text.includes("The following information describes your current session"))
         ? "durable/runtime-context"
         : undefined;
 }
@@ -444,8 +449,9 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
  *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
  *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
- *  runtime context" literal and the 0.2.2-rc.3 lead-in, #7085 — the mnemon
- *  family contributes two, the image-offload family contributes two), so a
+ *  runtime context" literal and the 0.2.2-rc.3 lead-in without its trailing
+ *  colon, which both the first-snapshot and re-send intros share, #7085 — the
+ *  mnemon family contributes two, the image-offload family contributes two), so a
  *  unified-store row can be screened with cheap substring checks BEFORE
  *  JSON.parse (rows may carry megabytes of base64 media). Lockstep with the
  *  classifiers is enforced in tests/issue5142-expected-rebase.test.ts. */
@@ -453,7 +459,7 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
     "Current runtime context",
-    "The following information describes your current session:",
+    "The following information describes your current session",
     "\x3cmcp_catalog\x3e",
     "Time sampled while preparing turn",
     "\x3ctype\x3eimage\x3c/type\x3e",
