@@ -202,6 +202,8 @@ interface PersistedSession {
         cacheSamples?: number;
         lastInputTokens?: number;
         lastInputTokensSource?: string;
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
         lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
         overflowArmCompletionReserve?: number;
@@ -222,7 +224,8 @@ interface PersistedSession {
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
-        calibrationRing?: { origin: string; values: number[] };
+        calibratedEstimateModel?: string;
+        calibrationRing?: { origin: string; model?: string; values: number[] };
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -4198,14 +4201,15 @@ function restoreCalibratedEstimate(v: unknown): number | undefined {
 // itself would admit (finite, within the plausibility band) and only the newest
 // window-size entries; anything else drops the ring wholesale so a malformed
 // file can neither teach a factor nor mask a fresh learning run on restart.
-function restoreCalibrationRing(v: unknown): { origin: string; values: number[] } | undefined {
+function restoreCalibrationRing(v: unknown): { origin: string; model?: string; values: number[] } | undefined {
     if (!v || typeof v !== "object") return undefined;
-    const ring = v as { origin?: unknown; values?: unknown };
+    const ring = v as { origin?: unknown; model?: unknown; values?: unknown };
     if (typeof ring.origin !== "string" || ring.origin.length === 0) return undefined;
     if (!Array.isArray(ring.values)) return undefined;
     const values = ring.values.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= CALIBRATION_SAMPLE_MIN && x <= CALIBRATION_SAMPLE_MAX);
     const recent = values.slice(-CALIBRATION_SAMPLE_WINDOW);
-    return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
+    const model = typeof ring.model === "string" && ring.model.trim().length > 0 ? ring.model : undefined;
+    return recent.length > 0 ? { origin: ring.origin, ...(model === undefined ? {} : { model }), values: recent } : undefined;
 }
 
 function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
@@ -4266,6 +4270,10 @@ function buildSession(parsed: PersistedSession): Session {
             // #857: provenance — legacy files lack it; absent stays absent and
             // evidence-grade consumers treat absent as untrusted.
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            // Preserve the explanation saved by armFailureShrink alongside its
+            // raised baseline. A real usage settlement clears both markers.
+            emergencyShrinkAt: typeof stats.emergencyShrinkAt === "number" && Number.isFinite(stats.emergencyShrinkAt) && stats.emergencyShrinkAt >= 0 ? stats.emergencyShrinkAt : undefined,
+            emergencyShrinkEstimate: typeof stats.emergencyShrinkEstimate === "number" && Number.isFinite(stats.emergencyShrinkEstimate) && stats.emergencyShrinkEstimate > 0 ? stats.emergencyShrinkEstimate : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
             // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
@@ -4291,6 +4299,7 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
+            calibratedEstimateModel: typeof stats.calibratedEstimateModel === "string" && stats.calibratedEstimateModel.trim().length > 0 ? stats.calibratedEstimateModel : undefined,
             calibrationRing: restoreCalibrationRing(stats.calibrationRing),
             // Intentionally NOT restored (#2129 triage): pendingFoldUsage is set at
             // compress execution and consumed only as a log-suffix attribution by the
