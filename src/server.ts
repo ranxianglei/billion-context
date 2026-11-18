@@ -4030,6 +4030,37 @@ export async function preflightCompressIfNeeded(
         }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
+    // #7167: the irreducible-dimension gate — tools[], system and other are
+    // dimensions folding CANNOT touch: the moment they alone clear the doom
+    // bar, no amount of message compaction can fit the body, so the fold
+    // below is guaranteed-doomed from its first summary call — it would
+    // irreversibly rewrite the session's history and bill real tokens for a
+    // 413 the post-fold measured dooms (#1839/#3146 arms) would answer
+    // anyway. Measure the UNMODIFIED prepared body with the #554 guard meter
+    // and fail fast before probeForEvidence / preflightCompress. Same bar as
+    // those post-fold dooms (the native window when bili knows it, the
+    // headroom limit as fallback): the gate can only refuse a body the
+    // post-fold flow would have 413'd with the same measured meter — no new
+    // failure mode. Growth-armed payloads keep the autoFold fail-open rule
+    // (a growth trigger is operator intent and the payload fits the real
+    // window by definition — the #3444 floor mechanism owns that regime's
+    // unreachable-target case). Unparseable bodies fall through
+    // (measuredOutbound undefined) — current behavior holds.
+    if (!growthArmed) {
+        const preFoldOutbound = measuredOutbound(prepared);
+        if (preFoldOutbound !== undefined) {
+            const pf = preFoldOutbound.breakdown;
+            const irreducible = pf.tools + pf.system + pf.other;
+            const doomBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+            if (irreducible >= doomBar) {
+                const nativeKnown = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0;
+                const irreducibleMessage = `tools[] + system + other alone measure ~${irreducible.toLocaleString("en-US")} tokens (${measuredBreakdownClause(pf)}; CJK-aware count, the #554 guard meter; images billed separately and never doom here — #496/#1800/#857) vs ${nativeKnown ? `the model's window ${doomBar.toLocaleString("en-US")}` : `bili's effective window ${doomBar.toLocaleString("en-US")}`} (model=${model}) — dimensions compression cannot touch, so no amount of message folding can fit this body. Compaction was NOT attempted and the body was NOT forwarded. Trim the tool surface (fewer or smaller tools, lazy tool discovery), shorten the system prompt${nativeKnown ? "" : ", or raise the effective window (compress.modelContextLimit)"} and retry.`;
+                log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, irreducible-dimension gate): ${irreducibleMessage}`);
+                noteLocalRefusal(session, currentOrigin, model, limit);
+                return { failFast: true, status: 413, message: irreducibleMessage, retryable: false, respond: !res.writableEnded };
+            }
+        }
+    }
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
     // window is independent evidence the payload cannot fit here — the
     // forward-once escapes below must not re-bet the estimator guess. Fitting
