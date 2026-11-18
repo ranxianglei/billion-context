@@ -104,3 +104,36 @@ test("re-listening restores exactly one handler set and closing removes it again
         restoreListeners(before);
     }
 });
+
+// #7026 review: the "close" event fires when the listener stops accepting, BEFORE
+// the session flush in finishDrain. Handlers stripped there left the flush window
+// unprotected — a second Ctrl+C would kill the process mid-flush. The handlers
+// must survive until the process actually exits. (Placed last: its shutdown chain
+// runs the full exit path — flushes, closeLogger(), instance cleanup — inside
+// the test process, so the clean-remove tests above run first.)
+test("graceful shutdown keeps signal handlers until the process exits", async () => {
+    const before = snapshot();
+    const realExit = process.exit;
+    const exits: Array<number | string | undefined> = [];
+    process.exit = ((code?: number | string) => { exits.push(code); }) as typeof process.exit;
+    const server = await start();
+    try {
+        const serving = snapshot();
+        process.kill(process.pid, "SIGINT");
+        await once(server, "close");
+        // Let the shutdown chain reach (the stubbed) process.exit first: the
+        // test process must not drain out from under the assertions while the
+        // flush is still running.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assertSameListeners(serving);
+        // Second Ctrl+C during the flush window: must be absorbed by the
+        // idempotent shutdown(), not delivered to Node's default handler.
+        process.kill(process.pid, "SIGTERM");
+        await new Promise((resolve) => setImmediate(resolve));
+        assertSameListeners(serving);
+        assert.ok(exits.length <= 1);
+    } finally {
+        restoreListeners(before);
+        process.exit = realExit;
+    }
+});
