@@ -1579,10 +1579,11 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null }[];
+            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null; ref: string | null }[];
         const seqByIdentity = new Map<string, number>();
         const hashBySeq = new Map<number, string>();
+        const storedRefBySeq = new Map<number, string | null>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of existing) {
@@ -1594,6 +1595,7 @@ export class UnifiedStore {
             if (row.retired_at !== null) retiredSeqs.push(row.seq);
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, row.seq);
             hashBySeq.set(row.seq, row.content_hash);
+            storedRefBySeq.set(row.seq, row.ref);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -1604,6 +1606,12 @@ export class UnifiedStore {
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
         const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
+        // #6947: rows written by the turn-final handoff write-back carry
+        // ref=NULL — their ref is minted only when a LATER request re-sends
+        // the message. This join hit is the first moment the minted ref can
+        // reach the stored row; backfill NULL only (a non-null stored ref is
+        // the frozen index-time projection and must never be rewritten).
+        const refBackfills: { seq: number; ref: string; refNum: number }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1625,10 +1633,21 @@ export class UnifiedStore {
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
                 if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
+                // #6947: minted-ref backfill for turn-final write-back rows.
+                // Never "BLOCKED" (a byRaw-only token, #ingest note) and never
+                // over an already-stored ref.
+                if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null && storedRefBySeq.get(abs) === null) {
+                    refBackfills.push({ seq: abs, ref: m.ref, refNum: m.refNum });
+                }
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const b of refBackfills) {
+            // The ref IS NULL re-check inside the statement keeps the update
+            // idempotent if two plan rows join the same stored row.
+            this.db.prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL").run(b.ref, b.refNum, s.sessionId, b.seq);
+        }
         for (const r of repairs) {
             // #4793: a sibling row may already hold the target bytes for this
             // msg_id — e.g. an old generation stamped with an EMPTY identity
