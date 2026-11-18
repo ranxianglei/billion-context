@@ -174,8 +174,12 @@ Two lanes, same plugin (#941):
      separate always-on `bili-compaction-gate` entry: disabling or
      kill-switching (`BILLION_CONTEXT_PLUGIN=0`) `bili-native` hands the
      lane back to STOCK dsh behavior — presets boot normally and native
-     auto-compaction returns; compression is simply off. Do NOT disable
-     `bili-compaction-gate` itself — that re-creates the brick. To fully
+      auto-compaction returns; compression is simply off. Do NOT disable
+      `bili-compaction-gate` itself: since #7111 that no longer bricks session
+      creation (the presets are fail-open), but it leaves native compaction
+      ARMED while bili owns the lane — a dsh checkpoint landing outside bili's
+      knowledge destroys the compression substrate (the #1729 wire-level
+      refusal is only the backstop). To fully
      uninstall, remove `billion-context` from the profile's
      `dsh.profile.bundles` (and its dependency) and restart: the whole
      patch layer disappears and `compaction-basic` returns to stock
