@@ -111,7 +111,8 @@ test("duplicates and out-of-order block IDs keep the existing high-water behavio
     assert.deepEqual(ledger.folds.map((fold) => [fold.bid, fold.seq, fold.k]), [["b1", 1, 0], ["b5", 2, 0], ["b7", 3, null]]);
 });
 
-test("batches and individual calls produce identical complete ledgers and reports across usage samples", () => {
+test("batches and individual calls produce identical complete ledgers and reports across usage samples", (t) => {
+    t.mock.method(Date, "now", () => T0 + 10_000);
     const batched = createSession("fold-comparison");
     const separate = createSession("fold-comparison");
     for (const session of [batched, separate]) recordCacheSample(session, { at: T0, input: 10_000, cached: 9_000 });

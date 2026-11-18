@@ -24,10 +24,14 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { startRegistry } from "./registry-fixture.js";
 import { biliSpawnEnv, isolatedEnv, npmHomeEnv, npmRunSync, windowsSystemEnv } from "./crossplat.ts";
 
-const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+// fileURLToPath (not new URL().pathname): on Windows the latter yields "/D:/..."
+// with a leading slash, which path.resolve mangles into "D:\D:\..." and breaks the
+// package.json read below (CI: windows hermetic-registry e2e, #6709 PR leg).
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
     name: string;
     files: string[];

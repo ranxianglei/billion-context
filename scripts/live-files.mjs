@@ -147,6 +147,9 @@ export const LIVE_FILES = [
     // Native-zstd absence is simulated in an isolated Node child; it binds
     // no sockets and changes only that child's built-in module exports.
     "tests/content-encoding-zstd.test.ts",
+    // One Linux-only Node child reads fixture system CAs and exits within 10s;
+    // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
+    "tests/upstream-ca-default-trust.test.ts",
     // #5625: opencode V2 hook-payload pins — three rows are in-process with a
     // fake fetch sink (no sockets bound), the setup-gate row starts a listen(0)
     // probe server and spawns `node --import tsx -e` children against it

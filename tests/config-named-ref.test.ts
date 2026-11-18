@@ -81,6 +81,27 @@ test("checkNamedConfigRef: missing name fails with the sibling list (gate off)",
     assert.ok(!(err as string).includes("summary-credentials"), "auxiliary *.json.*.json sidecars are not named configs");
 });
 
+test("a CWD DIRECTORY named like a bare ref is not a config file (PR#6793 review M1)", () => {
+    // A directory in the CWD with the same name as a bare ref must not shadow
+    // named-config resolution: existsSync(dir)===true used to keep the ref a
+    // "path", and readFileSync(dir) then threw EISDIR, so the proxy booted on
+    // the DEFAULT config, silently defeating the fail-fast gate.
+    const cwdDir = path.join(process.cwd(), "dsh-test");
+    fs.mkdirSync(cwdDir, { recursive: true });
+    try {
+        assert.equal(resolveConfigFileRef("dsh-test"), path.join(configDir, "dsh-test.json"));
+        assert.equal(checkNamedConfigRef("dsh-test"), null, "real named config in configDir still passes");
+        fs.rmSync(path.join(configDir, "dsh-test.json"), { force: true });
+        try {
+            assert.ok(checkNamedConfigRef("dsh-test"), "a shadowing directory must not satisfy the gate");
+        } finally {
+            fs.writeFileSync(path.join(configDir, "dsh-test.json"), "{}");
+        }
+    } finally {
+        fs.rmdirSync(cwdDir);
+    }
+});
+
 test("checkNamedConfigRef: paths and empty refs keep historical behavior (null)", () => {
     assert.equal(checkNamedConfigRef(""), null);
     assert.equal(checkNamedConfigRef("   "), null);
