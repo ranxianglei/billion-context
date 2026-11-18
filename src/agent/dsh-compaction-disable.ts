@@ -374,7 +374,7 @@ export function hostPlaneOverrideLostWarning(entryIds: readonly string[]): strin
     return `bili: the host-plane compaction-basic override is GONE (entry ${rows}): a later patch layer replaced that row's whole config, so "auto" fell back to its default true and dsh native auto-compaction is ARMED again. Restate "auto: false" in the LAST patch row that touches id compaction-basic, or remove that override (a landed checkpoint destroys the fold base).`;
 }
 
-export type ReconcileEntry = {
+type ReconcileEntry = {
     options?: { id?: unknown; name?: unknown; config?: unknown } | undefined;
     update?: (options: { config: unknown }, create?: boolean, force?: boolean) => unknown;
 };
