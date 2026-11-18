@@ -1,4 +1,4 @@
-// Native-mode fetch interception (#519): a globalThis.fetch patch that
+﻿// Native-mode fetch interception (#519): a globalThis.fetch patch that
 // silently routes model-API requests through a bili proxy that the extension
 // itself spawned (see pi-native.ts). Verified end-to-end on pi 0.83.6: pi's
 // provider stack (pi-stable-ai → Anthropic/OpenAI SDKs) resolves its fetch
@@ -987,7 +987,13 @@ export function bodyOverWindowDetail(
     // #4111 two-tier contract unchanged: the calibrated tier is floor x 1.14 and
     // the bare floor is the provably-over tier — #7106 only changes what the
     // floor PRICES (prompt mass when the body parses, whole-body bytes otherwise).
-    const estTokens = Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO);
+    // #7106 review: apply the 1.14 calibration ONLY to the byte heuristic. A
+    // shape-priced prompt is already a token count, so multiplying it would
+    // double-calibrate and refuse at ~0.877 x window (the wrong direction for
+    // the false-refusal this issue fixes).
+    const estTokens = promptMass === undefined
+        ? Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO)
+        : floorTokens;
     if (estTokens <= window) return undefined;
     return {
         coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow,

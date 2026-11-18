@@ -100,3 +100,26 @@ test("#7106: an image-carrying prompt adds the image mass back", () => {
     assert.equal(doom, undefined, "base64 image bytes are not text prompt mass");
 });
 
+
+test("#7106 review: a shape-priced prompt below the window is NOT doomed (no double calibration)", () => {
+    // 1.0M CJK chars price at ~1.0M tokens already (direct CJK-aware count).
+    // The old code multiplied that by 1.14 and refused at ~0.877 x window,
+    // which is the false-refusal this issue is about.
+    const raw = wire({
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: "\u61C9".repeat(1_000_000) }],
+        system: "s".repeat(50_000),
+    });
+    const bytes = Buffer.byteLength(raw, "utf8");
+    assert.ok(Math.ceil((bytes / 3) * 1.14) > WINDOW, "fixture must pass the cheap early-out bound");
+    assert.equal(bodyOverWindowDetail(bytes, raw, WINDOW), undefined, "prompt mass ~1.01M sits under the 1,048,576 window");
+});
+
+test("#7106 review: a shape-priced prompt just over the window dooms, and carries no 1.14 slack", () => {
+    const raw = wire({ messages: [{ role: "user", content: "\u61C9".repeat(1_060_000) }] });
+    const doom = bodyOverWindowDetail(Buffer.byteLength(raw, "utf8"), raw, WINDOW);
+    assert.ok(doom, "1.06M prompt tokens exceed the window");
+    assert.equal(doom.promptTokens, doom.floorTokens);
+    assert.equal(doom.estTokens, doom.floorTokens, "shape-priced mass is not re-calibrated by 1.14");
+    assert.equal(doom.provablyOver, true);
+});
