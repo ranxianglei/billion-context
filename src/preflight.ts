@@ -1,4 +1,4 @@
-import {
+﻿import {
     BLOCKED_REF,
     countMessageTokens,
     defaultCountTokens,
@@ -521,6 +521,15 @@ export interface RawBodyBreakdown {
      *  fields (telemetry uploads, config scalars) sit in `other` but NOT here.
      *  0 when no promptKeys were supplied to the walk. */
     prompt: number;
+    /** #7013 follow-up: the part of `other` that is still PROMPT mass for this
+     *  wire format. google carries its prompt in `contents`/`systemInstruction`
+     *  and responses in `input`/`instructions` — none of them is an anthropic
+     *  bucket name (messages/tools/system), so those masses land in `other`
+     *  while ALSO being priced through `prompt`. The doom clause must say
+     *  "counted toward the window" for them; calling `other` wholesale
+     *  "non-prompt, excluded" contradicts the dimension that tripped the gate.
+     *  0 for anthropic/openai, where `other` really is non-prompt. */
+    otherPrompt: number;
     /** #6844: per-top-level-field token counts inside the `other` bucket,
      *  descending by tokens — the field dominating `other` is the actionable
      *  signal in a measured-doom 413 (which host-attached field carries the
@@ -536,6 +545,7 @@ export interface RawBodyBreakdown {
 export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlySet<string>): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     let prompt = 0;
+    let otherPrompt = 0;
     const otherByField = new Map<string, number>();
     const otherByFieldBytes = new Map<string, number>();
     const pending: [unknown, string | undefined, number, boolean, string | undefined][] = [];
@@ -554,7 +564,10 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
             if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
                 const t = defaultCountTokens(value);
                 buckets[bucket] += t;
-                if (isPrompt) prompt += t;
+                if (isPrompt) {
+                    prompt += t;
+                    if (bucket === 3) otherPrompt += t;
+                }
                 if (bucket === 3 && field !== undefined) {
                     otherByField.set(field, (otherByField.get(field) ?? 0) + t);
                     otherByFieldBytes.set(field, (otherByFieldBytes.get(field) ?? 0) + Buffer.byteLength(value, "utf8"));
@@ -577,6 +590,7 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
         system: buckets[2],
         other: buckets[3],
         prompt,
+        otherPrompt,
         otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens, bytes: otherByFieldBytes.get(field) ?? 0 })).sort((a, b) => b.tokens - a.tokens),
     };
 }

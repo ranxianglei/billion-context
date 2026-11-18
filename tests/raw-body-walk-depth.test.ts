@@ -82,7 +82,7 @@ test("shallow plumbing: exclusion set, key inheritance and bucket split stay int
 
 test("non-object top-level bodies land whole in the other bucket", () => {
     const bd = estimateRawBodyBreakdown("plain string body");
-    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body"), prompt: 0, otherTop: [] });
+    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body"), prompt: 0, otherPrompt: 0, otherTop: [] });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
 });
 

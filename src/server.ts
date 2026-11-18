@@ -3799,10 +3799,17 @@ interface MeasuredOutbound {
 // dominating it, so the operator sees WHICH host-attached field carries the
 // non-prompt mass without manual arithmetic (the incident's 88%-`other` body
 // took a body dump to attribute).
+// #7013 follow-up: google/responses carry their prompt in top-level fields
+// (contents / input / systemInstruction / instructions) that the anthropic
+// bucket names do not cover, so prompt mass also lands in `other`. Calling the
+// whole bucket "non-prompt, excluded" contradicts the dimension that tripped
+// the gate — split it on `otherPrompt` instead.
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
     const top = b.otherTop[0];
     const other = b.other > 0 && top
-        ? `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")} tokens ≈${top.bytes.toLocaleString("en-US")} B)`
+        ? b.otherPrompt > 0
+            ? `other ~${b.other.toLocaleString("en-US")} (prompt mass ~${b.otherPrompt.toLocaleString("en-US")} counted toward the window, ${(b.other - b.otherPrompt).toLocaleString("en-US")} excluded as non-prompt; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")} tokens ≈${top.bytes.toLocaleString("en-US")} B)`
+            : `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")} tokens ≈${top.bytes.toLocaleString("en-US")} B)`
         : `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget)`;
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · ${other}`;
 }
