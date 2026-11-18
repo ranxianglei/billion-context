@@ -288,3 +288,42 @@ test("#7169 registerCompactionDisable: runtime preset wrapper is skipped when ve
         _resetDshCompactionGateTelemetryForTest();
     }
 });
+
+test("#7169 registerCompactionDisable: a re-fired inject callback does not double-wrap register()", async () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    declareDshCompactionActive();
+    try {
+        type RegLike = { register?: (d: unknown) => unknown };
+        let injectCallback: ((sub: { agentPresets?: RegLike }) => void) | undefined;
+        registerCompactionDisable({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: readonly string[], callback: (sub: { agentPresets?: RegLike }) => void) => {
+                injectCallback = callback;
+            },
+        });
+        let calls = 0;
+        const fakeRegistry: RegLike = {
+            register: (definition: unknown) => { calls++; return Promise.resolve(definition); },
+        };
+        injectCallback!({ agentPresets: fakeRegistry });
+        const wrappedOnce = fakeRegistry.register;
+        // The host re-fires the inject callback (service re-provisioned): the
+        // guard must see the marker on the function that now sits at
+        // registry.register and skip.
+        injectCallback!({ agentPresets: fakeRegistry });
+        assert.equal(fakeRegistry.register, wrappedOnce, "second callback must skip — the marker sits on the replacement, not the original");
+
+        // The single wrapper still rewrites and forwards exactly once.
+        const out = (await fakeRegistry.register!({
+            id: "double-wrap-preset",
+            plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }],
+        })) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(out.plugins?.[0]?.disabled, true);
+        assert.equal(calls, 1);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});

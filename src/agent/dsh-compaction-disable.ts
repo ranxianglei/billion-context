@@ -263,8 +263,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             if (!registry || typeof registry.register !== "function") return;
             if ((registry.register as unknown as Record<string, unknown>).__biliCompactionDisableWrapped) return;
             const original = registry.register.bind(registry);
-            (registry.register as unknown as Record<string, unknown>).__biliCompactionDisableWrapped = true;
-            registry.register = function (definition: unknown) {
+            const wrapped = function (definition: unknown) {
                 if (
                     isDshCompactionActive() &&
                     definition !== null &&
@@ -282,6 +281,11 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
                 }
                 return original(definition);
             };
+            // Marker on the REPLACEMENT, not the original: the guard re-reads
+            // registry.register on re-entry, so a re-fired inject callback
+            // must see the marker on the function that now sits there.
+            (wrapped as unknown as Record<string, unknown>).__biliCompactionDisableWrapped = true;
+            registry.register = wrapped;
             noteRuntimePresetHookInstalled();
         });
     }
