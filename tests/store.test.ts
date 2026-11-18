@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
     buildStoredPlaceholder,
+    createContentStore,
     createCore,
     createInitialState,
     DEFAULT_CCR_CONFIG,
     defaultConfig,
     STORED_PLACEHOLDER_MARKER,
+    storeOriginal,
     type CoreMessage,
     type MessageContentStore,
 } from "acp-kernel";
@@ -17,7 +19,7 @@ import { parseCompressSettings } from "../src/config.ts";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
 import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf, snapshotPendingRetrievals, commitRetrievals, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, snapshotRetrievalNotes, renderRetrievalNotes, commitRetrievalNotes } from "../src/store.ts";
 import { RETRIEVE_TOOL_NAME } from "../src/compress-tool.ts";
-import { getSession } from "../src/session.ts";
+import { getSession, isDroppedContentStore, lazyContentStore } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -696,6 +698,178 @@ test("#1457 notes survive a restart (metadata round-trip through the session env
     } finally {
         _setStoreForTest(new SessionStore({ enabled: false }));
     }
+});
+
+// --- #7223: unchanged-store adoption fast path ------------------------------
+// The kernel's store path is immutable (storeOriginal returns the input
+// unchanged when it adds nothing), so a processTurn that hands back the EXACT
+// resident store object proves the turn added no refs — the adoption must
+// cost zero enumeration. The still-folded lazy proxy is the one exception:
+// adopting it is what pays the re-materialization (or the warn+throw on lost
+// backing), and those behaviors must survive.
+
+/** n seeded refs starting at m<start>; deterministic content per ref. */
+function seedStore(n: number, start: number): MessageContentStore {
+    let st = createContentStore();
+    for (let i = start; i < start + n; i++) {
+        st = storeOriginal(st, {
+            ref: `m${String(i).padStart(5, "0")}`,
+            rawId: `seed-${i}`,
+            text: `seeded original ${i} ` + "x".repeat(64),
+            kind: "shell output",
+            tokens: 10,
+            head: `seeded original ${i}`,
+        });
+    }
+    return st;
+}
+
+/** Wrap byRef in a counting proxy: ownKeys/getOwnPropertyDescriptor are what
+ *  Object.keys/Object.entries pay — a fast-path adoption must register zero. */
+function observeStore(store: MessageContentStore): { store: MessageContentStore; count: () => number; reset: () => void } {
+    let touches = 0;
+    const byRef = new Proxy(store.byRef, {
+        ownKeys(t) { touches++; return Reflect.ownKeys(t); },
+        getOwnPropertyDescriptor(t, p) { touches++; return Reflect.getOwnPropertyDescriptor(t, p); },
+    });
+    return { store: { ...store, byRef }, count: () => touches, reset: () => { touches = 0; } };
+}
+
+const PLAIN_TURN: CoreMessage[] = [{ id: "u", role: "user", contentType: "text", text: "Continue." }];
+
+function noGrowthTurn(store: MessageContentStore) {
+    return createCore().processTurn({ messages: PLAIN_TURN, state: createInitialState(), config: ccrConfig(), tokenCount: 1, contentStore: store, renderTags: "none" });
+}
+
+test("#7223: a no-growth turn returning the resident store is adopted with zero enumeration", () => {
+    const session = getSession(`t-7223-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const observed = observeStore(seedStore(100, 6001));
+    session.contentStore = observed.store;
+    session.contentStoreDirty = false;
+    const before = { storedBytes: session.stats.storedBytes, saved: session.stats.storeBytesSaved };
+
+    const turn = noGrowthTurn(observed.store);
+    assert.equal(turn.contentStore, observed.store, "kernel preserves the store object when it adds no originals");
+    observed.reset();
+    adoptContentStore(session, turn.contentStore);
+
+    assert.equal(observed.count(), 0, "fast path must not enumerate the accumulated refs");
+    assert.equal(session.contentStore, observed.store);
+    assert.equal(session.contentStoreDirty, false, "no-growth adoption does not dirty");
+    assert.equal(session.stats.storedBytes, before.storedBytes, "no-growth adoption does not touch stats");
+    assert.equal(session.stats.storeBytesSaved, before.saved);
+});
+
+test("#7223: the fast path holds at scale — 2000 stored refs, zero enumeration on the real processTurn/adopt path", () => {
+    const session = getSession(`t-7223-scale-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const observed = observeStore(seedStore(2000, 7001));
+    session.contentStore = observed.store;
+    const turn = noGrowthTurn(observed.store);
+    assert.equal(turn.contentStore, observed.store);
+    observed.reset();
+    adoptContentStore(session, turn.contentStore);
+    assert.equal(observed.count(), 0, "a 2000-ref store costs zero enumeration on a no-growth turn");
+});
+
+test("#7223: first adoption and real growth still diff, dirty and serve exact retrievals", () => {
+    const session = getSession(`t-7223-grow-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+
+    // First adoption: prev undefined → full path.
+    const seeded = seedStore(50, 8001);
+    adoptContentStore(session, seeded);
+    assert.equal(session.contentStoreDirty, true);
+    assert.equal(Object.keys(session.contentStore!.byRef).length, 50);
+    const bytesAfterFirst = session.stats.storedBytes!;
+    assert.ok(bytesAfterFirst > 0);
+
+    // Growth: a fresh oversized tool result (refs start at m00001 — no
+    // collision with the m08001+ seed).
+    const turn = turnWith(ccrConfig(), session.contentStore);
+    assert.notEqual(turn.contentStore, session.contentStore, "growth returns a new store object");
+    adoptContentStore(session, turn.contentStore);
+    assert.equal(session.contentStoreDirty, true);
+    assert.ok(Object.keys(session.contentStore!.byRef).length > 50, "new ref adopted");
+    assert.ok(session.stats.storedBytes! > bytesAfterFirst, "stats moved only on growth");
+
+    // Retrieval is exact for the grown ref.
+    const ref = Object.entries(session.contentStore!.byRef).find(([, e]) => e.rawId === "t-res")![0];
+    const out = executeRetrieve({ ref }, session).text;
+    assert.match(out, new RegExp(`acp-retrieved #${ref}`));
+    assert.ok(out.includes(BIG_TEXT.slice(0, 80)), "the grown original is retrievable byte-exact");
+});
+
+test("#7223: an equal-but-different envelope takes the diff path (no false fast path)", () => {
+    const session = getSession(`t-7223-twin-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const seeded = seedStore(40, 9001);
+    adoptContentStore(session, seeded);
+    session.contentStoreDirty = false;
+
+    const twin = seedStore(40, 9001);
+    assert.notEqual(twin, seeded, "rebuild is a different object");
+    assert.deepEqual(twin.byRef, seeded.byRef, "…with identical content");
+    const observed = observeStore(twin);
+    adoptContentStore(session, observed.store);
+
+    assert.equal(session.contentStore, observed.store, "incoming envelope adopted");
+    assert.ok(observed.count() > 0, "different identity must be diffed, not fast-pathed");
+    assert.equal(session.contentStoreDirty, false, "no new refs → no dirtying");
+});
+
+test("#7223: a no-growth identity adopt leaves an already-dirty store dirty", () => {
+    const session = getSession(`t-7223-dirty-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const observed = observeStore(seedStore(60, 10001));
+    session.contentStore = observed.store;
+    session.contentStoreDirty = true; // unsaved growth pending its own save
+    const turn = noGrowthTurn(observed.store);
+    assert.equal(turn.contentStore, observed.store);
+    adoptContentStore(session, turn.contentStore);
+    assert.equal(session.contentStoreDirty, true, "fast path must not clear a pending dirty flag");
+});
+
+test("#7223: a folded lazy proxy keeps the materialization path; once materialized it fast-paths", () => {
+    const session = getSession(`t-7223-lazy-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const seeded = seedStore(25, 11001);
+    let loads = 0;
+    const proxy = lazyContentStore(session.id, () => { loads++; return seeded; });
+    assert.ok(isDroppedContentStore(proxy), "starts folded");
+    session.contentStore = proxy;
+    session.contentStoreDirty = false;
+
+    const turn = noGrowthTurn(proxy);
+    assert.equal(turn.contentStore, proxy, "no-growth turn returns the same unmaterialized proxy");
+    assert.ok(isDroppedContentStore(proxy), "still folded before adoption");
+
+    adoptContentStore(session, turn.contentStore);
+    assert.equal(loads, 1, "adoption materializes the proxy exactly once");
+    assert.ok(!isDroppedContentStore(proxy), "materialized after adoption");
+    assert.equal(Object.keys(session.contentStore!.byRef).length, 25, "full set visible");
+    assert.equal(session.contentStoreDirty, false, "materialization is not growth — no dirtying");
+
+    const turn2 = noGrowthTurn(session.contentStore);
+    assert.equal(turn2.contentStore, session.contentStore);
+    adoptContentStore(session, turn2.contentStore);
+    assert.equal(loads, 1, "a materialized proxy fast-paths — no further loads");
+});
+
+test("#7223: a folded lazy proxy with lost backing still warns and throws on adoption", () => {
+    const session = getSession(`t-7223-lost-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const proxy = lazyContentStore(session.id, () => null);
+    assert.ok(isDroppedContentStore(proxy));
+    session.contentStore = proxy;
+    const turn = noGrowthTurn(proxy);
+    assert.equal(turn.contentStore, proxy);
+    assert.throws(
+        () => adoptContentStore(session, turn.contentStore),
+        /could not be re-materialized from the store/,
+        "lost backing must still throw through adoption (warn first, then throw)",
+    );
 });
 
 function findEnvelope(root: string): string | null {
