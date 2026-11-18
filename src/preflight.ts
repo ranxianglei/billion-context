@@ -502,6 +502,20 @@ export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
     responses: new Set(["input", "instructions", "tools"]),
 };
 
+// #7090: which DISPLAY bucket each wire-format's prompt key lands in — so the
+// breakdown's named buckets (messages/tools/system) align with the prompt mass
+// on EVERY lane, not just openai/anthropic. Without this, the responses lane's
+// `input` (the main prompt content) and the google lane's `contents` /
+// `systemInstruction` fall into the `other` catch-all, and the 413 clause's
+// "non-prompt, excluded" note would mislabel prompt mass as non-prompt. The
+// gate already prices `prompt` correctly (PROMPT_BODY_KEYS); this only fixes
+// the diagnostic split so `other` truly holds non-prompt mass on every lane.
+const PROMPT_KEY_BUCKET: Record<string, number> = {
+    messages: 0, contents: 0, input: 0,
+    tools: 1,
+    system: 2, systemInstruction: 2, instructions: 2,
+};
+
 /** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
  *  must say whether it is messages[] (a giant paste / tool result), tools[]
  *  (84 schemas in #5000), the system prompt, or structural other — "trim the
@@ -509,7 +523,12 @@ export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
  *  equals estimateRawBodyTokens(parsed) exactly. #7013: `prompt` is the mass
- *  under the wire-format's prompt keys — what the window-fit gates price. */
+ *  under the wire-format's prompt keys — what the window-fit gates price.
+ *  #7090: with promptKeys supplied, the named buckets (messages/tools/system)
+ *  hold the prompt mass on every lane (responses `input`→messages, google
+ *  `contents`→messages / `systemInstruction`→system), and `other` holds only
+ *  non-prompt mass — so `prompt === messages + tools + system` and
+ *  `prompt + other === total`. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
@@ -541,8 +560,14 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
     const pending: [unknown, string | undefined, number, boolean, string | undefined][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            // #7090: with promptKeys, the prompt keys land in their named display
+            // bucket (PROMPT_KEY_BUCKET) and everything else in `other` — so the
+            // named buckets align with the prompt mass on every lane. Without
+            // promptKeys (legacy/test callers) the openai/anthropic split stands.
             const isPrompt = promptKeys ? promptKeys.has(k) : false;
+            const bucket = promptKeys
+                ? (isPrompt ? (PROMPT_KEY_BUCKET[k] ?? 3) : 3)
+                : (k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3);
             pending.push([v, k, bucket, isPrompt, bucket === 3 ? k : undefined]);
         }
     } else {

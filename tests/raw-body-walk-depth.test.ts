@@ -203,11 +203,11 @@ test("#7013: google prompt mass = contents + systemInstruction + tools", () => {
         dsh_session_log: "big telemetry blob",
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.google);
-    // google's prompt keys (contents/systemInstruction) land in the `other`
-    // bucket (the split is on the openai/anthropic key names), so assert the
-    // prompt mass against the direct leaf count, not the bucket sum.
+    // #7090: google's prompt keys land in their named buckets (contents→messages,
+    // systemInstruction→system), so the prompt mass equals the named-bucket sum.
     const expectedPrompt = t("user") + t("hello") + t("google system") + t("n") + t("d");
     assert.equal(bd.prompt, expectedPrompt);
+    assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, "prompt mass = named buckets on the google lane");
     assert.ok(bd.other > 0 && bd.total > bd.prompt, "dsh_session_log is non-prompt mass");
 });
 
@@ -221,7 +221,50 @@ test("#7013: responses prompt mass = input + instructions + tools", () => {
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.responses);
     const expectedPrompt = t("user") + t("hello") + t("responses instructions") + t("n") + t("d");
     assert.equal(bd.prompt, expectedPrompt);
+    assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, "prompt mass = named buckets on the responses lane");
     assert.ok(bd.other > 0 && bd.total > bd.prompt, "dsh_session_log is non-prompt mass");
+});
+
+// #7090: the responses lane's `input` (the main prompt content) must land in a
+// NAMED bucket, not the `other` catch-all — otherwise the 413 clause's
+// "non-prompt, excluded" note mislabels prompt mass as non-prompt. Same for
+// google's `contents` / `systemInstruction`. This is the display-side half of
+// the #7013 fix: the gate already prices `prompt` correctly; this keeps the
+// diagnostic split honest on every lane.
+
+test("#7090: responses `input` lands in the messages bucket, not other", () => {
+    const input = "I".repeat(100_000);
+    const body = {
+        model: "gpt",
+        input: [{ role: "user", content: input }],
+        tools: [{ name: "n", description: "d" }],
+        stream: true,
+        prompt_cache_key: "k",
+    };
+    const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.responses);
+    assert.equal(bd.messages, t("user") + t(input), "input mass is in the messages bucket");
+    assert.equal(bd.tools, t("n") + t("d"));
+    assert.equal(bd.system, 0);
+    // Non-prompt keys (model/stream/prompt_cache_key) are the only `other` mass.
+    assert.equal(bd.other, t("gpt") + t("k"));
+    assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, "prompt = named buckets");
+    assert.equal(bd.prompt + bd.other, bd.total, "prompt + other = total");
+    assert.ok(!bd.otherTop.some((e) => e.field === "input"), "input must NOT appear in the other-field attribution");
+});
+
+test("#7090: the prompt/named-bucket invariant holds on every lane", () => {
+    const lanes: Array<[string, Record<string, unknown>, ReadonlySet<string>]> = [
+        ["openai", { messages: [{ role: "user", content: "m" }], tools: [{ name: "n" }], model: "x" }, PROMPT_BODY_KEYS.openai],
+        ["anthropic", { messages: [{ role: "user", content: "m" }], tools: [{ name: "n" }], system: "s", dsh_session_log: "t" }, PROMPT_BODY_KEYS.anthropic],
+        ["google", { contents: [{ role: "user", parts: [{ text: "m" }] }], systemInstruction: "s", tools: [{ name: "n" }], dsh_session_log: "t" }, PROMPT_BODY_KEYS.google],
+        ["responses", { input: [{ role: "user", content: "m" }], instructions: "s", tools: [{ name: "n" }], dsh_session_log: "t" }, PROMPT_BODY_KEYS.responses],
+    ];
+    for (const [name, body, keys] of lanes) {
+        const bd = estimateRawBodyBreakdown(body, keys);
+        assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, `${name}: prompt = named buckets`);
+        assert.equal(bd.prompt + bd.other, bd.total, `${name}: prompt + other = total`);
+        assert.equal(bd.total, estimateRawBodyTokens(body), `${name}: total invariant holds`);
+    }
 });
 
 test("#7013: a giant dsh_session_log upload does not inflate the prompt mass", () => {
