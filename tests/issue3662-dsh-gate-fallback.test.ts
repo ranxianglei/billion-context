@@ -140,9 +140,8 @@ test("#3662: both patch carriers mount the gate entry alongside bili-native", ()
     try {
         const bundle = fs.readFileSync(path.join(TESTS_DIR, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
         assert.ok(bundle.includes(GATE_INSERT), "bundle patch must insert the always-on gate entry after bili-native");
-        for (const id of ["preset-standard", "preset-ptc", "preset-minimal", "preset-cordis"]) {
-            assert.ok(bundle.includes(`- id: ${id}\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`));
-        }
+        assert.ok(!bundle.includes(`inject: [${BILI_COMPACTION_DISABLE_SERVICE}]`),
+            "the bundle patch must not gate the presets on the gate service (#7111)");
         // launcher overlay, bare lane (shim resolves the subpath export)
         const file = writeDshAcpPatch(home, "billion-context");
         assert.ok(file, "writeDshAcpPatch must produce the overlay file");
@@ -153,7 +152,8 @@ test("#3662: both patch carriers mount the gate entry alongside bili-native", ()
         assert.ok(file2);
         const overlay2 = fs.readFileSync(file2, "utf8").replaceAll("\r\n", "\n");
         assert.match(overlay2, /^ {4}- id: bili-compaction-gate\n {6}name: file:\/\/.+dsh-compaction-gate\.js$/m);
-        assert.ok(overlay2.includes(`- id: preset-standard\n  inject: [${BILI_COMPACTION_DISABLE_SERVICE}]\n`));
+        assert.ok(!overlay2.includes(`inject: [${BILI_COMPACTION_DISABLE_SERVICE}]`),
+            "the URL-lane overlay must not gate the presets either (#7111)");
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
         fs.rmSync(`${home}-bili`, { recursive: true, force: true });
