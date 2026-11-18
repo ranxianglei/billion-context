@@ -124,9 +124,9 @@ test("#3662: normal boot (verdict active) — the gate entry disables the compac
         // they nest no compaction rows — a custom preset nesting them is
         // rewritten (structural match), unrelated config keeps identity.
         const otherCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
-        assert.equal(mw.call({ entry: { options: { name: "something-else" } } }, null, () => otherCfg), otherCfg);
+        assert.equal(mw.call(null, { entry: { options: { name: "something-else" } } }, () => otherCfg), otherCfg);
         const customCfg: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        const customOut = mw.call({ entry: { options: { name: "preset-general" } } }, null, () => customCfg) as { plugins?: Array<Record<string, unknown>> };
+        const customOut = mw.call(null, { entry: { options: { name: "preset-general" } } }, () => customCfg) as { plugins?: Array<Record<string, unknown>> };
         assert.equal(customOut.plugins?.[0]?.disabled, true);
     } finally {
         _resetDshCompactionVerdictForTest();
