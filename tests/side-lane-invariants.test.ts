@@ -16,6 +16,8 @@ import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts"
 import { _resetSessionsForTest, listSessions, SPLIT_CANARY_FRESH_MS, splitSessionWarnings, type Session } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { outputBudgetField as budgetFieldFromBudget, readOutputBudget as readFromBudget, writeOutputBudget as writeFromBudget } from "../src/server/budget.ts";
+import { outputBudgetField as budgetFieldFromSide, readOutputBudget as readFromSide, writeOutputBudget as writeFromSide } from "../src/server/side-request.ts";
 
 // #2170 measure 2: behavioral invariants of the #388 side lane, on the dsh
 // plugin wire (the host whose regression started this — #2156/#2157/#2164).
@@ -329,6 +331,17 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
     }
 });
 
+// (#6752 / #1440 P2 cut 2): the output-budget field plumbing moved out of the
+// side-lane engine into budget.ts so the prepare modules can use it without
+// reaching into side-request.js. side-request.ts re-exports it for the existing
+// importers — pin the identity so the re-export and the definition can never
+// silently diverge (a broken re-export would break every importer in one step).
+test("(F2) output-budget plumbing re-export identity (#6752 / #1440 P2 cut 2)", () => {
+    assert.equal(budgetFieldFromSide, budgetFieldFromBudget, "outputBudgetField re-export is identity");
+    assert.equal(readFromSide, readFromBudget, "readOutputBudget re-export is identity");
+    assert.equal(writeFromSide, writeFromBudget, "writeOutputBudget re-export is identity");
+});
+
 // (#1440 P2 cut 3): the extracted pipeline module OWNS the mid-pipeline lane
 // gates, so it legitimately imports side-request.js — unlike (F)'s modules.
 // What must not move or appear: the engine's internals (threshold constants,
@@ -367,7 +380,7 @@ test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isAudioOutputCall", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isResponsesServerToolSingleShot", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "hasSingleShotBudget", "isAudioOutputCall", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isMcodeOneShotAuxRequest", "isMcodeTitleRequest", "isOpencodeTitleRequest", "isResponsesServerToolSingleShot", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
