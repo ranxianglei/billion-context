@@ -19,9 +19,11 @@
  *   project .npmrc → user ~/.npmrc → global $XDG_CONFIG_HOME/pnpm/config.yaml
  *   → global $PREFIX/etc/npmrc.
  * Excludes travel with the source that defined them. A null/empty value in a
- * file (e.g. `minimumReleaseAge:` with nothing after) is "not provided" and
- * does not shadow a positive value in a lower-precedence source; only an
- * explicit number (0 = policy off) wins.
+ * file (e.g. `minimumReleaseAge:` with nothing after, or a bare
+ * `minimumReleaseAgeExclude:` with no list) is "not provided" and does not
+ * shadow a value in a lower-precedence source; only an explicit value wins —
+ * a number for the age (0 = policy off), or a list for the excludes (an
+ * explicit empty list `[]` IS provided: it clears the excludes).
  *
  * Publish time comes from the registry packument's `time` map — the same
  * field pnpm's resolver reads (the tarball's Last-Modified is NOT reliable:
@@ -254,7 +256,8 @@ function parseYamlPolicyKeys(text: string): { minAgeRaw?: string; excludeRaw?: s
             if (out.excludeRaw !== undefined) { out.error = "duplicate minimumReleaseAgeExclude key"; return out; }
             const v = stripInlineComment(rest).trim();
             if (v === "" || v === "~" || v.toLowerCase() === "null") {
-                // block list follows (or the value was null = no excludes)
+                // a block list may follow; if none does, the value is null =
+                // "not provided" (must not shadow a lower-precedence list)
                 const items: string[] = [];
                 let sawItem = false;
                 while (i < lines.length) {
@@ -268,7 +271,7 @@ function parseYamlPolicyKeys(text: string): { minAgeRaw?: string; excludeRaw?: s
                     sawItem = true;
                     items.push(stripQuotes(stripInlineComment(item[1]).trim()));
                 }
-                out.excludeRaw = sawItem ? items.join(",") : "";
+                if (sawItem) out.excludeRaw = items.join(",");
             } else if (v.startsWith("[")) {
                 if (!v.endsWith("]")) { out.error = "multi-line flow list for minimumReleaseAgeExclude is not supported"; return out; }
                 const items = v.slice(1, -1).split(",").map((s) => stripQuotes(stripInlineComment(s).trim())).filter((s) => s !== "");
