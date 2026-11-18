@@ -220,6 +220,13 @@
 | `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
 | `BILI_DSH_MAX_TESTED_VERSION` | dsh native lane「高于已测最高版」启动提示的上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读运行中的构建，**严格高于**上限才弹一条启动提示，建议先回滚；默认 0.2.0-rc.2（CI e2e 锚点），新版本验证通过后抬高；空串 = 关闭检查；只提示不拦截 |
 
+### 2.10 原生车道看门狗（#4006）
+
+| 变量 | 一句话用途 |
+|------|-----------|
+| `BILI_WATCHDOG_INTERVAL_MS` | watchdog.intervalMs，默认 30000——每会话原生车道（zcode/claude/kimi MCP entry）proxy 重生看门狗的健康探针间隔；低于 1000 回退默认（秒/毫秒笔误防护）；最坏恢复窗口 = interval × failureLimit（默认约 90 秒，#4006 实测 64 秒） |
+| `BILI_WATCHDOG_FAILURE_LIMIT` | watchdog.failureLimit，默认 3——连续探测失败多少次后车道看门狗重生 proxy |
+
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 
 以下共享 `BILI_` 前缀但是代码常量/工具表/错误码，不是环境变量，不在 CI 检查范围：
