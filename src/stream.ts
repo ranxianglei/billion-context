@@ -1310,20 +1310,26 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (offending.length > 0) {
             const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
-            // #6728: charge the ledger (see the nudge gate above). The
-            // spec-repeat guard text recordCompressFailure returns is dropped
-            // on purpose (one counter, stated once — the collapse below says
-            // it); only the ledger charge matters here.
+            // #6728: charge the SPEC-REPEAT ledger (recordCompressFailure) so
+            // the repeat-collapse below fires on identical re-submission.
+            // #7197: do NOT charge the session-level breaker
+            // (noteCompressLoopFailure) — the scope gate is a range-correctness
+            // gate ("your span was wrong"), not a fold-feasibility signal; its
+            // recovery (acp_status → an in-recommendation retry) is always
+            // available and succeeds if followed, so arming the breaker (which
+            // orders "do not try other ranges … do not poll acp_status") would
+            // forbid the only recovery the code still allows. The nudge gate
+            // above keeps the breaker charge (its recovery is "wait for a
+            // nudge" — the model cannot self-recover).
             const specKey = normalizedSpecKey(ranges);
             recordCompressFailure(ctx.session, specKey);
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey) : "";
             const occurrences = compressFailOccurrencesOf(ctx.session, specKey);
             if (trackLoop && occurrences >= 2) {
                 ctx.log(
                     `[acp-proxy: out-of-recommendation receipt collapsed to one-liner (attempt ${occurrences})]`,
                 );
                 return compressResult(
-                    `[Compression REFUSED again — span(s) ${listed} have now been refused ${occurrences} time(s) the same way (compress.requireRecommendation); nothing was compressed. The full refusal and the current compressible ranges are in the FIRST refused receipt above — do not re-send this call verbatim.${loopGuard}]`,
+                    `[Compression REFUSED again — span(s) ${listed} have now been refused ${occurrences} time(s) the same way (compress.requireRecommendation); nothing was compressed. The full refusal and the current compressible ranges are in the FIRST refused receipt above — do not re-send this call verbatim.`,
                     "refused",
                     0,
                     "out-of-recommendation",
@@ -1339,7 +1345,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const advice = recommendedEmpty
                 ? " No compressible ranges remain — the context is already at its minimum; continue the task without compressing. Compression happens again only when there is genuinely new content to fold."
                 : " Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.";
-            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding.${advice}${loopGuard}]`, "refused", 0, "out-of-recommendation");
+            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding.${advice}]`, "refused", 0, "out-of-recommendation");
         }
     }
     if (ctx.messages.length > 0) {
