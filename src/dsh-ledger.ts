@@ -437,7 +437,7 @@ function patchFlatEntries(lines: string[], spec: string, version: string): PnpmP
 }
 
 /** Options for the store-section sync in patchPnpmLock (#7125). */
-export interface PnpmLockPatchOpts {
+interface PnpmLockPatchOpts {
     /** The NEW version's SRI integrity (from the registry doc). Required when
      *  a store entry must be created and its source carries an integrity —
      *  the source's hash is NEVER carried to the new key. Absent → the patch
