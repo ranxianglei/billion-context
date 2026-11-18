@@ -230,6 +230,24 @@ the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
 
+**DSH Go host (third-party Android app):** the app
+(`ccch1mneyyy/dsh-Go`) ships its own dsh runtime — dsh `0.2.2-rc.1` on node
+24.22.1 / Ubuntu 24.04.5 inside a proot rootfs, ~135 patched dsh files per app
+build. The profile lane above works unchanged: run `dsh plugin --profile <name>
+add billion-context` inside its Linux environment; the engine mounts the bundle
+and spawns the proxy as its own child. Verified on a Redmi K80 / Android 16 /
+arm64-v8a — the first conversation went through the proxy (`[window]
+source=plugin`, `effective window 1048576 -> 792576 (reserved 256000)`,
+`forward POST → api.deepseek.com/anthropic/v1/messages`), and
+`GET /__bili/plugin/status` reported `contextTokens` from usage. That host's
+client is native, so a bundle shipping only `dsh.client.platform: web` (this
+one's Context tab and settings page) has no surface to render into — the
+host-side lane, the tools and the HTTP panel are unaffected, and native
+surfaces are opted into separately through `dshGo` slots (dsh-Go,
+`docs/plugins/native-for-free.md`). It also defines
+`preset-dsh-go-companion` and `preset-dsh-go-companion-full`, whose nested
+`compaction-basic` rows the #4147 structural walk is expected to cover.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
