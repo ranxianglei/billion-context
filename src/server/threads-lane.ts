@@ -147,6 +147,18 @@ export function isThreadsBody(parsed: unknown): boolean {
     return type === "create" || type === "continue";
 }
 
+/** The message-threads token of an `anthropic-beta` header, when bili should decline it:
+ *  the body is a threads turn of a Claude Code session bili compresses (its bili MCP tools
+ *  are on the wire, or its MCP server registered the session). A continue carries only the
+ *  new messages, so bili could neither nudge nor fold it (#2701). Claude Code answers the
+ *  unknown-beta 400 by dropping the header and threading for the session and retrying with
+ *  the full history. */
+export function threadsBetaToDecline(parsed: unknown, betaHeader: string | string[] | undefined, biliToolsDeclared: boolean): string | undefined {
+    if (!biliToolsDeclared || !isThreadsBody(parsed)) return undefined;
+    const raw = Array.isArray(betaHeader) ? betaHeader.join(",") : betaHeader ?? "";
+    return raw.split(",").map((s) => s.trim()).find((s) => s.startsWith("message-threads-"));
+}
+
 function serializeEntry(entry: ThreadsMirrorEntry): { ok: true; value: ThreadsMirrorEntry } | { ok: false; bytes: number } {
     const bytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
     if (bytes > ENTRY_BYTE_LIMIT) return { ok: false, bytes };
