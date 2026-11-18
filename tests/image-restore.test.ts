@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
@@ -14,6 +14,7 @@ import {
     type RestorableImage,
 } from "../src/image-restore.ts";
 import { resolveDecompress, type ProxyToolCtx } from "../src/decompress-shared.ts";
+import { imagePlaceholdersForSummary } from "../src/image-note.ts";
 import type { WireProtocol } from "../src/util.js";
 
 // Isolate stateDir() (hence restoreExportDir()) under a throwaway dir before any
@@ -24,6 +25,13 @@ process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "bili-img-restore-"));
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 const pngImg: RestorableImage = { mediaType: "image/png", b64: PNG, bytes: Buffer.byteLength(PNG, "base64") };
 const dataUrl = `data:image/png;base64,${PNG}`;
+
+const RED_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4AWP8z8DwnwEImBigAAAfFwICgH3ifwAAAABJRU5ErkJggg==";
+const BLUE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAE0lEQVR4AWNkYPj/nwEImBigAAAdGQICxBbJ1AAAAABJRU5ErkJggg==";
+
+function responseImage(b64: string) {
+    return { type: "input_image", image_url: `data:image/png;base64,${b64}` };
+}
 
 // Each wire converter has a distinct concrete signature; the test drives them
 // uniformly on already-shaped bodies, so they are widened at the single call
@@ -191,6 +199,22 @@ test("writeRestoredImage: a rebase that restarts refs never restores the previou
     assert.equal(writeRestoredImage("m00001", 0, pngImg, "sess-rebase"), gen1);
 });
 
+for (const length of [0, 8]) {
+    test(`image index repairs an incomplete ${length}-byte spill when the original is resent`, () => {
+        const body = { model: "gpt", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] };
+        const sessionId = `sess-incomplete-${length}`;
+        const original = buildIndex("openai", body, false, sessionId);
+        const file = [...original.values()][0][0].path;
+        writeFileSync(file, Buffer.from(PNG, "base64").subarray(0, length));
+        const repaired = buildIndex("openai", body, false, sessionId);
+        assert.equal([...repaired.values()][0][0].path, file, "stable refs retain the same spill path");
+        assert.deepEqual(readFileSync(file), Buffer.from(PNG, "base64"), "resending the original must recover a partial write");
+        const mtime = statSync(file).mtimeMs;
+        buildIndex("openai", body, false, sessionId);
+        assert.equal(statSync(file).mtimeMs, mtime, "complete files retain the skip-write fast path");
+    });
+}
+
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {
     const p = writeRestoredImage("m00042", 0, pngImg, "sess-A")!;
     const idx = new Map<string, IndexedImage[]>([["m00042", [{ mediaType: "image/png", bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: p }]]]);
@@ -299,4 +323,84 @@ test("buildIncomingImageIndex: end-to-end nested tool_result recovery (anthropic
     assert.match(ref, /^m\d+$/);
     assert.ok(existsSync(imgs[0].path), "nested image spilled at index time");
     assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "nested pixels round-trip");
+});
+
+test("buildIncomingImageIndex: Gemini $ref image notes resolve to their inline pixels", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+        parts: [{ inlineData: { mimeType: "image/png", displayName: "capture.png", data: PNG } }],
+    } }] }] };
+    const original = JSON.stringify(body);
+    const message = googleToCore(body).msgs[0];
+    const index = buildIndex("google", body);
+    assert.equal(index.size, 1);
+    const [ref, images] = [...index.entries()][0];
+    assert.deepEqual(imagePlaceholdersForSummary(message, ref), [`[image: png 1x1 · ${ref}]`]);
+    assert.match(resolveDecompress({ imageRef: ref }, ctxWith(index)).text, /Restored 1 image\(s\)/);
+    assert.deepEqual(readFileSync(images[0].path), Buffer.from(PNG, "base64"));
+    assert.equal(JSON.stringify(body), original, "indexing preserves the complete wire response");
+});
+
+test("buildIncomingImageIndex: a Gemini $ref without inline bytes adds no image", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+    } }] }] };
+    const message = googleToCore(body).msgs[0];
+    assert.deepEqual(messageImageBytes(message), []);
+    assert.deepEqual(imagePlaceholdersForSummary(message, "m00001"), []);
+    assert.equal(buildIndex("google", body).size, 0);
+});
+
+test("Responses split image refs restore only their own pixels", () => {
+    const index = buildIndex("responses", { model: "gpt", input: [{ type: "message", role: "user", content: [
+        { type: "input_text", text: "Compare these two screenshots." }, responseImage(RED_PNG), responseImage(BLUE_PNG),
+    ] }] }, false, "responses-split-own-image");
+    const entries = [...index.entries()];
+    assert.equal(entries.length, 2);
+    assert.deepEqual(entries.map(([, images]) => images.map(image => readFileSync(image.path).toString("base64"))), [[RED_PNG], [BLUE_PNG]]);
+    const [blueRef, blueImages] = entries[1];
+    const receipt = resolveDecompress({ imageRef: blueRef }, ctxWith(index));
+    assert.equal(receipt.outcome, "success");
+    assert.match(receipt.text, /Restored 1 image\(s\)/);
+    assert.ok(receipt.text.includes(blueImages[0].path));
+    assert.ok(!receipt.text.includes(entries[0][1][0].path), "retrieving the second image must not return its sibling");
+});
+
+test("Responses remote image refs do not borrow a carried sibling image", () => {
+    const body = { model: "gpt", input: [{ type: "message", role: "user", content: [
+        { type: "input_image", image_url: "https://example.invalid/remote.png" }, responseImage(BLUE_PNG),
+    ] }] };
+    const index = buildIndex("responses", body, false, "responses-remote-own-image");
+    assert.deepEqual([...index.keys()], ["m00002"], "the remote-only ref has no carried pixels");
+    assert.deepEqual(readFileSync(index.get("m00002")![0].path), Buffer.from(BLUE_PNG, "base64"));
+    assert.equal(resolveDecompress({ imageRef: "m00001" }, ctxWith(index)).outcome, "failure");
+});
+
+test("Responses repeated identical images remain distinct one-image occurrences", () => {
+    const index = buildIndex("responses", { model: "gpt", input: [{ type: "message", role: "user", content: [responseImage(RED_PNG), responseImage(RED_PNG)] }] }, false, "responses-repeated-own-image");
+    const images = [...index.values()];
+    assert.deepEqual(images.map(value => value.length), [1, 1]);
+    assert.notEqual(images[0][0].path, images[1][0].path);
+    for (const value of images) assert.deepEqual(readFileSync(value[0].path), Buffer.from(RED_PNG, "base64"));
+});
+
+test("Responses image recovery creates one spill per split image, not a carrier cross-product", () => {
+    const content = Array.from({ length: 20 }, (_, i) => responseImage(i % 2 === 0 ? RED_PNG : BLUE_PNG));
+    const index = buildIndex("responses", { model: "gpt", input: [{ type: "message", role: "user", content }] }, false, "responses-twenty-own-images");
+    assert.equal(index.size, 20);
+    const files = [...index.values()].flatMap(images => images.map(image => image.path));
+    assert.equal(files.length, 20);
+    assert.equal(new Set(files).size, 20);
+    assert.equal(files.reduce((total, file) => total + statSync(file).size, 0), 20 * Buffer.byteLength(RED_PNG, "base64"));
+});
+
+test("Responses unsplit carriers keep all images, including tool-result carriers", () => {
+    for (const [label, item] of [
+        ["unknown-part", { type: "message", role: "user", content: [{ type: "input_text", text: "keep opaque carrier" }, { type: "future_part", payload: "opaque" }, responseImage(RED_PNG), responseImage(BLUE_PNG)] }],
+        ["tool-output", { type: "function_call_output", call_id: "tool-images", output: [responseImage(RED_PNG), responseImage(BLUE_PNG)] }],
+    ] as const) {
+        const index = buildIndex("responses", { model: "gpt", input: [item] }, false, `responses-unsplit-${label}`);
+        assert.equal(index.size, 1, label);
+        assert.deepEqual([...index.values()][0].map(image => readFileSync(image.path).toString("base64")), [RED_PNG, BLUE_PNG], label);
+    }
 });

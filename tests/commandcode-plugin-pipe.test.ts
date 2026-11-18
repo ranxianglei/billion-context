@@ -157,16 +157,25 @@ test("stream-error emitters: commandcode branches speak bare JSONL", () => {
     assert.match(aOut, /"type":"error"/);
     assert.match(aOut, /boom/);
     assert.ok(!aOut.includes("data:"), "no SSE framing on the JSONL wire");
+    assert.ok(!aOut.includes("\n\n"), "error record ends with exactly one newline");
+    assert.ok(aOut.endsWith("}\n"), "bare JSONL record terminator");
 
     const b = makeCollector();
     emitUpstreamTruncation(b.res, "commandcode", false, undefined);
-    assert.match(b.out(), /"type"/, "truncation event is a JSONL line");
+    const bOut = b.out();
+    assert.match(bOut, /"type"/, "truncation event is a JSONL line");
+    // Every record on this wire is single-newline terminated (the pipe writes
+    // `line + "\n"`); a blank line is not a valid JSONL record and would choke
+    // strict consumers at exactly the moment the stream already failed.
+    assert.ok(!bOut.includes("\n\n"), "truncation record carries no blank line");
+    assert.ok(bOut.endsWith("}\n"), "truncation record ends with exactly one newline");
 
     const c = makeCollector();
     emitPreflightError(c.res, "commandcode", { message: "too big", retryable: false }, undefined);
     const cOut = c.out();
     assert.match(cOut, /too big/);
     assert.ok(!cOut.includes("event:"), "no SSE event framing");
+    assert.ok(!cOut.includes("\n\n"), "preflight error record ends with exactly one newline");
 });
 
 // F9c: duplicate tool names must not corrupt settleToolCalls' verbatim replay.

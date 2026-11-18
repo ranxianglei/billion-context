@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CompressionBlock } from "acp-kernel";
-import { statusInputBaseline, type Session } from "./session.js";
+import { evidenceInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
 // #3686: the x-bili-plugin marker name is read DIRECTLY here instead of via
@@ -161,6 +161,19 @@ export function isBiliCompactionItem(item: unknown): boolean {
     return false;
 }
 
+/** Native opaque checkpoints are explicit epoch boundaries; never decode them.
+ *  The last checkpoint identifies the current epoch across echoes and restarts. */
+export function nativeCompactionKey(input: unknown): string | undefined {
+    if (!Array.isArray(input)) return undefined;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const item = input[i] as { type?: unknown; encrypted_content?: unknown } | null;
+        if (!item || item.type !== "compaction" || isBiliCompactionItem(item)) continue;
+        if (typeof item.encrypted_content !== "string" || item.encrypted_content.length === 0) continue;
+        return createHash("sha256").update(item.encrypted_content).digest("hex");
+    }
+    return undefined;
+}
+
 export function stripBiliCompactionItems<T>(input: T[]): T[] {
     return input.filter((item) => !isBiliCompactionItem(item));
 }
@@ -219,10 +232,10 @@ export const CODEX_COMPACT_HEALTH_RATIO = 0.9;
 
 export function codexCompactGatePre(session: Session, effectiveLimit: number): boolean {
     if (effectiveLimit <= 0) return false;
-    // Evidence-grade baseline only (#3008/#1492/#1839 discipline): raw
-    // stats.lastInputTokens can be an uncalibrated estimate-grade value that
-    // self-disables the valve at phantom pressure while real usage is far below.
-    if (statusInputBaseline(session) >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
+    // Evidence-grade baseline only (#3008/#1492/#1839). Status can substitute
+    // a local estimate after a send without usage. That estimate can cross the
+    // threshold in either direction while the last measured usage is unchanged.
+    if (evidenceInputBaseline(session.stats) >= effectiveLimit * CODEX_COMPACT_HEALTH_RATIO) return false;
     return session.state.blocks.some((b) => b.active);
 }
 
