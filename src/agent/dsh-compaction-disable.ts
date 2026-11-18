@@ -185,7 +185,7 @@ type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     if (typeof ctx.on === "function") {
         // Preset entries must carry the gate: sibling imports may finish out of order.
-        ctx.on("internal/config", function (this: MiddlewareSelf, _raw: unknown, next: () => unknown): unknown {
+        ctx.on("internal/config", function (fiber: unknown, next: () => unknown): unknown {
             const resolved = next();
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
@@ -199,7 +199,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
                 // own manual auto:false is indistinguishable at this layer and is
                 // restored too (documented edge); if a build never fires this
                 // hook for that entry, this degrades to the old behavior.
-                const rawName = this?.entry?.options?.name;
+                const rawName = (fiber as MiddlewareSelf | null | undefined)?.entry?.options?.name;
                 if (rawName === DSH_COMPACTION_BASIC_PACKAGE && resolved !== null && typeof resolved === "object" && !Array.isArray(resolved)) {
                     const cfg = resolved as Record<string, unknown>;
                     if (cfg.auto === false) return { ...cfg, auto: true };
@@ -215,7 +215,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             if (!Array.isArray(config.plugins)) return resolved;
             const compactionRows = countCompactionRows(config.plugins);
             if (compactionRows === 0) return resolved;
-            const rawName = this?.entry?.options?.name;
+            const rawName = (fiber as MiddlewareSelf | null | undefined)?.entry?.options?.name;
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
             noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
