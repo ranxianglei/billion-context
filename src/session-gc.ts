@@ -3,7 +3,7 @@ import type { Stats } from "node:fs";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
-import { getStore, type SessionStore } from "./persist.js";
+import { getStore, relPathFor, type SessionStore } from "./persist.js";
 import { retrieveSessionDirName, retrievalExportDir, sessionsDir, stateDir } from "./paths.js";
 import { dropSessionForGc, listSessions, peekSession } from "./session.js";
 import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
@@ -333,11 +333,13 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         deletedSessions.add(file);
         // #1995 review ②: the image-restore spill tree
         // (<state>/retrieve/img/<sessionId>/) shares this session's lifecycle —
-        // refs are per-session, so once the file is gone the spills are
+        // refs are per-session, so once its last file is gone the spills are
         // unreachable. Co-delete; anything this deterministic path misses (null
         // id, a pre-salt dir name from an older build) is collected by the
         // stale-mtime pass below.
-        if (view.id !== null) {
+        const hasSurvivingTwin = view.id !== null && matchingSessions(path.basename(relPathFor(view.id), ".json"))
+            .some((candidate) => !deletedSessions.has(candidate));
+        if (view.id !== null && !hasSurvivingTwin) {
             try {
                 const imgDir = opts?.imgRoot !== undefined
                     ? path.join(opts.imgRoot, restoreExportDirName(view.id))
