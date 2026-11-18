@@ -3802,7 +3802,7 @@ interface MeasuredOutbound {
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
     const top = b.otherTop[0];
     const other = b.other > 0 && top
-        ? `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")})`
+        ? `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget; top field: ${top.field} ~${top.tokens.toLocaleString("en-US")} tokens ≈${top.bytes.toLocaleString("en-US")} B)`
         : `other ~${b.other.toLocaleString("en-US")} (non-prompt, excluded from the window budget)`;
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · ${other}`;
 }
