@@ -19,7 +19,7 @@ import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
-import type { PendingRetrieval, Session } from "./session.js";
+import { isDroppedContentStore, type PendingRetrieval, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 export type CcrSettings = NonNullable<CompressSettings["ccr"]>;
@@ -134,6 +134,7 @@ export function contentStoreOf(session: Session): MessageContentStore {
  *  only when new entries appeared, so a no-growth turn costs nothing. */
 export function adoptContentStore(session: Session, store: MessageContentStore): void {
     const prev = session.contentStore;
+    if (prev === store && !isDroppedContentStore(store)) return;
     // #4788 phase-2 dropped prev can be a lazy re-materialize proxy whose disk
     // proof vanished after the drop (envelope lost/corrupted). Touching it
     // throws by design (#2674 payload-first discipline) — but nothing READABLE
