@@ -70,7 +70,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -322,6 +322,17 @@ function memProbe(debug: boolean, log: (level: string, msg: string) => void, ses
     log("debug", `[${sessionId}] mem-probe ${stage}: heap=${mi(mu.heapUsed)} external=${mi(mu.external)} rss=${mi(mu.rss)}${payloadBytes !== undefined ? ` payload=${payloadBytes}B` : ""}`);
 }
 
+// #6884: non-empty header presence, proto-agnostically over Node's header map
+// (string values, string[] tolerated for folded multi-values; anything else
+// counts as absent). Lane evidence for the wire-client sidecar clauses in
+// handleRequest — same trust tier as the verbatim session-id roster
+// (src/session-id.ts): the header is client-stamped, not bili-derived.
+function hasNonEmptyHeader(h: Record<string, unknown>, name: string): boolean {
+    const v = h[name];
+    if (typeof v === "string") return v.length > 0;
+    if (Array.isArray(v)) return v.some((x) => typeof x === "string" && x.length > 0);
+    return false;
+}
 async function handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1278,6 +1289,58 @@ async function handleRequest(
         // small maxTokens and no tools must enter the kernel pipeline.
         const declaredPiMainTurn = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION
             && pluginAgentHeader(req.headers) === "pi";
+        // #6884 wire-client legs (the cross-agent session-identity audit;
+        // follow-on to #7077): every client on the verbatim roster
+        // (src/session-id.ts) mints ONE id per logical conversation and
+        // source review confirmed the lifecycles are healthy — but each fires
+        // auxiliary LLM calls (titles, compaction, suggestions, memory,
+        // naming) UNDER THE SAME id, and those shapes defeat isSideRequest,
+        // so they enter the main session's kernel pipeline as conversation
+        // turns. Each clause is gated on the client's OWN wire signal (its
+        // session header / its compaction header / its constant User-Agent) —
+        // the same trust tier as the roster itself; no clause identifies a
+        // client from body shape alone. Upstream evidence per client:
+        //  - grok-shell: main turns ALWAYS stamp x-grok-turn-idx
+        //    (turn.rs:3002-3003); every auxiliary path (/btw, compaction,
+        //    title refresh, recap, memory, ...) stamps x-grok-session-id
+        //    WITHOUT the turn index — grok's own test-support contract
+        //    (README:32): "a non empty x-grok-turn-idx makes it foreground,
+        //    else a non empty x-grok-req-id makes it auxiliary". One header
+        //    clause covers every present AND future auxiliary path.
+        //  - mcode: title-gen's entire tool surface is the single
+        //    submit_session_title tool; the prompt suggestion (default on,
+        //    every accepted answer) and the Goal evaluator are tool-less,
+        //    budget-less single user messages reusing the main turn's
+        //    headers (prompt-suggestion-service.ts:655-692).
+        //  - goose: every auxiliary (naming, compaction, tool-pair summaries,
+        //    labels, adversarial review, apps, summarize) is the dsh
+        //    single-shot shape — no tools + exactly one user + a system
+        //    carrier holding the context — so isDshSingleShotSidecar covers
+        //    it as-is; the lane evidence is the roster header
+        //    agent-session-id. Residual, accepted: the permission judge
+        //    carries one tool (#546 main rung) and a user who configures
+        //    zero tools loses the first turn only (#5687 class).
+        //  - CodeBuddy: the compaction request itself carries x-compaction
+        //    on the wire (identity-codebuddy.ts) — consume it. Deliberately
+        //    NOT x-context-compacted: that marks "context already compacted"
+        //    and appears on ordinary POST-compaction MAIN turns; consuming
+        //    it would demote the real mainline.
+        //  - opencode: the built-in title agent fires concurrently with the
+        //    first main turn of every root session, under the root's own id,
+        //    no tools, no budget, single user framed by a fixed template
+        //    (session/title.ts:37-41); the User-Agent (app.ts:22 constant
+        //    format) is the lane evidence and the template text the shape.
+        const grokAuxSidecar = hasNonEmptyHeader(req.headers, "x-grok-session-id")
+            && !hasNonEmptyHeader(req.headers, "x-grok-turn-idx");
+        const mcodeLane = hasNonEmptyHeader(req.headers, "x-mavis-session-id");
+        const mcodeTitleSidecar = mcodeLane && isMcodeTitleRequest(parsed);
+        const mcodeOneShotSidecar = mcodeLane && isMcodeOneShotAuxRequest(protocol, parsed);
+        const gooseSingleShotSidecar = hasNonEmptyHeader(req.headers, "agent-session-id")
+            && isDshSingleShotSidecar(protocol, parsed);
+        const codebuddyCompactionSidecar = hasNonEmptyHeader(req.headers, "x-compaction");
+        const opencodeTitleSidecar = isOpencodeTitleRequest(protocol, parsed)
+            && (typeof req.headers["user-agent"] === "string"
+                && req.headers["user-agent"].startsWith("opencode/"));
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
             && (isSideRequest(parsed, declaredPiMainTurn ? "main" : sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
@@ -1308,6 +1371,14 @@ async function handleRequest(
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
                  || ccTitleSidecar
+                 // #6884: the wire-client auxiliary sidecars (clause evidence
+                 // above) — same raw-key/anchor discipline as ccTitleSidecar:
+                 // verbatim passthrough, kernel state untouched, no |sub: fork.
+                 || grokAuxSidecar
+                 || mcodeTitleSidecar || mcodeOneShotSidecar
+                 || gooseSingleShotSidecar
+                 || codebuddyCompactionSidecar
+                 || opencodeTitleSidecar
                  || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
@@ -2700,7 +2771,8 @@ async function handleRequest(
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar
+            || grokAuxSidecar || mcodeTitleSidecar || mcodeOneShotSidecar || gooseSingleShotSidecar || codebuddyCompactionSidecar || opencodeTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2724,7 +2796,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : grokAuxSidecar ? "grok auxiliary sidecar (#6884)" : mcodeTitleSidecar ? "mcode title sidecar (#6884)" : mcodeOneShotSidecar ? "mcode one-shot aux sidecar (#6884)" : gooseSingleShotSidecar ? "goose single-shot sidecar (#6884)" : codebuddyCompactionSidecar ? "codebuddy compaction sidecar (#6884)" : opencodeTitleSidecar ? "opencode title-gen sidecar (#6884)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
