@@ -247,7 +247,7 @@ export async function prepareOpenai(
         const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-    const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
+        const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so

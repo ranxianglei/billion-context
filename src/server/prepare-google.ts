@@ -164,7 +164,7 @@ export async function prepareGoogle(
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-    const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
+        const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
         // #2432/#2658: same post-landing recovery as the openai/responses/
         // anthropic lanes — dsh desktop's native compaction can land without
         // transiting bili (direct-bypass / future gate mismatch); first notice =

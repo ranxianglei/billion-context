@@ -291,7 +291,7 @@ export async function prepareResponses(
         const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject && !isCompactionTrigger;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-    const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
+        const nudgeEscalationPct = resolveNudgeEscalationPct(loopConfig);
         // #2372/#2432: LOCAL auto-compaction — the client compacts on its own
         // and the call never transits the proxy; the first the proxy hears of
         // it is this request replaying [compaction summary, retained tail…].
