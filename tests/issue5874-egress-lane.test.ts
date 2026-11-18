@@ -241,9 +241,9 @@ test("#5874-v2 L2: a same-id content move degrades the round to the live derive 
         assert.deepEqual(JSON.stringify(warm), JSON.stringify(cold), "baseline: warm ≡ cold");
 
         // The ledger moves: m2 gains a new generation (a same-id rewrite
-        // through the real ingest path). The id-bound hash re-derive inside
-        // egressReadView must catch it: the next round derives live and the
-        // revised bytes render.
+        // through the real ingest path). The watermark-scope digest re-derive
+        // inside egressReadView must catch it: the next round derives live
+        // and the revised bytes render.
         const revised = plainSession(6);
         (revised.lastMessages as unknown as Array<{ id: string; text: string }>).find((m) => m.id === "m2")!.text = "text 2 REVISED";
         revised.lastMessages = [...(revised.lastMessages ?? []), { id: "m7", role: "assistant", text: "summary f1", contentType: "text" } as CoreMessage];
@@ -268,7 +268,7 @@ test("#5874-v2 L2: a same-id content move degrades the round to the live derive 
     }
 });
 
-test("#5874-v2 L3: a cached row the ledger no longer carries degrades the splice (+/-)", () => {
+test("#5874-v2 L3: a cached row the ledger no longer carries degrades the round to the live derive (+/-)", () => {
     const h = setup();
     try {
         maybeSnapshotView(makeSession(), CLIENT, { sessionId: "sess-es" });
@@ -286,19 +286,19 @@ test("#5874-v2 L3: a cached row the ledger no longer carries degrades the splice
         assert.equal(serverAuthSession.metadata["snapshotRenderDegradeReason"], undefined, "a head edit alone is not a degrade");
 
         // The real rewind: the ingest completeLog sweep retires m4 (the
-        // client no longer carries it). The store's id-bound hash is
-        // retirement-stable ⇒ the store STILL HITS — the reject must happen
-        // at the lane splice's row-liveness check, which cannot bind m4's
-        // dead seq. The engine re-derives live (full content load, no
-        // [0, …] skip), renders the post-rewind ledger, and the cut
-        // self-heals the cache row to the post-edit ledger.
+        // client no longer carries it). The store's watermark-scope digest
+        // is over the LIVE rows at seq <= watermark (#7064 slimming) — the
+        // in-range retirement moves the digest ⇒ the store MISSES. The lane
+        // derives every byte live (full content load, no [0, …] skip — never
+        // a partial splice, never a guess), renders the post-rewind ledger,
+        // and the cut self-heals the cache row to the post-edit ledger.
         const rewound = foldedSession(["m5", "m6"]);
         (rewound.lastMessages as unknown as Array<{ id: string }>).splice(3, 1); // drop m4
         const refs = rewound.state.messageRefs as { byRaw: Record<string, string>; byRef: Record<string, string> };
         delete refs.byRaw["m4"];
         delete refs.byRef["1004"];
         assert.ok(h.store.ingestSession(planIngest(rewound), undefined, { completeLog: true }), "rewind ingest");
-        assert.ok(h.store.egressReadView("sess-es"), "store hit survives the retirement (id-bound hash)");
+        assert.equal(h.store.egressReadView("sess-es"), null, "in-range retirement moves the watermark-scope digest ⇒ store miss (#7064)");
 
         const before = h.uncovered().length;
         const rejectSession = makeSession();
