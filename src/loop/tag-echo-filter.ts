@@ -217,7 +217,23 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // `<div tokens="5">`-free document is untouched. Runs in the whole-text pass
 // right after the lone open/close passes; the streaming path reuses the same
 // sources (see stripPass + the flush normalization below).
-const MANGLED_EXTRA_CLOSE = new RegExp("\x3c\\/[aA][cC][pP][a-zA-Z_]{1,32}\x3e", "g");
+//
+// (a) is EXACT ENUMERATION of the field-attested extra-letter shapes, NOT a
+// character-class generalization (#2190 round-3 decontamination): a class like
+// `acp[a-zA-Z_]+` would also swallow the kernel's own `acp_*` text-protocol
+// tags (`</acp_status>`, `</acp_search>`, `</acp_compress>`, `</acp_decompress>`,
+// `</acp_tool_call>` — all `acp` + underscore + word) and real prose words
+// that share the `acp` stem (`acpipe`, #2190 golden). Both are pinned to pass
+// through untouched, so only the attested mangled names are enumerated; a new
+// shape earns inclusion the same way the acplike drift names do (clean
+// attestation → residue audit).
+const MANGLED_EXTRA_NAMES = [
+    "[aA][cC][pP][xX]",
+    "[aA][cC][pP][sS][uU][mM][mM][aA][rR][yY]",
+    "[aA][cC][pP]_[sS][uU][mM][mM][aA][rR][yY]",
+    "[aA][cC][pP][uU][tT][eE]_[sS][uU][mM][mM][aA][rR][yY]",
+];
+const MANGLED_EXTRA_CLOSE = new RegExp("\x3c\\/(?:" + MANGLED_EXTRA_NAMES.join("|") + ")\x3e", "g");
 const ACP_ATTR = "(?:[tT][oO][kK][eE][nN][sS]|[tT][yY][pP][eE]|[tT][iI][mM][eE])";
 const MANGLED_ATTR_CLOSE = new RegExp("\x3c\\/[^<>]{1,32}\\s[^<>]*" + ACP_ATTR + "=\"[^\x3c\x3e\"]*\"[^<>]*\x3e", "g");
 const MANGLED_ATTR_OPEN = new RegExp("\x3c[a-zA-Z0-9_-]{1,16}\\s[^<>]*" + ACP_ATTR + "=\"[^\x3c\x3e\"]*\"[^<>]*\x3e", "g");
