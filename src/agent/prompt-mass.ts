@@ -34,7 +34,7 @@ const PROMPT_KEYS: Record<WireProtocol, readonly string[]> = {
     responses: ["input", "instructions", "tools"],
 };
 
-export interface WirePromptMass {
+interface WirePromptMass {
     /** Lane the body shape was recognized as; only used for reporting. */
     protocol: WireProtocol;
     /** CJK-aware token mass of the prompt fields (turns + system + tools). */
@@ -44,7 +44,7 @@ export interface WirePromptMass {
 }
 
 /** Recognize the lane from the body shape. */
-export function sniffWireProtocolOfBody(body: Record<string, unknown>): WireProtocol | undefined {
+function sniffWireProtocolOfBody(body: Record<string, unknown>): WireProtocol | undefined {
     if (body.contents !== undefined) return "google";
     if (body.input !== undefined) return "responses";
     if (body.system !== undefined) return "anthropic";
