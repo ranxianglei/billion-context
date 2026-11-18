@@ -8,9 +8,13 @@
 // service atomically (the #3354 ordering guarantee survives the split);
 // WHETHER the transform actually disables rows is decided per process by the
 // verdict bili-native declares — see dsh-compaction-disable.ts.
+// #7111/#7117: it also reconciles the presets that were already mounted —
+// registered for the verdict declaration (not run on the spot), because the
+// one-shot loader callback fires BEFORE the declaration on a real host.
 import {
     hostPlaneOverrideLostWarning,
     hostPlaneRowsMissingAutoFalse,
+    onDshCompactionDeclared,
     reconcileLoadedPresets,
     registerCompactionDisable,
     type CompactionDisableHost,
@@ -44,6 +48,14 @@ export function apply(ctx: GateContext): void {
     ctx.inject?.(["loader"], (inner) => {
         const warning = hostPlaneWarningFor(inner);
         if (warning !== null) logHostEvent("warn", "bili-compaction-gate", warning);
-        reconcileLoadedPresets(inner.loader?.entries?.() ?? []);
+        // #7117: this callback fires ONCE, and on a real host it runs before
+        // bili-native declares the verdict (presets ~140ms, declaration
+        // ~960ms) — reconciling on the spot would see an absent verdict and
+        // never run again. Register for the declaration instead; entries are
+        // re-read at fire time, so presets mounted after the callback are
+        // covered too.
+        onDshCompactionDeclared(() => {
+            reconcileLoadedPresets(inner.loader?.entries?.() ?? []);
+        });
     });
 }

@@ -70,19 +70,62 @@ export const BILI_COMPACTION_DISABLE_SERVICE = "biliBasicCompactionPolicy";
 // bili-native hands the lane back to stock dsh compaction, with the wire-level
 // refusal guard (#1729) as backstop.
 const DSH_COMPACTION_VERDICT_KEY = "__BILI_DSH_COMPACTION_VERDICT__";
+/** #7117: post-declaration callbacks ride the same globalThis channel. The
+ *  gate entry's one-shot loader callback can run BEFORE bili-native declares
+ *  (real-host order: presets mount ~140ms and the gate callback fires with
+ *  them, the declaration lands ~960ms), so the gate registers here instead of
+ *  reconciling once on the spot. */
+const DSH_COMPACTION_DECLARED_CALLBACKS_KEY = "__BILI_DSH_COMPACTION_DECLARED_CALLBACKS__";
 
-/** bili-native calls this from apply() when its plan keeps the lane owned. */
+type DeclaredCallback = () => void;
+
+function declaredCallbacks(): Set<DeclaredCallback> {
+    const store = globalThis as Record<string, unknown>;
+    let callbacks = store[DSH_COMPACTION_DECLARED_CALLBACKS_KEY] as Set<DeclaredCallback> | undefined;
+    if (callbacks === undefined) {
+        callbacks = new Set();
+        store[DSH_COMPACTION_DECLARED_CALLBACKS_KEY] = callbacks;
+    }
+    return callbacks;
+}
+
+/** bili-native calls this from apply() when its plan keeps the lane owned.
+ *  Fires the registered post-declaration callbacks (#7117); a failing consumer
+ *  must never break the declaration itself. */
 export function declareDshCompactionActive(): void {
     (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] = "active";
+    for (const callback of [...declaredCallbacks()]) {
+        try {
+            callback();
+        } catch {
+            // A failing consumer must never break the declaration.
+        }
+    }
 }
 
 export function isDshCompactionActive(): boolean {
     return (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] === "active";
 }
 
+/** #7117: register a callback that runs the moment the verdict lands — or
+ *  immediately, if the declaration already happened (the host's entry order is
+ *  not guaranteed). An absent declaration never fires it: stock stays stock. */
+export function onDshCompactionDeclared(callback: DeclaredCallback): void {
+    const callbacks = declaredCallbacks();
+    callbacks.add(callback);
+    if (!isDshCompactionActive()) return;
+    callbacks.delete(callback);
+    try {
+        callback();
+    } catch {
+        // A failing consumer must never break the registration.
+    }
+}
+
 /** Test hook: forget any declaration (back to "bili-native never ran"). */
 export function _resetDshCompactionVerdictForTest(): void {
     delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY];
+    delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_DECLARED_CALLBACKS_KEY];
 }
 
 // #3962: the gate entry and bili-native are SEPARATE bundles (module state
