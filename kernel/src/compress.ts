@@ -743,7 +743,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
         try {
           validateSummaryLength(solo, input.config.compress);
         } catch (error) {
-          if (error instanceof SummaryLengthError) failureKinds.add(error.kind);
+          if (isSummaryLengthError(error)) failureKinds.add(error.kind);
           lengthFailures.push(
             rangeError(
               solo,
@@ -756,7 +756,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           try {
             validateSummaryLength(spec, input.config.compress, { skipMin: true });
           } catch (error) {
-            if (error instanceof SummaryLengthError) failureKinds.add(error.kind);
+            if (isSummaryLengthError(error)) failureKinds.add(error.kind);
             lengthFailures.push(
               rangeError(
                 spec,
@@ -2063,13 +2063,22 @@ function validateCompressionRange(input: SingleRangeInput): void {
 // context re-read each time) until the circuit breaker fired.
 type SummaryLengthKind = "empty" | "tooShort" | "tooLong";
 
-class SummaryLengthError extends Error {
-  readonly kind: SummaryLengthKind;
-  constructor(kind: SummaryLengthKind, message: string) {
-    super(message);
-    this.name = "SummaryLengthError";
-    this.kind = kind;
-  }
+// The guarded-file subset (verif/subset-guard.ts) excludes class declarations
+// and non-NEWABLE `new` targets, so this is a plain-Error factory plus a type
+// guard instead of a class — same shape and messages, no class.
+type SummaryLengthError = Error & { kind: SummaryLengthKind };
+
+function summaryLengthError(kind: SummaryLengthKind, message: string): SummaryLengthError {
+  const error = new Error(message) as SummaryLengthError;
+  error.name = "SummaryLengthError";
+  error.kind = kind;
+  return error;
+}
+
+function isSummaryLengthError(error: unknown): error is SummaryLengthError {
+  if (!(error instanceof Error) || error.name !== "SummaryLengthError") return false;
+  const kind = (error as SummaryLengthError).kind;
+  return kind === "empty" || kind === "tooShort" || kind === "tooLong";
 }
 
 /** Build the batch-rejection remediation text from the set of failure
@@ -2096,7 +2105,7 @@ function validateSummaryLength(
   const summary = spec.summary?.trim() ?? "";
 
   if (summary.length === 0) {
-    throw new SummaryLengthError(
+    throw summaryLengthError(
       "empty",
       "Summary is empty — provide a meaningful summary of the compressed range.",
     );
@@ -2109,7 +2118,7 @@ function validateSummaryLength(
     cfg.minSummaryLength > 0 &&
     summary.length < cfg.minSummaryLength
   ) {
-    throw new SummaryLengthError(
+    throw summaryLengthError(
       "tooShort",
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
@@ -2117,7 +2126,7 @@ function validateSummaryLength(
 
   const effectiveMax = spec.summaryMaxChars ?? cfg.maxSummaryLength;
   if (effectiveMax > 0 && summary.length > effectiveMax) {
-    throw new SummaryLengthError(
+    throw summaryLengthError(
       "tooLong",
       `Summary too long (${summary.length} chars, max ${effectiveMax}). Strip noise — keep critical paths, decisions, errors, and code references. Or pass summaryMaxChars to increase the limit — don't lose critical info just to fit.`,
     );
