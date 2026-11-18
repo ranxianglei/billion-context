@@ -2196,7 +2196,7 @@ export async function installViaTarball(
     // the install (the copy itself is verified and standing).
     if (isDshDesktopBiliCopy(installDir, real, env)) {
         const profileDir = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE);
-        const conv = convergeDshLedger(profileDir, version);
+        const conv = convergeDshLedger(profileDir, version, { integrity });
         if (conv.error !== undefined) {
             loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced at ${version} but its ledgers were not converged (${conv.error}) — dsh may revert the copy on its next plugin install; rerun 'bili doctor --fix'`);
         } else if (conv.changed.length > 0) {
@@ -2233,8 +2233,10 @@ export async function detectStaleInstall(
 
 /** Fetch one published version's registry doc (#1481): tarball URL plus
  *  integrity/shasum for verification. Returns undefined when the version does
- *  not exist or the fetch fails — callers treat that as "do nothing". */
-async function fetchVersionDoc(
+ *  not exist or the fetch fails — callers treat that as "do nothing". Also
+ *  used by `bili doctor --fix` (#7125) to source the SRI hash a pnpm store
+ *  entry needs when converging a dsh profile lockfile. */
+export async function fetchVersionDoc(
     opts: Pick<UpdateOptions, "resolveProxy">,
     packageName: string,
     version: string,
