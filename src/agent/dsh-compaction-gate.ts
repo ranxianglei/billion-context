@@ -8,13 +8,28 @@
 // service atomically (the #3354 ordering guarantee survives the split);
 // WHETHER the transform actually disables rows is decided per process by the
 // verdict bili-native declares — see dsh-compaction-disable.ts.
-import { registerCompactionDisable, type CompactionDisableHost } from "./dsh-compaction-disable.js";
+import {
+    reconcileLoadedPresets,
+    registerCompactionDisable,
+    type CompactionDisableHost,
+} from "./dsh-compaction-disable.js";
 
-type PluginContext = CompactionDisableHost;
+/** What the #7111 reconcile needs from the host loader. Deliberately not a
+ *  hard dependency: an entry-level inject is fail-closed (no optional
+ *  dependency, no timeout, no fallback), and a required `loader` would restore
+ *  exactly the failure this change removes. */
+export type LoaderFace = { loader?: { entries?: () => Iterable<unknown> } };
+
+type GateContext = CompactionDisableHost & {
+    inject?: (deps: string[], callback: (inner: LoaderFace) => void) => unknown;
+};
 
 export const name = "bili-compaction-gate";
 export const inject: string[] = [];
 
-export function apply(ctx: PluginContext): void {
+export function apply(ctx: GateContext): void {
     registerCompactionDisable(ctx);
+    ctx.inject?.(["loader"], (inner) => {
+        reconcileLoadedPresets(inner.loader?.entries?.() ?? []);
+    });
 }
