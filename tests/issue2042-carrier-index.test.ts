@@ -51,13 +51,13 @@ test("non-tool-call message carrying the same toolCallId does not count", () => 
 });
 
 test("plugin block: exact range match via flat args -> stripped", () => {
-    const messages = [summary("pb0"), toolCall("c1", "compress", '{"startId":"m1","endId":"m9"}'), tail(0)];
+    const messages = [summary("pb0"), toolCall("c1", "compress", '{"startId":"m1","endId":"m9","summary":"summary"}'), tail(0)];
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
     assert.deepEqual(ids(out), ["tc_c1", "u0"]);
 });
 
 test("plugin block: exact range match via content array -> stripped", () => {
-    const messages = [summary("pb0"), toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m9"}]}'), tail(0)];
+    const messages = [summary("pb0"), toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m9","summary":"summary"}]}'), tail(0)];
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
     assert.deepEqual(ids(out), ["tc_c1", "u0"]);
 });
@@ -107,7 +107,7 @@ test("mixed branches: only blocks with carriers are stripped, order preserved", 
     const messages = [
         summary("p_hit"), summary("p_miss"), summary("pl_hit"), summary("pl_bad"),
         toolCall("proxy_call_p_hit", "bash"),
-        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2"},{"startId":"m3","endId":"m4"}]}'),
+        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2"},{"startId":"m3","endId":"m4","summary":"summary"}]}'),
         toolCall("c2", "compress", "{bad json"),
         tail(0),
     ];
@@ -124,7 +124,7 @@ test("mixed branches: only blocks with carriers are stripped, order preserved", 
 test("one content array serving two plugin blocks parses the args exactly once", () => {
     const messages = [
         summary("a0"), summary("a1"),
-        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2"},{"startId":"m3","endId":"m4"}]}'),
+        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2","summary":"summary"},{"startId":"m3","endId":"m4","summary":"summary"}]}'),
         tail(0),
     ];
     const state = stateWith([
