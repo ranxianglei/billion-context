@@ -22,6 +22,8 @@ import {
     dshDurableToolPathWithKinds,
     dshSourceKindToPath,
     msgKindFingerprint,
+    oneShotCarrierPathFactories,
+    oneShotCarrierPaths,
 } from "../src/durable-message-guards.ts";
 import { MSG_KINDS_HEADER, incomingMsgKindsHeader } from "../src/msgid-pin.ts";
 import { UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
@@ -310,6 +312,56 @@ test("one-shot families: a reworded settled notice reaches its oneshot path via 
     assert.ok(idx);
     assert.equal(classifier(idx)(textMsg(reworded)), "oneshot/subagent-settled");
     assert.equal(classifier(undefined)(textMsg(reworded)), undefined);
+});
+
+/* ------------------------------------------------------------------ */
+/* One-shot carrier FACTORY (fold-drift accounting, channel 1)         */
+/* ------------------------------------------------------------------
+ * The fold-reconcile expected-rebase accounting (fold-reconcile.ts channel
+ * 1) classifies NEW inbound carrier ids with a marker-based classifier.
+ * A reworded carrier that misses every marker is never recorded as an
+ * expected rebase → it later lands in `missing` → the #5139 O(full-history)
+ * drift tax + a false drift warning. The factory mirrors the protection
+ * classifier: kind-first, marker-fallback, byte-identical when unattested.
+ */
+
+const oneShotClassifier = (index: Map<string, string> | undefined) =>
+    oneShotCarrierPathFactories["dsh"](index);
+
+test("one-shot factory registry: exactly { dsh } — a non-dsh pluginAgent can never obtain the dsh one-shot factory", () => {
+    assert.deepEqual(Object.keys(oneShotCarrierPathFactories), ["dsh"]);
+    assert.equal(oneShotCarrierPathFactories["pi"], undefined);
+    assert.equal(oneShotCarrierPathFactories["opencode"], undefined);
+});
+
+test("one-shot parity: factory(undefined) IS the text-only classifier (same reference)", () => {
+    assert.equal(oneShotCarrierPathFactories["dsh"](undefined), oneShotCarrierPaths["dsh"]);
+});
+
+test("one-shot fix: an attested reworded carrier reaches its oneshot path via kind (channel 1)", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(oneShotClassifier(idx)(textMsg(REWORDED_SNAPSHOT)), "durable/runtime-context");
+    assert.equal(oneShotCarrierPaths["dsh"](textMsg(REWORDED_SNAPSHOT)), undefined); // unattested = marker miss
+});
+
+test("one-shot negative: unattested reworded carrier stays unclassified (marker miss)", () => {
+    const other = indexFrom(`time-context=${msgKindFingerprint("some other text")}`);
+    assert.ok(other);
+    assert.equal(oneShotClassifier(other)(textMsg(REWORDED_SNAPSHOT)), undefined);
+});
+
+test("one-shot fallback: unattested text keeps the existing marker classification", () => {
+    const legacy = "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.";
+    const idx = indexFrom(`time-context=${msgKindFingerprint("irrelevant")}`);
+    assert.ok(idx);
+    assert.equal(oneShotClassifier(idx)(textMsg(legacy)), "durable/runtime-context");
+});
+
+test("one-shot role gate: an attested ASSISTANT message is never a carrier", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(oneShotClassifier(idx)(textMsg(REWORDED_SNAPSHOT, "assistant")), undefined);
 });
 
 test("unknown attested kinds fall through to the markers (permitlist, not closed vocabulary)", () => {

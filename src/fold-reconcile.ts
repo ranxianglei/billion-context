@@ -139,7 +139,7 @@ import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
-import { dshCarrierRawMarkers, oneShotCarrierPaths } from "./durable-message-guards.js";
+import { dshCarrierRawMarkers, oneShotCarrierPathFactories, oneShotCarrierPaths } from "./durable-message-guards.js";
 import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
@@ -1706,6 +1706,14 @@ export interface ReconcileOptions {
       *  persisted, see the channel-2 note). Invoked only on drift passes
       *  (≤256 ids/pass); undefined = legacy mode, channels 2+3 stay silent. */
     storedRowLookup?: (msgIds: readonly string[]) => Array<{ seq: number; msgId: string; content: string }> | null;
+    /** #7085 follow-up: the decoded source-kind attestation index for THIS
+     *  inbound request (fingerprint → kind, from the x-bili-msg-kinds header).
+     *  Channel 1 (expected-rebase first-sight) consults it FIRST via the lane's
+     *  oneShotCarrierPathFactories entry before the text-marker fallback, so a
+     *  host rewording cannot re-break the drift accounting for the carrier
+     *  family (the #5139 O(full-history) tax). `undefined` (no header, or the
+     *  decoder rejected it) keeps the text-only classifier byte-identical. */
+    inboundMsgKinds?: ReadonlyMap<string, string>;
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1808,8 +1816,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // New ids only (anchored ids were judged on an earlier pass); a lane
     // without an evidence-backed classifier is untouched (KDD #9). Present
     // carriers per turn are few, so steady state pays ~nothing.
-    const classifyCarrier = typeof session.metadata.pluginAgent === "string"
-        ? oneShotCarrierPaths[session.metadata.pluginAgent] : undefined;
+    const pluginAgent = typeof session.metadata.pluginAgent === "string" ? session.metadata.pluginAgent : undefined;
+    const classifyCarrier = pluginAgent !== undefined
+        ? (oneShotCarrierPathFactories[pluginAgent]?.(opts.inboundMsgKinds) ?? oneShotCarrierPaths[pluginAgent])
+        : undefined;
     if (classifyCarrier !== undefined) {
         for (const m of msgs) {
             const id = m.id;

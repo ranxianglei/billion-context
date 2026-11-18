@@ -546,6 +546,37 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshImageOffloadPlaceholderPath(msg),
 };
 
+/** #7085 follow-up: the kind-aware ONE-SHOT carrier classifier for FOLD-DRIFT
+ *  ACCOUNTING (fold-reconcile's expected-rebase record, channel 1). Same
+ *  pattern as dshDurableToolPathWithKinds: the attestation index consulted
+ *  FIRST under the same role/content gates, then the twelve text markers as
+ *  the fallback. Without this, the NEXT host rewording re-breaks the drift
+ *  accounting for the whole carrier family (the #5139 O(full-history) tax +
+ *  false drift warnings) even though the protection path is kind-aware.
+ *  `undefined` index returns the text-only classifier unchanged. */
+function oneShotCarrierPathsWithKinds(index: DurableKindIndex | undefined): DurableMessageClassifier {
+    if (index === undefined) return oneShotCarrierPaths.dsh;
+    return (msg: CoreMessage) => {
+        if (msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.length > 0) {
+            const kind = index.get(msgKindFingerprint(msg.text));
+            if (kind !== undefined) {
+                const path = dshSourceKindToPath[kind];
+                if (path !== undefined) return path;
+            }
+        }
+        return oneShotCarrierPaths.dsh(msg);
+    };
+}
+
+/** Lane → one-shot carrier classifier FACTORY registry (fold-drift
+ *  accounting, fold-reconcile channel 1): the per-request form that accepts
+ *  the decoded attestation index. dsh is the only lane with an attesting
+ *  host, so it is the only entry (KDD #9). A lane absent from this map keeps
+ *  using the prebuilt text-only entry in oneShotCarrierPaths. */
+export const oneShotCarrierPathFactories: Record<string, (attest: DurableKindIndex | undefined) => DurableMessageClassifier> = {
+    dsh: oneShotCarrierPathsWithKinds,
+};
+
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
  *  exact marker strings of the twelve dsh classifiers above (fifteen markers:
  *  the runtime-context family contributes two — the pre-0.2.2-rc.3 "Current
