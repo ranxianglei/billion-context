@@ -371,12 +371,22 @@ function parseRetryAfterMs(headerValue: string | null, now: number): number | nu
 
 function holdKey(url: string, headers: Record<string, string>): { key: string; host: string; cred: string | undefined } {
     let host = url;
+    let cred = credentialFingerprint(headers);
     try {
-        host = new URL(url).host;
+        const parsed = new URL(url);
+        host = parsed.host;
+        // Native Google model RPCs also accept query API keys. Keep header
+        // identities unchanged and do not guess between conflicting values.
+        if (cred === undefined && /\/models\/[^/]+:(?:generateContent|streamGenerateContent|countTokens)$/.test(parsed.pathname)) {
+            const values = [...parsed.searchParams.getAll("key"), ...parsed.searchParams.getAll("$key")];
+            const queryKey = values[0];
+            if (queryKey !== undefined && values.every(value => value === queryKey)) {
+                cred = credentialFingerprint({ "x-goog-api-key": queryKey });
+            }
+        }
     } catch { /* opaque url — key by the raw value */ }
     // Multi-account safety (#2131 fingerprint): two credentials on the same
     // origin are independent rate-limit pools and must not hold each other.
-    const cred = credentialFingerprint(headers);
     return { key: cred === undefined ? host : `${host}\u0000${cred}`, host, cred };
 }
 
