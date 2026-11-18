@@ -79,7 +79,7 @@ export function rewriteArchiveLog(file: string, text: string): void {
     }
 }
 /** #4739 test instrumentation: message rows materialized by getMessages /
- *  getMessagesAt (each row = one CAS read + media hydration). Production
+ *  getMessagesAt (including content decoding + media hydration). Production
  *  code never reads this; tests assert ordinary loads stop decoding the
  *  whole historical log. */
 export const messageRowReads = { count: 0 };
@@ -1119,6 +1119,11 @@ export class UnifiedStore {
                        tail_json = excluded.tail_json,
                        ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
                        last_ingested_seq = excluded.last_ingested_seq,
+                       -- #6780: no same-value skip here (or for the #6325 columns): an unchanged
+                       -- OVERFLOW blob (a JSON column big enough to spill onto overflow pages) is
+                       -- copied onto fresh pages whenever ANY column of this row changes, so a
+                       -- CASE-when skip only saves inline-size values. Moving the big blobs out of
+                       -- the row (table-ization) is the real byte-cost fix.
                        orphans_json = excluded.orphans_json`,
                 )
                 .run({
@@ -1574,10 +1579,11 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null }[];
+            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null; ref: string | null }[];
         const seqByIdentity = new Map<string, number>();
         const hashBySeq = new Map<number, string>();
+        const storedRefBySeq = new Map<number, string | null>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of existing) {
@@ -1589,6 +1595,7 @@ export class UnifiedStore {
             if (row.retired_at !== null) retiredSeqs.push(row.seq);
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, row.seq);
             hashBySeq.set(row.seq, row.content_hash);
+            storedRefBySeq.set(row.seq, row.ref);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -1599,6 +1606,12 @@ export class UnifiedStore {
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
         const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
+        // #6947: rows written by the turn-final handoff write-back carry
+        // ref=NULL — their ref is minted only when a LATER request re-sends
+        // the message. This join hit is the first moment the minted ref can
+        // reach the stored row; backfill NULL only (a non-null stored ref is
+        // the frozen index-time projection and must never be rewritten).
+        const refBackfills: { seq: number; ref: string; refNum: number }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1620,10 +1633,21 @@ export class UnifiedStore {
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
                 if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
+                // #6947: minted-ref backfill for turn-final write-back rows.
+                // Never "BLOCKED" (a byRaw-only token, #ingest note) and never
+                // over an already-stored ref.
+                if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null && storedRefBySeq.get(abs) === null) {
+                    refBackfills.push({ seq: abs, ref: m.ref, refNum: m.refNum });
+                }
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const b of refBackfills) {
+            // The ref IS NULL re-check inside the statement keeps the update
+            // idempotent if two plan rows join the same stored row.
+            this.db.prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL").run(b.ref, b.refNum, s.sessionId, b.seq);
+        }
         for (const r of repairs) {
             // #4793: a sibling row may already hold the target bytes for this
             // msg_id — e.g. an old generation stamped with an EMPTY identity
@@ -3340,7 +3364,7 @@ export class UnifiedStore {
                 + ` AND (${clauses.join(" OR ")}) ORDER BY seq`;
             for (const row of this.db.prepare(sql).all(...params) as Record<string, unknown>[]) rows.push(row);
         }
-        return rows.map((r) => ({
+        return Array.from(this.messageContents(rows), ([r, content]) => ({
             seq: r.seq as number,
             msgId: r.msg_id as string,
             ref: (r.ref as string | null) ?? null,
@@ -3349,8 +3373,26 @@ export class UnifiedStore {
             kind: r.kind as string,
             contentHash: r.content_hash as string,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
         }));
+    }
+
+    /** Fetch bodies for captured message rows in bounded batches. Keeping
+     *  the metadata query separate avoids holding a whole history's BLOBs
+     *  alongside all of its decoded strings. Hashes preserve row identity. */
+    private *messageContents(rows: readonly Record<string, unknown>[]): Generator<readonly [Record<string, unknown>, string]> {
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => row.content_hash as string))];
+            const contents = this.db.prepare(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
+                .all(...hashes) as { hash: string; bytes: Uint8Array }[];
+            const byHash = new Map(contents.map((row) => [row.hash, row.bytes]));
+            for (const row of chunk) {
+                const bytes = byHash.get(row.content_hash as string);
+                yield [row, bytes === undefined ? "" : Buffer.from(bytes).toString("utf8")];
+            }
+        }
     }
 
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[]; fromSeqExclusive?: number }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
@@ -3371,7 +3413,7 @@ export class UnifiedStore {
                 `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
             )
             .all(...params) as Record<string, unknown>[];
-        return rows.map((r) => {
+        return Array.from(this.messageContents(rows), ([r, content]) => {
             messageRowReads.count++;
             return {
             seq: r.seq as number,
@@ -3383,7 +3425,7 @@ export class UnifiedStore {
             contentHash: r.content_hash as string,
             retiredAt: (r.retired_at as number | null) ?? null,
             ts: (r.ts as number | null) ?? null,
-            content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+            content: this.hydrateMedia(content),
             };
         });
     }
@@ -3403,7 +3445,8 @@ export class UnifiedStore {
             const chunk = unique.slice(i, i + CHUNK);
             const rows = this.db
                 .prepare(
-                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                    `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                     LEFT JOIN content c ON c.hash = messages.content_hash
                      WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 )
                 .all(sessionId, ...chunk) as Record<string, unknown>[];
@@ -3418,7 +3461,7 @@ export class UnifiedStore {
                     kind: r.kind as string,
                     contentHash: r.content_hash as string,
                     ts: (r.ts as number | null) ?? null,
-                    content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
+                    content: this.hydrateMedia(r.content_bytes === null ? "" : Buffer.from(r.content_bytes as Uint8Array).toString("utf8")),
                 });
             }
         }

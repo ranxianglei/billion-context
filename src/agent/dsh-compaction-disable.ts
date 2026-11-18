@@ -132,6 +132,17 @@ export function _resetDshCompactionGateTelemetryForTest(): void {
     delete (globalThis as Record<string, unknown>)[DSH_COMPACTION_GATE_TELEMETRY_KEY];
 }
 
+/** #6770: one-line coverage summary shared by the durable profile notes (#3962)
+ *  and bili-native's first-request log line. Pure over the record; "no entry
+ *  rewritten" is the honest frame because preset configs resolve lazily. */
+export function compactionCoverageText(telemetry: DshCompactionGateTelemetry | null = dshCompactionGateTelemetry()): string {
+    if (telemetry === null || telemetry.covered.length === 0) {
+        return "no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later)";
+    }
+    const entries = telemetry.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
+    return `${telemetry.covered.length} preset ${telemetry.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})`;
+}
+
 type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
 
 /** Count compaction-basic/command-compact rows the disable walk would mark
