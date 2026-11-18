@@ -166,9 +166,12 @@ const FILLER = (seed: number, kb: number): string => {
  *  string derived from a stored epoch-ms value — TZ-dependent display, never
  *  contract. Two shapes reach both the wire and persisted views: the tag
  *  attribute time="yyyy-mm-dd hh:mm:ss" and the fold receipt's covered span
- *  "[start – end". Stripped before hashing (same class as <PORT>/<SID>). */
+ *  "[start – end" and the success receipt's commit moment " folded at
+ *  yyyy-mm-dd hh:mm:ss" (Date.now() at fold — ephemeral, never contract).
+ *  Stripped before hashing (same class as <PORT>/<SID>). */
 const STAMP_ATTR_RE = / time=\\?"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\\?"/g; // \\? = also the \" form inside JSON.stringify'd views
 const STAMP_SPAN_RE = / \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} – \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/g;
+const FOLDED_AT_RE = / folded at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/g;
 
 /** Volatile ids minted onto the wire (Date.now-based or content-hash) become
  *  placeholders so the hash pins STRUCTURE+CONTENT, not wall-clock time. */
@@ -177,7 +180,7 @@ function canonicalBody(body: string): string {
         .replace(/msg-proxy-\d+(?:-\d+)?/g, "msg-proxy-<MINT>")
         .replace(/marker-\d+(?:-\d+)?/g, "marker-<MINT>")
         .replace(/msg-fix-[0-9a-f]+/g, "msg-fix-<MINT>")
-        .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "");
+        .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "").replace(FOLDED_AT_RE, "");
 }
 
 // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation numbers
@@ -189,7 +192,7 @@ function canonicalBody(body: string): string {
 // numbers in prose too; user content is identical across legs, so the wider
 // mask cannot hide a real divergence.
 function citeNormBody(body: string): string {
-    return body.replace(/\bm\d{5}\b/g, "<REF>").replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "");
+    return body.replace(/\bm\d{5}\b/g, "<REF>").replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "").replace(FOLDED_AT_RE, "");
 }
 
 /** Timestamps (ms-epoch magnitude) and UUIDs become placeholders; everything
@@ -619,7 +622,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             // ephemeral port and this drive's session id appear inside ledger
             // lines / stats origins. Normalize before hashing.
             .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
-            .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "")
+            .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "").replace(FOLDED_AT_RE, "")
             // #4313: cacheLedger.bd hashes wire bytes that now carry stamped
             // display strings — wall-clock-entangled, not contract; mask it.
             .replace(/"bd":"[0-9a-f]{64}"/g, '"bd":"<BD>"');
@@ -635,7 +638,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             }))))
                 .replace(/127\.0\.0\.1:\d+/g, "127.0.0\.1:<PORT>")
                 .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>")
-                .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "")
+                .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "").replace(FOLDED_AT_RE, "")
                 .replace(/"bd":"[0-9a-f]{64}"/g, '"bd":"<BD>"'),
         );
         // Localization aid for cross-machine digest drift: per-section and
@@ -644,7 +647,7 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
         // the golden to carry the full view.
         const norm = (v: unknown) =>
             (JSON.stringify(canonicalize(sortObjectKeys(v))) ?? "null")
-                .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "")
+                .replace(STAMP_ATTR_RE, "").replace(STAMP_SPAN_RE, "").replace(FOLDED_AT_RE, "")
                 .replace(/"bd":"[0-9a-f]{64}"/g, '"bd":"<BD>"')
                 .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
                 .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");

@@ -1742,20 +1742,6 @@ export function deterministicDigest(entries: DigestEntry[], startRef: string, en
 }
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
-    // #3641: epoch confirmation pending — the fold state and the resent
-    // history share nothing (wholesale replacement, no word evidence), so any
-    // fold computed here would summarize a substrate whose anchor set can
-    // never re-anchor. Pause folding for this session (verbatim passthrough)
-    // and say so once per pass at debug level: the error line lives at the
-    // escalation site (fold-reconcile). The FIRST realigned pass clears the
-    // latch (resetFoldDriftState), resuming folding automatically — no
-    // restart, no manual reset. Import direction: preflight → fold-reconcile
-    // is acyclic (fold-reconcile never imports preflight).
-    if (epochConfirmPending(deps.session)) {
-        deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
-        const paused = estimateCoreMessages(messages) + (deps.wireOverhead ?? 0);
-        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit, hadFoldableCandidates: false };
-    }
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
     // text estimate vs `target − imageReserve`. Algebraically the same firing
@@ -1812,6 +1798,26 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // failure stamp below).
     let fitExitForward = false;
     if (limit <= 0) return result;
+    // #3641: epoch confirmation pending — the fold state and the resent
+    // history share nothing (wholesale replacement, no word evidence), so any
+    // fold computed here would summarize a substrate whose anchor set can
+    // never re-anchor. Pause folding for this session (verbatim passthrough)
+    // and say so once per pass at debug level: the error line lives at the
+    // escalation site (fold-reconcile). The FIRST realigned pass clears the
+    // latch (resetFoldDriftState), resuming folding automatically — no
+    // restart, no manual reset. Import direction: preflight → fold-reconcile
+    // is acyclic (fold-reconcile never imports preflight).
+    // #6069: the pause holds only while the verbatim payload fits the window,
+    // judged on the same scale as the loop below. An over-window payload cannot
+    // pass through, and the latch clears only after a turn is forwarded, so a
+    // paused over-window session was refused on every turn. Fold it instead.
+    if (epochConfirmPending(deps.session)) {
+        if (result.payloadEstimate + viewDeltaCorrection < limit) {
+            deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
+            return result;
+        }
+        deps.log("warn", `[preflight] fold epoch confirmation pending for ${deps.session.id}, but the verbatim payload (~${Math.round(result.payloadEstimate + viewDeltaCorrection)} tokens) exceeds the model window ${limit} — folding the resent history instead of refusing the turn (#6069)`);
+    }
     if (deps.externalSummary === undefined) {
         try {
             // The plan rides the request Config rail: deps.config is this

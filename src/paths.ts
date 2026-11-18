@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -30,12 +30,13 @@ export function configDir(): string {
 }
 
 /** Resolve a config ref (BILI_CONFIG_FILE / -c/--config value): a path
- *  (contains a separator, or names an existing file in CWD) stays a path;
+ *  (contains a separator, or names an existing FILE in CWD — a directory is
+ *  never a valid config file) stays a path;
  *  a bare NAME selects <configDir>/NAME.json — "billion-context" is the
  *  default file itself, so per-purpose siblings ("dsh-test", "ework-qq")
  *  switch the whole config without touching env vars. */
 export function resolveConfigFileRef(ref: string): string {
-    if (ref.includes("/") || ref.includes("\\") || existsSync(ref)) return path.resolve(ref);
+    if (ref.includes("/") || ref.includes("\\") || statSync(ref, { throwIfNoEntry: false })?.isFile()) return path.resolve(ref);
     return path.join(configDir(), `${ref}.json`);
 }
 
@@ -43,11 +44,14 @@ export function resolveConfigFileRef(ref: string): string {
  *  a bare NAME (no separator, no CWD file) whose <configDir>/NAME.json is
  *  missing is an error — the message names the resolved path plus every
  *  available sibling so a typo can't silently start the proxy on an empty
- *  config. Explicit PATHS (and refs naming an existing CWD file) keep their
+ *  config. Explicit PATHS (and refs naming an existing CWD FILE — statSync:
+ *  a directory is NOT a file, so a CWD directory named like a bare config
+ *  name falls through to named resolution and fails fast instead of booting
+ *  with a default config via EISDIR) keep their
  *  historical missing→empty behavior and return null. */
 export function checkNamedConfigRef(ref: string): string | null {
     if (!ref || ref.trim().length === 0) return null;
-    if (ref.includes("/") || ref.includes("\\") || existsSync(ref)) return null;
+    if (ref.includes("/") || ref.includes("\\") || statSync(ref, { throwIfNoEntry: false })?.isFile()) return null;
     const dir = configDir();
     if (existsSync(path.join(dir, `${ref}.json`))) return null;
     let names: string[] = [];

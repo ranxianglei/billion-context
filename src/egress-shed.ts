@@ -218,7 +218,6 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     messages.forEach((m, entryIndex) => {
         if (!isObj(m)) return;
         if (protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names)) return;
-        if (protocol === "anthropic" && Array.isArray(m.content) && m.content.some((b) => isObj(b) && b.type === "tool_result" && isExemptOutput(protocol, b, names))) return;
         if (!Array.isArray(m.content)) return;
         const content = m.content as unknown[];
         if (protocol === "anthropic") addAnthropicImages(content, entryIndex, false);
@@ -242,6 +241,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
                 });
             } else if (p.type === "tool_result" && Array.isArray(p.content)) {
+                if (isExemptOutput(protocol, p, names)) return;
                 addAnthropicImages(p.content, entryIndex, true);
             }
         });
