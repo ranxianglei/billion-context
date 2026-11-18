@@ -202,6 +202,8 @@ interface PersistedSession {
         cacheSamples?: number;
         lastInputTokens?: number;
         lastInputTokensSource?: string;
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
         lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
         overflowArmCompletionReserve?: number;
@@ -222,8 +224,9 @@ interface PersistedSession {
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
+        calibratedEstimateModel?: string;
         calibratedEstimateProvenance?: string;
-        calibrationRing?: { origin: string; values: number[]; provenances?: (string | undefined)[] };
+        calibrationRing?: { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] };
         pendingFoldUsage?: boolean;
         lastLocalTextEstimate?: number;
         lastLocalTextEstimateOrigin?: string;
@@ -4204,9 +4207,9 @@ function restoreCalibratedEstimate(v: unknown): number | undefined {
 // provenance entry counts only on an exact "text-only-v1" match, and the key
 // is omitted entirely when no entry survives (legacy files keep their exact
 // restored shape).
-function restoreCalibrationRing(v: unknown): { origin: string; values: number[]; provenances?: (string | undefined)[] } | undefined {
+function restoreCalibrationRing(v: unknown): { origin: string; model?: string; values: number[]; provenances?: (string | undefined)[] } | undefined {
     if (!v || typeof v !== "object") return undefined;
-    const ring = v as { origin?: unknown; values?: unknown; provenances?: unknown };
+    const ring = v as { origin?: unknown; model?: unknown; values?: unknown; provenances?: unknown };
     if (typeof ring.origin !== "string" || ring.origin.length === 0) return undefined;
     if (!Array.isArray(ring.values)) return undefined;
     const storedProvenances = Array.isArray(ring.provenances) ? ring.provenances : undefined;
@@ -4216,7 +4219,8 @@ function restoreCalibrationRing(v: unknown): { origin: string; values: number[];
     const recent = kept.slice(-CALIBRATION_SAMPLE_WINDOW);
     if (recent.length === 0) return undefined;
     const provenances = recent.map((e) => (e.provenance === CALIBRATION_PROVENANCE_TEXT_ONLY ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined));
-    return { origin: ring.origin, values: recent.map((e) => e.value), ...(provenances.some((p) => p !== undefined) ? { provenances } : {}) };
+    const model = typeof ring.model === "string" && ring.model.trim().length > 0 ? ring.model : undefined;
+    return { origin: ring.origin, ...(model === undefined ? {} : { model }), values: recent.map((e) => e.value), ...(provenances.some((p) => p !== undefined) ? { provenances } : {}) };
 }
 
 function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
@@ -4277,6 +4281,10 @@ function buildSession(parsed: PersistedSession): Session {
             // #857: provenance — legacy files lack it; absent stays absent and
             // evidence-grade consumers treat absent as untrusted.
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            // Preserve the explanation saved by armFailureShrink alongside its
+            // raised baseline. A real usage settlement clears both markers.
+            emergencyShrinkAt: typeof stats.emergencyShrinkAt === "number" && Number.isFinite(stats.emergencyShrinkAt) && stats.emergencyShrinkAt >= 0 ? stats.emergencyShrinkAt : undefined,
+            emergencyShrinkEstimate: typeof stats.emergencyShrinkEstimate === "number" && Number.isFinite(stats.emergencyShrinkEstimate) && stats.emergencyShrinkEstimate > 0 ? stats.emergencyShrinkEstimate : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
             // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
@@ -4302,6 +4310,7 @@ function buildSession(parsed: PersistedSession): Session {
             lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
+            calibratedEstimateModel: typeof stats.calibratedEstimateModel === "string" && stats.calibratedEstimateModel.trim().length > 0 ? stats.calibratedEstimateModel : undefined,
             // #5952: restored on an exact "text-only-v1" match only, like the
             // ring's provenance entries — a stale mixed-modal multiplier must
             // not survive a restart wearing a provenance it never earned.

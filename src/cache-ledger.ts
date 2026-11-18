@@ -1062,14 +1062,9 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                 i++;
                 continue;
             }
-            // String content: hop to the next quote or backslash (native
-            // scans) instead of branching per byte — the bulk of any body.
-            let m = n;
-            const q = body.indexOf(34, i + 1);
-            if (q !== -1 && q < m) m = q;
-            const b = body.indexOf(92, i + 1);
-            if (b !== -1 && b < m) m = b;
-            i = m;
+            // Advance once per byte. Separate delimiter searches would each
+            // rescan the whole remaining body when a delimiter is absent.
+            i++;
             continue;
         }
         if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
@@ -1080,14 +1075,8 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
             i++;
             continue;
         }
-        // Inter-token filler (whitespace/commas/colons/literals): hop to the
-        // next structural byte, again natively.
-        let m = n;
-        for (const code of [34, 123, 125, 91, 93]) {
-            const p = body.indexOf(code, i + 1);
-            if (p !== -1 && p < m) m = p;
-        }
-        i = m;
+        // Whitespace, commas, colons and literals need no separate search.
+        i++;
     }
     return null;
 }
@@ -2139,12 +2128,16 @@ export function settleUsageReport(
                         // side would misread the pair as mid. No array locatable
                         // (unparseable body) keeps the conservative pre-fix class.
                         const shorterFull = prevSlot.full.length <= curSlot.full.length ? prevSlot.full : curSlot.full;
-                        const arrClose = messagesArrayCloseOffset(shorterFull);
-                        // #3476: a growing logical unit (single giant message whose interior
-                        // container extends in place) is byte-wise a mid-body insertion but
-                        // semantically an append — recognize it in the would-be-mid slot.
-                        const midInsert = isMidInsertionAppend(prevSlot.full, curSlot.full, lcp);
-                        curLine.bs = lcp >= Math.min(prevSlot.full.length, curSlot.full.length) - 64 ? "append" : lcp < 1024 ? "head" : arrClose !== null && lcp >= arrClose ? "tail" : midInsert ? "append" : "mid";
+                        if (lcp >= shorterFull.length - 64) curLine.bs = "append";
+                        else if (lcp < 1024) curLine.bs = "head";
+                        else {
+                            const arrClose = messagesArrayCloseOffset(shorterFull);
+                            // #3476: a growing logical unit (single giant message whose interior
+                            // container extends in place) is byte-wise a mid-body insertion but
+                            // semantically an append — recognize it in the would-be-mid slot.
+                            curLine.bs = arrClose !== null && lcp >= arrClose ? "tail"
+                                : isMidInsertionAppend(prevSlot.full, curSlot.full, lcp) ? "append" : "mid";
+                        }
                     } else {
                         curLine.bs = "unknown";
                     }
