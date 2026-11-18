@@ -17,7 +17,7 @@
 // sends no such bytes to the proxy, so those belong to the agent's in-process
 // recovery (cf. billion-context-pi#594), not here.
 
-import { existsSync, mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -125,6 +125,15 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
     // there, so the index must too (#1995 nested-tool-image parity).
     const ri = mm.rawResponsesItem;
     if (isObj(ri)) {
+        // A split Responses image core still points at the WHOLE wire item.
+        // Its imageBase64 sidecar identifies this occurrence's own pixels;
+        // walking the carrier would bind every sibling image to every ref.
+        // A URL-only occurrence has no carried bytes, even if a sibling does.
+        if (mm.imagePart === true) {
+            return typeof mm.imageBase64 === "string"
+                ? [{ mediaType: mm.imageMediaType ?? "image/png", b64: mm.imageBase64, bytes: b64Bytes(mm.imageBase64) }]
+                : [];
+        }
         const arr = ri.type === "function_call_output" || ri.type === "custom_tool_call_output"
             ? (Array.isArray(ri.output) ? ri.output : undefined)
             : (Array.isArray(ri.content) ? ri.content : undefined);
@@ -155,20 +164,13 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             }
             const fr = part.functionResponse;
             if (isObj(fr) && Array.isArray(fr.parts)) {
-                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (from the
-                // removed kernel strip-images.ts; kept for parity) — when
-                // `response` points at a part via
-                // {"$ref": displayName} the bytes are not inline,
-                // so there is nothing to restore: skip indexing (harmless waste,
-                // not corruption).
-                const refGuarded = JSON.stringify(fr.response ?? null).includes('"$ref"');
-                if (!refGuarded) {
-                    for (const np of fr.parts) {
-                        if (!isObj(np)) continue;
-                        const ni = np.inlineData;
-                        if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
-                            out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
-                        }
+                // Gemini's $ref names an inlineData part in this same response:
+                // https://ai.google.dev/api/generate-content#FunctionResponse
+                for (const np of fr.parts) {
+                    if (!isObj(np)) continue;
+                    const ni = np.inlineData;
+                    if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
+                        out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
                     }
                 }
             }
@@ -210,6 +212,20 @@ function coreMsgsOf(result: unknown): CoreMessage[] | undefined {
     return undefined;
 }
 
+function jsonAsciiMarker(text: string, foldCase = false): string {
+    return [...text].map((character) => {
+        const variants = foldCase ? [...new Set([character.toLowerCase(), character.toUpperCase()])] : [character];
+        return `(?:${variants.flatMap((value) => {
+            const hex = value.charCodeAt(0).toString(16).padStart(4, "0").replace(/[a-f]/g, (digit) => `[${digit}${digit.toUpperCase()}]`);
+            return [value, `\\\\u${hex}`];
+        }).join("|")})`;
+    }).join("");
+}
+
+const IMAGE_DATA_URL_MARKER = new RegExp(`"${jsonAsciiMarker("data:", true)}[^;,"]+(?:${jsonAsciiMarker(";base64", true)})?${jsonAsciiMarker(",")}`);
+const ANTHROPIC_BASE64_MARKER = new RegExp(`"${jsonAsciiMarker("type")}"\\s*:\\s*"${jsonAsciiMarker("base64")}"`);
+const GOOGLE_INLINE_DATA_MARKER = new RegExp(`"${jsonAsciiMarker("inlineData")}"\\s*:`);
+
 // #2824: raw-text pre-check — can this body carry indexable image bytes at
 // ALL? buildIncomingImageIndex pays a full wire→core conversion of the whole
 // history (twice per request with the post-prepare refresh) only to discover
@@ -222,15 +238,16 @@ function coreMsgsOf(result: unknown): CoreMessage[] | undefined {
 //   - anthropic source.type "base64": raw base64 payload, NO data: prefix;
 //   - google inlineData parts (top-level AND nested in functionResponse):
 //     raw base64 .data field, NO data: prefix.
-// Keyed markers tolerate JSON whitespace ("type": "base64" vs "type":"base64").
+// JSON string characters may use Unicode escapes (RFC 8259 section 7); match the ASCII
+// markers directly without decoding or copying the complete request.
 export function bodyMightCarryImages(bodyText: string, protocol: WireProtocol): boolean {
     switch (protocol) {
         case "anthropic":
-            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText) || /"type"\s*:\s*"base64"/.test(bodyText);
+            return IMAGE_DATA_URL_MARKER.test(bodyText) || ANTHROPIC_BASE64_MARKER.test(bodyText);
         case "google":
-            return /"inlineData"\s*:/.test(bodyText);
+            return GOOGLE_INLINE_DATA_MARKER.test(bodyText);
         default:
-            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText);
+            return IMAGE_DATA_URL_MARKER.test(bodyText);
     }
 }
 
@@ -438,7 +455,8 @@ export function writeRestoredImage(ref: string, idx: number, img: RestorableImag
     const digest = createHash("sha256").update(body).digest("hex").slice(0, 8);
     const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}-${digest}.${extFor(img.mediaType)}`);
     try {
-        if (existsSync(path)) return path;
+        const existing = statSync(path, { throwIfNoEntry: false });
+        if (existing?.isFile() && existing.size === body.length) return path;
         mkdirSync(dir, { recursive: true });
         writeFileSync(path, body, { mode: 0o600 });
         return path;

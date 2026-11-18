@@ -400,5 +400,54 @@ test("agentless compaction dispatch (sessionId, no initiator) is attributed", as
         await it.next();
         assert.ok(verdict !== false && verdict !== undefined, "compaction lane is attributed via the request sid");
         assert.equal(stamped["x-bili-plugin-conversation"], "sess-compaction");
+        // #6880: the declared purpose rides its own header on the same dispatch.
+        assert.equal(stamped["x-bili-plugin-purpose"], "compaction");
+    });
+});
+
+test("#6880: the dispatch purpose is captured into the scope and stamped per fetch", async (t) => {
+    await withSetup(async (handle) => {
+        const gate = _stateTakeoverGateForTest();
+        const beforeSend = _stateBeforeSendForTest();
+        const headersFor = _stateHeadersForTest();
+        assert.ok(gate);
+        assert.ok(beforeSend);
+        assert.ok(headersFor);
+        const stamps: Record<string, string>[] = [];
+        const base = async function* (): AsyncIterable<number> {
+            const init: { headers?: Record<string, string> } = { headers: {} };
+            await gate(MODEL_URL, { bytes: 200 }, init);
+            await beforeSend(MODEL_URL, init);
+            stamps.push({ ...(headersFor?.(MODEL_URL) ?? {}), ...headersOf(init) });
+            yield 1;
+        };
+        handle.setInitiator(undefined);
+
+        // 1. declared purpose: stamped verbatim next to the conversation header.
+        {
+            const it = runWaterfall(handle.events, { sessionId: "sess-review", purpose: "auto-review" }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-review");
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "auto-review");
+        }
+        // 2. ordinary conversation leaves purpose unset → the "conversation"
+        //    sentinel is stamped (presence is the v2 declaration; the server
+        //    normalizes the sentinel back to "no declared purpose", so it is
+        //    never a side request).
+        {
+            const it = runWaterfall(handle.events, { sessionId: "sess-main" }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-main");
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation");
+        }
+        // 3. hostile/odd values degrade to the main-turn sentinel — never a
+        //    bad header, never a declared aux purpose.
+        for (const junk of ["", 42, { a: 1 }, "bad\x00control", "a".repeat(65), "has space", "non-ascii-\u00e9"] as unknown[]) {
+            stamps.length = 0;
+            const it = runWaterfall(handle.events, { sessionId: "sess-junk", purpose: junk }, base)[Symbol.asyncIterator]();
+            await it.next();
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-purpose"], "conversation", `junk purpose ${JSON.stringify(String(junk).slice(0, 20))} degrades to the sentinel, never the raw value`);
+            assert.equal(stamps.at(-1)?.["x-bili-plugin-conversation"], "sess-junk");
+        }
     });
 });
