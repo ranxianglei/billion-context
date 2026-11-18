@@ -21,7 +21,7 @@ Two lanes, same plugin (#941):
    (host-plane `compaction-basic` → `auto: false`; web-profile preset
    instances are disabled at load time by the #3354 overlay; when
    `bili-native` is disabled or absent the gate restores the host-plane row
-   to stock, #5248); manual `/compact` stays available in non-web profiles. The
+   to stock, #5245); manual `/compact` stays available in non-web profiles. The
   same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
   retry whitelist, so one sampling flake that breaks a tool-call argument JSON
   retries instead of killing the turn (#2605).
@@ -207,7 +207,7 @@ untouched except for header stamping. Known limitation: manual
 kernel's natural ingest diff (auto-compaction is off everywhere while
 bili-native owns the lane — host plane via the bundle patch, web-profile
 presets via the #3354 load-time overlay; a disable restores stock since
-#5248; see the web-profile note above).
+#5245; see the web-profile note above).
 
 **Host-side context meters diverge from the model's view by design (#2837):**
 in plugin mode the host's durable session log

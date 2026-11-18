@@ -46,7 +46,7 @@ function mockGateHost() {
     };
 }
 const PRESET_SELF = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
-// #5248: the host-plane compaction-basic entry — its resolved config is the
+// #5245: the host-plane compaction-basic entry — its resolved config is the
 // plugin's own config, which the bundle patch replaces wholesale with {auto:false}
 const BASIC_SELF = { entry: { options: { name: "@deepseek-ai/dsh-compaction-basic" } } };
 function presetPlugins(): Array<Record<string, unknown>> {
@@ -105,7 +105,7 @@ test("#3662: bili-native absent (disabled / kill-switched) — service still pro
     }
 });
 
-test("#5248: bili-native absent — the static bundle-patch auto:false line is undone, host plane back to stock", () => {
+test("#5245: bili-native absent — the static bundle-patch auto:false line is undone, host plane back to stock", () => {
     try {
         _resetDshCompactionVerdictForTest();
         assert.ok(!isDshCompactionActive());
@@ -132,7 +132,7 @@ test("#5248: bili-native absent — the static bundle-patch auto:false line is u
     }
 });
 
-test("#5248: verdict active — the static line stays authoritative, host plane NOT restored", () => {
+test("#5245: verdict active — the static line stays authoritative, host plane NOT restored", () => {
     try {
         _resetDshCompactionVerdictForTest();
         declareDshCompactionActive();

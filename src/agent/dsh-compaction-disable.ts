@@ -11,7 +11,7 @@
 // (#1729); a dsh compaction checkpoint landing outside bili's knowledge
 // durably shadows the raw history and destroys the compression substrate.
 // Non-web profiles stand down the host-plane row via the bundle patch
-// (auto:false) WHILE bili owns the lane — and since #5248 the transform below
+// (auto:false) WHILE bili owns the lane — and since #5245 the transform below
 // undoes exactly that line when bili-native never declares itself active, so a
 // market disable fully reverses to stock. Web profiles run their instance
 // INSIDE an agent preset whose nested rows no patch layer can address by id
@@ -190,7 +190,7 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // #3662: honor the process verdict — without an active declaration
             // from bili-native every row passes through stock.
             if (!isDshCompactionActive()) {
-                // #5248: the bundle patch's static `compaction-basic → auto:false`
+                // #5245: the bundle patch's static `compaction-basic → auto:false`
                 // line applies whenever the bundle is mounted — including while
                 // bili-native is disabled or dead — which left non-web profiles'
                 // native auto-compaction permanently off after a market disable.
