@@ -3264,13 +3264,16 @@ export function pendingCompressValidationError(): string | undefined {
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
+    // #7100: reset on every parse — a reload that removes the externalSummary
+    // block (or the whole compress section) must not leave a stale rejection
+    // visible in /__bili/status. Only a freshly-seen invalid block re-arms it.
+    compressValidationError = undefined;
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
     if (obj.externalSummary !== undefined) {
         try {
             out.externalSummary = parseExternalSummaryChain(obj.externalSummary);
-            compressValidationError = undefined;
         }
         catch (error) {
             // Keep the "unparseable values reject the whole compress block"

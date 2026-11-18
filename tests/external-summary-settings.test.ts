@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { expandExternalSummaryChain, expandExternalSummaryChainTolerant, parseExternalSummaryChain, parseExternalSummarySettings } from "../src/external-summary-settings.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
-import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, type NamedProviderRecipe } from "../src/config.ts";
+import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, pendingCompressValidationError, type NamedProviderRecipe } from "../src/config.ts";
 import { defaultConfig } from "acp-kernel";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -132,6 +132,20 @@ test("explicit total smaller than target is a genuine contradiction and still re
     assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } }), /targetTimeoutMs 90000 exceeds totalTimeoutMs 50000/);
     // The whole compress block is still dropped (contract preserved).
     assert.equal(parseCompressSettings({ externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } } }), undefined);
+});
+
+test("pendingCompressValidationError does not go stale when the block is removed on reload (#7100)", () => {
+    // A failed load arms the pending error (parseCompressSettings drops the
+    // block and returns undefined rather than throwing — the throw is from
+    // parseExternalSummaryChain, caught here).
+    assert.equal(parseCompressSettings({ externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } } }), undefined);
+    assert.ok(pendingCompressValidationError());
+    // ...a reload with NO externalSummary key must clear it (no stale error)...
+    parseCompressSettings({});
+    assert.equal(pendingCompressValidationError(), undefined);
+    // ...and a reload with no compress section at all also clears it.
+    parseCompressSettings(undefined);
+    assert.equal(pendingCompressValidationError(), undefined);
 });
 
 for (const invalid of [
