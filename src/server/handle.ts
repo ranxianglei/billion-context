@@ -53,7 +53,7 @@ function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
-import { executeThreadsReforge } from "./threads-lane.js";
+import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
@@ -694,6 +694,17 @@ async function handleRequest(
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
+    // Only Claude Code answers the decline by dropping threads. It defers MCP tools behind tool
+    // search, so its bili MCP registration (keyed by its session id) counts when the tools are off the wire.
+    const ccSessionId = req.headers["x-claude-code-session-id"];
+    const biliCompressesThis = typeof ccSessionId === "string" && (declaresMcpBiliToolsOnWire(parsed) || consumePluginRegisterFor(ccSessionId) !== undefined);
+    const declinedThreadsBeta = protocol === "anthropic" ? threadsBetaToDecline(parsed, req.headers["anthropic-beta"], biliCompressesThis) : undefined;
+    if (declinedThreadsBeta !== undefined) {
+        log("info", `[threads] declined ${declinedThreadsBeta} for a session bili compresses — the client retries without threads and sends full history (#2701)`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `Unexpected value(s) \`${declinedThreadsBeta}\` for the \`anthropic-beta\` header. Please consult our documentation at docs.claude.com or try again without the header.` } }));
+        return;
+    }
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
@@ -1088,7 +1099,7 @@ async function handleRequest(
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim. #1421: `chainSkip` is the
     // content-level twin of the same decision (verifiable checkpoint present).
-    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1249,8 +1260,26 @@ async function handleRequest(
         // the plugin only stamps the real value).
         const rawDeclaredPurpose = pluginPurposeHeader(req.headers);
         const declaredPurpose = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION ? undefined : rawDeclaredPurpose;
+        // #6884 (pi's leg of the #6880 declaration; cross-agent session-id
+        // audit in discussions/6884): the "conversation" sentinel means
+        // DIFFERENT things per client. dsh derives it ("dsh left
+        // GenerateOptions.purpose unset on this dispatch" — possibly a brand-
+        // new aux feature the KNOWN_AUXILIARY_PURPOSES documentation set does
+        // not know yet), so for dsh it stays ≡ absent: the body heuristics
+        // classify, byte-for-byte as before #6884. pi has NO auxiliary-call
+        // concept at all (no title-gen, no compaction summarizer, no
+        // auto-review; subagents/forks mint FRESH session ids, so their turns
+        // ride their own ids) — its sentinel is a FACT about the dispatch:
+        // "this is the session's main conversation turn". A declared pi main
+        // turn therefore rides the #1699 explicit-"main" intent rung inside
+        // isSideRequest: it outranks every body heuristic (the budget <= 200
+        // demotion, the single-shot shapes) instead of being demoted to the
+        // #388 side passthrough by a shape guess — a `pi -p` one-shot with a
+        // small maxTokens and no tools must enter the kernel pipeline.
+        const declaredPiMainTurn = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION
+            && pluginAgentHeader(req.headers) === "pi";
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
-            && (isSideRequest(parsed, sideAgent, declaredPurpose)
+            && (isSideRequest(parsed, declaredPiMainTurn ? "main" : sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
@@ -2671,7 +2700,7 @@ async function handleRequest(
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
