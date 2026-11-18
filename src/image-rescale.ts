@@ -154,9 +154,9 @@ function loadJimp(): Promise<JimpModule | null> {
 // within-maxDim images the 100 KiB trigger gate IS applied as a cheap pre-filter:
 // an image at/below the trigger is skipped (re-encoding a small image rarely pays),
 // while one above it is re-encoded at the same dims and adopted only if strictly
-// smaller. The byte-shed caller pre-filters maxDim-fitting images before calling
-// (egress-shed rung B), so the within-maxDim branch is defensive — only hit when the
-// header dim parse disagrees with the authoritative Jimp.read decode.
+// smaller. The byte-shed caller pre-filters known-dim maxDim-fitting images before
+// calling (egress-shed rung B), so the within-maxDim branch is defensive — only hit
+// when the header dim parse fails or disagrees with the authoritative Jimp.read decode.
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();
