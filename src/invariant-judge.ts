@@ -498,7 +498,7 @@ function egressPairingViolations(entry: readonly CoreMessage[], exit: readonly C
 // of its normalized text) and whether the last user message survives. Advisory
 // only — never a violation, never blocks, zero extra parse (reuses the cores
 // the judge already holds).
-export interface TailCheck {
+interface TailCheck {
   /** Role of the last inbound (entry) message; "-" when entry is empty. */
   inRole: string;
   /** 8-hex sha256 of the last inbound message's normalized text; "-" when empty. */
