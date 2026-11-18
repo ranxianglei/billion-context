@@ -124,8 +124,13 @@ test("graceful shutdown keeps signal handlers until the process exits", async ()
     const server = await start();
     try {
         const serving = snapshot();
-        process.kill(process.pid, "SIGINT");
-        await once(server, "close");
+        // On Windows process.kill terminates unconditionally, bypassing JS handlers.
+        const signal = (name: "SIGINT" | "SIGTERM") => process.platform === "win32"
+            ? process.emit(name)
+            : process.kill(process.pid, name);
+        const closed = once(server, "close");
+        signal("SIGINT");
+        await closed;
         // Let the shutdown chain reach (the stubbed) process.exit first: the
         // test process must not drain out from under the assertions while the
         // flush is still running.
@@ -133,7 +138,7 @@ test("graceful shutdown keeps signal handlers until the process exits", async ()
         assertSameListeners(serving);
         // Second Ctrl+C during the flush window: must be absorbed by the
         // idempotent shutdown(), not delivered to Node's default handler.
-        process.kill(process.pid, "SIGTERM");
+        signal("SIGTERM");
         await new Promise((resolve) => setImmediate(resolve));
         assertSameListeners(serving);
         assert.ok(exits.length <= 1);
