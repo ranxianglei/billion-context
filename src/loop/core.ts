@@ -53,6 +53,13 @@ import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text
 
 export const MAX_LOOP_ROUNDS = 10;
 
+/** Keep the shared view's identity without expanding long histories into function arguments. */
+function replaceMessages(target: CoreMessage[], source: readonly CoreMessage[]): void {
+    if (target === source) return;
+    target.length = 0;
+    for (const message of source) target.push(message);
+}
+
 /** #5220: canonical signature of a failed proxy call — sorted-key JSON so
  *  argument-order noise doesn't defeat the repeat-detection set. Unparseable
  *  arguments fall back to the raw string (byte equality still catches the
@@ -1646,8 +1653,7 @@ export async function* runCompressLoop(
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
-                        coreMessages.length = 0;
-                        coreMessages.push(...hidden.messages);
+                        replaceMessages(coreMessages, hidden.messages);
                     }
                 }
                 // #422: a successful compress changed the session state — refresh
@@ -1666,8 +1672,7 @@ export async function* runCompressLoop(
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
                         if (refreshed.length > 0) {
-                            coreMessages.length = 0;
-                            coreMessages.push(...refreshed);
+                            replaceMessages(coreMessages, refreshed);
                             // The fold has now materialized in a request the
                             // model actually sees — the next usage report is
                             // post-fold reality; keeping the credit would net
@@ -1853,8 +1858,7 @@ export async function* runCompressLoop(
                     }
                     degradedRetried = true;
                     const stripped = stripLoopThinking(coreMessages);
-                    coreMessages.length = 0;
-                    coreMessages.push(...stripped);
+                    replaceMessages(coreMessages, stripped);
                     ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
                     loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
                     newBody = await buildLoopRequestBody();
