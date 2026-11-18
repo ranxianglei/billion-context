@@ -720,10 +720,12 @@ export function containsBareRefHeadText(s: string): boolean {
 }
 
 /** Raw-wire pre-check for done-event / JSON-body rebuild gates: a JSON
- *  `text` value opening exactly with the shape (followed by an escaped
- *  newline or the closing quote). Coarse by design — the false positive costs
- *  one no-op strip pass; strictness lives in stripBareRefHead. */
-const BARE_REF_HEAD_WIRE = /"text"\s*:\s*"m\d{4,6}[a-zA-Z]?(?:\\n|")/;
+ *  `text` value (Responses/Anthropic/Google) or `content` value (OpenAI chat —
+ *  the one wire where `content` is a plain string, not an array/object) opening
+ *  exactly with the shape (followed by an escaped newline or the closing quote).
+ *  Coarse by design — the false positive costs one no-op strip pass; strictness
+ *  lives in stripBareRefHead. */
+const BARE_REF_HEAD_WIRE = /"(?:text|content)"\s*:\s*"m\d{4,6}[a-zA-Z]?(?:\\n|")/;
 export function containsBareRefHeadWire(s: string): boolean {
     return BARE_REF_HEAD_WIRE.test(s);
 }

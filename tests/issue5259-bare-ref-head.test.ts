@@ -108,6 +108,15 @@ test("#5259: predicates (field-level, wire-level, chunk-level)", () => {
     assert.equal(containsBareRefHeadWire('{"text":"m01464bc\\n"}'), false);
     assert.equal(containsBareRefHeadWire('{"text":"xm01464"}'), false);
     assert.equal(containsBareRefHeadWire('{"text":"prose"}'), false);
+    // OpenAI chat: assistant text under a string `content` field — the
+    // non-streaming plugin path (pipePluginJson) gates on the raw JSON body,
+    // so the wire check must engage on `content` too (review fix, #5216).
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"m01464b\\nrest"}}]}'), true);
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"m01464b"}}]}'), true);
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"m01464bc\\n"}}]}'), false);
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"m1234567\\n"}}]}'), false);
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"m01464b more\\n"}}]}'), false);
+    assert.equal(containsBareRefHeadWire('{"choices":[{"message":{"content":"hello"}}]}'), false);
     // chunk-level fast-path gate: could this chunk OPEN the shape?
     assert.equal(mayStartBareRefHead("m"), true);
     assert.equal(mayStartBareRefHead("m0"), true);
