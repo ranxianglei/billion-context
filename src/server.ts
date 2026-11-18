@@ -2764,53 +2764,53 @@ export function warnResponsesReasoningPairs(
  *  block with recorded refs needs exact matching) and each call's args are
  *  parsed at most ONCE, whereas the old per-block scan reparsed them for
  *  every block. */
- function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>>; ensureRangeSummaries: () => Map<string, Map<string, Set<string>>> } {
-     const callIds = new Set<string>();
-     const compressCalls: BiliMessage[] = [];
-     for (const m of messages) {
-         if (m.contentType !== "tool-call") continue;
-         if (m.toolCallId) callIds.add(m.toolCallId);
-         if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
-     }
-     let rangePairs: Map<string, Set<string>> | null = null;
-     let rangeSummaries: Map<string, Map<string, Set<string>>> | null = null;
-     const ensureRangeData = (): void => {
-         if (rangePairs && rangeSummaries) return;
-         rangePairs = new Map<string, Set<string>>();
-         rangeSummaries = new Map<string, Map<string, Set<string>>>();
-         for (const c of compressCalls) {
-             let parsed: unknown;
-             try {
-                 parsed = JSON.parse(c.text ?? "");
-             } catch {
-                 continue;
-             }
-             const obj = parsed as { startId?: string; endId?: string; summary?: unknown; content?: unknown };
-             const ranges: Array<{ startId?: string; endId?: string; summary?: unknown }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string; summary?: unknown }>) : [obj];
-             for (const r of ranges) {
-                 if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
-                 let ends = rangePairs.get(r.startId);
-                 if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
-                 ends.add(r.endId);
-                 const summary = typeof r.summary === "string" ? r.summary : "";
-                 let sumEnds = rangeSummaries.get(r.startId);
-                 if (!sumEnds) { sumEnds = new Map<string, Set<string>>(); rangeSummaries.set(r.startId, sumEnds); }
-                 let summaries = sumEnds.get(r.endId);
-                 if (!summaries) { summaries = new Set<string>(); sumEnds.set(r.endId, summaries); }
-                 summaries.add(summary);
-             }
-         }
-     };
-     const ensureRangePairs = (): Map<string, Set<string>> => {
-         ensureRangeData();
-         return rangePairs!;
-     };
-     const ensureRangeSummaries = (): Map<string, Map<string, Set<string>>> => {
-         ensureRangeData();
-         return rangeSummaries!;
-     };
-     return { callIds, compressCalls, ensureRangePairs, ensureRangeSummaries };
- }
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>>; ensureRangeSummaries: () => Map<string, Map<string, Set<string>>> } {
+    const callIds = new Set<string>();
+    const compressCalls: BiliMessage[] = [];
+    for (const m of messages) {
+        if (m.contentType !== "tool-call") continue;
+        if (m.toolCallId) callIds.add(m.toolCallId);
+        if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
+    }
+    let rangePairs: Map<string, Set<string>> | null = null;
+    let rangeSummaries: Map<string, Map<string, Set<string>>> | null = null;
+    const ensureRangeData = (): void => {
+        if (rangePairs && rangeSummaries) return;
+        rangePairs = new Map<string, Set<string>>();
+        rangeSummaries = new Map<string, Map<string, Set<string>>>();
+        for (const c of compressCalls) {
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(c.text ?? "");
+            } catch {
+                continue;
+            }
+            const obj = parsed as { startId?: string; endId?: string; summary?: unknown; content?: unknown };
+            const ranges: Array<{ startId?: string; endId?: string; summary?: unknown }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string; summary?: unknown }>) : [obj];
+            for (const r of ranges) {
+                if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
+                let ends = rangePairs.get(r.startId);
+                if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
+                ends.add(r.endId);
+                const summary = typeof r.summary === "string" ? r.summary : "";
+                let sumEnds = rangeSummaries.get(r.startId);
+                if (!sumEnds) { sumEnds = new Map<string, Set<string>>(); rangeSummaries.set(r.startId, sumEnds); }
+                let summaries = sumEnds.get(r.endId);
+                if (!summaries) { summaries = new Set<string>(); sumEnds.set(r.endId, summaries); }
+                summaries.add(summary);
+            }
+        }
+    };
+    const ensureRangePairs = (): Map<string, Set<string>> => {
+        ensureRangeData();
+        return rangePairs!;
+    };
+    const ensureRangeSummaries = (): Map<string, Map<string, Set<string>>> => {
+        ensureRangeData();
+        return rangeSummaries!;
+    };
+    return { callIds, compressCalls, ensureRangePairs, ensureRangeSummaries };
+}
 
 // #5866: extract the body (everything after the first topic line) of a kernel
 // summary anchor. The kernel renders anchors as `<topic-line>\n<body>` (or just
