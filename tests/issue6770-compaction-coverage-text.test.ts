@@ -66,7 +66,9 @@ test("#6770: the argument-less default reads the live record the overlay writes"
                 { name: "@deepseek-ai/dsh-command-compact" },
             ],
         };
-        mw.call({ entry: { options: { name: "preset-dsh-go-companion" } } }, null, () => cfg);
+        // #7115: cordis dispatches internal/config as (fiber, next) with this=null,
+        // so the entry name rides the FIRST argument — pass it there, not as this.
+        mw.call(null, { entry: { options: { name: "preset-dsh-go-companion" } } }, () => cfg);
         assert.equal(compactionCoverageText(), "1 preset entry rewritten (preset-dsh-go-companion\u00d72)");
     } finally {
         _resetDshCompactionVerdictForTest();
