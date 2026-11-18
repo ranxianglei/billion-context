@@ -48,7 +48,7 @@ import type { FetchOptions } from "./fetch-util.js";
 
 const PACKUMENT_FETCH_TIMEOUT_MS = 30_000;
 
-export type MaturityVerdict =
+type MaturityVerdict =
     | { kind: "no-policy" }
     | { kind: "excluded"; spec: string; source: string }
     | { kind: "mature"; publishedAt: string; minAgeMinutes: number }
