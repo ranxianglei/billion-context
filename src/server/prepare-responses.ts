@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
+import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
@@ -32,6 +33,7 @@ import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -234,11 +236,11 @@ export async function prepareResponses(
         // Client's own system text captured BEFORE the anchor reconciliation
         // below can replace systemParts — fingerprinting the post-anchor value
         // would track bili's managed text and hide client-side drift (#1930-3).
-        const responsesClientSystem = projection.systemParts.join("\n\n---\n\n");
+        const responsesClientSystem = joinResponsesSystemSections(projection.systemParts);
         // Compaction-trigger requests are the compression mechanism itself —
         // their payload shape must not gain anchor state or note items.
         if (opts.stableSystemAnchor && !pluginMode && !isCompactionTrigger) {
-            const fresh = projection.systemParts.join("\n\n---\n\n");
+            const fresh = joinResponsesSystemSections(projection.systemParts);
             const outcome = reconcileSystemAnchor(session, "responses", fresh, sessionId, log);
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
@@ -488,7 +490,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             if (blockOpsActive) devParts.push(buildBlockOpsSystemPrompt(responsesTextProtocol ? "hybrid" : "function"));
-            const devContent = devParts.join("\n\n---\n\n");
+            const devContent = joinResponsesSystemSections(devParts);
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
@@ -502,7 +504,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
-            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
+            const devContent = joinResponsesSystemSections([...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])]);
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
@@ -597,12 +599,6 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             }
         } else if (emergencyPressureHeld) {
             nudgeOutcome = "gated";
-        }
-        // #4521: armed-but-silent window — same carrier + rationale as the
-        // anthropic lane (ephemeral trailing user item, current refs instead
-        // of model-guessed ones).
-        if (turn.statusLine && Array.isArray(rebuiltInput)) {
-            rebuiltInput = [...(rebuiltInput as ResponseInputItem[]), { type: "message", role: "user", content: turn.statusLine }];
         }
         transformOk = true;
     } catch (err) {
@@ -755,6 +751,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         separatorSlots,
         sentBodyStr,
     );
+    if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     return {
         body: sentBodyStr,
         parsedBody: rebuilt,

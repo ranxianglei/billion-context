@@ -230,6 +230,24 @@ the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
 
+**DSH Go host (third-party Android app):** the app
+(`ccch1mneyyy/dsh-Go`) ships its own dsh runtime — dsh `0.2.2-rc.1` on node
+24.22.1 / Ubuntu 24.04.5 inside a proot rootfs, ~135 patched dsh files per app
+build. The profile lane above works unchanged: run `dsh plugin --profile <name>
+add billion-context` inside its Linux environment; the engine mounts the bundle
+and spawns the proxy as its own child. Verified on a Redmi K80 / Android 16 /
+arm64-v8a — the first conversation went through the proxy (`[window]
+source=plugin`, `effective window 1048576 -> 792576 (reserved 256000)`,
+`forward POST → api.deepseek.com/anthropic/v1/messages`), and
+`GET /__bili/plugin/status` reported `contextTokens` from usage. That host's
+client is native, so a bundle shipping only `dsh.client.platform: web` (this
+one's Context tab and settings page) has no surface to render into — the
+host-side lane, the tools and the HTTP panel are unaffected, and native
+surfaces are opted into separately through `dshGo` slots (dsh-Go,
+`docs/plugins/native-for-free.md`). It also defines
+`preset-dsh-go-companion` and `preset-dsh-go-companion-full`, whose nested
+`compaction-basic` rows the #4147 structural walk is expected to cover.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
@@ -698,6 +716,19 @@ section of `~/.config/billion-context/billion-context.json` (boolean shorthand
 fallback — read only while the section is absent, ignored once it exists.
 Full field table and the `PI_ACP_DELEGATE_*` env overrides:
 configuration.md → [`pi`](configuration.md#pi).
+
+**Nudge visibility (what the proxy injected, without model-context cost).**
+With the global debug switch on (`ACP_DEBUG=1`, or `"debug": true` in the
+config file), every nudge the proxy injects mid-compression is shown in the
+terminal — once per user turn, as a transient notification after the model
+has answered — with the VERBATIM wire text: exactly the ephemeral trailing
+user message the model reads that turn, byte for byte. The notification is
+terminal-only: it is never written to the session file and adds nothing to
+model context (the nudge reaching the model is the pre-existing mechanism's
+job; this view just lets a human see it happen). Pi inline mode only — in
+spawn/attach the proxy is a separate process and the view is unavailable.
+Covers the Anthropic and OpenAI wire lanes (the two pi reaches over HTTP); on
+hosts without `ui.notify` the feature degrades to absent.
 
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request

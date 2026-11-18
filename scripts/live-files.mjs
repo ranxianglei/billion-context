@@ -147,6 +147,9 @@ export const LIVE_FILES = [
     // Native-zstd absence is simulated in an isolated Node child; it binds
     // no sockets and changes only that child's built-in module exports.
     "tests/content-encoding-zstd.test.ts",
+    // One Linux-only Node child reads fixture system CAs and exits within 10s;
+    // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
+    "tests/upstream-ca-default-trust.test.ts",
     // #5241 phase-0 startup-contract stakes: both spawn children — verify-attach
     // drives one child per lane (sequential await), latches drives the stderr
     // flip child. No shared ports (mock bili server + spawn stubs are listen(0)

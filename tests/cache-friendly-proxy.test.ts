@@ -33,12 +33,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, buildBlockOpsSystemPrompt } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { buildAbsorbSystemPrompt, ABSORB_TOOL_NAME } from "../src/compress-tool.ts";
+import { GENERATION_BOUNDARY_NOTE } from "../src/generation-boundary.ts";
+import { RESPONSES_SYSTEM_SECTION_SEPARATOR } from "../src/responses-system-sections.ts";
 
 type Item = Record<string, unknown>;
 type Wire = "responses" | "chat" | "anthropic" | "google";
@@ -398,7 +401,7 @@ function extractReply(wire: Wire, raw: string): string {
 /** Drives a growing conversation on one wire until >= 2 folds happened and at
  *  least 3 plain turns followed the last fold. Returns the captured upstream
  *  bodies in arrival order. */
-async function driveWire(wire: Wire, sessionId: string, model: string, ctx: number, opts?: { plan?: Array<number | undefined>; gapless?: boolean }): Promise<string[]> {
+async function driveWire(wire: Wire, sessionId: string, model: string, ctx: number, opts?: { plan?: Array<number | undefined>; gapless?: boolean; generationBoundary?: boolean; sections?: boolean }): Promise<string[]> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `cf-${wire}-`));
     const prevXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = tmp;
@@ -414,7 +417,12 @@ async function driveWire(wire: Wire, sessionId: string, model: string, ctx: numb
         const upstreamPort = (upstream.address() as { port: number }).port;
         _setStoreForTest(new SessionStore({ enabled: false }));
         setRegistryForTest({});
-        proxy = await startServer(proxyOptions(upstreamPort, model, ctx));
+        const options = proxyOptions(upstreamPort, model, ctx);
+        if (opts?.sections) {
+            options.compress.absorb = { enabled: true, contextThresholdPct: 0 };
+            options.compress.blockOps = { enabled: true };
+        }
+        proxy = await startServer(options);
         await listen(proxy);
         const proxyPort = (proxy.address() as { port: number }).port;
         const base = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}`;
@@ -427,13 +435,13 @@ async function driveWire(wire: Wire, sessionId: string, model: string, ctx: numb
         const hist: Item[] = [];
         const sendTurn = async (t: number): Promise<void> => {
             if (wire === "responses") {
-                hist.push({ type: "message", role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) });
+                hist.push({ type: "message", role: "user", content: (t === 0 && opts?.generationBoundary ? "Previous generation cited m90001 and m90002. " : "") + `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) });
                 const body: Item = {
                     model,
                     stream: true,
                     instructions: "You are a coding agent operating in a sandbox.\nFollow repo conventions strictly.\nRun tests before finishing.\nEnvironment notes: linux, node 22, repo at /workspace.",
                     tools: [{ type: "function", name: "shell", description: "run a shell command", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }],
-                    input: [...hist],
+                    input: [...(opts?.generationBoundary ? [{ type: "message", role: "developer", content: "Additional client instructions." }] : []), ...hist],
                 };
                 const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(body) });
                 if (!res.ok) throw new Error(`${wire} turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -581,4 +589,30 @@ test("cache-friendly proxy (anthropic swallow/back-to-back): superset replaces, 
         const after = rangesAt(r2Idxs[k]! + 1);
         for (const r of before) assert.ok(after.includes(r), `S3: summary ${r} dropped by fold #${k + 1}`);
     }
+});
+
+// #6922: these runs have no prefix-refresh feature: the standing developer
+// bytes must survive ordinary -> compress re-request (round-2) -> ordinary
+// transitions on their own. The round-2 rebuild (relay.ts) and the steady
+// prepare path (prepare-responses.ts) now share joinResponsesSystemSections,
+// so the developer item must be BYTE-identical across every fold — pinned
+// here per fold cycle and across the whole session.
+for (const sections of [false, true]) test(`Responses generation-boundary developer stays byte-identical across folds (sections=${sections})`, { timeout: 120_000 }, async () => {
+    const bodies = await driveWire("responses", `cf-generation-${sections}`, "gpt-test", 200_000, { generationBoundary: true, sections });
+    const parsed = bodies.map(body => JSON.parse(body) as Item);
+    const developer = (body: Item): Item | undefined => asArr(body.input).find(item => item.role === "developer");
+    const first = developer(parsed[0]!);
+    assert.ok(first, "real Responses encoder emitted the developer head");
+    assert.ok(JSON.stringify(first).includes(JSON.stringify(GENERATION_BOUNDARY_NOTE).slice(1, -1)), "standing note was actually detected");
+    const content = typeof first.content === "string" ? first.content : asArr(first.content).map(part => part.text).join("");
+    assert.ok(content.includes(`repo at /workspace.${RESPONSES_SYSTEM_SECTION_SEPARATOR}Additional client instructions.`), "client sections use the shared section separator");
+    const noteAt = content.indexOf(GENERATION_BOUNDARY_NOTE);
+    assert.equal(content.slice(noteAt - RESPONSES_SYSTEM_SECTION_SEPARATOR.length, noteAt), RESPONSES_SYSTEM_SECTION_SEPARATOR, "generation note sits on the shared section separator");
+    if (sections) {
+        assert.ok(JSON.stringify(first).includes("[ACP absorb]"), "absorb section enabled");
+        assert.ok(JSON.stringify(first).includes("BLOCK-LIFECYCLE MANAGEMENT"), "block-ops section enabled");
+        assert.ok(content.endsWith([GENERATION_BOUNDARY_NOTE, buildAbsorbSystemPrompt(ABSORB_TOOL_NAME), buildBlockOpsSystemPrompt("function")].join(RESPONSES_SYSTEM_SECTION_SEPARATOR)), "generation, absorb and block-ops sections sit on exactly the shared separator");
+    }
+    for (const body of parsed) assert.deepEqual(developer(body), first, "complete developer item must remain identical, including separators (steady AND round-2)");
+    runChecks("responses", bodies);
 });
