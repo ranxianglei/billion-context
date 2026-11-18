@@ -22,7 +22,7 @@ import { logHostEvent } from "./host-log.js";
  *  (no optional dependency, no timeout, no fallback), and a required
  *  `loader` would restore exactly the failure these changes remove (#3662,
  *  #7111). */
-export type LoaderFace = { loader?: { entries?: () => Iterable<unknown> } };
+type LoaderFace = { loader?: { entries?: () => Iterable<unknown> } };
 
 type GateContext = CompactionDisableHost & {
     inject?: (deps: string[], callback: (inner: LoaderFace) => void) => unknown;
