@@ -45,6 +45,26 @@ function restoreListeners(before: ReturnType<typeof snapshot>): void {
     }
 }
 
+// #7026 review follow-up (windows CI red, discussions/6884 audit): on POSIX,
+// process.kill(self, sig) dispatches to Node's signal handlers. On WINDOWS the
+// same call terminates the process (TerminateProcess) WITHOUT running the
+// handlers — the runtime only honors real console control events, and Node's
+// own docs state "On Windows, the signal being used to terminate a process
+// cannot be changed. SIGTERM is sent." (Verified on a win10 box: SIGINT and
+// SIGTERM self-kills die the process with the handler never invoked.) The
+// original test 4 therefore killed its own child on the windows-latest CI
+// runner before any assertion could run. Invoke the installed handler directly
+// instead: it exercises the identical shutdown() path a console Ctrl+C would
+// deliver.
+const sendSignal = (sig: NodeJS.Signals): void => {
+    if (process.platform === "win32") {
+        const listeners = processEvents.listeners(sig) as Array<(...args: unknown[]) => void>;
+        listeners[listeners.length - 1]?.();
+        return;
+    }
+    process.kill(process.pid, sig);
+};
+
 test("closing each server releases its process handlers across repeated lifecycles", async () => {
     const before = snapshot();
     const servers: Server[] = [];
@@ -124,21 +144,31 @@ test("graceful shutdown keeps signal handlers until the process exits", async ()
     const server = await start();
     try {
         const serving = snapshot();
-        process.kill(process.pid, "SIGINT");
+        sendSignal("SIGINT");
         await once(server, "close");
         // Let the shutdown chain reach (the stubbed) process.exit first: the
         // test process must not drain out from under the assertions while the
-        // flush is still running.
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        // flush is still running. Bounded wait instead of a fixed 500ms sleep
+        // — each flush stage is deadline-capped at EXIT_FLUSH_DEADLINE_MS
+        // (5s), so a fixed sleep races slow volumes (windows CI first).
+        for (let i = 0; i < 600 && exits.length === 0; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
         assertSameListeners(serving);
         // Second Ctrl+C during the flush window: must be absorbed by the
         // idempotent shutdown(), not delivered to Node's default handler.
-        process.kill(process.pid, "SIGTERM");
+        sendSignal("SIGTERM");
         await new Promise((resolve) => setImmediate(resolve));
         assertSameListeners(serving);
         assert.ok(exits.length <= 1);
     } finally {
         restoreListeners(before);
+        // This is the file's LAST test: if the shutdown chain has not reached
+        // the stubbed exit yet, keep the stub in place — a late REAL exit(0)
+        // would kill the runner before the TAP summary is written. The node
+        // --test child ends via event-loop drain, not process.exit, so the
+        // pending chain's exit(0) is then harmlessly recorded instead of fired.
+        if (exits.length === 0) return;
         process.exit = realExit;
     }
 });
