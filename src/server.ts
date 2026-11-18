@@ -233,7 +233,12 @@ export function selfAddressedLocalPath(reqUrl: string, localPort: number | undef
         const port = u.port !== "" ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
         if (port !== localPort) return undefined;
         const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || localMachineIps().has(normalizeIpLiteral(host));
+        // #7022 review: classifyIp covers the whole loopback range, not just
+        // configured interfaces — the tunnel-side fix stopped enumerating
+        // 127.0.0.x in localMachineIps(), so an unconfigured alias like
+        // 127.0.0.5:selfport must still be recognized as self here (else it
+        // would fall through to tunnel classification and 403, #562 self-layer).
+        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || classifyIp(host) === "loopback" || localMachineIps().has(normalizeIpLiteral(host));
         if (!mine) return undefined;
         return u.pathname + u.search;
     } catch {
@@ -1564,8 +1569,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // callback stacks on the server and a later successful bind fires ALL
         // accumulated claimOrAnnounce closures at once (double announce,
         // double registration, MaxListenersExceededWarning on long waits).
-        // Only our own callbacks ever use this event.
         server.removeAllListeners("listening");
+        server.on("listening", installProcessHandlers);
         server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
@@ -1714,7 +1719,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Node 20+ aborts the process on these by default. Log loudly and flush.
     let suppressedWriteErrors = 0;
     let suppressedRaceErrors = 0;
-    process.on("uncaughtException", (err) => {
+    const onUncaughtException = (err: Error): void => {
         if (isStreamWriteError(err)) {
             // Belt-and-suspenders for #1233: the logger's own stderr path is
             // guarded and never reaches here; a stream-write error that does
@@ -1739,10 +1744,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             return;
         }
         log("error", `uncaughtException: ${String(err?.stack ?? err)}`);
-    });
-    process.on("unhandledRejection", (reason) => {
+    };
+    const onUnhandledRejection = (reason: unknown): void => {
         log("error", `unhandledRejection: ${String(reason)}`);
-    });
+    };
     // Graceful shutdown: flush all dirty sessions to disk so a restart does
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
@@ -1816,14 +1821,40 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
     engine.lifecycleHooks.requestShutdown = (reason) => shutdown(reason);
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    // Windows never delivers SIGTERM (Node can listen but the kernel won't
-    // raise it). Ctrl+Break (and most service managers / `taskkill` / NSSM)
-    // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
-    if (process.platform === "win32") {
-        process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    const onSigterm = () => shutdown("SIGTERM");
+    const onSigint = () => shutdown("SIGINT");
+    const onSigbreak = () => shutdown("SIGBREAK");
+    let processHandlersInstalled = false;
+    function installProcessHandlers(): void {
+        if (processHandlersInstalled) return;
+        processHandlersInstalled = true;
+        process.on("uncaughtException", onUncaughtException);
+        process.on("unhandledRejection", onUnhandledRejection);
+        process.on("SIGTERM", onSigterm);
+        process.on("SIGINT", onSigint);
+        // Windows service managers deliver SIGBREAK instead of SIGTERM.
+        if (process.platform === "win32") process.on("SIGBREAK", onSigbreak);
     }
+    const removeProcessHandlers = (): void => {
+        if (!processHandlersInstalled) return;
+        // #7026 review: the close event fires when the listener stops accepting,
+        // i.e. BEFORE the session flush in finishDrain. Stripping the handlers
+        // here would leave a second Ctrl+C during the flush window unhandled —
+        // the process would die with unflushed compression state. Keep them
+        // until the process actually exits; a closed embedded server that never
+        // shut down (port-ladder retry path) still cleans up normally.
+        if (shuttingDown) return;
+        processHandlersInstalled = false;
+        process.removeListener("uncaughtException", onUncaughtException);
+        process.removeListener("unhandledRejection", onUnhandledRejection);
+        process.removeListener("SIGTERM", onSigterm);
+        process.removeListener("SIGINT", onSigint);
+        if (process.platform === "win32") process.removeListener("SIGBREAK", onSigbreak);
+    };
+    // A closed embedded server must not retain signal-driven shutdown of the
+    // hosting process. Port-claim retries can close and re-listen this server.
+    installProcessHandlers();
+    server.on("close", removeProcessHandlers);
     // Launcher children have no console and TerminateProcess leaves no room
     // for a flush (#414): they watch the launcher pid and run the graceful
     // path themselves when it disappears (≤2s after the parent exits).
@@ -4749,10 +4780,15 @@ export function isContextualUserFragment(text: string): boolean {
 //     `Time sampled while preparing turn N, step M: <ts>` — its
 //     `Browser time zone for this request:` line is embedded in that ONE
 //     message, never sent standalone, so no separate prefix for it.
+//   #7085: dsh 0.2.2-rc.3 wraps its injected notifications (the reworded
+//     runtime-context snapshot and its siblings) in a \x3csystem-reminder\x3e
+//     envelope; the envelope itself is the prefix — a real user question
+//     never opens with it.
 const AUTO_INJECTED_NOTIFICATION_PREFIXES: ReadonlyArray<string> = [
     "The approval policy changed from",
     "Current runtime context",
     "Time sampled while preparing turn",
+    "\x3csystem-reminder\x3e",
 ];
 
 export function isAutoInjectedNotification(text: string): boolean {
