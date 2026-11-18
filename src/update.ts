@@ -33,6 +33,7 @@ import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
 import { convergeDshLedger } from "./dsh-ledger.js";
+import { checkReleaseMaturity } from "./release-maturity.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -1174,6 +1175,7 @@ export async function fetchRegistryVersion(opts: Pick<UpdateOptions, "resolvePro
  *  exhausts its strikes — each names that lane's manual fix instead of the
  *  generic global-install advice. */
 const DESKTOP_LANE_HINT = "the dsh desktop profile layout is likely broken \u2014 recreate the desktop profile from dsh (or move DSH_HOME to a shorter path if pnpm virtual-store path limits are hit); retries resume automatically";
+const MATURITY_LANE_HINT = "the dsh desktop profile's pnpm maturity policy (minimumReleaseAge) is deferring this release, or its publish time could not be established \u2014 this usually clears itself once the release matures; if it persists, check the profile's pnpm config and the registry's time data";
 const PROFILE_LANE_HINT = "run `dsh plugin --profile <name> add billion-context@<version>` from a shell where `dsh` resolves (or point BILI_DSH_BIN at dsh's executable)";
 const PI_LANE_HINT = `run \`pi update --extension ${PI_NPM_SPEC}\` from a shell where \`pi\` resolves (or point BILI_PI_BIN at pi's executable)`;
 
@@ -1247,7 +1249,15 @@ export async function refreshDshProfileCopy(
  *  update lock. Silent while the copy is missing, in step, or ahead; failures
  *  log and back off through the owner-lane InstallBackoff (#2192 — this lane
  *  re-downloads the tarball per attempt, so an unbacked retry loop burned
- *  bandwidth every check cycle); never throws. */
+ *  bandwidth every check cycle); never throws.
+ *
+ *  #7139: before the swap, the profile's effective pnpm maturity policy
+ *  (minimumReleaseAge / minimumReleaseAgeExclude, resolved with pnpm's own
+ *  precedence) is checked against the registry publish time of the target
+ *  release (src/release-maturity.ts). An immature release defers the refresh
+ *  without a strike (it matures on its own); an undatable policy or publish
+ *  time FAILS CLOSED — the refresh is deferred and a strike is recorded, the
+ *  host policy is never bypassed or silently excluded. */
 export async function refreshDshDesktopCopy(
     targetVersion: string,
     log: Logger = loggerLog,
@@ -1273,6 +1283,22 @@ export async function refreshDshDesktopCopy(
     }
     if (await backoffInCooldown(bkey)) return; // #2192: inside the backoff window — no registry call, no download
     try {
+        // #7139: the desktop profile is a pnpm project whose host can pin a
+        // package-maturity policy (minimumReleaseAge + exclusions). This lane
+        // installs the tarball directly, bypassing pnpm's resolver, so the
+        // policy is enforced HERE before the swap — an immature release would
+        // leave the manifest requesting a version the lockfile cannot resolve,
+        // breaking every pnpm operation on the profile until it matures.
+        const maturity = await checkReleaseMaturity({ projectDir: path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE), packageName: DSH_PACKAGE, version: targetVersion, registryBase: REGISTRY_BASE, env, resolveProxy });
+        if (maturity.kind === "undatable") {
+            log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: cannot establish the pnpm maturity policy or the publish time for ${targetVersion} (${maturity.reason}) — deferring the in-place refresh (fail closed; the host policy is never bypassed)`);
+            await recordInstallFailure(bkey, `dsh ${DSH_DESKTOP_PROFILE} in-place refresh to ${targetVersion} deferred: ${maturity.reason}`, undefined, MATURITY_LANE_HINT);
+            return;
+        }
+        if (maturity.kind === "immature") {
+            log("info", `[update] dsh ${DSH_DESKTOP_PROFILE}: ${targetVersion} was published ${maturity.publishedAt}, inside the profile's ${maturity.minAgeMinutes}-minute pnpm minimumReleaseAge window (${maturity.source}) — deferring the in-place refresh until it matures`);
+            return; // not a failure — the version matures on its own; retry every cycle
+        }
         const doc = await fetchVersionDoc({ resolveProxy }, DSH_PACKAGE, targetVersion);
         if (!doc?.tarball) {
             log("warn", `[update] dsh ${DSH_DESKTOP_PROFILE}: in-place refresh to ${targetVersion} failed \u2014 no dist.tarball for that version on the registry; retrying next cycle`);

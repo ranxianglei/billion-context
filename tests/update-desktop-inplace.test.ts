@@ -145,6 +145,16 @@ function captureLog(): { lines: string[]; log: CaptureLog } {
     return { lines, log };
 }
 
+// #7139: the maturity gate resolves the profile's pnpm policy from the env it
+// is given (user ~/.npmrc, global config.yaml, $PREFIX/etc/npmrc). The
+// drive-path tests must not see the machine's real config — point
+// HOME/XDG_CONFIG_HOME/PREFIX at empty temp dirs.
+function hermeticPolicyEnv(root: string): NodeJS.ProcessEnv {
+    const home = path.join(root, "home");
+    mkdirSync(path.join(home, ".config"), { recursive: true });
+    return { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), PREFIX: path.join(root, "prefix") };
+}
+
 test("refreshDshDesktopCopy: stale junction displaced in place through the full drive path (#1575)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-drive-"));
     const prevDshHome = process.env.DSH_HOME;
@@ -164,7 +174,7 @@ test("refreshDshDesktopCopy: stale junction displaced in place through the full 
         process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-2.0.0.tgz", "2.0.0", integrityField(fx.tgz));
         const { lines, log } = captureLog();
-        await refreshDshDesktopCopy("2.0.0", log, process.env);
+        await refreshDshDesktopCopy("2.0.0", log, hermeticPolicyEnv(root));
 
         assert.equal(lstatSync(fx.flat).isSymbolicLink(), false, "the pnpm link must be replaced, not followed");
         assert.equal(lstatSync(fx.flat).isDirectory(), true);
@@ -277,7 +287,7 @@ test("refreshDshDesktopCopy: manifest spec converges to the installed version, r
         process.env.DSH_HOME = fx.dshHome;
         process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.194.tgz", "0.1.194", integrityField(fx.tgz));
-        await refreshDshDesktopCopy("0.1.194", captureLog().log, process.env);
+        await refreshDshDesktopCopy("0.1.194", captureLog().log, hermeticPolicyEnv(root));
 
         assert.equal(await readDiskVersion(fx.flat), "0.1.194");
         const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
@@ -346,7 +356,7 @@ test("refreshDshDesktopCopy converges the lockfile record along with the manifes
         process.env.DSH_HOME = fx.dshHome;
         process.env.XDG_CACHE_HOME = path.join(root, "cache");
         stubRegistryFetch(fx.tgz, "https://registry.test/bc-0.1.194.tgz", "0.1.194", integrityField(fx.tgz));
-        await refreshDshDesktopCopy("0.1.194", captureLog().log, process.env);
+        await refreshDshDesktopCopy("0.1.194", captureLog().log, hermeticPolicyEnv(root));
 
         assert.equal(await readDiskVersion(fx.flat), "0.1.194");
         const manifest = JSON.parse(readFileSync(path.join(profileDir, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
@@ -438,6 +448,380 @@ test("syncDshProfileManifestSpec writes atomically — converges and leaves no o
         assert.ok(!readdirSync(dir).some((f) => f.endsWith(".tmp")), `orphan tmp file left in ${dir}`);
     } finally {
         rmrf(root);
+    }
+});
+
+// —— #7139: the pnpm minimumReleaseAge gate on the in-place lane ———
+
+function isoHoursAgo(hours: number): string {
+    return new Date(Date.now() - hours * 3_600_000).toISOString();
+}
+
+/** Registry stub serving the packument (the gate's publish-time source)
+ *  alongside the dist doc + tarball. `time` = the packument's time map;
+ *  undefined = no time key at all. */
+function stubMaturityRegistryFetch(tgz: Buffer, tarballUrl: string, version: string, integrity: string, time: Record<string, string> | undefined, opts: { failNetwork?: boolean } = {}): { packumentCalls: number } {
+    const state = { packumentCalls: 0 };
+    globalThis.fetch = ((url: unknown) => {
+        const u = String(url);
+        if (u.endsWith("/billion-context")) {
+            state.packumentCalls++;
+            if (opts.failNetwork) return Promise.reject(new Error("network down"));
+            const doc: Record<string, unknown> = { name: "billion-context", versions: {} };
+            if (time !== undefined) doc.time = time;
+            return Promise.resolve(new Response(JSON.stringify(doc), { headers: { "content-type": "application/json" } }));
+        }
+        if (u.endsWith(`/billion-context/${version}`)) {
+            return Promise.resolve(new Response(JSON.stringify({ dist: { tarball: tarballUrl, integrity } }), { headers: { "content-type": "application/json" } }));
+        }
+        if (u === tarballUrl) {
+            return Promise.resolve(new Response(tgz));
+        }
+        return Promise.reject(new Error(`unexpected fetch in test: ${u}`));
+    }) as unknown as typeof fetch;
+    return state;
+}
+
+/** The frozen backoff state file (see the #2206 note at the top of this
+ *  file) — read straight from disk so the assertion is about what the lane
+ *  PERSISTED, not in-process bookkeeping. */
+function backoffStrikeCount(version: string): number {
+    try {
+        const doc = JSON.parse(readFileSync(path.join(__cacheRoot, "cache", "billion-context", ".install-backoff.json"), "utf8")) as { entries?: Record<string, { count?: number }> };
+        return doc.entries?.[`owner:dsh-desktop:${version}`]?.count ?? 0;
+    } catch {
+        return 0;
+    }
+}
+
+test("refreshDshDesktopCopy: immature release deferred — copy, manifest, lockfile untouched, no strike (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-defer-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "3.0.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        const manifestBefore = JSON.stringify({
+            name: "@dsh/profile-desktop",
+            dependencies: { "billion-context": "^1.2.3" },
+            dsh: { profile: { bundles: ["billion-context"] } },
+        }, null, 2) + "\n";
+        writeFileSync(path.join(profileDir, "package.json"), manifestBefore);
+        const lockBefore = [
+            "lockfileVersion: '9.0'",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^1.2.3",
+            "        version: 1.2.3",
+            "",
+            "packages:",
+            "",
+            "  billion-context@1.2.3:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@1.2.3: {}",
+            "",
+        ].join("\n");
+        writeFileSync(path.join(profileDir, "pnpm-lock.yaml"), lockBefore);
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), "minimumReleaseAge: 1440\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const env = hermeticPolicyEnv(root);
+        const publishedAt = isoHoursAgo(1);
+        const maturityCalls = stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-3.0.0.tgz", "3.0.0", integrityField(fx.tgz), { created: publishedAt, modified: publishedAt, "3.0.0": publishedAt });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("3.0.0", log, env);
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "the in-place swap must not have run");
+        assert.equal(await readDiskVersion(fx.storeCopy), "1.2.3");
+        assert.equal(readFileSync(path.join(profileDir, "package.json"), "utf8"), manifestBefore, "the manifest must be byte-identical");
+        assert.equal(readFileSync(path.join(profileDir, "pnpm-lock.yaml"), "utf8"), lockBefore, "the lockfile must be byte-identical");
+        assert.equal(maturityCalls.packumentCalls, 1, "the gate must have consulted the registry publish time");
+        assert.ok(lines.some((l) => l.startsWith("info:") && l.includes("minimumReleaseAge") && l.includes("deferring")), `expected the deferral line, got: ${lines.join(" | ")}`);
+        assert.ok(!lines.some((l) => l.startsWith("warn:")), `unexpected warns: ${lines.join(" | ")}`);
+        assert.equal(backoffStrikeCount("3.0.0"), 0, "deferral is not a failure — no backoff strike");
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: minimumReleaseAgeExclude lets the excluded release through (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-excluded-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "3.1.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), [
+            "minimumReleaseAge: 1440",
+            "minimumReleaseAgeExclude:",
+            "  - billion-context",
+            "",
+        ].join("\n"));
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const publishedAt = isoHoursAgo(1); // immature — but excluded
+        const maturityCalls = stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-3.1.0.tgz", "3.1.0", integrityField(fx.tgz), { created: publishedAt, modified: publishedAt, "3.1.0": publishedAt });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("3.1.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), false, "the excluded release must install");
+        assert.equal(await readDiskVersion(fx.flat), "3.1.0");
+        assert.equal(maturityCalls.packumentCalls, 0, "an excluded package must not need the publish time");
+        assert.ok(lines.some((l) => l.startsWith("info:") && l.includes("in place")), `expected the in-place success line, got: ${lines.join(" | ")}`);
+        assert.ok(!lines.some((l) => l.includes("deferring")), `must not defer an excluded release: ${lines.join(" | ")}`);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: an exclude for a different version does not lift the gate (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-excl-other-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "3.2.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), [
+            "minimumReleaseAge: 1440",
+            "minimumReleaseAgeExclude:",
+            "  - billion-context@9.9.9",
+            "",
+        ].join("\n"));
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const publishedAt = isoHoursAgo(1);
+        stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-3.2.0.tgz", "3.2.0", integrityField(fx.tgz), { created: publishedAt, modified: publishedAt, "3.2.0": publishedAt });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("3.2.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "the unrelated exclude must not lift the gate");
+        assert.ok(lines.some((l) => l.startsWith("info:") && l.includes("deferring")), `expected the deferral line, got: ${lines.join(" | ")}`);
+        assert.equal(backoffStrikeCount("3.2.0"), 0);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: a mature release updates and converges the ledgers as usual (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-mature-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "4.0.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({
+            name: "@dsh/profile-desktop",
+            dependencies: { "billion-context": "^1.2.3", "other-dep": "^1.2.3" },
+            dsh: { profile: { bundles: ["billion-context"] } },
+        }, null, 2) + "\n");
+        const lockPath = path.join(profileDir, "pnpm-lock.yaml");
+        writeFileSync(lockPath, [
+            "lockfileVersion: '9.0'",
+            "",
+            "importers:",
+            "",
+            "  .:",
+            "    dependencies:",
+            "      billion-context:",
+            "        specifier: ^1.2.3",
+            "        version: 1.2.3",
+            "",
+            "packages:",
+            "",
+            "  billion-context@1.2.3:",
+            "    resolution: {integrity: sha512-fake==}",
+            "",
+            "snapshots:",
+            "",
+            "  billion-context@1.2.3: {}",
+            "",
+        ].join("\n"));
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), "minimumReleaseAge: 1440\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const publishedAt = isoHoursAgo(48); // outside the 24h window
+        stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-4.0.0.tgz", "4.0.0", integrityField(fx.tgz), { created: publishedAt, modified: publishedAt, "4.0.0": publishedAt });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("4.0.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), false, "the mature release must install");
+        assert.equal(await readDiskVersion(fx.flat), "4.0.0");
+        const manifest = JSON.parse(readFileSync(path.join(profileDir, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
+        assert.equal(manifest.dependencies?.["billion-context"], "^4.0.0", "the manifest must converge");
+        assert.equal(manifest.dependencies?.["other-dep"], "^1.2.3");
+        const lockText = readFileSync(lockPath, "utf8");
+        assert.match(lockText, /specifier: \^4\.0\.0/);
+        assert.match(lockText, /version: 4\.0\.0/);
+        assert.ok(lockText.includes("billion-context@1.2.3:"), "store sections stay pnpm's to reconcile");
+        assert.ok(lines.some((l) => l.startsWith("info:") && l.includes("in place")), `expected the in-place success line, got: ${lines.join(" | ")}`);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: publish time unavailable → fail closed, strike recorded, copy untouched (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-notime-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "5.0.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), "minimumReleaseAge: 1440\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-5.0.0.tgz", "5.0.0", integrityField(fx.tgz), undefined); // no time key
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("5.0.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "fail closed: the swap must not have run");
+        assert.equal(await readDiskVersion(fx.storeCopy), "1.2.3");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("fail closed")), `expected the fail-closed warn, got: ${lines.join(" | ")}`);
+        assert.equal(backoffStrikeCount("5.0.0"), 1, "an undatable policy must record a strike (backed-off retry, not silent retry)");
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: registry unreachable → fail closed, strike recorded (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-netfail-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "5.1.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), "minimumReleaseAge: 1440\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-5.1.0.tgz", "5.1.0", integrityField(fx.tgz), { "5.1.0": isoHoursAgo(48) }, { failNetwork: true });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("5.1.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "fail closed: the swap must not have run");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("fail closed")), `expected the fail-closed warn, got: ${lines.join(" | ")}`);
+        assert.equal(backoffStrikeCount("5.1.0"), 1);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
+    }
+});
+
+test("refreshDshDesktopCopy: malformed maturity policy → fail closed before any registry traffic (#7139)", { timeout: 30_000 }, async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-maturity-badpolicy-"));
+    const prevDshHome = process.env.DSH_HOME;
+    const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
+    const originalFetch = globalThis.fetch;
+    t.after(() => {
+        globalThis.fetch = originalFetch;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+        else process.env.XDG_CACHE_HOME = prevXdgCacheHome;
+        rmrf(root);
+    });
+    try {
+        const fx = buildDesktopFixture(root, "1.2.3", "5.2.0");
+        const profileDir = path.join(fx.dshHome, "profiles", "desktop");
+        writeFileSync(path.join(profileDir, "pnpm-workspace.yaml"), "minimumReleaseAge: abc\n");
+        process.env.DSH_HOME = fx.dshHome;
+        process.env.XDG_CACHE_HOME = path.join(root, "cache");
+        const maturityCalls = stubMaturityRegistryFetch(fx.tgz, "https://registry.test/bc-5.2.0.tgz", "5.2.0", integrityField(fx.tgz), { "5.2.0": isoHoursAgo(48) });
+        const { lines, log } = captureLog();
+        await refreshDshDesktopCopy("5.2.0", log, hermeticPolicyEnv(root));
+
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "fail closed: the swap must not have run");
+        assert.equal(maturityCalls.packumentCalls, 0, "a malformed policy must fail before any registry traffic");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("fail closed")), `expected the fail-closed warn, got: ${lines.join(" | ")}`);
+        assert.equal(backoffStrikeCount("5.2.0"), 1);
+    } catch (e) {
+        if (String(e).includes("EPERM")) {
+            t.skip("creating directory symlinks requires elevated privileges on this platform");
+            return;
+        }
+        throw e;
     }
 });
 

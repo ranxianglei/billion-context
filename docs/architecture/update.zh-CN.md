@@ -23,6 +23,8 @@
 
 **三账收敛。** 桌面 dsh profile 是 bili 唯一完全自有的拷贝；它的自愈直接换 `node_modules/billion-context`，所以 `convergeDshLedger`（`src/dsh-ledger.ts`）同一操作里还要挪 profile manifest 的声明 spec 与 lockfile 的记录（#3496）——只挪拷贝的写者会亲手造出 #3224 检测的那种漂移。既有漂移只在显式要求时收敛：`bili doctor --fix`。`plugin-install.ts` 只驱动宿主自己的通道（`dsh plugin add`），绝不在旁边装第二份（#966）。
 
+**成熟度门。** 桌面自愈安装新版本前，`release-maturity.ts` 先查宿主的 pnpm `minimumReleaseAge` 策略——按 pnpm 自身优先级逐键解析（env `pnpm_config_*` > 项目 `pnpm-workspace.yaml`/`.npmrc` > 用户 `~/.npmrc` > 全局 config），`minimumReleaseAgeExclude` 按 pnpm version-policy 语法匹配。未成熟版本推迟到下轮（不记 strike）；发布时间或策略无法确立时 fail closed（记 strike、副本/manifest/lockfile 一律不动）——更新器绝不绕过宿主的成熟度策略（#7139）。
+
 **通告与重启。** `advisory.ts` 观察严重缺陷并开 advisory（#1481——人来处置，机器永不自行回滚）；`update-notes.ts` 承载分级 release notes（默认只 severe，#1870）；`restart.ts` 在新代码落盘后提供可选自重启（#811）。
 
 ## 硬规则
@@ -31,7 +33,7 @@
 
 ## 关键入口
 
-`src/update.ts`（更新器——承重件） · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts`（更新器——承重件） · `src/release-maturity.ts`（桌面车道 pnpm 成熟度门，#7139） · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## 相关
 
