@@ -65,6 +65,10 @@ Tier A entries are every-session rules and stay in full below. Tier B entries ca
 
 msgid 真身只有 `messages.msg_id` 一处，`l1_world`/`fold_journal`/`egress_snapshot` 里的 id 清单 JSON 全是投影，已全部降级为「区间引用 + 防伪指纹」：l1_world = 尾 512/头 32 id 窗 + count + max_pos（身份闸门→记账游标，中段不可见）；fold_journal = [start_seq,end_seq] + input_hash（原文行防伪指纹，按区间重扫重推）；egress_snapshot = 水位线以下存活行聚合指纹。**D1 永不判分叉**（判决最强动作是 reanchor 一条 UPDATE，永不 reject/400/reset）；**D2 conversation-bound 跳过 id 判定**（宿主身份行的 sid 游标纯记账，R3 故障永不触发，短/缺 msgid 只降级 + 日志）；**D3 尾锚常活**（水位命中轮同样 pin + 刷新游标；stage-0 推进 bump revisionEpoch，snapFlush epoch 证明看见推进——fork 拿不到过期父 revision）。改 l1/fold_journal/egress 任何一处前先读 discussion #7064 与本条目——三表回答的是同一个问题（「我缓存的和账本还对得上吗」），不需要 id 清单本身。Full text: design-decisions.md #20.
 
+### #21 — msgid pin 通道增量化：稳态只发尾部，快照轮才发全量（#7064 §8, owner 裁定 2026-11-18） (Tier B)
+
+全量 msgid 清单不再每轮发送：稳态靠既有有界通道 `x-bili-pf-tail-ids`（锚点+新增，≤2048，`?` 占位）携带增量，服务端从前缀**从账本 live 行重盖**（ingest 是 INSERT OR IGNORE on (session_id,seq)——位置上的 msg_id 只写一次，不从账本重盖 kernel ref 空间会漂）。校验规则三条（锚点=账本尾 id；声明数=账本数+新增数；`?` 槽=内容 id），任何失配**永不 reject**——降级 "full" 信号、下轮发全量重锚（两轮收敛，D1 家族）。全量形式不删、**全量优先**：只有快照轮（启动账本空 / 压缩/fork 后重锚）发全量。客户端经响应头 `x-bili-msgid-mode: incremental|full` 学 mode（与 x-bili-pf-seq 同头发出、4xx 即清、pf 状态机单学习点 pfLearnStamp）；抑制单点 pfSuppressFullMsgIds（wire 短于最近实测 T ⇒ 压缩 ⇒ 清 mode + 发全量）。灰度 `pluginMsgIdIncremental` 默认 0（off = 字节级同改前）；opencode 暂留全量（phase 2：core-aligned 列表跳过 leading system 而 /responses T 计 wire，tail off-by-one）。改 pin/信号/tail-ids 任何一处前先读 discussion #7064 §8 与本条目。Full text: design-decisions.md #21.
+
 ### Install-Lane & Update-Ownership Contract (#1196)
 
 Every bili presence on a machine follows ONE contract — decide changes against it, not ad hoc:

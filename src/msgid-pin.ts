@@ -96,6 +96,13 @@ export function incomingSeqsOf(body: unknown): number[] | undefined {
     return raw as number[];
 }
 
+/** #7064 §8: the pin-mode signal the server stamps on the response — tells
+ *  the client what it may send NEXT turn: "incremental" (the ledger pins the
+ *  prefix; ride only x-bili-pf-tail-ids, suppress the full list) or "full"
+ *  (send the full id list — bootstrap / reanchor / this turn degraded).
+ *  Rides with the existing watermark response headers (same chokepoint). */
+export const MSGID_MODE_HEADER = "x-bili-msgid-mode";
+
 /** Strict validation for the seq stamp array: 1-based positive integers,
  *  exactly one per message. Non-monotonic or non-contiguous values are
  *  ACCEPTED on purpose — the branch pointers pick arbitrary row subsets

@@ -343,6 +343,15 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // before trusting them, so drift degrades instead of misaligning.
             const msgIdsHeader = stampedMsgIdsHeaderFromMessages(e.messages);
             if (msgIdsHeader !== undefined) headers.set("x-bili-msg-ids", msgIdsHeader);
+            // #7064 §8: opencode stays on the FULL form (phase 2) — its
+            // id list is core-aligned (leading system run skipped, see
+            // opencodeV2MsgIdList) while the /responses watermark T counts
+            // the wire INCLUDING the head run, so the tail-ids slice would
+            // be off-by-one and the server's incremental anchor/width
+            // checks would degrade every turn. Wiring it needs the pf
+            // capture wired to this event's core-aligned list with a
+            // head-run offset; the header budget pressure it releases (the
+            // 16KiB ceiling past ~1000 messages) is tracked there.
             // #1699: forward the host's per-request persona so the proxy can classify
             // side requests by intent — opencode v2 title-gen carries no max_tokens, so
             // the budget heuristic alone can never see it. Stamped for every non-empty

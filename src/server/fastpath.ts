@@ -158,6 +158,9 @@ function parseTailIds(raw: string): string[] | null {
 
 /** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
  *  Production callers use parseTailIds directly. */
+/** #7064 §8: the INCREMENTAL pin (stage0) parses the same header it pins
+ *  from — one parser, one rule, parity-pinned via _parseTailIdsForTest. */
+export function parseTailIdsForPin(raw: string): string[] | null { return parseTailIds(raw); }
 export function _parseTailIdsForTest(raw: string): string[] | null { return parseTailIds(raw); }
 
 function readSaved(sessionId: string): PFSavedState | null {

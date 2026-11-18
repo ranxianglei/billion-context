@@ -1796,6 +1796,19 @@ export class UnifiedStore {
         return row !== undefined;
     }
 
+    /** #7064 §8: the ledger's LIVE stamped ids in seq order (0-based index ⇔
+     *  ledger position). The incremental pin re-stamps a steady-state turn's
+     *  prefix cores from this list — ingest is INSERT OR IGNORE on (session_id,
+     *  seq), so a position's msg_id is written once and the kernel's ref space
+     *  only stays stable when every presented id matches the ledger. Empty
+     *  array = empty ledger (bootstrap: the full-list path must run). */
+    snapMsgIdLiveIds(sid: string): string[] {
+        const rows = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+            .all(sid) as { msg_id: string }[];
+        return rows.map((r) => r.msg_id);
+    }
+
     /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
      *  previous process (a restart must not re-arm a misbehaving host and
      *  re-400 the same broken envelope). */

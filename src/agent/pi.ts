@@ -628,6 +628,12 @@ function stampMsgIdEnvelope(
     if (base.biliMsgIds !== undefined) return undefined; // already stamped — never double-stamp
     const ids = resolveEnvelopeIdsForFullResend(base, ctx);
     if (ids === undefined) return undefined;
+    // #7064 §8: steady-state turns SUPPRESS the full list — the server pins
+    // the prefix from the ledger and the pf tail-ids channel (same
+    // chokepoint, same captured ids) carries only anchor+new. Unlearned / 4xx
+    // relearned / shrinking ⇒ the full list rides as before.
+    const pfSid = sessionIdOf(ctx);
+    if (pfSid !== undefined && pfChannel.pfSuppressFullMsgIds(pfSid, ids.length)) return undefined;
     return { ...base, biliMsgIds: ids };
 }
 

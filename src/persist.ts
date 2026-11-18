@@ -2500,6 +2500,14 @@ export class SessionStore {
         return this.liveShadow().snapConvBound(sessionId);
     }
 
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds).
+     *  [] when the unified store is unavailable — the caller treats that as an
+     *  empty ledger (C=0) and degrades to the full-list signal. */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapMsgIdLiveIds(sessionId);
+    }
+
     /** #6181 M3: whether this sid's R3 breaker latch persisted from a
      *  previous process (a restart must not re-arm a misbehaving host). */
     snapR3Latched(sessionId: string): boolean {

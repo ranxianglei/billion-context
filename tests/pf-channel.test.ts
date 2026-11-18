@@ -12,9 +12,10 @@ import { makeRecordingFetch, type RecordedCall } from "./helpers/hot-replace.ts"
 
 const CONVO = "x-bili-plugin-conversation";
 
-function learn(headersIn: Record<string, string>, seq: string | null | undefined, status = 200): void {
+function learn(headersIn: Record<string, string>, seq: string | null | undefined, status = 200, mode?: "incremental" | "full"): void {
     const respHeaders = new Headers();
     if (seq !== null && seq !== undefined) respHeaders.set("x-bili-pf-seq", seq);
+    if (mode !== undefined) respHeaders.set("x-bili-msgid-mode", mode);
     pfChannel.pfLearnStamp(headersIn, status, respHeaders);
 }
 
@@ -331,4 +332,63 @@ test("laneMsgIdsForOpenAiWire: bails honestly on anything unprovable", () => {
         ]),
         undefined,
     );
+});
+
+// ---------------------------------------------------------------------------
+// #7064 §8: the pin-mode signal (x-bili-msgid-mode) — the client sends the
+// FULL msgid list only until the server proves steady-state incremental pins
+// work for this conversation; a 'full' signal / 4xx / shrink re-converges.
+// ---------------------------------------------------------------------------
+
+test("pf-channel: 'incremental' signal ⇒ the full msgid list stops riding the wire", () => {
+    const sid = "sid-mode-inc-1";
+    const inH = { [CONVO]: sid };
+    // not learned yet ⇒ never suppress
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false);
+    // the signal rides WITH the seq stamp (the server stamps both)
+    learn(inH, "10", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true, "wireCount == learned total ⇒ steady state");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 12), true, "growing wire ⇒ still steady state");
+    // a mode without a usable seq total is inert (structural coupling to the
+    // watermark cohort — the server only stamps the signal there)
+    const sidNoSeq = "sid-mode-inc-noseq";
+    learn({ [CONVO]: sidNoSeq }, null, 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sidNoSeq, 10), false, "no seq total ⇒ nothing to anchor a count against");
+});
+
+test("pf-channel: 'full' signal ⇒ the full list keeps riding (no suppression)", () => {
+    const sid = "sid-mode-full-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "10", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
+    // a degraded turn tells the client to go full again
+    learn(inH, "10", 200, "full");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "'full' overwrites 'incremental'");
+    // the client can grow back into steady state once pins succeed again
+    learn(inH, "11", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 11), true);
+});
+
+test("pf-channel: shrink (wire shorter than the learned total) ⇒ clear + send full this turn", () => {
+    const sid = "sid-mode-shrink-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "10", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
+    // compaction/rewind: the wire shrank — the stale anchor cannot be pinned
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 7), false, "shrinking turn sends the full list");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "the mode is CLEARED, not just skipped for one turn");
+    // a fresh incremental signal re-arms it
+    learn(inH, "7", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 7), true);
+});
+
+test("pf-channel: a >=4xx response clears the learned mode immediately", () => {
+    const sid = "sid-mode-4xx-1";
+    const inH = { [CONVO]: sid };
+    learn(inH, "10", 200, "incremental");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), true);
+    learn(inH, null, 400);
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 10), false, "4xx ⇒ back to full until a 2xx restamps");
+    // 4xx on an unknown sid is a no-op
+    learn({ [CONVO]: "sid-mode-4xx-unknown" }, null, 429);
 });

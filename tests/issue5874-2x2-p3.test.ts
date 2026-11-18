@@ -684,17 +684,18 @@ type DLog = { level: string, msg: string };
 function d23Harness(t: test.TestContext) {
     const dir = mkdtempSync(path.join(os.tmpdir(), "bili-5874-d23-"));
     const prevEnv: Record<string, string | undefined> = {};
-    for (const k of ["BILI_STORAGE_UNIFIED", "BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) {
+    for (const k of ["BILI_STORAGE_UNIFIED", "BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY", "BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) {
         prevEnv[k] = process.env[k];
         process.env[k] = k.startsWith("XDG") ? dir : (k === "BILI_STORAGE_UNIFIED" ? "full" : "1");
     }
     const store = UnifiedStore.open(path.join(dir, "index.db"));
     // runStage0 talks to the store through the SessionStore seam — give it
-    // the three snap delegates, delegating to the real UnifiedStore.
+    // the snap delegates, delegating to the real UnifiedStore.
     _setStoreForTest({
-        setSessionCommitListener() { /* the seam only needs the three snap delegates */ },
+        setSessionCommitListener() { /* the seam only needs the snap delegates */ },
         snapStage0: (sid: string, ids: string[], opts?: { seqs?: number[] | null }) => store.snapStage0(sid, ids, opts),
         snapConvBound: (sid: string) => store.snapConvBound(sid),
+        snapMsgIdLiveIds: (sid: string) => store.snapMsgIdLiveIds(sid),
         snapR3Latched: (sid: string) => store.snapR3Latched(sid),
     } as unknown as Parameters<typeof _setStoreForTest>[0]);
     t.after(() => {
@@ -827,4 +828,114 @@ test("#7064 D3: the tail anchor stays live across watermark-hit runs", async (t)
     } finally {
         r3FaultTracker.clearLatched(sid);
     }
+});
+
+// ---------------------------------------------------------------------------
+// I* — #7064 §8: the INCREMENTAL pin (steady state rides x-bili-pf-tail-ids,
+// the prefix is re-stamped from the ledger, the full form is a snapshot turn)
+// ---------------------------------------------------------------------------
+
+/** Seed the ledger's messages table (what ingestRowsNow does in production,
+ *  after the pin) so snapMsgIdLiveIds has rows to pin from. */
+function seedLedger(db: DbLike, sid: string, ids: string[]): void {
+    ids.forEach((id, seq) => {
+        const hash = `h-${sid}-${seq}`;
+        db.prepare("INSERT OR IGNORE INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, 1, 0, 'sha256', x'00')").run(hash);
+        db.prepare("INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, ?, ?, NULL, ?, 'user', 'message', ?, '', NULL)").run(sid, seq, id, seq + 1, hash);
+    });
+}
+
+test("#7064 §8 I1: bootstrap full pin signals 'incremental'; steady turn pins prefix from the ledger + tail from the header", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const sid = "i1-sid";
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    // bootstrap: the full list arrives on an EMPTY ledger.
+    const r0 = runStage0({
+        sessionId: sid, lane: "openai", msgs: dMsgs(5),
+        incomingMsgIds: ["a1", "a2", "a3", "a4", "a5"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.notEqual(r0.pinned, null, "bootstrap pins the full list");
+    assert.equal(r0.pinMode, "incremental", "a successful pin ⇒ the NEXT turn may go incremental (this is what upgrades the client out of full-list mode)");
+    // ingest lands the rows (production order: pin in-request, flush after).
+    seedLedger(db, sid, ["a1", "a2", "a3", "a4", "a5"]);
+    // steady state: no full list, only the tail (anchor a5 + new core a6).
+    const r1 = runStage0({
+        sessionId: sid, lane: "openai", msgs: dMsgs(6),
+        incomingMsgIds: undefined, incomingSeqs: null,
+        incomingTailIds: ["a5", "a6"], pluginMode: true, log,
+    });
+    assert.notEqual(r1.pinned, null, "the incremental pin applied");
+    assert.equal(r1.pinMode, "incremental");
+    assert.deepEqual(r1.pinned!.map((m) => m.id).slice(0, 5), ["a1", "a2", "a3", "a4", "a5"], "the prefix is re-stamped from the LEDGER, not the client");
+    assert.equal(r1.pinned![5].id, "a6", "the new core is pinned from the tail");
+    assert.equal(r1.anchorAdvanced, true, "the cursor extended");
+});
+
+test("#7064 §8 I2: any structural mismatch degrades to the 'full' signal — never a reject", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    const sid = "i2-sid";
+    seedLedger(db, sid, ["b1", "b2", "b3"]);
+    const cases: Array<[string, string[]]> = [
+        ["anchor mismatch (tail[0] ≠ ledger frontier)", ["b2", "x4"]],
+        ["anchor is an unknown slot", ["?", "x4"]],
+        ["width mismatch (ledger 3 + 2 new ≠ view 4)", ["b3", "x4", "x5"]],
+    ];
+    for (const [name, tail] of cases) {
+        const r = runStage0({
+            sessionId: sid, lane: "openai", msgs: dMsgs(4),
+            incomingMsgIds: undefined, incomingSeqs: null,
+            incomingTailIds: tail, pluginMode: true, log,
+        });
+        assert.equal(r.pinned, null, `${name}: no pin`);
+        assert.equal(r.pinMode, "full", `${name}: the full signal re-converges next turn`);
+    }
+    // a malformed header (null) is simply not the incremental form — no
+    // pin, no signal, byte-identical to pre-§8.
+    const r2 = runStage0({
+        sessionId: sid, lane: "openai", msgs: dMsgs(4),
+        incomingMsgIds: undefined, incomingSeqs: null,
+        incomingTailIds: null, pluginMode: true, log,
+    });
+    assert.equal(r2.pinned, null);
+    assert.equal(r2.pinMode, null, "malformed tail ⇒ the incremental form was not attempted");
+});
+
+test("#7064 §8 I3: empty ledger (true bootstrap) takes the full signal; full form wins when both arrive; a '?' NEW slot keeps its content-derived id", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    // (a) empty ledger + tail only ⇒ 'full' (the list must bootstrap).
+    const ra = runStage0({
+        sessionId: "i3a-sid", lane: "openai", msgs: dMsgs(2),
+        incomingMsgIds: undefined, incomingSeqs: null,
+        incomingTailIds: ["c1", "c2"], pluginMode: true, log,
+    });
+    assert.equal(ra.pinned, null, "no ledger ⇒ nothing to pin a prefix from");
+    assert.equal(ra.pinMode, "full");
+    // (b) BOTH forms present ⇒ the full form runs (bootstrap/reanchor must
+    // stay reachable regardless of the mode the client is in).
+    seedLedger(db, "i3b-sid", ["d1", "d2", "d3"]);
+    const rb = runStage0({
+        sessionId: "i3b-sid", lane: "openai", msgs: dMsgs(4),
+        incomingMsgIds: ["d1", "d2", "d3", "d4"], incomingSeqs: null,
+        incomingTailIds: ["d3", "d4"], pluginMode: true, log,
+    });
+    assert.notEqual(rb.pinned, null, "the full pin applied");
+    assert.equal(rb.pinMode, "incremental", "successful full pin ⇒ incremental signal");
+    // (c) a '?' NEW slot (id-less element) keeps its content-derived id —
+    // only the ledger prefix is re-stamped, the tail is trusted per-slot.
+    seedLedger(db, "i3c-sid", ["e1", "e2"]);
+    const rc = runStage0({
+        sessionId: "i3c-sid", lane: "openai", msgs: dMsgs(3),
+        incomingMsgIds: undefined, incomingSeqs: null,
+        incomingTailIds: ["e2", "?"], pluginMode: true, log,
+    });
+    assert.notEqual(rc.pinned, null);
+    assert.notEqual(rc.pinned![2].id, "?", "the '?' slot was NOT pinned verbatim");
+    assert.equal(rc.pinned![2].id, dMsgs(3)[2].id, "the '?' slot keeps the core's pre-existing content-derived id");
+    assert.equal(rc.pinMode, "incremental");
 });

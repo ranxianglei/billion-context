@@ -1000,6 +1000,12 @@ export class UnifiedShadow {
         return this.sync.snapConvBound(sessionId);
     }
 
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds). */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.snapMsgIdLiveIds(sessionId);
+    }
+
     /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
     snapR3Latched(sessionId: string): boolean {
         if (this.sync === null) return false;

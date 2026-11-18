@@ -2931,6 +2931,11 @@ export async function apply(ctx: PluginContext): Promise<void> {
         if (parsed === undefined) return;
         const coreAligned = resolveEnvelopeMsgIds(parsed, dispatchScope.getStore()?.messages);
         if (coreAligned === undefined) return;
+        // #7064 §8: steady-state suppression — the pf tail-ids channel
+        // (captured at the pfCaptureIds site above, same chokepoint) carries
+        // anchor+new and the server pins the prefix from the ledger; the
+        // full list rides only at bootstrap / reanchor (pfSuppressFullMsgIds).
+        if (pfChannel.pfSuppressFullMsgIds(attr.sid, coreAligned.length)) return;
         const fmt = detectWireFormat(parsed) as string; // log detail only — the resolver already gated the wire
         const stamped = { ...parsed, [ENVELOPE_MSG_IDS_FIELD]: coreAligned };
         init.body = JSON.stringify(stamped);

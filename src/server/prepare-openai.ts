@@ -8,7 +8,7 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
@@ -51,7 +51,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { PF_TAIL_IDS_HEADER, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -89,6 +89,17 @@ export async function prepareOpenai(
     const incomingSeqsRaw = incomingSeqsOf(parsed);
     delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #7064 §8: the INCREMENTAL pin reuses the watermark's bounded tail-ids
+    // header — the same bytes that ride the wire for the hit verdict pin the
+    // prefix when the full list is absent. Three-state handoff to stage 0
+    // (undefined = header absent, null = malformed → degrade, array = valid,
+    // "?" slots kept). The fastpath re-parses the header itself for its own
+    // verdict — one parser, one rule (parseTailIdsForPin).
+    const rawTailIdsHeader = req.headers[PF_TAIL_IDS_HEADER];
+    const incomingTailIds: string[] | null | undefined =
+        rawTailIdsHeader === undefined ? undefined
+        : typeof rawTailIdsHeader === "string" ? parseTailIdsForPin(rawTailIdsHeader)
+        : null;
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
     let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
@@ -176,6 +187,9 @@ export async function prepareOpenai(
     // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
     // read at end-of-prepare to decide whether the debounce still needs a shot).
     let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8: hoisted so the end-of-prepare response-header block can stamp
+    // the pin-mode signal (stage 0 runs inside the try below).
+    let s0PinMode: "full" | "incremental" | null = null;
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -218,10 +232,12 @@ export async function prepareOpenai(
             msgs,
             incomingMsgIds,
             incomingSeqs,
+            incomingTailIds,
             pluginMode,
             wpHit,
             log,
         });
+        s0PinMode = s0.pinMode;
         if (s0.pinned !== null) {
             msgs = s0.pinned;
             originalMessages = msgs;
@@ -708,6 +724,13 @@ export async function prepareOpenai(
             rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
             turnStripCounts: wpTurnStrip,
         });
+        // #7064 §8: the pin-mode signal rides WITH the watermark headers —
+        // the client relearns the mode exactly when it relearns T (same
+        // chokepoint, one round-trip). Gated on the flag: off = no new
+        // response bytes anywhere.
+        if (featureEnabled("pluginMsgIdIncremental") && s0PinMode !== null) {
+            wpResponseHeaders[MSGID_MODE_HEADER] = s0PinMode;
+        }
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);

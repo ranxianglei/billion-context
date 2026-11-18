@@ -33,6 +33,10 @@ const COUNT_HEADER = "x-bili-pf-count";
 const TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 const CONVERSATION_HEADER = "x-bili-plugin-conversation";
 const SEQ_HEADER = "x-bili-pf-seq";
+// #7064 §8: the pin-mode signal (server stamps it WITH the pf-seq header;
+// the literal duplicates src/msgid-pin.ts MSGID_MODE_HEADER — the agent
+// bundles are import-free leaves, same rule as PF_SLOT_UNKNOWN).
+const MSGID_MODE_HEADER = "x-bili-msgid-mode";
 export const PF_SLOT_UNKNOWN = "?";
 
 const MAX_ID_LEN = 512;
@@ -44,7 +48,15 @@ const BAD_ID_CHARS = /[\s\p{C}]/u;
 const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
 const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
 
-type Tracked = { t?: number; ids?: string[] };
+type Tracked = {
+    t?: number;
+    ids?: string[];
+    /** #7064 §8: what the server told us we may send next turn (learned
+     *  from x-bili-msgid-mode; cleared on any >=4xx response — the server
+     *  re-converges one turn later). "incremental" ⇒ steady-state turns
+     *  suppress the full msgid list and ride only the tail-ids header. */
+    mode?: "incremental" | "full";
+};
 
 const tracked = new Map<string, Tracked>();
 
@@ -66,11 +78,23 @@ function takeSlot(sid: string): Tracked {
 /** Central learn point (native-intercept success sites): record THIS
  *  request's measured element total T against its conversation id. Non-2xx
  *  responses and malformed stamps are ignored — a broken echo costs nothing
- *  (the server restamps every evaluated response). */
+ *  (the server restamps every evaluated response). #7064 §8 also learns the
+ *  pin mode here: a >=4xx clears it immediately (mismatch ⇒ the server told
+ *  us to go full anyway; the next 2xx restamps it). */
 export function pfLearnStamp(headersIn: Record<string, string>, respStatus: number, respHeaders: Headers | null | undefined): void {
-    if (respStatus !== 200) return;
     const sid = headersIn[CONVERSATION_HEADER];
-    if (sid === undefined || sid.length === 0 || respHeaders === null || respHeaders === undefined) return;
+    if (respStatus >= 400) {
+        if (sid !== undefined && sid.length > 0) {
+            const slot = tracked.get(sid);
+            if (slot !== undefined && slot.mode !== undefined) slot.mode = undefined;
+        }
+        return;
+    }
+    if (respStatus !== 200 || sid === undefined || sid.length === 0 || respHeaders === null || respHeaders === undefined) return;
+    const modeRaw = respHeaders.get(MSGID_MODE_HEADER);
+    if (modeRaw === "incremental" || modeRaw === "full") {
+        takeSlot(sid).mode = modeRaw;
+    }
     const raw = respHeaders.get(SEQ_HEADER);
     if (raw === null || !/^\d+$/.test(raw)) return;
     const t = Number(raw);
@@ -133,4 +157,23 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
         out[TAIL_IDS_HEADER] = ids.slice(k - 1).map(encodeURIComponent).join(",");
     }
     return out;
+}
+
+/** #7064 §8: whether the full msgid list may be SUPPRESSED on THIS outbound
+ *  request (steady-state incremental — the ledger pins the prefix; only the
+ *  bounded tail-ids header above carries the new ids). Full form stays
+ *  authoritative at bootstrap (nothing learned) and at reanchor: a wire
+ *  SHORTER than the last measured T means the host compacted/truncated —
+ *  the learned mode is stale and this turn MUST send the full list (the
+ *  server re-anchors and restamps the mode one round-trip later).
+ *  wireCount = the id list this turn would have carried. */
+export function pfSuppressFullMsgIds(sid: string, wireCount: number): boolean {
+    if (sid.length === 0) return false;
+    const slot = tracked.get(sid);
+    if (slot === undefined || slot.mode !== "incremental" || slot.t === undefined) return false;
+    if (wireCount < slot.t) {
+        slot.mode = undefined; // shrink ⇒ reanchor next turn — never suppress on the shrinking turn
+        return false;
+    }
+    return true;
 }

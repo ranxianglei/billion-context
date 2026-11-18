@@ -44,6 +44,15 @@ export interface Stage0Input {
     /** Validated ledger seqs (null when absent/mismatched — the lane
      *  already applied them to msgs when non-null). */
     incomingSeqs: number[] | null;
+    /** #7064 §8: the decoded x-bili-pf-tail-ids value — three-state, exactly
+     *  like the fastpath's parsedTailIds (undefined = header absent, null =
+     *  malformed, array = valid, possibly containing "?" slots). The lane
+     *  parses it; this path only pins from it when the FULL form is absent.
+     *  Positioning contract: element 0 ⇔ the turn's LAST prefix core (the
+     *  anchor), the rest are the NEW cores — the same shape the client's
+     *  tail-ids arithmetic produces (core-aligned id list sliced at the
+     *  last measured T, openai wire). */
+    incomingTailIds?: string[] | null;
     pluginMode: boolean;
     /** The openai fast-path watermark hit; the responses lane has none.
      *  (D3: a hit turn still refreshes the cursor — this field is now
@@ -66,13 +75,24 @@ export interface Stage0Result {
      *  taken between the cursor write and the flush otherwise reads a
      *  STALE parent revision (plugin-fork lane regression, #6785 WIP). */
     anchorAdvanced: boolean;
+    /** #7064 §8: what the client may send NEXT turn (stamped on the
+     *  response as x-bili-msgid-mode, only when the flag is on): "full"
+     *  — send the full id list (bootstrap / reanchor / this turn degraded
+     *  / the flag is off and only the full pin runs); "incremental" — the
+     *  ledger pins the prefix, ride only x-bili-pf-tail-ids. null = neither
+     *  form was attempted (no field, no valid tail-ids) — no signal. */
+    pinMode: "full" | "incremental" | null;
 }
 
 export function runStage0(opts: Stage0Input): Stage0Result {
-    const { sessionId, lane, msgs, incomingMsgIds, incomingSeqs, pluginMode, wpHit, log } = opts;
+    const { sessionId, lane, msgs, incomingMsgIds, incomingSeqs, incomingTailIds, pluginMode, wpHit, log } = opts;
     void wpHit; // D3: the arm no longer keys on the hit state (logs only)
     const rollout = featureEnabled("pluginLaneServerHistory");
     const declared = Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0;
+    // #7064 §8: the incremental pin is its OWN rollout on top of the lane's
+    // (the full-list pin below is untouched). Off = byte-identical to
+    // pre-§8 behavior.
+    const incrementalOn = rollout && pluginMode && featureEnabled("pluginMsgIdIncremental");
     // M1: the arm rides the SAME rollout as the pin — under the default
     // (rollout off) the whole 2×2 path is unreachable, so R3 is not dead
     // code waiting for a rollout that never arms it. #7064 D3: the
@@ -92,6 +112,10 @@ export function runStage0(opts: Stage0Input): Stage0Result {
         log("debug", `[${sessionId}] [2x2:${lane}] sid is R3-latched — legacy path this turn`);
     }
     let pinned: BiliMessage[] | null = null;
+    // #7064 §8: the pin-mode signal (see Stage0Result.pinMode). Set wherever
+    // EITHER declared form arrives; the full form ALWAYS wins when present
+    // (bootstrap / reanchor must be able to run regardless of mode).
+    let pinMode: Stage0Result["pinMode"] = null;
     // #6785 owner ruling (2026-11-17): the pin runs on watermark-hit turns TOO.
     // The fork lane matches by host msgid against the ledger's rawIds — a
     // hit turn that skipped the pin wrote h_ rows the child's host ids can
@@ -153,6 +177,35 @@ export function runStage0(opts: Stage0Input): Stage0Result {
         } else {
             log("info", `[${sessionId}] [msgid] ${lane}-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
         }
+        // #7064 §8: the signal is what the client may send NEXT turn — a
+        // SUCCESSFUL pin (bootstrap / reanchor included) means the ledger
+        // holds the prefix, so the next turn may go incremental. This is
+        // what upgrades the client out of full-list mode: a hard "full"
+        // here would deadlock the ladder (the full form always wins while
+        // it is sent, so the incremental branch would never be reached).
+        pinMode = pinned !== null ? "incremental" : "full";
+    } else if (pluginMode && Array.isArray(incomingTailIds) && incomingTailIds.length > 0) {
+        // #7064 §8 steady state: no full list, only the bounded tail (anchor
+        // + new cores). The prefix is pinned from the LEDGER's live rows,
+        // the new cores from the tail. ANY mismatch degrades to the full
+        // signal — D1: this path NEVER rejects (it is a drift class, not an
+        // R3 identity fault) — and the next turn re-converges with a full
+        // list (one-round convergence by construction).
+        if (incrementalOn) {
+            const inc = tryIncrementalPin(sessionId, lane, msgs, incomingTailIds, log);
+            if (inc !== null) {
+                pinned = inc;
+                pinMode = "incremental";
+            } else {
+                pinMode = "full";
+            }
+        } else {
+            // Flag off (or the lane rollout off): only the full-list pin
+            // runs server-side — tell the client to go back to the full
+            // form so a rollback self-heals instead of leaving the session
+            // pin-less until a 4xx relearns the mode.
+            pinMode = "full";
+        }
     }
     let anchorAdvanced = false;
     // D3: the cursor (world anchor) refreshes whenever the host declared +
@@ -190,5 +243,51 @@ export function runStage0(opts: Stage0Input): Stage0Result {
             }
         }
     }
-    return { pinned, cohortRan: armed, anchorAdvanced };
+    return { pinned, cohortRan: armed, anchorAdvanced, pinMode };
+}
+
+// #7064 §8: the incremental pin — prefix cores re-stamped from the ledger's
+// live rows (ingest is INSERT OR IGNORE on (session_id, seq): a position's
+// msg_id is written once, so the kernel's ref space only stays stable when
+// every presented id matches the ledger), new cores pinned from the tail
+// (a "?" slot keeps its content-derived id). Returns null — the full
+// signal — on ANY structural disagreement: empty ledger (bootstrap), width
+// mismatch (the host compacted/rewrote: C + N !== view length), or an
+// anchor that is not the ledger frontier (stale window / id space moved).
+function tryIncrementalPin(
+    sessionId: string,
+    lane: string,
+    msgs: BiliMessage[],
+    tailIds: string[],
+    log: (level: string, msg: string) => void,
+): BiliMessage[] | null {
+    let liveIds: string[];
+    try {
+        liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+    } catch {
+        return null; // a store fault degrades — never a 500 on the pin path
+    }
+    const C = liveIds.length;
+    const N = tailIds.length - 1;
+    if (C === 0) {
+        log("debug", `[${sessionId}] [2x2:${lane}] incremental form on an empty ledger — full signal (bootstrap)`);
+        return null;
+    }
+    if (C + N !== msgs.length) {
+        log("info", `[${sessionId}] [2x2:${lane}] incremental width mismatch (ledger=${C}, new=${N}, view=${msgs.length}) — full signal (reanchor next turn)`);
+        return null;
+    }
+    if (tailIds[0] === "?" || tailIds[0] !== liveIds[C - 1]) {
+        log("info", `[${sessionId}] [2x2:${lane}] incremental anchor mismatch (tail[0]=${tailIds[0]}, ledger frontier=${liveIds[C - 1]}) — full signal (reanchor next turn)`);
+        return null;
+    }
+    // Anchor proven: the ledger's live row order IS the view order (ingest
+    // sweeps the ledger to the authoritative set, #3285/#4390 — the width
+    // check above is what keeps the two in step; a fold-edge transient
+    // degrades one turn and re-converges with the full list).
+    return msgs.map((m, i) => {
+        if (i < C) return { ...m, id: liveIds[i] };
+        const id = tailIds[i - C + 1];
+        return id === "?" ? m : { ...m, id };
+    });
 }
