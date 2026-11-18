@@ -961,12 +961,17 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     return (stats.localInputEstimate ?? 0) > 0;
 }
 
+/** Last measured usage or bounded overflow evidence, before status fallbacks. */
+export function evidenceInputBaseline(stats: Session["stats"]): number {
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
     if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
-    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
-        ? stats.lastInputTokens
-        : stats.lastUsageGradeTokens ?? 0;
+    const baseline = evidenceInputBaseline(stats);
     return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 
