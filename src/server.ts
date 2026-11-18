@@ -233,7 +233,12 @@ export function selfAddressedLocalPath(reqUrl: string, localPort: number | undef
         const port = u.port !== "" ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
         if (port !== localPort) return undefined;
         const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || localMachineIps().has(normalizeIpLiteral(host));
+        // #7022 review: classifyIp covers the whole loopback range, not just
+        // configured interfaces — the tunnel-side fix stopped enumerating
+        // 127.0.0.x in localMachineIps(), so an unconfigured alias like
+        // 127.0.0.5:selfport must still be recognized as self here (else it
+        // would fall through to tunnel classification and 403, #562 self-layer).
+        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || classifyIp(host) === "loopback" || localMachineIps().has(normalizeIpLiteral(host));
         if (!mine) return undefined;
         return u.pathname + u.search;
     } catch {
