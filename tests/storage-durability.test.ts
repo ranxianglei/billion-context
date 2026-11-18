@@ -60,6 +60,10 @@ test("quick_check: a corrupt db fails open with a typed error, files left UNTOUC
             raw[i] = raw[i] ^ 0xff;
         }
         writeFileSync(path, raw);
+        // The flip keeps size + mtime (4 ms granularity), so the #4609 verdict
+        // cache (index.db.chk) would still match and skip quick_check — drop it
+        // so the reopen re-scans from fresh evidence (#4599).
+        rmSync(`${path}.chk`, { force: true });
 
         // 3. Reopen — must fail with a typed, greppable integrity error
         //    (migrations must never run against a corrupt file).
@@ -146,6 +150,10 @@ test("shadow open ALARMS on a corrupt index.db set — nothing renamed, boot pro
             raw[i] = raw[i] ^ 0xff;
         }
         writeFileSync(path, raw);
+        // Drop the #4609 verdict cache: the flip keeps size + mtime, so a
+        // cached "ok" would skip quick_check and the shadow would open the
+        // corrupt set instead of alarming (#4599).
+        rmSync(`${path}.chk`, { force: true });
         const beforeHash = createHash("sha256").update(raw).digest("hex");
 
         // The shadow's maybeOpen (full mode) must ALARM, not refuse — come
