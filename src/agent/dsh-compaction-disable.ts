@@ -104,6 +104,11 @@ export type DshCompactionGateTelemetry = {
     /** True once at least one covered entry is the factory agent-preset
      *  package (the only entry the pre-#4147 name filter ever reached). */
     sawFactoryPreset: boolean;
+    /** #7169: true once the runtime agentPresets.register() wrapper is
+     *  installed (covers presets registered at runtime, not just via the
+     *  internal/config hook). Absent on telemetry records created before
+     *  this field existed — readers should treat undefined as false. */
+    runtimePresetHookInstalled?: boolean;
 };
 
 function noteGateCoverage(entryName: string, rows: number, isFactory: boolean): void {
@@ -117,6 +122,15 @@ function noteGateCoverage(entryName: string, rows: number, isFactory: boolean): 
         existing.rows = rows;
     }
     if (isFactory) telemetry.sawFactoryPreset = true;
+    store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
+}
+
+/** #7169: record that the runtime agentPresets.register() wrapper is live. */
+function noteRuntimePresetHookInstalled(): void {
+    const store = globalThis as Record<string, unknown>;
+    const current = store[DSH_COMPACTION_GATE_TELEMETRY_KEY] as DshCompactionGateTelemetry | undefined;
+    const telemetry: DshCompactionGateTelemetry = current ?? { covered: [], sawFactoryPreset: false };
+    telemetry.runtimePresetHookInstalled = true;
     store[DSH_COMPACTION_GATE_TELEMETRY_KEY] = telemetry;
 }
 
@@ -134,16 +148,26 @@ export function _resetDshCompactionGateTelemetryForTest(): void {
 
 /** #6770: one-line coverage summary shared by the durable profile notes (#3962)
  *  and bili-native's first-request log line. Pure over the record; "no entry
- *  rewritten" is the honest frame because preset configs resolve lazily. */
+ *  rewritten" is the honest frame because preset configs resolve lazily.
+ *  #7169: also reports the runtime agentPresets.register() wrapper state, so
+ *  a zero-rewrite process can still show the runtime hook is in place. */
 export function compactionCoverageText(telemetry: DshCompactionGateTelemetry | null = dshCompactionGateTelemetry()): string {
+    const hook = telemetry?.runtimePresetHookInstalled ? " (runtime agentPresets.register() wrapper installed)" : "";
     if (telemetry === null || telemetry.covered.length === 0) {
-        return "no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later)";
+        return `no preset entry rewritten in this process${hook} (preset configs resolve lazily — zero at this point does not mean zero later)`;
     }
     const entries = telemetry.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return `${telemetry.covered.length} preset ${telemetry.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})`;
+    return `${telemetry.covered.length} preset ${telemetry.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})${hook}`;
 }
 
 type PresetRow = { name?: unknown; group?: unknown; config?: unknown };
+
+/** #7169: the minimal shape of the dsh agentPresets service the gate wraps.
+ *  The `register` method is async in dsh 0.2.2-rc.3+; the wrapper preserves
+ *  its Promise return so the host's await semantics are unchanged. */
+type AgentPresetRegistryLike = {
+    register?: (definition: unknown) => unknown;
+};
 
 /** Count compaction-basic/command-compact rows the disable walk would mark
  *  (recursing through group rows with the SAME shape gate as
@@ -180,6 +204,13 @@ export function disableBasicCompaction(rows: readonly unknown[]): unknown[] {
 export type CompactionDisableHost = {
     on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
     reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
+    /** #7169: cordis inject — the gate uses it to wrap agentPresets.register()
+     *  for runtime-registered presets. Absent on hosts that predate the
+     *  inject API; the wrapper is skipped in that case (fail-safe). The
+     *  callback's sub-context is typed as `unknown` here (the host's
+     *  PluginContext carries the injected services as properties; the gate
+     *  extracts `agentPresets` with a structural cast inside the callback). */
+    inject?: (deps: readonly string[], callback: (sub: unknown) => void) => unknown;
 };
 type MiddlewareSelf = { entry?: { options?: { name?: unknown } } | undefined };
 
@@ -214,6 +245,50 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             return { ...config, plugins: disableBasicCompaction(config.plugins) };
         }, { global: true });
     }
+    // #7169: wrap agentPresets.register() so runtime-registered presets get
+    // their compaction rows disabled too. The internal/config hook above only
+    // fires for plugin entries (bundles) resolved via waterfall; presets
+    // registered at runtime via ctx.agentPresets.register(definition) bypass
+    // it entirely, so their compaction rows stay armed — with an active bili
+    // block that means native compaction is answered 200 and silently wipes
+    // bili's folds. The gate is an always-on entry loaded before any preset,
+    // so this inject callback registers before any preset's register() call;
+    // the wrapper is idempotent (disableBasicCompaction is a no-op on
+    // already-disabled rows) and preserves the async register() semantics.
+    // Fail-safe: absent inject or absent agentPresets service → skip; the
+    // wire-level refusal guard (#1729) stays the backstop.
+    if (typeof ctx.inject === "function") {
+        ctx.inject(["agentPresets"], (sub) => {
+            const registry = (sub as { agentPresets?: AgentPresetRegistryLike }).agentPresets;
+            if (!registry || typeof registry.register !== "function") return;
+            if ((registry.register as unknown as Record<string, unknown>).__biliCompactionDisableWrapped) return;
+            const original = registry.register.bind(registry);
+            const wrapped = function (definition: unknown) {
+                if (
+                    isDshCompactionActive() &&
+                    definition !== null &&
+                    typeof definition === "object" &&
+                    Array.isArray((definition as { plugins?: unknown }).plugins)
+                ) {
+                    const plugins = (definition as { plugins: unknown[] }).plugins;
+                    const rows = countCompactionRows(plugins);
+                    if (rows > 0) {
+                        const rawName = (definition as { id?: unknown }).id;
+                        const entryName = typeof rawName === "string" ? rawName : "runtime-preset";
+                        noteGateCoverage(entryName.slice(0, 120), rows, false);
+                        return original({ ...(definition as object), plugins: disableBasicCompaction(plugins) });
+                    }
+                }
+                return original(definition);
+            };
+            // Marker on the REPLACEMENT, not the original: the guard re-reads
+            // registry.register on re-entry, so a re-fired inject callback
+            // must see the marker on the function that now sits there.
+            (wrapped as unknown as Record<string, unknown>).__biliCompactionDisableWrapped = true;
+            registry.register = wrapped;
+            noteRuntimePresetHookInstalled();
+        });
+    }
     // Publish only after the middleware is registered; the host owns both lifetimes.
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
 }
@@ -226,7 +301,13 @@ type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
  *  preset inject latch never opens — either way dsh native basic compaction
  *  stays ARMED. Exposed so the caller can turn the SILENT fail-safe degradation
  *  into a loud boot-time alarm (#3806) instead of letting the user discover an
- *  armed compactor days later through a destroyed fold base. */
+ *  armed compactor days later through a destroyed fold base.
+ *  #7169: an absent `inject` is deliberately NOT a gap — the loader-path
+ *  overlay (the internal/config hook) still latches without it, so the
+ *  "could not latch / likely ARMED" alarm would over-claim. Hosts that predate
+ *  the inject API also predate the runtime agentPresets.register() surface,
+ *  and the wire-level refusal guard (#1729) stays their backstop; the wrapper
+ *  state is observable through the telemetry/coverage text instead. */
 export function detectCompactionOverlayGap(ctx: CompactionDisableHost): CompactionOverlayGap | null {
     if (typeof ctx.on !== "function") return "no-config-hook";
     if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";

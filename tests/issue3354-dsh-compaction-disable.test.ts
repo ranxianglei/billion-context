@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BILI_COMPACTION_DISABLE_SERVICE, compactionDisablePatchRows, declareDshCompactionActive, detectCompactionOverlayGap, disableBasicCompaction, registerCompactionDisable, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE, compactionDisablePatchRows, declareDshCompactionActive, detectCompactionOverlayGap, disableBasicCompaction, dshCompactionGateTelemetry, registerCompactionDisable, _resetDshCompactionVerdictForTest, _resetDshCompactionGateTelemetryForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { writeDshAcpPatch } from "../src/launcher.ts";
 
 // #3354: the vendored dsh basic-compaction disable overlay (deshark42/
@@ -87,16 +87,20 @@ test("#3354 registerCompactionDisable: degrades per layer without throwing", () 
 });
 
 test("#3806 detectCompactionOverlayGap: latched when both capabilities are present", () => {
-    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} } }), null);
+    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} }, inject: () => {} }), null);
 });
 
 test("#3806 detectCompactionOverlayGap: missing internal/config hook -> no-config-hook", () => {
-    assert.equal(detectCompactionOverlayGap({ reflect: { provide: () => {} } }), "no-config-hook");
+    assert.equal(detectCompactionOverlayGap({ reflect: { provide: () => {} }, inject: () => {} }), "no-config-hook");
     assert.equal(detectCompactionOverlayGap({}), "no-config-hook");
 });
 
 test("#3806 detectCompactionOverlayGap: missing service provide -> no-service-provide", () => {
-    assert.equal(detectCompactionOverlayGap({ on: () => {} }), "no-service-provide");
+    assert.equal(detectCompactionOverlayGap({ on: () => {}, inject: () => {} }), "no-service-provide");
+});
+
+test("#7169 detectCompactionOverlayGap: missing inject is NOT a gap — the loader-path overlay still latches without it, so the boot alarm must not over-claim", () => {
+    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} } }), null);
 });
 
 test("#3354 registerCompactionDisable: transform honors the entry predicate and preserves siblings", () => {
@@ -164,5 +168,162 @@ test("#3354 patch carriers agree: root bundle yml and launcher overlay carry the
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
         fs.rmSync(`${home}-bili`, { recursive: true, force: true });
+    }
+});
+
+test("#7169 registerCompactionDisable: wraps agentPresets.register() for runtime presets", async () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    declareDshCompactionActive();
+    try {
+        type RegLike = { register?: (d: unknown) => unknown };
+        let injectCallback: ((sub: { agentPresets?: RegLike }) => void) | undefined;
+        registerCompactionDisable({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: readonly string[], callback: (sub: { agentPresets?: RegLike }) => void) => {
+                injectCallback = callback;
+            },
+        });
+        assert.equal(typeof injectCallback, "function");
+
+        // Simulate the agentPresets service becoming available.
+        const fakeRegistry: RegLike = {
+            register: (definition: unknown) => Promise.resolve(definition),
+        };
+        injectCallback!({ agentPresets: fakeRegistry });
+        assert.equal(typeof fakeRegistry.register, "function");
+
+        // Calling the wrapped register with a definition that nests compaction
+        // rows must disable them and preserve the async (Promise) return.
+        const definition = {
+            id: "my-runtime-preset",
+            plugins: [
+                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
+                { name: "@deepseek-ai/dsh-command-compact" },
+                { name: "@deepseek-ai/dsh-other" },
+            ],
+        };
+        const result = fakeRegistry.register!(definition);
+        assert.ok(result instanceof Promise);
+        const out = (await result) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(out.plugins?.[0]?.disabled, true);
+        assert.equal(out.plugins?.[1]?.disabled, true);
+        assert.equal(out.plugins?.[2]?.disabled, undefined);
+
+        // Telemetry records the runtime-preset coverage + hook-installed flag.
+        const telemetry = dshCompactionGateTelemetry();
+        assert.ok(telemetry);
+        assert.equal(telemetry?.runtimePresetHookInstalled, true);
+        const entry = telemetry?.covered.find((c) => c.entry === "my-runtime-preset");
+        assert.ok(entry);
+        assert.equal(entry?.rows, 2);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+test("#7169 registerCompactionDisable: runtime preset without compaction rows passes through unchanged", async () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    declareDshCompactionActive();
+    try {
+        type RegLike = { register?: (d: unknown) => unknown };
+        let injectCallback: ((sub: { agentPresets?: RegLike }) => void) | undefined;
+        registerCompactionDisable({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: readonly string[], callback: (sub: { agentPresets?: RegLike }) => void) => {
+                injectCallback = callback;
+            },
+        });
+        const fakeRegistry: RegLike = {
+            register: (definition: unknown) => Promise.resolve(definition),
+        };
+        injectCallback!({ agentPresets: fakeRegistry });
+
+        // A definition with no compaction rows keeps its object identity.
+        const definition = { id: "plain-preset", plugins: [{ name: "@deepseek-ai/dsh-other" }] };
+        const result = fakeRegistry.register!(definition);
+        assert.ok(result instanceof Promise);
+        const out = await result;
+        assert.equal(out, definition);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+test("#7169 registerCompactionDisable: runtime preset wrapper is skipped when verdict is inactive", async () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    // No declareDshCompactionActive() — bili-native never ran.
+    try {
+        type RegLike = { register?: (d: unknown) => unknown };
+        let injectCallback: ((sub: { agentPresets?: RegLike }) => void) | undefined;
+        registerCompactionDisable({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: readonly string[], callback: (sub: { agentPresets?: RegLike }) => void) => {
+                injectCallback = callback;
+            },
+        });
+        const fakeRegistry: RegLike = {
+            register: (definition: unknown) => Promise.resolve(definition),
+        };
+        injectCallback!({ agentPresets: fakeRegistry });
+
+        // Without an active verdict the wrapper passes through unchanged.
+        const definition = {
+            id: "inactive-preset",
+            plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }],
+        };
+        const result = fakeRegistry.register!(definition);
+        assert.ok(result instanceof Promise);
+        const out = (await result) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(out.plugins?.[0]?.disabled, undefined);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
+test("#7169 registerCompactionDisable: a re-fired inject callback does not double-wrap register()", async () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    declareDshCompactionActive();
+    try {
+        type RegLike = { register?: (d: unknown) => unknown };
+        let injectCallback: ((sub: { agentPresets?: RegLike }) => void) | undefined;
+        registerCompactionDisable({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: readonly string[], callback: (sub: { agentPresets?: RegLike }) => void) => {
+                injectCallback = callback;
+            },
+        });
+        let calls = 0;
+        const fakeRegistry: RegLike = {
+            register: (definition: unknown) => { calls++; return Promise.resolve(definition); },
+        };
+        injectCallback!({ agentPresets: fakeRegistry });
+        const wrappedOnce = fakeRegistry.register;
+        // The host re-fires the inject callback (service re-provisioned): the
+        // guard must see the marker on the function that now sits at
+        // registry.register and skip.
+        injectCallback!({ agentPresets: fakeRegistry });
+        assert.equal(fakeRegistry.register, wrappedOnce, "second callback must skip — the marker sits on the replacement, not the original");
+
+        // The single wrapper still rewrites and forwards exactly once.
+        const out = (await fakeRegistry.register!({
+            id: "double-wrap-preset",
+            plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }],
+        })) as { plugins?: Array<Record<string, unknown>> };
+        assert.equal(out.plugins?.[0]?.disabled, true);
+        assert.equal(calls, 1);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
     }
 });
