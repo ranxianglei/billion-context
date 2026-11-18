@@ -296,10 +296,12 @@ export { DSH_BUILD_CHECK } from "./client-build-note.js";
 function gateCoverageSuffix(): string {
     const t = dshCompactionGateTelemetry();
     if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
+        const hook = t?.runtimePresetHookInstalled ? " (runtime agentPresets.register() wrapper installed)" : "";
+        return ` Overlay coverage so far: no preset entry rewritten in this process${hook} (preset configs resolve lazily — zero at this point does not mean zero later).`;
     }
     const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+    const hook = t.runtimePresetHookInstalled ? " (runtime agentPresets.register() wrapper installed)" : "";
+    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries})${hook}.`;
 }
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base

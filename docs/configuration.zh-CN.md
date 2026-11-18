@@ -2510,7 +2510,9 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
  **#3354 起自动完成。** 在 bundles 含 `@deepseek-ai/dsh-web-app` 的 profile 里，真正运行的 compaction-basic 实例位于 agent preset（`preset-standard.config.plugins`）内部，任何 patch 层都无法按 id 直寻那条嵌套行（#1772）—— 随包的 `- id: compaction-basic` 行落在 web-app 已禁用的宿主平面行上、什么都没改。bili 现在在**加载期**补上这一环：一个**常驻**的 bundle 条目 `bili-compaction-gate`（与 `bili-native` 并列的独立 cordis 条目，由同一组 patch 层挂载，因此 `bili-native` 被禁用或 kill-switch 时它仍然存活，#3662）注册一个 cordis `internal/config` overlay（移植自 [deshark42/dsh-compaction-basic-disable](https://github.com/deshark42/dsh-compaction-basic-disable)，MIT），在 bili 持有该泳道期间把 preset 里的 `compaction-basic` 与 `command-compact` 行标记为 `disabled: true`；`dsh.bundle.patch.yml` / 启动器 overlay 里的 preset 门控行让每个 Web preset 在注册前等待该 overlay 的服务。这些 profile 里原生自动压缩无需任何用户操作即关闭；ACP 压缩不受影响。
 
- overlay 依赖 dsh 的内部钩子，对版本敏感。若在新/旧 dsh 构建上仍见到 dsh 压缩 checkpoint 落地，用下面的回退配方。
+  **运行期注册的 preset（#7169）。** 自 dsh 0.2.2-rc.3 起，preset 可通过 `ctx.agentPresets.register(definition)` 在运行期注册 —— 这类 preset 完全绕过 `internal/config` 钩子（该钩子只对经 waterfall 解析的 plugin 条目触发）。gate 现在也包装了 `agentPresets.register()`，对 definition 的 `plugins` 树应用同样的 `disabled: true` 改写，使运行期注册的 preset 也被同一 overlay 覆盖。包装通过 cordis `inject` 安装（gate 是常驻条目，在任何 preset 之前加载，因此包装在任何 `register()` 调用之前就位）。若宿主不支持 `inject` 或 `agentPresets` 服务不存在，包装被跳过（fail-safe）；wire 级拒绝守卫（#1729）仍为兜底。
+
+  overlay 依赖 dsh 的内部钩子，对版本敏感。若在新/旧 dsh 构建上仍见到 dsh 压缩 checkpoint 落地，用下面的回退配方。
 
  **禁用与移除的区别（#3662）。** 禁用 `bili-native`（dsh 插件管理器或 patch 层里的 `disabled: true`）不再会导致会话创建被「砖」：门控服务存活在独立的常驻条目 `bili-compaction-gate` 里，preset 回落到**原生**自动压缩而不是永久 pending —— 压缩关闭、dsh 完全可用。请勿禁用 `bili-compaction-gate` 本身（那会重新造成「砖」）；要彻底卸载，从 profile 的 `dsh.profile.bundles` 移除 `billion-context` 后重启。卡在 #3662 之前版本且已被禁用的安装，升级即自愈；手动解砖是在 `$DSH_HOME/cordis.patch.yml`（HOME 层；默认 `~/.dsh/cordis.patch.yml`）追加 `- id: preset-standard` / `preset-ptc` / `preset-minimal` / `preset-cordis`，各配 `inject: null` —— 顶层键为整体替换，清掉 pending 锁。
 
