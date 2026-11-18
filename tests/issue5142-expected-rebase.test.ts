@@ -430,7 +430,7 @@ describe("#5142 carrier classifier units", () => {
         // tool-jobs notice production shape (#5142 reporter sample, command redacted):
         const job = 'background job bash-abc123 (bash: "echo ok") finished [status: completed, exit code: 0]. Read its output with job_output.';
         assert.equal(dshToolJobNoticePath(mk("user", job)), "oneshot/tool-job-notice");
-        assert.equal(dshToolJobNoticePath(mk("user", " Background Job abc finished.")), "oneshot/tool-job-notice", "asciiCI prefix like the other auto-injected families");
+        assert.equal(dshToolJobNoticePath(mk("user", ' Background Job bash-abc123 (bash: "echo ok") finished [status: completed].')), "oneshot/tool-job-notice", "asciiCI prefix like the other auto-injected families");
         assert.equal(dshToolJobNoticePath(mk("assistant", job)), undefined, "assistant echo must never classify (#2766)");
         assert.equal(dshToolJobNoticePath(mk("user", "the background job failed again")), undefined, "marker mid-text is not a carrier");
         // request-image handle annotation (#5142 residual, production sample):
@@ -475,9 +475,21 @@ describe("#5142 carrier classifier units", () => {
         // varies, so the joint alone cannot classify).
         const MARKER_CONTEXT: Record<string, string> = {
             " sent a message: ": "Agent session-1",
+            // #7153: the two durable producers own a complete system-reminder
+            // frame, so the marker alone is no longer a classifiable shape.
+            "\x3cavailable_skills\x3e": "\x3csystem-reminder\x3e\n",
+            "Instructions from:": "\x3csystem-reminder\x3e\n",
+        };
+        // #7153: the two notice families also need their right context — the
+        // emitter puts a job id / a settlement ending after the marker, and a
+        // bare "background job"/"Background subagent " prefix is ordinary prose.
+        const MARKER_SUFFIX: Record<string, string> = {
+            "background job": ' bash-1 (bash: "true") finished [status: completed]',
+            "Background subagent ": "session-1 finished.",
         };
         for (const marker of dshCarrierRawMarkers) {
-            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}` } as CoreMessage;
+            const text = `${MARKER_CONTEXT[marker] ?? ""}${marker}${MARKER_SUFFIX[marker] ?? ""}`;
+            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text } as CoreMessage;
             assert.notEqual(cls(msg), undefined, `marker ${JSON.stringify(marker)} no longer matches any dsh classifier`);
         }
     });
