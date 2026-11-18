@@ -84,3 +84,29 @@ test("non-object top-level bodies land whole in the other bucket", () => {
     assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body") });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
 });
+
+// #7167: the foldable message channel is bucketed as `messages` for EVERY wire
+// shape — chat `messages[]`, Responses `input`, Google `contents` — so the
+// irreducible-dimension gate (which prices `total − messages`) cannot doom an
+// over-window Responses/Google body before a fold could run. Regression for
+// the CI break where `input`/`contents` mass landed in `other` and the gate
+// 413'd bodies that were perfectly foldable.
+test("foldable channel is the messages bucket on every wire shape (#7167)", () => {
+    const filler = "m".repeat(1_000);
+    // Responses API: the conversation rides `input`, not `messages`.
+    const responses = { model: "gpt", stream: true, instructions: "sys", input: [{ role: "user", content: filler }] };
+    const br = estimateRawBodyBreakdown(responses);
+    assert.ok(br.messages >= t(filler), "Responses `input` mass lands in the messages bucket");
+    assert.equal(br.messages + br.tools + br.system + br.other, br.total, "buckets stay exhaustive");
+    assert.equal(br.total, estimateRawBodyTokens(responses), "total invariant holds for Responses");
+    // Google wire: the conversation rides `contents`, not `messages`.
+    const google = { model: "gemini", contents: [{ role: "user", parts: [{ text: filler }] }] };
+    const bg = estimateRawBodyBreakdown(google);
+    assert.ok(bg.messages >= t(filler), "Google `contents` mass lands in the messages bucket");
+    assert.equal(bg.total, estimateRawBodyTokens(google), "total invariant holds for Google");
+    // The irreducible price the gate pays (total − messages) excludes the
+    // foldable channel on all three shapes.
+    for (const [shape, bd] of [["responses", br], ["google", bg]] as const) {
+        assert.ok(bd.total - bd.messages < t(filler), `${shape}: irreducible price excludes the foldable channel`);
+    }
+});
