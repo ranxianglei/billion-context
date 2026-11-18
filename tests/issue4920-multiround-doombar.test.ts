@@ -158,7 +158,7 @@ async function seedFoldState(ctx: Ctx, sessionId: string): Promise<number> {
     assert.equal(r1.status, 200, "seed turn forwards");
     await r1.text();
 
-    // ~88K estimated tokens against a 20K window: preflight must fold. Either
+    // ~88K estimated tokens against a 60K window: preflight must fold. Either
     // outcome (converged 200 or budget-exhausted 502) leaves ACTIVE BLOCKS —
     // that is the precondition the #4920 recovery path keys on.
     const r2 = await post(ctx, bigMessages(80));
