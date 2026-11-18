@@ -189,6 +189,45 @@ test("#5259: streaming filter — negative rows stay byte-exact", () => {
     assert.equal(f.pending(), false);
 });
 
+test("#5216 review: fast-path guard — filter stays pending until it decides the true first line", () => {
+    // The plugin-mode fast path (plugin.ts:3485/3666/3779/5071) bypasses the
+    // filter when !mayStartBareRefHead(v) && !anyPending(). The bare-ref
+    // filter must report pending() until it has DECIDED the first line, so a
+    // prose first line (no candidate held) does NOT let the fast path swallow
+    // the true first line — otherwise a later chunk starting with `m\d` is
+    // mis-read as the "first line" and dropped mid-channel (chunk-split
+    // determinism violation found in #5216 review).
+    const route = (f: ReturnType<typeof createBareRefHeadFilter>, chunks: string[]): string => {
+        let out = "";
+        for (const c of chunks) {
+            if (!mayStartBareRefHead(c) && !f.pending()) {
+                out += c; // fast path: bypass the filter
+            } else {
+                out += f.push(c);
+            }
+        }
+        out += f.flush();
+        return out;
+    };
+    // (a) prose first line, ref on line 2 — the ref must SURVIVE (it is not
+    // the true first line). Pre-fix, the fast path swallowed "hello\n" and the
+    // filter mis-read "m01464b\n" as the first line and dropped it.
+    let f = createBareRefHeadFilter();
+    assert.equal(route(f, ["hello\n", "m01464b\nmore"]), "hello\nm01464b\nmore", "line-2 ref must survive");
+    // (b) prose mid-line-1, ref completing line 1 — the ref must SURVIVE.
+    f = createBareRefHeadFilter();
+    assert.equal(route(f, ["The answer is ", "m01464b\nmore"]), "The answer is m01464b\nmore", "mid-line-1 ref must survive");
+    // (c) true first line IS a bare ref — it must still be DROPPED.
+    f = createBareRefHeadFilter();
+    assert.equal(route(f, ["m01464b\n", "more"]), "more", "true first-line ref still dropped");
+    // (d) pending() is true before any chunk (fast path off), false once the
+    // first chunk decides (fast path back on).
+    f = createBareRefHeadFilter();
+    assert.equal(f.pending(), true, "pending before first chunk");
+    f.push("hello\n");
+    assert.equal(f.pending(), false, "decided after prose first line");
+});
+
 test("#5259: composed onto the tag-echo chain, split-deterministic", () => {
     // input flows tagEcho→bareRef: residue line 1 + full tag line 2
     const S = `m01464b\n${LT}acp tokens="2" type="text"${GTE}m00010${LT}/acp${GTE} done\n`;

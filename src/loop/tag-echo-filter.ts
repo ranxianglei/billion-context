@@ -2090,7 +2090,16 @@ export function createBareRefHeadFilter(onDrop?: (snippet: string) => void): Tag
             return tail;
         },
         dropped: () => droppedAny,
-        pending: () => !decided && buf.length > 0,
+        // #5216 review: pending until the filter has DECIDED the first line,
+        // not merely while it holds a candidate. The plugin-mode fast path
+        // (plugin.ts) bypasses the filter when !anyPending(); with the old
+        // predicate a prose first line (no candidate held) let the fast path
+        // swallow the true first line, so a later chunk starting with `m\d`
+        // was mis-read as the "first line" and dropped mid-channel — a
+        // chunk-split determinism violation. Staying pending until decided
+        // keeps the fast path off until the filter has seen the real first
+        // line (a no-op O(1) pass for prose), then re-enables it.
+        pending: () => !decided,
         stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
     };
 }
