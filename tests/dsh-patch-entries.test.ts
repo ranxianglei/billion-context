@@ -56,3 +56,44 @@ test("parseDshPatchEntries: duplicate ids kept per occurrence", () => {
         { id: "e", disabled: true },
     ]);
 });
+
+test("parseDshPatchEntries: `disabled` is read by value, not by the literal `true`", () => {
+    // The patch layer accepts more than a lowercase boolean: YAML 1.1 spellings,
+    // quoted forms, and dsh's `!!js` extension (a stock web-profile dump carries
+    // four such rows today). A text scan that only matched `true` reported every
+    // one of these as ENABLED, which turned into a wrong cost hint and a notice
+    // the user could not dismiss.
+    const text = [
+        "- id: bool-lower",
+        "  disabled: true",
+        "- id: bool-title",
+        "  disabled: True",
+        "- id: yaml-short",
+        "  disabled: on",
+        "- id: quoted",
+        '  disabled: "true"',
+        "- id: js-const",
+        "  disabled: !!js true",
+        "- id: js-expr",
+        "  disabled: !!js process.platform === 'win32'",
+        "- id: commented",
+        "  disabled: true # because it doubles the bill",
+        "- id: still-on-false",
+        "  disabled: false",
+        "- id: still-on-false-title",
+        "  disabled: False",
+        "- id: not-a-boolean",
+        "  disabled: truex",
+    ].join("\n");
+    const byId = new Map(parseDshPatchEntries(text).map((e) => [e.id, e.disabled]));
+    assert.equal(byId.get("bool-lower"), true);
+    assert.equal(byId.get("bool-title"), true, "YAML 1.1 `True`");
+    assert.equal(byId.get("yaml-short"), true, "YAML 1.1 `on`");
+    assert.equal(byId.get("quoted"), true, "a quoted boolean is still a declaration");
+    assert.equal(byId.get("js-const"), true, "`!!js true` is off");
+    assert.equal(byId.get("js-expr"), true, "an unevaluable expression counts as off (conservative)");
+    assert.equal(byId.get("commented"), true, "a trailing comment does not hide the value");
+    assert.equal(byId.get("still-on-false"), false);
+    assert.equal(byId.get("still-on-false-title"), false);
+    assert.equal(byId.get("not-a-boolean"), false, "`truex` is not a boolean");
+});
