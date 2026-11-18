@@ -81,10 +81,29 @@ test("#7111: a preset that was already mounted is re-submitted with its compacti
     }
 });
 
+test("#7111: with no verdict (bili-native never ran) the presets stay STOCK — nothing is reconciled", () => {
+    _resetDshCompactionVerdictForTest();
+    try {
+        const { entry, updates } = presetEntry();
+        assert.equal(reconcileLoadedPresets([entry]), 0);
+        assert.equal(updates.length, 0, "an absent verdict must not stand down native compaction");
+        const row = entry.options.config.plugins[0]!.config![0]! as { disabled?: boolean };
+        assert.equal(row.disabled, undefined, "the nested compaction row must stay live");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+    }
+});
+
 test("#7111: entries without a nested compaction row, without update, or non-objects are left alone", () => {
-    const plain = { options: { id: "llm-deepseek", config: { retryPolicy: {} } }, update: () => { throw new Error("must not run") } };
-    const frozen = { options: { config: { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] } } };
-    assert.equal(reconcileLoadedPresets([plain, frozen, null, undefined, 42]), 0);
+    _resetDshCompactionVerdictForTest();
+    declareDshCompactionActive();
+    try {
+        const plain = { options: { id: "llm-deepseek", config: { retryPolicy: {} } }, update: () => { throw new Error("must not run") } };
+        const frozen = { options: { config: { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] } } };
+        assert.equal(reconcileLoadedPresets([plain, frozen, null, undefined, 42]), 0);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+    }
 });
 
 test("#7111: the gate entry reconciles through the optional loader and still provides the service", () => {

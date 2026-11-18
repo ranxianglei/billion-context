@@ -385,9 +385,12 @@ type ReconcileEntry = {
  *  restarts each entry and the `internal/config` middleware above rewrites the
  *  rows exactly as it does on a cold resolve. Entries that never nest a
  *  compaction row, and hosts whose entries expose no `update`, are left alone.
- *  Returns how many entries were re-submitted (0 = nothing to do, which is the
- *  only outcome a missing gate service can now produce). */
+ *  Honors the process verdict exactly like the overlay: an absent declaration
+ *  means bili-native never ran and the presets must stay STOCK, so nothing is
+ *  reconciled. Returns how many entries were re-submitted (0 = nothing to do,
+ *  which is the only outcome a missing gate service can now produce). */
 export function reconcileLoadedPresets(entries: Iterable<unknown>): number {
+    if (!isDshCompactionActive()) return 0;
     let touched = 0;
     for (const raw of entries) {
         if (raw === null || typeof raw !== "object") continue;
