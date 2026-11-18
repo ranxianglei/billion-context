@@ -11,15 +11,16 @@
 import {
     hostPlaneOverrideLostWarning,
     hostPlaneRowsMissingAutoFalse,
+    reconcileLoadedPresets,
     registerCompactionDisable,
     type CompactionDisableHost,
 } from "./dsh-compaction-disable.js";
 import { logHostEvent } from "./host-log.js";
 
-/** What the #7113 scan needs from the host loader (never a hard dependency:
- *  a required `loader` here would restore the #3662 failure mode — this entry
- *  would pend and the presets would keep waiting on a service it never
- *  publishes). */
+/** What the #7113 scan and the #7111 reconcile need from the host loader.
+ *  Deliberately not a hard dependency: an entry-level inject is fail-closed
+ *  (no optional dependency, no timeout, no fallback), and a required `loader`
+ *  would restore exactly the failure this change removes. */
 export type LoaderFace = { loader?: { entries?: () => Iterable<unknown> } };
 
 type GateContext = CompactionDisableHost & {
@@ -43,5 +44,6 @@ export function apply(ctx: GateContext): void {
     ctx.inject?.(["loader"], (inner) => {
         const warning = hostPlaneWarningFor(inner);
         if (warning !== null) logHostEvent("warn", "bili-compaction-gate", warning);
+        reconcileLoadedPresets(inner.loader?.entries?.() ?? []);
     });
 }
