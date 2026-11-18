@@ -94,14 +94,14 @@ function makeUpstream(firstRejectBody?: string): { server: http.Server; calls: C
     return { server, calls };
 }
 
-function proxyOptions(routes: Record<string, object>): ProxyOptions {
+function proxyOptions(routes: Record<string, object>, window = WINDOW): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: routes as ProxyOptions["routes"],
-        modelContextLimit: WINDOW,
-        kernelConfig: defaultConfig(WINDOW, {
+        modelContextLimit: window,
+        kernelConfig: defaultConfig(window, {
             preserveRecentMessages: 2,
             preserveRecentTokens: 2000,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
@@ -126,14 +126,14 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
 
 type Ctx = { url: string; headers: Record<string, string>; upstreamPort: number };
 
-async function setup(firstRejectBody?: string): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
+async function setup(firstRejectBody?: string, window = WINDOW): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream(firstRejectBody);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: WINDOW } } } }));
+    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: window } } } }, window));
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
@@ -159,6 +159,32 @@ const post = (ctx: Ctx, messages: Array<{ role: string; content: string }>) =>
         headers: { ...ctx.headers },
         body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
     });
+
+for (const pluginMode of [false, true]) test(`a probe that the local egress fuse would reject folds before forwarding (${pluginMode ? "plugin" : "proxy"})`, async () => {
+    const { ctx, calls, close } = await setup(undefined, 1_000_000);
+    try {
+        const sessionId = `probe-egress-cjk-${pluginMode ? "plugin" : "proxy"}`;
+        if (pluginMode) ctx.headers["x-bili-plugin"] = "test-agent";
+        await seedStuckMeter(ctx, sessionId);
+        // Below the 7.5 MB byte floor, but above the egress meter's 1M bar.
+        const messages = Array.from({ length: 120 }, (_, i) => ({
+            role: i % 2 === 0 ? "user" : "assistant",
+            content: `turn ${i}: ` + "历史".repeat(6_000),
+        }));
+        const response = await post(ctx, messages);
+        const body = await response.text();
+        assert.equal(response.status, 200, body.slice(0, 1_000));
+        assert.ok(body.includes("forwarded answer"), "the restored turn reaches the mock model");
+        assert.ok(calls.some((c) => c.summary), "normal preflight compression runs");
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 2, "seed plus one compressed forward; no oversized probe");
+        assert.ok(forwards[1]!.contentChars < 1_000_000);
+        assert.equal(getSession(sessionId)?.metadata.localRefusals, undefined,
+            "the request-scoped decision must not poison a future route");
+    } finally {
+        await close();
+    }
+});
 
 // Create the session with one real turn, then corrupt its meter into the
 // #2313 stuck state: estimate-sourced baseline at phantom scale, measured on
@@ -280,6 +306,44 @@ test("e2e #2313 d: probe 400 without a parseable window arms the fallback shrink
         const s = getSession("i2313-d");
         assert.ok(s);
         assert.equal(s.stats.lastInputTokensOrigin, normalizeUpstreamOrigin(`http://127.0.0.1:${ctx.upstreamPort}`), "fallback arm origin is stamped from the rejecting upstream");
+        assert.equal(s.stats.lastInputTokensSource, "usage", "the folded retry settles the final baseline");
+    } finally {
+        await close();
+    }
+});
+
+test("e2e #2313 e: a probe 400 stating only an input-length RANGE arms the shrink — the DashScope livelock recovers", async () => {
+    // DashScope compatible-mode rejects an over-long input as "Range of input
+    // length should be [1, 20000]" — no token/length-subject phrase, so while it
+    // was unrecognized as an overflow the arm never fired, the probe gate
+    // re-forwarded the same raw body on every attempt and the session could
+    // only 400 (each turn burning the client's ~300s stream idle).
+    const rejectBody = JSON.stringify({
+        error: {
+            message: "<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 20000]",
+            type: "invalid_request_error",
+            param: null,
+            code: "invalid_parameter_error",
+        },
+        id: "chatcmpl-55bbf071-1040-9261-8cd4-76088d25ee5c",
+        request_id: "55bbf071-1040-9261-8cd4-76088d25ee5c",
+    });
+    const { ctx, calls, close } = await setup(rejectBody);
+    try {
+        await seedStuckMeter(ctx, "i2313-e");
+
+        const r = await post(ctx, bigMessages());
+        assert.equal(r.status, 200, "the stated range is an overflow on the probe path, and the in-request refold recovers");
+        await r.text();
+
+        const forwards = calls.filter((c) => !c.summary);
+        assert.equal(forwards.length, 3, "turn 1 + raw probe forward + one folded retry");
+        assert.ok(calls.some((c) => c.summary), "the refold made summarization call(s)");
+        assert.ok(forwards[2]!.contentChars < forwards[1]!.contentChars, "the retry carries the folded payload");
+
+        const s = getSession("i2313-e");
+        assert.ok(s);
+        assert.equal(s.stats.overflowArmTokens, undefined, "the successful retry's usage report retires the one-shot arm (#1110)");
         assert.equal(s.stats.lastInputTokensSource, "usage", "the folded retry settles the final baseline");
     } finally {
         await close();

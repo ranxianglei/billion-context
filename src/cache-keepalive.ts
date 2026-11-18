@@ -114,8 +114,9 @@ export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstre
     };
 }
 
-/** Pure: the TTL tier declared by the snapshot's cache_control breakpoints —
- *  any "1h" wins over "5m"; undefined when the body carries none. */
+/** Pure: the TTL tier declared by the snapshot's cache_control breakpoints.
+ *  Tool inputs and schema examples are data, not directives. Any "1h" wins
+ *  over "5m"; undefined when the body carries no breakpoint. */
 export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
     let found: "5m" | "1h" | undefined;
     const walk = (n: unknown): void => {
@@ -137,7 +138,11 @@ export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
             // explicit "1h" lifts the tier.
             found = "5m";
         }
-        for (const v of Object.values(o)) walk(v);
+        for (const [key, value] of Object.entries(o)) {
+            if (key === "input_schema") continue;
+            if (key === "input" && (o.type === "tool_use" || o.type === "server_tool_use")) continue;
+            walk(value);
+        }
     };
     walk(body);
     return found;
@@ -288,7 +293,7 @@ function armInternal(inp: KeepaliveArmInput): void {
     const prev = registry.get(inp.sessionId);
     // Credential rotated since the snapshot (#2131): the old body was signed
     // for another key — drop it before deciding about the new one.
-    if (prev && prev.credFp !== credFp) registry.delete(inp.sessionId);
+    if (prev && prev.credFp !== credFp) disarm(inp.sessionId, "credential-rotated");
 
     const breakpointTier = detectKeepaliveTier(parsed);
     let cadenceMs: number;
@@ -378,7 +383,17 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     }
     entry.pingInFlight = false;
     if (registry.get(entry.sessionId) !== entry) return;
-    const text = await resp.text().catch(() => "");
+    let text: string;
+    try {
+        text = await resp.text();
+    } catch (err) {
+        if (resp.status !== 429) {
+            handleFailure(entry, `response body: ${err instanceof Error ? err.message : String(err)}`);
+            return;
+        }
+        text = "";
+    }
+    if (registry.get(entry.sessionId) !== entry) return;
     if (!resp.ok) {
         if (resp.status === 429) {
             disarm(entry.sessionId, "rate-limited(429)");
