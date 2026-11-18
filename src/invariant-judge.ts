@@ -50,6 +50,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
+import { createHash } from "node:crypto";
 import { parseStoredPlaceholder, type CompressionState, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
@@ -111,6 +112,11 @@ export interface JudgeVerdict {
   lane?: "main" | "loop";
   /** #4241: true when judged in render-lane tail-fidelity mode (outbound prefix was server-rendered). */
   renderLane?: boolean;
+  /** #7131: tail-identity observation (advisory, never a violation) — who the
+   *  last message on each side is, and whether the last user message survived
+   *  entry→exit. Lets a stale INBOUND body (host built the request without the
+   *  newest message) be spotted from one line instead of a full body dump. */
+  tail?: TailCheck;
 }
 
 interface JudgeOptions {
@@ -483,6 +489,54 @@ function egressPairingViolations(entry: readonly CoreMessage[], exit: readonly C
   return out;
 }
 
+// #7131 — tail-identity observation. The judge's I1/I2 already prove outbound
+// fidelity to the inbound view, but a CLEAN verdict says nothing about whether
+// the INBOUND view itself carried the host's newest message — a host that
+// builds the request body from a stale history snapshot (message logged, not
+// wired) judges clean and the model answers the PREVIOUS turn. This makes the
+// tail readable per request: the last message on each side (role + 8-hex hash
+// of its normalized text) and whether the last user message survives. Advisory
+// only — never a violation, never blocks, zero extra parse (reuses the cores
+// the judge already holds).
+export interface TailCheck {
+  /** Role of the last inbound (entry) message; "-" when entry is empty. */
+  inRole: string;
+  /** 8-hex sha256 of the last inbound message's normalized text; "-" when empty. */
+  inHash: string;
+  /** Role of the last outbound (exit) message; "-" when exit is empty. */
+  outRole: string;
+  /** 8-hex sha256 of the last outbound message's normalized text; "-" when empty. */
+  outHash: string;
+  /** Last inbound user message normalized-equal to the last outbound user
+   *  message (both sides must have one). */
+  lastUserMatch: boolean;
+}
+
+function tailHash(m: CoreMessage | undefined): string {
+  if (!m) return "-";
+  return createHash("sha256").update(normText(m), "utf8").digest("hex").slice(0, 8);
+}
+
+export function computeTailCheck(entry: readonly CoreMessage[], exit: readonly CoreMessage[]): TailCheck {
+  const inLast = entry.length > 0 ? entry[entry.length - 1] : undefined;
+  const outLast = exit.length > 0 ? exit[exit.length - 1] : undefined;
+  const lastUserOf = (msgs: readonly CoreMessage[]): CoreMessage | undefined => {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") return msgs[i];
+    }
+    return undefined;
+  };
+  const inUser = lastUserOf(entry);
+  const outUser = lastUserOf(exit);
+  return {
+    inRole: inLast?.role ?? "-",
+    inHash: tailHash(inLast),
+    outRole: outLast?.role ?? "-",
+    outHash: tailHash(outLast),
+    lastUserMatch: inUser !== undefined && outUser !== undefined && normText(inUser) === normText(outUser),
+  };
+}
+
 /**
  * Reconcile one request's inbound core against its outbound core. Returns a
  * structured verdict; never throws on well-formed input. On a corrupted stream
@@ -822,6 +876,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
     } else {
       loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.covered ? `, covered ${v.covered}` : ``}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
+    if (v.tail) {
+      loggerLog("debug", `${where} tail-check: in=${v.tail.inRole} h=${v.tail.inHash} out=${v.tail.outRole} h=${v.tail.outHash} last-user=${v.tail.lastUserMatch ? "yes" : "no"}`);
+    }
   };
 }
 
@@ -866,7 +923,10 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): ReadonlySet<
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
-    (sink ?? defaultSink(input.sessionId, "main"))({ ...v, lane: "main" });
+    // #7131: the tail observation rides the same verdict — computed from the
+    // ACTUAL outbound cores (exitCores0, pre-fault) so a test fault never
+    // shadows what the wire really carried.
+    (sink ?? defaultSink(input.sessionId, "main"))({ ...v, lane: "main", tail: computeTailCheck(entry, exitCores0) });
     return separatorProvenance !== undefined && separatorProvenance.size > 0 ? separatorProvenance : undefined;
   } catch {
     // advisory layer: a judge failure must never disturb the request
