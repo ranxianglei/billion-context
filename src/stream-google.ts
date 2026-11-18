@@ -25,13 +25,18 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     let promotedSignature = "";
     const noteParts: string[] = [];
     const keptParts: GooglePart[] = [];
+    // #6842/KDD#10: Gemini signs ORDINARY text parts too (thoughtSignature
+    // without thought: true); the signature is verified byte-for-byte over the
+    // part's text on replay, so a signed part is never rewritten.
+    const isSignedPart = (part: GooglePart): boolean =>
+        typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const containsEcho = (text: string): boolean => containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || (absorbArmed && containsToolCallEmissionText(text));
     // Capture request evidence before a yielded proxy tool can change the context.
     const requestText = absorbArmed && parts.some(part => part && typeof part === "object"
-        && (part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text))
+        && part.thought !== true && !isSignedPart(part) && typeof part.text === "string" && containsEcho(part.text))
         ? JSON.stringify(ctx.messages) : undefined;
     for (const part of parts) {
         if (!part || typeof part !== "object") continue;
@@ -48,8 +53,8 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
         if (fc) sawReal = true;
         // #1960/KDD#10: a thought part carries a thoughtSignature the client
         // echoes back verbatim — rewriting its text desyncs the signature and
-        // bricks replay. Strip prose only from non-thought parts.
-        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text)) {
+        // bricks replay. Strip prose only from non-thought, unsigned parts.
+        if (part.thought !== true && !isSignedPart(part) && typeof part.text === "string" && containsEcho(part.text)) {
             ctx.log(`[tag-echo] stripped: non-stream google output ACP echo (render tags/markers/internal artifacts): ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAcpTags(part.text, absorbArmed, requestText);
         }
