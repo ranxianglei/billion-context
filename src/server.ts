@@ -4768,10 +4768,15 @@ export function isContextualUserFragment(text: string): boolean {
 //     `Time sampled while preparing turn N, step M: <ts>` — its
 //     `Browser time zone for this request:` line is embedded in that ONE
 //     message, never sent standalone, so no separate prefix for it.
+//   #7085: dsh 0.2.2-rc.3 wraps its injected notifications (the reworded
+//     runtime-context snapshot and its siblings) in a \x3csystem-reminder\x3e
+//     envelope; the envelope itself is the prefix — a real user question
+//     never opens with it.
 const AUTO_INJECTED_NOTIFICATION_PREFIXES: ReadonlyArray<string> = [
     "The approval policy changed from",
     "Current runtime context",
     "Time sampled while preparing turn",
+    "\x3csystem-reminder\x3e",
 ];
 
 export function isAutoInjectedNotification(text: string): boolean {

@@ -997,8 +997,8 @@ export function executeSearchContextTarget(
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
-                    if (!searchBlocks(blockDocs(anc.state), String(args.query ?? ""), { limit: anc.state.blocks.length, algorithm: "substring", minScore: 1e-9 }).length) continue;
-                    return executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    const inherited = executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    if (inherited.text.startsWith("Found ")) return inherited;
                 }
             }
         }
