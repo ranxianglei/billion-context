@@ -746,6 +746,8 @@ export function noteUpstreamThrottle429(
     const stateKey = scopeModel === undefined ? key : modelHoldKey(key, scopeModel);
     const previous = holds.get(stateKey);
     const observedState = createHoldState(key, host, cred, retryAfterHeader, now, previous, scopeModel, false);
+    // Concurrent refusals may omit Retry-After; they cannot shorten an existing hold for this scope.
+    if (previous) observedState.nextAttemptAt = Math.max(observedState.nextAttemptAt, previous.nextAttemptAt);
     if (previous === undefined) {
         if (!storeHold(stateKey, observedState, scopeModel !== undefined)) {
             // #5199/#5889: the hold map is saturated (MAX_HOLDS full, nothing
