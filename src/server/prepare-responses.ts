@@ -19,7 +19,8 @@ import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcile
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
 import { FoundationRejectError } from "../snapshot/plane.js";
 import { runStage0 } from "../snapshot/stage0.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
+import { featureEnabled } from "../rollout.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -190,6 +191,8 @@ export async function prepareResponses(
     // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
     // read at end-of-prepare to decide whether the debounce still needs a shot).
     let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8 phase 2: x-bili-msgid-mode signal (set after stage 0 below).
+    let msgidModeHeaders: Record<string, string> | undefined;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -296,6 +299,13 @@ export async function prepareResponses(
         // taken between the cursor write and the flush otherwise reads a
         // STALE parent revision and lands the child on the wrong lane.
         if (s0.anchorAdvanced) markDirty(session);
+        // #7064 §8 phase 2: the pin-mode signal (what the client may send
+        // NEXT turn) rides this lane's response headers — the responses
+        // lane has no watermark plane, so it is stamped independently of
+        // x-bili-pf-seq (the client's pfIdTailForm reads mode only).
+        if (featureEnabled("pluginMsgIdIncremental") && s0.pinMode !== null) {
+            msgidModeHeaders = { [MSGID_MODE_HEADER]: s0.pinMode };
+        }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
@@ -825,6 +835,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         judgeBaseline,
         ...(separatorManifest !== undefined ? { separatorManifest } : {}),
         responsesProjection,
+        responseExtraHeaders: msgidModeHeaders,
         systemNotes: sysNotes,
         protocol: "responses",
         stream,

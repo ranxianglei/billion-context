@@ -103,13 +103,19 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // endpoint it co-gates is inert until a client opts in (none calls it yet).
     // Roll back with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=0`.
     pluginLaneServerHistory: { percent: 100 },
-    // #7064 §8 (owner ruling 2026-11-18): steady-state turns ride the bounded
-    // x-bili-pf-tail-ids channel instead of re-sending the FULL msgid list
-    // every turn (the opencode 16KiB header budget died past ~1000 messages);
-    // the full form survives only at bootstrap + reanchor. 0 = byte-identical
-    // to pre-§8 behavior (full list every turn); ramp follows the x-bili-
-    // msgid-mode signal (off → 5 → 100). Requires pluginLaneServerHistory.
-    pluginMsgIdIncremental: { percent: 0 },
+    // #7064 §8 (owner rulings 2026-11-18): steady-state turns ride the
+    // bounded tail (anchor + new cores) instead of re-sending the FULL msgid
+    // list every turn (the opencode 16KiB header budget died past ~1000
+    // messages); the full form survives only at bootstrap + reanchor. ALL
+    // stamping clients are covered (pi / dsh openai wire via
+    // x-bili-pf-tail-ids; opencode V1 anthropic + V2 responses via the
+    // x-bili-msg-ids channel carrying the tail — server two-form rule). The
+    // owner set it ON by default: it is a core part of the msgid storage
+    // structure, and every mismatch self-heals one round trip (degrade →
+    // full signal → reanchor). Roll back with
+    // `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`. Requires
+    // pluginLaneServerHistory.
+    pluginMsgIdIncremental: { percent: 100 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

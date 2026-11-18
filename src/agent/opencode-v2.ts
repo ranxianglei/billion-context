@@ -50,7 +50,8 @@
 
 import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { opencodeV2MsgIdList, stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
+import { opencodeV2MsgIdList, stampedMsgIdsHeaderFromList } from "./opencode-v2-msgids.js";
+import * as pfChannel from "./pf-channel.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { harvestOpencodeMsgIds } from "./opencode-msgids.js";
@@ -341,17 +342,20 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // ids ride only when every one carries a usable host id, else no
             // header); the server re-proves exact count parity vs the wire
             // before trusting them, so drift degrades instead of misaligning.
-            const msgIdsHeader = stampedMsgIdsHeaderFromMessages(e.messages);
+            // #7064 §8 phase 2 (owner 2026-11-18): steady-state turns send
+            // only the TAIL (anchor + new cores, derived from this session's
+            // previous full list — pfIdTailForm). The server's two-form rule
+            // accepts the short list on this same header channel and pins
+            // the prefix from the ledger; the mode signal (x-bili-msgid-mode
+            // on the response, learned at the shared fetch chokepoint) is
+            // what flips this switch on. This releases the 16KiB header
+            // ceiling past ~1000 messages that made the full form die
+            // permanently on long sessions.
+            const msgIdList = opencodeV2MsgIdList(e.messages);
+            pfChannel.pfCaptureIds(sid, msgIdList);
+            const pfTail = msgIdList !== undefined && msgIdList.length > 0 ? pfChannel.pfIdTailForm(sid, msgIdList) : undefined;
+            const msgIdsHeader = stampedMsgIdsHeaderFromList(pfTail ?? msgIdList);
             if (msgIdsHeader !== undefined) headers.set("x-bili-msg-ids", msgIdsHeader);
-            // #7064 §8: opencode stays on the FULL form (phase 2) — its
-            // id list is core-aligned (leading system run skipped, see
-            // opencodeV2MsgIdList) while the /responses watermark T counts
-            // the wire INCLUDING the head run, so the tail-ids slice would
-            // be off-by-one and the server's incremental anchor/width
-            // checks would degrade every turn. Wiring it needs the pf
-            // capture wired to this event's core-aligned list with a
-            // head-run offset; the header budget pressure it releases (the
-            // 16KiB ceiling past ~1000 messages) is tracked there.
             // #1699: forward the host's per-request persona so the proxy can classify
             // side requests by intent — opencode v2 title-gen carries no max_tokens, so
             // the budget heuristic alone can never see it. Stamped for every non-empty

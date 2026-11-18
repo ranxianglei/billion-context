@@ -56,6 +56,11 @@ type Tracked = {
      *  re-converges one turn later). "incremental" ⇒ steady-state turns
      *  suppress the full msgid list and ride only the tail-ids header. */
     mode?: "incremental" | "full";
+    /** #7064 §8 phase 2 (non-watermark lanes): this session's LAST FULL id
+     *  list as captured this turn — the tail form is derived from it
+     *  client-side (pfIdTailForm) because these lanes get no x-bili-pf-seq
+     *  (the watermark plane is openai-lane only). Cleared alongside mode. */
+    prevIds?: string[];
 };
 
 const tracked = new Map<string, Tracked>();
@@ -86,7 +91,10 @@ export function pfLearnStamp(headersIn: Record<string, string>, respStatus: numb
     if (respStatus >= 400) {
         if (sid !== undefined && sid.length > 0) {
             const slot = tracked.get(sid);
-            if (slot !== undefined && slot.mode !== undefined) slot.mode = undefined;
+            if (slot !== undefined) {
+                if (slot.mode !== undefined) slot.mode = undefined;
+                if (slot.prevIds !== undefined) slot.prevIds = undefined;
+            }
         }
         return;
     }
@@ -176,4 +184,47 @@ export function pfSuppressFullMsgIds(sid: string, wireCount: number): boolean {
         return false;
     }
     return true;
+}
+
+/** #7064 §8 phase 2 (owner ruling 2026-11-18): the TAIL form for lanes
+ *  WITHOUT a watermark plane (anthropic / responses egress — their servers
+ *  never stamp x-bili-pf-seq, so pfRequestHeaders can't run): derive the
+ *  bounded "anchor + new cores" list from this turn's FULL list and this
+ *  session's previous full list. Returns undefined ⇒ send the full list.
+ *
+ *  Rules (one-round convergence, same contract as the server's
+ *  tryIncrementalPin):
+ *   - mode !== "incremental"            → full (nothing learned yet),
+ *   - no previous full list             → full (bootstrap), store this one,
+ *   - list SHORTER than the previous    → full (host compacted/rewrote —
+ *     reanchor), store this one,
+ *   - prefix MISMATCH vs the previous   → full (history rewrite — reanchor),
+ *     store this one,
+ *   - otherwise                         → [previous.last, ...new cores];
+ *     store this turn's list.
+ *  The server re-proves anchor + width + entries and signals "full" back
+ *  when anything drifted — a wrong tail costs one degraded turn, never a
+ *  mis-pin. fullIds = this turn's whole core-aligned id list (the very
+ *  list that would have been stamped full). */
+export function pfIdTailForm(sid: string, fullIds: string[] | undefined): string[] | undefined {
+    if (sid.length === 0 || fullIds === undefined || fullIds.length === 0) return undefined;
+    const slot = tracked.get(sid);
+    if (slot === undefined || slot.mode !== "incremental") return undefined;
+    const prev = slot.prevIds;
+    if (prev === undefined) {
+        slot.prevIds = [...fullIds]; // bootstrap: this turn establishes the baseline
+        return undefined;
+    }
+    if (fullIds.length < prev.length) {
+        slot.prevIds = [...fullIds]; // shrink ⇒ full reanchor next round trip
+        return undefined;
+    }
+    for (let i = 0; i < prev.length; i++) {
+        if (fullIds[i] !== prev[i]) {
+            slot.prevIds = [...fullIds]; // rewrite ⇒ full reanchor next round trip
+            return undefined;
+        }
+    }
+    slot.prevIds = [...fullIds];
+    return [prev[prev.length - 1], ...fullIds.slice(prev.length)];
 }

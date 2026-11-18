@@ -325,8 +325,15 @@ export async function opencodeV1EnvelopeBeforeSend(_url: string, init: RequestIn
         // (This replaces the dead host-shaped pfCaptureIds call that sat in
         // harvestMsgIdsTransform and could only ever clear the slot.)
         pfChannel.pfCaptureIds(sid.trim(), ids);
-        if (ids === undefined || ids.length === 0 || ids.length > V1_ENVELOPE_MAX_IDS) return;
-        const joined = ids.join(",");
+        // #7064 §8 phase 2 (owner 2026-11-18): steady-state turns ride the
+        // TAIL form on this same header (anchor + new cores from the
+        // previous full list) — the server's two-form rule accepts it and
+        // pins the prefix from the ledger (anthropic lane); the mode
+        // signal on the response flips this switch on. Full form stays the
+        // bootstrap / reanchor / degraded shape.
+        const sendIds = pfChannel.pfIdTailForm(sid.trim(), ids) ?? ids;
+        if (sendIds === undefined || sendIds.length === 0 || sendIds.length > V1_ENVELOPE_MAX_IDS) return;
+        const joined = sendIds.join(",");
         if (Buffer.byteLength(joined, "utf8") > V1_ENVELOPE_MAX_BYTES) return;
         headers.set(V1_ENVELOPE_MSG_IDS_HEADER, joined);
         init.headers = headers;
