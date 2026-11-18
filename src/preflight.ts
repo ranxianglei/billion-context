@@ -524,14 +524,20 @@ export interface RawBodyBreakdown {
     /** #6844: per-top-level-field token counts inside the `other` bucket,
      *  descending by tokens — the field dominating `other` is the actionable
      *  signal in a measured-doom 413 (which host-attached field carries the
-     *  non-prompt mass) without manual arithmetic. Empty when `other` is empty. */
-    otherTop: Array<{ field: string; tokens: number }>;
+     *  non-prompt mass) without manual arithmetic. Empty when `other` is empty.
+     *  #7090: `bytes` is the UTF-8 byte length of the field's string content
+     *  (sum of leaves) — for a capped upload like DSH's 8 MiB `dsh_session_log`
+     *  the cap is in BYTES, so bytes localize the truncation/backlog better
+     *  than tokens. An approximation of the field's JSON size (leaf content
+     *  only, excludes syntax overhead). */
+    otherTop: Array<{ field: string; tokens: number; bytes: number }>;
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlySet<string>): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     let prompt = 0;
     const otherByField = new Map<string, number>();
+    const otherByFieldBytes = new Map<string, number>();
     const pending: [unknown, string | undefined, number, boolean, string | undefined][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
@@ -549,7 +555,10 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
                 const t = defaultCountTokens(value);
                 buckets[bucket] += t;
                 if (isPrompt) prompt += t;
-                if (bucket === 3 && field !== undefined) otherByField.set(field, (otherByField.get(field) ?? 0) + t);
+                if (bucket === 3 && field !== undefined) {
+                    otherByField.set(field, (otherByField.get(field) ?? 0) + t);
+                    otherByFieldBytes.set(field, (otherByFieldBytes.get(field) ?? 0) + Buffer.byteLength(value, "utf8"));
+                }
             }
             continue;
         }
@@ -568,7 +577,7 @@ export function estimateRawBodyBreakdown(parsed: unknown, promptKeys?: ReadonlyS
         system: buckets[2],
         other: buckets[3],
         prompt,
-        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens })).sort((a, b) => b.tokens - a.tokens),
+        otherTop: [...otherByField.entries()].map(([field, tokens]) => ({ field, tokens, bytes: otherByFieldBytes.get(field) ?? 0 })).sort((a, b) => b.tokens - a.tokens),
     };
 }
 

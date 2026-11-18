@@ -100,9 +100,9 @@ test("#6844: otherTop attributes the other bucket to its top-level fields, desce
     };
     const bd = estimateRawBodyBreakdown(body);
     assert.deepEqual(bd.otherTop, [
-        { field: "custom_extension", tokens: t(extra) },
-        { field: "model", tokens: t("deepseek-flash") },
-        { field: "metadata", tokens: t("note x") },
+        { field: "custom_extension", tokens: t(extra), bytes: Buffer.byteLength(extra, "utf8") },
+        { field: "model", tokens: t("deepseek-flash"), bytes: Buffer.byteLength("deepseek-flash", "utf8") },
+        { field: "metadata", tokens: t("note x"), bytes: Buffer.byteLength("note x", "utf8") },
     ], "per-field attribution, largest first");
     assert.equal(bd.otherTop.reduce((sum, e) => sum + e.tokens, 0), bd.other, "otherTop sums to the other bucket");
 });
@@ -114,8 +114,16 @@ test("#6844: otherTop inherits the top-level field through nesting", () => {
         dsh_session_log: { entries: [{ seq: 1, text: nested }] },
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic);
-    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(nested) }], "only the string leaf counts, attributed to the top-level field");
+    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(nested), bytes: Buffer.byteLength(nested, "utf8") }], "only the string leaf counts, attributed to the top-level field");
     assert.equal(bd.other, bd.otherTop[0]!.tokens);
+});
+
+test("#7090: otherTop bytes are UTF-8 byte length (multi-byte aware), not code-unit count", () => {
+    // "会话日志" is 4 CJK chars = 12 UTF-8 bytes; value.length would say 4.
+    const cjk = "会话日志";
+    const bd = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }], dsh_session_log: cjk });
+    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(cjk), bytes: 12 }], "bytes must count UTF-8 bytes, not JS code units");
+    assert.equal(bd.otherTop[0]!.bytes, Buffer.byteLength(cjk, "utf8"));
 });
 
 test("#6844: empty other stays empty; messages/tools/system fields never appear in otherTop", () => {
@@ -126,7 +134,7 @@ test("#6844: empty other stays empty; messages/tools/system fields never appear 
         system: "s",
         model: "m",
     });
-    assert.deepEqual(bd.otherTop, [{ field: "model", tokens: t("m") }], "only the other-bucket field is attributed");
+    assert.deepEqual(bd.otherTop, [{ field: "model", tokens: t("m"), bytes: Buffer.byteLength("m", "utf8") }], "only the other-bucket field is attributed");
 });
 
 test("#6844: measuredBreakdownClause names the field dominating other", () => {
@@ -136,7 +144,7 @@ test("#6844: measuredBreakdownClause names the field dominating other", () => {
         custom_extension: extra,
     });
     const clause = measuredBreakdownClause(bd);
-    assert.match(clause, /other ~[\d,]+ \(non-prompt, excluded from the window budget; top field: custom_extension ~[\d,]+\)/, `the clause must name the dominating field, got: ${clause}`);
+    assert.match(clause, /other ~[\d,]+ \(non-prompt, excluded from the window budget; top field: custom_extension ~[\d,]+ tokens ≈[\d,]+ B\)/, `the clause must name the dominating field with its byte size, got: ${clause}`);
     assert.match(clause, /^messages ~[\d,]+ · tools\[\] ~[\d,]+ · system ~[\d,]+ · other /, "the four-bucket shape is unchanged");
 });
 
