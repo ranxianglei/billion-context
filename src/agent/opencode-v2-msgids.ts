@@ -88,7 +88,15 @@ export function stampedMsgIdsHeaderFromMessages(
     messages: readonly OpencodeV2MessageLike[] | null | undefined,
 ): string | undefined {
     const ids = opencodeV2MsgIdList(messages);
-    if (ids === undefined) return undefined;
+    return stampedMsgIdsHeaderFromList(ids);
+}
+
+/** #7064 §8 phase 2: the budget/join check for an ALREADY-extracted list
+ *  (steady-state turns send the TAIL derived from the previous full list —
+ *  same header, same budgets). */
+export function stampedMsgIdsHeaderFromList(ids: string[] | undefined): string | undefined {
+    if (ids === undefined || ids.length === 0) return undefined;
+    if (ids.length > MAX_IDS_PER_TURN) return undefined;
     const joined = ids.join(",");
     if (Buffer.byteLength(joined, "utf8") > STAMPED_HEADER_MAX_BYTES) return undefined;
     return joined;

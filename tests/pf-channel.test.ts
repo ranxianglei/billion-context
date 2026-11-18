@@ -392,3 +392,35 @@ test("pf-channel: a >=4xx response clears the learned mode immediately", () => {
     // 4xx on an unknown sid is a no-op
     learn({ [CONVO]: "sid-mode-4xx-unknown" }, null, 429);
 });
+
+// #7064 §8 phase 2: pfIdTailForm — the client-side tail derivation for
+// lanes WITHOUT a watermark plane (anthropic / responses egress).
+{
+    const learnMode = (sid: string, mode: "incremental" | "full"): void =>
+        learn({ [CONVO]: sid }, null, 200, mode);
+    test("pfIdTailForm: bootstrap stores the baseline and sends full", () => {
+        learnMode("tail-a", "incremental");
+        assert.equal(pfChannel.pfIdTailForm("tail-a", ["p1", "p2", "p3"]), undefined, "no previous list ⇒ full (bootstrap)");
+        assert.deepEqual(pfChannel.pfIdTailForm("tail-a", ["p1", "p2", "p3", "p4"]), ["p3", "p4"], "next turn: anchor + new core");
+        assert.deepEqual(pfChannel.pfIdTailForm("tail-a", ["p1", "p2", "p3", "p4", "p5"]), ["p4", "p5"], "rolling forward");
+    });
+    test("pfIdTailForm: shrink and rewrite both reanchor with the full list", () => {
+        learnMode("tail-b", "incremental");
+        pfChannel.pfIdTailForm("tail-b", ["q1", "q2", "q3"]);
+        assert.equal(pfChannel.pfIdTailForm("tail-b", ["q1"]), undefined, "shrink (host compacted) ⇒ full reanchor");
+        assert.deepEqual(pfChannel.pfIdTailForm("tail-b", ["q1", "q9"]), ["q1", "q9"], "…and the shortened list becomes the new baseline");
+        pfChannel.pfIdTailForm("tail-b", ["q1", "q9", "q5"]);
+        assert.equal(pfChannel.pfIdTailForm("tail-b", ["r1", "q9", "q5"]), undefined, "prefix rewrite ⇒ full reanchor");
+    });
+    test("pfIdTailForm: mode 'full' or absent ⇒ always full; a 4xx clears the learned state", () => {
+        learnMode("tail-c", "full");
+        pfChannel.pfIdTailForm("tail-c", ["s1"]);
+        assert.equal(pfChannel.pfIdTailForm("tail-c", ["s1", "s2"]), undefined, "mode 'full' ⇒ never tail");
+        learnMode("tail-d", "incremental");
+        pfChannel.pfIdTailForm("tail-d", ["u1", "u2"]);
+        assert.deepEqual(pfChannel.pfIdTailForm("tail-d", ["u1", "u2", "u3"]), ["u2", "u3"]);
+        learn({ [CONVO]: "tail-d" }, null, 400);
+        pfChannel.pfIdTailForm("tail-d", ["u1", "u2"]);
+        assert.equal(pfChannel.pfIdTailForm("tail-d", ["u1", "u2", "u3"]), undefined, "after a 4xx the baseline + mode are cleared ⇒ full again");
+    });
+}

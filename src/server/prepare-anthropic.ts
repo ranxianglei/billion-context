@@ -47,7 +47,8 @@ import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -225,6 +226,9 @@ export async function prepareAnthropic(
     // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
     // read at end-of-prepare to decide whether the debounce still needs a shot).
     let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
+    // #7064 §8 phase 2: pin-mode signal (set in the pin block below).
+    let msgidPinMode: "full" | "incremental" | null = null;
+    let msgidModeHeaders: Record<string, string> | undefined;
     try {
         const converted = anthropicToCore(parsed);
         let msgs = converted.msgs;
@@ -236,13 +240,34 @@ export async function prepareAnthropic(
         // fold coverage, and the unified-table rows the rawTail ingest writes.
         if (pluginMode && (incomingMsgIds !== undefined || incomingMsgSeqs !== undefined)) {
             if (featureEnabled("pluginLaneServerHistory")) {
-                const v = incomingMsgIds === undefined ? undefined : validateMsgIds(incomingMsgIds, msgs.length);
+                // #7064 §8 phase 2: the same TWO-FORM rule as stage 0 (the
+                // openai / responses lanes) — this lane pins inline (no
+                // runStage0), so the split is local: len === view = FULL
+                // list (existing path), len !== view = TAIL form (the
+                // shared drift-class helper: anchor + width + entry
+                // screen; any mismatch degrades to the full signal, never
+                // rejects — opencode V1's anthropic-wire header is the
+                // steady-state consumer).
+                const idsFullForm = Array.isArray(incomingMsgIds) && incomingMsgIds.length === msgs.length ? (incomingMsgIds as string[]) : undefined;
+                const v = idsFullForm === undefined ? undefined : validateMsgIds(idsFullForm, msgs.length);
                 if (v !== undefined && v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
+                    msgidPinMode = "incremental";
                 } else if (v !== undefined) {
                     log("warn", `[${sessionId}] [msgid] pin rejected (${v.reason}) — falling back to content-derived ids (#4491)`);
+                    msgidPinMode = "full";
+                } else if (Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0 && incomingMsgIds.length !== msgs.length) {
+                    const ip = tryIncrementalPin(sessionId, "anthropic", msgs, incomingMsgIds as string[], log);
+                    if (ip !== null) {
+                        msgs = ip;
+                        originalMessages = ip;
+                        noteMsgIdObservation(session, ip.map((m) => m.id), msgs, log, sessionId);
+                        msgidPinMode = "incremental";
+                    } else {
+                        msgidPinMode = "full";
+                    }
                 }
                 // #4316 PR2/3: re-attach the ledger seq stamps the lane sent —
                 // the same parallel-array lifecycle as the ids (strip →
@@ -258,6 +283,9 @@ export async function prepareAnthropic(
             } else {
                 log("info", `[${sessionId}] [msgid] biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#4491)`);
             }
+        }
+        if (featureEnabled("pluginMsgIdIncremental") && msgidPinMode !== null) {
+            msgidModeHeaders = { [MSGID_MODE_HEADER]: msgidPinMode };
         }
         // #3756 snapshot render: outbound prefix from the unified transcript
         // (fold-time ids, immune to identity re-mints); live tail keeps the
@@ -720,7 +748,7 @@ export async function prepareAnthropic(
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", responseExtraHeaders: msgidModeHeaders, stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";

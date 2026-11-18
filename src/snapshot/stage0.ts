@@ -13,13 +13,20 @@
 //    wherever the pin is unreachable). D3: the arm no longer excludes
 //    watermark-HIT turns — the cursor refreshes on hit turns too (the hit
 //    view is the same canonical id space; the tail anchor stays live).
-//  - R3: declared but incomplete → checkR3Identity is the single arbiter
+//  - R3: a FULL-LENGTH declared array that fails entry validation
+//    (bad-entry / reserved / control / duplicate) → checkR3Identity is the single arbiter
 //    (M2: it is CALLED here, in both lanes); an unlatched fault throws
 //    FoundationRejectError → the server maps it to 400 (B1); 3 faults in a
 //    10-minute window latch the sid to the legacy path and the latch
 //    PERSISTS across proxy restarts (snapR3Latch). D2: the fault path
 //    NEVER fires for conversation-bound sids — the host conversation
 //    identity IS the identity, the cursor is bookkeeping there.
+//    #7064 §8 phase 2 (owner ruling 2026-11-18): a SHORT declared array
+//    is now a LEGAL tail form (steady-state incremental — the channel
+//    carries anchor + new cores), so "declared but short" is a drift class
+//    that degrades to the full signal and NEVER 400s; a genuinely broken
+//    host re-converges (full form) and is caught there if its full list
+//    is also wrong (D1: never reject drift).
 //  - D1 永不判分叉: the stage-0 verdict NEVER rejects or resets — the
 //    strongest move is `reanchor` (re-issue the world cursor from the
 //    incoming array, one cheap UPDATE). The pre-slimming diverge/envelope
@@ -89,6 +96,18 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     void wpHit; // D3: the arm no longer keys on the hit state (logs only)
     const rollout = featureEnabled("pluginLaneServerHistory");
     const declared = Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0;
+    // #7064 §8 phase 2 (owner 2026-11-18): TWO-FORM rule on the declared
+    // channel — the SAME field carries either shape and the length
+    // discriminates: len === view = FULL list (bootstrap / reanchor),
+    // len !== view = TAIL form (anchor + new cores, steady state). No
+    // per-lane splitting: the handle.ts funnel puts body, header and
+    // harvest sources into this one field on every wire, so responses /
+    // anthropic clients go incremental with NO new server channel — they
+    // just stop sending the full list in steady state (the client derives
+    // the tail from its own previous full list, pfIdTailForm).
+    const declaredIds = Array.isArray(incomingMsgIds) ? (incomingMsgIds as string[]) : null;
+    const fullForm = declaredIds !== null && declaredIds.length === msgs.length;
+    const bodyTail = declaredIds !== null && !fullForm && declaredIds.length > 0 ? declaredIds : null;
     // #7064 §8: the incremental pin is its OWN rollout on top of the lane's
     // (the full-list pin below is untouched). Off = byte-identical to
     // pre-§8 behavior.
@@ -123,9 +142,10 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     // array is captured pre-watermark (prepare-openai:83) and aligns to the
     // FULL view length on hit exactly as on miss, so validation and the pin
     // are unchanged; only the R3 consequences stay behind the `armed` gate.
-    if (pluginMode && incomingMsgIds !== undefined) {
+    if (pluginMode && declaredIds !== null) {
         if (rollout) {
-            const v = validateMsgIds(incomingMsgIds, msgs.length);
+            if (fullForm) {
+            const v = validateMsgIds(declaredIds, msgs.length);
             if (v.ok) {
                 pinned = applyMsgIdPin(msgs, v.ids);
             } else if (armed) {
@@ -173,6 +193,59 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                 }
             } else {
                 log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+            }
+            } else {
+                // TAIL form on the declared channel (responses / anthropic
+                // steady state, or the openai body field carrying the tail):
+                // anchor + new cores, the ledger pins the prefix. Same
+                // drift-class contract as the pf-tail-ids branch — ANY
+                // mismatch degrades to the full signal, never rejects.
+                // Read the ledger ONCE here: it decides the gate below AND
+                // feeds the pin (single source of truth for C); a store
+                // fault reads empty (conservative: takes the FAULT side).
+                let liveIds: string[] = [];
+                try {
+                    liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+                } catch {
+                    liveIds = [];
+                }
+                // EXCEPTION: a short array on an EMPTY ledger is not drift —
+                // there is no frontier to anchor against, so it is a failed
+                // collection on an unknown session: the legacy R3 fault
+                // applies (B1/D2 semantics: 400 for a non-bound sid).
+                if (liveIds.length === 0 && bodyTail !== null) {
+                    const v = validateMsgIds(bodyTail, msgs.length);
+                    if (!v.ok && armed) {
+                        const convBound = (() => {
+                            try {
+                                return getStore()?.snapConvBound(sessionId) ?? false;
+                            } catch {
+                                return false;
+                            }
+                        })();
+                        if (convBound) {
+                            log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — conversation-bound sid skips the R3 fault, content-derived ids this turn`);
+                        } else if (!checkR3Identity(true, msgs.length, bodyTail)) {
+                            const { latched } = r3FaultTracker.recordFault(sessionId);
+                            if (latched) {
+                                armed = false;
+                                try {
+                                    getStore()?.snapR3Latch(sessionId);
+                                } catch { /* best-effort */ }
+                                log("error", `[${sessionId}] [2x2:${lane}] R3 identity fault ×3 in window (${v.reason}) — sid latched to the legacy path (persisted)`);
+                            } else {
+                                const strike = r3FaultTracker.strikes(sessionId);
+                                log("warn", `[${sessionId}] [2x2:${lane}] R3 identity fault — strike ${strike}/${r3FaultTracker.strikeCap} in window (${v.reason}) — 400 sent; the sid latches to the legacy path after ${r3FaultTracker.strikeCap - strike} more`);
+                                throw new FoundationRejectError(`inbound msgid envelope failed validation (${v.reason})`);
+                            }
+                        } else {
+                            log("warn", `[${sessionId}] [msgid] ${lane}-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                        }
+                    }
+                } else {
+                    const inc = incrementalOn && bodyTail !== null ? tryIncrementalPin(sessionId, lane, msgs, bodyTail, log, liveIds) : null;
+                    if (inc !== null) pinned = inc;
+                }
             }
         } else {
             log("info", `[${sessionId}] [msgid] ${lane}-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
@@ -254,18 +327,24 @@ export function runStage0(opts: Stage0Input): Stage0Result {
 // signal — on ANY structural disagreement: empty ledger (bootstrap), width
 // mismatch (the host compacted/rewrote: C + N !== view length), or an
 // anchor that is not the ledger frontier (stale window / id space moved).
-function tryIncrementalPin(
+// Exported: the anthropic lane's inline pin reuses it (two-form rule).
+export function tryIncrementalPin(
     sessionId: string,
     lane: string,
     msgs: BiliMessage[],
     tailIds: string[],
     log: (level: string, msg: string) => void,
+    preReadLiveIds?: string[],
 ): BiliMessage[] | null {
     let liveIds: string[];
-    try {
-        liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
-    } catch {
-        return null; // a store fault degrades — never a 500 on the pin path
+    if (preReadLiveIds !== undefined) {
+        liveIds = preReadLiveIds;
+    } else {
+        try {
+            liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+        } catch {
+            return null; // a store fault degrades — never a 500 on the pin path
+        }
     }
     const C = liveIds.length;
     const N = tailIds.length - 1;
@@ -280,6 +359,22 @@ function tryIncrementalPin(
     if (tailIds[0] === "?" || tailIds[0] !== liveIds[C - 1]) {
         log("info", `[${sessionId}] [2x2:${lane}] incremental anchor mismatch (tail[0]=${tailIds[0]}, ledger frontier=${liveIds[C - 1]}) — full signal (reanchor next turn)`);
         return null;
+    }
+    // Entry screening on the NEW cores (same rules as msgid-pin
+    // validateMsgIds — a bad id must never reach the ledger's unique index).
+    // The seen-set is SEEDED WITH THE LEDGER PREFIX: a new core reusing an
+    // existing id (same id, different content) is the identity-anomaly
+    // validateMsgIds rejects on the full form — a legit host mints fresh ids
+    // for fresh positions, it never reuses one.
+    const seen = new Set<string>(liveIds);
+    for (let i = 1; i < tailIds.length; i++) { // slot 0 is the anchor (checked above); the NEW cores are slots 1..
+        const id = tailIds[i];
+        if (id === "?") continue;
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id) || seen.has(id)) {
+            log("info", `[${sessionId}] [2x2:${lane}] incremental tail carried an invalid id at slot ${i} — full signal (reanchor next turn)`);
+            return null;
+        }
+        seen.add(id);
     }
     // Anchor proven: the ledger's live row order IS the view order (ingest
     // sweeps the ledger to the authoritative set, #3285/#4390 — the width

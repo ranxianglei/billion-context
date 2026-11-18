@@ -939,3 +939,84 @@ test("#7064 §8 I3: empty ledger (true bootstrap) takes the full signal; full fo
     assert.equal(rc.pinned![2].id, dMsgs(3)[2].id, "the '?' slot keeps the core's pre-existing content-derived id");
     assert.equal(rc.pinMode, "incremental");
 });
+
+test("#7064 §8 phase 2 I4: the TAIL form rides the declared channel itself (responses/anthropic steady state); the body short array wins over the pf header", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    // bootstrap on the ledger with the FULL list (any carrier — here the
+    // declared channel, exactly as the responses/anthropic lanes see it).
+    seedLedger(db, "i4-sid", ["f1", "f2", "f3"]);
+    const r0 = runStage0({
+        sessionId: "i4-sid", lane: "responses", msgs: dMsgs(3),
+        incomingMsgIds: ["f1", "f2", "f3"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.notEqual(r0.pinned, null, "the full form pinned at bootstrap");
+    // steady state: the SAME field now carries the short tail (anchor +
+    // new cores) — len !== view ⇒ the two-form rule takes the tail path
+    // (no pf header at all on these lanes).
+    const r1 = runStage0({
+        sessionId: "i4-sid", lane: "responses", msgs: dMsgs(4),
+        incomingMsgIds: ["f3", "f4"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.notEqual(r1.pinned, null, "the short declared array pinned as the tail form");
+    assert.deepEqual(r1.pinned!.map((m) => m.id), ["f1", "f2", "f3", "f4"], "prefix re-stamped from the ledger, tail from the array");
+    assert.equal(r1.pinMode, "incremental");
+    // both carriers present (openai lane shape): the body short array is
+    // the host-declared channel and WINS over the pf-tail-ids header.
+    const r2 = runStage0({
+        sessionId: "i4-sid", lane: "openai", msgs: dMsgs(4),
+        incomingMsgIds: ["f3", "f4"], incomingSeqs: null,
+        incomingTailIds: ["f3", "f9"], pluginMode: true, log,
+    });
+    assert.notEqual(r2.pinned, null);
+    assert.deepEqual(r2.pinned!.map((m) => m.id), ["f1", "f2", "f3", "f4"], "the body tail won (f9 from the header was NOT used)");
+});
+
+test("#7064 §8 phase 2 I5: an invalid entry in the TAIL form degrades to 'full' (drift class — NEVER an R3 throw), on every lane", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    seedLedger(db, "i5-sid", ["g1", "g2"]);
+    const mk = (badId: string) => runStage0({
+        sessionId: "i5-sid", lane: "anthropic", msgs: dMsgs(3),
+        incomingMsgIds: ["g2", badId], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    for (const badId of ["g2", "acp_summary_x", "bad id", "x".repeat(513)]) {
+        const r = mk(badId);
+        assert.equal(r.pinned, null, `bad tail entry ${JSON.stringify(badId)} ⇒ no pin`);
+        assert.equal(r.pinMode, "full", `bad tail entry ${JSON.stringify(badId)} ⇒ the client re-sends the full list next turn`);
+    }
+    // the anchor slot is screened too (it is a NEW-core slot: i >= C).
+    const rA = runStage0({
+        sessionId: "i5-sid", lane: "anthropic", msgs: dMsgs(3),
+        incomingMsgIds: ["g3", "g4"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.equal(rA.pinned, null, "anchor ≠ ledger frontier ⇒ drift, not a fault");
+    assert.equal(rA.pinMode, "full");
+});
+
+test("#7064 §8 phase 2 I6: the flag OFF leaves a short array pinned-less and signals 'full' (rollback self-heals the client back to the full form)", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    seedLedger(db, "i6-sid", ["h1", "h2"]);
+    const prev = process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"];
+    process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"] = "0";
+    try {
+        const r = runStage0({
+            sessionId: "i6-sid", lane: "responses", msgs: dMsgs(3),
+            incomingMsgIds: ["h2", "h3"], incomingSeqs: null,
+            pluginMode: true, log,
+        });
+        assert.equal(r.pinned, null, "flag off ⇒ only the full pin runs server-side");
+        assert.equal(r.pinMode, "full", "…and the client is told to go back to the full form (no 4xx, no pin until it does)");
+    } finally {
+        if (prev === undefined) delete process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"];
+        else process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"] = prev;
+    }
+});
