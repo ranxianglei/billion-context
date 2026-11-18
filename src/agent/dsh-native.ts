@@ -47,6 +47,7 @@
 // manual /compact is rare and auto mode is off).
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -1252,6 +1253,9 @@ interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
     purpose?: string;
+    /** #7085 follow-up: deduped `kind=fp` attestation pairs captured from
+     *  this dispatch's host messages (empty = nothing attestable). */
+    kindAttestations: string[];
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
@@ -1314,6 +1318,104 @@ function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
  *  drives these collectors directly against the shared reject-class set. */
 export const _hostMsgIdsOfForTest = hostMsgIdsOf;
 export const _pfSlotIdsOfForTest = pfSlotIdsOf;
+
+/* ------------------------------------------------------------------ */
+/* #7085 follow-up: source-kind attestation for the dsh lane.          */
+/* ------------------------------------------------------------------ */
+// Every dsh MessageBase carries `source: MessageSource` in-process (a
+// merge-extensible kind vocabulary — each producer declares its own kind in
+// its own module; consumers fall through unknowns). The wire never shows it
+// (the adapters reduce messages to role+content), and bili's durable
+// classifiers therefore match copied TEXT markers — the #7085 failure mode
+// (a host rewording its snapshot silently disarms the classifier). This
+// collector closes the loop: for every host message whose (kind, form) is in
+// the attestation list below it emits `kind=fingerprint` pairs, the
+// fingerprint binding the kind to the EXACT text units (first 16 hex of
+// sha256, mirrored from src/durable-message-guards.ts msgKindFingerprint —
+// host bundles must not import server modules, KDD #17; the lockstep is
+// pinned in tests/msgkind-channel.test.ts). The pairs ride the
+// x-bili-msg-kinds request header; the server classifies by fingerprint
+// first and falls through to the text markers, so a missed attestation is
+// always a no-op, never a wrong class.
+//
+// The list mirrors the server's evidence-permitlist (dshSourceKindToPath):
+// ONLY kinds with a source-verified emitter AND a classifier twin are
+// attested. Two kinds carry a FORM filter — the shape the server cannot see
+// (it only receives the kind token): agent-instructions attests the baseline
+// ('instructions') but not reconcile notices (which the text classifier
+// deliberately leaves foldable), and agent-message attests the relay form
+// only. Unattested kinds (system-prompt, compact-checkpoint, tmux-context,
+// user, model, tool, …) never reach the header.
+const KIND_ATTESTATION_CAP = 512; // matches the server decode cap (msgid-pin.ts)
+// #7085 follow-up: header name mirrored from src/msgid-pin.ts MSG_KINDS_HEADER
+// (host bundles mirror, not import — same discipline as the MAX_ID_LEN /
+// RESERVED_PREFIX twins above; keep in sync).
+const MSG_KINDS_HEADER = "x-bili-msg-kinds";
+const ATTESTABLE_SOURCE_KINDS = new Set([
+    "runtime-context",
+    "skill-catalog",
+    "time-context",
+    "ptc-mode",
+    "tool-jobs",
+    "subagent-settled",
+    "dsh-mnemon",
+]);
+const ATTESTABLE_KIND_FORMS: Readonly<Record<string, string>> = {
+    "agent-instructions": "instructions",
+    "agent-message": "relay",
+};
+
+/** The text units of one host message that become their own core message on
+ *  both wires (string content as-is; each text block of a block array) — the
+ *  same granularity the kernel codecs flatten to, which is what makes the
+ *  fingerprint join work. Image/other blocks contribute nothing. */
+function msgTextUnitsOf(content: unknown): string[] {
+    if (typeof content === "string") return content.length > 0 ? [content] : [];
+    if (!Array.isArray(content)) return [];
+    const units: string[] = [];
+    for (const raw of content) {
+        if (raw !== null && typeof raw === "object") {
+            const block = raw as { type?: unknown; text?: unknown };
+            if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) units.push(block.text);
+        }
+    }
+    return units;
+}
+
+/** #7085 follow-up test twin of msgKindFingerprint (src/durable-message-guards.ts)
+ *  — the two expressions must stay byte-identical (mirrored, not imported;
+ *  tests/msgkind-channel.test.ts drives both against one corpus). */
+export function _msgKindFingerprintForTest(text: string): string {
+    return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
+}
+
+function kindAttestationsOf(messages: unknown): string[] {
+    if (!Array.isArray(messages)) return [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") continue;
+        const source = (m as { source?: unknown }).source;
+        if (source === null || typeof source !== "object") continue; // RequestUserInput / sidecar shapes
+        const kind = (source as { kind?: unknown }).kind;
+        if (typeof kind !== "string") continue;
+        const wantForm = ATTESTABLE_KIND_FORMS[kind];
+        const attested = wantForm === undefined
+            ? ATTESTABLE_SOURCE_KINDS.has(kind)
+            : (source as { form?: unknown }).form === wantForm;
+        if (!attested) continue;
+        for (const unit of msgTextUnitsOf((m as { content?: unknown }).content)) {
+            const pair = `${kind}=${_msgKindFingerprintForTest(unit)}`;
+            if (seen.has(pair)) continue;
+            seen.add(pair);
+            out.push(pair);
+            if (out.length >= KIND_ATTESTATION_CAP) return out;
+        }
+    }
+    return out;
+}
+
+export const _kindAttestationsOfForTest = kindAttestationsOf;
 
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
@@ -2094,7 +2196,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
                 // (dsh sets it on every auxiliary call; conversation leaves it
                 // unset). Absent/odd values simply stay off the turn.
                 const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), purpose };
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), purpose, kindAttestations: kindAttestationsOf(options?.messages) };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2621,6 +2723,12 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const declaredPurpose = attr.purpose ?? "conversation";
         const purposeHeader = asciiHeaderValue(declaredPurpose);
         if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
+        // #7085 follow-up: the source-kind attestation for THIS dispatch —
+        // `kind=fp` pairs, all-ASCII by construction (lower-kebab kinds +
+        // hex fingerprints), so no encoding is needed. Empty list = no
+        // header (exactly the pre-channel request).
+        const attested = dispatchScope.getStore()?.kindAttestations;
+        if (attested !== undefined && attested.length > 0) headers[MSG_KINDS_HEADER] = attested.join(",");
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited

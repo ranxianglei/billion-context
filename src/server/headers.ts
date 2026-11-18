@@ -47,6 +47,11 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // host↔bili bookkeeping like the pf-* handshake above; the real upstream
     // must never see it.
     "x-bili-msg-ids",
+    // #7085 follow-up: source-kind attestation channel — the dsh plugin rides
+    // `(kind, fingerprint-of-exact-text)` pairs here for its host-injected
+    // messages; the durable classifier consults it before its text markers.
+    // Same host↔bili bookkeeping class as x-bili-msg-ids; strip at egress.
+    "x-bili-msg-kinds",
     "te",
     "trailer",
     "upgrade",

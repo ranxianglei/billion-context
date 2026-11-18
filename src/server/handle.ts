@@ -18,7 +18,7 @@ import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-mode
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
-import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
+import { durableMessageToolPaths, durableMessageToolPathFactories, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
@@ -77,7 +77,7 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_KINDS_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader, incomingMsgKindsHeader } from "../msgid-pin.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -1443,6 +1443,13 @@ async function handleRequest(
             ? incomingMsgIdsHeader(req.headers["x-bili-msg-ids"])
             : undefined;
         let inboundMsgIds = stampedInboundMsgIds ?? headerStampedMsgIds;
+        // #7085 follow-up: the source-kind attestation rides its own header
+        // (dsh plugin — kind + fingerprint-of-exact-text per host-injected
+        // message). Decoded per request, consumed ONLY by the durable
+        // classifier below (no identity role — never an attribution rung,
+        // never pinned); a rejected/absent header classifies byte-identically
+        // to pre-channel traffic.
+        const inboundMsgKinds = incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]);
         if (inboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
             const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
             if (Array.isArray(openaiLike) && openaiLike.length > 0) {
@@ -3095,7 +3102,12 @@ async function handleRequest(
         // effectiveConfig() re-resolves both from the lane id at read time, so
         // /__bili/plugin/tool sees them too.
         storeEffectiveConfig(session, reqConfig);
-        const durableClassifier = pluginAgent ? durableMessageToolPaths[pluginAgent] : undefined;
+        // #7085 follow-up: lanes with an attesting host go through the
+        // classifier FACTORY with this request's decoded kind index (the
+        // attestation is consulted before the text markers, so a host
+        // rewording an injection cannot silently disarm a classifier); every
+        // other lane keeps the prebuilt text-only entry unchanged.
+        const durableClassifier = pluginAgent ? (durableMessageToolPathFactories[pluginAgent]?.(inboundMsgKinds) ?? durableMessageToolPaths[pluginAgent]) : undefined;
         if (durableClassifier !== undefined) reqConfig = withDurableProtection(reqConfig, durableClassifier);
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0

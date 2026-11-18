@@ -80,6 +80,49 @@ export function incomingMsgIdsHeader(headerValue: string | string[] | undefined)
     return incomingMsgIdsOf({ [MSG_IDS_BODY_FIELD]: list });
 }
 
+// #7085 follow-up: source-kind attestation channel. The dsh plugin attests
+// `(kind, fingerprint)` pairs for its host-injected messages — the kind is
+// the structured `source.kind` it stamps internally (never visible on the
+// wire otherwise), the fingerprint is 16 hex of sha256(exact text). The
+// classifier (src/durable-message-guards.ts dshDurableToolPathWithKinds)
+// consults the decoded index before its text markers, so a host rewording an
+// injection can no longer silently disarm a classifier. Strict decode, whole
+// header all-or-nothing (one malformed pair or an ambiguous fingerprint —
+// the same fp attested under two kinds — drops EVERYTHING, exactly the
+// parseTailIds / stamped-header discipline): absent or rejected headers
+// classify byte-identically to pre-channel traffic. The header is egress-
+// stripped (UPSTREAM_HOP_HEADERS); it rides alongside x-bili-msg-ids and is
+// consumed at the same seam (src/server/handle.ts).
+export const MSG_KINDS_HEADER = "x-bili-msg-kinds";
+const MSG_KINDS_MAX_PAIRS = 512; // ~13KiB worst case under the byte cap below
+const MSG_KIND_TOKEN_RE = /^[a-z][a-z0-9-]{0,39}$/; // dsh kinds are lower-kebab, producer-declared
+const MSG_KIND_FP_RE = /^[0-9a-f]{16}$/;
+
+/** Decode `x-bili-msg-kinds` into a fingerprint→kind index, or undefined
+ *  (absent / oversized / any malformed pair / ambiguous fp) — the caller
+ *  then classifies exactly as pre-channel. Unknown kinds PASS validation and
+ *  are ignored at classify time: the kind→path map is the evidence
+ *  permitlist, not a closed vocabulary (a future dsh kind degrades to the
+ *  text markers, never to a 400 or a dropped turn). */
+export function incomingMsgKindsHeader(headerValue: string | string[] | undefined): Map<string, string> | undefined {
+    const raw = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    if (raw.length > STAMPED_HEADER_MAX_TOTAL_BYTES) return undefined;
+    const index = new Map<string, string>();
+    for (const pair of raw.split(",")) {
+        if (pair.length === 0) continue; // trailing/interior comma tolerance, like the ids header
+        const eq = pair.indexOf("=");
+        const kind = eq <= 0 ? "" : pair.slice(0, eq);
+        const fp = eq <= 0 ? "" : pair.slice(eq + 1);
+        if (!MSG_KIND_TOKEN_RE.test(kind) || !MSG_KIND_FP_RE.test(fp)) return undefined;
+        const prior = index.get(fp);
+        if (prior !== undefined && prior !== kind) return undefined; // ambiguous attestation → void
+        index.set(fp, kind);
+        if (index.size > MSG_KINDS_MAX_PAIRS) return undefined;
+    }
+    return index.size > 0 ? index : undefined;
+}
+
 type SeqValidation = { ok: true; seqs: number[] } | { ok: false; reason: string };
 
 /** Strict validation for the seq stamp array: 1-based positive integers,

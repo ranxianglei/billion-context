@@ -65,6 +65,8 @@
 // to foldable, one compression later the forged/partial copy is the only
 // survivor. The role gate is checked first in every classifier below.
 
+import { createHash } from "node:crypto";
+
 import type { Config, CoreMessage } from "acp-kernel";
 
 /** Projects a plain-text message to a canonical `durable/<name>` virtual tool
@@ -393,6 +395,102 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
 export const durableMessageToolPaths: Record<string, DurableMessageClassifier> = {
     dsh: dshDurableToolPath,
+};
+
+/* ------------------------------------------------------------------ */
+/* #7085 follow-up — structured source-kind attestation channel.       */
+/* ------------------------------------------------------------------ */
+// The file header's "the structured source.kind these hosts stamp internally
+// never reaches the proxy wire" is no longer true for the dsh lane: its
+// plugin observes the in-process llm/stream options (every MessageBase
+// carries `source: MessageSource`, packages/llm/llm/src/message.ts — a
+// merge-extensible kind vocabulary each producer declares in its own module)
+// and attests `(kind, fingerprint-of-the-exact-text)` pairs on the
+// `x-bili-msg-kinds` request header (src/msgid-pin.ts decoder; the header is
+// egress-stripped like x-bili-msg-ids). The classifier below consults the
+// attestation FIRST and falls through to the text markers above when it has
+// no opinion — so an absent header, an unmapped kind, or a fingerprint
+// miss (a transform that broke byte-equality between the host text and the
+// core text) all degrade to exactly today's text-marker behavior. This makes
+// classification STRUCTURE-CARRYING instead of copy-carrying: the host owns
+// the kind, bili owns only the fp→path map, and a host rewording a snapshot
+// (the #7085 failure: dsh 0.2.2-rc.3 changed the runtime-context intro and
+// the copied literal silently stopped matching) can no longer disarm a
+// classifier — the attestation follows the new bytes automatically.
+//
+// Fingerprint: first 16 hex of sha256(text, utf8) — 64 bits, a classification
+// HINT rather than an identity anchor (the ledger's content_hash is the full
+// digest over stored serialization; a 2^-64 hint collision pins one extra
+// message foldable→durable or re-labels its one-shot family — bounded,
+// self-contained, no re-keying). The host-side twin (src/agent/dsh-native.ts
+// kindAttestationsOf) must NOT import this module (host bundles run in the
+// foreign runtime, KDD #17), so the digest expression is mirrored there and
+// tests/msgkind-channel.test.ts drives both sides against one corpus.
+//
+// Trust boundary (declared, like the msgid channel's §7): the attester is
+// the loopback plugin itself — it can only map fingerprints of texts that
+// are IN ITS OWN outgoing request, so the worst case is pinning or
+// re-labeling one of its own messages (bounded context bloat), never
+// another session's rows. The kind→path map is the KDD #9
+// evidence-permitlist: unknown kinds are ignored, not rejected.
+
+type DurableKindIndex = ReadonlyMap<string, string>; // fingerprint → kind
+
+/** dsh source.kind → virtual path. ONLY kinds whose emitter is source-
+ *  verified (or carries reporter session evidence) AND which have a text-
+ *  classifier twin above belong here — the kind path and the marker path
+ *  must agree on the family, so a kind hit can never change a message's
+ *  protection class, only rescue it when the wording drifted. Unmapped on
+ *  purpose: mcp-catalog (third-party plugin, kind not source-verifiable),
+ *  the image-handle / image-offload-placeholder pair (emitted by the
+ *  out-of-repo @deepseek-ai/dsh-compaction package), tmux-context (no
+ *  classifier family exists for it). */
+export const dshSourceKindToPath: Readonly<Record<string, string>> = {
+    "runtime-context": "durable/runtime-context",       // packages/core/agent-loop/src/runtime-context.ts
+    "agent-instructions": "durable/agents-md",          // packages/context/agent-instructions/src/state.ts (form: 'instructions' = baseline only; the host pre-filters the reconcile form)
+    "skill-catalog": "durable/skill-catalog",           // packages/skill/tool-skill/src/index.ts
+    "time-context": "oneshot/time-context",             // packages/context/time-context/src/index.ts
+    "ptc-mode": "oneshot/ptc-image",                    // packages/core/tool-executor-ptc/src/ptc.ts
+    "tool-jobs": "oneshot/tool-job-notice",             // packages/jobs/tool-jobs/src/index.ts
+    "subagent-settled": "oneshot/subagent-settled",     // packages/subagent/subagent/src/continuation-messages.ts
+    "agent-message": "oneshot/agent-relay",             // ditto (form: 'relay')
+    "dsh-mnemon": "oneshot/mnemon",                     // omdsh-dev/dsh-mnemon (kind from the #5173 reporter's session jsonl)
+};
+
+/** The attestation fingerprint of one text unit — the SAME expression the
+ *  host-side collector uses (mirror, not import; see the block above). */
+export function msgKindFingerprint(text: string): string {
+    return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
+}
+
+/** Build the dsh classifier for one request: the kind attestation index
+ *  (fingerprint → kind, decoded from the request header) consulted FIRST
+ *  under the same role/content gates every text classifier uses, then the
+ *  twelve text markers as the fallback. `undefined` index (no header, or the
+ *  decoder rejected it) returns the text-only classifier unchanged — the
+ *  rebuild paths (src/session.ts) deliberately keep calling the registry
+ *  entry, so stateless fold-time classification never regresses. */
+export function dshDurableToolPathWithKinds(index: DurableKindIndex | undefined): DurableMessageClassifier {
+    if (index === undefined) return dshDurableToolPath;
+    return (msg: CoreMessage) => {
+        if (msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.length > 0) {
+            const kind = index.get(msgKindFingerprint(msg.text));
+            if (kind !== undefined) {
+                const path = dshSourceKindToPath[kind];
+                if (path !== undefined) return path;
+            }
+        }
+        return dshDurableToolPath(msg);
+    };
+}
+
+/** Lane → classifier FACTORY registry: the per-request form that accepts the
+ *  decoded attestation index (src/server/handle.ts passes it at the same site
+ *  where durableMessageToolPaths is consulted today; a lane absent from this
+ *  map keeps using the prebuilt text-only entry). dsh is the only lane with
+ *  an attesting host, so it is the only entry (KDD #9). */
+export const durableMessageToolPathFactories: Record<string, (attest: DurableKindIndex | undefined) => DurableMessageClassifier> = {
+    dsh: dshDurableToolPathWithKinds,
 };
 
 /** True when a pattern list already classifies the durable identity space —
