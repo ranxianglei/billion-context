@@ -1356,13 +1356,26 @@ const ATTESTABLE_SOURCE_KINDS = new Set([
     "skill-catalog",
     "time-context",
     "ptc-mode",
-    "tool-jobs",
     "subagent-settled",
     "dsh-mnemon",
 ]);
+// Kinds whose dsh source type is form-bearing: only the form whose text twin
+// exists on the bili side is attested — the invariant is that a kind hit and
+// its marker twin always agree on family, and forms the text classifier
+// deliberately leaves foldable must not be rescued by the kind.
+//   agent-instructions: form 'instructions' is the durable baseline; the
+//     'reconcile' notification form is deliberately foldable (marker twin
+//     matches nothing on purpose).
+//   agent-message: form 'relay' is the peer-agent durable note; other forms
+//     (e.g. question replies) are ordinary conversation.
+//   tool-jobs: dsh stamps ONLY form 'notice' today (single emission site,
+//     packages/jobs/tool-jobs/src/index.ts:391) and its source type is
+//     ContextFormed — a future recurring-jobs form would have no text twin, so
+//     the filter guards the invariant rather than today's behavior.
 const ATTESTABLE_KIND_FORMS: Readonly<Record<string, string>> = {
     "agent-instructions": "instructions",
     "agent-message": "relay",
+    "tool-jobs": "notice",
 };
 
 /** The text units of one host message that become their own core message on
@@ -1374,6 +1387,12 @@ function msgTextUnitsOf(content: unknown): string[] {
     if (!Array.isArray(content)) return [];
     const units: string[] = [];
     for (const raw of content) {
+        if (typeof raw === "string") {
+            // kernel/src/wire/openai.ts also turns a bare string ARRAY PART
+            // into its own text core — same granularity, same byte equality.
+            if (raw.length > 0) units.push(raw);
+            continue;
+        }
         if (raw !== null && typeof raw === "object") {
             const block = raw as { type?: unknown; text?: unknown };
             if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) units.push(block.text);
@@ -1395,6 +1414,7 @@ function kindAttestationsOf(messages: unknown): string[] {
     const seen = new Set<string>();
     for (const m of messages) {
         if (m === null || typeof m !== "object") continue;
+        if ((m as { role?: unknown }).role === "assistant") continue; // hosts never stamp sources on assistant echoes; the server-side role gate makes this redundant, the collector should not emit pairs it knows can never resolve
         const source = (m as { source?: unknown }).source;
         if (source === null || typeof source !== "object") continue; // RequestUserInput / sidecar shapes
         const kind = (source as { kind?: unknown }).kind;
@@ -1416,6 +1436,12 @@ function kindAttestationsOf(messages: unknown): string[] {
 }
 
 export const _kindAttestationsOfForTest = kindAttestationsOf;
+// Test lockstep surface: the attested kind set must equal the server's
+// dshSourceKindToPath permitlist (tests/msgkind-channel.test.ts pins the
+// union of both tables) — an asymmetry on either side would attest kinds the
+// server can never map or drop kinds it can.
+export const _attestableSourceKindsForTest: ReadonlySet<string> = ATTESTABLE_SOURCE_KINDS;
+export const _attestableKindFormsForTest: Readonly<Record<string, string>> = ATTESTABLE_KIND_FORMS;
 
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the

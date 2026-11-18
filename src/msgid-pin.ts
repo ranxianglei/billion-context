@@ -94,7 +94,7 @@ export function incomingMsgIdsHeader(headerValue: string | string[] | undefined)
 // stripped (UPSTREAM_HOP_HEADERS); it rides alongside x-bili-msg-ids and is
 // consumed at the same seam (src/server/handle.ts).
 export const MSG_KINDS_HEADER = "x-bili-msg-kinds";
-const MSG_KINDS_MAX_PAIRS = 512; // ~13KiB worst case under the byte cap below
+const MSG_KINDS_MAX_PAIRS = 512; // ~30KiB worst case under the byte cap below
 const MSG_KIND_TOKEN_RE = /^[a-z][a-z0-9-]{0,39}$/; // dsh kinds are lower-kebab, producer-declared
 const MSG_KIND_FP_RE = /^[0-9a-f]{16}$/;
 
@@ -109,8 +109,12 @@ export function incomingMsgKindsHeader(headerValue: string | string[] | undefine
     if (typeof raw !== "string" || raw.length === 0) return undefined;
     if (raw.length > STAMPED_HEADER_MAX_TOTAL_BYTES) return undefined;
     const index = new Map<string, string>();
+    let pairs = 0; // RAW pair count (duplicates included) — the documented
+    // "≤512 pairs" guarantee is about the header's work, not the deduped index
     for (const pair of raw.split(",")) {
         if (pair.length === 0) continue; // trailing/interior comma tolerance, like the ids header
+        pairs += 1;
+        if (pairs > MSG_KINDS_MAX_PAIRS) return undefined;
         const eq = pair.indexOf("=");
         const kind = eq <= 0 ? "" : pair.slice(0, eq);
         const fp = eq <= 0 ? "" : pair.slice(eq + 1);
@@ -118,7 +122,6 @@ export function incomingMsgKindsHeader(headerValue: string | string[] | undefine
         const prior = index.get(fp);
         if (prior !== undefined && prior !== kind) return undefined; // ambiguous attestation → void
         index.set(fp, kind);
-        if (index.size > MSG_KINDS_MAX_PAIRS) return undefined;
     }
     return index.size > 0 ? index : undefined;
 }

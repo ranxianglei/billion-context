@@ -18,13 +18,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    durableMessageToolPathFactories,
     dshDurableToolPathWithKinds,
     dshSourceKindToPath,
     msgKindFingerprint,
 } from "../src/durable-message-guards.ts";
 import { MSG_KINDS_HEADER, incomingMsgKindsHeader } from "../src/msgid-pin.ts";
 import { UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
-import { _kindAttestationsOfForTest, _msgKindFingerprintForTest } from "../src/agent/dsh-native.ts";
+import {
+    _attestableKindFormsForTest,
+    _attestableSourceKindsForTest,
+    _kindAttestationsOfForTest,
+    _msgKindFingerprintForTest,
+} from "../src/agent/dsh-native.ts";
 import type { CoreMessage } from "acp-kernel";
 
 const textMsg = (text: string, role: CoreMessage["role"] = "user"): CoreMessage =>
@@ -87,10 +93,27 @@ test("decode: caps — 512 pairs pass, 513 void; oversized raw voids before any 
     const n = (count: number) => Array.from({ length: count }, (_, i) => pair(i)).join(",");
     assert.ok(incomingMsgKindsHeader(n(512)));
     assert.equal(incomingMsgKindsHeader(n(513)), undefined);
+    // the cap counts RAW pairs (duplicates included) — the documented
+    // "≤512 pairs" is about the header's work, not the deduped index
+    const dup = [Array.from({ length: 512 }, (_, i) => pair(i)), ...Array.from({ length: 2 }, (_, i) => pair(i))].join(",");
+    assert.equal(incomingMsgKindsHeader(dup), undefined);
     // the byte cap (64KiB, shared with the stamped ids header) fires on the
     // RAW value before pair parsing — well-formed or not
     const over = "a".repeat(64 * 1024 + 1);
     assert.equal(incomingMsgKindsHeader(over), undefined);
+});
+
+test("decode: interior-comma tolerance; a space in any pair voids the whole header", () => {
+    const fp1 = msgKindFingerprint("one");
+    const fp2 = msgKindFingerprint("two");
+    const idx = indexFrom(`time-context=${fp1},,skill-catalog=${fp2}`);
+    assert.ok(idx);
+    assert.equal(idx.get(fp1), "time-context");
+    assert.equal(idx.get(fp2), "skill-catalog");
+    // a space (e.g. from a raw "a, b" join or leading whitespace) is not in
+    // the pair alphabet — the header voids, it never half-decodes
+    assert.equal(indexFrom(`time-context=${fp1}, skill-catalog=${fp2}`), undefined);
+    assert.equal(indexFrom(` time-context=${fp1}`), undefined);
 });
 
 test("decode: array header values take the first entry (undici shape)", () => {
@@ -163,8 +186,35 @@ test("collector: duplicate (kind, text) pairs dedupe; the 512 cap holds", () => 
     const t = "once";
     const two = _kindAttestationsOfForTest([hostMsg(t, { kind: "dsh-mnemon" }), hostMsg(t, { kind: "dsh-mnemon" })]);
     assert.equal(two.length, 1);
-    const many = Array.from({ length: 600 }, (_, i) => hostMsg(`unit ${i}`, { kind: "tool-jobs" }));
+    const many = Array.from({ length: 600 }, (_, i) => hostMsg(`unit ${i}`, { kind: "tool-jobs", form: "notice" }));
     assert.equal(_kindAttestationsOfForTest(many).length, 512);
+});
+
+test("collector: a bare string ARRAY PART is its own unit (matches the openai wire codec)", () => {
+    const msg = hostMsg(["plain string part", { type: "text", text: "block part" }], { kind: "dsh-mnemon" });
+    assert.deepEqual(_kindAttestationsOfForTest([msg]), [
+        `dsh-mnemon=${msgKindFingerprint("plain string part")}`,
+        `dsh-mnemon=${msgKindFingerprint("block part")}`,
+    ]);
+});
+
+test("collector: assistant-role messages are skipped (defensive; server role gate still applies)", () => {
+    const t = "an assistant echo with a source stamped on it";
+    assert.deepEqual(_kindAttestationsOfForTest([{ id: "m", role: "assistant", content: t, source: { kind: "dsh-mnemon" } }]), []);
+});
+
+test("lockstep: host attestable kind set === server permitlist keys (asymmetry would pin both directions)", () => {
+    const hostKinds = [..._attestableSourceKindsForTest, ...Object.keys(_attestableKindFormsForTest)].sort();
+    assert.deepEqual(hostKinds, Object.keys(dshSourceKindToPath).sort());
+});
+
+test("factory registry: exactly { dsh } — a non-dsh pluginAgent can never obtain the dsh factory", () => {
+    assert.deepEqual(Object.keys(durableMessageToolPathFactories), ["dsh"]);
+    assert.equal(durableMessageToolPathFactories["pi"], undefined);
+    assert.equal(durableMessageToolPathFactories["opencode"], undefined);
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint("x")}`);
+    assert.ok(idx);
+    assert.equal(durableMessageToolPathFactories["dsh"](idx)(textMsg("x")), "durable/runtime-context");
 });
 
 test("collector: empty / non-array inputs degrade to no attestation", () => {

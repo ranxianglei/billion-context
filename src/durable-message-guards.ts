@@ -16,10 +16,12 @@
 // whose emitter is not dsh core). ACP compression treats every history
 // message as consumable, so one fold of any carrier silently kills its
 // guidance forever (the host will not resend what it believes is already
-// present). The structured source.kind these hosts stamp internally never
-// reaches the proxy wire (CoreMessage carries no metadata field), so the
-// classification matches stable text markers instead — the same criterion
-// discipline as #2447.
+// present). Classification therefore matched stable text markers — the same
+// criterion discipline as #2447. (The sentence "the structured source.kind
+// these hosts stamp internally never reaches the proxy wire" — true when the
+// markers were written — is no longer true for the dsh lane: its plugin
+// now attests the kind per message over x-bili-msg-kinds, #7085 follow-up;
+// see dshSourceKindToPath below. The text markers are that lane's FALLBACK.)
 //
 // ARCHITECTURE (this file owns TRANSLATION only; the POLICY lives in kernel
 // config): each carrier is projected to a canonical virtual tool path
