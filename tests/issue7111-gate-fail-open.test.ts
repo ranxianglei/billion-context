@@ -132,3 +132,32 @@ test("#7111: the gate entry reconciles through the optional loader and still pro
         _resetDshCompactionGateTelemetryForTest();
     }
 });
+
+test("#7117: real-host order — the one-shot loader callback fires BEFORE the verdict, the reconcile must wait for it", () => {
+    _resetDshCompactionVerdictForTest();
+    _resetDshCompactionGateTelemetryForTest();
+    try {
+        const { entry, updates } = presetEntry();
+        let scan: ((inner: { loader?: { entries?: () => Iterable<unknown> } }) => void) | undefined;
+        gate.apply({
+            on: () => {},
+            reflect: { provide: () => {} },
+            inject: (_deps: string[], callback: (inner: { loader?: { entries?: () => Iterable<unknown> } }) => void) => {
+                scan = callback;
+            },
+        } as unknown as CompactionDisableHost);
+
+        // Real-host order (dsh 0.2.2-rc.4): presets mount ~140ms and the gate
+        // callback fires with them, while bili-native declares ~960ms later.
+        scan?.({ loader: { entries: () => [entry] } });
+        assert.equal(updates.length, 0, "no verdict yet: nothing is reconciled");
+
+        declareDshCompactionActive();
+        assert.equal(updates.length, 1, "the declaration must trigger the pending reconcile");
+        const row = updates[0]!.plugins[0]!.config![0]!;
+        assert.equal(row.disabled, true, "the nested compaction row must be stood down");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
