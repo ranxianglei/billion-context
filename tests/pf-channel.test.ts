@@ -46,9 +46,10 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
 test("pf-channel: oversized tail window drops the tail-ids header, never the count (#7212)", () => {
     const sid = "sid-overflow-1";
     const inH = { [CONVO]: sid };
-    // 36-char ids (uuid-shaped); a lagging stamp k=2 against T=450 ⇒ 449-id
-    // window ≈ 16.4 KB — exactly the shape that tripped Node's 16 KiB
-    // maxHeaderSize and dropped the connection.
+    // 13-char ids; a lagging stamp k=2 against T=450 ⇒ a 449-id window of
+    // ≈6.5 KB — over the 2 KiB cap this test pins. (The production overflow was
+    // the same shape at a much wider lag, 16+ KiB, tripping Node's 16 KiB
+    // maxHeaderSize and dropping the connection.)
     learn(inH, "2");
     const ids = Array.from({ length: 450 }, (_, i) => `id-${i.toString(36).padStart(8, "0")}-${(i % 97).toString(16)}`);
     pfChannel.pfCaptureIds(sid, ids);
