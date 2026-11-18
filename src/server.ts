@@ -55,7 +55,7 @@ import { prepareResponses, prepareResponsesCompact } from "./server/prepare-resp
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
 import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
@@ -125,7 +125,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginCompact, hand
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
+import { appendSystemText, applyEstimateCalibration, currentCalibrationFactor, BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, strippedResponseIdWarning, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -233,7 +233,12 @@ export function selfAddressedLocalPath(reqUrl: string, localPort: number | undef
         const port = u.port !== "" ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
         if (port !== localPort) return undefined;
         const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || localMachineIps().has(normalizeIpLiteral(host));
+        // #7022 review: classifyIp covers the whole loopback range, not just
+        // configured interfaces — the tunnel-side fix stopped enumerating
+        // 127.0.0.x in localMachineIps(), so an unconfigured alias like
+        // 127.0.0.5:selfport must still be recognized as self here (else it
+        // would fall through to tunnel classification and 403, #562 self-layer).
+        const mine = host === "0.0.0.0" || host === "::" || host === "localhost" || classifyIp(host) === "loopback" || localMachineIps().has(normalizeIpLiteral(host));
         if (!mine) return undefined;
         return u.pathname + u.search;
     } catch {
@@ -1564,8 +1569,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // callback stacks on the server and a later successful bind fires ALL
         // accumulated claimOrAnnounce closures at once (double announce,
         // double registration, MaxListenersExceededWarning on long waits).
-        // Only our own callbacks ever use this event.
         server.removeAllListeners("listening");
+        server.on("listening", installProcessHandlers);
         server.listen(port, opts.host, claimOrAnnounce);
     };
     attemptListen(opts.port);
@@ -1714,7 +1719,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Node 20+ aborts the process on these by default. Log loudly and flush.
     let suppressedWriteErrors = 0;
     let suppressedRaceErrors = 0;
-    process.on("uncaughtException", (err) => {
+    const onUncaughtException = (err: Error): void => {
         if (isStreamWriteError(err)) {
             // Belt-and-suspenders for #1233: the logger's own stderr path is
             // guarded and never reaches here; a stream-write error that does
@@ -1739,10 +1744,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             return;
         }
         log("error", `uncaughtException: ${String(err?.stack ?? err)}`);
-    });
-    process.on("unhandledRejection", (reason) => {
+    };
+    const onUnhandledRejection = (reason: unknown): void => {
         log("error", `unhandledRejection: ${String(reason)}`);
-    });
+    };
     // Graceful shutdown: flush all dirty sessions to disk so a restart does
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
@@ -1816,14 +1821,40 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
     engine.lifecycleHooks.requestShutdown = (reason) => shutdown(reason);
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
-    // Windows never delivers SIGTERM (Node can listen but the kernel won't
-    // raise it). Ctrl+Break (and most service managers / `taskkill` / NSSM)
-    // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
-    if (process.platform === "win32") {
-        process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    const onSigterm = () => shutdown("SIGTERM");
+    const onSigint = () => shutdown("SIGINT");
+    const onSigbreak = () => shutdown("SIGBREAK");
+    let processHandlersInstalled = false;
+    function installProcessHandlers(): void {
+        if (processHandlersInstalled) return;
+        processHandlersInstalled = true;
+        process.on("uncaughtException", onUncaughtException);
+        process.on("unhandledRejection", onUnhandledRejection);
+        process.on("SIGTERM", onSigterm);
+        process.on("SIGINT", onSigint);
+        // Windows service managers deliver SIGBREAK instead of SIGTERM.
+        if (process.platform === "win32") process.on("SIGBREAK", onSigbreak);
     }
+    const removeProcessHandlers = (): void => {
+        if (!processHandlersInstalled) return;
+        // #7026 review: the close event fires when the listener stops accepting,
+        // i.e. BEFORE the session flush in finishDrain. Stripping the handlers
+        // here would leave a second Ctrl+C during the flush window unhandled —
+        // the process would die with unflushed compression state. Keep them
+        // until the process actually exits; a closed embedded server that never
+        // shut down (port-ladder retry path) still cleans up normally.
+        if (shuttingDown) return;
+        processHandlersInstalled = false;
+        process.removeListener("uncaughtException", onUncaughtException);
+        process.removeListener("unhandledRejection", onUnhandledRejection);
+        process.removeListener("SIGTERM", onSigterm);
+        process.removeListener("SIGINT", onSigint);
+        if (process.platform === "win32") process.removeListener("SIGBREAK", onSigbreak);
+    };
+    // A closed embedded server must not retain signal-driven shutdown of the
+    // hosting process. Port-claim retries can close and re-listen this server.
+    installProcessHandlers();
+    server.on("close", removeProcessHandlers);
     // Launcher children have no console and TerminateProcess leaves no room
     // for a flush (#414): they watch the launcher pid and run the graceful
     // path themselves when it disappears (≤2s after the parent exits).
@@ -2059,6 +2090,8 @@ export type Prepared = {
       * before delivery was attempted (suppression / breaker / gate off) —
       * consumers test for "injected" (+ "gated" where pressure counts). */
      nudgeOutcome?: "injected" | "vetoed" | "skipped" | "gated";
+     /** The nudge stamps before this turn, so a rejected request can un-show its nudge (rejectNudge). */
+     nudgeStampsBefore?: NudgeStamps;
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -4056,9 +4089,9 @@ export async function preflightCompressIfNeeded(
         // A measured-token tier lives at the gates where a forward is
         // arbitration of a body preflight already tried to shrink: the #1839
         // forward-once arm below, the #3146/#4185 post-fold block further down,
-        // and the egress fuse in relay.ts — not here, where the 400 of a probe
-        // is the designed #2313 evidence (refusal record, model/origin-scoped,
-        // TTL) rather than a guaranteed waste.
+        // and the egress fuse in relay.ts. A probe that the local egress fuse
+        // would block cannot acquire upstream evidence: use the normal fold
+        // path instead, without recording a persistent route refusal.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4077,10 +4110,18 @@ export async function preflightCompressIfNeeded(
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
         }
+        const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
+            ? session.metadata.effectiveContextLimit : 0;
+        const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
+            ? measuredOutbound(prepared) : undefined;
+        const probeBlockedByEgress = probeMeasurement !== undefined
+            && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
+        } else if (probeBlockedByEgress) {
+            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
         } else {
             log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
             return prepared;
@@ -4747,10 +4788,15 @@ export function isContextualUserFragment(text: string): boolean {
 //     `Time sampled while preparing turn N, step M: <ts>` — its
 //     `Browser time zone for this request:` line is embedded in that ONE
 //     message, never sent standalone, so no separate prefix for it.
+//   #7085: dsh 0.2.2-rc.3 wraps its injected notifications (the reworded
+//     runtime-context snapshot and its siblings) in a \x3csystem-reminder\x3e
+//     envelope; the envelope itself is the prefix — a real user question
+//     never opens with it.
 const AUTO_INJECTED_NOTIFICATION_PREFIXES: ReadonlyArray<string> = [
     "The approval policy changed from",
     "Current runtime context",
     "Time sampled while preparing turn",
+    "\x3csystem-reminder\x3e",
 ];
 
 export function isAutoInjectedNotification(text: string): boolean {
@@ -4863,5 +4909,5 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, anthropicBetaMessageThreads, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
-export { BILI_TOOL_NAMES, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
+export { BILI_TOOL_NAMES, isAudioOutputCall, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";

@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { keepResponseId as knobKeepResponseId } from "../knobs.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -8,7 +9,7 @@ import { hashId, strippedResponseIdWarning } from "../util.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { createSseFramer } from "../sse-util.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import type {
@@ -182,7 +183,7 @@ function rebuildResponsesEvent(type: string, obj: Record<string, unknown>): Buff
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const framer = createSseFramer();
     try {
         while (true) {
             let done: boolean;
@@ -193,23 +194,13 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.push(decoder.decode(value, { stream: true }))) {
                 if (raw.trim().length > 0) yield raw;
             }
         }
-        buf = finalizeSseLineEndings(buf);
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-            const raw = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
+        for (const raw of framer.finish()) {
             if (raw.trim().length > 0) yield raw;
         }
-        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -342,7 +333,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
-            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"), projection?.headRole ?? "developer");
+            const withDev = injectResponsesDeveloperMessage(inputItems, joinResponsesSystemSections(devParts), projection?.headRole ?? "developer");
             const finalInput = notes && notes.length > 0
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
@@ -402,8 +393,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const absorbArmedLocal = absorbName !== undefined;
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
