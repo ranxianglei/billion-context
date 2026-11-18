@@ -5,7 +5,7 @@ import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
-import { dshCarrierRawMarkers } from "../durable-message-guards.js";
+import { dshCarrierRawMarkers, dshTextUnitIsCarrier, type DurableKindIndex } from "../durable-message-guards.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -356,10 +356,18 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
  *  BLOCKED ref (#2419/#2446/#2447/#2481) and the wire-byte contracts of
  *  #2817/#5403 reset. Genuine sidecars (title / enhance / translate /
  *  auto-review) carry the host's own prompt and no marker, so they keep the
- *  side lane. */
-function carriesDurableState(text: string): boolean {
+ *  side lane.
+ *  #7120: the marker list is copied text — a host rewording its snapshot
+ *  silently disarms the gate (the #7085 class). The kind attestation index
+ *  (x-bili-msg-kinds, decoded per request) rescues the reworded units: a text
+ *  unit attested as a mapped carrier kind carries durable state even when no
+ *  marker matches. `undefined` index (no header / voided) keeps the gate
+ *  byte-identical to the marker-only behavior. Residual (accepted): the
+ *  no-kind families (mcp-catalog, image-offload — off the permitlist on
+ *  purpose) stay marker-only. */
+function carriesDurableState(text: string, kinds: DurableKindIndex | undefined): boolean {
     for (const marker of dshCarrierRawMarkers) if (text.indexOf(marker) >= 0) return true;
-    return false;
+    return dshTextUnitIsCarrier(text, kinds);
 }
 
 /** #5687 follow-up (call-site narrowing): a utility sidecar pins a TINY fixed
@@ -396,13 +404,14 @@ export function hasSingleShotBudget(parsed: unknown): boolean {
 // A non-empty system carrier is REQUIRED so the kernel's empty-instructions
 // path (aux calls riding the main session through the full pipeline, pinned in
 // tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
-// Residual, accepted (narrowed by #5687 follow-up): a tool-less MAIN turn 1
-// that ALSO passes the call-site budget screen (small pinned output,
-// hasSingleShotBudget) and carries no durable-state marker still rides the
-// verbatim side lane for that one turn; turn 2+ replays history and rejoins
-// the full pipeline. The caller must gate on the dsh lane
-// (evidence-per-client discipline, cf. isDshTitleRequest).
-export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
+// Residual, accepted (narrowed by #5687 follow-up + the #7120 kind channel):
+// a tool-less MAIN turn 1 that ALSO passes the call-site budget screen (small
+// pinned output, hasSingleShotBudget) and carries neither a durable-state
+// marker NOR an attested carrier kind (unattested rewording, or a no-kind
+// family) still rides the verbatim side lane for that one turn; turn 2+
+// replays history and rejoins the full pipeline. The caller must gate on the
+// dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown, kinds?: DurableKindIndex): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest.
@@ -427,15 +436,16 @@ export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown)
         const c = rec.content ?? rec.parts;
         if (typeof c === "string") {
             if (c.length > 0) userHasContent = true;
-            // #5687 follow-up: a durable-state marker means this is a MAIN turn's
-            // injected context, never a utility sidecar.
-            if (carriesDurableState(c)) return false;
+            // #5687 follow-up: a durable-state marker (or an attested carrier
+            // kind, #7120) means this is a MAIN turn's injected context, never
+            // a utility sidecar.
+            if (carriesDurableState(c, kinds)) return false;
         } else if (Array.isArray(c) && c.length > 0) {
             userHasContent = true;
             for (const part of c) {
                 if (part === null || typeof part !== "object") continue;
                 const text = (part as { text?: unknown }).text;
-                if (typeof text === "string" && carriesDurableState(text)) return false;
+                if (typeof text === "string" && carriesDurableState(text, kinds)) return false;
             }
         }
     }

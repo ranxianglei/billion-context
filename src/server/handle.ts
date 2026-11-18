@@ -1341,6 +1341,15 @@ async function handleRequest(
         const opencodeTitleSidecar = isOpencodeTitleRequest(protocol, parsed)
             && (typeof req.headers["user-agent"] === "string"
                 && req.headers["user-agent"].startsWith("opencode/"));
+        // #7085 follow-up: the source-kind attestation rides its own header
+        // (dsh plugin — kind + fingerprint-of-exact-text per host-injected
+        // message). Decoded per request, consumed by the durable classifier
+        // below, the dsh single-shot sidecar demotion gate (#7120) and the
+        // title-derivation skip in the prepare adapters (no identity role —
+        // never an attribution rung, never pinned); a rejected/absent header
+        // classifies byte-identically to pre-channel traffic. Decoded BEFORE
+        // sideRequestLike because the demotion gate needs it.
+        const inboundMsgKinds = incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]);
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
             && (isSideRequest(parsed, declaredPiMainTurn ? "main" : sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
@@ -1365,9 +1374,9 @@ async function handleRequest(
                  // every NEW sidecar (prompt-enhance in #5656) claim the raw-key
                  // anchor before the first main turn and exile the real
                  // conversation onto a persisted `|sub:<fp>` ghost.
-                 || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
-                     && hasSingleShotBudget(parsed)
-                     && isDshSingleShotSidecar(protocol, parsed))
+                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                      && hasSingleShotBudget(parsed)
+                      && isDshSingleShotSidecar(protocol, parsed, inboundMsgKinds))
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
                  || ccTitleSidecar
@@ -1443,13 +1452,6 @@ async function handleRequest(
             ? incomingMsgIdsHeader(req.headers["x-bili-msg-ids"])
             : undefined;
         let inboundMsgIds = stampedInboundMsgIds ?? headerStampedMsgIds;
-        // #7085 follow-up: the source-kind attestation rides its own header
-        // (dsh plugin — kind + fingerprint-of-exact-text per host-injected
-        // message). Decoded per request, consumed ONLY by the durable
-        // classifier below (no identity role — never an attribution rung,
-        // never pinned); a rejected/absent header classifies byte-identically
-        // to pre-channel traffic.
-        const inboundMsgKinds = incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]);
         if (inboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
             const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
             if (Array.isArray(openaiLike) && openaiLike.length > 0) {
@@ -2772,7 +2774,7 @@ async function handleRequest(
         // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
         // mirrors #4438 — the extension client can arrive unstamped.
         const dshSingleShotSidecar = requestAgent !== "main" && hasSingleShotBudget(parsed)
-            && isDshSingleShotSidecar(protocol, parsed)
+            && isDshSingleShotSidecar(protocol, parsed, inboundMsgKinds)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
         // #5135: ccTitleSidecar joins the intent set so the title call rides

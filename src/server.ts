@@ -53,6 +53,7 @@ import { prepareOpenai } from "./server/prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google.js";
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
+import { dshTextUnitIsCarrier, type DurableKindIndex } from "./durable-message-guards.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, type NudgeStamps, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
@@ -4799,24 +4800,30 @@ const AUTO_INJECTED_NOTIFICATION_PREFIXES: ReadonlyArray<string> = [
     "\x3csystem-reminder\x3e",
 ];
 
-export function isAutoInjectedNotification(text: string): boolean {
+export function isAutoInjectedNotification(text: string, kinds?: DurableKindIndex): boolean {
     const t = text.trim();
     if (!t) return false;
-    return AUTO_INJECTED_NOTIFICATION_PREFIXES.some((p) => asciiCI(t.slice(0, p.length), p));
+    if (AUTO_INJECTED_NOTIFICATION_PREFIXES.some((p) => asciiCI(t.slice(0, p.length), p))) return true;
+    // #7120: the kind channel rescues the reworded families the prefix list
+    // no longer matches — the fingerprint is over the UNTRIMMED bytes, the
+    // exact unit the host attested.
+    return dshTextUnitIsCarrier(text, kinds);
 }
 
 /** Derive a short human-readable title from the first real user text message.
  *  Used so the web UI can show "Fix auth bug" instead of an opaque hash.
  *  Contextual fragments (#2118) and host-injected notifications (#2286) are
  *  skipped — if no real question has arrived yet, no title is set and
- *  derivation retries on later requests. */
-export function deriveTitle(messages: CoreMessage[]): string | undefined {
+ *  derivation retries on later requests. #7120: the kind attestation index
+ *  (x-bili-msg-kinds) rescues reworded notifications the prefix list misses;
+ *  `undefined` index keeps the derivation byte-identical to pre-channel. */
+export function deriveTitle(messages: CoreMessage[], kinds?: DurableKindIndex): string | undefined {
     for (const m of messages) {
         if (m.role !== "user" || m.contentType !== "text") continue;
         const raw = m.text ?? "";
         if (!raw.trim()) continue;
         if (isContextualUserFragment(raw)) continue;
-        if (isAutoInjectedNotification(raw)) continue;
+        if (isAutoInjectedNotification(raw, kinds)) continue;
         const clean = raw.replace(/\s+/g, " ").trim();
         return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }

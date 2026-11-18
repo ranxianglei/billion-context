@@ -436,7 +436,7 @@ export const durableMessageToolPaths: Record<string, DurableMessageClassifier> =
 // another session's rows. The kind→path map is the KDD #9
 // evidence-permitlist: unknown kinds are ignored, not rejected.
 
-type DurableKindIndex = ReadonlyMap<string, string>; // fingerprint → kind
+export type DurableKindIndex = ReadonlyMap<string, string>; // fingerprint → kind
 
 /** dsh source.kind → virtual path. ONLY kinds whose emitter is source-
  *  verified (or carries reporter session evidence) AND which have a text-
@@ -465,6 +465,32 @@ export function msgKindFingerprint(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex").slice(0, 16);
 }
 
+/** #7120: the ONE kind-first carrier resolution every kind-aware surface
+ *  shares — fingerprint → attested kind → virtual path. `undefined` when the
+ *  unit is unattested or its kind is off the permitlist. The two message
+ *  classifiers (durable protection, one-shot fold-drift accounting) and the
+ *  two raw-text surfaces (side-request demotion, title derivation) all resolve
+ *  through this expression, so a kind can never change a message's family —
+ *  it only rescues one whose wording drifted. */
+function dshCarrierPathByKind(index: DurableKindIndex, text: string): string | undefined {
+    const kind = index.get(msgKindFingerprint(text));
+    return kind === undefined ? undefined : dshSourceKindToPath[kind];
+}
+
+/** #7120: the kind-aware carrier test for surfaces that scan raw request TEXT
+ *  instead of core messages — the side-request demotion gate
+ *  (src/server/side-request.ts) and the title-derivation skip (src/server.ts).
+ *  Same trust boundary as the classifiers: the index is the decoded
+ *  x-bili-msg-kinds attestation (loopback-only, KDD #9 permitlist), and the
+ *  fingerprint must be computed over the EXACT unit bytes the host sent (no
+ *  trim, no normalization) or it simply misses. `undefined` index (no header,
+ *  or the decoder voided it) returns false — every caller stays byte-identical
+ *  to its pre-channel marker/prefix behavior. */
+export function dshTextUnitIsCarrier(text: string, index: DurableKindIndex | undefined): boolean {
+    if (index === undefined || text.length === 0) return false;
+    return dshCarrierPathByKind(index, text) !== undefined;
+}
+
 /** Build the dsh classifier for one request: the kind attestation index
  *  (fingerprint → kind, decoded from the request header) consulted FIRST
  *  under the same role/content gates every text classifier uses, then the
@@ -476,11 +502,8 @@ export function dshDurableToolPathWithKinds(index: DurableKindIndex | undefined)
     if (index === undefined) return dshDurableToolPath;
     return (msg: CoreMessage) => {
         if (msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.length > 0) {
-            const kind = index.get(msgKindFingerprint(msg.text));
-            if (kind !== undefined) {
-                const path = dshSourceKindToPath[kind];
-                if (path !== undefined) return path;
-            }
+            const path = dshCarrierPathByKind(index, msg.text);
+            if (path !== undefined) return path;
         }
         return dshDurableToolPath(msg);
     };
@@ -558,11 +581,8 @@ function oneShotCarrierPathsWithKinds(index: DurableKindIndex | undefined): Dura
     if (index === undefined) return oneShotCarrierPaths.dsh;
     return (msg: CoreMessage) => {
         if (msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.length > 0) {
-            const kind = index.get(msgKindFingerprint(msg.text));
-            if (kind !== undefined) {
-                const path = dshSourceKindToPath[kind];
-                if (path !== undefined) return path;
-            }
+            const path = dshCarrierPathByKind(index, msg.text);
+            if (path !== undefined) return path;
         }
         return oneShotCarrierPaths.dsh(msg);
     };

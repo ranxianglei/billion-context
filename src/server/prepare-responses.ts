@@ -352,8 +352,12 @@ export async function prepareResponses(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, inboundMsgKinds: incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]), storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
+        const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+        // #7085/#7120: the source-kind attestation, decoded once per request —
+        // consumed by the fold-drift accounting below (channel 1) and the
+        // title derivation (reworded-notification skip).
+        const inboundMsgKinds = incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]);
+        reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, inboundMsgKinds, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isCompactionTrigger) {
             noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
             // #2867: the mode-independent twin — lets the ledger classify a
@@ -413,8 +417,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
-            const t = deriveTitle(msgs);
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title, inboundMsgKinds)) {
+            const t = deriveTitle(msgs, inboundMsgKinds);
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, renderTags));

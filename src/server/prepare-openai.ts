@@ -310,7 +310,11 @@ export async function prepareOpenai(
         // #3301: stored decompositions for pre-#2644 anchors whose wire-side
         // backfill can never fire after a wire-shape flip.
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, inboundMsgKinds: incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]), storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
+        // #7085/#7120: the source-kind attestation, decoded once per request —
+        // consumed by the fold-drift accounting below (channel 1) and the
+        // title derivation (reworded-notification skip).
+        const inboundMsgKinds = incomingMsgKindsHeader(req.headers[MSG_KINDS_HEADER]);
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, inboundMsgKinds, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -365,8 +369,8 @@ export async function prepareOpenai(
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
-        if (!session.meta.title || isAutoInjectedNotification(session.meta.title)) {
-            const t = deriveTitle(msgs);
+        if (!session.meta.title || isAutoInjectedNotification(session.meta.title, inboundMsgKinds)) {
+            const t = deriveTitle(msgs, inboundMsgKinds);
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));

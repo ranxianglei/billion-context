@@ -8,6 +8,10 @@
 // x-bili-msg-kinds header, the server classifies by fingerprint first and
 // falls through to the text markers, so an absent header / unmapped kind /
 // fingerprint miss all degrade to byte-identical pre-channel behavior.
+// #7120: the same index also rescues the side-request demotion gate
+// (isDshSingleShotSidecar) and the title derivation
+// (deriveTitle / isAutoInjectedNotification) — the two surfaces left
+// marker-only by v1.
 //
 // Gate discipline (#3617) — every behavior asserted BOTH directions:
 //   positive: attested reworded text classifies; well-formed headers decode;
@@ -18,15 +22,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    dshSourceKindToPath,
+    dshTextUnitIsCarrier,
     durableMessageToolPathFactories,
     dshDurableToolPathWithKinds,
-    dshSourceKindToPath,
     msgKindFingerprint,
     oneShotCarrierPathFactories,
     oneShotCarrierPaths,
 } from "../src/durable-message-guards.ts";
 import { MSG_KINDS_HEADER, incomingMsgKindsHeader } from "../src/msgid-pin.ts";
 import { UPSTREAM_HOP_HEADERS } from "../src/server/headers.ts";
+import { isDshSingleShotSidecar } from "../src/server/side-request.ts";
+import { deriveTitle, isAutoInjectedNotification } from "../src/server.ts";
 import {
     _attestableKindFormsForTest,
     _attestableSourceKindsForTest,
@@ -421,4 +428,133 @@ test("e2e: what the plugin stamps is exactly what the classifier resolves", () =
     assert.equal(classify(textMsg(snapshot)), "durable/runtime-context");
     assert.equal(classify(textMsg(catalog)), "durable/skill-catalog");
     assert.equal(classify(textMsg("human: do the thing")), undefined);
+});
+
+/* ------------------------------------------------------------------ */
+/* #7120 surface 2: side-request demotion gate (isDshSingleShotSidecar) */
+/* ------------------------------------------------------------------
+ * A tool-less single-user body carrying a durable-state marker is a MAIN
+ * turn, not a utility sidecar — routing it to the verbatim side lane skips
+ * the kernel, so the classifier can never stamp the carrier's BLOCKED ref
+ * (#2419/#2446/#2447/#2817/#5403). The marker list is copied text: a host
+ * rewording its snapshot silently disarms the gate (the #7085 class). The
+ * kind attestation index (x-bili-msg-kinds) rescues the reworded units; an
+ * `undefined` index (no header / voided) keeps the gate byte-identical to
+ * the marker-only behavior.
+ */
+
+const sidecarBody = (userContent: unknown) => ({
+    model: "m",
+    messages: [
+        { role: "system", content: "You are a title generator." },
+        { role: "user", content: userContent },
+    ],
+});
+
+test("sidecar fix: an attested reworded carrier keeps the body on the MAIN lane", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(REWORDED_SNAPSHOT), idx), false);
+});
+
+test("sidecar negative: the SAME reworded body without the header still takes the side lane", () => {
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(REWORDED_SNAPSHOT)), true);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(REWORDED_SNAPSHOT), undefined), true);
+});
+
+test("sidecar negative: an attestation for OTHER text (wrong fp) does not rescue", () => {
+    const other = indexFrom(`runtime-context=${msgKindFingerprint("some other text")}`);
+    assert.ok(other);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(REWORDED_SNAPSHOT), other), true);
+});
+
+test("sidecar negative: an unmapped kind (tmux-context) never rescues", () => {
+    const idx = indexFrom(`tmux-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(REWORDED_SNAPSHOT), idx), true);
+});
+
+test("sidecar parity: a marker-matching carrier is a MAIN turn with or without the header", () => {
+    const legacy = "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.";
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(legacy)), false);
+    const idx = indexFrom(`time-context=${msgKindFingerprint("irrelevant")}`);
+    assert.ok(idx);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(legacy), idx), false);
+});
+
+test("sidecar fix: the parts-array content form is rescued the same way", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    const parts = [{ text: REWORDED_SNAPSHOT }];
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(parts), idx), false);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody(parts)), true);
+});
+
+test("sidecar parity: a genuine sidecar keeps the side lane even with an unrelated header", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(isDshSingleShotSidecar("openai", sidecarBody("summarize this document"), idx), true);
+});
+
+/* ------------------------------------------------------------------ */
+/* #7120 surface 3: title derivation (deriveTitle / isAutoInjectedNotification) */
+/* ------------------------------------------------------------------
+ * deriveTitle skips host-injected notifications by PREFIX — copied text a
+ * host rewords (the #7085 class) titles the session on the notification
+ * forever (the title is set-once, #2286). The kind attestation index
+ * rescues the reworded units; the fingerprint is over the UNTRIMMED bytes,
+ * the exact unit the host attested. An `undefined` index keeps the
+ * derivation byte-identical to pre-channel.
+ */
+
+/** A reworded notification on ONE line (no marker, no prefix match). */
+const REWORDED_SINGLE_LINE = "Your session parameters: approval read-only, cwd /work";
+assert.ok(!REWORDED_SINGLE_LINE.includes("Current runtime context"));
+assert.ok(!REWORDED_SINGLE_LINE.startsWith("\x3csystem-reminder\x3e"));
+
+test("title fix: an attested reworded notification is skipped, the real question wins", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SINGLE_LINE)}`);
+    assert.ok(idx);
+    const msgs = [textMsg(REWORDED_SINGLE_LINE), textMsg("fix the auth bug")];
+    assert.equal(deriveTitle(msgs, idx), "fix the auth bug");
+});
+
+test("title negative: the SAME history without the header titles on the reworded carrier", () => {
+    const msgs = [textMsg(REWORDED_SINGLE_LINE), textMsg("fix the auth bug")];
+    assert.equal(deriveTitle(msgs), REWORDED_SINGLE_LINE);
+    assert.equal(deriveTitle(msgs, undefined), REWORDED_SINGLE_LINE);
+});
+
+test("title fix: isAutoInjectedNotification recognizes the attested reworded unit, not a real question", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SINGLE_LINE)}`);
+    assert.ok(idx);
+    assert.equal(isAutoInjectedNotification(REWORDED_SINGLE_LINE, idx), true);
+    assert.equal(isAutoInjectedNotification("fix the auth bug", idx), false);
+});
+
+test("title parity: the legacy prefix fallback is unchanged with or without the header", () => {
+    const legacy = "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.";
+    assert.equal(isAutoInjectedNotification(legacy), true);
+    assert.equal(isAutoInjectedNotification(legacy, undefined), true);
+    const idx = indexFrom(`time-context=${msgKindFingerprint("irrelevant")}`);
+    assert.ok(idx);
+    assert.equal(isAutoInjectedNotification(legacy, idx), true);
+});
+
+test("title byte-equality: the fingerprint is over the UNTRIMMED bytes the host attested", () => {
+    const padded = `  ${REWORDED_SINGLE_LINE}  `;
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(padded)}`);
+    assert.ok(idx);
+    // the wire unit carries the padding the host sent — it is skipped
+    assert.equal(isAutoInjectedNotification(padded, idx), true);
+    // the trimmed form is a DIFFERENT unit: no rescue (no normalization)
+    assert.equal(isAutoInjectedNotification(REWORDED_SINGLE_LINE, idx), false);
+});
+
+test("helper: dshTextUnitIsCarrier is false without an index and for empty text", () => {
+    const idx = indexFrom(`runtime-context=${msgKindFingerprint(REWORDED_SNAPSHOT)}`);
+    assert.ok(idx);
+    assert.equal(dshTextUnitIsCarrier(REWORDED_SNAPSHOT, idx), true);
+    assert.equal(dshTextUnitIsCarrier(REWORDED_SNAPSHOT, undefined), false);
+    assert.equal(dshTextUnitIsCarrier("", idx), false);
 });
