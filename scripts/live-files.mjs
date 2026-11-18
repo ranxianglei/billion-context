@@ -150,6 +150,9 @@ export const LIVE_FILES = [
     // One Linux-only Node child reads fixture system CAs and exits within 10s;
     // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
     "tests/upstream-ca-default-trust.test.ts",
+    // MCP stdio children talk only to each case's listen(0) HTTP fixture;
+    // teardown reaps each child and closes its listener. No shared port or state.
+    "tests/mcp-initialize-metadata.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
