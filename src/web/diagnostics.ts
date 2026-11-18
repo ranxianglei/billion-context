@@ -5,9 +5,11 @@
  * diagnostic blob (environment facts + host client versions + sanitized bili
  * config + one topic-specific section) plus a prefilled GitHub issue link, so
  * any future warning can offer "copy diagnostics / report on GitHub" without
- * inventing its own plumbing. Consumers: the SQLite legacy-only degradation
- * banner (topic `storage-legacy-only`) and the compression-conflict banner
- * (topic `conflict-banner`, #3235).
+ * inventing its own plumbing. Consumers (one topic each): the SQLite legacy-only
+ * degradation banner (`storage-legacy-only`), the snapshot-render shadow banner
+ * (`snapshot-shadow`, #3756 follow-up), the compression-conflict banner
+ * (`conflict-banner`, #3235), and the takeover-attribution banner
+ * (`attribution`, #3581/#3651).
  *
  * #3611 enrichment: the first field reports showed the blob was not
  * diagnosable as-is — no client version, no config, no log evidence. Every
@@ -38,6 +40,7 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
 import { summarizeConflicts } from "../conflict-watch.js";
+import { attributionStatusWire } from "../server/attribution-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
@@ -62,6 +65,10 @@ const STORAGE_LOG_TAIL_LINES = 12;
 const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
+// #3581: the attribution error is a single host-supplied error message (the
+// primary diagnostic evidence for a `threw` episode); bound it so a pathological
+// message cannot outgrow the pasteable blob budget.
+const ATTRIBUTION_ERROR_MAX_CHARS = 500;
 const DSH_PROFILE_CAP = 8;
 // #4649: display budget for the observed-UA lines (the registry itself is
 // bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
@@ -365,6 +372,17 @@ const TOPICS: Record<string, TopicDef> = {
         title: () => `Snapshot-render shadow mismatch (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: () => snapshotShadowDiagnosticsLines(),
     },
+    // #3581/#3651: the takeover-attribution banner ships "copy diagnostics /
+    // report on GitHub" buttons wired to topic=attribution, but the topic was
+    // never registered — the blob fell back to the generic title and printed
+    // "no topic-specific section registered", so the report carried NONE of the
+    // attribution evidence (which agent degraded, state, refusals, error,
+    // endpoint) that a maintainer needs to adjudicate a takeover-broken episode.
+    // Register it so the banner's report is diagnosable on its own.
+    "attribution": {
+        title: () => `Takeover attribution failure (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
+        section: () => attributionDiagnosticsLines(),
+    },
     "conflict-banner": {
         title: () => `Compression conflict banner (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: (ctx) => [
@@ -410,6 +428,38 @@ function snapshotShadowDiagnosticsLines(): string[] {
         if (listed >= 40) { lines.push("(…more sessions truncated)"); break; }
     }
     if (listed === 0) lines.push("(no watching sessions in the live pool)");
+    return lines;
+}
+
+// #3581/#3651: the takeover-attribution banner's diagnostic section. The
+// evidence lives in the HOST process (the proxy only learns of a refusal when a
+// plugin reports it), so this renders the latest per-agent report the proxy has
+// kept. Under the #3651 diagnosable-failure contract only DIAGNOSABLE failures
+// reach this surface: `threw` episodes carry the error text + masked endpoint,
+// while a by-design agentless lane never reports — so an EMPTY map means "no
+// diagnosable failure observed since process start", not "no plugins". The
+// error/endpoint bytes are host-supplied free text; the sink-level
+// redactForPublish in buildDiagnostics is what makes them publish-safe (same as
+// every other section here), so no per-field scrubbing is needed upstream.
+function attributionDiagnosticsLines(): string[] {
+    const lines = ["--- takeover attribution ---"];
+    const reports = attributionStatusWire();
+    const agents = Object.entries(reports);
+    if (agents.length === 0) {
+        lines.push("(no attribution reports received by this process — a healthy or by-design-agentless lane never reports, so this means no diagnosable failure was observed since process start)");
+        return lines;
+    }
+    for (const [agent, r] of agents) {
+        const sinceText = r.since > 0 ? new Date(r.since).toISOString() : "?";
+        lines.push(`${agent}: state=${r.state} refusals=${r.refusals} since=${sinceText}`);
+        if (r.error !== undefined) {
+            const err = redactForPublish(r.error);
+            lines.push(`  error: ${err.length > ATTRIBUTION_ERROR_MAX_CHARS ? safePrefix(err, ATTRIBUTION_ERROR_MAX_CHARS - 1) + "…" : err}`);
+        }
+        if (r.endpoint !== undefined) lines.push(`  endpoint: ${r.endpoint}`);
+    }
+    lines.push("banner policy (#3581/#3651): only DIAGNOSABLE failures reach this surface (threw episodes report error text + masked endpoint; by-design agentless lanes never report).");
+    lines.push("remedy: restart the host process to restore takeover; if it persists after restart, the error line above is the first thing to look at.");
     return lines;
 }
 

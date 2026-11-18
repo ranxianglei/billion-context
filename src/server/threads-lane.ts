@@ -338,12 +338,18 @@ function renderTranscript(entries: ThreadsMirrorEntry[]): string {
 
 function buildSummaryRequestBody(shape: ThreadsMirrorShape | undefined, model: string | undefined, meta: ThreadsMirrorMeta, entries: ThreadsMirrorEntry[], cut: number, billingBlock: { type: "text"; text: string } | undefined): Record<string, unknown> {
     const system: unknown[] = billingBlock !== undefined ? [billingBlock, { type: "text", text: SUMMARIZER_SYSTEM }] : [{ type: "text", text: SUMMARIZER_SYSTEM }];
+    const transcript = renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut));
+    // A reforge replaces the entire old thread. The next summary must carry
+    // forward the previously folded prefix as well as the newly folded slice.
+    const content = meta.foldedSummary
+        ? `# Previously folded history\n${meta.foldedSummary}\n\n# New history to fold\n${transcript}`
+        : transcript;
     return {
         model: model ?? shape?.model ?? "claude-sonnet-4-5",
         max_tokens: SUMMARY_MAX_TOKENS,
         stream: false,
         system,
-        messages: [{ role: "user", content: renderTranscript(entries.slice(Math.min(meta.foldedBefore, cut), cut)) }],
+        messages: [{ role: "user", content }],
     };
 }
 
