@@ -269,3 +269,41 @@ test("isSideRequest: the pi conversation sentinel declares main — side-shaped 
     // header was never demoted (the #1699 rung the sentinel now rides)
     assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-agent": "main" }, sideShaped), false);
 });
+
+// #7120 (PR #7104): the side-request demotion gate is now kind-aware — a
+// reworded carrier (no text marker) is still recognized via the decoded
+// x-bili-msg-kinds attestation index (exact-unit fingerprint → permitlist
+// kind). The lane-guard (#2170) demands this table grow with the gate edit:
+// pin the rescue, the pre-channel degrade, and the negative cells.
+import { msgKindFingerprint } from "../src/durable-message-guards.ts";
+import { isDshSingleShotSidecar } from "../src/server/side-request.ts";
+
+// a runtime-context snapshot whose wording matches NONE of the
+// dshCarrierRawMarkers (the #7085 shape that blinded the gate)
+const REWORDED_CARRIER = "Your session parameters are currently: the working directory is /home/user/proj and the file policy is strict.";
+const KIND_INDEX = new Map([[ msgKindFingerprint(REWORDED_CARRIER), "runtime-context" ]]);
+function singleShotBody(): Record<string, unknown> {
+    return {
+        system: "You are a helpful coding assistant.",
+        messages: [{ role: "user", content: REWORDED_CARRIER }],
+    };
+}
+
+test("isDshSingleShotSidecar: an attested reworded carrier keeps the main pipeline (#7120 rescue)", () => {
+    // no marker matches REWORDED_CARRIER — only the kind index recognizes it
+    assert.equal(isDshSingleShotSidecar("anthropic", singleShotBody(), KIND_INDEX), false, "attested kind = injected main-turn context, never a utility sidecar");
+});
+
+test("isDshSingleShotSidecar: absent kinds index is byte-identical to pre-channel behavior (degrade path)", () => {
+    // the SAME body with no attestation: marker-only gate classifies it as a
+    // one-shot sidecar exactly as before the channel existed
+    assert.equal(isDshSingleShotSidecar("anthropic", singleShotBody(), undefined), true);
+    assert.equal(isDshSingleShotSidecar("anthropic", singleShotBody()), true);
+});
+
+test("isDshSingleShotSidecar: wrong fingerprint and unmapped kind never rescue (negative cells)", () => {
+    const wrongFp = new Map([["0000000000000000", "runtime-context"]]);
+    const unmappedKind = new Map([[ msgKindFingerprint(REWORDED_CARRIER), "tmux-context" ]]);
+    assert.equal(isDshSingleShotSidecar("anthropic", singleShotBody(), wrongFp), true, "a fingerprint the unit does not carry cannot attest it");
+    assert.equal(isDshSingleShotSidecar("anthropic", singleShotBody(), unmappedKind), true, "an off-permitlist kind is invisible to the gate");
+});
