@@ -159,6 +159,43 @@ test("policy: excludes travel with the source that defines them (env minAge + pr
     }
 });
 
+test("policy: a null exclude list does not shadow a lower-precedence list (pnpm: null = unset)", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-maturity-null-excl-"));
+    try {
+        const env = makeEnv(root);
+        writeFileSync(path.join(env.HOME as string, ".npmrc"), "minimumReleaseAgeExclude=billion-context\n");
+        const projectDir = projectWith(root, "minimumReleaseAge: 1440\nminimumReleaseAgeExclude:\n");
+        const r = resolveMaturityPolicy(projectDir, env);
+        assert.equal(r.ok, true);
+        if (r.ok) {
+            assert.equal(r.policy.minAgeMinutes, 1440);
+            assert.equal(r.policy.minAgeSource, "project pnpm-workspace.yaml");
+            assert.deepEqual(r.policy.excludeSpecs, ["billion-context"]);
+            assert.equal(r.policy.excludeSource, "user ~/.npmrc");
+        }
+    } finally {
+        rmrf(root);
+    }
+});
+
+test("policy: an explicit empty exclude list ([]) IS provided and clears lower lists", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-maturity-empty-excl-"));
+    try {
+        const env = makeEnv(root);
+        writeFileSync(path.join(env.HOME as string, ".npmrc"), "minimumReleaseAgeExclude=billion-context\n");
+        const projectDir = projectWith(root, "minimumReleaseAge: 1440\nminimumReleaseAgeExclude: []\n");
+        const r = resolveMaturityPolicy(projectDir, env);
+        assert.equal(r.ok, true);
+        if (r.ok) {
+            assert.equal(r.policy.minAgeMinutes, 1440);
+            assert.deepEqual(r.policy.excludeSpecs, []);
+            assert.equal(r.policy.excludeSource, "project pnpm-workspace.yaml");
+        }
+    } finally {
+        rmrf(root);
+    }
+});
+
 test("policy: yaml forms — flow list, null value, inline comments, quoted values", () => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-maturity-yaml-"));
     try {
@@ -324,6 +361,39 @@ test("gate: immature release → immature with the policy source named", async (
         const publishedAt = isoHoursAgo(1);
         stubPackumentFetch({ created: publishedAt, modified: publishedAt, "3.0.0": publishedAt });
         const v = await checkReleaseMaturity({ projectDir, packageName: "billion-context", version: "3.0.0", registryBase: REGISTRY, env: makeEnv(root) });
+        assert.deepEqual(v, { kind: "immature", publishedAt, minAgeMinutes: 1440, source: "project pnpm-workspace.yaml" });
+    } finally {
+        globalThis.fetch = originalFetch;
+        rmrf(root);
+    }
+});
+
+test("gate: null exclude in project yaml → the user-npmrc exclude still applies (excluded, no traffic)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-maturity-gate-null-excl-"));
+    const originalFetch = globalThis.fetch;
+    try {
+        const env = makeEnv(root);
+        writeFileSync(path.join(env.HOME as string, ".npmrc"), "minimumReleaseAgeExclude=billion-context\n");
+        const projectDir = projectWith(root, "minimumReleaseAge: 1440\nminimumReleaseAgeExclude:\n");
+        globalThis.fetch = (() => Promise.reject(new Error("no registry traffic expected for an excluded package"))) as unknown as typeof fetch;
+        const v = await checkReleaseMaturity({ projectDir, packageName: "billion-context", version: "8.0.0", registryBase: REGISTRY, env });
+        assert.deepEqual(v, { kind: "excluded", spec: "billion-context", source: "user ~/.npmrc" });
+    } finally {
+        globalThis.fetch = originalFetch;
+        rmrf(root);
+    }
+});
+
+test("gate: explicit [] exclude in project yaml → the gate still applies (immature)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bc-maturity-gate-empty-excl-"));
+    const originalFetch = globalThis.fetch;
+    try {
+        const env = makeEnv(root);
+        writeFileSync(path.join(env.HOME as string, ".npmrc"), "minimumReleaseAgeExclude=billion-context\n");
+        const projectDir = projectWith(root, "minimumReleaseAge: 1440\nminimumReleaseAgeExclude: []\n");
+        const publishedAt = isoHoursAgo(1);
+        stubPackumentFetch({ created: publishedAt, modified: publishedAt, "8.1.0": publishedAt });
+        const v = await checkReleaseMaturity({ projectDir, packageName: "billion-context", version: "8.1.0", registryBase: REGISTRY, env });
         assert.deepEqual(v, { kind: "immature", publishedAt, minAgeMinutes: 1440, source: "project pnpm-workspace.yaml" });
     } finally {
         globalThis.fetch = originalFetch;
