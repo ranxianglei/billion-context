@@ -43,6 +43,32 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2" });
 });
 
+test("pf-channel: oversized tail window drops the tail-ids header, never the count (#7212)", () => {
+    const sid = "sid-overflow-1";
+    const inH = { [CONVO]: sid };
+    // 36-char ids (uuid-shaped); a lagging stamp k=2 against T=450 ⇒ 449-id
+    // window ≈ 16.4 KB — exactly the shape that tripped Node's 16 KiB
+    // maxHeaderSize and dropped the connection.
+    learn(inH, "2");
+    const ids = Array.from({ length: 450 }, (_, i) => `id-${i.toString(36).padStart(8, "0")}-${(i % 97).toString(16)}`);
+    pfChannel.pfCaptureIds(sid, ids);
+    const out = pfChannel.pfRequestHeaders(inH);
+    assert.equal(out["x-bili-pf-count"], "2", "count still rides (pure count mode)");
+    assert.equal(out["x-bili-pf-tail-ids"], undefined, "oversized window ⇒ no tail-ids header");
+    // the encoded window is genuinely over the budget (guards the test itself)
+    const full = ids.slice(1).map(encodeURIComponent).join(",");
+    assert.ok(full.length > 2048, `fixture must exceed the cap (got ${full.length}B)`);
+    // a tight window (k ≈ T) still rides the full tail-ids list
+    const sidTight = "sid-overflow-tight";
+    learn({ [CONVO]: sidTight }, "448");
+    pfChannel.pfCaptureIds(sidTight, ids);
+    assert.equal(
+        pfChannel.pfRequestHeaders({ [CONVO]: sidTight })["x-bili-pf-tail-ids"],
+        ids.slice(447).map(encodeURIComponent).join(","),
+        "small window ⇒ tail-ids intact",
+    );
+});
+
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
     const sid = "sid-clear-1";
     const inH = { [CONVO]: sid };

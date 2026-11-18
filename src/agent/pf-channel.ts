@@ -114,6 +114,18 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
     slot.ids = known > 0 ? out : undefined;
 }
 
+// #7212: the tail window is (T - k + 1) ids — UNBOUNDED when the learned stamp
+// k lags far behind the current element count T (a side request with a smaller
+// seq overwrites k). Node's default maxHeaderSize is 16 KiB for the WHOLE
+// header block; an oversized x-bili-pf-tail-ids trips it and the parser drops
+// the connection, killing the session (each retry re-sends the same oversized
+// header, so it never recovers). Cap the encoded VALUE: over the budget, drop
+// the tail-ids header (count only) — the proxy degrades to the legacy full-parse
+// for this turn and restamps the true T, so the window self-heals next turn.
+// The cap sits far under 16 KiB, leaving room for the other headers in the
+// block. encodeURIComponent output is pure ASCII, so .length == byte length.
+const MAX_TAIL_IDS_BYTES = 2048;
+
 /** Chokepoint emit (native-intercept routed-send site): the handshake headers
  *  this request should carry, given its outgoing header record (source of the
  *  conversation id). {} whenever the session never saw a stamp yet. */
@@ -130,7 +142,8 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
     const ids = slot.ids;
     if (ids !== undefined && ids.length >= k) {
-        out[TAIL_IDS_HEADER] = ids.slice(k - 1).map(encodeURIComponent).join(",");
+        const tail = ids.slice(k - 1).map(encodeURIComponent).join(",");
+        if (tail.length <= MAX_TAIL_IDS_BYTES) out[TAIL_IDS_HEADER] = tail;
     }
     return out;
 }
