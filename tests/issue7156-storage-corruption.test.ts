@@ -88,6 +88,19 @@ function zeroPage(p: string, page: number): void {
     }
 }
 
+/** Windows: an ephemeral stray handle must not fail CI — best-effort delete
+ *  with bounded retries, swallowed on persistent EBUSY/EPERM. The FIX 4 test
+ *  below exercises the abandon-without-close path (owner policy 2026-10-30: a
+ *  runtime corruption finding must not re-stamp the verdict cache), so the
+ *  store handle outlives the test and holds index.db open. */
+function rmBestEffort(p: string): void {
+    try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* leaked temp dir on a Windows runner is harmless */
+    }
+}
+
 test("#7156 FIX 1: an empty payload_json degrades to NULL instead of killing webSummaryRows", { skip: SKIP }, () => {
     const dir = tmpDir();
     try {
@@ -206,6 +219,6 @@ test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         _resetStorageRuntimeStatusForTest();
-        rmSync(dir, { recursive: true, force: true });
+        rmBestEffort(dir);
     }
 });
