@@ -4,9 +4,54 @@ import { estimateCoreMessages } from "../preflight.js";
 import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
 import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
-import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
-export { outputBudgetField, readOutputBudget, writeOutputBudget };
+// #6752: the output-budget field plumbing moved here from side-request.ts —
+// it is generic wire plumbing (used by the clamp, the restore path, and the
+// watermark fastpath), not side-lane logic, and the prepare modules must stay
+// decoupled from the side-lane engine (#1440 P2 cut 2). side-request.ts
+// re-exports these, so its existing importers are untouched.
+export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
+
+/** The declared output budget, proto-agnostically. Gemini nests it under
+ *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
+ *  families keep it flat, so every reader goes through these two accessors. */
+export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
+    if (!parsed || typeof parsed !== "object") return null;
+    const p = parsed as Record<string, unknown>;
+    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
+        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
+    }
+    const gen = p.generationConfig;
+    if (gen && typeof gen === "object") {
+        const v = (gen as Record<string, unknown>).maxOutputTokens;
+        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
+    }
+    return null;
+}
+
+export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
+    if (field !== "generationConfig.maxOutputTokens") {
+        const v = parsed[field];
+        return typeof v === "number" ? v : undefined;
+    }
+    const gen = parsed.generationConfig;
+    if (!gen || typeof gen !== "object") return undefined;
+    const v = (gen as Record<string, unknown>).maxOutputTokens;
+    return typeof v === "number" ? v : undefined;
+}
+
+export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
+    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
+    // sole writer so NO caller can emit a fractional token count — the clamp path already
+    // floors, but this also guards the restore path and any future caller at the type boundary.
+    const tokens = Number.isInteger(value) ? value : Math.floor(value);
+    if (field !== "generationConfig.maxOutputTokens") {
+        parsed[field] = tokens;
+        return;
+    }
+    const gen = parsed.generationConfig;
+    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
+}
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
