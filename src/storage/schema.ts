@@ -278,6 +278,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     PRIMARY KEY (namespace, conversation_id)
 ) WITHOUT ROWID;
 
+-- #6785 review: the stage-0 plane resolves the conversation binding per turn
+-- (store.ts snapSessRawOf: WHERE session_id = ?) — the PK cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
+
 -- Per-session arbitrary state (#3069 v4): the escape hatch for host /
 -- plugin / UI state that must survive restarts but is NOT kernel session
 -- state. Keys are namespaced by convention ("r3:...", "web:...",

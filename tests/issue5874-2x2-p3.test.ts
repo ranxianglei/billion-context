@@ -35,6 +35,8 @@ import {
     matchAppendWindow,
     matchWindow,
     windowOf,
+    WORLD_HEAD_K,
+    WORLD_TAIL_K,
 } from "../src/snapshot/identity.ts";
 import type { WorldWindow } from "../src/snapshot/types.ts";
 import {
@@ -229,6 +231,28 @@ test("W11 matchAppendWindow +/- : the next M1 full resend echoes (the round-trip
     const re = matchWindow({ ...matchInput(stored, ["m1", "m2", "m3", "m4", "m5"]), stored: app.window });
     assert.equal(re.mode, "echo");
     assert.deepEqual(re.newIdPos, []);
+});
+
+test("W10b matchAppendWindow: >WORLD_TAIL_K stored — the head stays the TRUE head (PR#6785 review)", () => {
+    // count 600 > WORLD_TAIL_K(512): stored.tailIds holds only m89..m600, so
+    // `[...tailIds, ...new].slice(0, WORLD_HEAD_K)` is a MIDDLE slice. The
+    // pre-fix code stored it as headIds, breaking the echo gate
+    // (matchWindow's sameArr(s.headIds, incoming[0..K-1])) for every later
+    // full-resend turn of a >512-element session: perpetual re-anchor +
+    // window upsert (the steady-state no-write contract).
+    const n = WORLD_TAIL_K + 88; // 600
+    const stored = world(n);
+    assert.equal(stored.window.tailIds.length, WORLD_TAIL_K);
+    assert.equal(stored.window.tailIds[0], `m${n - WORLD_TAIL_K + 1}`); // m89
+    const d = matchAppendWindow(stored.window, [`m${n + 1}`, `m${n + 2}`]);
+    assert.equal(d.mode, "extend");
+    assert.equal(d.window.count, n + 2);
+    assert.equal(d.window.headIds.length, WORLD_HEAD_K);
+    assert.equal(d.window.headIds[0], "m1", "head is UNCHANGED by an append");
+    assert.deepEqual(d.window.headIds, stored.window.headIds);
+    // and the head check the echo gate performs really passes now:
+    const full = Array.from({ length: n + 2 }, (_, i) => `m${i + 1}`);
+    assert.deepEqual(d.window.headIds, full.slice(0, WORLD_HEAD_K));
 });
 
 // ---------------------------------------------------------------------------

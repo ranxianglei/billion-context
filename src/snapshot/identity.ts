@@ -212,10 +212,17 @@ export function matchAppendWindow(stored: WorldWindow, incoming: string[]): Worl
     return {
         mode: "extend",
         window: {
-            // head + tail both track the COMBINED array — the next M1 full
-            // resend re-compares against it (the W11 round trip).
+            // tail tracks the COMBINED array — the next M1 full resend
+            // re-compares against it (the W11 round trip). The head: while
+            // the array is <= WORLD_HEAD_K the head IS the whole array, so it
+            // extends with the appends; past K the true head is not in
+            // stored.tailIds and re-slicing `all` would store a
+            // middle-of-array slice as head (PR#6785 review fix — that broke
+            // the echo gate at identity.ts:134 for every >WORLD_TAIL_K
+            // session after any M2 turn: perpetual re-anchor + window
+            // upsert instead of the steady-state no-write).
             tailIds: all.slice(-WORLD_TAIL_K),
-            headIds: all.slice(0, WORLD_HEAD_K),
+            headIds: stored.count <= WORLD_HEAD_K ? all.slice(0, WORLD_HEAD_K) : stored.headIds,
             count: stored.count + ids.length,
             maxPos: stored.maxPos + ids.length, // M2 appends sequentially — every appended id takes the next pos, known or not
         },
