@@ -147,7 +147,6 @@ billion-context/
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
 │   ├── snapshot/                 # Stage-0 snapshot identity plane: world match, envelope codec, decision glue (#6181/#5874)
-│   │   ├── checksums.ts          #   Snapshot checksums (lowercase hex sha256) + canon digests (#5874)
 │   │   ├── identity.ts           #   matchWorld verdicts (echo/probe/scatter/issue/diverge/resync) + canon parse (#5874)
 │   │   ├── plane.ts              #   Stage-0 decision glue: R3 identity check, 400 fault breaker, lane decide (#6181)
 │   │   ├── stage0.ts             #   Lane-agnostic stage-0 entry: pin + R3 + stage-0 decision + assembly, shared by the openai and responses lanes (#6181)
