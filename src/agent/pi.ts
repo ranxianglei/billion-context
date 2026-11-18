@@ -43,6 +43,7 @@ export type Ctx = {
         find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined;
         // #2336 agent-registry fallback: the fuller surface (verified against
         // pi v0.99.1 model-registry.d.ts) — all optional, older hosts lack them.
+        getError?: () => string | undefined;
         getAll?: () => Array<{ id: string; provider: string; api?: unknown; contextWindow?: unknown; maxTokens?: unknown }>;
         getProvider?: (provider: string) => { baseUrl?: unknown; auth?: { oauth?: unknown; apiKey?: unknown } | undefined } | undefined;
         getProviderAuthStatus?: (provider: string) => { configured?: unknown; source?: unknown } | undefined;
@@ -167,12 +168,15 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
  *  collected by design), unmappable apis, baseUrls that point back at this
  *  proxy, and plain-HTTP non-loopback baseUrls (#2585 — the server would
  *  refuse them). Returns true when done (or permanently unavailable) so the
- *  caller can stop retrying; throws on transient failures. */
+ *  caller can stop retrying; returns false for incomplete collections and
+ *  throws on transport failures. The model catalogue does not enumerate
+ *  configured providers, so an empty result never authorizes `clear: true`. */
 export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
     const proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined) return false;
     const registry = ctx.modelRegistry;
     if (registry?.getAll === undefined || registry.getProvider === undefined || registry.getProviderAuthStatus === undefined || registry.getApiKeyForProvider === undefined) return true;
+    if (registry.getError?.()) return false;
     type ProviderAcc = { api: "anthropic" | "openai" | "responses" | "google"; models: Array<{ id: string; contextWindow?: number; outputTokens?: number }> };
     const byProvider = new Map<string, ProviderAcc>();
     for (const model of registry.getAll()) {
@@ -196,6 +200,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
     for (const [id, entry] of byProvider) {
         if (entry.models.length === 0) continue;
         const provider = registry.getProvider(id);
+        if (provider === undefined) return false;
         const baseUrl = provider?.baseUrl;
         if (typeof baseUrl !== "string" || !(baseUrl.startsWith("https://") || baseUrl.startsWith("http://"))) continue;
         // Self-loop guard: skip providers whose endpoint IS this proxy — in
@@ -220,15 +225,16 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         } catch { selfLoop = true; }
         if (selfLoop) continue;
         const status = registry.getProviderAuthStatus(id);
-        if (status?.configured !== true || status.source === "stored") continue;
+        if (status === undefined) return false;
+        if (status.configured !== true || status.source === "stored") continue;
         if (provider?.auth?.oauth !== undefined) continue;
         let apiKey: string | undefined;
         try {
             apiKey = await registry.getApiKeyForProvider(id);
         } catch {
-            continue;
+            return false;
         }
-        if (typeof apiKey !== "string" || apiKey.length === 0) continue;
+        if (typeof apiKey !== "string" || apiKey.length === 0) return false;
         const models: Record<string, { contextWindow?: number; outputTokens?: number }> = {};
         for (const model of entry.models) {
             models[model.id] = {
@@ -238,8 +244,7 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         }
         providers[id] = { baseUrl, api: entry.api, apiKey, models };
     }
-    // A complete empty snapshot must clear previously reported recipes too.
-    // Hosts without the registry face returned above without making a claim.
+    if (Object.keys(providers).length === 0) return false;
     const res = await fetch(`${proxyBase}/__bili/agent-providers`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -933,6 +938,16 @@ let nudgeDebugWired = false;
 const nudgeNotifiedTurns = new Map<string, string>();
 let nudgeFullPending: NudgeDebugEvent | null = null;
 
+/** The pi-lane terminal notification for an injected nudge: a fixed label
+ *  prefix + the VERBATIM wire text the model read — nothing appended (strict
+ *  fidelity, owner direction 2026-11-17). A display-only "suggested call" used
+ *  to be tacked on here; unmarked, it read as part of the injection (and
+ *  advertised the non-canonical {startId,endId} array shape), which is exactly
+ *  what this surface must not do. */
+export function nudgeNotifyText(pending: Pick<NudgeDebugEvent, "emergency" | "text">): string {
+    return `[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}`;
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -949,7 +964,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
-        // (native mode resolves it asynchronously).
+        // or provider collection is incomplete.
         let agentProvidersDone = false;
         // #2185 方案 A: this bundle's own file path, registered per session so
         // pi-subagents children load it deterministically (see module header).
@@ -1166,8 +1181,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
                 nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);
                 try {
-                    const example = pending.topRange !== null ? `\n\nExample: compress({ content: [{ startId: "${pending.topRange.startRef}", endId: "${pending.topRange.endRef}", summary: "..." }] })` : "";
-                    ctx.ui?.notify?.(`[ACP nudge → context]${pending.emergency ? " [EMERGENCY]" : ""}\n${pending.text}${example}`);
+                    ctx.ui?.notify?.(nudgeNotifyText(pending));
                 } catch {
                     // host UI unavailable — best-effort display
                 }
@@ -1422,6 +1436,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #6884: pi's leg of the #6880/#6883 declaration (cross-agent
+                    // session-id audit, discussions/6884): pi has NO auxiliary
+                    // LLM calls — no title-gen, no compaction summarizer, no
+                    // auto-review — and subagents/forks mint FRESH session ids
+                    // (their parentSession file header points back at the
+                    // parent), so EVERY dispatch through this plugin is the
+                    // session's main conversation turn. Stamp the "conversation"
+                    // sentinel on every dispatch (the plugin.ts
+                    // PLUGIN_PURPOSE_CONVERSATION wire constant, inlined like
+                    // dsh-native) and the server classifies by declaration:
+                    // the body heuristics (budget <= 200 demotion, single-shot
+                    // shapes) can no longer demote a real turn to the #388 side
+                    // passthrough — a one-shot `pi -p` with a small maxTokens
+                    // and no tools would otherwise never enter the kernel
+                    // pipeline and silently lose compression state.
+                    headers["x-bili-plugin-purpose"] = "conversation";
                     // #3248: when the lane advertises incremental turns, declare
                     // the divert intent. Declaring is safe — the lane shape-tests
                     // the body, so full-resend turns (retries, dead conversations,
@@ -1735,7 +1765,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 agentProvidersDone = true;
                 reportAgentProviders(ctx, agent).then((done) => {
                     if (done) return;
-                    // Proxy base not resolvable yet — retry on the next session.
+                    // Proxy or provider collection not ready — retry next session.
                     agentProvidersDone = false;
                 }).catch((err: unknown) => {
                     agentProvidersDone = false;
