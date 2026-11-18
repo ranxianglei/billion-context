@@ -1430,6 +1430,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #6884: pi's leg of the #6880/#6883 declaration (cross-agent
+                    // session-id audit, discussions/6884): pi has NO auxiliary
+                    // LLM calls — no title-gen, no compaction summarizer, no
+                    // auto-review — and subagents/forks mint FRESH session ids
+                    // (their parentSession file header points back at the
+                    // parent), so EVERY dispatch through this plugin is the
+                    // session's main conversation turn. Stamp the "conversation"
+                    // sentinel on every dispatch (the plugin.ts
+                    // PLUGIN_PURPOSE_CONVERSATION wire constant, inlined like
+                    // dsh-native) and the server classifies by declaration:
+                    // the body heuristics (budget <= 200 demotion, single-shot
+                    // shapes) can no longer demote a real turn to the #388 side
+                    // passthrough — a one-shot `pi -p` with a small maxTokens
+                    // and no tools would otherwise never enter the kernel
+                    // pipeline and silently lose compression state.
+                    headers["x-bili-plugin-purpose"] = "conversation";
                     // #3248: when the lane advertises incremental turns, declare
                     // the divert intent. Declaring is safe — the lane shape-tests
                     // the body, so full-resend turns (retries, dead conversations,

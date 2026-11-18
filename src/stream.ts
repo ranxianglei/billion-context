@@ -528,6 +528,15 @@ export function rebaseNote(session: Session, errs: string, beyond: string): stri
 // session instance whose refs restart at m00001), stale refs from the previous
 // generation fail resolution. The kernel gate points at acp_status; inline the
 // current span here so the model can re-issue immediately without the round-trip.
+// 2026-11-17 (session 01a1e89d, qwen3.8-27b): the receipt that carries this
+// line is PERSISTED in visible history, so a long session accumulates many
+// stale copies with different max refs. The model read them as simultaneously
+// true ("summaries claimed m02129–m02325, but the highest ref is m02255 —
+// something's off"), then aimed compress calls at phantom endpoints
+// (m02383/m02489, all above the real frontier) in a 7-call loop. The label
+// below makes each copy self-describe as a point-in-time snapshot and names
+// the newest copy as the live frontier. Model-facing wording — any future
+// edit keeps this stale-copy disambiguation.
 function currentRefsSnapshot(ctx: RewriteCtx): string {
     // Refs live in state.messageRefs (mNNNNN namespace); message ids are raw
     // client ids and carry no ref numbers.
@@ -544,7 +553,7 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
     }
     if (!loId || !hiId) return "";
     const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
-    return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
+    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
 }
 
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
