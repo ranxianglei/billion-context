@@ -2189,6 +2189,31 @@ test("#4566: fallback neutralizes a bili-owned env hop with a scoped NO_PROXY ho
     assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored exactly once the last hold releases");
 });
 
+test("#7319: fallback to an IPv6 literal host arms no NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://[::1]:11434/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.deepEqual(sink.map((c) => c.url), ["https://[::1]:11434/v1/messages"]);
+        assert.equal(sink[0].noProxyDuringSend, undefined, "bracketed IPv6 must never be written into NO_PROXY — Python httpx children crash on it");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY untouched after the send");
+});
+
+test("#7319 negative: fallback to an IPv4 loopback host still arms the NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTP_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("http://127.0.0.1:11434/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.ok((sink[0].noProxyDuringSend ?? "").includes("127.0.0.1"), "IPv4 loopback is NO_PROXY-safe and must stay held");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored once the hold releases");
+});
+
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
     for (let i = 0; i < 500; i++) {
         if (cond()) return;
