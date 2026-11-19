@@ -411,20 +411,42 @@ test("pf-channel: a >=4xx response clears the learned mode immediately", () => {
     learn({ [CONVO]: "sid-mode-4xx-unknown" }, null, 429);
 });
 
-// #6785 review fix (2026-11-19): suppression is coupled to the CARRIER. The
-// two stuck states below used to strand a session pin-less FOREVER (the
-// server sees neither form ⇒ sends no mode signal ⇒ the client keeps
-// suppressing): a list over the 2048 capture ceiling, and a tail whose
-// encoded bytes exceed the header budget.
-test("pf-channel: list over the capture ceiling ⇒ no tail header AND no suppression (full form keeps riding)", () => {
+// #6785 review fix (2026-11-19, owner): ultra-long sessions still send
+// TAIL-ONLY — the capture keeps the last MAX_IDS entries (baseOffset) and
+// the steady-state slice (t-1, one core short of the list end) always lands
+// in that window. Only a slice reaching BELOW the kept window (a stale
+// small stamp after a big growth) or an over-byte-budget tail degrades to
+// the full form riding instead — the server then re-proves and restamps.
+test("pf-channel: list over the capture ceiling ⇒ tail window kept, tail-only slice goes out, body suppressed", () => {
     const sid = "sid-mode-oversize-1";
     const inH = { [CONVO]: sid };
-    learn(inH, "3000", 200, "incremental");
-    pfChannel.pfCaptureIds(sid, gen(3000)); // > MAX_IDS ⇒ the store refuses
+    // steady state: previous total 2999, this turn adds one core (m3000)
+    learn(inH, "2999", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(3000)); // > MAX_IDS ⇒ last 2048 kept, baseOffset 952
     const h = pfChannel.pfRequestHeaders(inH);
-    assert.equal(h["x-bili-pf-count"], "3000");
-    assert.equal(h["x-bili-pf-tail-ids"], undefined, "refused list ⇒ count-only headers");
-    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 3000), false, "no carrier ⇒ the full form rides (pre-§8 behavior, pins fine)");
+    assert.equal(h["x-bili-pf-count"], "2999");
+    assert.equal(h["x-bili-pf-tail-ids"], "m2999,m3000", "anchor + new core only — the body's full list stays suppressed");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 3000), true, "carrier out ⇒ suppression on (no full-body bytes for a 3000-id session)");
+});
+
+test("pf-channel: stamp below the kept tail window ⇒ count-only AND full form rides (safe degrade)", () => {
+    const sid = "sid-mode-oversize-2";
+    const inH = { [CONVO]: sid };
+    // stale tiny stamp (e.g. first stamp after the slot was evicted) while
+    // the host already holds a 3000-element list: the slice would start at
+    // index 99 — below the kept window (baseOffset 952) and would be a
+    // 2901-id header — so the carrier stays off and the full form rides
+    learn(inH, "100", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(3000));
+    const h = pfChannel.pfRequestHeaders(inH);
+    assert.equal(h["x-bili-pf-count"], "100");
+    assert.equal(h["x-bili-pf-tail-ids"], undefined, "slice reaches below the window ⇒ count-only");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 3000), false, "no carrier ⇒ the full form rides (pins fine; server restamps next turn)");
+    // one 2xx later the stamp tracks the real size and tail-only resumes
+    learn(inH, "3000", 200, "incremental");
+    pfChannel.pfCaptureIds(sid, gen(3001));
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "m3000,m3001", "steady state resumes tail-only");
+    assert.equal(pfChannel.pfSuppressFullMsgIds(sid, 3001), true);
 });
 
 test("pf-channel: tail payload over the byte budget ⇒ no tail header AND no suppression", () => {

@@ -143,7 +143,7 @@ test("pf-channel end-to-end screening via the public handshake API (#5826 parity
     assert.deepEqual(pfRoundTrip(3, [GOOD, GOOD2, "\u200bcf"]), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": "%3F" }, "\\p{C} slot screens to ? (emitted percent-encoded)");
     assert.deepEqual(pfRoundTrip(3, ["a b", "c d"]), { "x-bili-pf-count": "3" }, "nothing identifiable -> count-only");
     assert.deepEqual(pfRoundTrip(2, [GOOD, GOOD]), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "%3F" }, "duplicate second slot screens to ?");
-    assert.deepEqual(pfRoundTrip(3, LONG_LIST), { "x-bili-pf-count": "3" }, "MAX_IDS (2048) cap degrades to count-only");
+    assert.deepEqual(pfRoundTrip(3, LONG_LIST), { "x-bili-pf-count": "3" }, "over-ceiling capture keeps a tail window, but the stamp (3) is far below its base ⇒ slice would be a 2048-id header ⇒ byte budget keeps it count-only");
     assert.deepEqual(pfRoundTrip(3, "not-an-array"), { "x-bili-pf-count": "3" }, "failed resolution clears stored list (honest absence beats stale)");
 });
 

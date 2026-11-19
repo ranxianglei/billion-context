@@ -45,7 +45,10 @@ const RESERVED_PREFIX = "acp_summary_";
 // the incremental-lane adapters; keep them in sync (a bad id degrades the WHOLE
 // list to absent, never a partial list onto the wire).
 const BAD_ID_CHARS = /[\s\p{C}]/u;
-const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
+const MAX_IDS = 2048; // long-conversation ceiling; a longer captured list keeps
+                // ONLY its last MAX_IDS entries (baseOffset below) — the
+                // steady-state tail slice lives in that window, so ultra-long
+                // sessions still send tail-only instead of the full body
 const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
 // #6785 review fix (2026-11-19): byte budget for the tail-ids HEADER value.
 // Node's default maxHeaderSize covers the WHOLE header block (16 KB), and
@@ -59,6 +62,13 @@ const TAIL_MAX_BYTES = 8 * 1024;
 type Tracked = {
     t?: number;
     ids?: string[];
+    /** #6785 review fix (2026-11-19, owner): when the captured list exceeded
+     *  MAX_IDS, ids holds only its LAST MAX_IDS entries — baseOffset is where
+     *  that window starts in FULL-list coordinates (undefined ⇒ full list
+     *  kept). A requested slice reaching below the window degrades to
+     *  count-only + full body (the full form pins fine) — never a pin-less
+     *  loop. */
+    baseOffset?: number;
     /** #7064 §8: what the server told us we may send next turn (learned
      *  from x-bili-msgid-mode; cleared on any >=4xx response — the server
      *  re-converges one turn later). "incremental" ⇒ steady-state turns
@@ -131,14 +141,25 @@ export function pfLearnStamp(headersIn: Record<string, string>, respStatus: numb
 export function pfCaptureIds(sid: string, ids: unknown): void {
     if (sid.length === 0) return;
     const slot = takeSlot(sid);
-    if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_IDS) {
+    if (!Array.isArray(ids) || ids.length === 0) {
         delete slot.ids;
+        delete slot.baseOffset;
         return;
+    }
+    // #6785 review fix (owner): over the ceiling, keep the TAIL, not nothing —
+    // the steady-state slice (t-1, t ≈ previous total) sits one core short of
+    // the list end and is always inside this window; only a slice reaching
+    // below it (stale/small stamp after a big growth) degrades to full body.
+    let span: unknown[] = ids;
+    let baseOffset: number | undefined;
+    if (ids.length > MAX_IDS) {
+        span = ids.slice(ids.length - MAX_IDS);
+        baseOffset = ids.length - MAX_IDS;
     }
     const seen = new Set<string>();
     let known = 0;
     const out: string[] = [];
-    for (const v of ids) {
+    for (const v of span) {
         if (
             typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN ||
             v.startsWith(RESERVED_PREFIX) || BAD_ID_CHARS.test(v) || seen.has(v)
@@ -152,6 +173,8 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
     }
     // Nothing identifiable in the whole span ⇒ count-only beats noise.
     slot.ids = known > 0 ? out : undefined;
+    if (baseOffset !== undefined) slot.baseOffset = baseOffset;
+    else delete slot.baseOffset;
 }
 
 /** Chokepoint emit (native-intercept routed-send site): the handshake headers
@@ -174,18 +197,22 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
 }
 
 /** #6785 review fix: the encoded tail-ids payload this turn, or undefined
- *  when the carrier must stay off (not enough captured ids, or the joined
- *  value exceeds TAIL_MAX_BYTES). The SAME verdict feeds the header emit
+ *  when the carrier must stay off: not enough captured ids, a slice reaching
+ *  BELOW the kept tail window (a >2048 capture whose stamp predates the
+ *  window — the full form rides instead), or the joined value exceeding
+ *  TAIL_MAX_BYTES. The SAME verdict feeds the header emit
  *  (pfRequestHeaders) and the full-form suppression (pfSuppressFullMsgIds):
  *  suppressing the body while the header carrier is absent strands the
  *  session pin-less FOREVER — the server sees neither form, sends no mode
- *  signal, and the client keeps suppressing (the >2048-id regime pfCaptureIds
- *  refuses to store). */
+ *  signal, and the client keeps suppressing. */
 function tailPayloadFor(slot: Tracked): string | undefined {
     const t = slot.t;
     const ids = slot.ids;
-    if (t === undefined || t < 1 || ids === undefined || ids.length < t) return undefined;
-    const payload = ids.slice(t - 1).map(encodeURIComponent).join(",");
+    if (t === undefined || t < 1 || ids === undefined) return undefined;
+    const base = slot.baseOffset ?? 0;
+    if (t - 1 < base) return undefined; // slice reaches below the kept window
+    if (ids.length < t - base) return undefined;
+    const payload = ids.slice(t - 1 - base).map(encodeURIComponent).join(",");
     return payload.length <= TAIL_MAX_BYTES ? payload : undefined;
 }
 
@@ -206,9 +233,10 @@ export function pfSuppressFullMsgIds(sid: string, wireCount: number): boolean {
         return false;
     }
     // #6785 review fix: suppression is coupled to the CARRIER actually going
-    // out this turn (see tailPayloadFor) — a session whose list exceeds
-    // MAX_IDS (or whose tail exceeds TAIL_MAX_BYTES) keeps sending the full
-    // form: the pre-§8 behavior, which pins fine, instead of pin-less.
+    // out this turn (see tailPayloadFor). When the carrier cannot go out
+    // (stale stamp below the kept tail window, or over-byte-budget tail),
+    // the full form rides instead: the pre-§8 behavior, which pins fine,
+    // rather than a pin-less loop.
     return tailPayloadFor(slot) !== undefined;
 }
 
