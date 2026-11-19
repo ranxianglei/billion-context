@@ -19,6 +19,7 @@
 
 import { isCodexClient } from "./codex-compact.js";
 import { sniffScanClient } from "./thirdparty-scan.js";
+import { safePrefix } from "./text-safe.js";
 
 // Read directly (wire literal) instead of via plugin.ts — same discipline as
 // codex-compact.ts / session-id.ts: importing plugin.ts back into the request
@@ -62,7 +63,7 @@ export function clientFamilyOf(headers: Record<string, string | string[] | undef
 export function recordClientUa(headers: Record<string, string | string[] | undefined>): void {
     const raw = headerString(headers, "user-agent");
     if (!raw || !raw.trim()) return;
-    const ua = raw.trim().slice(0, UA_MAX_CHARS);
+    const ua = safePrefix(raw.trim(), UA_MAX_CHARS);
     const now = Date.now();
     let fam = families.get(clientFamilyOf(headers));
     if (!fam) {

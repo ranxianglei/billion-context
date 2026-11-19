@@ -925,8 +925,10 @@ export class MysqlBackend implements StorageBackend {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
                        ord = VALUES(ord),
-                        // #4608: keep durable interval evidence when a later batch can no
-                       // longer re-derive it (post-fold client resends carry no covered raws)
+                       /* #4608: keep durable interval evidence when a later batch can no
+                          longer re-derive it (post-fold client resends carry no covered raws).
+                          Double-slash lines are JS comment syntax, not MySQL — they syntax-error
+                          every blocks ingest on this lane, so this note is a block comment. */
                        start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
                        end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
@@ -1067,11 +1069,15 @@ export class MysqlBackend implements StorageBackend {
     ): Promise<{ messages: MessageRow[]; watermark: number | null }> {
         const s = input.session;
         const [rows] = (await c.query(
-            "SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?",
+            "SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?",
             [s.sessionId],
         )) as unknown as Row[][];
         const seqByIdentity = new Map<string, number>();
         const hashBySeq = new Map<number, string>();
+        // #6947 (mirror of the sqlite lane): turn-final write-back rows are
+        // stored with ref=NULL; this join hit is the first moment a minted
+        // ref can reach them on the FULL path.
+        const storedRefBySeq = new Map<number, string | null>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of rows) {
@@ -1080,10 +1086,15 @@ export class MysqlBackend implements StorageBackend {
             if (row.retired_at !== null && row.retired_at !== undefined) retiredSeqs.push(num(row.seq));
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, num(row.seq));
             hashBySeq.set(num(row.seq), str(row.content_hash));
+            storedRefBySeq.set(num(row.seq), row.ref === null || row.ref === undefined ? null : str(row.ref));
             if (num(row.seq) + 1 > nextSeq) nextSeq = num(row.seq) + 1;
         }
         const planToAbs = new Map<number, number>();
         const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
+        // #6947: minted-ref backfill for turn-final write-back rows — backfill
+        // NULL only (a non-null stored ref is the frozen index-time projection
+        // and must never be rewritten), never "BLOCKED" (byRaw-only token).
+        const refBackfills: { seq: number; ref: string; refNum: number }[] = [];
         const messages = input.messages.map((m) => {
             const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
@@ -1098,10 +1109,18 @@ export class MysqlBackend implements StorageBackend {
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
                 if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
+                if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null && storedRefBySeq.get(abs) === null) {
+                    refBackfills.push({ seq: abs, ref: m.ref, refNum: m.refNum });
+                }
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const b of refBackfills) {
+            // The ref IS NULL re-check inside the statement keeps the update
+            // idempotent if two plan rows join the same stored row.
+            await c.query("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL", [b.ref, b.refNum, s.sessionId, b.seq]);
+        }
         for (const r of repairs) {
             // #4793: mirror of the sqlite lane — a sibling row may already hold
             // the target bytes for this msg_id (old generation stamped EMPTY
@@ -1138,9 +1157,12 @@ export class MysqlBackend implements StorageBackend {
             await this.releaseContent(c, r.from);
         }
         // #4390 rewind-redo: reactivate in place (no duplicate row).
-        for (const seq of retiredSeqs) {
-            if (messages.some((m) => m.seq === seq)) {
-                await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+        if (retiredSeqs.length > 0) {
+            const presentedSeqs = new Set(messages.map((m) => m.seq));
+            for (const seq of retiredSeqs) {
+                if (presentedSeqs.has(seq)) {
+                    await c.query("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?", [s.sessionId, seq]);
+                }
             }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
@@ -1560,7 +1582,8 @@ export class MysqlBackend implements StorageBackend {
             const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
             if (chunk.length === 0) continue;
             const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
+                 LEFT JOIN content c ON c.hash = messages.content_hash
                  WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 [sessionId, ...chunk],
             )) as unknown as Row[][];
@@ -1575,7 +1598,7 @@ export class MysqlBackend implements StorageBackend {
                     kind: str(r.kind),
                     contentHash,
                     ts: nullableNum(r.ts),
-                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
+                    content: await this.hydrateMediaAsync(str(r.content_bytes), this.pool),
                 });
             }
         }
@@ -1603,20 +1626,31 @@ export class MysqlBackend implements StorageBackend {
             [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
-        for (const r of rows) {
-            const contentHash = str(r.content_hash);
-            out.push({
-                seq: num(r.seq),
-                msgId: str(r.msg_id),
-                ref: nullableStr(r.ref),
-                refNum: nullableNum(r.ref_num),
-                role: str(r.role),
-                kind: str(r.kind),
-                contentHash,
-                retiredAt: nullableNum(r.retired_at),
-                ts: nullableNum(r.ts),
-                content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
-            });
+        // Keep body batches bounded even when the selected metadata spans a
+        // whole historian log. Every query stays on the caller's connection.
+        const CHUNK = 500;
+        for (let i = 0; i < rows.length; i += CHUNK) {
+            const chunk = rows.slice(i, i + CHUNK);
+            const hashes = [...new Set(chunk.map((row) => str(row.content_hash)))];
+            const [contents] = (await conn.query(
+                `SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`, hashes,
+            )) as unknown as Row[][];
+            const byHash = new Map(contents.map((row) => [str(row.hash), str(row.bytes)]));
+            for (const r of chunk) {
+                const contentHash = str(r.content_hash);
+                out.push({
+                    seq: num(r.seq),
+                    msgId: str(r.msg_id),
+                    ref: nullableStr(r.ref),
+                    refNum: nullableNum(r.ref_num),
+                    role: str(r.role),
+                    kind: str(r.kind),
+                    contentHash,
+                    retiredAt: nullableNum(r.retired_at),
+                    ts: nullableNum(r.ts),
+                    content: await this.hydrateMediaAsync(byHash.get(contentHash) ?? "", conn),
+                });
+            }
         }
         return out;
     }

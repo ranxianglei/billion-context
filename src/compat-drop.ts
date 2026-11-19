@@ -77,10 +77,10 @@ export function dropCompatFieldsJson(parsed: Record<string, unknown>, paths: rea
         const segs = raw.split(".");
         let node: unknown = parsed;
         for (let i = 0; i < segs.length - 1; i++) {
-            node = isPlainObj(node) ? node[segs[i]] : undefined;
+            node = isPlainObj(node) && Object.hasOwn(node, segs[i]) ? node[segs[i]] : undefined;
         }
         const leaf = segs[segs.length - 1];
-        if (isPlainObj(node) && Object.prototype.hasOwnProperty.call(node, leaf)) {
+        if (isPlainObj(node) && Object.hasOwn(node, leaf)) {
             delete node[leaf];
             dropped++;
         }
