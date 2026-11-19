@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { queryLogFiles } from "../src/web/logs-query.ts";
@@ -155,6 +157,70 @@ test("time-window view reports each unreadable generation once across passes", a
         });
         assert.deepEqual(result.lines, lines);
         assert.deepEqual(errors, [missing]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("time-window lead-in stays bounded when the retained log exceeds the heap", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "logs-window-memory-"));
+    try {
+        const file = path.join(dir, "active.log");
+        const before = mkLine(0, "x".repeat(990));
+        const hit = mkLine(0, "needle");
+        const batch = `${before}\n`.repeat(1000);
+        writeFileSync(file, "");
+        for (let i = 0; i < 100; i++) appendFileSync(file, batch);
+        appendFileSync(file, `${hit}\n`);
+        const source = `
+            import { queryLogFiles } from './src/web/logs-query.ts';
+            const result = await queryLogFiles([process.argv[1]], 'needle',
+                { ctx: 0, winSec: Number(process.argv[2]), n: 3 });
+            console.log(JSON.stringify(result));
+        `;
+        const run = (winSec: number) => {
+            const child = spawnSync(process.execPath, [
+                "--max-old-space-size=64", "--import", "./tests/preload-test-env.mjs",
+                "--import", "tsx", "--input-type=module", "--eval", source, file, String(winSec),
+            ], { cwd: fileURLToPath(new URL("../", import.meta.url)), encoding: "utf8", timeout: 60_000 });
+            assert.equal(child.error, undefined);
+            assert.equal(child.status, 0, child.stderr);
+            return JSON.parse(child.stdout) as Awaited<ReturnType<typeof queryLogFiles>>;
+        };
+        assert.deepEqual(run(0).lines, [hit], "the streaming reader fits the heap without window context");
+        const result = run(60);
+        assert.equal(result.total, 1);
+        assert.equal(result.shown, 3);
+        assert.equal(result.omitted, 99_998);
+        assert.deepEqual(result.lines, [before, before, hit]);
+        assert.deepEqual(result.isMatch, [false, false, true]);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("time-window drops a disconnected lead-in and its omitted count", async () => {
+    const rows = [mkLine(2, "old-a"), mkLine(2, "old-b"), mkLine(0, "outside"), mkLine(2, "near"), mkLine(2, "needle")];
+    const result = await query(rows, "needle", { ctx: 0, winSec: 60, n: 2 });
+    assert.deepEqual(result.lines, rows.slice(-2));
+    assert.equal(result.omitted, 0);
+    assert.deepEqual(result.isMatch, [false, true]);
+});
+
+test("time-window returns no context when rotation removes every hit between passes", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "logs-window-rotation-"));
+    try {
+        const active = path.join(dir, "active.log");
+        const missing = path.join(dir, "missing.log");
+        writeFileSync(active, `${mkLine(2, "needle")}\n`);
+        const result = await queryLogFiles([active, missing], "needle", { ctx: 0, winSec: 60, n: 2 }, {
+            onError: () => writeFileSync(active, `${mkLine(2, "replacement")}\n`),
+        });
+        assert.equal(result.total, 1, "the first pass still reports its observed match count");
+        assert.equal(result.shown, 0);
+        assert.equal(result.omitted, 0);
+        assert.deepEqual(result.lines, []);
+        assert.deepEqual(result.isMatch, []);
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

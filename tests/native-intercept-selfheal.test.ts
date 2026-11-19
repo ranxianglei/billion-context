@@ -50,6 +50,30 @@ async function withHeal<T>(fn: (ctx: { sink: string[]; rearm: (v: typeof fetch) 
     }
 }
 
+test("native headersFor stamps a host recovery owner on the routed proxy request", async () => {
+    const captured: Headers[] = [];
+    const saved = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        captured.push(new Headers(init?.headers));
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        headersFor: () => ({ "x-bili-host-recovery-owner": "omp" }),
+    };
+    _resetForTest();
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "{}" });
+        assert.equal(captured[0]?.get("x-bili-host-recovery-owner"), "omp");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("#1158 self-heal: third-party reset to a frozen bare fetch re-chains and keeps routing through bili", async () => {
     const bareSink: string[] = [];
     const { sink } = await withHeal(async ({ rearm, fetch }) => {

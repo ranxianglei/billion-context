@@ -42,10 +42,11 @@ export type EgressTransformEntry = {
     order: number;
 };
 
-/** Context handed to each plugin's `transform`. `headers` is a LIVE reference to
- *  the outgoing header map — a successful plugin may mutate it directly, or
- *  return `headers` to merge. `body` is the current stage's outbound copy
- *  (string JSON text or Buffer). */
+/** Context handed to each plugin's `transform`. `headers` is a writable draft:
+ *  successful direct mutations commit to the outgoing map before returned
+ *  headers merge; failed or timed-out drafts are discarded. `body` is the
+ *  current stage's string or a private Buffer draft. Buffer edits take effect
+ *  only when the plugin successfully returns that draft as `body`. */
 export type EgressTransformCtx = {
     sessionId: string | undefined;
     upstreamUrl: string;
@@ -138,12 +139,14 @@ type LoadedModule =
     | { ok: false; err: string };
 
 const moduleCache = new Map<string, LoadedModule>();
+let moduleGeneration = 0;
 
 /** Clear the loaded-module cache. Called on `POST /__bili/config/reload` so a
  *  plugin's code (and any newly-added/removed entry) takes effect on the next
  *  request without a restart. Modules stay stable WITHIN a generation so a
  *  running session never swaps transform behavior mid-flight. */
 export function resetEgressModuleCache(): void {
+    moduleGeneration++;
     moduleCache.clear();
 }
 
@@ -160,6 +163,7 @@ function coerceModule(def: unknown): EgressTransformModule | null {
 async function loadModule(absPath: string): Promise<LoadedModule> {
     const cached = moduleCache.get(absPath);
     if (cached) return cached;
+    const generation = moduleGeneration;
     let result: LoadedModule;
     try {
         if (!existsSync(absPath)) throw new Error(`module not found: ${absPath}`);
@@ -175,7 +179,7 @@ async function loadModule(absPath: string): Promise<LoadedModule> {
     } catch (e) {
         result = { ok: false, err: String(e instanceof Error ? e.message : e) };
     }
-    moduleCache.set(absPath, result);
+    if (generation === moduleGeneration) moduleCache.set(absPath, result);
     return result;
 }
 
@@ -188,6 +192,11 @@ function byteLen(body: string | Buffer): number {
 function deleteHeaderInsensitive(headers: Record<string, string>, name: string): void {
     const target = name.toLowerCase();
     for (const key of Object.keys(headers)) if (key.toLowerCase() === target) delete headers[key];
+}
+
+function commitHeaders(target: Record<string, string>, draft: Record<string, string>): void {
+    for (const key of Object.keys(target)) delete target[key];
+    Object.assign(target, draft);
 }
 
 function matchUpstream(match: EgressTransformMatch | undefined, upstreamUrl: string): boolean {
@@ -255,7 +264,8 @@ export async function applyEgressTransforms(
     let current = body;
     for (const t of resolved) {
         if (!matchUpstream(t.match, base.upstreamUrl)) continue;
-        const ctx: EgressTransformCtx = { ...base, body: current };
+        const headers = { ...base.headers };
+        const ctx: EgressTransformCtx = { ...base, headers, body: Buffer.isBuffer(current) ? Buffer.from(current) : current };
         const inBytes = byteLen(current);
         let result: EgressTransformResult;
         try {
@@ -265,6 +275,7 @@ export async function applyEgressTransforms(
             continue;
         }
         if (result === undefined || result === null) {
+            commitHeaders(base.headers, headers);
             log("debug", `[${base.sessionId ?? "-"}] [egress:${t.id}] stage=${base.stage} in=${inBytes}B out=${inBytes}B (unchanged)`);
             continue;
         }
@@ -272,11 +283,12 @@ export async function applyEgressTransforms(
             log("error", `[egress:${t.id}] stage=${base.stage} returned an illegal body type (fail-open, keeping previous body)`);
             continue;
         }
+        commitHeaders(base.headers, headers);
         if (result.body !== undefined) current = result.body;
         if (result.headers !== undefined) {
             for (const [k, v] of Object.entries(result.headers)) {
-                if (v === undefined) deleteHeaderInsensitive(base.headers, k);
-                else base.headers[k] = String(v);
+                deleteHeaderInsensitive(base.headers, k);
+                if (v !== undefined) base.headers[k] = String(v);
             }
         }
         const outBytes = byteLen(current);
