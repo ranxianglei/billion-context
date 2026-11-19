@@ -450,8 +450,7 @@ export function scanRegistryCostRow(
             let chosen: { row: CostRow; key: string; profile: PriceProfile } | undefined;
             const seen = new Set<string>();
             const parts: string[] = [];
-            for (const { lower, key, value: row } of idx.entries) {
-                if (!lower.endsWith(suffix)) continue;
+            for (const { key, value: row } of suffixEntries(idx, suffix)) {
                 const profile = priceProfileFromRow(row);
                 if (!profile) continue;
                 const sig = `${profile.w}|${profile.r}|${profile.q}`;
@@ -543,20 +542,42 @@ export function modelVariants(name: string): string[] {
 // byLower keeps only the FIRST original key per lowercased form (case-only
 // collisions in one roster are degenerate); entries keeps every key so the
 // relay scan still sees all providers.
+type LowerKeyEntry<T> = { lower: string; key: string; value: T };
 type LowerKeyIndex<T> = {
-    byLower: Map<string, { key: string; value: T }>;
-    entries: Array<{ lower: string; key: string; value: T }>;
+    byLower: Map<string, LowerKeyEntry<T>>;
+    entries: Array<LowerKeyEntry<T>>;
+    bySuffix?: Map<string, Array<LowerKeyEntry<T>>>;
 };
 
 function buildLowerKeyIndex<T>(obj: Record<string, T>): LowerKeyIndex<T> {
-    const byLower = new Map<string, { key: string; value: T }>();
-    const entries: Array<{ lower: string; key: string; value: T }> = [];
+    const byLower = new Map<string, LowerKeyEntry<T>>();
+    const entries: Array<LowerKeyEntry<T>> = [];
     for (const [key, value] of Object.entries(obj)) {
         const lower = key.toLowerCase();
-        if (!byLower.has(lower)) byLower.set(lower, { key, value });
-        entries.push({ lower, key, value });
+        const entry = { lower, key, value };
+        if (!byLower.has(lower)) byLower.set(lower, entry);
+        entries.push(entry);
     }
     return { byLower, entries };
+}
+
+// Relay lookups match a slash-delimited suffix, including nested model ids.
+// Build the index only when that fallback is used; known-provider/exact hits
+// do not need it. Buckets retain every original row in snapshot key order.
+function suffixEntries<T>(index: LowerKeyIndex<T>, suffix: string): ReadonlyArray<LowerKeyEntry<T>> {
+    if (!index.bySuffix) {
+        const bySuffix = new Map<string, Array<LowerKeyEntry<T>>>();
+        for (const entry of index.entries) {
+            for (let slash = entry.lower.indexOf("/"); slash >= 0; slash = entry.lower.indexOf("/", slash + 1)) {
+                const key = entry.lower.slice(slash);
+                const bucket = bySuffix.get(key);
+                if (bucket) bucket.push(entry);
+                else bySuffix.set(key, [entry]);
+            }
+        }
+        index.bySuffix = bySuffix;
+    }
+    return index.bySuffix.get(suffix) ?? [];
 }
 
 function registryLowerIndex(reg: RegistryShape): LowerKeyIndex<ModelEntry> {
@@ -636,8 +657,7 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string,
             let max: number | undefined;
             const distinct = new Set<number>();
             const parts: string[] = [];
-            for (const { lower, key, value: entry } of idx.entries) {
-                if (!lower.endsWith(suffix)) continue;
+            for (const { key, value: entry } of suffixEntries(idx, suffix)) {
                 const value = entry.limit?.[field];
                 if (typeof value !== "number" || value <= 0) continue;
                 if (max === undefined || value > max) max = value;
