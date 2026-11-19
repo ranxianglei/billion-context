@@ -187,6 +187,26 @@ function stripGoogleContents(parsed: unknown, counts: RawStripCounts): void {
     }
 }
 
+// Only discard a standalone Responses status echo. Codex's passthrough
+// metadata describes the item itself; unknown fields and tool-bearing or
+// multimodal items may have independent meaning and must keep their carrier.
+const RESPONSES_STATUS_ITEM_KEYS = new Set([
+    "type", "role", "content", "id", "status", "internal_chat_message_metadata_passthrough",
+]);
+
+function isEmptyResponsesStatusItem(item: Record<string, unknown>): boolean {
+    if (item.status !== undefined && item.status !== "completed") return false;
+    if (!Object.keys(item).every((key) => RESPONSES_STATUS_ITEM_KEYS.has(key))) return false;
+    const content = item.content;
+    if (typeof content === "string") return content.trim() === "";
+    return Array.isArray(content) && content.every((part: unknown) =>
+        isPlainRecord(part) &&
+        (part.type === undefined || part.type === "output_text" || part.type === "input_text" || part.type === "text") &&
+        typeof part.text === "string" && part.text.trim() === "" &&
+        Object.keys(part).every((key) => key === "type" || key === "text" ||
+            ((key === "annotations" || key === "logprobs") && Array.isArray(part[key]) && part[key].length === 0)));
+}
+
 // Responses `input` walk: message items (plus the type-less omp wire form).
 function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
     if (!Array.isArray(input)) return;
@@ -197,6 +217,7 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
         const r = input[i];
         if (isPlainRecord(r) && r.role === "user" && (r.type === "message" || r.type === undefined)) lastUserIdx = i;
     }
+    let statusOnly: Set<Record<string, unknown>> | undefined;
     for (let i = input.length - 1; i >= 0; i--) {
         const rec = input[i];
         if (!isPlainRecord(rec)) continue;
@@ -205,8 +226,11 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
         const role = typeof rec.role === "string" ? rec.role : "";
         if (role !== "user" && role !== "assistant") continue;
         const latestUserTurn = i === lastUserIdx;
+        let changed = false;
         if (typeof rec.content === "string") {
-            rec.content = stripTextSlot(rec.content, counts, { latestUserTurn });
+            const stripped = stripTextSlot(rec.content, counts, { latestUserTurn });
+            changed = rec.content !== stripped;
+            rec.content = stripped;
             if (role === "user" && isNudgeEchoText(rec.content as string)) {
                 input.splice(i, 1);
                 counts.nudges++;
@@ -217,9 +241,26 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
                 // KDD #10 symmetry with the anthropic/openai walk: signed
                 // reasoning rides byte-for-byte, never through the strip walk.
                 if (part.type === "thinking" || part.type === "redacted_thinking" || part.type === "reasoning") continue;
-                if (typeof part.text === "string") part.text = stripTextSlot(part.text, counts, { latestUserTurn });
+                if (typeof part.text === "string") {
+                    const stripped = stripTextSlot(part.text, counts, { latestUserTurn });
+                    changed ||= part.text !== stripped;
+                    part.text = stripped;
+                }
             }
         }
+        if (role === "assistant" && changed && isEmptyResponsesStatusItem(rec)) {
+            (statusOnly ??= new Set()).add(rec);
+        }
+    }
+    if (statusOnly) {
+        // Do not mint occurrence-numbered message IDs for these spaces: a
+        // resumed history can shift them and move existing summary anchors.
+        // Compact once, preserving order and the array identity.
+        let write = 0;
+        for (const item of input) {
+            if (!statusOnly.has(item)) input[write++] = item;
+        }
+        input.length = write;
     }
 }
 
