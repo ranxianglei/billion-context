@@ -24,6 +24,11 @@ delete process.env.BILLION_CONTEXT_PROXY;
 // #820 coexistence: standalone billion-context-pi checks env at load time, so
 // the marker must be set synchronously during module evaluation (before our
 // async bootstrap writes BILLION_CONTEXT_PROXY) for its action-time back-off.
+test("Pi package entry identifies billion-context", () => {
+    const manifest = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    assert.deepEqual(manifest.pi.extensions, ["./dist/agent/billion-context.js"]);
+});
+
 test("module evaluation marks the process as a native pi host", () => {
     assert.equal(process.env.BILLION_CONTEXT_NATIVE, "pi");
 });

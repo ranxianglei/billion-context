@@ -35,6 +35,14 @@ test("quoteWinToken: whitespace-bearing tokens get wrapped in double quotes", ()
 // embedded-quote tokens before they ever reach this function (see
 // win-cmd-argv.test.ts). The bare output here documents what the formatter
 // does with such input, NOT that it is a safe pass-through.
+test("quoteWinToken: a trailing backslash run is doubled inside the quotes (MSVCRT 2n -> n)", () => {
+    assert.equal(quoteWinToken("C:\\My Dir\\"), '"C:\\My Dir\\\\"');
+    assert.equal(quoteWinToken("a b\\\\"), '"a b\\\\\\\\"');
+    // Backslashes that are not trailing, and space-free tokens, are untouched.
+    assert.equal(quoteWinToken("C:\\My Docs\\a.txt"), '"C:\\My Docs\\a.txt"');
+    assert.equal(quoteWinToken("C:\\bin\\"), "C:\\bin\\");
+});
+
 test("quoteWinToken: embedded double quotes stay bare at the formatter level (rejected upstream since #2196)", () => {
     assert.equal(quoteWinToken('key="value"'), 'key="value"');
     assert.equal(quoteWinToken('C:\\x "q" y'), 'C:\\x "q" y');
