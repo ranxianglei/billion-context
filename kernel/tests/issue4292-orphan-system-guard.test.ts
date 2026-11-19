@@ -179,17 +179,23 @@ test("sidecar system at array end stays verbatim", () => {
   assert.deepEqual(roundTrip({ messages }), messages);
 });
 
-test("directive-only system adjacent to the anchor stays system (legal anywhere)", () => {
-  // Re-voicing a pure effort marker would mint an empty-content user that 400s alone.
+test("directive-only system adjacent to the anchor is moved to the trailing run (#7270)", () => {
+  // #7270: the anchor renders as a user on the wire, so a directive-only
+  // system immediately before it is in an illegal PRECEDE position (followed
+  // by a non-assistant). It is moved to the trailing run instead of being
+  // skipped, preserving the effort semantics while landing in a legal spot.
   const dir = { role: "system", content: [], output_config: { effort: "high" } } as unknown as AnthropicSystemMessage;
   const rebuilt = coreToAnthropic([
     { id: "u0", role: "user", contentType: "text", text: "q1" },
     { id: "s1", role: "system", contentType: "text", text: "[effort]", rawAnthropicMessage: dir },
     anchor("a1", "[Compressed conversation section] x"),
   ] as never);
-  assert.equal(rebuilt[1]!.role, "system");
-  assert.deepEqual(rebuilt[1]!.content, []);
-  assert.equal(rebuilt[2]!.role, "user");
+  assert.equal(rebuilt.length, 3);
+  assert.equal(rebuilt[0]!.role, "user");
+  assert.equal(rebuilt[1]!.role, "user");
+  assert.equal(rebuilt[2]!.role, "system");
+  assert.deepEqual(rebuilt[2]!.content, []);
+  assert.equal((rebuilt[2]! as { output_config?: { effort?: string } }).output_config?.effort, "high");
 });
 
 test("system separated from a later anchor by a user core is healed too", () => {
