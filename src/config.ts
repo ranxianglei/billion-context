@@ -2554,6 +2554,9 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
     "autoModeForge", "imageRescale", "guardrails",
+    // #7243: degenerateRetry block (exemptEnvelopes) — without this mirror entry
+    // a documented key warned as unknown on load (same class as #5706).
+    "degenerateRetry",
     // #3376:
     "cacheKeepalive",
     // #6003 phase 2: user-registerable egress body-rewrite pipeline.
