@@ -150,6 +150,13 @@ export const LIVE_FILES = [
     // One Linux-only Node child reads fixture system CAs and exits within 10s;
     // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
     "tests/upstream-ca-default-trust.test.ts",
+    // #6987: spawnSyncs one bare node child (--import tsx) that arms the real
+    // background quick_check (child-process scan) on a per-run mkdtemp fixture
+    // DB and process.exit()s mid-scan; the spawn is synchronous (blocks the
+    // shard runner while it runs), the child binds no port and does no network
+    // I/O, so no zone band is needed — the entry is for the tripwire alone,
+    // like #3890/#5114/#5940
+    "tests/issue6987-quickcheck-shutdown.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
