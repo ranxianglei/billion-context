@@ -925,7 +925,8 @@ function emptySlotOversizeRefusal(
  *  when the media split is known, name it in the message so the user can tell
  *  at a glance whether any folding could ever bring this body under the cap. */
 function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number }): Response {
-    const basis = `its body (${detail.bytes.toLocaleString("en-US")} B) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
+    const estTokens = Math.ceil(detail.bytes / 7.5);
+    const basis = `its body (${detail.bytes.toLocaleString("en-US")} B, ≥ ~${estTokens.toLocaleString("en-US")} tokens at ~7.5 bytes/token, #2122) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
     const remedy = detail.mediaBytes !== undefined && detail.mediaBytes > 0
         ? detail.mediaBytes >= detail.cap
             ? `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media (images/audio) that no compression can shrink — the media alone already exceeds the ceiling, so this conversation cannot fit under it as-is: start a fresh session or attach smaller images. Routing through a bili session will not remove the media.`
@@ -938,7 +939,7 @@ function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; c
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
     }
-    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed_bytes", message, retryable: true } }), { status: 422, headers });
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "context_too_large", message, retryable: true } }), { status: 422, headers });
 }
 
 // ———— Oversized doom math (#2924/#4068, media-aware since #4111) ——————
