@@ -72,6 +72,31 @@ test("#7278 both cost tables stay cached when their identities are stable", () =
     assert.equal(overridesBuilds, 1, `overrides index rebuilt ${overridesBuilds}× (expected 1)`);
 });
 
+test("#7278 registry index stays hot when the overrides table is a fresh identity per lookup (real pre-#7276 path; pins LRU over FIFO)", () => {
+    _resetForTest();
+    let registryBuilds = 0;
+    const registry = new Proxy(makeCostTable(4000), {
+        ownKeys(t) {
+            registryBuilds++;
+            return Reflect.ownKeys(t);
+        },
+    });
+    _setForTest({}, registry);
+
+    const model = "absent-model";
+    for (let i = 0; i < 50; i++) {
+        // overrideCosts() hands scanRegistryCostRow a brand-new table identity on
+        // every lookup (the pre-#7276 path); the registry (costCache) is the same
+        // object throughout. The LRU must keep the stable registry index hot and
+        // evict the throwaway overrides indexes — a FIFO cache would evict the
+        // registry every other lookup and rebuild it (25× here), so this pins the
+        // recency-refresh the stable-identity test above cannot see.
+        scanRegistryCostRow(makeCostTable(10), model); // fresh overrides, miss
+        scanRegistryCostRow(registry, model); // stable registry fallback
+    }
+    assert.equal(registryBuilds, 1, `registry index rebuilt ${registryBuilds}× with a fresh overrides identity per lookup (expected 1 — LRU must keep the stable table hot; a FIFO cache evicts it every other lookup)`);
+});
+
 test("#7278 the cache still resolves a registry hit correctly (Proxy does not break lookup)", () => {
     _resetForTest();
     const registry: CostsShape = { "host-a/present-model": { input: 2, output: 8 } };
