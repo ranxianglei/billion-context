@@ -174,7 +174,7 @@ test("e2e #2847: a mathematically-doomed payload answers NON-retryable 4xx seman
         assert.equal(r.status, 413, `doomed overflow must answer 413 (got ${r.status}) — a 502 re-invites the host retry storm (#2847)`);
         assert.ok(r.status >= 400 && r.status < 500, "doomed overflow is a 4xx (non-retryable class), never a 5xx");
         // Everything else pinned by #2490 stays byte-identical in meaning:
-        assert.equal(parsed.error?.code, "preflight_compress_failed", "same structured error code");
+        assert.equal(parsed.error?.code, "context_too_large", "oversize 413 code unified to context_too_large (#7244)");
         assert.equal(parsed.error?.retryable, false, "body still says retryable:false");
         assert.match(parsed.error?.message ?? "", /~2[23]\d{5} bytes/, "the byte math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /NOT forwarded even for evidence/, "the remedy wording is present");
