@@ -2598,14 +2598,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
 export function noteSystemPromptFingerprint(session: Session, system: unknown, opts: ReconcileOptions = {}): void {
     if (!session.metadata) return;
     const text = system === undefined || system === null ? "" : JSON.stringify(system) ?? "";
-    const fp = system === undefined || system === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
-    const prev = session.metadata[METADATA_SYSTEM_FP] as { fp: string; size: number } | undefined;
+    // Change probe (#7149 batch2): the probe (size + first 256 chars) is a
+    // detection SIGNAL, not a security boundary — a rewrite that preserves
+    // length AND the first 256 chars stays unobserved, which is acceptable for
+    // a ledger (#1921), and the stored fp is still the true full-hash value
+    // every time it is actually computed. Probe miss / first turn / legacy
+    // stored shape (no head) ⇒ full hash.
+    const prev = session.metadata[METADATA_SYSTEM_FP] as { fp: string; size: number; head?: string } | undefined;
+    const fp = system === undefined || system === null
+        ? "-"
+        : (prev !== undefined && prev.fp !== "-" && prev.size === text.length && prev.head !== undefined && prev.head === text.slice(0, 256)
+            ? prev.fp
+            : createHash("sha256").update(text).digest("hex").slice(0, 16));
     if (prev !== undefined && prev.fp !== fp) {
         if (opts.log !== undefined) {
             opts.log("info", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[fold-reconcile] system prompt changed (${prev.size} → ${text.length} chars); fold state unaffected (#1921)`);
         }
     }
-    session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length };
+    session.metadata[METADATA_SYSTEM_FP] = { fp, size: text.length, head: text.slice(0, 256) };
 }
 
 /** #2867: canonical INCOMING system/developer fingerprint — the mode-independent
@@ -2617,8 +2627,14 @@ export function noteSystemPromptFingerprint(session: Session, system: unknown, o
 export function noteCanonicalSystemFingerprint(session: Session, canonical: unknown): void {
     if (!session.metadata) return;
     const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
-    const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
-    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
+    // Same change-probe tradeoff as noteSystemPromptFingerprint (#7149 batch2).
+    const prev = session.metadata[METADATA_CANONICAL_SYS_FP] as { fp: string; size: number; head?: string } | undefined;
+    const fp = canonical === undefined || canonical === null
+        ? "-"
+        : (prev !== undefined && prev.fp !== "-" && prev.size === text.length && prev.head !== undefined && prev.head === text.slice(0, 256)
+            ? prev.fp
+            : createHash("sha256").update(text).digest("hex").slice(0, 16));
+    session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length, head: text.slice(0, 256) };
 }
 
 /** #4789: last-noted outbound bili tool surface per live session object.
