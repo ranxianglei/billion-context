@@ -324,6 +324,53 @@ bili's compression/prefix-cache accounting cannot see it. The real fix
 (materialize lineage before compression) is tracked as feature #1973. Official
 migration guide: https://developers.openai.com/api/docs/guides/migrate-to-responses
 
+## GPT-6.2 drops reasoning after prefix edits — bili folds live with it (#7144)
+
+Starting with GPT-6.2, OpenAI's Responses API **voids (deletes) reasoning items**
+after any edit to the conversation's earlier turns — the model re-derives its
+thinking from whatever visible text remains. Only OpenAI's own server-side
+compaction (`/responses/compact`, `context_management`) preserves reasoning,
+because it runs where the reasoning lives. bili's fold is exactly the kind of
+client-side prefix edit this mechanism targets: folded turns are replaced by
+the in-place block summary at the fold anchor (kernel `acp_summary`; see
+tests/responses-fold-cache-seam.test.ts, #1548), and newly forged summaries
+ride in the developer message (`devParts = [...systemParts, ...forgedSummaries, prompt]`
+in src/server/prepare-responses.ts) — a prefix rewrite in OpenAI's own
+documentation's terms. #651's reasoning drop (src/reasoning-drop.ts, default
+on, threshold 2048 chars) is the same kind of edit: the first closed-turn
+drop on a GPT-6.2 session voids the live reasoning after it, even if no fold
+ever happens.
+
+Consequence, precisely scoped: on responses-wire sessions with GPT-6.2 or
+later, every bili fold (and every #651 drop) invalidates the *live* reasoning
+items after the edit point; the model continues from summaries + visible tail
+messages and may re-derive earlier thinking (OpenAI's documented failure
+mode: answer quality can decline and the model burns tokens repeating earlier
+work). Closed/older turns were already subject to the same loss for **every**
+model under bili's design — this is not a new damage axis. The retention tail
+is a dial, not a contract: `compress.preserveRecentMessages: 0` (the initial
+version's posture) folds the whole history and runs the model on summaries
+alone, so GPT-6.2's worst case sits inside a configuration the tool already
+legitimately supports. It only moves the dial down, server-side, for the
+reasoning portion.
+
+**Decision (owner, 2026-11-19, #7144): accept the status quo — document,
+do not gate.** Impact is bounded, and for strong models losing a segment of
+thinking is cheap: the next tool result re-anchors the derivation. If a
+measurable symptom appears (long chained-reasoning tasks re-deriving deep
+thinking between folds, visible token blowup), the cheap levers exist in order:
+(1) a quiet-moment fold gate — defer folds while the tail is a consecutive
+pure-thinking run, emergency fallback unchanged; (2) `compress.reasoning.drop:
+false` for gpt-6.2+ sessions to stop the #651 edits; (3) delegating
+compaction to the official `/responses/compact` — the only lossless path, but
+it requires server-held state (`previous_response_id`), which contradicts the
+stateless replay design above (#1954) and is a separate, larger feature.
+(Note: bili's existing `/responses/compact` handling in src/codex-compact.ts
+*fakes* the compact response for codex; it never calls OpenAI's endpoint.)
+
+Official docs: https://developers.openai.com/api/docs/guides/keep-prefix-unchanged.md
+and https://developers.openai.com/api/docs/guides/latest-model#gpt-6.2-astra-whats-new
+
 ## Single-writer: who owns which copy (#991)
 
 Every bili presence on a machine has exactly **one writer** — the thing
