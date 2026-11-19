@@ -111,6 +111,32 @@ export interface SeparatorManifest {
   body: string;
 }
 
+/** The Responses hosted-call item types `responsesToCore` flattens into
+ *  `contentType: "reasoning"` cores (kernel/src/wire/responses.ts). On the wire
+ *  these are tool-call items, NOT reasoning items: a `web_search_call` must stay
+ *  in the same assistant run as its `reasoning` item (the server rejects a
+ *  `web_search_call` "without its required 'reasoning' item" once a user
+ *  separator splits the run). Classifying them as a second reasoning would
+ *  insert a spurious separator and break the run (#7296). */
+const RESPONSES_HOSTED_CALL_TYPES = new Set([
+    "computer_call",
+    "computer_call_output",
+    "file_search_call",
+    "web_search_call",
+    "image_generation_call",
+    "code_interpreter_call",
+    "mcp_call",
+]);
+
+/** True when a `contentType: "reasoning"` core is actually a flattened hosted
+ *  call (its `rawResponsesItem` sidecar is a hosted-call item), not a real
+ *  reasoning item. Only the sidecar's wire `type` decides — never the core text
+ *  or id, which the codec re-derives and a client could shape. */
+function isHostedCallCore(m: CoreMessage): boolean {
+    const raw = (m as BiliMessage).rawResponsesItem as { type?: unknown } | undefined;
+    return typeof raw?.type === "string" && RESPONSES_HOSTED_CALL_TYPES.has(raw.type);
+}
+
 // #564: folding + stripKernelSummaries can merge two assistant turns into one
 // run, which Responses rejects (run order reasoning* -> message* ->
 // function_call*, <=1 reasoning). Rebuild boundaries from the ORIGINAL history
@@ -187,7 +213,13 @@ export function repairResponsesAssistantOrdering(
             seenReasoning = false;
             continue;
         }
-        const kind = m.contentType === "reasoning" ? "reasoning" : m.contentType === "tool-call" ? "tool-call" : "message";
+        // A flattened hosted call carries contentType "reasoning" but is a
+        // tool-call on the wire (#7296): classify it as tool-call (phase 2) so a
+        // `reasoning -> web_search_call` run stays intact instead of getting a
+        // spurious user separator between the two.
+        const kind = m.contentType === "reasoning"
+            ? (isHostedCallCore(m) ? "tool-call" : "reasoning")
+            : m.contentType === "tool-call" ? "tool-call" : "message";
         const r = runOf.get(m.id);
         if (kind === "reasoning" && r !== undefined && runHasBody.get(r) && survivorCount.get(r) === 1) continue;
         if ((kind === "reasoning" && (phase > 0 || seenReasoning)) || (kind === "message" && phase === 2)) pushSeparator();
