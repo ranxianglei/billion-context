@@ -97,11 +97,81 @@ test("idempotence: a second pass changes nothing", () => {
 });
 
 test("resolveReasoningDrop: defaults, validation, and passthrough", () => {
-    assert.deepEqual(resolveReasoningDrop(undefined), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({}), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({ drop: false, threshold: 0 }), { drop: false, threshold: 0 });
-    assert.deepEqual(resolveReasoningDrop({ threshold: -3 }), { drop: true, threshold: 2048 });
-    assert.deepEqual(resolveReasoningDrop({ threshold: 512.9 }), { drop: true, threshold: 512 });
+    assert.deepEqual(resolveReasoningDrop(undefined), { drop: true, threshold: 2048, tail: false });
+    assert.deepEqual(resolveReasoningDrop({}), { drop: true, threshold: 2048, tail: false });
+    assert.deepEqual(resolveReasoningDrop({ drop: false, threshold: 0 }), { drop: false, threshold: 0, tail: false });
+    assert.deepEqual(resolveReasoningDrop({ threshold: -3 }), { drop: true, threshold: 2048, tail: false });
+    assert.deepEqual(resolveReasoningDrop({ threshold: 512.9 }), { drop: true, threshold: 512, tail: false });
+    assert.deepEqual(resolveReasoningDrop({ tail: true }), { drop: true, threshold: 2048, tail: true });
+    assert.deepEqual(resolveReasoningDrop({ tail: "yes" as unknown as boolean }), { drop: true, threshold: 2048, tail: false });
+});
+
+// ---- (#7144 follow-up) tail scope: any closed round, not only compress turns ----
+
+test("tail:off (default) keeps non-compress closed rounds' reasoning", () => {
+    const msgs = [R("x".repeat(3000)), CALL("read", "t1"), RESULT("t1"), USER("next")];
+    assert.ok(dropCompressReasoning(msgs).some((m) => m.contentType === "reasoning"));
+});
+
+test("tail:on drops a closed non-compress tool-call round's reasoning", () => {
+    const msgs = [R("x".repeat(3000)), CALL("read", "t1"), RESULT("t1"), USER("next")];
+    const out = dropCompressReasoning(msgs, { tail: true });
+    assert.equal(out.length, 3);
+    assert.ok(!out.some((m) => m.contentType === "reasoning"));
+});
+
+test("tail:on drops a closed assistant text round's reasoning", () => {
+    const msgs = [R("x".repeat(3000), "r1"), TEXT("final answer"), USER("next q")];
+    const out = dropCompressReasoning(msgs, { tail: true });
+    assert.equal(out.length, 2);
+    assert.ok(!out.some((m) => m.contentType === "reasoning"));
+});
+
+test("tail:on in-flight call (no result) is never touched", () => {
+    const msgs = [R("x".repeat(3000)), CALL("read", "t1"), TEXT("next round already started")];
+    assert.equal(dropCompressReasoning(msgs, { tail: true }).length, 3);
+});
+
+test("tail:on result still the last message is never touched", () => {
+    const msgs = [USER("q"), R("x".repeat(3000)), CALL("read", "t1"), RESULT("t1")];
+    assert.equal(dropCompressReasoning(msgs, { tail: true }).length, 4);
+});
+
+test("tail:on text turn that IS the last message is never touched (active round)", () => {
+    const msgs = [R("x".repeat(3000)), TEXT("answering...")];
+    assert.equal(dropCompressReasoning(msgs, { tail: true }).length, 2);
+});
+
+test("tail:on respects the threshold gate (strictly greater)", () => {
+    const keep = [R("x".repeat(2048)), CALL("read", "t1"), RESULT("t1"), USER("n")];
+    assert.equal(dropCompressReasoning(keep, { tail: true }).length, 4);
+    const drop = [R("x".repeat(2049)), CALL("read", "t1"), RESULT("t1"), USER("n")];
+    assert.equal(dropCompressReasoning(drop, { tail: true }).length, 3);
+});
+
+test("tail:on drop:false kill-switch disables both scopes", () => {
+    const msgs = [R("x".repeat(3000), "r1"), CALL(), RESULT(), R("y".repeat(3000), "r2"), CALL("bash", "t2"), RESULT("t2"), USER("n")];
+    assert.equal(dropCompressReasoning(msgs, { drop: false, tail: true }).length, 7);
+});
+
+test("tail:on closed agentic chain without any user message", () => {
+    const msgs = [
+        R("a".repeat(3000), "r1"), CALL("read", "c1"), RESULT("c1"),
+        R("b".repeat(3000), "r2"), CALL("bash", "c2"), RESULT("c2"),
+        R("c".repeat(3000), "r3"), CALL("bash", "c3"),
+    ];
+    const out = dropCompressReasoning(msgs, { tail: true });
+    // r1, r2 dropped (closed rounds); r3 kept (in-flight c3): 8 - 2 = 6
+    assert.equal(out.length, 6);
+    assert.ok(out.some((m) => m.id === "r3"));
+    assert.ok(!out.some((m) => m.id === "r1" || m.id === "r2"));
+});
+
+test("tail:on idempotence and purity", () => {
+    const msgs = [R("x".repeat(3000), "r1"), CALL("read", "t1"), RESULT("t1"), TEXT("more"), R("y".repeat(3000), "r2"), TEXT("end"), USER("n")];
+    const once = dropCompressReasoning(msgs, { tail: true });
+    assert.equal(dropCompressReasoning(once, { tail: true }).length, once.length);
+    assert.equal(msgs.length, 7);
 });
 
 test("multiple closed compress rounds all get stripped (distinct toolCallIds)", () => {
@@ -130,6 +200,7 @@ test("mergeCompress merges reasoning sub-field-wise across levels", () => {
     assert.deepEqual(mergeCompress({ reasoning: { threshold: 1024 } }, undefined, { reasoning: { drop: false } }).reasoning, { threshold: 1024, drop: false });
     assert.equal(mergeCompress(undefined, undefined, undefined).reasoning, undefined);
     assert.deepEqual(mergeCompress({ reasoning: { threshold: 100 } }, { reasoning: { threshold: 200 } }, undefined).reasoning, { threshold: 200 });
+    assert.deepEqual(mergeCompress({ reasoning: { drop: true } }, undefined, { reasoning: { tail: true } }).reasoning, { drop: true, tail: true });
 });
 
 test("empty input and empty config short-circuit", () => {
