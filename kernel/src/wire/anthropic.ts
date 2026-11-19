@@ -405,11 +405,12 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
 // predecessor (array start) follows the existing contract and is untouched.
 // Demotion re-voices to user with tool_addition/tool_removal blocks stripped
 // first (WC-022 forbids them outside system) and drops the entry when
-// nothing remains; a
-// directive-only system (empty content + output_config) is accepted at ANY
-// position, so it is never healed (and never legitimizes a neighbour). Fresh
-// objects only — sidecars stay intact for future verbatim emission once
-// re-legitimized.
+// nothing remains. A directive-only system (empty content + output_config) is
+// never re-voiced — a demotion would mint an empty-content user message that
+// 400s on its own — but per #7270 it is no longer exempt at illegal PRECEDE
+// positions: it is moved to the trailing run there instead (see
+// isDirectiveOnlySystem above). Fresh objects only — sidecars stay intact for
+// future verbatim emission once re-legitimized.
 function isToolUpdateBlock(b: { type?: unknown }): boolean {
   return b.type === "tool_addition" || b.type === "tool_removal";
 }

@@ -17,7 +17,9 @@ import type { BiliMessage } from "../src/wire/bili-message.js";
 // system whose first non-system follower is neither an assistant nor the
 // array end is healed — re-voiced to user with tool_update blocks stripped
 // (WC-022), dropped when nothing remains. Legal layouts (assistant next,
-// array end, trailing runs, directive-only anywhere) round-trip verbatim.
+// array end, trailing runs, directive-only at a legal position) round-trip
+// verbatim; a directive-only system at an illegal PRECEDE position is moved
+// to the trailing run instead (#7270).
 
 function sys(content: AnthropicSystemMessage["content"]): AnthropicSystemMessage {
   return { role: "system", content };
