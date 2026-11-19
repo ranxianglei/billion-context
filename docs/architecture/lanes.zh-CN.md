@@ -19,6 +19,8 @@
 
 **宿主插件（按宿主）。** dsh shim（divert anthropic-wire 回合；openai 形保持全量重发——#3433） · pi entry-walker（omp 复用同一批 entry） · opencode V1/V2 transform 钩子 · codex Responses-over-WebSocket · claude hook（lane token，#5095） · kimi / zcode 原生 TOML 车道。每个宿主车道都有 `-native` 启动闸门；`native-intercept.ts` 把宿主 fetch 流量带归因头路由到代理。
 
+**Pi Anthropic 兼容。** 对经 bili 路由的 Anthropic Messages 模型，Pi 插件在会话开始、模型选择和每回合开始前（原生启动完成后）通过宿主模型 API 设置会话级 `compat.supportsMessageThreads=false`。保留其他兼容设置与当前 thinking 等级，不重写共享模型目录或用户配置。Pi 发送全量请求，bili 仍执行正常压缩与工具流水线。原生 thread 增量在此不安全：Pi 计算历史指纹后，bili 传输层才改写历史。这是兼容协商，并非压缩前移实现。OMP 保留已有独立协商；未路由模型与插件关闭状态不变。恢复原生 threads 需要在宿主计算完整请求指纹之前完成压缩。兼容覆盖保留在已选会话模型上，直到下一次选择替换它；关闭路由不会反向修改该快照。若其他监听器选择了不同模型，进行中的兼容协商不会向该模型恢复 thinking 等级。
+
 **身份与归因。** session id 逐字取自请求头（优先原生稳定 id，#280）。匿名流量走前缀亲和（`pfa-*`，首写者出处 #2879、simhash 链 #2265）。dsh persona 指纹是**证据白名单**（#1104/#2156）：只有被证明「一个 id 复用给多个 persona」的宿主才分叉到 `|sub:<fp>` 会话；某 id 下首个 system 锚定原始键，side 请求永不锚定（#2156/#2160）。注入坏状态经 `/__bili/status` 的 `attribution` 字段可见（#3581）。
 
 **裁决器。** `lane-decisions.ts` 匹配请求形状 × 会话粘滞绑定（外加 #5643 底座车道的一行，正负成对），逐请求选出：增量 plugin-turn / v5 水位 / D-lane 快照渲染 / legacy 全量重发。

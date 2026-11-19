@@ -623,6 +623,11 @@ export type CompressSettings = {
         /** A closed turn's reasoning run must exceed this many chars to be
          *  dropped (default 2048). */
         threshold?: number;
+        /** (#7144 follow-up) Also drop the reasoning of ANY closed round in
+         *  the protected tail, not only compress turns — those rounds leave
+         *  the window (and their reasoning) at the next fold anyway. The
+         *  in-flight round is never touched. Default: false. */
+        tail?: boolean;
     };
     /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
      *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
@@ -1950,6 +1955,13 @@ export interface PiSubagentsFileConfig {
     /** "skip" (default) — suppress the completion notification when the
      *  model already read the result file; "always" — always inject. */
     notifyIfRead?: "skip" | "always";
+    /** Deliver acp_delegate notifications as a typed custom message carrying a
+     *  versioned details envelope (run identity + launch provenance) alongside
+     *  the SAME model-visible text, so third-party UIs tie a notice to its
+     *  launching turn without parsing prose (#5750). Default false — plain
+     *  user-message delivery, byte-identical to before; hosts without
+     *  ExtensionAPI.sendMessage fall back to the plain path automatically. */
+    notifyStructured?: boolean;
     /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
      *  disables keyboard registration (/acp-fleet still works). */
     fleetShortcut?: string;
