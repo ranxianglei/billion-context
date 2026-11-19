@@ -203,6 +203,46 @@ test("B2: a still-protected (current last user) exclusion is NOT absorbed", () =
   assert.deepEqual(b.excludedMessageIds, ["u1"], "pending list untouched");
 });
 
+test("B2: a pair-rejected exclusion stays pending when a sibling id is admitted in the same pass", () => {
+  // The pair-reject path: the result half is BLOCKED (protected, e.g.
+  // unrecoverable media) so the call half fails pair integrity. A sibling
+  // text id IS admitted in the same pass — the rewrite of
+  // excludedMessageIds must keep the rejected call on the pending list
+  // (retried next turn), not drop it (dropped = orphaned forever).
+  const u1 = msg("u1", "older user text");
+  const t = msg("t", "small text exclusion");
+  const call = toolCall("c", "read", "tc1");
+  const res = toolResult("r", "file contents", "tc1");
+  const u2 = msg("u2", "newer user moved the anchor");
+  const messages = [u1, t, call, res, u2];
+  const state = seededState(messages);
+  // Simulate the production state where the result half is protected at
+  // assignRefs time (unrecoverable media / protectedTools) — visible but
+  // unnumbered, so the call half can never be co-absorbed while it lives.
+  state.messageRefs.byRaw["r"] = "BLOCKED";
+  const b = block("b1", ["u1"], {
+    excludedMessageIds: ["t", "c", "r"],
+    startSeq: 1,
+    endSeq: 1,
+  });
+  state.blocks.push(b);
+  // preserveRecentMessages: 1 -> zone = {u2}; t and c are outside it (c is a
+  // "read" tool, excluded from the recent window by the built-in
+  // neverPreserveRecentTools, and t falls before the last-1 window).
+  const reports = absorbStaleExclusions(state, messages, config({ preserveRecentMessages: 1 }), (t) => t.length / 4);
+  assert.equal(reports.length, 1, "the text id is admitted");
+  assert.deepEqual(reports[0].refs, ["m00002"]);
+  assert.ok(b.effectiveMessageIds.includes("t"), "text id absorbed");
+  assert.ok(!b.effectiveMessageIds.includes("c"), "pair-rejected call is NOT absorbed");
+  assert.deepEqual(
+    b.excludedMessageIds,
+    ["c", "r"],
+    "the pair-rejected call stays pending for next turn (not dropped)",
+  );
+  assert.equal(b.startSeq, undefined, "ledger interval claim invalidated");
+  assert.equal(b.endSeq, undefined, "ledger interval claim invalidated");
+});
+
 test("B2: tool-call exclusion is absorbed only when its result half is covered or co-absorbed", () => {
   // Half 1: result already inside the block's coverage -> call is admitted.
   {

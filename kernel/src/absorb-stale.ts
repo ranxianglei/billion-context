@@ -37,7 +37,8 @@ export interface AbsorptionReport {
  *    hide it mid-zone;
  *  - for tool-call/tool-result cores, the paired half must already be in
  *    the block's coverage or co-absorbed in this same pass (absorbing one
- *    half of a live pair would strand the other exactly like #684).
+ *    half of a live pair would strand the other exactly like #684); a
+ *    rejected half stays on the pending list and is retried next turn.
  *
  * When any id is absorbed the block's startSeq/endSeq ledger-interval claim
  * is invalidated (#4316 layer 3): the recorded interval described the
@@ -93,7 +94,7 @@ export function absorbStaleExclusions(
     const absorbSet = new Set<string>();
     for (const m of absorbable) absorbSet.add(m.id);
     const admitted: Array<{ message: CoreMessage; ref: string }> = [];
-    const admittedIds = new Set<string>();
+    const pairRejected: string[] = [];
     for (let i = 0; i < absorbable.length; i++) {
       const m = absorbable[i]!;
       let ok = true;
@@ -118,7 +119,8 @@ export function absorbStaleExclusions(
       }
       if (ok) {
         admitted.push({ message: m, ref: pendingRefs[i]! });
-        admittedIds.add(m.id);
+      } else {
+        pairRejected.push(m.id);
       }
     }
     if (admitted.length === 0) continue;
@@ -129,7 +131,12 @@ export function absorbStaleExclusions(
     // breaks its exactness — drop the claim, the id path is authoritative.
     block.startSeq = undefined;
     block.endSeq = undefined;
-    const keptAfter = keep.filter((id) => !admittedIds.has(id));
+    // Phase-2 rejects stay pending (retried next turn) — merging them into
+    // keep preserves the original order and never drops a pending id.
+    const pendingAfter = new Set([...keep, ...pairRejected]);
+    const keptAfter = (block.excludedMessageIds ?? []).filter((id) =>
+      pendingAfter.has(id),
+    );
     if (keptAfter.length > 0) block.excludedMessageIds = keptAfter;
     else delete block.excludedMessageIds;
     reports.push({ blockId: block.blockId, refs: admitted.map((a) => a.ref) });
