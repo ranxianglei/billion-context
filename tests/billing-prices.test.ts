@@ -24,6 +24,7 @@ import {
     setBillingOverrides,
     stampBillingPrice,
     stampedBillingPrice,
+    type BillingPrice,
 } from "../src/billing.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -123,6 +124,58 @@ test("#4899 resolveBillingPrice: overrides win over the registry, matching model
     // Empty-string / undefined models resolve nothing.
     assert.equal(resolveBillingPrice(undefined), undefined);
     assert.equal(resolveBillingPrice(""), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// #7276 — the normalized cost table is built once per setter call, not per
+// lookup. Replacing / emptying / clearing overrides must immediately expose
+// the new prices or the registry fallback (zero optional rates + case-folded
+// names included); a reused input object must still refresh on re-set.
+// ---------------------------------------------------------------------------
+
+test("#7276 billing override reloads replace and clear normalized price rows", () => {
+    resetState();
+    setRegistryForTest({}, { "custom/model": { input: 2, output: 8 } });
+    setBillingOverrides({ "custom/model": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } });
+    const initial = resolveBillingPrice("custom/model");
+    assert.deepEqual(initial, { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, source: "config" });
+
+    // Replacing the table drops the old override and exposes the registry row.
+    setBillingOverrides({ "custom/other": { input: 4 } });
+    assert.deepEqual(resolveBillingPrice("custom/model"), { input: 2, output: 8, cacheRead: 2, cacheWrite: 2, source: "registry" });
+    assert.equal(resolveBillingPrice("custom/other")?.input, 4);
+    // A previously resolved price object is immutable — reloads never rewrite it.
+    assert.equal(initial?.input, 3, "reloading leaves previously resolved prices unchanged");
+
+    // Emptying the table clears overrides and falls back to the registry.
+    setBillingOverrides({});
+    assert.equal(resolveBillingPrice("custom/other"), undefined, "no override, no registry row: unpriced");
+    assert.equal(resolveBillingPrice("custom/model")?.source, "registry");
+    // Clearing (undefined) behaves the same as emptying.
+    setBillingOverrides({ "custom/model": { input: 6 } });
+    setBillingOverrides(undefined);
+    assert.equal(resolveBillingPrice("custom/model")?.input, 2, "cleared overrides fall back to the registry");
+    assert.deepEqual(billingOverrides(), {});
+});
+
+test("#7276 billing override reloads refresh a reused table and zero optional rates", () => {
+    resetState();
+    const prices: Record<string, BillingPrice> = { "custom/model": { input: 3 } };
+    setBillingOverrides(prices);
+    // Case-folded model name hits the override key; absent rates bill at input.
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 3, output: 3, cacheRead: 3, cacheWrite: 3, source: "config" });
+
+    // Re-setting the SAME object must rebuild the table (not reuse a stale
+    // identity): the mutated row + explicit zero rates are exposed immediately.
+    prices["custom/model"] = { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 };
+    setBillingOverrides(prices);
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, source: "config" });
+    assert.equal(billingOverrides(), prices, "the raw table is the same object the setter was given");
+
+    // A further mutation + re-set refreshes again.
+    prices["custom/model"] = { input: 7 };
+    setBillingOverrides(prices);
+    assert.deepEqual(resolveBillingPrice("CUSTOM/MODEL"), { input: 7, output: 7, cacheRead: 7, cacheWrite: 7, source: "config" });
 });
 
 // ---------------------------------------------------------------------------

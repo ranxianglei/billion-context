@@ -105,11 +105,21 @@ function nonNegNumStrict(v: unknown): number | undefined | typeof REJECT {
 
 /** Module-level override table — set by loadOptions (startup + every config
  *  reload path funnels through it) and by nothing else. Keeps deep settle
- *  sites free of options plumbing, mirroring the registry costCache pattern. */
+ *  sites free of options plumbing, mirroring the registry costCache pattern.
+ *  `overrideCostRows` is the normalized `CostsShape` view of the same table,
+ *  rebuilt ONCE per setter call (#7276): resolveBillingPrice is hot (per-request
+ *  stamping + the pricing UI), and a per-call rebuild both re-converts every
+ *  row and hands scanRegistryCostRow a fresh table identity — which defeats
+ *  costLowerIndex's identity cache (registry.ts) and re-indexes the whole table
+ *  on every lookup, even an exact override hit. Rebuilt unconditionally (even
+ *  for a repeated object) so in-place mutation between sets can't leak stale
+ *  rows; an empty/cleared set yields null so the registry fallback applies. */
 let overridePrices: Record<string, BillingPrice> = {};
+let overrideCostRows: CostsShape | null = null;
 
 export function setBillingOverrides(prices: Record<string, BillingPrice> | undefined): void {
     overridePrices = prices ?? {};
+    overrideCostRows = overrideCosts();
 }
 
 export function billingOverrides(): Record<string, BillingPrice> {
@@ -130,9 +140,8 @@ function overrideCosts(): CostsShape | null {
 
 export function resolveBillingPrice(model: string | undefined, host?: string): ResolvedBillingPrice | undefined {
     if (!model) return undefined;
-    const costs = overrideCosts();
-    if (costs !== null) {
-        const hit = scanRegistryCostRow(costs, model, host, { conflictHint: "billing.prices" });
+    if (overrideCostRows !== null) {
+        const hit = scanRegistryCostRow(overrideCostRows, model, host, { conflictHint: "billing.prices" });
         if (hit) return finalize(hit.row, "config");
     }
     const row = peekRegistryCostRow(model, host);
