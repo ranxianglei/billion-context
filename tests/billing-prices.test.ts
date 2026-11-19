@@ -79,6 +79,31 @@ test("#4899 parseBillingSettings: rejects every invalid shape loudly", () => {
     assert.equal(parseBillingSettings({ prices: { m: { input: "3" } } }), undefined, "string number");
 });
 
+test("#7263 parseBillingSettings: unknown root keys reject the block even when prices is present", () => {
+    // prices absent — the pre-existing loud-reject behavior, kept.
+    assert.equal(parseBillingSettings({ cacheRead: 0.3 }), undefined, "unknown root key without prices");
+    // prices present — the #7263 hole: the misplaced root field must still
+    // reject the whole block, not be silently dropped.
+    assert.equal(parseBillingSettings({ prices: {}, cacheRead: 0.3 }), undefined, "empty prices + misplaced root key");
+    assert.equal(
+        parseBillingSettings({ prices: { "claude-bill": { input: 3 } }, cacheRead: 0.3 }),
+        undefined,
+        "populated prices + misplaced root key",
+    );
+    assert.equal(
+        parseBillingSettings({ prices: { "claude-bill": { input: 3 } }, extra: 1 }),
+        undefined,
+        "populated prices + other unknown root key",
+    );
+    // Accepted schema unchanged: valid shapes still parse.
+    assert.deepEqual(parseBillingSettings({}), { prices: {} });
+    assert.deepEqual(parseBillingSettings({ prices: {} }), { prices: {} });
+    assert.deepEqual(
+        parseBillingSettings({ prices: { "claude-bill": { input: 3 } } }),
+        { prices: { "claude-bill": { input: 3 } } },
+    );
+});
+
 // ---------------------------------------------------------------------------
 // resolveBillingPrice — overrides first (same name matching as the registry),
 // registry second, nothing third. Conservative fallbacks: a spend estimate
