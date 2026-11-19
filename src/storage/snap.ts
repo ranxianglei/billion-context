@@ -387,6 +387,10 @@ export interface EgressSnapshotRow {
     prefixRef: string | null;
     lastStableId: string;
     createdAt: number;
+    /** #6785 review (owner): the session's message-mutation revision this
+     *  row was cut at (egress_scope_rev). NULL = pre-upgrade row (the read
+     *  side verifies once, as before). */
+    scopeRev: number | null;
 }
 
 /** A verified egress read hit: the materialized stable-prefix bytes (CAS
@@ -416,6 +420,36 @@ export function egressInputHash(
     return h.digest("hex");
 }
 
+/** #6785 review (owner): per-session revision of the message table —
+ *  bumped on every write that can change the egress input aggregate
+ *  (retire / unretire / content_hash edit / hard delete / archive restore).
+ *  Plain appends never bump: seq is monotonic, so a new row always lands
+ *  BEYOND every existing watermark and cannot enter any stored scope.
+ *  0 = no such mutation has been recorded. One indexed row per session;
+ *  both ops are O(1) regardless of history size. */
+export function egressScopeRev(db: DbLike, sessionId: string): number {
+    try {
+        const row = db.prepare("SELECT rev FROM egress_scope_rev WHERE session_id = ?")
+            .get(sessionId) as { rev: number } | undefined;
+        return row?.rev ?? 0;
+    } catch {
+        return 0; // table missing (pre-upgrade open mid-migration) ⇒ verify normally
+    }
+}
+
+/** Bump the session's egress mutation revision (called beside each
+ *  hash-input-mutating write; see egressScopeRev for the set). */
+export function bumpEgressScopeRev(db: DbLike, sessionId: string): void {
+    try {
+        db.prepare(
+            `INSERT INTO egress_scope_rev (session_id, rev) VALUES (?, 1)
+             ON CONFLICT(session_id) DO UPDATE SET rev = rev + 1`,
+        ).run(sessionId);
+    } catch {
+        /* rev unavailable ⇒ the read side re-verifies the full aggregate anyway */
+    }
+}
+
 /** Append one egress cut row (snap_seq is per-session, max+1). Returns the
  *  new snap_seq. */
 export function appendEgressSnapshot(
@@ -426,14 +460,15 @@ export function appendEgressSnapshot(
     prefixRef: string | null,
     lastStableId: string,
     createdAt: number,
+    scopeRev: number,
 ): number {
     const row = db.prepare("SELECT COALESCE(MAX(snap_seq), 0) AS m FROM egress_snapshot WHERE session_id = ?")
         .get(sessionId) as { m: number };
     const snapSeq = row.m + 1;
     db.prepare(
-        `INSERT INTO egress_snapshot (session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(sessionId, snapSeq, watermark, inputHash, prefixRef, lastStableId, createdAt);
+        `INSERT INTO egress_snapshot (session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at, scope_rev)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(sessionId, snapSeq, watermark, inputHash, prefixRef, lastStableId, createdAt, scopeRev);
     return snapSeq;
 }
 
@@ -441,9 +476,9 @@ export function appendEgressSnapshot(
  *  or null. */
 export function egressLatestRow(db: DbLike, sessionId: string): EgressSnapshotRow | null {
     const row = db.prepare(
-        `SELECT session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at
+        `SELECT session_id, snap_seq, watermark, input_hash, prefix_ref, last_stable_id, created_at, scope_rev
          FROM egress_snapshot WHERE session_id = ? ORDER BY snap_seq DESC LIMIT 1`,
-    ).get(sessionId) as { session_id: string; snap_seq: number; watermark: number; input_hash: string; prefix_ref: string | null; last_stable_id: string; created_at: number } | undefined;
+    ).get(sessionId) as { session_id: string; snap_seq: number; watermark: number; input_hash: string; prefix_ref: string | null; last_stable_id: string; created_at: number; scope_rev: number | null } | undefined;
     if (!row) return null;
     return {
         sessionId: row.session_id,
@@ -453,5 +488,6 @@ export function egressLatestRow(db: DbLike, sessionId: string): EgressSnapshotRo
         prefixRef: row.prefix_ref,
         lastStableId: row.last_stable_id,
         createdAt: row.created_at,
+        scopeRev: row.scope_rev,
     };
 }

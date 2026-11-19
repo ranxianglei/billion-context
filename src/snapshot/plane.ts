@@ -183,14 +183,30 @@ export function stage0Decide(input: Stage0Input): Stage0Result {
                 newIdPos.push({ id, pos });
             }
         }
-        decision = {
-            mode: "anchor",
-            window: { ...windowOf(input.incoming, 0), maxPos: pos },
-            newIdPos,
-            goneIds: storedWindow !== null ? storedWindow.tailIds.filter((id) => !incomingSet.has(id)) : [],
-            issuedAt: storedIssuedAt || now,
-            witness: "anchor: conversation-bound, id verdict skipped",
-        };
+        // #6785 review (owner): an idempotent re-render (every incoming id
+        // already windowed) moves the cursor NOWHERE — issue the same
+        // zero-side-effect echo the non-bound replay path uses instead of
+        // re-anchoring + upserting the unchanged row on every such turn.
+        if (newIdPos.length === 0 && storedWindow !== null && input.incoming.length > 0 && !input.resync) {
+            decision = {
+                mode: "echo",
+                replay: true,
+                window: storedWindow,
+                newIdPos: [],
+                goneIds: [],
+                issuedAt: storedIssuedAt,
+                witness: "echo: conversation-bound, all ids known (cursor unchanged)",
+            };
+        } else {
+            decision = {
+                mode: "anchor",
+                window: { ...windowOf(input.incoming, 0), maxPos: pos },
+                newIdPos,
+                goneIds: storedWindow !== null ? storedWindow.tailIds.filter((id) => !incomingSet.has(id)) : [],
+                issuedAt: storedIssuedAt || now,
+                witness: "anchor: conversation-bound, id verdict skipped",
+            };
+        }
     } else {
         // Review-round-2 Residual 1b: the host re-sent a body this proxy
         // already processed — every id is already in the stored windows and

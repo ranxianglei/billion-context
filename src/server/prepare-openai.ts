@@ -95,6 +95,11 @@ export async function prepareOpenai(
     // (undefined = header absent, null = malformed → degrade, array = valid,
     // "?" slots kept). The fastpath re-parses the header itself for its own
     // verdict — one parser, one rule (parseTailIdsForPin).
+    // #6785 review note (owner): this parse is DELIBERATELY ungated by
+    // pluginMsgIdIncremental — a flag-OFF server must still READ a client's
+    // tail-ids declaration, because the rollback self-heal signal ("full")
+    // is derived from it (stage 0's tail-ids branch). Gating the parse
+    // behind the flag would strand upgraded clients after a rollback.
     const rawTailIdsHeader = req.headers[PF_TAIL_IDS_HEADER];
     const incomingTailIds: string[] | null | undefined =
         rawTailIdsHeader === undefined ? undefined

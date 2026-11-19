@@ -2945,8 +2945,24 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // (captured at the pfCaptureIds site above, same chokepoint) carries
         // anchor+new and the server pins the prefix from the ledger; the
         // full list rides only at bootstrap / reanchor (pfSuppressFullMsgIds).
-        if (pfChannel.pfSuppressFullMsgIds(attr.sid, coreAligned.length)) return;
-        const fmt = detectWireFormat(parsed) as string; // log detail only — the resolver already gated the wire
+        // #6785 review fix (owner): the tail-ids CARRIER is parsed by the
+        // openai lane ONLY — suppressing the envelope list on the responses
+        // /anthropic wire would leave that turn with NO ids at all (body
+        // list gone, header unread) ⇒ a pin-less stretch until the session
+        // is back on the openai wire. Those wires parse the body list
+        // themselves (two-form rule: the full form is always accepted), so
+        // it rides there — suppression is a per-WIRE decision, not a
+        // per-session one.
+        const fmt = detectWireFormat(parsed) as string | undefined;
+        // #6785 review fix (owner): compare in the SAME space T was measured
+        // in — the server stamps x-bili-pf-seq from the WIRE element total
+        // (scanMessagesSpans over the messages array, leading bili-ps- system
+        // run included), while coreAligned is core-space (system run
+        // excluded). Comparing core count vs wire T misfired the shrink
+        // check by L every turn once L > 1 (permanent re-anchor loop, §8
+        // dead for that session). The wire array length IS the space.
+        const wireLen = Array.isArray(parsed.messages) ? (parsed.messages as unknown[]).length : coreAligned.length;
+        if (fmt === "openai" && pfChannel.pfSuppressFullMsgIds(attr.sid, wireLen)) return;
         const stamped = { ...parsed, [ENVELOPE_MSG_IDS_FIELD]: coreAligned };
         init.body = JSON.stringify(stamped);
         if (envelopeStampedFor !== attr.sid) {

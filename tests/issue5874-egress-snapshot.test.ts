@@ -281,3 +281,44 @@ test("#5874-v2 T7: a post-cut fold OUTSIDE the prefix keeps serving (+/-)", () =
         st.close();
     } finally { rm(dir); }
 });
+
+test("#6785-review T8: the mutation-revision fast path (O(1) steady-state trust)", () => {
+    process.env.BILI_PERSIST_ZSTD = "0";
+    const dir = mkdtempSync(join(tmpdir(), "bili-5874-es-"));
+    const path = join(dir, "store.db");
+    try {
+        const st = open(dir);
+        assert.ok(st.ingestSession(planIngest(plainSession(6))), "seed");
+        const prefix: CoreMessage[] = [core("m1", "user", "text 1"), core("m2", "assistant", "text 2")];
+        const cut = st.egressCut("sess-es", ["m1", "m2"], JSON.stringify(prefix), 1000);
+        assert.ok(cut);
+        const raw = openSqliteDatabase(path).db as unknown as SqliteDatabase;
+        const revOf = () => (raw.prepare("SELECT COALESCE((SELECT rev FROM egress_scope_rev WHERE session_id = 'sess-es'), 0) AS r").get() as { r: number }).r;
+        const storedRev = () => (raw.prepare("SELECT scope_rev FROM egress_snapshot WHERE session_id = 'sess-es' ORDER BY snap_seq DESC LIMIT 1").get() as { scope_rev: number }).scope_rev;
+        // (+) cut stamps the current revision — the read side trusts the
+        //  aggregate without re-deriving it.
+        assert.equal(storedRev(), revOf(), "cut row carries the live revision");
+        // (+) idempotent re-receipt (the M1 full-resend path, changes=0 rows)
+        //  and pure tail growth (new seqs beyond the watermark) must NOT
+        //  move the revision — the fast path stays hot.
+        assert.ok(st.ingestSession(planIngest(plainSession(6)), undefined, { completeLog: true }), "re-receipt");
+        assert.ok(st.ingestSession(planIngest(plainSession(8))), "tail growth");
+        assert.equal(revOf(), storedRev(), "re-receipt + append ⇒ revision unchanged");
+        const hit = st.egressReadView("sess-es");
+        assert.ok(hit, "fast-path hit after tail growth");
+        assert.deepEqual(JSON.parse(hit.prefix), prefix, "stored bytes verbatim");
+        // (-) an in-scope mutation (m2 retires out of the watermark scope)
+        //  moves the revision ⇒ the read re-derives and degrades.
+        const revised = plainSession(8);
+        (revised.lastMessages as CoreMessage[]).splice(1, 1); // drop m2
+        assert.ok(st.ingestSession(planIngest(revised), undefined, { completeLog: true }), "retire m2");
+        assert.equal(revOf(), storedRev() + 1, "retire bumps exactly once");
+        assert.equal(st.egressReadView("sess-es"), null, "in-scope move ⇒ degrade");
+        // (-) a new cut restamps; deleteSession cascades the counter.
+        assert.ok(st.egressCut("sess-es", ["m1"], JSON.stringify([core("m1", "user", "text 1")]), 2000), "re-cut");
+        assert.equal(storedRev(), revOf(), "new cut carries the new revision");
+        st.deleteSession("sess-es");
+        assert.equal((raw.prepare("SELECT COUNT(*) AS n FROM egress_scope_rev").get() as { n: number }).n, 0, "counter cascades");
+        st.close();
+    } finally { rm(dir); }
+});

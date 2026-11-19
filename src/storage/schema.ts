@@ -447,7 +447,19 @@ CREATE TABLE IF NOT EXISTS egress_snapshot (
     prefix_ref TEXT,
     last_stable_id TEXT NOT NULL,
     created_at INTEGER NOT NULL,
+    scope_rev INTEGER,
     PRIMARY KEY (session_id, snap_seq)
+);
+`;
+
+/** #6785 review (owner): per-session message-mutation revision for the
+ *  egress read-side O(1) fast path (see egressScopeRev in snap.ts). A
+ *  separate table so the counter survives egress row trims and is never
+ *  touched by the per-turn cut path. Probe-first, no version bump. */
+const EGRESS_SCOPE_REV_DDL = `-- #6785 review (owner): per-session egress input-mutation revision.
+CREATE TABLE IF NOT EXISTS egress_scope_rev (
+    session_id TEXT PRIMARY KEY,
+    rev INTEGER NOT NULL
 );
 `;
 
@@ -493,6 +505,17 @@ export function migrateSchema(db: {
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
+    // #6785 review fix (owner): DROP COLUMN needs SQLite ≥ 3.35. The host
+    // better-sqlite3 v7 in the engine ladder can carry SQLite 3.32 — there
+    // the redundant columns simply STAY (every reader probes table_info and
+    // every INSERT/UPDATE names its columns explicitly, so a kept column is
+    // inert). Never throw from a migration because the host engine is old.
+    let dropColumnOk = false;
+    try {
+        const v = (db.prepare("PRAGMA sqlite_version").get() as { sqlite_version: string } | undefined)?.sqlite_version ?? "";
+        const m = v.match(/^(\d+)\.(\d+)/);
+        if (m) dropColumnOk = Number(m[1]) > 3 || (Number(m[1]) === 3 && Number(m[2]) >= 35);
+    } catch { /* leave false — keep the columns */ }
     // v12 (#5874) is PROBE-FIRST, not version-gated. A sibling branch may
     // have consumed the version numbers after v11 for its own additive DDL
     // while ours was still unmerged — real-world 2026-11-08: #5855 landed
@@ -521,7 +544,7 @@ export function migrateSchema(db: {
     if (hasFoldJournal) {
         const fjCols = (db.prepare("PRAGMA table_info(fold_journal)").all() as unknown as { name?: unknown }[])
             .map((c) => c.name);
-        if (fjCols.includes("covered_ids")) db.exec("ALTER TABLE fold_journal DROP COLUMN covered_ids");
+        if (fjCols.includes("covered_ids") && dropColumnOk) db.exec("ALTER TABLE fold_journal DROP COLUMN covered_ids");
     }
     // #5874 v2 (step 3): the egress snapshot is its OWN probe (a db written
     // between the fold_journal and egress_snapshot landings picks it up here;
@@ -535,8 +558,17 @@ export function migrateSchema(db: {
     if (hasEgressSnapshot) {
         const esCols = (db.prepare("PRAGMA table_info(egress_snapshot)").all() as unknown as { name?: unknown }[])
             .map((c) => c.name);
-        if (esCols.includes("ids_json")) db.exec("ALTER TABLE egress_snapshot DROP COLUMN ids_json");
+        if (esCols.includes("ids_json") && dropColumnOk) db.exec("ALTER TABLE egress_snapshot DROP COLUMN ids_json");
+        // #6785 review (owner): the cut-time mutation revision (additive —
+        // pre-upgrade rows read NULL and verify once as before).
+        if (!esCols.includes("scope_rev")) db.exec("ALTER TABLE egress_snapshot ADD COLUMN scope_rev INTEGER");
     }
+    // #6785 review (owner): the egress mutation-revision counter (own probe,
+    // same discipline — no version bump).
+    const hasEgressScopeRev = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_scope_rev'")
+        .get();
+    if (!hasEgressScopeRev) db.exec(EGRESS_SCOPE_REV_DDL);
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).
@@ -590,8 +622,14 @@ export function migrateSchema(db: {
                     "UPDATE l1_world SET tail_json = ?, head_json = ?, count = ?, max_pos = ? WHERE sess_raw = ?"
                 ).run(tail, head, count, maxPos, row.sess_raw);
             }
-            db.exec("ALTER TABLE l1_world DROP COLUMN envelope_json");
-            if (l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world DROP COLUMN envelope_checksum");
+            // #6785 review fix (owner): on a < 3.35 host the reshaped data
+            // stays in the NEW columns and the legacy columns are kept
+            // (inert — readers probe table_info; the legacy SELECT above is
+            // re-run only while rows still lack tail_json, which it now has).
+            if (dropColumnOk) {
+                db.exec("ALTER TABLE l1_world DROP COLUMN envelope_json");
+                if (l1Cols.includes("envelope_checksum")) db.exec("ALTER TABLE l1_world DROP COLUMN envelope_checksum");
+            }
         }
         // #6181 M3: the R3 breaker latch PERSISTS (a proxy restart must not
         // re-arm a misbehaving host's sid and re-400 the same broken

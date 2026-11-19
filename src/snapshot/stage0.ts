@@ -38,6 +38,8 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { serializeForStore } from "../storage/ingest.js";
+import { splitMediaContent } from "../storage/identity.js";
 import { checkR3Identity, FoundationRejectError, r3FaultTracker } from "./plane.js";
 
 export interface Stage0Input {
@@ -203,11 +205,17 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                 // Read the ledger ONCE here: it decides the gate below AND
                 // feeds the pin (single source of truth for C); a store
                 // fault reads empty (conservative: takes the FAULT side).
+                // #6785 review: the same read carries the content hashes —
+                // the incremental pin's prefix-verification material.
                 let liveIds: string[] = [];
+                let liveHashes: string[] | undefined;
                 try {
-                    liveIds = getStore()?.snapMsgIdLiveIds(sessionId) ?? [];
+                    const rows = getStore()?.snapMsgIdLiveIdHashes?.(sessionId) ?? [];
+                    liveIds = rows.map((r) => r.id);
+                    liveHashes = rows.map((r) => r.hash);
                 } catch {
                     liveIds = [];
+                    liveHashes = undefined;
                 }
                 // EXCEPTION: a short array on an EMPTY ledger is not drift —
                 // there is no frontier to anchor against, so it is a failed
@@ -243,7 +251,7 @@ export function runStage0(opts: Stage0Input): Stage0Result {
                         }
                     }
                 } else {
-                    const inc = incrementalOn && bodyTail !== null ? tryIncrementalPin(sessionId, lane, msgs, bodyTail, log, liveIds) : null;
+                    const inc = incrementalOn && bodyTail !== null ? tryIncrementalPin(sessionId, lane, msgs, bodyTail, log, liveIds, liveHashes) : null;
                     if (inc !== null) pinned = inc;
                 }
             }
@@ -265,7 +273,16 @@ export function runStage0(opts: Stage0Input): Stage0Result {
         // R3 identity fault) — and the next turn re-converges with a full
         // list (one-round convergence by construction).
         if (incrementalOn) {
-            const inc = tryIncrementalPin(sessionId, lane, msgs, incomingTailIds, log);
+            // #6785 review: the tail-ids form also VERIFIES the prefix content
+            // against the ledger (same contract as the body-tail branch) — an
+            // unreadable ledger degrades the turn, never trusts it blind.
+            let liveHashes: string[] | null | undefined;
+            try {
+                liveHashes = (getStore()?.snapMsgIdLiveIdHashes?.(sessionId) ?? []).map((r) => r.hash);
+            } catch {
+                liveHashes = null;
+            }
+            const inc = tryIncrementalPin(sessionId, lane, msgs, incomingTailIds, log, undefined, liveHashes);
             if (inc !== null) {
                 pinned = inc;
                 pinMode = "incremental";
@@ -335,6 +352,7 @@ export function tryIncrementalPin(
     tailIds: string[],
     log: (level: string, msg: string) => void,
     preReadLiveIds?: string[],
+    preReadLiveHashes?: string[] | null,
 ): BiliMessage[] | null {
     let liveIds: string[];
     if (preReadLiveIds !== undefined) {
@@ -380,9 +398,40 @@ export function tryIncrementalPin(
     // sweeps the ledger to the authoritative set, #3285/#4390 — the width
     // check above is what keeps the two in step; a fold-edge transient
     // degrades one turn and re-converges with the full list).
-    return msgs.map((m, i) => {
+    const stamped = msgs.map((m, i) => {
         if (i < C) return { ...m, id: liveIds[i] };
         const id = tailIds[i - C + 1];
         return id === "?" ? m : { ...m, id };
     });
+    // #6785 review (owner: "msgid 是整个系统工作的根基"): the tail form stops
+    // sending ids for the prefix — the pin now TRUSTS the prefix content is
+    // unchanged too. Verify that trust against the ledger's content hashes
+    // before re-stamping: a net-zero mid-history rewrite (same element
+    // count, different bytes at some prefix position) passes every check
+    // above and would re-stamp the ledger's ids onto new content, desyncing
+    // the id↔content contract (the full form rejects id-reuse for changed
+    // content — this closes that gap for the tail form). The hash input is
+    // the EXACT stored chain (serializeForStore → splitMediaContent) on the
+    // STAMPED message — the content bytes include the id (identity is
+    // stored-bytes minus id, content_hash is not), and this turn's ingest
+    // serializes these same objects, so the comparison is by construction.
+    // preReadLiveHashes: undefined = not supplied (no verification —
+    // stub-seam callers, behavior unchanged); null/length-mismatch =
+    // unverifiable ⇒ full signal. A mismatch is a contract violation,
+    // still drift-class here: degrade to the full signal, one-round
+    // re-anchor, never a reject (D1). Cost: C × (stringify + sha256) on
+    // in-memory strings — ms-scale, zero wire bytes.
+    if (preReadLiveHashes !== undefined) {
+        if (preReadLiveHashes === null || preReadLiveHashes.length !== C) {
+            log("info", `[${sessionId}] [2x2:${lane}] incremental prefix unverifiable (hash rows ${preReadLiveHashes === null ? "unreadable" : preReadLiveHashes.length} ≠ ledger ${C}) — full signal (reanchor next turn)`);
+            return null;
+        }
+        for (let i = 0; i < C; i++) {
+            if (splitMediaContent(serializeForStore(stamped[i])).hash !== preReadLiveHashes[i]) {
+                log("info", `[${sessionId}] [2x2:${lane}] incremental prefix content diverged at position ${i} of ${C} (ledger id ${liveIds[i]}) — full signal (reanchor next turn)`);
+                return null;
+            }
+        }
+    }
+    return stamped;
 }

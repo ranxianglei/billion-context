@@ -635,8 +635,12 @@ function stampMsgIdEnvelope(
     // the prefix from the ledger and the pf tail-ids channel (same
     // chokepoint, same captured ids) carries only anchor+new. Unlearned / 4xx
     // relearned / shrinking ⇒ the full list rides as before.
+    // #6785 review fix (owner): pass the WIRE element count (same space the
+    // server measures x-bili-pf-seq in — see the dsh call site) instead of
+    // the core-aligned length; core space is L short of wire space once the
+    // hoisted system run is non-trivial and the shrink check misfired.
     const pfSid = sessionIdOf(ctx);
-    if (pfSid !== undefined && pfChannel.pfSuppressFullMsgIds(pfSid, ids.length)) return undefined;
+    if (pfSid !== undefined && pfChannel.pfSuppressFullMsgIds(pfSid, Array.isArray(base.messages) ? (base.messages as unknown[]).length : ids.length)) return undefined;
     return { ...base, biliMsgIds: ids };
 }
 
