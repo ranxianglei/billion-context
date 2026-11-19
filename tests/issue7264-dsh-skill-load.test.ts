@@ -245,13 +245,16 @@ test("session-level: the dsh lane stamps the skill-load guard onto the effective
         const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: SKILL_BODY }, { role: "assistant", content: "ok" }, { role: "user", content: "Second turn after the skill body." }] }) });
         assert.equal(r2.status, 200);
         await r2.text();
-        // The skill body must NOT steal the last-user anchor: the newest human
-        // request ("Second turn after the skill body.") is the anchor, not the
-        // skill-body injection. Proven indirectly: the skill body got a
-        // virtual path (classified), so lastUserAnchor skips it.
+        // The stamped effective config (read by /__bili/plugin/tool) carries
+        // the guard — proven indirectly: the skill body got a BLOCKED ref,
+        // i.e. it was recognized as protected AT ASSIGNMENT TIME on the first
+        // full-pipeline turn (turn 2 — turn 1 rides the #5656 side lane). A
+        // BLOCKED ref also proves the skill body carries a virtual path, so
+        // lastUserAnchor skips it and the newest human request keeps the
+        // anchor (the skill body never steals it).
         const sFull = peekSession("i7264-stamp")!;
-        const skillBodyClassified = Object.keys(sFull.state.messageRefs.byRaw).length > 0;
-        assert.ok(skillBodyClassified, "the session has assigned refs by the first full-pipeline turn");
+        const skillBodyBlocked = Object.entries(sFull.state.messageRefs.byRaw).some(([, ref]) => ref === "BLOCKED");
+        assert.ok(skillBodyBlocked, "the skill body must carry a BLOCKED ref by the first full-pipeline turn (never advertised, never foldable)");
     } finally {
         await closeRig(rig);
     }
