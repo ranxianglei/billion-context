@@ -71,6 +71,15 @@ export interface AssignRefsResult {
 export interface AssignRefsOptions {
   existing: MessageRefMap;
   nextIndex: number;
+  /**
+   * Returns true when a message must NEVER receive a numeric ref — it gets
+   * BLOCKED_REF instead (invisible to the advertised compressible set). Pass
+   * ONLY the permanently-pinned class (unrecoverable media, statically-
+   * protected tools); do NOT pass the demotable latest-per-identity class
+   * (#3999): those are numbered at birth so their later demotion inserts zero
+   * bytes, and their fold exclusion happens at projection time, not via the
+   * ref value.
+   */
   isProtected?: (message: CoreMessage) => boolean;
   shouldSkip?: (message: CoreMessage) => boolean;
 }
