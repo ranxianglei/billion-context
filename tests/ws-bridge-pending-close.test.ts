@@ -21,7 +21,7 @@ function fixture(proxied: boolean) {
             return { onMessage() {}, onClose() {}, shutdown() {} };
         },
     };
-    const handler = installWebSocketBridge(server, async () => {}, () => {}, [codec], () => proxied);
+    const handler = installWebSocketBridge(server, async () => {}, () => {}, [codec], () => (proxied ? "http://127.0.0.1:3128" : undefined));
     return { server, handler, created: () => created };
 }
 
