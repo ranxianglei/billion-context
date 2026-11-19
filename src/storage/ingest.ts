@@ -152,10 +152,8 @@ export function toLegacyLike(s: {
  *  what a pre-feature save wrote for the same logical message, so content
  *  hash / identity / boundary probes cannot churn when stamps attach.
  *  ts is appended last by its producers (stamper node, row hydration), so
- *  deleting it restores the pre-feature key order exactly.
- *  EXPORTED so consumers that must derive a row's content_hash (the
- *  incremental pin's prefix verification) cannot drift from this chain. */
-export function serializeForStore(m: CoreMessage): string {
+ *  deleting it restores the pre-feature key order exactly. */
+function serializeForStore(m: CoreMessage): string {
     if (m.ts === undefined) return stringifyForStore(m);
     const copy = { ...m };
     delete copy.ts;

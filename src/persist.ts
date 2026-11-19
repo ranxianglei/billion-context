@@ -2511,15 +2511,6 @@ export class SessionStore {
         return this.liveShadow().snapMsgIdLiveIds(sessionId);
     }
 
-    /** #6785 review: live (id, content_hash) pairs in seq order (see
-     *  UnifiedStore.snapMsgIdLiveIdHashes). [] when unavailable — the pin
-     *  treats an unreadable ledger as unverifiable and degrades to the full
-     *  signal (self-healing next turn). */
-    snapMsgIdLiveIdHashes(sessionId: string): Array<{ id: string, hash: string }> {
-        if (!this.replicasAvailable()) return [];
-        return this.liveShadow().snapMsgIdLiveIdHashes(sessionId);
-    }
-
     /** #6181 M3: whether this sid's R3 breaker latch persisted from a
      *  previous process (a restart must not re-arm a misbehaving host). */
     snapR3Latched(sessionId: string): boolean {

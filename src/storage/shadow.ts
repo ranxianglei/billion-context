@@ -1006,12 +1006,6 @@ export class UnifiedShadow {
         return this.sync.snapMsgIdLiveIds(sessionId);
     }
 
-    /** #6785 review: live (id, content_hash) pairs in seq order (see UnifiedStore.snapMsgIdLiveIdHashes). */
-    snapMsgIdLiveIdHashes(sessionId: string): Array<{ id: string, hash: string }> {
-        if (this.sync === null) return [];
-        return this.sync.snapMsgIdLiveIdHashes(sessionId);
-    }
-
     /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
     snapR3Latched(sessionId: string): boolean {
         if (this.sync === null) return false;

@@ -30,8 +30,6 @@ import path from "node:path";
 import type { BiliMessage } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { serializeForStore } from "../src/storage/ingest.ts";
-import { splitMediaContent } from "../src/storage/identity.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import {
     matchAppendWindow,
@@ -722,7 +720,6 @@ function d23Harness(t: test.TestContext) {
         snapStage0: (sid: string, ids: string[], opts?: { seqs?: number[] | null }) => store.snapStage0(sid, ids, opts),
         snapConvBound: (sid: string) => store.snapConvBound(sid),
         snapMsgIdLiveIds: (sid: string) => store.snapMsgIdLiveIds(sid),
-        snapMsgIdLiveIdHashes: (sid: string) => store.snapMsgIdLiveIdHashes(sid),
         snapR3Latched: (sid: string) => store.snapR3Latched(sid),
     } as unknown as Parameters<typeof _setStoreForTest>[0]);
     t.after(() => {
@@ -831,6 +828,7 @@ test("#6785-review D2: an idempotent re-render of a conv-bound sid is an echo (n
     }
 });
 
+
 test("#7064 D3: the tail anchor stays live across watermark-hit runs", async (t) => {
     const { store } = d23Harness(t);
     const sid = "d3-sid";
@@ -896,49 +894,13 @@ test("#7064 D3: the tail anchor stays live across watermark-hit runs", async (t)
 // ---------------------------------------------------------------------------
 
 /** Seed the ledger's messages table (what ingestRowsNow does in production,
- *  after the pin) so snapMsgIdLiveIds has rows to pin from. FAKE content
- *  hashes — use ONLY for tests whose pins degrade BEFORE content
- *  verification (structural mismatches, invalid tail entries); the
- *  incremental pin verifies the prefix against REAL hashes since the
- *  #6785 review, so a pin that succeeds must be seeded from real stamped
- *  messages (seedLedgerReal below). */
+ *  after the pin) so snapMsgIdLiveIds has rows to pin from. */
 function seedLedger(db: DbLike, sid: string, ids: string[]): void {
     ids.forEach((id, seq) => {
         const hash = `h-${sid}-${seq}`;
         db.prepare("INSERT OR IGNORE INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, 1, 0, 'sha256', x'00')").run(hash);
         db.prepare("INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, ?, ?, NULL, ?, 'user', 'message', ?, '', NULL)").run(sid, seq, id, seq + 1, hash);
     });
-}
-
-/** The stored content_hash of a stamped message — the EXACT chain ingest
- *  runs (serializeForStore → splitMediaContent), so a ledger seeded this
- *  way is what a real turn's flush would have written. */
-function realHashes(msgs: BiliMessage[]): string[] {
-    return msgs.map((m) => splitMediaContent(serializeForStore(m)).hash);
-}
-
-/** Honest seedLedger: the rows carry the REAL (id, content_hash) of the
- *  stamped messages a bootstrap pin produced (what this turn's ingest
- *  stores), so the next turn's prefix verification sees what production
- *  would. */
-function seedLedgerReal(db: DbLike, sid: string, stamped: BiliMessage[]): void {
-    stamped.forEach((m, seq) => {
-        const hash = splitMediaContent(serializeForStore(m)).hash;
-        db.prepare("INSERT OR IGNORE INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, 1, 0, 'sha256', x'00')").run(hash);
-        db.prepare("INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at) VALUES (?, ?, ?, NULL, ?, 'user', 'message', ?, '', NULL)").run(sid, seq, m.id, seq + 1, hash);
-    });
-}
-
-/** The content-derived ids a fresh (empty-ledger) run would issue for
- *  these messages — the ids the host never declared and the ledger holds
- *  for them. */
-function derivedIds(db: DbLike, probeSid: string, msgs: BiliMessage[]): string[] {
-    const r = runStage0({
-        sessionId: probeSid, lane: "openai", msgs,
-        incomingMsgIds: undefined, incomingSeqs: null,
-        pluginMode: true, log: () => {},
-    });
-    return (r.pinned ?? msgs).map((m) => m.id);
 }
 
 test("#7064 §8 I1: bootstrap full pin signals 'incremental'; steady turn pins prefix from the ledger + tail from the header", (t: test.TestContext) => {
@@ -954,10 +916,8 @@ test("#7064 §8 I1: bootstrap full pin signals 'incremental'; steady turn pins p
     });
     assert.notEqual(r0.pinned, null, "bootstrap pins the full list");
     assert.equal(r0.pinMode, "incremental", "a successful pin ⇒ the NEXT turn may go incremental (this is what upgrades the client out of full-list mode)");
-    // ingest lands the rows (production order: pin in-request, flush after) —
-    // seeded from the stamped bootstrap messages so the ledger carries the
-    // REAL (id, content_hash) the steady turn's prefix verification sees.
-    seedLedgerReal(db, sid, r0.pinned!);
+    // ingest lands the rows (production order: pin in-request, flush after).
+    seedLedger(db, sid, ["a1", "a2", "a3", "a4", "a5"]);
     // steady state: no full list, only the tail (anchor a5 + new core a6).
     const r1 = runStage0({
         sessionId: sid, lane: "openai", msgs: dMsgs(6),
@@ -969,47 +929,6 @@ test("#7064 §8 I1: bootstrap full pin signals 'incremental'; steady turn pins p
     assert.deepEqual(r1.pinned!.map((m) => m.id).slice(0, 5), ["a1", "a2", "a3", "a4", "a5"], "the prefix is re-stamped from the LEDGER, not the client");
     assert.equal(r1.pinned![5].id, "a6", "the new core is pinned from the tail");
     assert.equal(r1.anchorAdvanced, true, "the cursor extended");
-});
-
-test("#6785-review §8 I1b: a net-zero mid-history REWRITE degrades to the 'full' signal — the pin verifies prefix CONTENT, not just width+anchor", (t: test.TestContext) => {
-    const { store } = d23Harness(t);
-    const sid = "i1b-sid";
-    const db = (store as unknown as { db: DbLike }).db;
-    const logs: string[] = [];
-    const log = (level: string, msg: string): void => { logs.push(msg); };
-    // bootstrap: full pin of 3 messages, ledger seeded from the stamped
-    // rows (real hashes).
-    const r0 = runStage0({
-        sessionId: sid, lane: "openai", msgs: dMsgs(3),
-        incomingMsgIds: ["k1", "k2", "k3"], incomingSeqs: null,
-        pluginMode: true, log,
-    });
-    assert.notEqual(r0.pinned, null, "bootstrap pins");
-    seedLedgerReal(db, sid, r0.pinned!);
-    // the host edits c2 IN PLACE (no element added/removed) and appends one
-    // new turn: element count grew by exactly one, so the tail form is
-    // structurally PERFECT — width 3+1===4, anchor k3 === ledger frontier.
-    // Only the content check sees the divergence.
-    const raw: Array<{ role: string, content: string }> = [{ role: "system", content: "sys" },
-        { role: "user", content: "c1" }, { role: "assistant", content: "c2-EDITED" },
-        { role: "user", content: "c3" }, { role: "assistant", content: "c4" }];
-    const r = runStage0({
-        sessionId: sid, lane: "openai", msgs: (openaiToCore({ messages: raw } as never)).msgs,
-        incomingMsgIds: undefined, incomingSeqs: null,
-        incomingTailIds: ["k3", "k4"], pluginMode: true, log,
-    });
-    assert.equal(r.pinned, null, "a width+anchor-passing rewrite does NOT get the ledger ids re-stamped onto new bytes");
-    assert.equal(r.pinMode, "full", "the client re-sends the full list next turn (drift class — no 4xx)");
-    assert.ok(logs.some((m) => m.includes("content diverged")), `the divergence is logged with the position: ${logs.join(" | ")}`);
-    // the honest append (same turn, unedited prefix) STILL pins — the
-    // verification is not a blunt refusal.
-    const ok = runStage0({
-        sessionId: sid, lane: "openai", msgs: dMsgs(4),
-        incomingMsgIds: undefined, incomingSeqs: null,
-        incomingTailIds: ["k3", "k4"], pluginMode: true, log,
-    });
-    assert.notEqual(ok.pinned, null, "the unedited append pins (the ledger's k1..k3 match its content)");
-    assert.equal(ok.pinMode, "incremental");
 });
 
 test("#7064 §8 I2: any structural mismatch degrades to the 'full' signal — never a reject", (t: test.TestContext) => {
@@ -1067,10 +986,7 @@ test("#7064 §8 I3: empty ledger (true bootstrap) takes the full signal; full fo
     assert.equal(rb.pinMode, "incremental", "successful full pin ⇒ incremental signal");
     // (c) a '?' NEW slot (id-less element) keeps its content-derived id —
     // only the ledger prefix is re-stamped, the tail is trusted per-slot.
-    // (seeded with the REAL hashes of the stamped e1/e2 messages — the pin's
-    // prefix verification recomputes exactly these bytes)
-    const base3 = dMsgs(3);
-    seedLedgerReal(db, "i3c-sid", [{ ...base3[0], id: "e1" }, { ...base3[1], id: "e2" }]);
+    seedLedger(db, "i3c-sid", ["e1", "e2"]);
     const rc = runStage0({
         sessionId: "i3c-sid", lane: "openai", msgs: dMsgs(3),
         incomingMsgIds: undefined, incomingSeqs: null,
@@ -1086,16 +1002,15 @@ test("#7064 §8 phase 2 I4: the TAIL form rides the declared channel itself (res
     const { store } = d23Harness(t);
     const db = (store as unknown as { db: DbLike }).db;
     const log = (level: string, msg: string): void => {};
-    // bootstrap on an EMPTY ledger with the FULL list (any carrier — here
-    // the declared channel, exactly as the responses/anthropic lanes see it).
+    // bootstrap on the ledger with the FULL list (any carrier — here the
+    // declared channel, exactly as the responses/anthropic lanes see it).
+    seedLedger(db, "i4-sid", ["f1", "f2", "f3"]);
     const r0 = runStage0({
         sessionId: "i4-sid", lane: "responses", msgs: dMsgs(3),
         incomingMsgIds: ["f1", "f2", "f3"], incomingSeqs: null,
         pluginMode: true, log,
     });
     assert.notEqual(r0.pinned, null, "the full form pinned at bootstrap");
-    // ingest lands the stamped bootstrap messages (real hashes, as above).
-    seedLedgerReal(db, "i4-sid", r0.pinned!);
     // steady state: the SAME field now carries the short tail (anchor +
     // new cores) — len !== view ⇒ the two-form rule takes the tail path
     // (no pf header at all on these lanes).

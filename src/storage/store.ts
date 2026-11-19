@@ -1825,21 +1825,6 @@ export class UnifiedStore {
         return rows.map((r) => r.msg_id);
     }
 
-    /** #6785 review (owner: "msgid 是整个系统工作的根基"): the ledger's
-     *  LIVE rows as (id, content_hash) pairs in seq order. The incremental
-     *  pin's prefix-verification material: the tail form stops sending
-     *  ids for the prefix, so the pin TRUSTS the prefix content is
-     *  unchanged too — this is how it checks instead of assuming (a
-     *  mid-history net-zero rewrite passes the width+anchor checks; only
-     *  the content hash catches it). Same rows as snapMsgIdLiveIds plus
-     *  the byte-faithful CAS key. */
-    snapMsgIdLiveIdHashes(sid: string): Array<{ id: string, hash: string }> {
-        const rows = this.db
-            .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
-            .all(sid) as { msg_id: string; content_hash: string }[];
-        return rows.map((r) => ({ id: r.msg_id, hash: r.content_hash }));
-    }
-
     /** #6181 M3: whether this sid's R3 breaker latch PERSISTED from a
      *  previous process (a restart must not re-arm a misbehaving host and
      *  re-400 the same broken envelope). */
