@@ -56,8 +56,8 @@ export function parseBillingSettings(value: unknown): BillingSettings | undefine
     if (value === undefined || value === null) return undefined;
     if (typeof value !== "object" || Array.isArray(value)) return undefined;
     const root = value as Record<string, unknown>;
+    for (const k of Object.keys(root)) if (k !== "prices") return undefined;
     if (root["prices"] === undefined) {
-        for (const k of Object.keys(root)) if (k !== "prices") return undefined;
         return { prices: {} };
     }
     if (root["prices"] === null || typeof root["prices"] !== "object" || Array.isArray(root["prices"])) return undefined;
