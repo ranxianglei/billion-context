@@ -3804,6 +3804,24 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
     return { tokens: breakdown.total, breakdown };
 }
 
+function responsesPreflightMeter(prepared: Prepared, limit: number) {
+    const projection = prepared.responsesProjection;
+    if (prepared.protocol !== "responses" || !projection) return undefined;
+    const measured = measuredOutbound(prepared);
+    const declared = prepared.session.metadata.effectiveContextLimit;
+    const fuseWindow = Math.max(typeof declared === "number" && declared > 0 ? declared : limit, MIN_ASSUMED_WINDOW_TOKENS);
+    if (!measured) return undefined;
+    const body = prepared.parsedBody ?? JSON.parse(typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8"));
+    return {
+        tokens: measured.tokens,
+        fuseWindow,
+        measure: (view: CoreMessage[]): number => estimateRawBodyTokens({
+            ...body,
+            input: patchResponsesInput(projection, view),
+        }),
+    };
+}
+
 export async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -3915,6 +3933,8 @@ export async function preflightCompressIfNeeded(
     // the same quantity so a no-usage failure can't arm lastInputTokens to raw-
     // history scale and fire preflight on a payload that actually fits.
     const { textEstimate, overheadEstimate, imageTokens } = outboundPayloadBreakdown(prepared, opts, route, req.url ?? "");
+    const measuredWire = responsesPreflightMeter(prepared, limit);
+    const wireMeter = measuredWire && measuredWire.tokens > measuredWire.fuseWindow ? measuredWire : undefined;
     // #553: anonymous requests resolve their session by prefix affinity. After
     // an ACP compression breaks the chain hash, the client's replay mints a NEW
     // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
@@ -3997,7 +4017,7 @@ export async function preflightCompressIfNeeded(
     // Image-dominant payloads keep the original unconditional arm: images are
     // not foldable, so their overage is not "expected benefit" at all.
     const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
-    const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
+    const triggerFires = wireMeter !== undefined || growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
@@ -4064,7 +4084,7 @@ export async function preflightCompressIfNeeded(
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
     const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
-    if (probeForEvidence) {
+    if (probeForEvidence && !wireMeter) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
         // positive expected value only while SOME tokenizer could make the
@@ -4131,7 +4151,7 @@ export async function preflightCompressIfNeeded(
     // the char-count bound (tokenCount) is the TRIGGER arm only. Judging fit on
     // it made a fresh session whose real size fits the window read as over-window
     // and fail-fast on the early no-compressible-ranges path below (#3146).
-    const payloadFitsWindow = calibratedPayload < limit;
+    const payloadFitsWindow = calibratedPayload < limit && !wireMeter;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -4319,6 +4339,7 @@ export async function preflightCompressIfNeeded(
             ? (view) => imageReserveFor(session, "responses", { input: patchResponsesInput(responsesProjection, view) }, opts, upstreamUrl)
             : undefined,
         wireOverhead: overheadEstimate,
+        measureWireTokens: wireMeter?.measure,
         unknownBaseline,
         upstreamOrigin: currentOrigin,
         forceStreamSummary,
@@ -4340,11 +4361,19 @@ export async function preflightCompressIfNeeded(
                 session.stats.lastInputTokens = probeTextSize;
                 session.stats.lastInputTokensSource = "estimate";
             }
-            const probeCalibrated = applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens;
+            const correctiveMeter = wireMeter ? responsesPreflightMeter(probe, limit) : undefined;
+            const probeCalibrated = Math.max(
+                applyEstimateCalibration(probeTextSize, kFactor, kOrigin, currentOrigin) + imageTokens,
+                correctiveMeter?.tokens ?? 0,
+            );
             const divergence = Math.round(probeCalibrated - result.payloadEstimate);
             if (probeCalibrated >= limit && divergence >= Math.max(10_000, Math.round(limit * 0.02))) {
                 log("warn", `[${session.id}] preflight view fits (~${Math.round(result.payloadEstimate)} tok) but the rebuilt body measures ~${Math.round(probeCalibrated)} tok (Δ~${divergence} tok) — running one corrective second pass with the measured divergence as its exit bar (#5974)`);
-                const corrective = await preflightCompress({ ...preflightDeps, viewDeltaCorrection: divergence }, prepared.originalMessages);
+                const corrective = await preflightCompress({
+                    ...preflightDeps,
+                    viewDeltaCorrection: divergence,
+                    measureWireTokens: correctiveMeter?.measure,
+                }, prepared.originalMessages);
                 // Phase 1 exited early-fit (failure undefined), so phase 2's verdicts are strictly newer.
                 result.compressedRanges += corrective.compressedRanges;
                 result.savedTokens += corrective.savedTokens;
@@ -4422,7 +4451,10 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const rebuiltCalibrated = applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens;
+        const rebuiltCalibrated = Math.max(
+            applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + rebuiltImageTokens,
+            wireMeter ? measuredOutbound(rebuilt)?.tokens ?? Infinity : 0,
+        );
         // #3645: hoist the calibrated post-fold figure so the fail-fast message
         // quotes the same scale as this fit and the pre-fold tokenCount — quoting
         // the raw size there claimed a sub-window number exceeds the window when k̂>1.
