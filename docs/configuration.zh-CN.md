@@ -310,7 +310,7 @@
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
@@ -353,6 +353,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
+| `compress.reasoning.tail` | boolean | false | — | （#7144 后续）保护尾内不止 compress 轮次、任意已关闭轮次的推理块也丢弃——工具调用结果已到且其后还有消息，或助手文本不再是最后一条。这些轮次下次折叠时反正会连推理一起离开窗口，提前丢即回收 token；进行中的轮次绝不触碰。严格推理上游不受影响：#762/#2169 空回显归一化跑在丢弃之后。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
 
 **路由表字段**
@@ -913,6 +914,7 @@
       "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
     },
     "notifyIfRead": "skip",      // "skip" —— 模型已读结果文件则不再补发完成通知
+    "notifyStructured": false,   // true —— 通知改为带版本化 details 信封（runId/状态+发起溯源）的类型化消息，供第三方 UI 使用；模型可见文本不变（#5750）
     "fleetShortcut": "ctrl+alt+d", // "" 关闭快捷键（/acp-fleet 仍可用）
     "prompt": null,              // 替换（字符串）或移除（null）ACP_DELEGATE NOTIFICATIONS 附录
     "debug": false               // ~/.pi/acp.log 调试事件，仅限子代理子系统

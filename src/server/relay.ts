@@ -25,6 +25,7 @@ import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -377,7 +378,7 @@ async function forwardCaptured(
 // client socket still open?" — a client that hangs up on the terminal frame
 // (pi's shape) must not lose the finished reply. Partial turns (no terminal)
 // are still never captured.
-const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => true, prepared.protocol) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
@@ -2694,17 +2695,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
             // Cache-seam: the compress<->absorb join must be byte-identical to
-            // the steady prepare* paths. Every steady wire joins the absorb
-            // section with a plain "\n\n" (sysParts.join / injectSystem parts
-            // join); the historical "---" divider here existed ONLY on round-2
-            // and broke the system-element prefix on every fold while absorb
-            // was armed (probe: cache-seam-probes P1+P2, chat wire diverged at
-            // the absorb boundary char).
+            // the steady prepare* paths. The Responses wire joins its system
+            // sections with the "---" divider (see joinResponsesSystemSections,
+            // #6922) — round-2 must reuse the SAME helper or the developer
+            // element forks at the boundary-note position on every fold and the
+            // upstream prefix re-bills everything after it. Every OTHER steady
+            // wire joins the absorb section with a plain "\n\n" (sysParts.join /
+            // injectSystem parts join), so the non-responses rebuild keeps that
+            // historical "\n\n" glue (probes P1-P3 verified byte parity there).
             const absorbSection = absorbActive
-                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                ? buildAbsorbSystemPrompt(absorbToolName(loopConfig))
                 : "";
             const blockOpsSection = blockOpsActive
-                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
+                ? buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2724,8 +2727,15 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // between the compress prompt and the absorb section on every steady
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
-            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? GENERATION_BOUNDARY_NOTE : "";
+            const baseSystemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive));
+            // #6922: Responses goes through the shared section joiner (the
+            // steady prepare-responses path calls the very same function), so
+            // section order AND separators can no longer drift between the two
+            // builders. Non-responses keeps the historical plain-\n\n glue.
+            const systemPrompt = prepared.protocol === "responses"
+                ? joinResponsesSystemSections([baseSystemPrompt, genBoundaryNote, absorbSection, blockOpsSection].filter(s => s !== ""))
+                : baseSystemPrompt + (genBoundaryNote ? `\n\n${genBoundaryNote}` : "") + (absorbSection ? `\n\n${absorbSection}` : "") + (blockOpsSection ? `\n\n${blockOpsSection}` : "");
             // #1295: commandcode keeps the internal protocol "openai" (request
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode

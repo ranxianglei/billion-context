@@ -310,7 +310,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
 | `compress.blockOps` | object | off | — | Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
@@ -353,6 +353,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
+| `compress.reasoning.tail` | boolean | false | — | (#7144 follow-up) Also drop reasoning from any CLOSED round in the protected tail, not only compress turns — a tool call whose result arrived with at least one message after it, or an assistant text turn that is no longer the last message. Those rounds leave the protected window at the next fold anyway, so dropping early reclaims the tokens now; the in-flight round is never touched. Strict-echo upstreams are unaffected: #762/#2169 blank-echo normalization runs after the drop. |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
 
 **Provider route fields**
@@ -919,6 +920,7 @@ Top-level keys that control how the proxy listens and behaves globally.
       "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
     },
     "notifyIfRead": "skip",      // "skip" — no completion nudge if the model already read the result file
+    "notifyStructured": false,   // true — notices become typed custom messages carrying a versioned details envelope (runId/status + launch provenance) for third-party UIs; model-visible text unchanged (#5750)
     "fleetShortcut": "ctrl+alt+d", // "" disables the keyboard shortcut (/acp-fleet still works)
     "prompt": null,              // replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS appendix
     "debug": false               // debug events in ~/.pi/acp.log, scoped to sub-agents
