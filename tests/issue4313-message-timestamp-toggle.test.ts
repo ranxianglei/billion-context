@@ -153,7 +153,7 @@ const SPAN_RE = /\[\d{4}-\d{2}-\d{2}[^\]]*–[^\]]*\]/;
 test("receipt span GATE: explicit-off (env 0) omits the coverage span despite stamps", () => {
     setToggleLayers("0");
     const text = foldReceiptText();
-    assert.match(text, /full summary \d+ch · head/);
+    assert.match(text, /full summary \d+ch "/);
     assert.doesNotMatch(text, SPAN_RE, `flag OFF must emit no local-time span:\n${text}`);
 });
 

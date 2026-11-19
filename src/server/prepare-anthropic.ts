@@ -11,6 +11,7 @@ import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { emitNudgeInjected, nudgeDebugMeta } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -32,7 +33,7 @@ import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper, extractBillingAttributionBlock } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
-import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
+import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnthropicSystemCacheControls, countAnthropicToolsCacheControls, pinClientMessageMarks, stampAnthropicSystemCacheControl } from "../loop/cache-control.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -496,15 +497,27 @@ export async function prepareAnthropic(
         anthropicCacheMarks = cacheControls.size > 0 || anthropicToolsCarryCacheControl(parsed.tools)
             ? undefined
             : computeAnthropicMessageMarks(processedMessages as { id?: string }[], attachedRetrievals.length, session);
-        // #2499: hand the round-2 adapter the SAME marks source the steady path
-        // uses — `anthropicCacheMarks ?? cacheControls`. The client's harvested
-        // map is the fallback the rebuild applies when bili adds no marks of its
-        // own (a client-managed session), so its trigger-turn breakpoint survives.
-        clientCacheControls = cacheControls;
+        // #6861: a client-managed session's moving breakpoints are pinned
+        // cumulatively (same discipline as our own marks) so the outbound
+        // history stays append-stable: without pinning, the client's last-
+        // message breakpoint moves every turn and the old message's bytes
+        // rewrite mid-history on every request. The pinned map is what the
+        // round-2 adapter rebuilds from too (#2499). Proxy mode ONLY: in
+        // plugin mode the host owns the rolling marks (opencode retouch
+        // channel, "no accumulation" contract) — pinning there breaks the
+        // host's latest-only discipline (opencode-rolling-cache-marks).
+        const clientManaged = anthropicCacheMarks === undefined && !pluginMode;
+        if (clientManaged) {
+            const messageCap = Math.max(0, 4 - countAnthropicSystemCacheControls(parsed.system) - countAnthropicToolsCacheControls(parsed.tools));
+            const liveIds = new Set(processedMessages.map((m) => m.id).filter((id): id is string => typeof id === "string" && id.length > 0));
+            clientCacheControls = pinClientMessageMarks(cacheControls, liveIds, session, messageCap);
+        } else {
+            clientCacheControls = cacheControls;
+        }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
@@ -534,14 +547,20 @@ export async function prepareAnthropic(
             // anything else injects nothing this round. EMERGENCY arms and
             // tier>=2 distillation keep the legacy advisory below.
             const useDecide = decide !== undefined && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
+            // Nudge debug record fields (billion-context-pi #326 parity) —
+            // computed from the PRE-nudge array so the turnKey is the user
+            // message, stable across the turn's re-injections.
+            const nudgeMeta = nudgeDebugMeta(turn.nudge, rebuiltMessages);
             if (useDecide && ladderMode(session.metadata) === "fallback") {
                 consumeFallback(session.metadata);
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: wireText }]);
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "fallback", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                     }
@@ -563,8 +582,10 @@ export async function prepareAnthropic(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: wireText }]);
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "directive", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
@@ -579,8 +600,10 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: wireText }]);
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "advisory", text: wireText, ts: Date.now(), ...nudgeMeta });
                     } else {
                         nudgeOutcome = "skipped";
                     }
