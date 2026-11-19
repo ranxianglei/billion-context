@@ -952,7 +952,8 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         : undefined;
     // #4899 v4: publish the unit rates this session's dollars were computed
     // with so the panel can print them INSIDE the formulas (fold math uses
-    // usdProf; spend/miss mirrors use livePrice — same tiers whenever both).
+    // usdProf — calibrated to the session's billed average when its spend
+    // ledger exists, #7237; spend/miss mirrors use the raw livePrice tiers).
     const rates = usdProf !== undefined
         ? { w: usdProf.w, r: usdProf.r, q: usdProf.q }
         : livePrice !== undefined
