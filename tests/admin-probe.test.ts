@@ -41,6 +41,8 @@ test("selfAddressedLocalPath: self-addressed absolute-form requests only", () =>
     assert.equal(selfAddressedLocalPath(`http://[::ffff:127.0.0.1]:${P}/__bili/health`, P), "/__bili/health", "hex-mapped loopback folds to 127.0.0.1");
     assert.equal(selfAddressedLocalPath(`http://0.0.0.0:${P}/__bili/health`, P), "/__bili/health");
     assert.equal(selfAddressedLocalPath(`http://[::]:${P}/__acp/x`, P), "/__acp/x", "v6 unspecified in brackets");
+    assert.equal(selfAddressedLocalPath(`http://127.0.0.5:${P}/__bili/health`, P), "/__bili/health", "unconfigured loopback alias is still self (#7022 review)");
+    assert.equal(selfAddressedLocalPath(`http://127.42.19.8:${P}/__bili/health`, P), "/__bili/health", "deep 127/8 alias is still self (#7022 review)");
     // #3245: ANY path qualifies — model-style paths and the /bili/ zero-config
     // entry are served locally exactly as a direct connection would send them.
     assert.equal(selfAddressedLocalPath(`http://127.0.0.1:${P}/v1/chat/completions`, P), "/v1/chat/completions");
