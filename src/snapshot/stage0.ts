@@ -319,15 +319,22 @@ export function runStage0(opts: Stage0Input): Stage0Result {
     return { pinned, cohortRan: armed, anchorAdvanced, pinMode };
 }
 
-// #7064 §8: the incremental pin — prefix cores re-stamped from the ledger's
-// live rows (ingest is INSERT OR IGNORE on (session_id, seq): a position's
-// msg_id is written once, so the kernel's ref space only stays stable when
-// every presented id matches the ledger), new cores pinned from the tail
-// (a "?" slot keeps its content-derived id). Returns null — the full
-// signal — on ANY structural disagreement: empty ledger (bootstrap), width
-// mismatch (the host compacted/rewrote: C + N !== view length), or an
-// anchor that is not the ledger frontier (stale window / id space moved).
-// Exported: the anthropic lane's inline pin reuses it (two-form rule).
+// #7064 §8 (2026-11-19 owner ruling, the ed71f127 deadlock fix): the
+// INCREMENTAL pin — the list is a CONTIGUOUS TAIL of the current view,
+// [T-L .. T-1]; the overlap with the ledger's live rows ([T-L .. C-1])
+// must equal the ledger ROW BY ROW, the cores past the overlap are pinned
+// from the list (a "?" slot keeps its content-derived id). Returns null —
+// the full signal — on ANY structural disagreement: empty ledger
+// (bootstrap), a list too SHORT to reach into the ledger (nothing to
+// verify), a non-tail-aligned list (longer than the view), or any overlap
+// row drifting from the ledger. The steady-state form (anchor + new cores,
+// L = N+1) is the 1-row-overlap special case of the same rule. Over-ceiling
+// sessions (> the client's 2048 retention window) send their TRUNCATED
+// body list on carrier-off turns: the overlap then spans hundreds–2047
+// rows and the pin PROVES MORE, not less — so a degraded "full" turn can
+// still pin and re-upgrade the client; the full list is never a
+// requirement any client must be able to produce. Exported: the anthropic
+// lane's inline pin reuses it (two-form rule).
 export function tryIncrementalPin(
     sessionId: string,
     lane: string,
@@ -347,18 +354,38 @@ export function tryIncrementalPin(
         }
     }
     const C = liveIds.length;
-    const N = tailIds.length - 1;
+    const T = msgs.length;
+    const L = tailIds.length;
     if (C === 0) {
         log("debug", `[${sessionId}] [2x2:${lane}] incremental form on an empty ledger — full signal (bootstrap)`);
         return null;
     }
-    if (C + N !== msgs.length) {
-        log("info", `[${sessionId}] [2x2:${lane}] incremental width mismatch (ledger=${C}, new=${N}, view=${msgs.length}) — full signal (reanchor next turn)`);
+    const n = T - C; // new cores since the ledger caught up (0 on a pure resend)
+    if (L < n + 1) {
+        // A list that does not reach into the ledger has NO overlap to
+        // verify — it cannot prove the prefix, so it cannot pin. (A host
+        // that shrank/rewrote sends the FULL form instead — that path
+        // re-anchors by design.)
+        log("info", `[${sessionId}] [2x2:${lane}] incremental list too short to overlap the ledger (list=${L}, new cores=${n}, view=${T}, ledger=${C}) — full signal (reanchor next turn)`);
         return null;
     }
-    if (tailIds[0] === "?" || tailIds[0] !== liveIds[C - 1]) {
-        log("info", `[${sessionId}] [2x2:${lane}] incremental anchor mismatch (tail[0]=${tailIds[0]}, ledger frontier=${liveIds[C - 1]}) — full signal (reanchor next turn)`);
+    if (L > T) {
+        log("info", `[${sessionId}] [2x2:${lane}] incremental list longer than the view (list=${L}, view=${T}) — full signal (reanchor next turn)`);
         return null;
+    }
+    // TAIL ALIGNMENT: the list covers [T-L .. T-1]; the overlap with the
+    // ledger is [T-L .. C-1] = tailIds[0 .. L-n-1]. The steady-state form
+    // (anchor + new cores) is exactly the 1-row overlap (tailIds[0] must be
+    // the ledger frontier); an over-ceiling truncated list (ed71f127:
+    // >2048 sessions can only ever send their retained tail) carries up to
+    // the client's window of overlap rows and proves MORE. ANY drift row
+    // degrades to the full signal — D1: never a reject.
+    const overlapEnd = L - n; // first slot that is a NEW core (>= C)
+    for (let j = 0; j < overlapEnd; j++) {
+        if (tailIds[j] !== liveIds[T - L + j]) {
+            log("info", `[${sessionId}] [2x2:${lane}] incremental tail drift at overlap row ${T - L + j} (got=${tailIds[j]}, ledger=${liveIds[T - L + j]}) — full signal (reanchor next turn)`);
+            return null;
+        }
     }
     // Entry screening on the NEW cores (same rules as msgid-pin
     // validateMsgIds — a bad id must never reach the ledger's unique index).
@@ -367,22 +394,22 @@ export function tryIncrementalPin(
     // validateMsgIds rejects on the full form — a legit host mints fresh ids
     // for fresh positions, it never reuses one.
     const seen = new Set<string>(liveIds);
-    for (let i = 1; i < tailIds.length; i++) { // slot 0 is the anchor (checked above); the NEW cores are slots 1..
-        const id = tailIds[i];
+    for (let j = overlapEnd; j < L; j++) {
+        const id = tailIds[j];
         if (id === "?") continue;
         if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id) || seen.has(id)) {
-            log("info", `[${sessionId}] [2x2:${lane}] incremental tail carried an invalid id at slot ${i} — full signal (reanchor next turn)`);
+            log("info", `[${sessionId}] [2x2:${lane}] incremental tail carried an invalid id at slot ${j} — full signal (reanchor next turn)`);
             return null;
         }
         seen.add(id);
     }
-    // Anchor proven: the ledger's live row order IS the view order (ingest
-    // sweeps the ledger to the authoritative set, #3285/#4390 — the width
+    // Overlap proven: the ledger's live row order IS the view order (ingest
+    // sweeps the ledger to the authoritative set, #3285/#4390 — the overlap
     // check above is what keeps the two in step; a fold-edge transient
     // degrades one turn and re-converges with the full list).
     return msgs.map((m, i) => {
         if (i < C) return { ...m, id: liveIds[i] };
-        const id = tailIds[i - C + 1];
+        const id = tailIds[i - C + L - n]; // slot of view position i in the list (n = T - C)
         return id === "?" ? m : { ...m, id };
     });
 }

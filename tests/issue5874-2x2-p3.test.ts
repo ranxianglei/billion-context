@@ -938,9 +938,13 @@ test("#7064 §8 I2: any structural mismatch degrades to the 'full' signal — ne
     const sid = "i2-sid";
     seedLedger(db, sid, ["b1", "b2", "b3"]);
     const cases: Array<[string, string[]]> = [
-        ["anchor mismatch (tail[0] ≠ ledger frontier)", ["b2", "x4"]],
-        ["anchor is an unknown slot", ["?", "x4"]],
-        ["width mismatch (ledger 3 + 2 new ≠ view 4)", ["b3", "x4", "x5"]],
+        // 2026-11-19: a whole-history tail is now LEGAL (tail-aligned
+        // overlap covers rows 0..2 and pins the one new core) — the old
+        // "anchor mismatch" shape is replaced by a drift row INSIDE the
+        // overlap, which is what the new rule actually rejects.
+        ["overlap row drift (b1 vs b9, list otherwise tail-aligned)", ["b9", "b2", "b3", "x4"]],
+        ["list too short to reach into the ledger (no overlap to verify)", ["?"]],
+        ["list longer than the view (not a tail of THIS turn)", ["b3", "x4", "x5"]],
     ];
     for (const [name, tail] of cases) {
         const r = runStage0({
@@ -1077,4 +1081,66 @@ test("#7064 §8 phase 2 I6: the flag OFF leaves a short array pinned-less and si
         if (prev === undefined) delete process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"];
         else process.env["BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL"] = prev;
     }
+});
+
+test("#7064 §8 2026-11-19 I7: an over-ceiling session's TRUNCATED tail pins (the ed71f127 deadlock fix) — the overlap row-by-row proves more than the anchor did", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    const sid = "i7-sid";
+    // a 3000-turn session: the ledger holds all rows; the client's carrier
+    // is over its 8KiB budget this turn (a big growth turn), so the BODY
+    // carries its TRUNCATED retained list — the last 2048 ids of the view,
+    // NOT the full form (the client no longer HAS a full list).
+    const C = 3000;
+    const ledgerIds = Array.from({ length: C }, (_, i) => `k${i}`);
+    seedLedger(db, sid, ledgerIds);
+    const T = C + 2; // two new cores this turn
+    const retained = 2048; // the client's over-ceiling retention window
+    const list = Array.from({ length: retained }, (_, i) => ledgerIds[C - retained + i])
+        .concat(["new1", "new2"]);
+    const r = runStage0({
+        sessionId: sid, lane: "openai", msgs: dMsgs(T),
+        incomingMsgIds: list, incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.notEqual(r.pinned, null, "the truncated tail PINS — the 2047-row overlap matched the ledger");
+    assert.equal(r.pinMode, "incremental", "…and re-upgrades the client to the carrier (no dead 'full' loop)");
+    assert.deepEqual(r.pinned!.map((m) => m.id).slice(0, C), ledgerIds, "the full prefix re-stamped from the LEDGER");
+    assert.equal(r.pinned![C].id, "new1");
+    assert.equal(r.pinned![C + 1].id, "new2");
+    // the SAME turn with one drift row inside the overlap ⇒ no pin, 'full'.
+    const drifted = list.slice();
+    drifted[0] = "k0-rewritten";
+    const rd = runStage0({
+        sessionId: sid, lane: "openai", msgs: dMsgs(T),
+        incomingMsgIds: drifted, incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.equal(rd.pinned, null, "one drift row in the overlap ⇒ degrade");
+    assert.equal(rd.pinMode, "full", "…drift class, never a reject");
+});
+
+test("#7064 §8 2026-11-19 I8: the steady-state form is the 1-row-overlap special case — behavior unchanged", (t: test.TestContext) => {
+    const { store } = d23Harness(t);
+    const db = (store as unknown as { db: DbLike }).db;
+    const log = (level: string, msg: string): void => {};
+    seedLedger(db, "i8-sid", ["j1", "j2"]);
+    // anchor + new (L = N+1): overlap = exactly 1 row = the old anchor check.
+    const ok = runStage0({
+        sessionId: "i8-sid", lane: "openai", msgs: dMsgs(3),
+        incomingMsgIds: ["j2", "j3"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.notEqual(ok.pinned, null);
+    assert.deepEqual(ok.pinned!.map((m) => m.id), ["j1", "j2", "j3"]);
+    // anchor ≠ frontier ⇒ the 1-row overlap drifts ⇒ degrade (same verdict
+    // as the old anchor rule, same shape).
+    const bad = runStage0({
+        sessionId: "i8-sid", lane: "openai", msgs: dMsgs(3),
+        incomingMsgIds: ["j9", "j3"], incomingSeqs: null,
+        pluginMode: true, log,
+    });
+    assert.equal(bad.pinned, null);
+    assert.equal(bad.pinMode, "full");
 });
