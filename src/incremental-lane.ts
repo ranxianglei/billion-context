@@ -628,6 +628,22 @@ export function continueContentClusters(
     return { msgs, cacheControls: new Map([...delta.cacheControls].map(([id, mark]) => [renamed.get(id) ?? id, mark])) };
 }
 
+/** #7321: which canonical rows the kernel records a cache_control mark for
+ *  (anthropicToCore's cacheControls map). Only these rows belong in
+ *  entry.marks — sidecar rows (image / redacted_thinking / unknown) and
+ *  thinking rows render their raw block verbatim and never read the marks
+ *  map, so a compact retouch must not write them there. The full path
+ *  derives marks from the kernel's map and already excludes them; the
+ *  compact path (which maps a per-block mark list) must apply the same
+ *  filter or it pollutes entry.marks with rows the full path would never
+ *  set. */
+function isKernelRecordedRow(m: BiliMessage): boolean {
+    return m.role === "system"
+        || m.contentType === "tool-call"
+        || m.contentType === "tool-result"
+        || (m.contentType === "text" && m.rawAnthropicBlock === undefined);
+}
+
 function applyTurn(
     entry: Canonical,
     sinceSeq: number,
@@ -663,7 +679,12 @@ function applyTurn(
     // must map onto known wire spans with identical content (only the
     // cache_control decoration may differ); anything else is drift → 409 and
     // the client recovers with a full resync.
-    const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[]; compact: boolean }[] = [];
+    // #7321: two mark channels per retouch. `marks` feeds entry.marks (render
+    // + persist) and holds ONLY kernel-recorded rows; `rawMarks` is the
+    // complete per-block mark list (incl. sidecar/thinking rows) that the
+    // compact apply phase uses to set/delete the raw block's cache_control.
+    // The full path replaces whole raw blocks, so its rawMarks stays empty.
+    const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawMarks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[]; compact: boolean }[] = [];
     if (!resync && retouch.length > 0) {
         const spans = entry.wireSpans;
         if (spans === null || spans === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "retouch without wire spans (cold canonical)" };
@@ -691,7 +712,7 @@ function applyTurn(
                     if (mark !== undefined) marks.set(ids[k], mark);
                     if (conv.msgs[k].rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: conv.msgs[k].rawAnthropicBlock });
                 }
-                retouchMarks.push({ ids, marks, rawBlocks, compact: false });
+                retouchMarks.push({ ids, marks, rawMarks: new Map(), rawBlocks, compact: false });
             } else if (r.hash !== undefined && Array.isArray(r.marks)) {
                 // #6776 compact retouch: verify content-unchanged by hash, map
                 // the per-block mark list to core ids via the wire span.
@@ -699,13 +720,23 @@ function applyTurn(
                 if (alignHashes === null || alignHashes === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "compact retouch without align hashes (cold canonical)" };
                 if (alignHashes[r.index] !== r.hash) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} hash mismatch (content changed)` };
                 if (r.marks.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} marks length ${String(r.marks.length)} != span ${String(ids.length)}` };
+                const rawMarks = new Map<string, unknown>();
                 for (let k = 0; k < ids.length; k++) {
-                    const mark = r.marks[k];
-                    if (mark !== null && mark !== undefined) marks.set(ids[k], mark);
                     const have = byId.get(ids[k]);
+                    const mark = r.marks[k];
+                    if (mark !== null && mark !== undefined) {
+                        // Complete per-block list: the compact apply phase
+                        // reads this (not entry.marks) to set/delete the raw
+                        // block's cache_control, so sidecar/thinking rows keep
+                        // their mark even though it never reaches entry.marks
+                        // (#7321). entry.marks takes only kernel-recorded rows,
+                        // matching the full path's kernel-map derivation.
+                        rawMarks.set(ids[k], mark);
+                        if (have !== undefined && isKernelRecordedRow(have)) marks.set(ids[k], mark);
+                    }
                     if (have !== undefined && have.rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: have.rawAnthropicBlock });
                 }
-                retouchMarks.push({ ids, marks, rawBlocks, compact: true });
+                retouchMarks.push({ ids, marks, rawMarks, rawBlocks, compact: true });
             } else {
                 return { ok: false, status: 400, error: "retouch entry must carry either message or (hash+marks)", serverSeq };
             }
@@ -769,9 +800,12 @@ function applyTurn(
         if (r.compact) {
             // #6776 compact retouch: update the existing raw blocks'
             // cache_control in place (the client did not send new blocks).
+            // #7321: read the COMPLETE per-block list (rawMarks), not
+            // entry.marks — sidecar/thinking rows carry their mark here even
+            // though it never reaches entry.marks.
             for (const { message } of r.rawBlocks) {
                 const raw = message.rawAnthropicBlock as Record<string, unknown>;
-                const mark = r.marks.get(message.id);
+                const mark = r.rawMarks.get(message.id);
                 if (mark === undefined) delete raw.cache_control;
                 else raw.cache_control = mark;
             }

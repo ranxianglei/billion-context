@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -290,6 +290,72 @@ test("compact retouch: malformed entry (missing hash or marks) is refused with 4
             retouch: [{ index: 0, marks: [null] }],
         }), laneHeaders);
         assert.equal(noHash.status, 400);
+    } finally {
+        await h.close();
+    }
+});
+
+test("compact retouch: a mark on a sidecar (image) row updates the raw block but never pollutes entry.marks (#7321)", async () => {
+    const h = await harness();
+    try {
+        // Seed: a user message with a text block AND an image block (the
+        // image is a sidecar row — the kernel records no cache_control mark
+        // for it, so the full path would never put it in entry.marks).
+        const seedMsg: IncrementalWireMessage = {
+            role: "user",
+            content: [
+                { type: "text", text: "first" },
+                { type: "image", source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" } },
+            ],
+        };
+        const seedBody = JSON.stringify({
+            conversationId: "conv-compact-1",
+            sinceSeq: 0,
+            resync: true,
+            path: "/v1/messages",
+            request: { model: "claude-test", max_tokens: 1024 },
+            messages: [seedMsg],
+            system: SYSTEM,
+        });
+        const seed = await h.post("/__bili/plugin/turn", seedBody, laneHeaders);
+        assert.equal(seed.status, 200);
+        // The seed produces two core rows (text + image sidecar).
+        assert.equal(seed.appliedSeq, 2);
+
+        // Delta: a new assistant message plus a compact retouch that ADDS a
+        // cache_control mark to the image block (block index 1 = sidecar row).
+        const deltaBody = JSON.stringify({
+            conversationId: "conv-compact-1",
+            sinceSeq: 2,
+            path: "/v1/messages",
+            request: { model: "claude-test", max_tokens: 1024 },
+            messages: [{ role: "assistant", content: [{ type: "text", text: "second" }] }],
+            retouch: [{ index: 0, hash: alignHash(seedMsg), marks: [null, MARK] }],
+        });
+        const delta = await h.post("/__bili/plugin/turn", deltaBody, laneHeaders);
+        assert.equal(delta.status, 200);
+        assert.equal(delta.appliedSeq, 3);
+
+        // (a) The raw image block still gets its cache_control set in place —
+        // the raw-block mutation channel is complete (reads rawMarks, not
+        // entry.marks), so sidecar rows keep their mark on the wire.
+        const lastForwarded = h.forwarded.at(-1);
+        assert.ok(lastForwarded);
+        const msgs = lastForwarded!.messages as Record<string, unknown>[];
+        assert.equal(msgs.length, 2);
+        const seedContent = msgs[0].content as Record<string, unknown>[];
+        const imageBlock = seedContent.find((b) => (b as { type?: string }).type === "image");
+        assert.ok(imageBlock, "the image block must be present in the forwarded wire");
+        assert.deepEqual(imageBlock.cache_control, MARK, "the raw image block keeps its cache_control");
+
+        // (b) entry.marks (persisted as inc:cache-marks) must NOT contain the
+        // sidecar image row — only kernel-recorded rows belong there, matching
+        // the full path. Before the #7321 fix the compact path wrote the
+        // image row's mark into entry.marks, leaving a stale entry that the
+        // full path would never produce.
+        const marks = getStore().getSessionExt("conv-compact-1", "inc:cache-marks") as [string, unknown][];
+        assert.ok(Array.isArray(marks), "inc:cache-marks must be persisted as an entry list");
+        assert.equal(marks.length, 0, "entry.marks must be empty — the image row is not kernel-recorded");
     } finally {
         await h.close();
     }
