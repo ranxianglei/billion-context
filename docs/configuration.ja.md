@@ -307,7 +307,7 @@
 | `compress.rules` | boolean | false | — | 注入された `acp_rule` ツールを通じて配信される永続モデルリマインダー。フォールドからハード保護される。`pi/omp` は `/acp-rule` コマンドを公開する。プロキシモード専用 — プラグインモードでは無効であり、ホストがツールサーフェスを所有する。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | クライアント向けに `acp_compress` ツールを登録（グローバルレベルのみ）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。 |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
@@ -350,6 +350,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 入力価格に対する出力価格比。 |
 | `compress.reasoning.drop` | boolean | true | — | 閾値を超える長さの完了ラウンド推論実行を破棄する。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 完了推論実行を破棄する文字数閾値。 |
+| `compress.reasoning.tail` | boolean | false | — | (#7144 フォローアップ) 保護テール内では compress ラウンド以外に、任意のクローズ済みのラウンド（結果到着後メッセージがあるツール呼び出し、または最後のメッセージでなくなったアシスタントテキスト）の推論実行も破棄する。進行中のラウンドには一切触れない。厳格な推論アップストリームには影響なし：#762/#2169 の空白エコー正規化は破棄後に実行される。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars の非推奨エイリアス（受け入れられ、それにマッピングされる）。 _(非推奨)_ |
 
 **プロバイダールートフィールド**

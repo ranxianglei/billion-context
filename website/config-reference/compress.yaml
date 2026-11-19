@@ -350,16 +350,16 @@ entries:
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
   - key: compress.reasoning
-    type: "{ drop?, threshold? }"
-    default: "drop true · threshold 2048"
+    type: "{ drop?, threshold?, tail? }"
+    default: "drop true · threshold 2048 · tail false"
     group: compress
     id: ct.rz
     render: compress-row
     desc_en: "Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     desc_ja: "2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。"
-    site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
-    site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+    site_en: "{ drop?, threshold?, tail? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default; tail: false keeps it scoped to compress turns only); strict-reasoning upstreams need drop:false."
+    site_zh: "{ drop?, threshold?, tail? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true；tail 默认 false，只限 compress 轮次）；严格推理上游需设 drop:false。"
   - key: compress.absorb
     type: object
     default: "opt-in (disabled)"
@@ -698,6 +698,13 @@ entries:
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
     desc_ja: "完了推論実行を破棄する文字数閾値。"
+  - key: compress.reasoning.tail
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "(#7144 follow-up) Also drop reasoning from any CLOSED round in the protected tail, not only compress turns — a tool call whose result arrived with at least one message after it, or an assistant text turn that is no longer the last message. Those rounds leave the protected window at the next fold anyway, so dropping early reclaims the tokens now; the in-flight round is never touched. Strict-echo upstreams are unaffected: #762/#2169 blank-echo normalization runs after the drop."
+    desc_zh: "（#7144 后续）保护尾内不止 compress 轮次、任意已关闭轮次的推理块也丢弃——工具调用结果已到且其后还有消息，或助手文本不再是最后一条。这些轮次下次折叠时反正会连推理一起离开窗口，提前丢即回收 token；进行中的轮次绝不触碰。严格推理上游不受影响：#762/#2169 空回显归一化跑在丢弃之后。"
+    desc_ja: "(#7144 フォローアップ) 保護テール内では compress ラウンド以外に、任意のクローズ済みのラウンド（結果到着後メッセージがあるツール呼び出し、または最後のメッセージでなくなったアシスタントテキスト）の推論実行も破棄する。進行中のラウンドには一切触れない。厳格な推論アップストリームには影響なし：#762/#2169 の空白エコー正規化は破棄後に実行される。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"
