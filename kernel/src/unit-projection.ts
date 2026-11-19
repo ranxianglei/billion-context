@@ -107,6 +107,12 @@ export interface UnitProjection {
   directMessageIds: string[];
   filteredIds: string[];
   withdrawnIds: Set<string>;
+  /** Raw ids inside the requested range that the protected-zone carve left
+   *  visible outside the block (recent-N / last-user anchor). The new block
+   *  records these in `excludedMessageIds` so a later turn can absorb them
+   *  once they leave the protected zone (absorbStaleExclusions) instead of
+   *  letting them orphan forever. */
+  excludedProtectedIds: string[];
   splitTurnCount: number;
   splitPairCount: number;
   targetTier: CompressionTier;
@@ -122,6 +128,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // Declared up front: every exit path (including the zone fatal below)
   // assembles the result through finish(), which reads these bindings.
   let withdrawnIds = new Set<string>();
+  let excludedProtectedIds: string[] = [];
   let splitTurnCount = 0;
   let splitPairCount = 0;
 
@@ -344,6 +351,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     // Remove protected messages from effective coverage too, so they are NOT
     // hidden by the new block (they must stay fully visible).
     for (const id of hitProtectedRaw) effectiveMessageIds.delete(id);
+    // Fold-residue bookkeeping: these ids were inside the requested range
+    // but stayed visible. The new block records them so a later turn can
+    // absorb them into coverage once they leave the protected zone (see
+    // absorbStaleExclusions) — otherwise a message that was the last-user
+    // anchor at fold time can never be folded again (sub-threshold,
+    // gap-bounded, and the receipt below tells the model off).
+    excludedProtectedIds = [...hitProtectedRaw];
 
     const hitRefs = hitProtectedRaw
       .map((id) => input.state.messageRefs.byRaw[id])
@@ -390,7 +404,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
         ", ",
-      )} from compression range (recent/last-user zone) — they stay visible outside the new block; do not target them in another compress call.` +
+      )} from compression range (recent/last-user zone) — they stay visible outside the new block and are recorded on it; once they leave the protected zone they are absorbed into the block's coverage automatically — do not target them in another compress call.` +
         anchorNote +
         (truncatedAfter > 0
           ? ` Range truncated at that boundary — ${truncatedAfter} later message(s) (including replies to the protected message) stay visible too, so no summary can land above the question it answers (#3953).`
@@ -805,6 +819,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       directMessageIds,
       filteredIds,
       withdrawnIds,
+      excludedProtectedIds,
       splitTurnCount,
       splitPairCount,
       targetTier,
@@ -899,7 +914,7 @@ export function buildProjectionShared(
 /** tool-call/tool-result pairing map over a whole message array (a side may
  *  be empty until its half shows up). Mirrors the inline map the #3953
  *  truncation check used to rebuild per unit. */
-function buildPairMap(messages: CoreMessage[]): Map<string, [string, string]> {
+export function buildPairMap(messages: CoreMessage[]): Map<string, [string, string]> {
   const pairByCallId = new Map<string, [string, string]>();
   for (const m of messages) {
     if (m.contentType === "tool-call" || m.contentType === "tool-result") {

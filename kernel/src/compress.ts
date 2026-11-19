@@ -38,6 +38,7 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { absorbStaleExclusions } from "./absorb-stale.js";
 import {
   appendMediaRefsSection,
   collectFoldMediaRefs,
@@ -1031,6 +1032,24 @@ export function createCore(ports: Ports = {}): CompressionCore {
       deadRefs = kept.length > 0 ? kept : undefined;
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
+    // Fold-residue self-heal: messages that a fold excluded via the
+    // protected zone (recent-N / last-user anchor) are recorded on the
+    // block; once they leave the zone they are absorbed into the block's
+    // coverage here, every turn, so they can never orphan forever
+    // (sub-threshold + gap-bounded => the nudge stops offering them).
+    const absorptions = absorbStaleExclusions(
+      state,
+      result.messages,
+      input.config,
+      countTokens,
+    );
+    if (absorptions.length > 0) {
+      for (const a of absorptions) {
+        console.log(
+          `[acp-kernel] absorbed fold residue into ${a.blockId}: ${a.refs.join(", ")}`,
+        );
+      }
+    }
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
     // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
     // emitted on turns where a nudge plan is armed but its banner is not
@@ -1937,6 +1956,12 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     compressCallId: input.spec.compressCallId,
     startRef: input.spec.startRef,
     endRef: input.spec.endRef,
+    // Fold-residue bookkeeping: protected-zone carve exclusions (recent-N /
+    // last-user anchor) recorded for later absorption — see
+    // CompressionBlock.excludedMessageIds and absorbStaleExclusions.
+    ...(projection.excludedProtectedIds.length > 0
+      ? { excludedMessageIds: [...projection.excludedProtectedIds] }
+      : {}),
     ...(interval
       ? { startSeq: interval.start, endSeq: interval.end }
       : {}),

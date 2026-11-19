@@ -112,6 +112,19 @@ export interface CompressionBlock {
   compressCallId?: string;
   startRef?: string;
   endRef?: string;
+  /** Fold residue: raw message ids that fell inside the requested range but
+   *  were excluded from the fold by the protected-zone carve (recent-N /
+   *  last-user anchor) and therefore left visible OUTSIDE the block's
+   *  coverage. Recorded so a later turn can absorb them into this block's
+   *  effective coverage once they leave the protected zone (see
+   *  absorbStaleExclusions) — without that, a message that was the
+   *  last-user anchor at fold time becomes a permanent orphan: sub-threshold
+   *  and gap-bounded, so the nudge never offers it, and the receipt already
+   *  told the model not to re-target it. Only protected-carve exclusions
+   *  qualify; turn-integrity withdrawals stay out (their visibility is a
+   *  provider protocol requirement, not a zone effect). Empty/absent =
+   *  nothing pending. */
+  excludedMessageIds?: string[];
   /** #4316 layer 3: the block's coverage as a unified-ledger seq interval
    *  [startSeq, endSeq] (inclusive, 1-based display space — same space as
    *  CoreMessage.ledgerSeq). Recorded ONLY when the fold can prove the claim

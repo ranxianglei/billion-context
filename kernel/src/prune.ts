@@ -1,4 +1,5 @@
 import { activeBlocks, coveredMessageIds } from "./state.js";
+import { isNudgeEchoText } from "./nudge-text.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
 export const SUMMARY_HEADER = "[Compressed conversation section]";
@@ -474,6 +475,26 @@ function rebuildMessages(
     }
   }
   const ix = anchors.length > 0 ? buildAnchorPairingIndex(messages) : null;
+  // Fold-residue fix (first-user pin vs nudge echo): the pin exists so a
+  // strict provider always sees at least one user message. It must not
+  // freeze an opening user message that is merely an ECHO of bili's own
+  // rendered nudge text (a pasted evidence blob, or a resumed session whose
+  // first message carries an old compression receipt): such a message
+  // carries no task of its own, and pinning it makes the fold that covered
+  // it a permanent no-op on the wire. The pin is skipped only when the
+  // pinned core is a nudge echo AND at least one other user message
+  // follows the pinned run — so a provider never ends up with zero user
+  // messages (and a folded block's rendered summary carrier is itself a
+  // user message, so coverage alone keeps the conversation valid).
+  let firstUserPinSkipped = false;
+  if (firstUserIndex >= 0 && isNudgeEchoText(messages[firstUserIndex]!.text)) {
+    for (let k = firstUserPinEnd; k < messages.length; k++) {
+      if (messages[k]!.role === "user") {
+        firstUserPinSkipped = true;
+        break;
+      }
+    }
+  }
   const safeAnchors = anchors
     .map((anchor) => ({
       ...anchor,
@@ -517,7 +538,11 @@ function rebuildMessages(
     // range strip the last guaranteed user message off the wire. Strict
     // providers reject conversations with no user message. See DESIGN.md §8.1.
     // #3642: the pin spans the opening wire message's whole core run.
-    if (index === firstUserIndex && firstUserIndex >= 0) {
+    if (
+      index === firstUserIndex &&
+      firstUserIndex >= 0 &&
+      !firstUserPinSkipped
+    ) {
       for (let k = index; k < firstUserPinEnd; k++) {
         result.push(messages[k]!);
       }

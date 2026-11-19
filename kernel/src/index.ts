@@ -1,4 +1,9 @@
 export * from "./types.js";
+export {
+  absorbStaleExclusions,
+  type AbsorptionReport,
+} from "./absorb-stale.js";
+export { isNudgeEchoText, NUDGE_ECHO_MARKERS } from "./nudge-text.js";
 export { createCore } from "./compress.js";
 export type {
   Ports,

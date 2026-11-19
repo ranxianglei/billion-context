@@ -18,6 +18,33 @@ export type NudgeProtocol = "anthropic" | "openai" | "responses" | "google";
 
 export type NudgeVoice = "gentle" | "emergency";
 
+/** Distinctive markers of a rendered nudge / compaction-instruction text.
+ *  A nudge is assembled from the compression-rules preamble ("PRIORITY —
+ *  when the summary must be compact…"), the block ledger ("Active blocks
+ *  (…):"), the range offer ("Compressible ranges (…):") and the one-call
+ *  hint (💡). Two co-occurring markers are treated as conclusive without
+ *  matching exact layout, so wording tweaks on any one side do not break
+ *  detection. */
+export const NUDGE_ECHO_MARKERS = [
+  "PRIORITY — when the summary must be compact",
+  "Active blocks (",
+  "Compressible ranges (",
+  "💡",
+] as const;
+
+/** The message IS an echo of bili's own rendered nudge text — e.g. a
+ *  pasted evidence blob or a resumed-session continuation that carries an
+ *  old receipt as its opening user message. Such a message has no task of
+ *  its own; the first-user pin must not freeze it onto the wire forever. */
+export function isNudgeEchoText(text: string | undefined): boolean {
+  if (!text) return false;
+  let hits = 0;
+  for (const marker of NUDGE_ECHO_MARKERS) {
+    if (text.includes(marker)) hits++;
+  }
+  return hits >= 2;
+}
+
 export interface NudgePromptSections {
   efficiencyNote?: string | null;
   emergencyHeader?: string | null;
