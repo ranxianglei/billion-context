@@ -522,8 +522,8 @@ function isLoopbackTarget(url: string): boolean {
     } catch {
         return false;
     }
-    const h = u.hostname;
-    return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+    const h = u.hostname; // URL.hostname brackets IPv6 literals ([::1])
+    return h === "localhost" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 const droppedHopsLogged = new Set<string>();

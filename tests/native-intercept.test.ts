@@ -2104,6 +2104,17 @@ test("#4566: rewrite drops the host's stale hop — loopback proxy origin needs 
     assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
 });
 
+test("#4566: rewrite drops the host's stale hop — IPv6 loopback proxy origin needs no hop", async () => {
+    const state: NativeInterceptState = { origin: "http://[::1]:41008", ready: Promise.resolve("http://[::1]:41008") };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://[::1]:41008/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
+});
+
 test("#4566: self branch drops the host's stale hop", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:41002", ready: Promise.resolve("http://127.0.0.1:41002") };
     const stale: HopInit = { proxy: "http://127.0.0.1:18788" };
