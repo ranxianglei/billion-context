@@ -776,10 +776,19 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // sharing a 512 KiB prefix apart. Re-noting a byte-identical payload (the
     // non-streaming settle path) reuses the prior slot's count/full instead of
     // re-deriving them.
+    // #7149 batch3-1 (delta anchoring): the byte-identical re-note inherits the
+    // prior digest via a pure byte compare — ZERO hashing on the common path.
+    // Changed/new bodies keep the full-body digest: `bd` is the ground-truth
+    // equality proof (#2131) and the ONLY equality proof once the payload
+    // exceeds BODY_FULL_CAP (nothing is retained), so a delta descriptor cannot
+    // replace it without breaking settle's be decision. View-ID anchoring is
+    // not available here — the send chokepoints hold the wire string, not the
+    // stored canonical views (those live in the storage layer).
     const buf = Buffer.from(body, "utf8");
-    const digest = createHash("sha256").update(buf).digest("hex");
     const transient = pendingCapture(session);
     const prior = transient.sentBody;
+    const sameBytes = prior !== undefined && prior.bytes === buf.byteLength && prior.full !== null && prior.full.equals(buf);
+    const digest = sameBytes ? prior.digest : createHash("sha256").update(buf).digest("hex");
     const samePayload = prior !== undefined && prior.digest === digest;
     transient.sentBody = {
         order: ++captureOrder,
