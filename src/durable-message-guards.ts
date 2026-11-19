@@ -203,7 +203,7 @@ const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
 
 /** dsh per-turn time-context carrier (#5142, superseding #5109's naming):
  *  the timestamp notice injected before each turn (marker above).
- *  Deliberately FOLDABLE by design — unlike the four durable carriers it
+ *  Deliberately FOLDABLE by design — unlike the five durable carriers it
  *  carries no state beyond its own turn and must NEVER be pinned, so its
  *  path lives in the oneshot/ namespace where no protection pattern matches
  *  it (kernel-foldable) while still riding dshDurableToolPath. Its problem is
@@ -391,8 +391,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the twelve evidence-backed identities → its
- *  canonical path (four durable carriers + eight foldable one-shot injections).
+/** dsh lane classifier: any of the thirteen evidence-backed identities → its
+ *  canonical path (five durable carriers + eight foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
