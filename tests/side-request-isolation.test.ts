@@ -7,7 +7,7 @@ import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, 
 import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown, estimateRawBodyTopKeys } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -616,6 +616,45 @@ test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5
     // non-object bodies bucket into other (or nothing) without throwing.
     assert.equal(estimateRawBodyBreakdown(null).total, 0, "null body");
     assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
+});
+
+test("estimateRawBodyTopKeys: names the offending top-level field when the fuse fires (#7273)", () => {
+    // The #7273 shape: a body whose mass rides a top-level field the
+    // contextView NEVER counts (not messages/tools/system) — the four-bucket
+    // clause reports it as "other", a black box. The top-key view must NAME
+    // that field so the operator can localize it without a body dump.
+    const secretMass = "x".repeat(200_000);
+    const body = {
+        system: "s".repeat(1_000),
+        tools: [{ type: "function", function: { name: "t", description: "d".repeat(4_000) } }],
+        messages: [{ role: "user", content: "m".repeat(2_000) }],
+        dshInjectedState: { blob: secretMass },
+    };
+    const keys = estimateRawBodyTopKeys(body, 0); // full per-key map
+    // sum of every key's tokens equals the plain meter exactly (same walk,
+    // same CJK meter, same NON_TEXT_BODY_KEYS exclusions).
+    assert.equal(keys.reduce((s, k) => s + k.tokens, 0), estimateRawBodyTokens(body), "sum of all key tokens equals the plain meter");
+    // the offending field is named and dominates.
+    const byKey = Object.fromEntries(keys.map((k) => [k.key, k]));
+    assert.ok(byKey.dshInjectedState, "the offending top-level key is present");
+    assert.ok(byKey.dshInjectedState.tokens >= defaultCountTokens(secretMass), "the offending key carries its own mass");
+    assert.ok(byKey.dshInjectedState.tokens > byKey.messages.tokens + byKey.system.tokens + byKey.tools.tokens, "the offending key dominates the body");
+    // default top-N (8) caps the list but still includes the dominant key.
+    const top8 = estimateRawBodyTopKeys(body);
+    assert.ok(top8.length <= 8, "top-N caps the list");
+    assert.equal(top8[0].key, "dshInjectedState", "the dominant key is first (sorted tokens desc)");
+    // bytes track UTF-8 size.
+    assert.ok(byKey.dshInjectedState.bytes >= Buffer.byteLength(secretMass, "utf8"), "bytes track UTF-8 size");
+    // image payloads stay excluded from the top-key view too (#5932).
+    const imgKeys = estimateRawBodyTopKeys({ image_url: `data:image/png;base64,${"A".repeat(50_000)}` }, 0);
+    assert.equal(imgKeys.reduce((s, k) => s + k.tokens, 0), 0, "image_url stays excluded");
+    // non-object bodies: a single <root> key, no throw.
+    const rootKeys = estimateRawBodyTopKeys("plain string", 0);
+    assert.equal(rootKeys.length, 1, "bare string is one <root> key");
+    assert.equal(rootKeys[0].key, "<root>");
+    assert.equal(rootKeys[0].tokens, defaultCountTokens("plain string"));
+    const nullKeys = estimateRawBodyTopKeys(null, 0);
+    assert.equal(nullKeys.length, 0, "null body has no top-level keys (consistent with breakdown total 0)");
 });
 
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {

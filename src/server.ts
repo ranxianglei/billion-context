@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, estimateRawBodyTopKeys, type PreflightDeps, type PreflightResult, type RawBodyBreakdown, type RawBodyTopKey } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -3780,6 +3780,9 @@ export function buildWindowShrinkNote(args: {
 interface MeasuredOutbound {
     tokens: number;
     breakdown: RawBodyBreakdown;
+    /** The parsed body the breakdown was computed on — lets a caller derive
+     *  the per-top-level-key view (#7273) without re-parsing. */
+    parsed: unknown;
 }
 
 // #5000 item 3: dimension clause for the measured-doom messages — which part
@@ -3788,6 +3791,15 @@ interface MeasuredOutbound {
 // mass is tools[], not a giant paste).
 export function measuredBreakdownClause(b: RawBodyBreakdown): string {
     return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+}
+
+// #7273: per-top-level-key clause — the four-bucket "other" is a black box, so
+// when the egress fuse fires on mass that the contextView never counts, name
+// the offending field (key + bytes + est. tokens) instead of just "other".
+export function measuredTopKeysClause(keys: RawBodyTopKey[]): string {
+    return keys
+        .map((k) => `${k.key} ~${k.tokens.toLocaleString("en-US")}tok/~${k.bytes.toLocaleString("en-US")}B`)
+        .join(" · ");
 }
 
 export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
@@ -3801,7 +3813,7 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
         }
     }
     const breakdown = estimateRawBodyBreakdown(parsed);
-    return { tokens: breakdown.total, breakdown };
+    return { tokens: breakdown.total, breakdown, parsed };
 }
 
 export async function preflightCompressIfNeeded(
