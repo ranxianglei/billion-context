@@ -31,7 +31,7 @@ function makeSession(id: string): Session {
 
 type StoreInternals = {
     tombstoneOrphanRefs(id: string, session: Session): void;
-    unifiedSeqByRaw(id: string): Map<string, number> | null;
+    unifiedLiveMsgIds(id: string): Set<string> | null;
 };
 
 function internals(store: SessionStore): StoreInternals {
@@ -101,16 +101,16 @@ test("tombstoneOrphanRefs removes orphan refs when live set is available", () =>
     };
     state.messageRefs.byRef = byRef;
 
-    // Mock unifiedSeqByRaw to return only the live rawIds.
+    // Mock unifiedLiveMsgIds to return only the live rawIds.
     const internals_ = internals(store);
-    const origSeqByRaw = internals_.unifiedSeqByRaw.bind(store);
-    const mockable = store as unknown as { unifiedSeqByRaw: (id: string) => Map<string, number> | null };
-    mockable.unifiedSeqByRaw = () => new Map([["live-1", 1]]);
+    const origLiveMsgIds = internals_.unifiedLiveMsgIds.bind(store);
+    const mockable = store as unknown as { unifiedLiveMsgIds: (id: string) => Set<string> | null };
+    mockable.unifiedLiveMsgIds = () => new Set(["live-1"]);
 
     try {
         internals_.tombstoneOrphanRefs("tombstone-test", session);
     } finally {
-        mockable.unifiedSeqByRaw = origSeqByRaw;
+        mockable.unifiedLiveMsgIds = origLiveMsgIds;
     }
 
     // Orphans removed from byRaw/byRef.
@@ -137,16 +137,16 @@ test("tombstoneOrphanRefs is a no-op when unified store is unavailable", () => {
         "m00001": "orphan-a",
     };
 
-    // Mock unifiedSeqByRaw to return null (store unavailable).
+    // Mock unifiedLiveMsgIds to return null (store unavailable).
     const internals_ = internals(store);
-    const origSeqByRaw = internals_.unifiedSeqByRaw.bind(store);
-    const mockable = store as unknown as { unifiedSeqByRaw: (id: string) => Map<string, number> | null };
-    mockable.unifiedSeqByRaw = () => null;
+    const origLiveMsgIds = internals_.unifiedLiveMsgIds.bind(store);
+    const mockable = store as unknown as { unifiedLiveMsgIds: (id: string) => Set<string> | null };
+    mockable.unifiedLiveMsgIds = () => null;
 
     try {
         internals_.tombstoneOrphanRefs("tombstone-off-test", session);
     } finally {
-        mockable.unifiedSeqByRaw = origSeqByRaw;
+        mockable.unifiedLiveMsgIds = origLiveMsgIds;
     }
 
     // Orphan stays in byRaw (no tombstone).
@@ -169,14 +169,14 @@ test("tombstoneOrphanRefs is a no-op when no orphans exist", () => {
 
     // All refs are live → no orphans.
     const internals_ = internals(store);
-    const origSeqByRaw = internals_.unifiedSeqByRaw.bind(store);
-    const mockable = store as unknown as { unifiedSeqByRaw: (id: string) => Map<string, number> | null };
-    mockable.unifiedSeqByRaw = () => new Map([["live-1", 1]]);
+    const origLiveMsgIds = internals_.unifiedLiveMsgIds.bind(store);
+    const mockable = store as unknown as { unifiedLiveMsgIds: (id: string) => Set<string> | null };
+    mockable.unifiedLiveMsgIds = () => new Set(["live-1"]);
 
     try {
         internals_.tombstoneOrphanRefs("tombstone-none-test", session);
     } finally {
-        mockable.unifiedSeqByRaw = origSeqByRaw;
+        mockable.unifiedLiveMsgIds = origLiveMsgIds;
     }
 
     // No orphans → no deadRefs, ref preserved.
@@ -201,14 +201,14 @@ test("tombstoneOrphanRefs preserves REF_FLOOR_RAW_ID", () => {
     };
 
     const internals_ = internals(store);
-    const origSeqByRaw = internals_.unifiedSeqByRaw.bind(store);
-    const mockable = store as unknown as { unifiedSeqByRaw: (id: string) => Map<string, number> | null };
-    mockable.unifiedSeqByRaw = () => new Map([["live-1", 2]]);
+    const origLiveMsgIds = internals_.unifiedLiveMsgIds.bind(store);
+    const mockable = store as unknown as { unifiedLiveMsgIds: (id: string) => Set<string> | null };
+    mockable.unifiedLiveMsgIds = () => new Set(["live-1"]);
 
     try {
         internals_.tombstoneOrphanRefs("tombstone-floor-test", session);
     } finally {
-        mockable.unifiedSeqByRaw = origSeqByRaw;
+        mockable.unifiedLiveMsgIds = origLiveMsgIds;
     }
 
     // REF_FLOOR_RAW_ID preserved (not treated as orphan).
@@ -217,4 +217,45 @@ test("tombstoneOrphanRefs preserves REF_FLOOR_RAW_ID", () => {
     assert.equal(state.messageRefs.byRaw["orphan-a"], undefined);
     assert.ok(state.deadRefs);
     assert.ok(state.deadRefs.includes("m00001"));
+});
+
+test("tombstoneOrphanRefs preserves multi-generation msg_ids (edits)", () => {
+    const dir = mkdtempSync(path.join(ROOT, "tombstone-multigen-"));
+    const store = new SessionStore({ dir, enabled: true, debounceMs: 60_000 });
+
+    const session = makeSession("tombstone-multigen-test");
+    const state = session.state;
+    // "edited-1" is a multi-generation msg_id (an edit left two rows in the
+    // log). It has live rows, so it is NOT an orphan — even though seqByRaw
+    // would exclude it (n > 1).
+    state.messageRefs.byRaw = {
+        "edited-1": "m00001",
+        "orphan-a": "m00002",
+    };
+    state.messageRefs.byRef = {
+        "m00001": "edited-1",
+        "m00002": "orphan-a",
+    };
+
+    // Mock unifiedLiveMsgIds to return only "edited-1" (the new method
+    // includes multi-generation ids — "edited-1" has live rows even though
+    // seqByRaw would exclude it). "orphan-a" has NO live rows.
+    const internals_ = internals(store);
+    const origLiveMsgIds = internals_.unifiedLiveMsgIds.bind(store);
+    const mockable = store as unknown as { unifiedLiveMsgIds: (id: string) => Set<string> | null };
+    mockable.unifiedLiveMsgIds = () => new Set(["edited-1"]);
+
+    try {
+        internals_.tombstoneOrphanRefs("tombstone-multigen-test", session);
+    } finally {
+        mockable.unifiedLiveMsgIds = origLiveMsgIds;
+    }
+
+    // edited-1 is live (multi-generation) → preserved.
+    assert.equal(state.messageRefs.byRaw["edited-1"], "m00001");
+    // orphan-a is NOT in the live set → tombstoned.
+    assert.equal(state.messageRefs.byRaw["orphan-a"], undefined);
+    assert.ok(state.deadRefs);
+    assert.ok(state.deadRefs.includes("m00002"));
+    assert.ok(!state.deadRefs.includes("m00001"));
 });

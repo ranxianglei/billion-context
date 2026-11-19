@@ -2038,9 +2038,8 @@ export class SessionStore {
     private tombstoneOrphanRefs(id: string, session: Session): void {
         const refs = session.state.messageRefs;
         if (!refs || Object.keys(refs.byRaw).length === 0) return;
-        const seqByRawId = this.unifiedSeqByRaw(id);
-        if (seqByRawId === null || seqByRawId.size === 0) return;
-        const liveRawIds = new Set(seqByRawId.keys());
+        const liveRawIds = this.unifiedLiveMsgIds(id);
+        if (liveRawIds === null || liveRawIds.size === 0) return;
         const orphanIds = Object.keys(refs.byRaw).filter(
             (rawId) => rawId !== REF_FLOOR_RAW_ID && !liveRawIds.has(rawId),
         );
@@ -2313,6 +2312,19 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #7258: distinct live msg_ids (any generation count). Unlike
+     *  unifiedSeqByRaw, multi-generation ids (edits) are included — they
+     *  have live rows, so their byRaw entries are not orphans. Null when the
+     *  unified store is unavailable. */
+    unifiedLiveMsgIds(id: string): Set<string> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.liveMsgIds(id);
         } catch {
             return null;
         }
