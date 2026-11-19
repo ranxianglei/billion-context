@@ -89,12 +89,13 @@ test("continuation preserves prior input/output/tools and current metadata; chec
     assert.equal(JSON.stringify(priorRequest), snapshotBefore);
 });
 
-// The session-level prewarm guard (src/responses-ws.ts:512) catches only
-// EMPTY-input probes (input.length === 0 && generate === false) and forwards
-// them verbatim without committing a checkpoint. A NON-empty prewarm (e.g. a
-// developer message + generate:false) goes through the ACP pipeline and gets
-// committed, so its generate:false leaks into the next continuation via
-// expand(). This test pins that specific trigger shape.
+// The session-level prewarm guard (isPrewarmProbe, src/responses-ws.ts)
+// forwards generate:false frames that replay no conversation turn (empty
+// input, or only developer/system/user messages) verbatim on the probe
+// relay, which still commits a #3342 checkpoint from the frame's body. A
+// history-replaying prewarm rides the ACP pipeline instead. Either way a
+// committed generate:false body can reach expand(), so this test pins the
+// guard that strips it from a later continuation.
 test("non-empty prewarm with developer message + generate:false does not poison continuation (#2966)", () => {
     const history = new ResponsesWsHistory();
     history.commit(
