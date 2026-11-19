@@ -69,6 +69,30 @@ test("#3128 limits: defaults 5/10/5 GiB, file tier, env precedence, garbage fall
     clearConfig();
 });
 
+test("#7277 large-decode admission knobs: defaults 2 / 32 MiB, file tier, env precedence, garbage falls back", () => {
+    clearConfig();
+    assert.equal(knobs.limitsMaxLargeDecodedRequests(), 2);
+    assert.equal(knobs.limitsLargeDecodedAdmissionBytes(), 32 * 1024 * 1024);
+
+    setConfig({ network: { maxLargeDecodedRequests: 4, largeDecodedAdmissionBytes: 64 * 1024 * 1024 } });
+    assert.equal(knobs.limitsMaxLargeDecodedRequests(), 4);
+    assert.equal(knobs.limitsLargeDecodedAdmissionBytes(), 64 * 1024 * 1024);
+
+    withEnv({ BILI_MAX_LARGE_DECODED_REQUESTS: "8", BILI_LARGE_DECODED_ADMISSION_BYTES: "104857600" }, () => {
+        assert.equal(knobs.limitsMaxLargeDecodedRequests(), 8);
+        assert.equal(knobs.limitsLargeDecodedAdmissionBytes(), 104857600);
+    });
+
+    // non-numeric / non-positive values resolve to the default and never throw
+    setConfig({ network: { maxLargeDecodedRequests: "big", largeDecodedAdmissionBytes: -3 } });
+    assert.equal(knobs.limitsMaxLargeDecodedRequests(), 2);
+    assert.equal(knobs.limitsLargeDecodedAdmissionBytes(), 32 * 1024 * 1024);
+    withEnv({ BILI_MAX_LARGE_DECODED_REQUESTS: "junk" }, () => {
+        assert.equal(knobs.limitsMaxLargeDecodedRequests(), 2);
+    });
+    clearConfig();
+});
+
 test("defaults: no env, no file", () => {
     clearConfig();
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);

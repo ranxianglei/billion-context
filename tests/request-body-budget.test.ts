@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync, deflateRawSync, brotliCompressSync } from "node:zlib";
 import { decodeRequestBody, DecompressedTooLargeError } from "../src/content-encoding.ts";
-import { checkOutboundBody, DecodedRequestAdmission, DecodedRequestBusyError, LARGE_DECODED_ADMISSION_BYTES, MAX_REQUEST_BYTES, MAX_DECODED_REQUEST_BYTES, OutboundBodyTooLargeError } from "../src/request-body-budget.ts";
+import { checkOutboundBody, DecodedRequestAdmission, DecodedRequestBusyError, MAX_REQUEST_BYTES, MAX_DECODED_REQUEST_BYTES, OutboundBodyTooLargeError } from "../src/request-body-budget.ts";
+import { limitsLargeDecodedAdmissionBytes } from "../src/knobs.ts";
 import { fetchWithTimeout, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 
 // #3128: assert the LEGACY byte-budget behavior at the old 100/200/100 MiB caps. Pin the
@@ -30,7 +31,16 @@ test("large decoded admission: normal requests free, two large slots, third busy
         // Two large slots, third busy.
         a.observe(MAX_REQUEST_BYTES + 1);
         b.observe(MAX_DECODED_REQUEST_BYTES);
-        assert.throws(() => c.observe(MAX_REQUEST_BYTES + 1), DecodedRequestBusyError);
+        // #7277: the refusal now carries the live diagnosis — count/limit and how
+        // long the OLDEST in-flight large request has been running — plus the
+        // "local limit, not upstream" clarification that keeps a 503 from being
+        // misread as a provider failure.
+        let busy: DecodedRequestBusyError | undefined;
+        try { c.observe(MAX_REQUEST_BYTES + 1); } catch (e) { busy = e as DecodedRequestBusyError; }
+        assert.ok(busy instanceof DecodedRequestBusyError, "third large request is refused");
+        assert.match(busy!.message, /2\/2 large requests active/);
+        assert.match(busy!.message, /oldest admitted \d+ ms ago/);
+        assert.match(busy!.message, /local bili concurrency limit, not an upstream error/);
         a.release(); a.release();
         c.observe(MAX_REQUEST_BYTES + 1);
         assert.throws(() => a.observe(MAX_REQUEST_BYTES + 1), DecodedRequestBusyError);
@@ -44,7 +54,7 @@ test("large decoded admission: normal requests free, two large slots, third busy
     // min(receive cap, 32MiB) is monotonic, so a smaller operator cap still
     // binds (the same expression the legacy phase already exercises at
     // 100MiB > 32MiB — here the band itself is the binding side).
-    const band = LARGE_DECODED_ADMISSION_BYTES;
+    const band = limitsLargeDecodedAdmissionBytes();
     assert.ok(band < MAX_REQUEST_BYTES, "the band sits below the pinned 100MiB receive cap");
     const f = new DecodedRequestAdmission(), g = new DecodedRequestAdmission(), h = new DecodedRequestAdmission();
     try {
@@ -57,6 +67,16 @@ test("large decoded admission: normal requests free, two large slots, third busy
         f.release();
         f.observe(band + 1);  // re-admit after release (idempotent within a request)
     } finally { f.release(); g.release(); h.release(); }
+});
+
+test("#7277: bare DecodedRequestBusyError (decode-layer stand-in) still constructs a valid, clarified message", () => {
+    // The decode layer (content-encoding.ts) throws a bare stand-in; the real
+    // refusal path carries the diagnostic triple. Both must stay constructible
+    // and the message must keep the "local limit, not upstream" clarification.
+    const e = new DecodedRequestBusyError();
+    assert.equal(e.name, "DecodedRequestBusyError");
+    assert.match(e.message, /large decoded request budget is busy/);
+    assert.match(e.message, /local bili concurrency limit, not an upstream error/);
 });
 
 test("every stacked decode retains its hard cap and resource failures do not fall back to raw deflate", async () => {
