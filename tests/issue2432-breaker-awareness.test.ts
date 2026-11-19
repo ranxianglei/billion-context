@@ -130,7 +130,7 @@ test("#2432/#2451: acp_status shows the armed counter and keeps reporting the li
     session.metadata["compressFailStreak"] = { n: 4, lastAt: Date.now() };
     const armed = handleAcpStatus({}, ctx);
     assert.match(armed.text, /COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: 4 \/ 3\./, "armed section with the visible counter");
-    assert.match(armed.text, /Disarms on one successful compress or 10 min/, "disarm condition stated");
+    assert.match(armed.text, /Disarms on one substantial compress \(a trivial one that saves almost nothing does not count\) or 10 min/, "disarm condition stated (#7300: a trivial fold does not count)");
     assert.ok(armed.text.includes("Compressible ranges ("), "armed surface still reports the live table — it is re-derived from the current view, and hiding it contradicts the recovery receipts that point here");
     assert.match(armed.text, /do not attempt to compress now; continue the task/, "unknown-cause armed note mirrors the receipt's STOP order instead of inventing a second command");
     assert.doesNotMatch(armed.text, /SUPPRESSED/, "no false claim that the list is hidden");
@@ -185,8 +185,8 @@ test("#2432/#2451: substrate/stale-ref verdicts annotate honestly BEFORE arming;
 
 test("#2451 review: armed + substrate-destruction reports live ranges — the receipt's recovery path is reachable", () => {
     // The armed receipt (#2432) orders: "run acp_status once, then compress
-    // ONLY a range it currently reports as compressible — one success clears
-    // this breaker." Before this fix acp_status suppressed the list whenever
+    // ONLY a range it currently reports as compressible — one substantial
+    // success clears this breaker." Before this fix acp_status suppressed the list whenever
     // armed, so the promised recovery was unreachable and the output carried
     // two contradictory orders ("do not attempt to compress now" /
     // "start a fresh conversation") — the #2360 two-orders shape.
@@ -200,7 +200,7 @@ test("#2451 review: armed + substrate-destruction reports live ranges — the re
     assert.ok(armed.includes("Compressible ranges ("), "armed substrate-destruction still reports live ranges (the receipt's single recovery step)");
     assert.match(armed, /COMPRESS CIRCUIT BREAKER: ARMED — consecutiveFailures: 4 \/ 3\./, "armed section with the visible counter");
     assert.match(armed, /re-derived from the CURRENT resent view/, "tailored recovery line replaces the blanket suppression order");
-    assert.match(armed, /one success clears this breaker/, "disarm-by-success is restated on the status surface");
+    assert.match(armed, /one substantial success clears this breaker/, "disarm-by-success is restated on the status surface (#7300: a trivial fold does not count)");
     assert.doesNotMatch(armed, /SUPPRESSED while the breaker is armed/, "no blanket suppression on the receipt's own recovery path");
     assert.doesNotMatch(armed, /Do not attempt to compress now/, "no contradictory compress ban");
     assert.doesNotMatch(armed, /start a fresh conversation/, "no second, contradictory recovery order (#2360 shape)");
