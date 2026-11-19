@@ -143,14 +143,15 @@ async function close(server: http.Server): Promise<void> {
     await new Promise<void>(resolve => server.close(() => resolve()));
 }
 
-async function throughProxy(rounds: Array<Array<Record<string, unknown>>>): Promise<{ calls: Array<Record<string, unknown>>; wire: string }> {
+async function throughProxy(rounds: Array<Array<Record<string, unknown>>>, options: { plugin?: boolean; stream?: boolean } = {}): Promise<{ calls: Array<Record<string, unknown>>; wire: string }> {
     const calls: Array<Record<string, unknown>> = [];
     const upstream = http.createServer(async (req, res) => {
         const buffers: Buffer[] = [];
         for await (const chunk of req) buffers.push(Buffer.from(chunk));
         calls.push(JSON.parse(Buffer.concat(buffers).toString()) as Record<string, unknown>);
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.end((rounds[calls.length - 1] ?? [candidate([{ text: "Unexpected retry." }], "STOP")]).map(sse).join(""));
+        const reply = rounds[calls.length - 1] ?? [candidate([{ text: "Unexpected retry." }], "STOP")];
+        res.writeHead(200, { "content-type": options.stream === false ? "application/json" : "text/event-stream" });
+        res.end(options.stream === false ? JSON.stringify(reply[0]) : reply.map(sse).join(""));
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -169,8 +170,9 @@ async function throughProxy(rounds: Array<Array<Record<string, unknown>>>): Prom
     try {
         const upstreamPort = (upstream.address() as import("node:net").AddressInfo).port;
         const proxyPort = (proxy.address() as import("node:net").AddressInfo).port;
-        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse`, {
-            method: "POST", headers: { "content-type": "application/json", "x-acp-session": `complete-frame-${proxyPort}` },
+        const method = options.stream === false ? "generateContent" : "streamGenerateContent?alt=sse";
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-2.5-pro:${method}`, {
+            method: "POST", headers: { "content-type": "application/json", "x-acp-session": `complete-frame-${proxyPort}`, ...(options.plugin ? { "x-bili-plugin": "pi", "x-bili-plugin-conversation": `complete-frame-${proxyPort}` } : {}) },
             body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "Report status then answer." }] }] }),
         });
         const wire = await response.text();
@@ -224,4 +226,39 @@ test("Google HTTP control: single-part replies remain single-part", async () => 
     const { calls, wire } = await throughProxy([[candidate([{ text: "Control answer." }]), candidate([], "STOP")]]);
     assert.equal(calls.length, 1);
     assert.deepEqual(partsOf(framesOf(wire)), [{ text: "Control answer." }]);
+});
+
+for (const mode of ["sse", "array"] as const) {
+    test(`Google ${mode}: signed ordinary text bypasses prose filtering`, async () => {
+        const signed = { text: thought, thoughtSignature: signature };
+        const events = await collect([candidate([signed]), candidate([], "STOP")], mode);
+        assert.deepEqual(partsOf(framesOf(forwarded(events))), [signed]);
+        assert.deepEqual(events.filter(event => event.kind === "text").map(event => event.delta), [thought]);
+    });
+}
+
+for (const plugin of [false, true]) {
+    for (const stream of [false, true]) {
+        test(`Google HTTP ${plugin ? "plugin" : "proxy"} ${stream ? "SSE" : "JSON"}: signed text stays byte-exact`, async () => {
+            const signed = { text: thought, thoughtSignature: signature };
+            const { calls, wire } = await throughProxy([[candidate([signed], "STOP")]], { plugin, stream });
+            assert.equal(calls.length, 1);
+            assert.deepEqual(partsOf(stream ? framesOf(wire) : [JSON.parse(wire) as Record<string, unknown>]), [signed]);
+        });
+    }
+}
+
+test("Google HTTP proxy: signed text boundaries and signatures survive a tool continuation", async () => {
+    const signedA = { text: "  Signed ordinary answer A.  ", thoughtSignature: "c2lnLWE=" };
+    const signedB = { text: "Signed ordinary answer B.\n", thoughtSignature: "c2lnLWI=" };
+    const parts = [{ text: "Unsigned prefix." }, signedA, signedB, { text: "Unsigned suffix." }];
+    const { calls, wire } = await throughProxy([
+        [candidate(parts), candidate([{ functionCall: { id: "status", name: "acp_status", args: {} }, thoughtSignature: "c3RhdHVzLXNpZw==" }], "STOP")],
+        [candidate([{ text: "Final answer." }], "STOP")],
+    ]);
+    assert.equal(calls.length, 2);
+    const visible = partsOf(framesOf(wire));
+    assert.deepEqual(visible.filter(part => part.thoughtSignature === signedA.thoughtSignature || part.thoughtSignature === signedB.thoughtSignature), [signedA, signedB]);
+    const replay = (calls[1]!.contents as Array<{ parts: Part[] }>).flatMap(content => content.parts);
+    assert.deepEqual(replay.filter(part => part.thoughtSignature === signedA.thoughtSignature || part.thoughtSignature === signedB.thoughtSignature), [signedA, signedB]);
 });

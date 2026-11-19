@@ -61,8 +61,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // unchanged below.
     // x-grok-session-id next: grok-shell (xAI's CLI) stamps its per-session
     // UUID on every model request (verified against grok-shell 1.0.34; the
-    // parallel x-grok-conv-id carries the same value and stays as a
-    // fallback). Client-specific name — same trust class as the claude
+    // parallel x-grok-conv-id carries the same value on the main conversation
+    // and stays as a fallback — but the #6884 source audit found that on the
+    // Responses-backend auxiliary paths it instead carries a TAGGED value
+    // (recap-<uuid> / btw-<uuid>), so the session id is the only trustworthy
+    // one there). Client-specific name — same trust class as the claude
     // header above: without it the request is anonymous and falls to
     // prefix-affinity, which forks every turn because grok-shell reorders
     // its replayed history head between turns.
