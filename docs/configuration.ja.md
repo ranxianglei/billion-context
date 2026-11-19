@@ -292,6 +292,8 @@
 | `compress.streamSummary` | boolean | false (unset) | — | 事前チェックの要約を、最初の試行からストリーミング（SSE）コールとして実行することを強制する。エラー駆動の自己学習は、ストリーミングを強制するアップストリームを独自に処理する（非ストリーミング要約での 400 はワンショット SSE プローブをトリガーする、#2494）が、ゲートウェイタイムアウト（例: Cloudflare HTTP 524）では決してアームしない：bili とオリジンの間にそのようなゲートウェイがある場合にこれを設定するか、単に 1 回のプローブ往復をスキップするために設定する。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最新のメッセージは、折りたたみからソフト保護される。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最新のトークンはフォールドからソフト保護される。 |
+| `compress.preserveRecentTurns` | number | off | — | 直近 N ターン（ターン = user メッセージ→次の user メッセージ）の全メッセージがソフト保護される（#4593）。 |
+| `compress.protectUserMessages` | boolean | off | — | 全 user テキストメッセージをハード保護し、圧縮不能とする（#4593）。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | フォールド可能な最小範囲（文字数）。これより短い範囲はフォールドされない。 |
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 1つの生成サマリーに対する文字数のハード上限。これを超える返信は全体として拒否される（切り詰めもリトライもされない）。外部サマライザーにはこの正確な上限が事前に通知される（#3635）。0 = 無制限。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成サマリーの文字数下限：単一範囲はこれに単独で達する必要がある。複数範囲のバッチは、その結合サマリーがこれに達した場合に合格する（#5894）。0 = 無効。外部サマライザーはサマリーごとの下限に引き続き従う（#3635）。 |
