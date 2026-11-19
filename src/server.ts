@@ -3801,7 +3801,13 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
         }
     }
     const breakdown = estimateRawBodyBreakdown(parsed);
-    return { tokens: breakdown.total, breakdown };
+    // #7013: the callers that read `tokens` (the egress window fuse and the
+    // estimate-only probe gate) ask "will the upstream accept this", so they are
+    // owed what the MODEL reads. Host transport fields (dsh_session_log …) ride
+    // the body but reach no tokenizer; counting them refused sends whose prompt
+    // fit the window. `breakdown.total` stays the raw meter for every other
+    // reader (logs, breakdown clause, tests).
+    return { tokens: breakdown.promptTotal, breakdown };
 }
 
 export async function preflightCompressIfNeeded(

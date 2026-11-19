@@ -465,6 +465,17 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
+// #7013: some top-level fields are HOST->proxy transport, never model input. DSH
+// ships its session-log envelope (`dsh_session_log`, observed up to 8 MiB on a
+// forked session's first turn) and its plugin ledger (`dsh_plugin_packages`) in
+// the same HTTP body the model request rides, but no upstream tokenizer ever
+// sees them; priced by the raw walk they inflated `other` to ~1.6M tokens and
+// the egress fuse refused sends whose real prompt was ~240K (#7013/#7189/#7099/
+// #7114). This is an EVIDENCE-PERMITLIST (same discipline as KDD #9): a key
+// joins only WITH traffic evidence naming the host field — never wholesale, so a
+// future prompt-bearing field cannot take cover here.
+const HOP_ONLY_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
     const pending: [unknown, string | undefined][] = [[parsed, undefined]];
@@ -498,6 +509,12 @@ export interface RawBodyBreakdown {
     tools: number;
     system: number;
     other: number;
+    /** Hop-only transport mass INSIDE `other` (#7013). `total` keeps counting it
+     *  — the raw meter stays raw — while a gate that asks "will an upstream
+     *  accept this" prices `promptTotal` instead. */
+    hop: number;
+    /** What the model is actually asked to read: total − hop. */
+    promptTotal: number;
 }
 
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
@@ -525,8 +542,20 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
             for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
         }
     }
+    // #7013: hop-only mass is measured apart from prompt mass. The walk above
+    // still counts it (so `total` keeps meaning "everything in the body" and the
+    // four buckets stay exhaustive); the egress fuse prices `promptTotal`.
+    let hop = 0;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (HOP_ONLY_BODY_KEYS.has(k)) hop += estimateRawBodyTokens(v);
+        }
+    }
+    const total = buckets[0] + buckets[1] + buckets[2] + buckets[3];
     return {
-        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
+        total,
+        promptTotal: total - hop,
+        hop,
         messages: buckets[0],
         tools: buckets[1],
         system: buckets[2],

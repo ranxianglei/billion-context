@@ -1040,6 +1040,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
                 log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
+                if (fuseMeasured.breakdown.hop > 0)
+                    log("warn", `413: [${prepared.session.id}] egress window fuse hop-only profile: ~${fuseMeasured.breakdown.hop.toLocaleString("en-US")} of the measured ${fuseMeasured.breakdown.total.toLocaleString("en-US")} tokens are host transport metadata (HOP_ONLY_BODY_KEYS, never sent to a model) and were not priced against the window (#7013)`);
                 const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
