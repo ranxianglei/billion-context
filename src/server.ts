@@ -3312,6 +3312,8 @@ interface PreflightFailFast {
     retryable: boolean;
     /** False when the client already disconnected — there is nothing to write. */
     respond: boolean;
+    /** Optional error code override (default: "preflight_compress_failed"). */
+    code?: string;
 }
 
 export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is PreflightFailFast {
@@ -4108,7 +4110,7 @@ export async function preflightCompressIfNeeded(
             // math, same message, same no-forward behavior — status only.
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded, code: "context_too_large" };
         }
         const declaredWindow = typeof session.metadata.effectiveContextLimit === "number" && session.metadata.effectiveContextLimit > 0
             ? session.metadata.effectiveContextLimit : 0;
@@ -4683,7 +4685,7 @@ export async function preflightCompressIfNeeded(
             const doomedMessage = `payload core text alone is ~${doomBytes} bytes even after preflight compression — at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${limit} (model=${model}); no upstream can accept it. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${doomedMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: doomedMessage, retryable: false, respond: !res.writableEnded, code: "context_too_large" };
         }
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — do not re-bet on

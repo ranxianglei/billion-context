@@ -314,8 +314,8 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
  *               retries), so only code+message survive.
  * Never throws.
  */
-export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
-    const err = { type: "server_error", code: "preflight_compress_failed", message: error.message, retryable: error.retryable };
+export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean; code?: string }, log?: (msg: string) => void): void {
+    const err = { type: "server_error", code: error.code ?? "preflight_compress_failed", message: error.message, retryable: error.retryable };
     log?.(`[acp-proxy: preflight failed after early response commit — delivering in-band: ${error.message}]`);
     try {
         if (protocol === "openai") {
