@@ -667,6 +667,13 @@ function applyTurn(
     if (!resync && retouch.length > 0) {
         const spans = entry.wireSpans;
         if (spans === null || spans === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "retouch without wire spans (cold canonical)" };
+        // Validate the complete index set before any per-entry work, so a
+        // small envelope cannot request repeated work on the same message.
+        const touched = new Set<number>();
+        for (const update of retouch) {
+            if (touched.has(update.index)) return { ok: false, status: 400, error: "duplicate retouch index", serverSeq };
+            touched.add(update.index);
+        }
         const byId = new Map(entry.msgs.map((m) => [m.id, m] as const));
         for (const r of retouch) {
             const ids = Number.isInteger(r.index) && r.index >= 0 && r.index < spans.length ? spans[r.index] : undefined;
@@ -947,6 +954,8 @@ export async function handleIncrementalTurn(
                 return jsonReply(res, 400, { error: "retouch entries must carry either message or (hash + marks)", conversationId });
             } else if (typeof obj.hash !== "string") {
                 return jsonReply(res, 400, { error: "retouch compact entries must carry hash: string", conversationId });
+            } else if (!(obj.marks as unknown[]).every((mark) => mark === null || (mark !== null && typeof mark === "object" && !Array.isArray(mark)))) {
+                return jsonReply(res, 400, { error: "retouch compact marks must be null or objects", conversationId });
             }
         }
         retouch = payload.retouch as typeof retouch;
