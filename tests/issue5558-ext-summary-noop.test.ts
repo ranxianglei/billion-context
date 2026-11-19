@@ -85,7 +85,7 @@ test("#5558: replaying an already-covered range -> ext lane reports the covering
     assert.equal(res.blocksCreated, 0);
     assert.equal(ctx.session.state.blocks.length, 1, "existing covering block untouched, none added");
     assert.ok(res.text.startsWith("[Compression no-op"), `success-shaped receipt: ${res.text}`);
-    assert.ok(res.text.includes("already compressed"), `receipt names the covering block: ${res.text}`);
+    assert.match(res.text, /covered by active block/, `receipt names the covering block: ${res.text}`);
     assert.equal(ctx.session.metadata["compressFailStreak"], undefined, "no failure streak recorded");
 });
 
