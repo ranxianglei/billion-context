@@ -105,7 +105,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 后果的精确范围:responses 线路 + GPT-6.2 及以上,每次 bili 折叠(和每次 #651 裁剪)会使编辑点之后的*活*推理项失效;模型从摘要 + 尾部可见消息继续,可能重推早先思考(OpenAI 文档载明的失效形态:回答质量可能下降,且模型花重复劳动的 token)。已关闭/较早轮次的推理在 bili 现有设计下对**所有**模型本来就有同样损失——这不是新的伤害维度。尾部保护是**可调权衡**而非契约:`compress.preserveRecentMessages: 0`(初始版本姿态)会把全部历史折掉、让模型只靠摘要干活,所以 GPT-6.2 的最坏情况落在工具本来就合法支持的配置之内,只是服务端替你把“推理部分”的保护调小了。
 
-**裁定(owner, 2026-11-19, #7144):维持现状 —— 只文档化,不加 gate。** 影响有界,对强模型丢一段思考代价低:下一个工具结果就会重新锚定推导。若出现可测症状(长链推理任务在两次折叠之间重推深度思考、token 明显翻倍),按序有现成轻杆:(1) 安静时刻折叠 gate —— 尾部为连续纯思考段时延后折叠,emergency 兑底不动;(2) gpt-6.2+ 会话设 `compress.reasoning.drop: false`,停掉 #651 这类编辑;(3) 委托官方 `/responses/compact` —— 唯一无损路径,但依赖服务端持有状态(`previous_response_id`),与上文无状态重放设计(#1954)矛盾,属另立的更大特性。(注意:src/codex-compact.ts 现有的 `/responses/compact` 处理是给 codex *伪造*压缩响应,从不调 OpenAI 端点。)
+**裁定(owner, 2026-11-19, #7144):维持现状 —— 只文档化,不加 gate。** 影响有界,对强模型丢一段思考代价低:下一个工具结果就会重新锚定推导。若出现可测症状(长链推理任务在两次折叠之间重推深度思考、token 明显翻倍),按序有现成轻杆:(1) 安静时刻折叠 gate —— 尾部为连续纯思考段时延后折叠,emergency 兑底不动;(2) gpt-6.2+ 会话设 `compress.reasoning.drop: false`,停掉 #651 这类编辑;(3) 委托官方 `/responses/compact` —— 唯一无损路径,但依赖服务端持有状态(`previous_response_id`),与无状态重放设计(#1954)矛盾,属另立的更大特性。(注意:src/codex-compact.ts 现有的 `/responses/compact` 处理是给 codex *伪造*压缩响应,从不调 OpenAI 端点。)
 
 官方文档:https://developers.openai.com/api/docs/guides/keep-prefix-unchanged.md 与 https://developers.openai.com/api/docs/guides/latest-model#gpt-6.2-astra-whats-new
 
