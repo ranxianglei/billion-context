@@ -786,7 +786,18 @@ test("install: an unattributed oversized request is refused before direct send (
         });
         assert.equal(res.status, 422);
         assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
-        assert.equal(((await res.json()) as { error: { retryable: boolean } }).error.retryable, true);
+        const err = (await res.json()) as { error: { retryable: boolean; type?: string } };
+        assert.equal(err.error.retryable, true);
+        assert.equal(err.error.type, "invalid_request_error", "the /messages shape carries the refusal as a typed error");
+        // the code lives on the non-/messages wire shape — pin it there:
+        const res2 = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+            method: "POST",
+            body: "x".repeat(MAX_SILENT_DIRECT_BODY_BYTES + 1),
+        });
+        assert.equal(res2.status, 422);
+        const err2 = (await res2.json()) as { error: { retryable: boolean; code?: string } };
+        assert.equal(err2.error.retryable, true);
+        assert.equal(err2.error.code, "context_too_large", "unified oversize code (#7244)");
     });
     assert.deepEqual(sink, [], "the oversized request must not reach the provider");
 });
