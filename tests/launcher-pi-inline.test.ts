@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { rmrf } from "./tmp-rm.ts";
+import { acquireDistFixtureLock } from "./dist-fixture-lock.ts";
 import { runLaunch } from "../src/launcher.js";
 import type { SpawnChild, SpawnFn } from "../src/launcher.js";
 import { selfPackageRoot } from "../src/plugin-install.js";
@@ -63,6 +64,7 @@ test("runLaunch pi-inline: no proxy spawned, BILI_PI_INLINE=1, attach/proxy env 
     // tests/launcher.test.ts).
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const stubbed = !fs.existsSync(distAgent);
     if (stubbed) {
         fs.mkdirSync(path.dirname(distAgent), { recursive: true });
@@ -143,6 +145,7 @@ test("runLaunch pi-inline: no proxy spawned, BILI_PI_INLINE=1, attach/proxy env 
         if (prevMitmHosts === undefined) delete process.env.BILI_MITM_HOSTS;
         else process.env.BILI_MITM_HOSTS = prevMitmHosts;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        releaseFixture();
         rmrf(home);
     }
 });
@@ -168,6 +171,7 @@ test("runLaunch pi-inline: refuses (exit 2) when the bili extension cannot load"
 
     const root = selfPackageRoot();
     const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const releaseFixture = await acquireDistFixtureLock(distAgent);
     const distBackup = `${distAgent}.bak-test`;
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
@@ -207,6 +211,7 @@ test("runLaunch pi-inline: refuses (exit 2) when the bili extension cannot load"
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
+        releaseFixture();
         rmrf(home);
     }
 });
