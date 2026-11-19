@@ -704,3 +704,50 @@ test("#7295: hold and terminal messages name the network.throttle429* settings",
         assert.ok(termMsg.message.includes("network.throttle429Scope"), "terminal message names the scope knob");
     });
 });
+
+test("#7295: provisional settlement across a quiet gap resets the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // A confirmed account hold from T0 (streak 1), then a 429 observed 20
+        // min later through the provisional (degenerate-retry) lane — the stale
+        // hold is long expired, so this is a fresh episode, not a continuation.
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 1_200_000, undefined);
+        settle(undefined);
+        const hold = activeThrottleHolds()[0]!;
+        assert.equal(hold.streak, 1, "a quiet gap starts a fresh episode even through the provisional lane");
+        assert.equal(hold.terminal, false, "no quiet-gap episode is terminal");
+    });
+});
+
+test("#7295: provisional settlement within the quiet window keeps the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // 30 s apart — inside the 60 s quiet window, so the provisional
+        // settlement continues the episode exactly like the direct path.
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 30_000, undefined);
+        settle(undefined);
+        const hold = activeThrottleHolds()[0]!;
+        assert.equal(hold.streak, 2, "within-window 429s keep the streak through the provisional lane");
+        assert.equal(hold.terminal, false, "one within-window step is not terminal");
+    });
+});
+
+test("#7295: provisional settlement onto a probed hold across a quiet gap resets the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        // A concurrent send is admitted as the probe of the expired hold and is
+        // still in flight when this send's 429 settles — the separate-ownership
+        // branch must apply the quiet-gap rule too.
+        const gate = upstreamThrottleGate(URL_A, H_CRED_A, T0 + 1_200_000);
+        assert.ok(gate.probeToken, "the expired hold admits a probe");
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 1_200_001, undefined);
+        settle(undefined);
+        for (const hold of activeThrottleHolds()) {
+            assert.equal(hold.streak, 1, "quiet gap resets the streak even when settling onto a probed hold");
+            assert.equal(hold.terminal, false, "no quiet-gap episode is terminal");
+        }
+    });
+});

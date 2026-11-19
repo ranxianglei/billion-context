@@ -670,11 +670,18 @@ function settleProvisionalObservation(
     } else if (target.probeToken !== state.probeToken) {
         // Keep separate ownership records; a response may release only its
         // own probe even when several observations converge on one scope.
-        state.streak = target.streak + 1;
+        // #7295: same quiet-gap rule as the direct observation path — a stale
+        // target starts a fresh episode instead of carrying its streak.
+        const quietGap = state.lastObservedAt - target.lastObservedAt > STREAK_QUIET_RESET_MS;
+        state.streak = quietGap ? 1 : target.streak + 1;
         state.nextAttemptAt = Math.max(state.nextAttemptAt, target.nextAttemptAt);
         storeHold(Symbol("settled upstream throttle observation"), state, preserveAccountWide);
     } else {
-        target.streak += 1;
+        // #7295: refresh the observation timestamp — a stale target must not
+        // keep a frozen lastObservedAt that misfires the quiet-gap check later.
+        const quietGap = state.lastObservedAt - target.lastObservedAt > STREAK_QUIET_RESET_MS;
+        target.streak = quietGap ? 1 : target.streak + 1;
+        target.lastObservedAt = state.lastObservedAt;
         target.nextAttemptAt = Math.max(target.nextAttemptAt, state.nextAttemptAt);
     }
 }
