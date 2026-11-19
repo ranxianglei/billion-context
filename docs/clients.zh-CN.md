@@ -24,6 +24,8 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 technical-notes.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**dsh-go 宿主(第三方安卓 App):** 该 App(`ccch1mneyyy/dsh-Go`)自带一套 dsh 运行时 —— proot rootfs 里的 dsh `0.2.2-rc.1` / node 24.22.1 / Ubuntu 24.04.5,每次 App 更新替换约 135 个 dsh 文件。上面的 profile 泳道在这里原样可用:在它的 Linux 环境里执行 `dsh plugin --profile <name> add billion-context`,引擎即挂载该 bundle 并把代理拉成自己的子进程。已在 Redmi K80 / Android 16 / arm64-v8a 上验证:首次对话经代理转发(`[window] source=plugin`、`effective window 1048576 -> 792576 (reserved 256000)`、`forward POST → api.deepseek.com/anthropic/v1/messages`),`GET /__bili/plugin/status` 的 `contextTokens` 取自 usage。该宿主的客户端是原生实现,因此只带 `dsh.client.platform: web` 的 bundle(本插件的 Context 标签页与设置页)在那里没有落点 —— 宿主面、工具与 HTTP 面板不受影响,原生界面经 `dshGo` 槽另行接入(dsh-Go 的 `docs/plugins/native-for-free.md`)。它还定义了 `preset-dsh-go-companion` 与 `preset-dsh-go-companion-full`,其内嵌的 `compaction-basic` 行应由 #4147 的结构化遍历覆盖。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:
@@ -163,6 +165,8 @@ Codex Desktop 的 Composer 预测功能有一道**客户端资格门槛**,在任
 Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。DSH 也拦截 Codex Responses WebSocket(#5838),其宿主专属生命周期见上文。
 
 **子代理配置(#2230)。** 内置 `acp_delegate` 面(三个 delegate 工具、角色、fleet 检查器——由 `bili pi` 经内嵌扩展接线)配置在 bili 自己的配置文件:`~/.config/billion-context/billion-context.json` 的 `pi.subagents` 段(布尔简写 `"pi": {"subagents": false}` 可整体关闭)。`~/.pi/acp.json` 的四键(`delegate` / `delegatePrompt` / `displayUsage` / `debug`)是已废弃的回退源——仅当段缺失时读取,段存在后完全忽略。完整字段表与 `PI_ACP_DELEGATE_*` 环境变量见 configuration.zh-CN.md 的 [`pi`](configuration.zh-CN.md#pi) 段。
+
+**nudge 可见性(模型零上下文成本,看代理注入了什么)。** 打开全局 debug 开关(`ACP_DEBUG=1` 或配置文件 `"debug": true`)后,代理每次在压缩中注入 nudge,都会在终端以**一次性临时通知**显示——每个用户 turn 一次,且在该轮模型回答之后——显示的是**逐字 wire 原文**,即模型当轮实际读到的那条临时尾随 user 消息,一字不差。通知只进终端:从不写入 session 文件,也不给模型上下文增加任何东西(nudge 进模型是既有机制的职责,这个视图只是让人看到它发生)。仅 pi inline 模式有效——spawn/attach 下代理是独立进程,看不到;覆盖 Anthropic 与 OpenAI 两条 wire 车道(pi 走 HTTP 仅有的两条);宿主没有 `ui.notify` 时此功能静默缺席。
 
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
@@ -311,6 +315,27 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**宿主代次**和**本 bili 自身的安装来源**。**OpenCode 1.x + npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)在 **OpenCode 2.x 宿主**上 —— 以及任何 **git checkout / 开发构建** —— 改写本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 本次安装的 `dist/agent/opencode-native.js`):2.x 按包的 `main` 字段(`dist/index.js`,是 CLI、没有插件定义)解析裸包名,所以裸包名在那里永远加载不出来(#3976);重跑 install(或重装到新路径)会重新生成指向当前根的 shim,2.x 配置里遗留的裸包名条目也会被自动迁移为 shim。
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
+
+### 内置 Claude Agent provider(2.x)
+
+OpenCode 2.x 内置了一个 **Claude Agent** provider(`claude-agent/*`),它驱动一个本地 Claude Code CLI。这个子进程直连 Anthropic——不从 OpenCode 发请求——所以插件的 HTTP-hook 路由永远看不到它的流量,其会话否则会不压缩地运行。在 2.x 主机上,`bili plugin install opencode` 通过在你的 opencode 配置里写入 `providers.claude-agent.settings.baseURL`(钉在 opencode 泳道的实时端口)来路由它:
+
+```json
+{
+  "providers": {
+    "claude-agent": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:<port>/bili/https://api.anthropic.com"
+      }
+    }
+  }
+}
+```
+
+- **已有安装** —— 重新运行 `bili plugin install opencode`;该条目在安装时写入,所以已有配置不会被追溯路由。
+- **端口漂移** —— 如果 opencode 泳道端口变化,钉死的 URL 会失效;`bili doctor` 会在 opencode 泳道告警,重新运行会重新钉死。
+- **你自己的代理** —— 非 bili 的 `baseURL` 会被保留不动(那是你的,不是我们要覆盖的)。
+- **已知限制** —— 压缩可用,但这些会话里 `mcp__opencode__*` bili 工具仍然没有会话状态:代理以 Claude Code 子进程的 id 为键,而非 OpenCode 的 `ses_…` id。
 
 ### OpenAI Responses WebSocket(V2)
 

@@ -8,6 +8,9 @@
  *   bili start --port 9000        override listen port
  *   bili start --host 0.0.0.0     override listen host
  *   bili start --debug            verbose logging
+ *   bili start -c NAME            named config: <configDir>/NAME.json
+ *                                  (NAME "billion-context" = the default file;
+ *                                  per-model test configs need no env vars)
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
@@ -32,7 +35,7 @@ import { startServer, restartForceCloseOf } from "./server.js";
 import { serveStartupFailurePage } from "./startup-failure-page.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
-import { configFile as defaultConfigFile } from "./paths.js";
+import { configFile as defaultConfigFile, checkNamedConfigRef } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
@@ -195,7 +198,10 @@ Options (override config file / env):
   --port <N>                       listen port (start: 8787; launcher default: random free port)
   --host <ADDR>                    listen host (default 127.0.0.1)
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
-  --config <FILE>                  path to config JSON (default: XDG location)
+  -c, --config <NAME|FILE>         config to use (default: XDG location); a bare NAME
+                                   selects <configDir>/NAME.json ("billion-context"
+                                   = billion-context.json), so per-model test configs
+                                   need no BILI_CONFIG_FILE env
   --debug                          verbose logging
   --passthrough                    forward without compression
   --no-passthrough                 force compression on (overrides config)
@@ -438,6 +444,7 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             }
             case "-F":
+            case "-c":
             case "--port":
             case "--host":
             case "--config":
@@ -451,7 +458,7 @@ export function parseArgs(argv: string[]): Parsed {
                 }
                 if (a === "--port") overrides.ACP_PORT = val;
                 else if (a === "--host") overrides.ACP_HOST = val;
-                else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
+                else if (a === "--config" || a === "-c") overrides.BILI_CONFIG_FILE = val;
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
                 else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
@@ -610,6 +617,17 @@ export function parseArgs(argv: string[]): Parsed {
 
 export async function main(): Promise<void> {
     const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    // -c/--config fail-fast: a bare NAME that resolves to a missing
+    // <configDir>/NAME.json names the typo + the available siblings instead of
+    // silently starting on an empty config (see paths.ts for path behavior).
+    const configRef = overrides.BILI_CONFIG_FILE ?? process.env.BILI_CONFIG_FILE;
+    if (configRef && command !== "help" && command !== "version") {
+        const configErr = checkNamedConfigRef(configRef);
+        if (configErr) {
+            console.error(configErr);
+            process.exit(2);
+        }
+    }
     if (command === "help") {
         process.stdout.write(HELP);
         return;

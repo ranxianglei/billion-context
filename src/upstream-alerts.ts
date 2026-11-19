@@ -92,11 +92,15 @@ function pruneStaleAlerts(now: number): void {
     }
 }
 
-/** #5146: pull the errno off a Node error when present (ECONNREFUSED, ENOTFOUND, …) so the
+/** #5146: pull the errno off a Node error or its cause (ECONNREFUSED, ENOTFOUND, …) so the
  *  /__bili/upstreams report can show WHY beyond the classified kind. undefined for non-errors. */
 function errnoCode(error: unknown): string | undefined {
-    const c = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-    return typeof c === "string" && c.length > 0 ? c : undefined;
+    for (let depth = 0; typeof error === "object" && error !== null && depth < 8; depth++) {
+        const current = error as { code?: unknown; cause?: unknown };
+        if (typeof current.code === "string" && current.code.length > 0) return current.code;
+        error = current.cause;
+    }
+    return undefined;
 }
 
 /** Record one failed model request. Dedup key (kind, host): repeats refresh
