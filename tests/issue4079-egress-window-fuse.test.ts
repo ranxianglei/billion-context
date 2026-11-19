@@ -166,6 +166,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
         assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
+        assert.match(parsed.error?.message ?? "", /Top-level keys by size: messages ~[\d,]+tok\/~[\d,]+B/, "#7273: the 413 body names the offending top-level key (the mass rides messages[] here)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
