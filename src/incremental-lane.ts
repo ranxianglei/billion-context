@@ -77,7 +77,10 @@ export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
  * conversations, side lanes) — the shape is the final word, so a marker'd
  * ordinary body replays through the normal pipeline untouched. */
 export function incrementalTurnBodyShape(raw: Buffer): boolean {
-    if (raw.length < 2 || raw.length > 64 * 1024 * 1024) return false;
+    // readBody already enforces the receive-size budget before this check.
+    // A large lane-only envelope must not fall through to ordinary upstream
+    // relay merely because its seed crosses a second, unrelated size limit.
+    if (raw.length < 2) return false;
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw.toString("utf8"));
@@ -457,10 +460,11 @@ export function recordCanonicalPointers(sessionId: string, msgs: BiliMessage[], 
                 // unparseable row -> skip; a miss keeps the previous pointers
             }
         }
+        for (const bucket of byStable.values()) bucket.reverse();
         for (let i = ptrs.length; i < msgs.length; i++) {
             const m = msgs[i]!;
             const bucket = byStable.get(stableMessageKey(m as unknown as Record<string, unknown>).replace(CLUSTER_ID_SUFFIX_RE, "$1"));
-            const seq = bucket === undefined ? undefined : bucket.shift();
+            const seq = bucket?.pop();
             if (seq === undefined) {
                 // #5155: with the debounced save the unsettled tail is the
                 // common case right after a turn — record the settled prefix

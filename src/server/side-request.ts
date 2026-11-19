@@ -6,6 +6,12 @@ import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, BLOCK_OP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 import { dshCarrierRawMarkers } from "../durable-message-guards.js";
+import { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./budget.js";
+
+// #6752: the output-budget field plumbing lives in budget.ts now (generic wire
+// plumbing, not side-lane logic); re-exported here so existing importers
+// (server.ts, tests) keep working unchanged.
+export { outputBudgetField, readOutputBudget, writeOutputBudget, type OutputBudgetField };
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -20,6 +26,23 @@ import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 // (x-bili-plugin-agent) and a known side-request agent is a side req by
 // definition regardless of budget.
 export const SIDE_REQUEST_MAX_TOKENS = 200;
+
+/** #6880: the auxiliary purposes dsh's GenerateOptions.purpose carries on the
+ *  wire today: session-title (session-title-llm), compaction (compaction-basic
+ *  summarizer), auto-review (experimental/auto-review classifyRisk),
+ *  timeline-report (experimental/timeline summary). This set is DOCUMENTATION,
+ *  not a gate: dsh's contract is "ordinary conversation requests leave purpose
+ *  unset", so ANY non-empty declared purpose on a plugin-announced request
+ *  classifies it as a side request by declaration. A brand-new sidecar purpose
+ *  needs no bili recognizer anymore — the per-feature template chain
+ *  (#2503/#4438/#5656/#5584) stays only as the fallback for pre-#6880 plugin
+ *  installs. */
+export const KNOWN_AUXILIARY_PURPOSES = new Set([
+    "session-title",
+    "compaction",
+    "auto-review",
+    "timeline-report",
+]);
 // Persona ids whose requests are side requests by intent (#1699). Main personas
 // (build/plan/general/...) are deliberately absent — they are real turns.
 export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
@@ -73,6 +96,60 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
     return false;
 }
 
+// #6548: the Responses-wire analogue of isServerToolUtilityCall. pi-web-access
+// sends its xAI web-search backend as a deliberately minimal single-shot
+// Responses body — `{ model, input, tools: [{type:"web_search"},
+// {type:"x_search"}] }` — string input, no message history, no
+// prompt_cache_key, and it exposes no config knob for extra headers or a
+// session id, so the client cannot carry an identity here. That shape is NOT
+// a conversation turn: it has no history to fingerprint and creates no
+// session state, so the #286 refusal's rationale (content-fingerprint
+// sessions would silently orphan state) does not apply to it — the refusal
+// branch forwards it verbatim instead of hard-400ing.
+// Decisive conditions (all must hold):
+//   - `input` is a plain string (the single-shot prompt); an array input is
+//     message history, and a missing input is degenerate;
+//   - non-empty tools where EVERY entry's type is a Responses server-executed
+//     search type (`web_search`, `web_search_preview`, `x_search`) — mixing
+//     ANY client-side tool (`function`, `mcp`, ...) vetoes;
+//   - no identity/history signal in the body: `previous_response_id`,
+//     `session_id` or `prompt_cache_key` present means the call chains onto
+//     a conversation (or carries an identity the #286 path already honors);
+//   - tool_choice absent, "auto" or "required", or an object forcing a
+//     DECLARED server tool; "none" vetoes (a request that forbids tool use
+//     is not a tool call), as does forcing a client tool or an unrecognized
+//     shape.
+// Deliberately proto-safe by shape alone: the Anthropic detector above
+// requires `messages`, so a Responses body can never match it — and this one
+// requires string `input`, so an Anthropic body can never match it either.
+const RESPONSES_SERVER_SEARCH_TOOL_TYPES: ReadonlySet<string> = new Set(["web_search", "web_search_preview", "x_search"]);
+
+export function isResponsesServerToolSingleShot(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (typeof p.input !== "string") return false;
+    if (typeof p.previous_response_id === "string" && p.previous_response_id !== "") return false;
+    if (typeof p.session_id === "string" && p.session_id !== "") return false;
+    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key !== "") return false;
+    const tools = p.tools;
+    if (!Array.isArray(tools) || tools.length === 0) return false;
+    const declared = new Set<string>();
+    for (const t of tools) {
+        if (t === null || typeof t !== "object") return false;
+        const type = (t as { type?: unknown }).type;
+        if (typeof type !== "string" || !RESPONSES_SERVER_SEARCH_TOOL_TYPES.has(type)) return false;
+        declared.add(type);
+    }
+    const choice = p.tool_choice;
+    if (choice === undefined) return true;
+    if (choice === "auto" || choice === "required") return true;
+    if (choice !== null && typeof choice === "object") {
+        const c = choice as { type?: unknown };
+        if (typeof c.type === "string" && declared.has(c.type)) return true;
+    }
+    return false;
+}
+
 const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
 
 /** #5073: structural identification of a tool-less structured-output utility
@@ -101,10 +178,45 @@ export function isStructuredOutputCall(parsed: unknown): boolean {
     return typeof type === "string" && STRUCTURED_FORMAT_TYPES.has(type);
 }
 
-export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
+/** #6636: structural identification of a tool-less audio-output utility
+ *  call — a TTS request on the chat wire carries a top-level `audio` object
+ *  (`{voice, format}`, OpenAI chat-completions audio output) and no tools.
+ *  It is a one-shot media side call, not an agent turn: agent turns always
+ *  carry an action surface (#546), and a TTS model behind an
+ *  OpenAI-compatible endpoint rejects the ACP decoration outright — the
+ *  injected leading system prompt 400s ("messages[0] system role is not
+ *  allowed for TTS model", Xiaomi MiMo mimo-v2.5-tts) and the per-message
+ *  <acp> prefixes would be read aloud as text. Routed through the #388 side
+ *  passthrough like the #2500/#5073 utility shapes above, so the request
+ *  leaves the machine exactly as the client wrote it.
+ *  The no-tools veto is part of the predicate (same discipline as
+ *  isStructuredOutputCall): a tool-carrying request is a main turn even
+ *  when it asks for audio output. An empty `audio` object does not count —
+ *  it carries no media request. Residual, accepted: a tool-less plain chat
+ *  turn that asks for audio output (voice-mode chat with no tools) also
+ *  rides the side lane for that one turn — it forwards verbatim and its
+ *  fold state simply does not advance; the ACP decoration is never needed
+ *  for the reply to work, and the next tool-carrying turn rejoins the full
+ *  pipeline. */
+export function isAudioOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const audio = p.audio;
+    if (audio === null || typeof audio !== "object" || Array.isArray(audio)) return false;
+    return Object.keys(audio).length > 0;
+}
+
+export function isSideRequest(parsed: unknown, requestAgent?: string, purpose?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
     if (requestAgent === "main") return false;
+    // #6880: the DECLARED purpose outranks every body heuristic. It arrives
+    // pre-gated (plugin.ts only surfaces it behind the x-bili-plugin marker),
+    // so a non-empty value is the plugin telling us — from the dispatch
+    // options it itself controls — that this call is auxiliary: route it
+    // through the #388 verbatim passthrough without content matching.
+    if (purpose !== undefined && purpose.length > 0) return true;
     const p = parsed as Record<string, unknown>;
     // #2500: BEFORE the #546 rule — a server-tool-only utility call carries
     // non-empty tools but is not an agent turn. Routed through the #388 side
@@ -120,6 +232,12 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // pair with a 400. Routed through the #388 side passthrough like the #2500
     // server-tool shape above.
     if (isStructuredOutputCall(parsed)) return true;
+    // #6636: a tool-less request asking for audio output (top-level `audio`
+    // object — TTS on the chat wire) is a one-shot media side call, not an
+    // agent turn. The ACP decoration 400s it (leading system prompt) and
+    // would corrupt the spoken text (per-message tags), so it rides the
+    // #388 side passthrough verbatim like the utility shapes above.
+    if (isAudioOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
@@ -375,6 +493,136 @@ export function isClaudeCodeTitleRequest(protocol: string | null, parsed: unknow
     return text.trimStart().startsWith(CLAUDE_CODE_TITLE_SESSION_TAG);
 }
 
+// #6884 (wire-client legs of the cross-agent session-identity audit; follow-on
+// to the pi purpose declaration in #7077): every client on the verbatim
+// session-id roster (src/session-id.ts — grok-shell, mcode, goose, CodeBuddy,
+// opencode) mints ONE id per logical conversation and per-client source review
+// confirmed the lifecycle is healthy (forks/subagents mint fresh ids with a
+// parent pointer). The exposure is elsewhere: each fires auxiliary LLM calls
+// (titles, compaction, suggestions, memory, naming) UNDER THE SAME id, and
+// their body shapes defeat isSideRequest (no tools plus a missing, small or
+// large budget), so they would enter the main session's kernel pipeline as
+// conversation turns. Each predicate below is a SHAPE only — the caller must
+// gate it on the client's own wire signal (its session header / compaction
+// header / constant User-Agent), the same trust tier as the roster itself.
+
+// mcode's title sidecar calls the model with EXACTLY ONE tool —
+// `submit_session_title` (session-title-model-adapter.ts:17, pinned budget
+// TITLE_MAX_TOKENS=1000) — under the main conversation's mvs_ id. A main turn
+// never matches: it carries mcode's full tool surface beside the title tool,
+// so the length-1 bar rejects every real turn. Name is read proto-
+// agnostically (openai `{function:{name}}` and flat `{name}`).
+export const MCODE_TITLE_TOOL = "submit_session_title";
+export function isMcodeTitleRequest(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const tools = (parsed as Record<string, unknown>).tools;
+    if (!Array.isArray(tools) || tools.length !== 1) return false;
+    const t = tools[0];
+    if (t === null || typeof t !== "object") return false;
+    const o = t as Record<string, unknown>;
+    if (o.name === MCODE_TITLE_TOOL) return true;
+    const fn = o.function;
+    return fn !== null && typeof fn === "object" && (fn as Record<string, unknown>).name === MCODE_TITLE_TOOL;
+}
+
+// mcode's prompt suggestion (default ON — fired after every accepted answer)
+// and its Goal evaluator send a tool-less, BUDGET-LESS single user message
+// reusing the main turn's resolved headers, including x-mavis-session-id
+// (prompt-suggestion-service.ts:655-692; the evaluator's 32k budget variant
+// keeps the same shape). Budget-less defeats the <=200 rung and no-tools
+// defeats the #546 main rung, so isSideRequest can never see them — hence
+// this dedicated clause. A real mcode main turn vetoes at every bar: it
+// carries the full tool surface, and turn 2+ replays assistant/tool history
+// (the role loop below rejects any non-user entry). Residual, accepted (same
+// class as #5687): a tool-less FIRST main turn under a zero-tools config rides
+// the side lane for that one turn; the next turn replays history and rejoins
+// the full pipeline. No system carrier is required (the suggestion sends
+// none) — that is the difference from isDshSingleShotSidecar.
+export function isMcodeOneShotAuxRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // The replay veto: ANY assistant/tool turn is a history resend, not a
+        // one-shot auxiliary call.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    return users === 1 && userHasContent;
+}
+
+// opencode's built-in title agent (on by default) fires CONCURRENTLY with the
+// first main turn of every root session, under the root session's OWN id
+// (runner/llm.ts:202): a single user message framed by a fixed wire template
+// (session/title.ts:37-41), no tools, and NO output budget (kind==="title" →
+// options {} — see the #1699 note at the top of this file). The #1699 defense
+// covers only PLUGIN installs (x-bili-plugin-agent: title); the caller gates
+// this clause on the opencode User-Agent (app.ts:22 — a constant format
+// "opencode/<channel>/<version>/<name>", not a plugin signal), so this closes
+// the pure-proxy gap. Both frame variants are pinned: the first-turn call and
+// the regeneration call (≤8000 chars of history, same framing).
+export const OPENCODE_TITLE_FRAME_PREFIXES: readonly string[] = [
+    "Here is the first message of the conversation:",
+    "Here is the conversation so far:",
+];
+export function isOpencodeTitleRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // No-tools veto (same discipline as every clause above).
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // Budget-LESS is part of the pinned shape (kind==="title" sends options {}):
+    // a budgeted single-user request is not the title agent's wire form.
+    if (outputBudgetField(p) !== null) return false;
+    // ONE user entry total: on the chat wires the system prompt rides INSIDE
+    // messages[] (so the entry count cannot be the bar — that is the #3149
+    // class of bug); any assistant/tool row is a replayed history and vetoes,
+    // and a second user entry does too.
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let userText: string | null = null;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        if (userText !== null) return false;
+        const c = rec.content ?? rec.parts;
+        let text = "";
+        if (typeof c === "string") {
+            text = c;
+        } else if (Array.isArray(c)) {
+            for (const b of c) {
+                if (b !== null && typeof b === "object" && typeof (b as Record<string, unknown>).text === "string") {
+                    text += (b as Record<string, unknown>).text as string;
+                }
+            }
+        }
+        userText = text;
+    }
+    if (userText === null) return false;
+    const t = userText.trimStart();
+    return OPENCODE_TITLE_FRAME_PREFIXES.some((prefix) => t.startsWith(prefix));
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the
@@ -516,49 +764,6 @@ export function stripLeakedBiliTools(parsed: unknown): boolean {
     if (!hasLeakedBiliToolsOnly(parsed)) return false;
     delete (parsed as Record<string, unknown>).tools;
     return true;
-}
-
-export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
-
-/** The declared output budget, proto-agnostically. Gemini nests it under
- *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
- *  families keep it flat, so every reader goes through these two accessors. */
-export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
-    if (!parsed || typeof parsed !== "object") return null;
-    const p = parsed as Record<string, unknown>;
-    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
-        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
-    }
-    const gen = p.generationConfig;
-    if (gen && typeof gen === "object") {
-        const v = (gen as Record<string, unknown>).maxOutputTokens;
-        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
-    }
-    return null;
-}
-
-export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
-    if (field !== "generationConfig.maxOutputTokens") {
-        const v = parsed[field];
-        return typeof v === "number" ? v : undefined;
-    }
-    const gen = parsed.generationConfig;
-    if (!gen || typeof gen !== "object") return undefined;
-    const v = (gen as Record<string, unknown>).maxOutputTokens;
-    return typeof v === "number" ? v : undefined;
-}
-
-export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
-    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
-    // sole writer so NO caller can emit a fractional token count — the clamp path already
-    // floors, but this also guards the restore path and any future caller at the type boundary.
-    const tokens = Number.isInteger(value) ? value : Math.floor(value);
-    if (field !== "generationConfig.maxOutputTokens") {
-        parsed[field] = tokens;
-        return;
-    }
-    const gen = parsed.generationConfig;
-    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
 }
 
 // #3071: absolute capability floor for the output budget when NO source knows a

@@ -31,7 +31,9 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
     const containsEcho = (text: string): boolean => containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || (absorbArmed && containsToolCallEmissionText(text));
     // Capture request evidence before a yielded proxy tool can change the context.
     const requestText = absorbArmed && parts.some(part => part && typeof part === "object"
-        && (part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text))
+        && (part as { thought?: boolean }).thought !== true
+        && !(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0)
+        && typeof part.text === "string" && containsEcho(part.text))
         ? JSON.stringify(ctx.messages) : undefined;
     for (const part of parts) {
         if (!part || typeof part !== "object") continue;
@@ -46,10 +48,12 @@ function* rewriteGoogleJsonSteps(body: unknown, ctx: RewriteCtx): Generator<Json
             continue;
         }
         if (fc) sawReal = true;
-        // #1960/KDD#10: a thought part carries a thoughtSignature the client
-        // echoes back verbatim — rewriting its text desyncs the signature and
-        // bricks replay. Strip prose only from non-thought parts.
-        if ((part as { thought?: boolean }).thought !== true && typeof part.text === "string" && containsEcho(part.text)) {
+        // #1960/KDD#10: thought parts and signed ordinary text are replayed
+        // verbatim. Rewriting their text desyncs the signed payload; strip
+        // prose only from unsigned, non-thought parts.
+        if ((part as { thought?: boolean }).thought !== true
+            && !(typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0)
+            && typeof part.text === "string" && containsEcho(part.text)) {
             ctx.log(`[tag-echo] stripped: non-stream google output ACP echo (render tags/markers/internal artifacts): ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAcpTags(part.text, absorbArmed, requestText);
         }

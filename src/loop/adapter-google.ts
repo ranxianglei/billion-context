@@ -5,7 +5,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData } from "../sse-util.js";
+import { createSseFramer, sseEventData } from "../sse-util.js";
 
 import type {
     CompressLoopAdapter,
@@ -169,6 +169,7 @@ interface GoogleChunk {
 async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<GoogleChunk> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const framer = createSseFramer();
     let buf = "";
     let mode: "unknown" | "sse" | "array" = "unknown";
     let cursor = 0;
@@ -200,14 +201,11 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                 }
             }
             if (mode === "sse") {
-                buf = normalizeSseLineEndings(buf);
-                let idx: number;
-                while ((idx = buf.indexOf("\n\n")) >= 0) {
-                    const raw = buf.slice(0, idx);
-                    buf = buf.slice(idx + 2);
+                for (const raw of framer.push(buf)) {
                     const json = dataLine(raw);
                     if (json !== null) yield { frame: raw, json };
                 }
+                buf = "";
                 continue;
             }
             for (; cursor < buf.length && !arrayDone; cursor++) {
@@ -241,17 +239,9 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
             }
         }
         if (mode === "sse") {
-            buf = finalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.finish()) {
                 const json = dataLine(raw);
                 if (json !== null) yield { frame: raw, json };
-            }
-            if (buf.trim().length > 0) {
-                const json = dataLine(buf);
-                if (json !== null) yield { frame: buf, json };
             }
         }
     } finally {
@@ -334,8 +324,9 @@ export function createGoogleAdapter(
             const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
@@ -633,13 +624,16 @@ export function createGoogleAdapter(
                         });
                         continue;
                     }
-                    const clean = tagFilter.push(part.text);
+                    // A signature may belong to ordinary text, without thought:true.
+                    // Preserve its bytes and part boundary on both replay paths.
+                    const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
+                    const clean = signed ? part.text : tagFilter.push(part.text);
                     if (clean !== part.text) {
                         editedParts ??= [...parts];
                         editedParts[i] = { ...part, text: clean };
                     }
                     if (clean.length === 0) continue;
-                    partEvents.push({ kind: "text", delta: clean, rawHandled: true });
+                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed ? { rawGooglePart: part } : {}) });
                 }
                 // Decide wire output only after every prose sibling has been
                 // cleaned. Each complete frame belongs to one event, regardless
