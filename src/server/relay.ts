@@ -48,7 +48,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
+import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes, estimateRawBodyTopKeys } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, releaseNudgeHold, rejectNudge, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -77,7 +77,7 @@ import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, measuredTopKeysClause, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
 function capOverflowOutput(body: string | Buffer, info: ContextOverflowInfo): { body: string; cap: number } | null {
@@ -1040,7 +1040,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const fuseRawTokens = fuseMeasured?.tokens;
             if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
                 log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                // #7273: the four-bucket "other" is a black box — when the fuse
+                // fires on mass the contextView never counts, name the top
+                // top-level keys (key + bytes + est. tokens) so the operator
+                // can localize the offending field without a body dump.
+                const topKeys = estimateRawBodyTopKeys(fuseMeasured.parsed);
+                const topKeysClause = topKeys.length > 0 ? measuredTopKeysClause(topKeys) : "(unparseable body)";
+                log("warn", `413: [${prepared.session.id}] egress window fuse top-level keys: ${topKeysClause}`);
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Top-level keys by size: ${topKeysClause}. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
                 else {
