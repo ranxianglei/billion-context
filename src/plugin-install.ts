@@ -1461,6 +1461,106 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
     return [`${key} -> ${shimDir} (replaced ${replaced.join(", ")})`, note];
 }
 
+// #6816: OpenCode 2.x ships a built-in Claude Agent provider (claude-agent/*)
+// that drives a local Claude Code binary and makes NO HTTP request from
+// OpenCode — the plugin's HTTP-hook routing never sees its traffic, so the
+// provider silently runs uncompressed while `bili doctor` stays green. The
+// fix routes it by pointing it at the proxy in the host config (the
+// reporter's verified workaround), pinned to the LIVE lane port — the port
+// drifts (#5127/#5129), so it is resolved per install, never hardcoded.
+const OPENCODE_CLAUDE_AGENT_PROVIDER = "claude-agent";
+
+/** #6816: the proxy origin a claude-agent baseURL must point at. */
+export function opencodeClaudeAgentBaseUrl(): string {
+    return `http://127.0.0.1:${lanePreferredPort("opencode")}/bili/https://api.anthropic.com`;
+}
+
+/** #6816: the claude-agent baseURL currently in the opencode config, if any.
+ *  Fail-open: an unreadable or malformed config reads as "not configured"
+ *  (the install path refuses to overwrite such a file anyway, §7.3). */
+export function inspectOpencodeClaudeAgent(): { file: string; baseUrl: string | undefined } {
+    const file = opencodeTargetFile();
+    let baseUrl: string | undefined;
+    try {
+        const { data } = loadOpencodeConfig(file);
+        const providers = data.providers;
+        if (isPlainMcpObject(providers)) {
+            const entry = providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+            if (isPlainMcpObject(entry)) {
+                const settings = entry.settings;
+                if (isPlainMcpObject(settings) && typeof settings.baseURL === "string") baseUrl = settings.baseURL;
+            }
+        }
+    } catch {
+        baseUrl = undefined;
+    }
+    return { file, baseUrl };
+}
+
+// #6816: route the built-in Claude Agent provider at the live lane port.
+// Merge-preserving: foreign providers and existing claude-agent settings
+// survive; a foreign baseURL is the user's explicit choice and is never
+// clobbered (§7.3). 1.x hosts have no such provider — skip there.
+function applyOpencodeClaudeAgentEntry(data: Record<string, unknown>, touched: Set<string>, notes: string[]): void {
+    if (detectOpencodeMajor() < 2) {
+        notes.push("claude-agent baseURL skipped (OpenCode 1.x has no built-in Claude Agent provider)");
+        return;
+    }
+    const url = opencodeClaudeAgentBaseUrl();
+    const providers = data.providers;
+    if (providers !== undefined && !isPlainMcpObject(providers)) {
+        notes.push('claude-agent baseURL skipped ("providers" is not an object)');
+        return;
+    }
+    const existing = isPlainMcpObject(providers) ? providers[OPENCODE_CLAUDE_AGENT_PROVIDER] : undefined;
+    if (existing !== undefined && !isPlainMcpObject(existing)) {
+        notes.push('claude-agent baseURL skipped ("providers.claude-agent" is not an object)');
+        return;
+    }
+    const settings = isPlainMcpObject(existing) ? existing.settings : undefined;
+    if (settings !== undefined && !isPlainMcpObject(settings)) {
+        notes.push('claude-agent baseURL skipped ("providers.claude-agent.settings" is not an object)');
+        return;
+    }
+    const current = isPlainMcpObject(settings) ? settings.baseURL : undefined;
+    if (typeof current === "string" && !isBiliClaudeBaseUrl(current)) {
+        notes.push(`claude-agent baseURL untouched (foreign: ${current})`);
+        return;
+    }
+    if (current === url) {
+        notes.push("claude-agent baseURL present");
+        return;
+    }
+    const nextProviders = isPlainMcpObject(providers) ? providers : {};
+    const nextEntry = isPlainMcpObject(existing) ? existing : {};
+    const nextSettings = isPlainMcpObject(settings) ? settings : {};
+    nextSettings.baseURL = url;
+    nextEntry.settings = nextSettings;
+    nextProviders[OPENCODE_CLAUDE_AGENT_PROVIDER] = nextEntry;
+    data.providers = nextProviders;
+    touched.add("providers");
+    notes.push(current === undefined ? `claude-agent baseURL -> ${url}` : `claude-agent baseURL re-pinned ${current} -> ${url}`);
+}
+
+// #6816: take back only a baseURL we could have written — a foreign one is
+// the user's and stays. Prune the emptied parents so remove leaves no husk.
+function removeOpencodeClaudeAgentEntry(data: Record<string, unknown>, touched: Set<string>, notes: string[]): void {
+    const providers = data.providers;
+    if (!isPlainMcpObject(providers)) return;
+    const entry = providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+    if (!isPlainMcpObject(entry)) return;
+    const settings = entry.settings;
+    if (!isPlainMcpObject(settings)) return;
+    const current = settings.baseURL;
+    if (typeof current !== "string" || !isBiliClaudeBaseUrl(current)) return;
+    delete settings.baseURL;
+    if (Object.keys(settings).length === 0) delete entry.settings;
+    if (Object.keys(entry).length === 0) delete providers[OPENCODE_CLAUDE_AGENT_PROVIDER];
+    if (Object.keys(providers).length === 0) delete data.providers;
+    touched.add("providers");
+    notes.push("claude-agent baseURL removed");
+}
+
 function opencodeInstall(withMcp = false): string {
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
@@ -1549,6 +1649,10 @@ function opencodeInstall(withMcp = false): string {
         notes.push("compaction.auto set to false");
     }
 
+    // #6816: the built-in Claude Agent provider bypasses HTTP-hook routing —
+    // point it at the proxy (live lane port) or leave a foreign baseURL alone.
+    applyOpencodeClaudeAgentEntry(data, touched, notes);
+
     writeOpencodeConfig(file, original, data, touched);
     return `opencode: installed -> ${file} (${notes.join("; ")})`;
 }
@@ -1600,6 +1704,9 @@ function opencodeRemove(): string {
         if (removed.includes(dir)) fs.rmSync(dir, { recursive: true, force: true });
         notes.push(`plugin removed (${removed.join(", ")})`);
     }
+
+    // #6816: take back only a bili baseURL — a foreign one is the user's.
+    removeOpencodeClaudeAgentEntry(data, touched, notes);
 
     if (notes.length > 0) {
         const cur = data.compaction as Record<string, unknown> | undefined;

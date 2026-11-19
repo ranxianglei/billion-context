@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, releaseNudgeHold, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, blockOpsTools, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -144,6 +144,27 @@ const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+/** #6880: the host's declared PURPOSE for the dispatch (dsh stamps
+ *  GenerateOptions.purpose verbatim — "session-title", "compaction",
+ *  "auto-review", "timeline-report", ...; its contract: ordinary
+ *  conversation requests leave it unset). Carries the side/main intent
+ *  that content-guessing used to approximate: a PLUGIN-ANNOUNCED request
+ *  with a non-empty purpose is a side request by declaration, no per-feature
+ *  template matching needed (the content recognizers stay as the fallback
+ *  for pre-#6880 plugin installs). Honored only behind the x-bili-plugin
+ *  marker, same trust discipline as the conversation header: an unannounced
+ *  client's purpose header is inert telemetry. */
+const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
+/** #6880 v2 wire: the post-#6883 dsh plugin stamps this sentinel for MAIN
+ *  turns (dsh leaves GenerateOptions.purpose unset for ordinary conversation,
+ *  so no real dsh purpose can collide with it). PRESENCE of the header in any
+ *  value is the declaration that this conversation's plugin announces every
+ *  dispatch's purpose — main traffic then keys the raw session id directly
+ *  (dsh mints one UUID per session, ids never recycle) instead of routing
+ *  through the persona-order ladder, and its auxiliary traffic is a declared
+ *  side request by the header alone. The sentinel itself is NOT a side:
+ *  handle.ts normalizes it back to "absent" before the side classification. */
+export const PLUGIN_PURPOSE_CONVERSATION = "conversation";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -210,6 +231,14 @@ function headerValue(headers: Record<string, string | string[] | undefined>, nam
     const s = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined;
     const t = s?.trim();
     return t && t.length > 0 ? t : undefined;
+}
+
+export function pluginPurposeHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    // #6880: purpose is a protocol-internal steering signal — honoring it
+    // without the plugin announcement would let any client that can reach
+    // the endpoint opt its traffic out of the session pipeline. A real
+    // plugin sends the marker and the purpose together.
+    return pluginAgentHeader(headers) !== undefined ? headerValue(headers, PLUGIN_PURPOSE_HEADER) : undefined;
 }
 
 export function pluginAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -2810,10 +2839,11 @@ export async function pipePluginChatWithStrip(
     // write through the request logger landed in the SAME tee file, doubling
     // every count taken from bili.log.
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: the filter released bytes that still carry echo-residue shape —
     // the leak is now observable instead of silent. Log-only; the bytes were
@@ -3288,7 +3318,10 @@ export async function pipePluginChatWithStrip(
         // #1595: clean completion but no input usage sample — name it (the
         // cut-stream paths below have sawTerminal=false, so they stay
         // distinguishable from transport failures).
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -3733,10 +3766,11 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
+                const signed = typeof p["thoughtSignature"] === "string" && p["thoughtSignature"].length > 0;
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
                         keptText = true;
                         appendReply(field, index, raw);
@@ -3832,7 +3866,10 @@ export async function pipePluginChatWithStrip(
         // structured or user data (#1039) and are excluded from the audit.
         if (!googleFrameHasNonText(ev)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // #5848 twin on the google lane: a frame carrying only empty parts has
+        // nothing a held tail must precede, and draining on it split a render tag
+        // so the remainder reached the host as prose (the #5192 shape).
+        if (!hadText && anyPending() && googleFrameHasNonText(ev)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     try {
@@ -4066,9 +4103,11 @@ export async function pipePluginJsonlWithStrip(
     // delta as a whole line, so the filters' held tails are only resolved at
     // the terminal frame / EOF / read failure — never per line (a per-line
     // flush destroys the cross-delta tag/marker state this filter exists for).
-    const onStrip = (snippet: string) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onStrip = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (commandcode plugin mode)";
+        const head = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] ${head}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
     const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
@@ -4386,8 +4425,9 @@ export async function pipePluginResponsesWithStrip(
         if (diagLastTypes.length > 5) diagLastTypes.shift();
     };
     const who = session ? `[${session.id}] ` : "";
-    const onTagDrop = (snippet: string) => {
-        loggerLog("warn", `${who}[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    const onTagDrop = (snippet: string, duringDrain?: boolean) => {
+        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag (plugin passthrough)";
+        loggerLog("warn", `${who}[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     // #2190: log-only residue audit — see the twin above.
     const onResidueWarn = (snippet: string) => {
@@ -4528,7 +4568,10 @@ export async function pipePluginResponsesWithStrip(
             markDirty(session);
         }
         // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
-        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+        if (sawTerminal && acc.inputTokens === undefined) {
+            diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
+            releaseNudgeHold(session);
+        }
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -5165,12 +5208,16 @@ function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string
             ...cand,
             content: {
                 ...cont,
-                parts: (cont["parts"] as unknown[]).map((p) =>
-                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
-                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
-                        : p,
-                ),
+                parts: (cont["parts"] as unknown[]).map((p) => {
+                    if (!p || typeof p !== "object") return p;
+                    const part = p as Record<string, unknown>;
+                    // #1960/KDD#10: ordinary text can carry a signature too.
+                    return part["thought"] !== true
+                        && !(typeof part["thoughtSignature"] === "string" && part["thoughtSignature"].length > 0)
+                        && typeof part["text"] === "string"
+                        ? { ...part, text: stripAcpTags(part["text"], drop, requestText) }
+                        : p;
+                }),
             },
         };
     });
@@ -5263,7 +5310,10 @@ export async function pipePluginJson(
             }
         }
         // #1595: parsed success body carrying no input usage report — name it.
-        if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        if (session && !sawInputSample) {
+            diagnoseSuccessWithoutUsage(session, "plugin-json");
+            releaseNudgeHold(session);
+        }
         // #1685: a non-streaming plugin response still carries the model's
         // complete tool calls — same witness feed as the SSE pipes, from the
         // one full-body parse this path already does. Observe-only (#1039).
