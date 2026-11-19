@@ -4574,7 +4574,7 @@ export async function preflightCompressIfNeeded(
             const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded, code: "context_too_large" };
         }
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
@@ -4676,7 +4676,7 @@ export async function preflightCompressIfNeeded(
             const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
-            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded, code: "context_too_large" };
         }
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
