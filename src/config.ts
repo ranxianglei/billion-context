@@ -623,6 +623,11 @@ export type CompressSettings = {
         /** A closed turn's reasoning run must exceed this many chars to be
          *  dropped (default 2048). */
         threshold?: number;
+        /** (#7144 follow-up) Also drop the reasoning of ANY closed round in
+         *  the protected tail, not only compress turns — those rounds leave
+         *  the window (and their reasoning) at the next fold anyway. The
+         *  in-flight round is never touched. Default: false. */
+        tail?: boolean;
     };
     /** [#739] Opt-in guard against gpt-5.x/gpt-6.x "lattice" reasoning truncation
      *  (reasoning stops at exactly base*n+offset tokens, default 518n-2 -> 516,
