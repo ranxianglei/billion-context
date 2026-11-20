@@ -407,6 +407,21 @@ export async function prepareOpenai(
         // synthetic acp_summary anchor is not a transcript message). The
         // watermark window pin is preserved.
         snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+        // #7064 ledger drain: on a watermark-HIT turn that snapshot is the
+        // ~2-row tail WINDOW — a verified suffix of the ledger (head check +
+        // pf-seq vouch for the prefix), NOT the complete log. Claiming rawness
+        // (lastMessagesFolded=false) makes the save present it as the raw tail,
+        // and the #3285 authoritative-set sweep then retires every prefix row
+        // the window omits — draining the msgid pin ledger (snapMsgIdLiveIds)
+        // to the window, so tryIncrementalPin sees ledger≈2 and the KDD#21
+        // tail form degrades to the full form every turn (full-list body +
+        // 100k id validation + path=full ingest, alternating with window turns).
+        // Mark the tail non-raw: persist presents the envelope view, the sweep
+        // stays off, and the ledger keeps the watermark-protected prefix live
+        // (KDD#20 水位线以下存活行). Every consumer of the flag already treats
+        // "pruned view, not raw log" as the skip-sweep / skip-append contract
+        // (persist tail selection, ingest tail_json, handoff stash, export).
+        if (wpHit !== undefined) session.lastMessagesFolded = true;
         snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
