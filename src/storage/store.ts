@@ -260,7 +260,10 @@ export interface CheckpointRow {
      /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
       *  restore (see archiveSession); the CLI surfaces both. */
      status: string;
- }
+  }
+
+/** Boot aliases need identity fields only, without web-list aggregates. */
+export type SessionAliasRow = Pick<SessionSummaryRow, "sessionId" | "label" | "protocol" | "origin" | "updatedAt">;
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
  *  JSON columns the web summaryOf needs (stats/metadata) plus block
@@ -473,6 +476,8 @@ export class UnifiedStore {
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
     readonly engineSource: SqliteEngineSource;
     private readonly db: SqliteDatabase;
+    private inheritedWatermarksUntrusted = false;
+    private readonly committedWatermarkSessions = new Set<string>();
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
     /** #5744: last periodic checkpoint result (plus its wall time) for the
@@ -1065,6 +1070,7 @@ export class UnifiedStore {
         opts?: { completeLog?: boolean },
     ): boolean {
         const s = input.session;
+        if (delta && this.inheritedWatermarksUntrusted && !this.committedWatermarkSessions.has(s.sessionId)) return false;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -1273,7 +1279,18 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
+            const existingMessages = new Map<number, { msg_id: string; identity: string; content_hash: string }>();
+            if (!delta && messages.length > 0) {
+                const rows = this.db.prepare("SELECT m.seq, m.msg_id, m.identity, m.content_hash FROM messages m " +
+                    "JOIN content c ON c.hash = m.content_hash AND c.refcount > 0 WHERE m.session_id = ?")
+                    .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string }[];
+                for (const row of rows) existingMessages.set(row.seq, row);
+            }
             for (const m of messages) {
+                const existing = existingMessages.get(m.seq);
+                if ((!m.media || m.media.length === 0) && existing && existing.msg_id === m.msgId &&
+                    existing.identity === (m.identity ?? identityOfStoredContent(m.content)) &&
+                    existing.content_hash === (m.contentHash ?? sha256Hex(m.content))) continue;
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
@@ -1625,7 +1642,10 @@ export class UnifiedStore {
             }
             return true;
         });
-        if (ok) this.maybeCheckpointWal();
+        if (ok) {
+            this.trustCommittedIngestWatermark(s.sessionId);
+            this.maybeCheckpointWal();
+        }
         return ok;
     }
 
@@ -1830,6 +1850,7 @@ export class UnifiedStore {
      *  upgrade) means "no trusted prefix": the next save runs the full
      *  ingest. Point read on the sessions PK. */
     ingestWatermark(sessionId: string): { seq: number; tailSeqs: number[] } | null {
+        if (this.inheritedWatermarksUntrusted && !this.committedWatermarkSessions.has(sessionId)) return null;
         const row = this.db
             .prepare("SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?")
             .get(sessionId) as { last_ingested_seq: number | null; tail_json: string } | undefined;
@@ -1870,21 +1891,19 @@ export class UnifiedStore {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
-    /** #3285: drop EVERY session's ingest watermark at once. A watermark
-     *  vouches "the writer that set it verified this prefix" but carries no
-     *  writer identity, so the trust must not survive a process handoff:
-     *  under the multi-process shared-directory contract (#2671) a
-     *  restart-handoff overlap (old instance still draining while the new
-     *  one boots, both sharing index.db) leaves a foreign process's rows
-     *  AND its watermark behind, and inheriting that trust lets the new
-     *  process take unverified empty deltas against rows it never wrote.
-     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
-     *  (export) must not call it. After the reset each session's first save
-     *  takes the exact full path — an authoritative replace, see
-     *  ingestSession — re-establishing trust from this process's own view.
-     *  Cost: one full ingest per saved session per boot. */
+    /** #3285: inherited pointers do not vouch for this writer's prefix.
+     *  Invalidate trust locally, preserving all durable pointers and avoiding
+     *  a startup rewrite of every large session row. Each session's first save
+     *  still takes the full authoritative path; only an outer committed save
+     *  can restore this writer's delta eligibility. Pure readers never reset. */
     resetAllIngestWatermarks(): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+        this.inheritedWatermarksUntrusted = true;
+        this.committedWatermarkSessions.clear();
+    }
+
+    trustCommittedIngestWatermark(sessionId: string): void {
+        // Unknown transaction state fails closed; releasing a savepoint is not an outer COMMIT.
+        if (this.db.inTransaction?.() === false) this.committedWatermarkSessions.add(sessionId);
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
@@ -3039,6 +3058,21 @@ export class UnifiedStore {
      *  parse, no Session hydration. Parity contract with the legacy walk
      *  (export.ts listSessions): display title = host_title ?? title;
      *  display time = latest block created_at; blocks = ALL blocks count. */
+    sessionAliasRows(): SessionAliasRow[] {
+        // Keep the summary query's table-scan order: equal-time alias ties
+        // retain its last-row-wins behavior even with a covering index.
+        const rows = this.db.prepare(
+            "SELECT session_id AS sessionId, label, protocol, origin, updated_at AS updatedAt FROM sessions NOT INDEXED",
+        ).all() as { sessionId: string; label: string | null; protocol: string | null; origin: string | null; updatedAt: number }[];
+        return rows.map((row) => ({
+            sessionId: row.sessionId,
+            label: row.label ?? undefined,
+            protocol: row.protocol ?? undefined,
+            origin: row.origin ?? undefined,
+            updatedAt: row.updatedAt,
+        }));
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         const rows = this.db
             .prepare(
