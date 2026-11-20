@@ -94,6 +94,88 @@ interface UpdateOp {
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
+/** Pure replay: apply ops (in log_seq order) on top of an existing view.
+ * Shared by the db-backed replays and the diff engine's own verification. */
+export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressViewRow[] {
+    const view: EgressViewRow[] = prev.map((r) => ({ ...r }));
+    const idxOf = (msgid: string): number => view.findIndex((r) => r.msgid === msgid);
+    for (const op of ops) {
+        if (op.type === "I") {
+            if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError("diff", `duplicate msgid ${op.msgid}`);
+            const at = op.after === null ? -1 : idxOf(op.after);
+            if (at < -1) throw new EgressStateCorruptError("diff", `insert anchor ${op.after} missing`);
+            view.splice(at + 1, 0, { msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, contentHash: op.contentHash });
+        } else if (op.type === "D") {
+            const s = idxOf(op.start);
+            const e = idxOf(op.end);
+            if (s < 0) throw new EgressStateCorruptError("diff", `delete start ${op.start} missing`);
+            if (e < 0) throw new EgressStateCorruptError("diff", `delete end ${op.end} missing`);
+            if (s > e) throw new EgressStateCorruptError("diff", "delete range inverted");
+            view.splice(s, e - s + 1);
+        } else {
+            const i = idxOf(op.msgid);
+            if (i < 0) throw new EgressStateCorruptError("diff", `update target ${op.msgid} missing`);
+            view[i] = { ...view[i], contentHash: op.contentHash };
+        }
+    }
+    return view;
+}
+
+/** Deterministic diff between two consecutive views (owner design, 4 upper
+ * cases: tail append / nudge appear+vanish / fold replace / content edit).
+ *
+ * Spine = the longest subsequence of `next` whose msgids appear in `prev` in
+ * INCREASING prev order (pointer scan, O(n+m); exact for the sparse-change
+ * regime this lane exists for). Spine rows with a changed content hash emit
+ * +U; everything else emits -D (maximal contiguous runs in PREV order) plus
+ * +I in NEXT order with the preceding row as anchor. egressReplay(prev, diff)
+ * always reproduces `next` exactly.
+ *
+ * Moves (same msgid, new position) are deliberately expressed as D+I — there
+ * is no M op; the msgid stays the identity through both ops. */
+export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): EgressOp[] {
+    const prevIdx = new Map<string, number>();
+    prev.forEach((r, i) => { if (!prevIdx.has(r.msgid)) prevIdx.set(r.msgid, i); });
+    const prevByMsg = new Map<string, EgressViewRow>();
+    prev.forEach((r) => { if (!prevByMsg.has(r.msgid)) prevByMsg.set(r.msgid, r); });
+    const spine = new Set<string>();
+    let p = -1;
+    for (const r of next) {
+        const i = prevIdx.get(r.msgid);
+        if (i !== undefined && i > p) {
+            spine.add(r.msgid);
+            p = i;
+        }
+    }
+    const ops: EgressOp[] = [];
+    let runStart: string | null = null;
+    let runEnd: string | null = null;
+    for (const r of prev) {
+        if (!spine.has(r.msgid)) {
+            if (runStart === null) runStart = r.msgid;
+            runEnd = r.msgid;
+        } else if (runStart !== null) {
+            ops.push({ type: "D", start: runStart, end: runEnd! });
+            runStart = runEnd = null;
+        }
+    }
+    if (runStart !== null) ops.push({ type: "D", start: runStart, end: runEnd! });
+    for (const r of next) {
+        if (spine.has(r.msgid)) {
+            const old = prevByMsg.get(r.msgid)!;
+            if (old.contentHash !== r.contentHash) ops.push({ type: "U", msgid: r.msgid, contentHash: r.contentHash });
+        }
+    }
+    let last: string | null = null;
+    for (const r of next) {
+        if (!spine.has(r.msgid)) {
+            ops.push({ type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, contentHash: r.contentHash });
+        }
+        last = r.msgid;
+    }
+    return ops;
+}
+
 /** Append a batch of ops to BOTH tables (state + flow) in ONE transaction.
  * Returns the assigned log_seqs in input order. */
 export function egressStateAppend(
