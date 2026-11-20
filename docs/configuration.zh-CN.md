@@ -312,7 +312,7 @@
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
 | `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
@@ -355,6 +355,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
+| `compress.reasoning.tail` | boolean | false | — | （#7144 后续）保护尾内不止 compress 轮次、任意已关闭轮次的推理块也丢弃——工具调用结果已到且其后还有消息，或助手文本不再是最后一条。这些轮次下次折叠时反正会连推理一起离开窗口，提前丢即回收 token；进行中的轮次绝不触碰。严格推理上游不受影响：#762/#2169 空回显归一化跑在丢弃之后。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
 
 **路由表字段**
@@ -412,6 +413,7 @@
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。 |
 | `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | 对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。 |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | number | (built-in) | — | spawn 前第二写者闸（#7156）内的有界宽限（毫秒）：同车道前任的监听器已消失后，等待进程真正退出的时长——排空期间其最终 flush 仍在写 index.db。非数字或非正值回退默认（envMillis 契约，#1365）。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
 | `BILI_SILENT_DIRECT_MAX_MB` | number | (built-in) | — | 静默直连超大请求保护上限（MiB）。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
@@ -2148,6 +2150,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CA_FILE` | 指向一个 PEM 文件的路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 TLS。做 HTTPS/加密连接扫描的安全软件（卡巴斯基、企业 DLP）或企业 MITM 代理会用自家 CA 重签上游：浏览器通过系统证书库信任它，但 Node 的 fetch 只读内置根证书加 `NODE_EXTRA_CA_CERTS`——于是 bili 报 `SELF_SIGNED_CERT_IN_CHAIN`，而机器上其他一切连接正常。把扫描软件/厂商根证书导出为 PEM 后设置此项（或 `NODE_EXTRA_CA_CERTS`）；或在安全软件的 HTTPS 检查中排除 node.exe。该文件与 Node 内置根证书及 `NODE_EXTRA_CA_CERTS` 条目合并——从不替换。未设置 = 当前默认信任，逐字节不变。配置键：`network.caFile`。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | dsh/opencode attach 校验中，attach 目标已挂但本进程模型通道**钉死**在其上（观察到指向它的 `/bili/…` 路由流量）时的健康等待上限（毫秒）：bili 等待目标恢复而不是 spawn 第二实例——spawn 会把会话劈成两半（模型流量保持钉死，bili 工具在另一实例上 404）。超时后大声报错，并在每次模型请求时持续重查直到目标恢复（默认 `15000`）。见 #1365。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | dsh/opencode attach 校验探测到目标已挂时，等待路由通道证据出现的宽限窗口（毫秒），超时才回退到旧的 spawn 路径（覆盖「判定早于首个请求」的竞态：t≈0 时探测失败、t≈1s 时首个模型请求才落地）（默认 `5000`）。见 #1365。 |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | spawn 前第二写者闸（#7156）内的有界宽限（毫秒）：同车道前任的监听器已消失后，等待进程真正退出的时长——排空期间其最终 flush 仍在写 index.db，所以「端口空了」不是安全条件。典型排空几秒内完成；默认值保持较小，因为宿主自身的子进程预算（~`SPAWN_BUDGET_MS`）封顶整个拉起过程（默认 `10000`）。非数字或非正值回退默认（envMillis 契约，#1365）。 |
 | `BILI_PLUGIN_BYPASS` | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：**未设置**/auto = 现状（由入站头逐请求决定）；**1/on/true** = 强制 bypass（所有请求原样透传——不注入工具、不注入 nudge、不绑定会话）；**0/off/false** = 永不 bypass（忽略任何入站 x-bili-plugin-bypass 头）；无法识别的取值按 auto 处理。按 #6220 owner 拍板仅环境变量（无配置文件键）。 |
 | `BILI_PERSIST` | 设 `0` 关闭会话持久化（仅内存，重启即丢）。 |
 | `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |

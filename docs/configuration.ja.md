@@ -309,7 +309,7 @@
 | `compress.rules` | boolean | false | — | 注入された `acp_rule` ツールを通じて配信される永続モデルリマインダー。フォールドからハード保護される。`pi/omp` は `/acp-rule` コマンドを公開する。プロキシモード専用 — プラグインモードでは無効であり、ホストがツールサーフェスを所有する。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | クライアント向けに `acp_compress` ツールを登録（グローバルレベルのみ）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | ウィンドウが埋まるにつれて成長の通知を送信する（グローバルレベルのみ）。 |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | 2048文字を超える完了ラウンドの推論実行を破棄する（デフォルトで drop: true）；厳格な推論を要求するアップストリームでは drop: false が必要。 |
 | `compress.absorb` | object | opt-in (disabled) | — | ツール結果を短い要約に即時蒸留するオプトイン機能；元データはコンテンツストアに保存される。デフォルトでは画像を含む結果のみが対象となる。 |
 | `compress.blockOps` | object | off | — | 圧縮ブロック管理用のブロックライフサイクルツール（acp_retire / acp_restore / acp_rewrite）のオプトイン；デフォルト無効により、#5765 以前のワイヤーとバイト単位で同一を維持する。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | コンテンツキャッシュと取得：大きな出力はセッションの隣接にロスカレスで保存され、先頭抜粋とポインタに置き換えられ、acp_retrieve 経由で取得される；上限や退避は行われない。 |
@@ -352,6 +352,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 入力価格に対する出力価格比。 |
 | `compress.reasoning.drop` | boolean | true | — | 閾値を超える長さの完了ラウンド推論実行を破棄する。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 完了推論実行を破棄する文字数閾値。 |
+| `compress.reasoning.tail` | boolean | false | — | (#7144 フォローアップ) 保護テール内では compress ラウンド以外に、任意のクローズ済みのラウンド（結果到着後メッセージがあるツール呼び出し、または最後のメッセージでなくなったアシスタントテキスト）の推論実行も破棄する。進行中のラウンドには一切触れない。厳格な推論アップストリームには影響なし：#762/#2169 の空白エコー正規化は破棄後に実行される。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars の非推奨エイリアス（受け入れられ、それにマッピングされる）。 _(非推奨)_ |
 
 **プロバイダールートフィールド**
@@ -409,6 +410,7 @@
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 外部デーモンに参加する際のヘルスチェック接続の期限。 |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新規に生成されたプロキシ子プロセスについて、ランチャーが待機を延長するまでの初期ヘルスウェイトウィンドウ（ms）。 |
 | `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | まだ生存しているがバインドが遅い子プロセス（低速ストレージ、AVスキャン、共有ストレージのロック競合など）に対する追加の猶予時間（ms）。生成の総予算はこれら2つの合計である。 |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | number | (built-in) | — | spawn 前の第二書き手ゲート (#7156) 内の有界猶予時間 (ms): 同じレーンの前任リスナーが消失した後、プロセスが実際に終了するまで待つ時間 — ドレイン中は最終フラッシュがまだ index.db に書き込み中です。数値でない場合や非正の値はデフォルトにフォールバックします (envMillis 契約、#1365)。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | アタッチ所有権の証拠に対する猶予期間。 |
 | `BILI_SILENT_DIRECT_MAX_MB` | number | (built-in) | — | サイレントダイレクトの過大ガード上限（MiB）。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | ルーティング前に適用されるプロバイダーURL書き換えルール。 |
@@ -2164,6 +2166,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_SILENT_DIRECT_MAX_MB` | プラグインのライブ状態スロットが欠落しているかリクエスト帰属が失われた場合、ローカルで 422 を返して直接モデルリクエストを拒否する生ボディバイトガードの上限 (MiB、> 0; 小数可) (#5405/#5408)。ガードは生バイトをカウントします — base64 膨張メディアを含む — したがって、画像中心のセッションは正しく 2 MiB を超える可能性があります; デフォルトは `8`。無効な値はデフォルトにフォールバックします。#5405、#5826 を参照。 |
 | `BILI_SPAWN_WAIT_MS` | 新しく起動されたプロキシ子プロセスの初期ヘルスウェイトウィンドウ (ms)、ランチャーが `still starting up` をログに記録してウェイトを延長する前に (デフォルト `20000`)。プロキシの pre-bind オープンパスが長時間実行される場合は拡張してください: 大きな `index.db` は bind 前に完全な DB を開きます (整合性チェック、WAL 復旧 — #4939 を参照)、そして 1 つのストアを共有する 2 つのレーンが同時にコールドスタートすると SQLite 書き込みロックを競合します (Windows で 1.7 GiB ストアの場合、最初のログ行まで 28 秒以上、出力ゼロで 60 秒以上観察)。数値でない場合や非正の値はデフォルトにフォールバックします (#1365 と同じ `envMillis` 契約)。 |
 | `BILI_SLOW_START_GRACE_MS` | まだ生存していて起動中の起動子プロセスの `BILI_SPAWN_WAIT_MS` を超えるスロースタート猶予 (ms) (#2187: AV / 初回実行ディスクアクティビティによる Windows 起動ウィンドウ 26-45 秒; 大きくまたは競合している共有ストアは、pre-bind 総時間を 60 秒以上押し上げる可能性があります)。起動総予算は 2 つのノブの合計です; 終了した子プロセスはそれでもフェイルファストします (デフォルト `40000`)。 |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | spawn 前の第二書き手ゲート (#7156) 内の有界猶予時間 (ms): 同じレーンの前任リスナーが消失した後、プロセスが実際に終了するまで待つ時間 — ドレイン中は最終フラッシュがまだ index.db に書き込み続けるため、「ポートが空いた」ことは安全条件ではありません。通常のドレインは数秒で完了します; ホスト自身の子プロセス予算 (~`SPAWN_BUDGET_MS`) が起動全体を上限するため、デフォルトは小さく保たれています (デフォルト `10000`)。数値でない場合や非正の値はデフォルトにフォールバックします (envMillis 契約、#1365)。 |
 | `BILI_PERSIST` | `0` に設定すると、セッション永続化を無効にします (メモリ内のみ、再起動で失われる)。 |
 | `BILI_PERSIST_DEBOUNCE_MS` | ディスクへの永続化書き込みのデバウンスウィンドウ (ms) (デフォルト `500`)。 |
 | `BILI_PERSIST_MAX_DELAY_MS` | 変更が到着し続ける間、保留中の永続化書き込みが待てる最大時間 (ms) — デバウンスウィンドウはすべての変更で再起動されるため、この予算が持続トラフィック下でファイルが着地することを保証します (デフォルト `5000`; 以前はセッション順序 / プレフィックスアフィニティライターでハードコード、#6058)。 |

@@ -3779,10 +3779,11 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
+                const signed = typeof p["thoughtSignature"] === "string" && p["thoughtSignature"].length > 0;
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
                         keptText = true;
                         appendReply(field, index, raw);
@@ -5220,12 +5221,16 @@ function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string
             ...cand,
             content: {
                 ...cont,
-                parts: (cont["parts"] as unknown[]).map((p) =>
-                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
-                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
-                        : p,
-                ),
+                parts: (cont["parts"] as unknown[]).map((p) => {
+                    if (!p || typeof p !== "object") return p;
+                    const part = p as Record<string, unknown>;
+                    // #1960/KDD#10: ordinary text can carry a signature too.
+                    return part["thought"] !== true
+                        && !(typeof part["thoughtSignature"] === "string" && part["thoughtSignature"].length > 0)
+                        && typeof part["text"] === "string"
+                        ? { ...part, text: stripAcpTags(part["text"], drop, requestText) }
+                        : p;
+                }),
             },
         };
     });

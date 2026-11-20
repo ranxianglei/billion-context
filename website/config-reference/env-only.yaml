@@ -236,6 +236,15 @@ entries:
     desc_en: "Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two."
     desc_zh: "对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。"
     desc_ja: "まだ生存しているがバインドが遅い子プロセス（低速ストレージ、AVスキャン、共有ストレージのロック競合など）に対する追加の猶予時間（ms）。生成の総予算はこれら2つの合計である。"
+  - key: BILI_PREDECESSOR_DRAIN_GRACE_MS
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Bounded grace (ms) inside the pre-spawn second-writer gate (#7156): after a same-lane predecessor's listener is gone, how long to wait for the PROCESS to actually exit — its final flush still writes index.db while it drains. Non-numeric or non-positive values fall back to the default (envMillis contract, #1365)."
+    desc_zh: "spawn 前第二写者闸（#7156）内的有界宽限（毫秒）：同车道前任的监听器已消失后，等待进程真正退出的时长——排空期间其最终 flush 仍在写 index.db。非数字或非正值回退默认（envMillis 契约，#1365）。"
+    desc_ja: "spawn 前の第二書き手ゲート (#7156) 内の有界猶予時間 (ms): 同じレーンの前任リスナーが消失した後、プロセスが実際に終了するまで待つ時間 — ドレイン中は最終フラッシュがまだ index.db に書き込み中です。数値でない場合や非正の値はデフォルトにフォールバックします (envMillis 契約、#1365)。"
   - key: BILI_ATTACH_EVIDENCE_GRACE_MS
     type: number
     default: "(built-in)"
