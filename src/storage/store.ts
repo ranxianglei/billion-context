@@ -25,6 +25,15 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import { hydrateSlimCcrStore } from "./slim.js";
 import {
+    egressStateAppend,
+    egressStateAt,
+    egressStateCompact,
+    egressStateView,
+    EgressStateCorruptError,
+    type EgressOp,
+    type EgressViewRow,
+} from "./egress-state.js";
+import {
     appendEgressSnapshot,
     appendFoldJournal,
     bumpEgressScopeRev,
@@ -2030,6 +2039,28 @@ export class UnifiedStore {
         }
         if (prev?.prefixRef != null && prev.prefixRef !== newRef) this.releaseContent(prev.prefixRef);
         return egressLatestRow(this.db, sessionId);
+    }
+
+    /** #6785 perf (proposal discussions/7398): EGRESS STATE LOG — op-log
+     *  outbound view. The four methods below are the store surface over
+     *  src/storage/egress-state.ts (dual table: bounded state + total flow).
+     *  Corruption throws EgressStateCorruptError — callers degrade the whole
+     *  session to the legacy full path (never a partial view). */
+    egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[] {
+        return egressStateAppend(this.db, sessionId, ops, nowMs);
+    }
+
+    egressStateView(sessionId: string): EgressViewRow[] {
+        return egressStateView(this.db, sessionId);
+    }
+
+    /** Rollback reconstruction at any log_seq (flow table is total). */
+    egressStateViewAt(sessionId: string, logSeq: number): EgressViewRow[] {
+        return egressStateAt(this.db, sessionId, logSeq);
+    }
+
+    egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number {
+        return egressStateCompact(this.db, sessionId, view, nowMs);
     }
 
     /** #5874 v2 (step 3): the egress READ — serve the newest cut row's CAS

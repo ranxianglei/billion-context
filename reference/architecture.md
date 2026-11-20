@@ -157,6 +157,7 @@ billion-context/
 │   │   ├── driver.ts             #   SQLite driver ladder: bun/node builtin, host, self-downloaded (#2833)
 │   │   ├── engine-bootstrap.ts   #   Self-downloads pinned better-sqlite3 prebuilt when no engine exists
 │   │   ├── identity.ts           #   messages-table identity hash: strips position metadata (#4390)
+│   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
 │   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)
 │   │   ├── mysql.ts              #   MySQL 8.0 backend implementing the storage contract (#3388)

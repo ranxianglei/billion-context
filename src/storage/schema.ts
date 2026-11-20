@@ -497,6 +497,37 @@ CREATE TABLE IF NOT EXISTS state_fields (
 );
 `;
 
+/** #6785 perf (proposal discussions/7398, owner design 2026-11-20): the
+ *  EGRESS STATE LOG — the op-log view of the outbound conversation (B base /
+ *  I insert / D delete-range / U update-content; anchors are msgids, never
+ *  positions). DUAL TABLES: egress_state is what serving reads and compaction
+ *  physically trims below the watermark; egress_flow is append-only and never
+ *  deleted (any log_seq stays reconstructible — rollback is based on this
+ *  table, not on client resends). The secondary index serves +U targeting and
+ *  -D endpoint resolution. Probe-first, no version bump. */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposal discussions/7398): op-log outbound view (state + flow).
+CREATE TABLE IF NOT EXISTS egress_state (
+    session_id TEXT NOT NULL,
+    log_seq INTEGER NOT NULL,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    msgid TEXT,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, log_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
+CREATE TABLE IF NOT EXISTS egress_flow (
+    session_id TEXT NOT NULL,
+    log_seq INTEGER NOT NULL,
+    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    msgid TEXT,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, log_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
+`;
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -581,6 +612,12 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'state_fields'")
         .get();
     if (!hasStateFields) db.exec(STATE_FIELDS_DDL);
+    // #6785 perf (proposal discussions/7398): the egress state log — own
+    // probe (same discipline, no version bump).
+    const hasEgressState = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
+        .get();
+    if (!hasEgressState) db.exec(EGRESS_STATE_DDL);
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the
     // session-level witness_probe. Pure additive probe-first ALTER (a dev
