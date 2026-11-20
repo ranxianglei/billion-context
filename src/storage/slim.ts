@@ -128,11 +128,13 @@ export function hydrateSlimCcrStore(
         }
     }
     if (rows.length === 0) {
-        // A slim envelope with an EMPTY ledger is only a real store when the
-        // orphans half is non-empty (a byHash-only store — host-pruned refs)
-        // and the envelope declares no byRef keys (checked above).
-        // Otherwise it is an inconsistency: the file lane stays authority.
-        return Object.keys(orphans).length > 0 ? { version: 1, byHash: orphans, byRef: {} } : null;
+        // Empty envelope + empty ledger is the ALWAYS-empty store: server.ts
+        // materializes createContentStore() ({byHash:{},byRef:{}}) for every
+        // session (contentStoreOf ?? fallback), so the column carries a slim
+        // envelope with zero refs for every plain session. The envelope's own
+        // key-set coverage check above already proved nothing is declared,
+        // so this is a COMPLETE empty store, not a partial one.
+        return { version: 1, byHash: orphans, byRef: {} };
     }
     if (!rows.every((r) => r.origContent !== null)) return null;
     const store = hydrateCcrContentStore(rows);

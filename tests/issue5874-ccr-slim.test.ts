@@ -214,3 +214,42 @@ test("ccr slim: canonical digest of a slim-restored store equals the live store'
         rm(dir);
     }
 });
+
+// #6785-review regression: the ALWAYS-empty store. Every session materializes
+// createContentStore() ({byHash:{},byRef:{}}) via contentStoreOf's ?? fallback,
+// so plain (never-compressed) sessions persist a slim envelope with ZERO
+// declared refs and ZERO ledger rows. The empty-envelope case is COMPLETE,
+// not partial: hydrating it to null desynced the unified replay (undefined)
+// from the live view (the empty store object) — a permanent structural
+// "diverged: contentStore" digest drift on every sampled verify, forcing a
+// full re-ingest per save (O(n²) at large sessions) and walking the
+// #4323 escalation → freeze chain. The key-set coverage guard above already
+// rejects envelopes that DECLARE refs the ledger lacks (the true partial case).
+test("ccr slim: empty envelope + empty ledger hydrates the empty store, digest-parity with the live view", () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-ccr-slim-empty-"));
+    const store = open(dir);
+    const raw = openSqliteDatabase(join(dir, "index.db"));
+    try {
+        const empty = { version: 1 as const, byHash: {} as Record<string, string>, byRef: {} as Record<string, unknown> };
+        store.ingestSession(planIngest(session(empty)), undefined, { completeLog: true });
+
+        // The column carries the slim empty envelope; the ledger stays empty.
+        const col = raw.db.prepare("SELECT ccr_json FROM sessions WHERE session_id = ?").get("sess-ccr") as { ccr_json: string };
+        assert.equal(col.ccr_json, JSON.stringify({ version: 1, ccrSlim: 1, byRef: {} }));
+        assert.equal(store.getCcrEntries("sess-ccr").length, 0);
+
+        // The hydration must yield the exact empty store — null is the regression.
+        const served = store.getCcr("sess-ccr");
+        assert.ok(served, "empty slim envelope must hydrate (null = the digest-drift regression)");
+        assert.deepEqual((served as { byRef: unknown }).byRef, {});
+        assert.deepEqual((served as { byHash: unknown }).byHash, {});
+        assert.equal(
+            sha(JSON.stringify(canonicalize(served))),
+            sha(JSON.stringify(canonicalize(empty))),
+            "unified replay digest must equal the live view digest for the empty store");
+    } finally {
+        raw.db.close();
+        store.close();
+        rm(dir);
+    }
+});
