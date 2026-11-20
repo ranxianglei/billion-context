@@ -159,6 +159,7 @@ test("egress serve-from-log: served bytes == legacy bytes; tool rows fall back (
         await new Promise((r) => srv.close(() => r(undefined)));
         upstream.closeAllConnections?.();
         await new Promise((r) => upstream.close(() => r(undefined)));
+        store.closeQuietly();
     } finally {
         if (savedServe === undefined) delete process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG;
         else process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG = savedServe;
