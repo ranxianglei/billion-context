@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { rmrf } from "./tmp-rm.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
@@ -46,7 +47,9 @@ function fixture(t: TestContext): { store: UnifiedStore; db: ReturnType<typeof o
     process.env.BILI_CONFIG_FILE = join(dir, "no-config.json");
     const store = UnifiedStore.open(join(dir, "index.db"));
     const db = openSqliteDatabase(join(dir, "index.db"), "node:sqlite").db;
-    t.after(() => { store.close(); db.close(); rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+    // rmrf (tests/tmp-rm.ts): the bare rmSync retry budget lost the Windows
+    // AV/indexer unlink race (#2799/#2908 family) on CI — hookFailed teardown.
+    t.after(() => { store.close(); db.close(); rmrf(dir); });
     return { store, db, dir };
 }
 
