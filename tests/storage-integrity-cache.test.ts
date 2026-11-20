@@ -227,23 +227,22 @@ test("a damaged verdict cache cannot prevent a healthy store from reopening", ()
     }
 });
 
-// #7156: the close-time cache refresh used to be unconditional on
-// lastIntegrityOk — a process that booted healthy (cache hit or sync ok) but
-// whose file was then corrupted by a CONCURRENT second writer (the incident:
-// a wedged predecessor still holding index.db when its replacement opened it)
-// stamped a FRESH "ok" verdict onto the corrupted stats at close, so every
-// later boot hit the poisoned cache, skipped the rescan, and died on the
-// first write. The refresh is now gated on there being no live foreign
-// writer: with one present, close() leaves the verdict untouched so the next
-// boot re-scans fresh.
-test("close skips the integrity-cache refresh while a live foreign writer holds the lock (#7156)", { timeout: 30_000 }, async (t) => {
+// #7156 review: the poisoning window is WIDER than the close-time refresh —
+// the boot-time scan itself races a live foreign writer (the incident's .chk
+// ok at 19:19:23 was written by a scan that ran while the wedged predecessor
+// was still writing). An ok verdict stamped in that window can describe a
+// file state that was already corrupted, and if the foreign writer dies
+// without another write, the stats never change and EVERY later boot hits
+// the poisoned cache. So: while a live foreign holder is present, no ok
+// verdict is cached AT ALL (not at the sync boot site, not in the
+// background-completion path, not at close) — the next boot re-scans fresh.
+test("a live foreign writer suppresses every ok-verdict cache write (boot, close, rescan on next boot) (#7156)", { timeout: 30_000 }, async (t) => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();
     // A live foreign process whose pid we plant in <db>.lock BEFORE open —
     // the #7156 shape (a predecessor still holding index.db when the
-    // replacement boots). open() captures it as the foreign lock holder,
-    // then overwrites the file with its own pid.
+    // replacement boots).
     const holder = spawn(process.execPath, ["--input-type=module", "-e", "setTimeout(() => {}, 30000);"], { stdio: "ignore" });
     t.after(() => { try { holder.kill("SIGKILL"); } catch { /* gone */ } });
     await new Promise<void>((resolve, reject) => {
@@ -259,22 +258,95 @@ test("close skips the integrity-cache refresh while a live foreign writer holds 
         const dbPath = join(dir, "index.db");
         writeFileSync(dbPath + ".lock", JSON.stringify({ pid: holder.pid, boot: Date.now() }));
         let skipping = "";
-        let bootCache: { at: number; ok: boolean } | null = null;
-        setLogCapture((level, m) => { if (level === "info" && m.includes("skipping the close-time integrity-cache refresh")) skipping = m; });
+        setLogCapture((level, m) => {
+            if (level === "info" && m.includes("skipping the close-time integrity-cache refresh")) skipping = m;
+        });
         try {
             const store = UnifiedStore.open(dbPath);
-            bootCache = readIntegrityCache(dbPath);
-            assert.ok(bootCache !== null && bootCache.ok === true, "boot cached an ok verdict");
+            assert.equal(readIntegrityCache(dbPath), null, "boot did NOT cache an ok verdict while a live foreign writer was present");
             store.setKv("test", "key", { x: 1 }); // a write — lands in the -wal
-            await new Promise((r) => setTimeout(r, 30)); // separate the boot/close timestamps
             store.close();
         } finally {
             setLogCapture(null);
         }
-        assert.ok(skipping.length > 0, "close() reported skipping the cache refresh for the live foreign writer");
-        const afterClose = readIntegrityCache(dbPath);
-        assert.ok(afterClose !== null, "the boot-time verdict is still present (not clobbered)");
-        assert.equal(afterClose.at, bootCache!.at, "the verdict still carries the BOOT timestamp — close() did not refresh it onto post-checkpoint stats");
+        assert.ok(skipping.length > 0, "close() reported skipping the cache refresh for the foreign writer seen in this lifetime");
+        assert.equal(readIntegrityCache(dbPath), null, "no verdict was cached at all (neither at boot nor at close)");
+        // The foreign writer is gone now — the next boot rescans fresh and
+        // restores the fast path.
+        holder.kill("SIGKILL");
+        await new Promise((r) => setTimeout(r, 100)); // let the pid actually die before the liveness probe
+        const before = integrityCheckRunsForTests();
+        const again = UnifiedStore.open(dbPath);
+        try {
+            assert.equal(integrityCheckRunsForTests(), before + 1, "the next boot re-scanned instead of trusting a stale verdict");
+            assert.equal(readIntegrityCache(dbPath)?.ok, true, "the healthy file set re-cached a PASS verdict once the foreign writer is gone");
+        } finally {
+            again.close();
+        }
+    } finally {
+        setIntegritySyncThresholdForTests(null);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// #7156 review: the same suppression applies to the BACKGROUND completion
+// path — the incident's actual cache write was a background quick_check
+// (571.9 MiB store, over the sync threshold) finishing while the predecessor
+// was still alive.
+test("a background ok verdict is not cached while a live foreign writer is present (#7156)", { timeout: 30_000 }, async (t) => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(1); // every store is "large" → background lane
+    const dir = tmpDir();
+    const holder = spawn(process.execPath, ["--input-type=module", "-e", "setTimeout(() => {}, 30000);"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch { /* gone */ } });
+    await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const tick = () => {
+            if (holder.pid !== undefined) return resolve();
+            if (Date.now() > deadline) return reject(new Error("holder pid never assigned"));
+            setTimeout(tick, 10);
+        };
+        tick();
+    });
+    try {
+        const dbPath = join(dir, "index.db");
+        writeFileSync(dbPath + ".lock", JSON.stringify({ pid: holder.pid, boot: Date.now() }));
+        const store = UnifiedStore.open(dbPath); // returns immediately; worker scans in the background
+        const done = await waitFor(() => !backgroundIntegrityInflightForTests(dbPath), 15000);
+        assert.ok(done, "background check completed within 15s");
+        assert.equal(readIntegrityCache(dbPath), null, "the ok verdict was NOT cached — the foreign writer was still alive at completion");
+        store.close();
+        assert.equal(readIntegrityCache(dbPath), null, "close() also wrote nothing");
+    } finally {
+        setIntegritySyncThresholdForTests(null);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// #7156 review: a boot whose ok verdict came from the CACHED cache (no fresh
+// scan ran in this lifetime) must NOT re-stamp the verdict at close.
+// Re-stamping an unverified verdict would perpetuate a poisoned .chk forever
+// (cache hit → close re-stamp → cache hit ...). Without the re-stamp, the
+// file set that was verified by a FRESH scan stays what is trusted; any
+// change outside verified writes invalidates the stats and forces a rescan.
+test("a cache-hit boot does not re-stamp the verdict cache at close (#7156)", () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const store = UnifiedStore.open(dbPath); // fresh sync scan
+        store.close(); // clean close of a FRESH-verdict store → re-stamp
+        const afterFirstClose = readIntegrityCache(dbPath);
+        assert.ok(afterFirstClose !== null && afterFirstClose.ok === true, "first close refreshed the verdict");
+        // Second lifetime: boot is a cache hit (no fresh scan).
+        const before = integrityCheckRunsForTests();
+        const again = UnifiedStore.open(dbPath);
+        assert.equal(integrityCheckRunsForTests(), before, "cache hit skipped the rescan");
+        again.close();
+        const afterSecondClose = readIntegrityCache(dbPath);
+        assert.ok(afterSecondClose !== null, "the verdict is still present (not clobbered)");
+        assert.equal(afterSecondClose.at, afterFirstClose.at, "the cache-hit close did NOT re-stamp the unverified verdict onto new stats");
     } finally {
         setIntegritySyncThresholdForTests(null);
         rmSync(dir, { recursive: true, force: true });

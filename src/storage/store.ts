@@ -483,11 +483,21 @@ export class UnifiedStore {
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
     private readonly dbPath: string;
-    /** #4609: the last completed check (sync, cache hit, or background
+    /** #4609: a check that RAN IN THIS LIFETIME (sync scan or background
      * verdict) said the file set is sound — a clean close then refreshes the
      * verdict cache onto the post-checkpoint stats so the next boot skips
-     * the rescan. Never true while a check is still in flight or failed. */
+     * the rescan. A boot-time CACHED-ok deliberately does NOT arm this
+     * (#7156 review): re-stamping a verdict we never re-verified would
+     * perpetuate a poisoned .chk forever (cache hit → close → re-stamp →
+     * cache hit ...); without the re-stamp the post-close stat change forces
+     * the next boot to rescan fresh. Never true while a check is still in
+     * flight or failed. */
     private lastIntegrityOk = false;
+    /** #7156 review: a live foreign writer was observed at any point in this
+     * lifetime (boot, background-check completion, close). While true, NO ok
+     * verdict may be cached: the file moved outside this process's verified
+     * writes, so every cache write site defers to the next boot's fresh scan. */
+    private sawForeignWriter = false;
     /** #5539 secondary finding: releaseContent runs once per released hash
      * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
      * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
@@ -543,11 +553,30 @@ export class UnifiedStore {
         // stale FAIL left behind by an older version is treated as a miss and
         // re-scanned fresh. BILI_STORAGE_QUICK_CHECK=0 opts out of all
         // of it (no check, no cache IO).
-        let integrityOk = false;
+        // #7156 review: read the ownership lock BEFORE any ok verdict is
+        // cached (the claim below at #4175 happens AFTER the integrity block
+        // and would overwrite this evidence). A live foreign holder means the
+        // file may change outside this process's writes while our scan runs —
+        // an ok verdict stamped in that window poisons every later boot
+        // (cache hit skips the rescan; the incident's .chk ok at 19:19:23 was
+        // written by exactly such a scan while the wedged predecessor was
+        // still writing). Fail-open like the #4175 block: unreadable means
+        // "no evidence".
+        let foreignLockPidAtBoot: number | null = null;
+        try {
+            const bootLockPath = `${path}.lock`;
+            if (existsSync(bootLockPath)) {
+                const parsed = JSON.parse(readFileSync(bootLockPath, "utf8")) as { pid?: unknown };
+                const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                if (pid !== null && pid !== process.pid && processAlive(pid)) foreignLockPidAtBoot = pid;
+            }
+        } catch {
+            /* unreadable lockfile: no evidence of a foreign writer */
+        }
+        let bootVerdictFresh = false; // this lifetime actually scanned ok (sync or background)
         const mode = integrityModeFor(path);
         if (mode.kind === "cached-ok") {
             recordIntegrityOutcome(path, true, 0, "verdict cache hit (file set unchanged since the last check)");
-            integrityOk = true;
         } else if (mode.kind === "sync") {
             noteIntegrityCheckRun();
             const started = Date.now();
@@ -591,8 +620,16 @@ export class UnifiedStore {
                 db.close();
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
-            writeIntegrityCache(path, true);
-            integrityOk = true;
+            // #7156 review: never cache an ok verdict stamped while a live
+            // foreign writer holds the lock — same reasoning as the boot-time
+            // pre-read above; the next boot re-scans fresh instead of trusting
+            // a scan that raced a second writer.
+            if (foreignLockPidAtBoot === null) {
+                writeIntegrityCache(path, true);
+            } else {
+                loggerLog("info", `[storage] quick_check passed for ${path}, but live foreign writer pid ${foreignLockPidAtBoot} holds ${path}.lock — NOT caching the ok verdict (the file may change outside this process's writes); the next boot re-scans fresh (#7156)`);
+            }
+            bootVerdictFresh = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
         // is surfaced (web wire + banner) as INFORMATIONAL ONLY. #5082: sharing
@@ -704,21 +741,43 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
         const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
-        if (integrityOk) store.noteIntegrityOk();
+        if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
+        if (bootVerdictFresh) store.noteIntegrityOk();
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status as an ALARM ONLY (2026-10-30 owner policy:
         // a running store's background verdict never refuses future boots —
         // each next boot re-scans fresh; no automatic file moves, #4175).
-        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
+        // #7156 review: the completion-side ok cache write is gated on the
+        // same foreign-writer evidence as the close-time refresh — the
+        // incident's .chk ok was written by THIS path (background quick_check
+        // started 19:19:02 while the wedged predecessor was still writing).
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(
+            path,
+            (ok) => { if (ok) store.noteIntegrityOk(); },
+            () => store.activeForeignWriter(),
+            (pid) => store.noteForeignWriterSeen(pid),
+        );
         return store;
     }
 
-    /** #4609: mark this instance's file set as verified (sync check ok,
-     * cache hit, or background verdict ok) so a clean close refreshes the
-     * verdict cache onto the post-checkpoint stats. */
+    /** #4609: mark this instance's file set as verified by a scan that ran IN
+     * THIS LIFETIME (sync or background ok) so a clean close refreshes the
+     * verdict cache onto the post-checkpoint stats. A boot-time cached ok
+     * does NOT call this — see the field comment for why re-stamping an
+     * unverified verdict would perpetuate a poisoned cache. */
     noteIntegrityOk(): void {
         this.lastIntegrityOk = true;
+    }
+
+    /** #7156 review: a live foreign writer was proven present at some point
+     * in this lifetime — suppress every ok-verdict cache write from here on
+     * (the file moved outside this process's verified writes; the next boot
+     * re-scans fresh). Idempotent; the first sighting logs. */
+    noteForeignWriterSeen(pid: number): void {
+        if (this.sawForeignWriter) return;
+        this.sawForeignWriter = true;
+        loggerLog("info", `[storage] live foreign writer pid ${pid} observed in this lifetime — the ${this.dbPath} verdict cache will not be refreshed by this process; the next boot re-scans fresh (#7156)`);
     }
 
     /** Keep paged reads on one generation without taking the writer lock. */
@@ -767,13 +826,15 @@ export class UnifiedStore {
         // next boot re-scans fresh. A read-only foreign opener is a safe false
         // positive (it only costs one extra rescan, never a wrong verdict).
         if (!backgroundIntegrityInflightForTests(this.dbPath)) {
-            if (this.lastIntegrityOk) {
+            if (this.lastIntegrityOk && !this.sawForeignWriter) {
                 const foreign = this.activeForeignWriter();
                 if (foreign === null) {
                     writeIntegrityCache(this.dbPath, true);
                 } else {
                     loggerLog("info", `[storage] skipping the close-time integrity-cache refresh for ${this.dbPath}: live foreign writer pid ${foreign} present — the file may have changed outside this process's verified writes, so the next boot re-scans fresh (#7156)`);
                 }
+            } else if (this.lastIntegrityOk && this.sawForeignWriter) {
+                loggerLog("info", `[storage] skipping the close-time integrity-cache refresh for ${this.dbPath}: a live foreign writer was seen during this lifetime — the file may have changed outside this process's verified writes, so the next boot re-scans fresh (#7156)`);
             }
         }
         // #4175: release the ownership lockfile on a clean close so the next
