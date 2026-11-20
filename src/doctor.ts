@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { isPidAlive, listInstances, procMainScript } from "./instance.js";
-import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, detectOpencodeMajor, inspectLanePresence, inspectOpencodeClaudeAgent, isBiliClaudeBaseUrl, opencodeClaudeAgentBaseUrl, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
@@ -313,6 +313,24 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
             // no marker or unreadable — nothing to surface
         }
         if (warnings.length > 0) row.warnings = warnings;
+    }
+    if (agent === "opencode" && presence.installed) {
+        // #6816: the built-in Claude Agent provider (OpenCode 2.x) makes no
+        // HTTP request, so the plugin's HTTP-hook routing never sees it — an
+        // installed plugin with an unrouted provider is silently inactive.
+        // Advisory only: never change the verdict. The 1.x host has no such
+        // provider, so the check is gated on the host major.
+        if (detectOpencodeMajor() >= 2) {
+            const live = opencodeClaudeAgentBaseUrl();
+            const { baseUrl } = inspectOpencodeClaudeAgent();
+            if (baseUrl === undefined) {
+                row.warnings = [...(row.warnings ?? []), "claude-agent provider is not routed through bili: OpenCode 2.x ships a built-in Claude Agent provider (claude-agent/*) whose requests never reach the proxy, so its sessions run uncompressed and the mcp__opencode__* tools have no session state — rerun 'bili plugin install opencode' to route it"];
+            } else if (!isBiliClaudeBaseUrl(baseUrl)) {
+                row.warnings = [...(row.warnings ?? []), `claude-agent provider baseURL is not a bili URL (${baseUrl}) — its sessions bypass bili entirely; rerun 'bili plugin install opencode' to route it, or leave it if intentional`];
+            } else if (baseUrl !== live) {
+                row.warnings = [...(row.warnings ?? []), `claude-agent provider baseURL points at a stale port (${baseUrl}) — the live opencode lane is ${live}; rerun 'bili plugin install opencode' to re-pin it`];
+            }
+        }
     }
     return [row];
 }

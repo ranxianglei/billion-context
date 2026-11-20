@@ -158,6 +158,12 @@ export const LIVE_FILES = [
     // _setSpawnForTest). Both arms reset the module-level origin plane in
     // `finally`, so rows cannot leak into each other.
     "tests/issue7176-dead-attach-origin-release.test.ts",
+    // #7156: the close-time cache-refresh gate test spawns ONE bare `node -e`
+    // dummy child purely as a live PID holder for the <db>.lock fixture — no
+    // ports, no servers, mkdtemp-isolated per test, SIGKILL'd in t.after, so
+    // the zone band is irrelevant; the entry is for the tripwire, like
+    // #5046/#4612.
+    "tests/storage-integrity-cache.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
