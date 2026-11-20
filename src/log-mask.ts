@@ -294,7 +294,20 @@ function isIpv4Literal(s: string): boolean {
 }
 
 function isLoopbackIp(ip: string): boolean {
-    return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
+    if (ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0") return true;
+    if (!ip.startsWith("127.")) return false;
+    if (isIpv4Literal(ip)) return true;
+    // The prefix alone also matches private DNS names such as
+    // 127.relay.internal. Preserve numeric aliases accepted by Node URLs
+    // (127.1, 127.0x1, etc.) only when they normalize to an actual IPv4
+    // loopback address; never interpret URL syntax as part of a host.
+    if (!/^[0-9a-fx.]+$/i.test(ip)) return false;
+    try {
+        const normalized = new URL(`http://${ip}`).hostname;
+        return normalized.startsWith("127.") && isIpv4Literal(normalized);
+    } catch {
+        return false;
+    }
 }
 
 /** #4254: is this a loopback host name/address? Loopback identifies a LOCAL
@@ -312,8 +325,10 @@ export function isLoopbackHost(host: string): boolean {
  *  is masked with its port kept. Used by the upstream-failure egress path so one
  *  message never mixes a raw loopback next to a masked <private-host>. */
 export function maskHostPortForDisplay(target: string): string {
-    const i = target.lastIndexOf(":");
-    if (i <= 0) return isLoopbackHost(target) ? target : maskHostForLog(target);
+    // A bracketed address can have no port (new URL("http://[::1]").host).
+    // Only the colon after the closing bracket can delimit its port.
+    const i = target.startsWith("[") ? target.indexOf("]") + 1 : target.lastIndexOf(":");
+    if (i <= 0 || i === target.length) return isLoopbackHost(target) ? target : maskHostForLog(target);
     const host = target.slice(0, i);
     return `${isLoopbackHost(host) ? host : maskHostForLog(host)}${target.slice(i)}`;
 }
