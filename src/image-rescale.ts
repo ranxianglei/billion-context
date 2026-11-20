@@ -167,7 +167,7 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
         // Re-check the gate against the AUTHORITATIVE dims (the header parse
         // may have failed for exotic containers).
         const scale = Math.min(1, maxDim / Math.max(ow, oh));
-        if (scale >= 1 && (!force || origBytes <= RESCALE_TRIGGER_BYTES)) return null;
+        if (scale >= 1 && origBytes <= RESCALE_TRIGGER_BYTES) return null;
         const tw = Math.max(1, Math.round(ow * scale));
         const th = Math.max(1, Math.round(oh * scale));
         if (tw !== ow || th !== oh) await img.resize({ w: tw, h: th });
