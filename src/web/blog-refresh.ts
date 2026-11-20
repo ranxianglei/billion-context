@@ -307,7 +307,7 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
         if (!Array.isArray(raw)) throw new Error("contents listing is not a JSON array");
         return raw as ContentsEntry[];
     } finally {
-        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -328,7 +328,7 @@ async function fetchPlainText(url: string, account?: (bytes: number) => void): P
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
-        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -350,7 +350,7 @@ async function fetchApiText(rel: string, account?: (bytes: number) => void): Pro
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
-        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -398,7 +398,7 @@ async function fetchPlainImage(url: string, account?: (bytes: number) => void): 
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
-        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
 }
@@ -424,9 +424,13 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
-        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        await releaseUnreadBody(result.response);
         result.stopIdleTimer();
     }
+}
+
+async function releaseUnreadBody(response: Response): Promise<void> {
+    if (!response.bodyUsed) await response.body?.cancel().catch(() => {});
 }
 
 function decodeCappedBase64(content: string, maxBytes: number): Buffer | undefined {
