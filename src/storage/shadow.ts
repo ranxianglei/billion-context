@@ -727,6 +727,7 @@ export class UnifiedShadow {
                 for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
+                warnCorruptSkips(id, builder);
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
                 return builder.finish() as LegacySessionLike;
@@ -1312,6 +1313,7 @@ export class UnifiedShadow {
                     for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
+                    warnCorruptSkips(id, builder);
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;
@@ -1537,6 +1539,25 @@ function warnTailGaps(id: string, view: { tailGaps?: number }): void {
     }
 }
 
+/** #7335: poison-row isolation report — unparseable rows the builder skipped
+ *  so a single corrupt row cannot abort the whole load (previously one bad
+ *  row threw out of finish(), the session was rebuilt from scratch and every
+ *  block and ref was discarded). */
+function warnCorruptSkips(
+    id: string,
+    builder: { skippedCorruptRows: { table: string; key: string; error: string }[] },
+): void {
+    const rows = builder.skippedCorruptRows;
+    if (rows.length > 0) {
+        loggerLog(
+            "warn",
+            `[storage] unified view degraded for ${id}: ${rows.length} unparseable row(s) skipped (${rows
+                .map((r) => `${r.table} ${r.key}: ${r.error}`)
+                .join("; ")}); the session loaded without them (#7335)`,
+        );
+    }
+}
+
 function shadowDigest(view: unknown): string {
     return canonicalDigest(view);
 }
@@ -1620,7 +1641,17 @@ class BatchedViewVerification {
 
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
-            const raw = JSON.parse(row.content);
+            let raw: unknown;
+            try {
+                raw = JSON.parse(row.content);
+            } catch {
+                // #7335: a poisoned row must not abort the whole save — the
+                // verify-sample throw retried on every subsequent save until
+                // the store was cleaned. Skip it and mark drift so the
+                // comparison surfaces the disagreement loudly instead.
+                this.changed("messages");
+                continue;
+            }
             this.messages.set(row.seq, { sig: messageSignature(raw), raw });
         }
     }
