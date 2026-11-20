@@ -23,7 +23,10 @@ import { UnifiedStore } from "../src/storage/store.ts";
 //      aborting the whole load.
 
 function seed(id: string): LegacySessionLike {
-    const messages = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, role: "user" as const, contentType: "text" as const, text: `original ${i}`, ts: 1000 + i }));
+    // No `ts`: it rides a dedicated column and never the content bytes
+    // (#4313), so a stamped message would digest-drift on every verify-sample
+    // and mask whether the corruption is what the drift actually came from.
+    const messages = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, role: "user" as const, contentType: "text" as const, text: `original ${i}` }));
     const blocks: LegacySessionLike["state"]["blocks"] = messages.map((message, i) => ({
         blockId: `b${i}`, runId: "r1", tier: 1, summary: `summary ${i}`, directMessageIds: [message.id],
         effectiveMessageIds: [message.id], directBlockIds: [], compressedTokens: 1, createdAt: 1,
@@ -148,6 +151,28 @@ test("verify-sample: one unparseable message row marks drift instead of failing 
     // watermark drop, drift latch, escalation streak), not as a verify-sample
     // throw that failed every subsequent save until the store was cleaned by
     // hand (the incident's symptom #5).
+    assert.equal(shadow.stats.verifySamples, 1);
+    assert.equal(shadow.stats.verifyDrift, 1);
+    assert.match(shadow.stats.lastError ?? "", /digest drift/);
+});
+
+test("verify-sample: one unparseable block content row marks drift instead of failing every save", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    // Poison the CAS body of block b0's full summary — the sibling parse
+    // site of the message row above, reached through the verifier's block
+    // replay (BatchedViewVerification.addBlocks). The CAS is insert-if-absent,
+    // so the poisoned row survives the re-ingest and the sampled read-back
+    // is the surface that sees it.
+    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" }, (record) => record as LegacySessionLike);
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    assert.doesNotThrow(() => shadow.record(seed("target")));
     assert.equal(shadow.stats.verifySamples, 1);
     assert.equal(shadow.stats.verifyDrift, 1);
     assert.match(shadow.stats.lastError ?? "", /digest drift/);
