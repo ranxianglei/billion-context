@@ -45,7 +45,7 @@ import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
-import type { CoreMessage, MessageContentStore } from "acp-kernel";
+import type { CompressionBlock, CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
 // alarm-only by design (files stay put; the operator repairs/moves them by
@@ -969,11 +969,15 @@ export class UnifiedShadow {
                 }
                 if (fields.blockContents) {
                     const contents: NonNullable<ResidentFields["blockContents"]> = new Map();
+                    const corruptSkips: { table: "messages" | "blocks"; key: string; error: string }[] = [];
                     for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
                         const page = store.getBlockContents(id, { limit: VIEW_READ_BATCH_SIZE, offset });
                         const blocks = Array.isArray(page) ? page : [];
-                        appendBlockContents(contents, blocks);
+                        appendBlockContents(contents, blocks, corruptSkips);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    if (corruptSkips.length > 0) {
+                        loggerLog("warn", `[storage] resident block contents degraded for ${id}: ${corruptSkips.length} unparseable row(s) skipped (${corruptSkips.map((s) => s.key).join(", ")})`);
                     }
                     mergeOrphanBlockContents(contents, JSON.stringify(store.getOrphanViews(id) ?? {}));
                     result.blockContents = contents;
@@ -1919,11 +1923,28 @@ class BatchedViewVerification {
 
     addBlocks(rows: BlockRow[]): void {
         for (const row of rows) {
-            const payload = JSON.parse(row.payloadJson);
+            let payload: CompressionBlock;
+            try {
+                payload = JSON.parse(row.payloadJson);
+            } catch {
+                // #7335: a poisoned block row must not abort the whole save —
+                // mark drift so the comparison surfaces it loudly, and keep
+                // positional alignment for the slots that follow.
+                this.changed("state");
+                this.blockCount++;
+                continue;
+            }
             if (payload?.active === true) this.activeBlocks++;
             if (this.blockCount >= this.legacy.state.blocks.length || shadowDigest(payload) !== shadowDigest(this.legacy.state.blocks[this.blockCount])) this.changed("state");
             this.blockCount++;
-            this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
+            try {
+                this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
+            } catch {
+                // #7335: poisoned summary/one CAS row — the block slot above
+                // already compared; the unreadable text is drift, not a crash.
+                this.changed("blockContents");
+                this.remainingContents.delete(row.blockId);
+            }
             // A current block wins over an identically named journal entry.
             this.orphans.delete(row.blockId);
         }

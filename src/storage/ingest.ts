@@ -705,13 +705,25 @@ interface LegacyView {
 
 type BlockContents = LegacyView["blockContents"];
 
-/** Shared by full-view and resident-field reads; each page is released after parsing. */
-export function appendBlockContents(contents: BlockContents, rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[]): void {
+/** Shared by full-view and resident-field reads; each page is released after parsing.
+ *  #7335: a poisoned summary/one CAS row (stored bytes no longer parse) is skipped and
+ *  reported through `skipped` instead of aborting the whole load — the block's state row
+ *  survives, completeBlockContents falls back to the block's own inline summary for the
+ *  missing text, and the next full ingest re-points the row at the synthesized content. */
+export function appendBlockContents(
+    contents: BlockContents,
+    rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[],
+    skipped?: { table: "messages" | "blocks"; key: string; error: string }[],
+): void {
     for (const b of rows) {
-        contents.set(b.blockId, {
-            one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
-            full: JSON.parse(b.summary) as BlockView,
-        });
+        try {
+            contents.set(b.blockId, {
+                one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
+                full: JSON.parse(b.summary) as BlockView,
+            });
+        } catch (err) {
+            skipped?.push({ table: "blocks", key: `content:${b.blockId}`, error: String(err) });
+        }
     }
 }
 
@@ -847,7 +859,7 @@ export class LegacyViewBuilder {
                 this.skippedCorruptRows.push({ table: "blocks", key: String(b.blockId), error: String(err) });
             }
         }
-        appendBlockContents(this.blockContents, rows);
+        appendBlockContents(this.blockContents, rows, this.skippedCorruptRows);
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {
