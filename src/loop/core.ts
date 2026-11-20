@@ -3,6 +3,7 @@ import {
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import type { HandoffReply } from "../server/handoff-response.js";
 import { estimateCoreMessages } from "../preflight.js";
@@ -240,6 +241,14 @@ export interface LoopCtx {
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
+    /** #2404: this request's prepare-time nudge — the pre-fold offer the model
+     *  acted on. postCompressTail bases "remaining ranges" on it (minus the
+     *  just-folded spans) instead of a post-fold recompute, which would advance
+     *  the protection window and leak newly-de-protected ranges into the receipt
+     *  (zero-growth chained folds + prefix-cache thrash). The plugin lane stores
+     *  this in transient.pluginMessages (rememberPluginMessages) and now passes
+     *  it through here; lanes without one fall back to the live recompute. */
+    lastNudge?: NudgeDecision;
     session: Session;
     reply?: HandoffReply;
     log: (msg: string) => void;
