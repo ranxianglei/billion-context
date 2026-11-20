@@ -47,14 +47,20 @@ function fixture(t: TestContext): { store: UnifiedStore; db: ReturnType<typeof o
     process.env.BILI_CONFIG_FILE = join(dir, "no-config.json");
     const store = UnifiedStore.open(join(dir, "index.db"));
     const db = openSqliteDatabase(join(dir, "index.db"), "node:sqlite").db;
-    // rmrf (tests/tmp-rm.ts): the bare rmSync retry budget lost the Windows
-    // AV/indexer unlink race (#2799/#2908 family) on CI — hookFailed teardown.
-    t.after(() => { store.close(); db.close(); rmrf(dir); });
+    // Teardown ordering: node:test runs t.after hooks in REGISTRATION order
+    // (FIFO), so this hook — registered first — closes only the fixture's own
+    // connections. Each test registers a later hook that closes the shadow
+    // (if any) and runs rmrf; deleting the dir while the shadow's connection
+    // is still open is a deterministic EBUSY on Windows (unlink of an open
+    // file), not an AV flake. rmrf (tests/tmp-rm.ts) keeps the exponential
+    // retry ladder for the true external AV/indexer race (#2799/#2908).
+    t.after(() => { store.close(); db.close(); });
     return { store, db, dir };
 }
 
 test("writer: mismatched precomputed digest is refused, nothing persists", (t) => {
-    const { store, db } = fixture(t);
+    const { store, db, dir } = fixture(t);
+    t.after(() => rmrf(dir));
     const clean = planIngest(seed("target"));
     assert.equal(store.ingestSession(clean, undefined, { completeLog: true }), true);
 
@@ -82,7 +88,7 @@ test("reader: one unparseable message row degrades the view instead of aborting 
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
-    t.after(() => shadow.close());
+    t.after(() => { shadow.close(); rmrf(dir); });
     const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
     assert.ok(view, "the session must still load with one corrupt row");
     // The corrupt row is skipped; everything else survives.
@@ -100,7 +106,7 @@ test("reader: one unparseable block payload degrades the view instead of abortin
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
-    t.after(() => shadow.close());
+    t.after(() => { shadow.close(); rmrf(dir); });
     const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
     assert.ok(view, "the session must still load with one corrupt block row");
     assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt block row");
@@ -120,7 +126,7 @@ test("reader: one unparseable block summary CAS row degrades the view instead of
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
-    t.after(() => shadow.close());
+    t.after(() => { shadow.close(); rmrf(dir); });
     const view = shadow.viewFor("target") as LegacySessionLike | null;
     assert.ok(view, "the session must still load with one corrupt block content row");
     assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt block content row");
@@ -146,7 +152,7 @@ test("verify-sample: one unparseable message row marks drift instead of failing 
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" }, (record) => record as LegacySessionLike);
     assert.ok(shadow);
-    t.after(() => shadow.close());
+    t.after(() => { shadow.close(); rmrf(dir); });
     // The host's LIVE record still carries the message in memory — that is
     // what record() receives, not the degraded view.
     assert.doesNotThrow(() => shadow.record(seed("target")));
@@ -174,7 +180,7 @@ test("verify-sample: one unparseable block content row marks drift instead of fa
 
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" }, (record) => record as LegacySessionLike);
     assert.ok(shadow);
-    t.after(() => shadow.close());
+    t.after(() => { shadow.close(); rmrf(dir); });
     assert.doesNotThrow(() => shadow.record(seed("target")));
     assert.equal(shadow.stats.verifySamples, 1);
     assert.equal(shadow.stats.verifyDrift, 1);
