@@ -191,19 +191,18 @@ test("a purpose header without the x-bili-plugin marker is inert", async () => {
     }
 });
 
-test("a declared dsh compaction is guarded even when the INSTRUCTION text drifted", async () => {
+test("#7380: a declared compaction on a session with NO fold blocks is a plugin background call — forwarded, not refused", async () => {
     const h = await harness();
     try {
-        // dsh bumped its compaction INSTRUCTION template; the tracked prefix
-        // no longer matches (the #2193 failure mode) — but the plugin
-        // declaration still carries the purpose.
-        const driftedInstruction = "Please compress the prior conversation. " + DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 3);
-        const body = { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: "old work" }, { role: "assistant", content: "ok" }, { role: "user", content: driftedInstruction }] };
+        // dsh-mneme's dream consolidation declares purpose=compaction but rides
+        // a background session with one message and zero fold blocks — no
+        // compression substrate to shadow, so the #1729 guard does not apply.
+        // The content-marker branch (isDshCompactionCall) is not triggered
+        // because the final user message is NOT the COMPACTION_INSTRUCTION.
+        const body = { model: "fake-a", max_completion_tokens: 8192, stream: false, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: "consolidate the dream notes" }] };
         const r = await h.dshSend("conv5", body, undefined, "compaction");
-        assert.equal(r.status, 422, "declared compaction is refused like its text-matched twin");
-        const err = r.body?.error as { code?: string };
-        assert.equal(err?.code, "dsh_compaction_refused");
-        assert.equal(h.forwarded.length, 0, "the refused call never reaches the upstream");
+        assert.equal(r.status, 200, "no fold blocks: the declared compaction forwards normally");
+        assert.equal(h.forwarded.length, 1, "the call reaches the upstream");
     } finally {
         await h.close();
     }

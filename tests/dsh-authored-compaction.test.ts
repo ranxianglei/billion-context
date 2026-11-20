@@ -388,6 +388,22 @@ test("e2e: knob off → the #1729 refusal still stands (status quo pinned)", asy
     });
 });
 
+test("#7380: declared compaction WITH fold blocks is still guarded (knob off) — the #6880 intent preserved", async () => {
+    await withHarness(async (h) => {
+        await armBlock(h, "s-decl");
+        process.env.BILI_DSH_AUTHORED_COMPACTION = "0";
+        // The declared purpose is the signal, not the instruction text — the
+        // text here is a drifted variant that would not match the content
+        // marker. With fold blocks present, the #1729 guard still applies.
+        const r = await turn(h, "s-decl", [
+            { role: "user", content: "Please compress the prior conversation. [drifted]" },
+        ], { "x-bili-plugin": "dsh", "x-bili-plugin-purpose": "compaction" });
+        assert.equal(r.status, 422, r.body);
+        assert.equal(JSON.parse(r.body).error.code, "dsh_compaction_refused");
+        assert.equal(h.bodies.filter((b) => b.includes("drifted")).length, 0, "never forwarded");
+    });
+});
+
 test("e2e: no active blocks → authored mode falls through to refusal", async () => {
     await withHarness(async (h) => {
         process.env.BILI_DSH_AUTHORED_COMPACTION = "1";

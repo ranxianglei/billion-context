@@ -2616,7 +2616,18 @@ async function handleRequest(
         // installs; dsh-only, like the text path's trust domain.
         const declaredDshCompaction = pluginAgentHeader(req.headers) === "dsh"
             && declaredPurpose === "compaction";
-        if (protocol !== null && (isDshCompactionCall(protocol, parsed) || declaredDshCompaction)) {
+        // #7380: a DECLARED compaction (post-#6880 x-bili-plugin-purpose:
+        // compaction) on a session with no active fold block is a plugin
+        // background call (e.g. dsh-mneme's dream consolidation), not a real
+        // dsh compaction — no compression substrate to shadow, so the #1729
+        // guard does not apply: forward normally. The content-marker branch
+        // (isDshCompactionCall) stays unconditional: a final user message that
+        // IS the COMPACTION_INSTRUCTION is a definitive real-compaction signal
+        // regardless of fold blocks.
+        const hasActiveFoldBlock = session.state.blocks.some((b) => b.active);
+        const guardApplies = isDshCompactionCall(protocol, parsed)
+            || (declaredDshCompaction && hasActiveFoldBlock);
+        if (protocol !== null && guardApplies) {
             // #6880: the log must state the ACTUAL identification basis — a
             // declared compaction is recognized by declaration even when the
             // INSTRUCTION text has drifted (the exact case this declaration
@@ -2635,7 +2646,7 @@ async function handleRequest(
             // an authored answer is bili answering the call, never passing it
             // through. Undecidable shapes (null forge) fall through to the
             // refusal below.
-            const forgeText = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
+            const forgeText = dshAuthoredCompactionEnabled() && hasActiveFoldBlock
                 ? renderDshAuthoredCheckpoint(session)
                 : null;
             // #5811: size the forged usage from the FORGED RESPONSE, not the
