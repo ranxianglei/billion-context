@@ -79,6 +79,7 @@ import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
 import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
 import { DeltaReanchorError } from "./fastpath.js";
+import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -695,12 +696,29 @@ async function handleRequest(
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
     let parsed: unknown = null;
     let bodyText: string | undefined;
+    let bodyParseDeferred = false;
     if (protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
-        try {
-            parsed = JSON.parse(bodyText);
-        } catch {
-            parsed = null;
+        // #7398 perf: a multi-MiB OpenAI body on the pf handshake is a
+        // plugin-lane resend whose conversation array the fastpath/delta lane
+        // never needs whole (byte span scan + window-only parse). The full
+        // JSON.parse costs 150-600ms here for nothing on a hit, so synthesize
+        // `parsed` from the span scan (top-level fields only; messages stays
+        // the null marker). prepareOpenai re-parses the full body exactly once
+        // if — and only if — the lanes miss. No pf header / small body /
+        // unscannable shape / any field-span parse failure = legacy parse,
+        // byte-for-byte the old behavior.
+        const pfProto = req.headers["x-bili-pf-count"] !== undefined || req.headers["x-bili-pf-delta"] !== undefined || req.headers["x-bili-pf-tail-ids"] !== undefined;
+        if (protocol === "openai" && pfProto && bodyBuffer.length >= 1048576) {
+            const synth = synthesizeTopLevel(bodyText);
+            if (synth !== null) { parsed = synth; bodyParseDeferred = true; }
+        }
+        if (!bodyParseDeferred) {
+            try {
+                parsed = JSON.parse(bodyText);
+            } catch {
+                parsed = null;
+            }
         }
     }
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
@@ -851,7 +869,7 @@ async function handleRequest(
     const throttleModel = v1Model ?? googleModel ?? vertexModel ?? bodyModel;
     if ((protocol === "anthropic" || protocol === "openai") && parsed !== null) {
         const p = typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
-        if (!p || !Array.isArray(p.messages)) {
+        if (!p || (p.messages !== null && !Array.isArray(p.messages))) {
             const relayKey = `${upstreamOrigin}${urlPath}`;
             if (!nonConversationRelayWarned.has(relayKey)) {
                 nonConversationRelayWarned.add(relayKey);
@@ -3262,7 +3280,7 @@ async function handleRequest(
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, bodyParseDeferred)
                           : pureChainContinuation
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
                             : responsesCompact

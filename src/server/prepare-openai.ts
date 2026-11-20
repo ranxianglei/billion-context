@@ -82,6 +82,7 @@ export async function prepareOpenai(
     billingUpstream?: string,
     decide?: DecideConfig,
     bodyText?: string,
+    bodyParseDeferred = false,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -193,6 +194,15 @@ export async function prepareOpenai(
         } else {
             wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
             log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
+        }
+        // #7398 perf: the deferral gate skipped the full JSON.parse in handle.ts
+        // (150-600ms on a 155MiB resend). The lanes above only consumed the span
+        // scan + window fragments; a miss — or the gates staying closed — means
+        // the legacy path needs the whole conversation array, so parse it exactly
+        // once, here. A throw is equivalent to the legacy parse failure (same
+        // catch in handle.ts).
+        if (bodyParseDeferred && !wpOutcome?.hit && !Array.isArray(parsed.messages) && bodyText !== undefined) {
+            parsed = JSON.parse(bodyText) as OpenAIRequestBody;
         }
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
