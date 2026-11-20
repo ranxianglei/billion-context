@@ -16,7 +16,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -30,6 +30,7 @@ import {
     setIntegritySyncThresholdForTests,
     backgroundIntegrityInflightForTests,
 } from "../src/storage/integrity-check.js";
+import { DatabaseSync } from "node:sqlite";
 
 function tmpDir(): string {
     return mkdtempSync(join(tmpdir(), "bili-integrity-"));
@@ -376,3 +377,102 @@ test("close still refreshes the integrity cache when no foreign writer is presen
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+// Seeds a real db whose WAL holds committed frames, and keeps the seeding
+// connection OPEN — the last connection closing would auto-checkpoint and
+// delete the -wal, destroying the very state under test. Returns the wal size.
+function seedWal(dir: string): { seed: DatabaseSync; dbPath: string; walSize: number } {
+    const dbPath = join(dir, "index.db");
+    const seed = new DatabaseSync(dbPath);
+    try {
+        seed.exec("PRAGMA journal_mode=WAL;");
+        seed.exec("CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT);");
+        const ins = seed.prepare("INSERT INTO t (k, v) VALUES (?, ?);");
+        for (let i = 0; i < 50; i++) ins.run("k" + i, "v".repeat(200));
+    } catch (err) {
+        seed.close();
+        throw err;
+    }
+    const walSize = statSync(dbPath + "-wal").size;
+    assert.ok(walSize > 0, "the seeded WAL holds committed frames");
+    return { seed, dbPath, walSize };
+}
+
+// #7156 fix 2 (owner 2026-11-20): the corruption vector is not merely "two
+// writers" — it is a TRUNCATE checkpoint reclaiming the WAL + its -shm index
+// state out from under a peer that still holds a STALE view of it. The
+// incident's old sidecar ran exactly this: its shutdown checkpoint while its
+// replacement was already writing. So while a live foreign writer is proven
+// present (the #4175 lockfile), NEITHER the open-time nor the close-time
+// TRUNCATE checkpoint runs — the WAL simply stays until the peer exits and
+// the next clean pass converges it. Nothing is lost by the skip: WAL frames
+// are durable and are replayed/checkpointed by whoever closes cleanly later.
+test("a live foreign writer suppresses the WAL checkpoint (TRUNCATE) on open and close (#7156 fix 2)", { timeout: 30_000 }, async (t) => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    const holder = spawn(process.execPath, ["--input-type=module", "-e", "setTimeout(() => {}, 30000);"], { stdio: "ignore" });
+    t.after(() => { try { holder.kill("SIGKILL"); } catch { /* gone */ } });
+    await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const tick = () => {
+            if (holder.pid !== undefined) return resolve();
+            if (Date.now() > deadline) return reject(new Error("holder pid never assigned"));
+            setTimeout(tick, 10);
+        };
+        tick();
+    });
+    let seed: DatabaseSync | null = null;
+    try {
+        // ---- foreign writer present: both checkpoints must SKIP ----
+        const seeded = seedWal(dir);
+        seed = seeded.seed;
+        const dbPath = join(dir, "index.db");
+        writeFileSync(dbPath + ".lock", JSON.stringify({ pid: holder.pid, boot: Date.now() }));
+        let skipOpen = "", skipClose = "";
+        setLogCapture((level, m) => {
+            const msg = String(m);
+            if (level === "info" && msg.includes("live foreign writer pid")) {
+                if (msg.includes("on open")) skipOpen = msg;
+                if (msg.includes("on close")) skipClose = msg;
+            }
+        });
+        try {
+            const store = UnifiedStore.open(dbPath);
+            // TRUNCATE would have reclaimed the seeded frames (wal → 0, then
+            // small bootstrap writes); with the skip the seeded frames must
+            // still be IN the wal, so its size can only have grown.
+            assert.ok(walSizeOf(dbPath) >= seeded.walSize, `open() did NOT truncate the WAL out from under the live peer (now ${walSizeOf(dbPath)}, seeded ${seeded.walSize})`);
+            assert.ok(skipOpen.length > 0, `open reported the checkpoint skip: ${skipOpen}`);
+            store.setKv("test", "key", { x: 1 }); // a committed frame stays in the WAL
+            store.close();
+            assert.ok(statSync(dbPath + "-wal").size > 0, "close() did NOT run the final checkpoint under a live peer — the WAL stays for the peer's next clean pass");
+            assert.ok(skipClose.length > 0, `close reported the checkpoint skip: ${skipClose}`);
+            assert.ok(skipOpen.includes(String(holder.pid)), "the skip log names the peer pid");
+        } finally {
+            setLogCapture(null);
+        }
+        seed?.close();
+
+        // ---- control: no foreign writer → both checkpoints run ----
+        const dir2 = tmpDir();
+        t.after(() => rmSync(dir2, { recursive: true, force: true }));
+        seed = seedWal(dir2).seed;
+        const db2 = join(dir2, "index.db");
+        const store2 = UnifiedStore.open(db2);
+        assert.equal(walSizeOf(db2), 0, "open() ran the TRUNCATE checkpoint (fast path preserved without a peer)");
+        store2.setKv("test", "key", { x: 1 });
+        assert.ok(walSizeOf(db2) > 0, "the committed frame is in the WAL before close");
+        store2.close();
+        assert.equal(walSizeOf(db2), 0, "close() converged the WAL (single-writer behavior unchanged)");
+        // seed is closed by the outer finally.
+    } finally {
+        seed?.close();
+        setIntegritySyncThresholdForTests(null);
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+function walSizeOf(dbPath: string): number {
+    try { return statSync(dbPath + "-wal").size; } catch { return 0; }
+}

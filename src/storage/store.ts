@@ -728,6 +728,9 @@ export class UnifiedStore {
             if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
             throw err;
         }
+        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+        if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
+        if (bootVerdictFresh) store.noteIntegrityOk();
         // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
         // loss never reaches close()). Moving committed frames into the main db
         // now shortens the NEXT crash's recovery replay. Isolated from the open
@@ -735,14 +738,27 @@ export class UnifiedStore {
         // (#2671) a TRUNCATE can come back busy while a foreign connection is
         // mid-transaction — that must log, not fail the open; the periodic and
         // close-time passes retry the reclamation.
-        try {
-            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-        } catch (err) {
-            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        // #7156 fix 2 (owner 2026-11-20): a TRUNCATE checkpoint does not merely
+        // move frames — it RECLAIMS the WAL file and its -shm index state out
+        // from under every peer. A live peer holding a STALE view of that index
+        // (a wedged predecessor mid-fold, a predecessor still draining after
+        // accepting shutdown) then writes or checkpoints from the invalidated
+        // view, and its frames land in reclaimed offsets — the #7156 damage
+        // shape (child pointers beyond EOF, "2nd reference to page", ptrmap
+        // mismatches). So while a live foreign writer is proven present, skip
+        // the truncate: the WAL simply stays until the peer exits, and the
+        // periodic/close/next-open passes converge it then. With no live
+        // foreign writer the behavior is byte-identical to before.
+        const foreignAtOpen = store.activeForeignWriter();
+        if (foreignAtOpen === null) {
+            try {
+                db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch (err) {
+                loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+            }
+        } else {
+            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on open for ${path}: live foreign writer pid ${foreignAtOpen} present — truncating the WAL index under a live peer risks the #7156 corruption shape; the periodic/close/next-open passes converge the WAL after it exits`);
         }
-        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
-        if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
-        if (bootVerdictFresh) store.noteIntegrityOk();
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status as an ALARM ONLY (2026-10-30 owner policy:
@@ -803,10 +819,21 @@ export class UnifiedStore {
         // leaves nothing for the next boot's recovery to replay. Same isolation
         // as open(): a checkpoint hiccup logs and never throws — callers treat
         // close() as best-effort shutdown work.
-        try {
-            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-        } catch (err) {
-            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        // #7156 fix 2: the same live-foreign-writer guard as open(). The dying
+        // process's FINAL checkpoint is the proven vector — the incident's old
+        // sidecar ran its shutdown checkpoint while its replacement was already
+        // writing, and that truncate reclaimed the WAL under a live peer. A
+        // skip only delays reclamation: the WAL stays, the peer's next clean
+        // pass converges it, nothing is lost.
+        const foreignAtClose = this.activeForeignWriter();
+        if (foreignAtClose === null) {
+            try {
+                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch (err) {
+                loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+            }
+        } else {
+            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on close for ${this.dbPath}: live foreign writer pid ${foreignAtClose} present (#7156) — the WAL is left for the peer's next clean pass to converge`);
         }
         this.db.close();
         // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
