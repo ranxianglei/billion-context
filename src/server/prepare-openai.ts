@@ -406,7 +406,24 @@ export async function prepareOpenai(
         // — and it stays the RAW client resend (never the D-lane view: its
         // synthetic acp_summary anchor is not a transcript message). The
         // watermark window pin is preserved.
-        snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+        // #7366: on a pinned HIT turn the ledger window must carry the
+        // DECLARED ids, not the window cores' fresh content-hash ids.
+        // wpHit.windowCores is the tail fragment re-converted by openaiToCore
+        // (fresh h_… mints), while s0.pinned is the SAME view with the id
+        // field re-stamped to the client-declared host msgids (stage 0).
+        // Ingesting the raw window cores wrote h_… into the ledger for every
+        // post-seed row (msg_id is write-once — INSERT OR IGNORE on
+        // (session_id, seq)), so the next turn's KDD#21 tail-overlap check
+        // compared declared host ids against h_… rows → guaranteed drift →
+        // full form every turn. pinned is element-wise a map of the same
+        // view (ids only), so its tail slice aligns position-for-position
+        // with windowCores; the length guard falls back to the legacy cores
+        // on any shape anomaly, and unpinned turns are byte-identical.
+        const ledgerWindow =
+            wpHit !== undefined && s0.pinned !== null && s0.pinned.length === wpHit.totalT
+                ? s0.pinned.slice(s0.pinned.length - wpHit.windowCores.length)
+                : wpHit?.windowCores;
+        snapshotMessages(session, ledgerWindow ?? originalMessages);
         // #7064 ledger drain: on a watermark-HIT turn that snapshot is the
         // ~2-row tail WINDOW — a verified suffix of the ledger (head check +
         // pf-seq vouch for the prefix), NOT the complete log. Claiming rawness
