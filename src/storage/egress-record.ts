@@ -25,7 +25,7 @@ function rowHash(s: string): string {
 
 /** Minimal structural shape — accepts both BiliMessage (wire sidecar) and
  * bare kernel CoreMessage (the degraded-path originalMessages). */
-export interface EgressSourceMsg {
+interface EgressSourceMsg {
     id: string;
     role: string;
     contentType?: unknown;
