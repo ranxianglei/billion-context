@@ -474,6 +474,44 @@ test("an oversize document blows the round budget: fail-soft keeps the last good
     assert.ok(feed.items.some((i) => i.id === "demo"), "previous good overlay survives");
 });
 
+for (const failure of ["http", "network", "raw-missing", "api-missing", "body"] as const) {
+    test(`a ${failure} failure fetching the optional manifest preserves the last complete overlay`, async () => {
+        const manifest = JSON.stringify({ articles: [{ file: "website/articles/kept.md", slug: "kept", title: "Kept article" }] });
+        const good = (url: string): Response => {
+            if (url === CONTENTS_URL) return Response.json([{ name: "2026-10-09_fresh.md", type: "file" }]);
+            if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return new Response("# Original post\n\noriginal post body\n");
+            if (url === rawUrl("website/articles.json")) return new Response(manifest);
+            if (url === rawUrl("website/articles/kept.md")) return new Response("# Kept article\n\nlast complete article\n");
+            return new Response("not here", { status: 404 });
+        };
+        router = good;
+        await runBlogRefreshRound({ force: true });
+        assert.ok(getBlogFeed().items.some((item) => item.id === "kept"));
+
+        router = (url) => {
+            if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return new Response("# Partial new post\n\nincomplete round\n");
+            if (url === rawUrl("website/articles.json") || url === apiFileUrl("website/articles.json")) {
+                if (failure === "network") throw new Error("fixture manifest unavailable");
+                if (failure === "body") return new Response(new ReadableStream({ start(controller) { controller.error(new Error("fixture truncated body")); } }));
+                const missing = (failure === "raw-missing" && url === rawUrl("website/articles.json"))
+                    || (failure === "api-missing" && url === apiFileUrl("website/articles.json"));
+                return new Response("unavailable", { status: missing ? 404 : 503 });
+            }
+            return good(url);
+        };
+        await runBlogRefreshRound({ force: true });
+        const failed = getBlogFeed();
+        assert.ok(failed.items.some((item) => item.id === "kept" && item.html.includes("last complete article")));
+        assert.ok(failed.items.some((item) => item.id === "fresh" && item.html.includes("original post body")));
+        assert.ok(!failed.items.some((item) => item.html.includes("incomplete round")));
+        assert.equal(failed.error, "offline");
+
+        router = good;
+        await runBlogRefreshRound({ force: true });
+        assert.equal(getBlogFeed().error, undefined, "a complete later refresh clears the failure marker");
+    });
+}
+
 test("malformed articles.json degrades to a posts-only round without failing", async () => {
     router = (url) => {
         if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
