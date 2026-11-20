@@ -24,8 +24,9 @@ function rowHash(s: string): string {
 }
 
 /** Minimal structural shape — accepts both BiliMessage (wire sidecar) and
- * bare kernel CoreMessage (the degraded-path originalMessages). */
-interface EgressSourceMsg {
+ * bare kernel CoreMessage (the degraded-path originalMessages). Exported:
+ * prepare-openai names the source array it hands to recordEgressTurn. */
+export interface EgressSourceMsg {
     id: string;
     role: string;
     contentType?: unknown;

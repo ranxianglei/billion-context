@@ -28,7 +28,7 @@ export interface EgressContentStore {
     egressGetContent(hash: string): string | null;
 }
 
-export interface EgressRebuildResult {
+interface EgressRebuildResult {
     /** The rebuilt outbound elements for the conversation rows (system
      *  block excluded — sysParts are built live and stay live). */
     elements: ReturnType<typeof coreToOpenai>;
