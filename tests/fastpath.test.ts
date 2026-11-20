@@ -9,6 +9,7 @@ import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
+import { applyMsgIdPin } from "../src/msgid-pin.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -59,6 +60,33 @@ const runTurn = (
     const headers = finalizeWatermarkTurn(session, out, {
         model,
         legacyCores: out.hit !== null ? out.hit.view : oracle.msgs,
+        rawSystemText: out.hit !== null ? out.hit.systemText : oracle.systemText,
+        turnStripCounts: stripCounts,
+    });
+    return { out, headers };
+};
+
+/** Drive one turn the way prepareOpenai does for a PINNED session
+ *  (pluginLaneServerHistory on, #4491): on a miss the seed is re-keyed to the
+ *  host msgids via applyMsgIdPin (the id namespace the stash then carries), on
+ *  a hit the pin is skipped (the seed's prefix was already pinned when it was
+ *  materialized). This is the 2x2 traffic the watermark fastpath exists to
+ *  accelerate — the seed cores carry host msgids while a fresh openaiToCore
+ *  parse mints content-hash ids, so the id namespaces differ structurally
+ *  (#7347). */
+const runPinnedTurn = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    bodyText: string,
+    hostIds: string[],
+): { out: ReturnType<typeof evaluateWatermarkFastpath>; headers: Record<string, string> } => {
+    const model = JSON.parse(bodyText).model as string;
+    const out = evaluateWatermarkFastpath(bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    const oracle = openaiToCore(JSON.parse(bodyText));
+    const stripCounts = stripRawStage(JSON.parse(bodyText), "openai");
+    const headers = finalizeWatermarkTurn(session, out, {
+        model,
+        legacyCores: out.hit !== null ? out.hit.view : applyMsgIdPin(oracle.msgs, hostIds),
         rawSystemText: out.hit !== null ? out.hit.systemText : oracle.systemText,
         turnStripCounts: stripCounts,
     });
@@ -463,4 +491,43 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
+});
+
+test("pinned seed (host msgids) + tail-only growth HITS; in-place head edit still drifts (#7347)", () => {
+    makeStubStore();
+    const session = freshSession("pf-pin");
+    // turn 1: seed. pluginLaneServerHistory pins the seed cores to host msgids
+    // (applyMsgIdPin), so the stash carries a DIFFERENT id namespace than the
+    // content-hash ids a fresh openaiToCore parse mints.
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d")]);
+    const t1 = runPinnedTurn(session, {}, b1, ["host-a", "host-b", "host-c", "host-d"]);
+    assert.equal(t1.out.decision, "no-stamp", LOGS.join("\n"));
+    assert.equal(t1.out.measuredT, 5);
+    // turn 2: same prefix + one new tail element. The fresh head cores carry
+    // content-hash ids while the seed carries host msgids — the head check must
+    // ignore the id namespace and HIT on the unchanged content. Pre-fix this is
+    // a permanent head-prefix-drift miss (the field symptom: every turn of a
+    // 2x2 pinned session fell back to the full legacy parse).
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d"), USR("e")]);
+    const t2 = runPinnedTurn(session, { [PF_COUNT_HEADER]: "5" }, b2, ["host-a", "host-b", "host-c", "host-d", "host-e"]);
+    assert.equal(t2.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(t2.out.creditedMiss, false);
+    // the view must still be the legacy full-parse oracle on CONTENT. The
+    // prefix ids are host msgids by design in a pinned session, so assert
+    // text/role parity (not id parity — that is the namespace difference).
+    if (!t2.out.hit) throw new Error("expected hit");
+    const oracle2 = openaiToCore(JSON.parse(b2));
+    assert.equal(t2.out.hit.view.length, oracle2.msgs.length);
+    for (let i = 0; i < oracle2.msgs.length; i++) {
+        assert.equal(t2.out.hit.view[i]!.text, oracle2.msgs[i]!.text, `text @${i}`);
+        assert.equal(t2.out.hit.view[i]!.role, oracle2.msgs[i]!.role, `role @${i}`);
+    }
+    // turn 3: rewrite a HEAD element IN PLACE (prefix counts unchanged, system
+    // identical, stamp honest) + append one tail — the per-core content
+    // comparison (id excluded) must still catch the rewrite, so the fix does
+    // not mask a genuine in-place edit.
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b-EDITED"), ASST("c"), USR("d"), USR("e"), USR("f")]);
+    const t3 = runPinnedTurn(session, { [PF_COUNT_HEADER]: "6" }, b3, ["host-a", "host-b2", "host-c", "host-d", "host-e", "host-f"]);
+    assert.equal(t3.out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(t3.out.creditedMiss, false);
 });
