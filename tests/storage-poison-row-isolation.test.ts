@@ -103,3 +103,52 @@ test("reader: one unparseable block payload degrades the view instead of abortin
     // payload_json — they survive the payload corruption.
     assert.equal(view!.blockContents.size, 4);
 });
+
+test("reader: one unparseable block summary CAS row degrades the view instead of aborting the load", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    const view = shadow.viewFor("target") as LegacySessionLike | null;
+    assert.ok(view, "the session must still load with one corrupt block content row");
+    assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt block content row");
+    assert.equal(view!.state.blocks!.length, 4, "the block's state row survives; only its text is unreadable");
+    // The poisoned block's text is missing from the raw view; the inline
+    // summary in payload_json is the designed fallback (completeBlockContents),
+    // and the next full ingest re-points the row at the synthesized content.
+    assert.equal(view!.blockContents.has("b0"), false);
+    assert.equal(view!.blockContents.size, 3);
+});
+
+test("verify-sample: one unparseable message row marks drift instead of failing every save", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    // Poison the tail message's CAS bytes (the incident shape: 26 message
+    // content rows of one session). Message rows are INSERT OR IGNORE, so the
+    // corrupt row SURVIVES the next ingest — the stored tail still points at
+    // it, and the verify-sample reads it back.
+    const row = db.prepare("SELECT content_hash FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1").get("target") as { content_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.content_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" }, (record) => record as LegacySessionLike);
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    // The host's LIVE record still carries the message in memory — that is
+    // what record() receives, not the degraded view.
+    assert.doesNotThrow(() => shadow.record(seed("target")));
+    // The poisoned row surfaces as loud drift (the designed heal path:
+    // watermark drop, drift latch, escalation streak), not as a verify-sample
+    // throw that failed every subsequent save until the store was cleaned by
+    // hand (the incident's symptom #5).
+    assert.equal(shadow.stats.verifySamples, 1);
+    assert.equal(shadow.stats.verifyDrift, 1);
+    assert.match(shadow.stats.lastError ?? "", /digest drift/);
+});
