@@ -48,7 +48,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -676,6 +676,13 @@ export async function prepareOpenai(
             rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
             turnStripCounts: wpTurnStrip,
         });
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
+        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
+        // heartbeat still must flow or the client's watermark freezes and its
+        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
+        // saved state (the fastpath re-establishes both when it next runs).
+        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
