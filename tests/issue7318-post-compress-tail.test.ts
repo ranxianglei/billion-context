@@ -166,13 +166,17 @@ test("#7318 N2 (explicit ON): the uncovered note fires at most once per injectio
     assert.ok(out1.includes(UNCOVERED_HEADER), "first note expected:\n" + out1);
     assert.equal(ctx.session.uncoveredReceiptNoted, true, "latch must be a session field");
     // Fold 2: a span INSIDE the uncovered hole splits the run — the latch keeps
-    // the receipt quiet (the #6522 loop step).
+    // the receipt quiet (the #6522 loop step). The remaining hole is still
+    // above the receipt floor, so the receipt must stay SILENT — it must not
+    // fall through to the "No compressible ranges remain" claim, which would
+    // assert the context is at its minimum while material mass sits uncovered
+    // (#4331 honesty; the pre-#7318 code always returned the note here).
     const mid = turnSpan(18, 20);
     setOffer(ctx, [offerRange(mid.startRef, mid.endRef, 27)]);
     const out2 = runApply(ctx, foldArgs([mid]));
     assert.ok(out2.startsWith("[Compressed"), `fold 2: ${out2.slice(0, 160)}`);
     assert.ok(!out2.includes(UNCOVERED_HEADER), "second fold must not re-nag:\n" + out2);
-    assert.ok(out2.includes(NO_RANGES_REMAIN_TEXT), "plain stop signal expected after a latched fold:\n" + out2);
+    assert.ok(!out2.includes(NO_RANGES_REMAIN_TEXT), "latched + hole still above floor: honest silence, no false minimum claim (#4331):\n" + out2);
     // A fresh ACTUAL nudge injection (nudgeOutcome === "injected" in
     // src/server/handle.ts) re-opens the latch — the next qualifying fold may
     // note the uncovered runs once more in the new cycle.

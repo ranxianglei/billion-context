@@ -801,6 +801,15 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                     ctx.session.uncoveredReceiptNoted = true;
                     return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
                 }
+                // Latch already fired this cycle but material mass still sits
+                // uncovered (totalTok >= floor): stay silent, do NOT fall
+                // through to the "No compressible ranges remain" claim below —
+                // that would assert the context is at its minimum while a
+                // >=floor run sits outside every active block (#4331 honesty;
+                // the pre-#7318 code always returned the note here, never the
+                // minimum claim). The detail stays available on demand via
+                // acp_status(scope:"uncompressed").
+                return "";
             }
         }
     } catch {
