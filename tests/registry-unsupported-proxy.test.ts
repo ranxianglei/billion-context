@@ -165,7 +165,7 @@ test("the request path does not wait on a stalled fetch beyond its budget", asyn
 
         const started = Date.now();
         assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
-        assert.ok(Date.now() - started < 5_000, "answered within the budget, not after the stalled fetch");
+        assert.ok(Date.now() - started < 1_000, "answered within the budget, not after the stalled fetch");
     } finally {
         // Settle the in-flight load before resetting so it cannot write the
         // fallback back into the module state after this test.
