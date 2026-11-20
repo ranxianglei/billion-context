@@ -239,6 +239,20 @@ test("raw AND contents-API dead (rate-limited) → the round fails soft with the
     assert.ok(!hits.some((h) => !h.startsWith("https://raw.githubusercontent.com/") && !h.startsWith("https://api.github.com/")));
 });
 
+test("a non-2xx listing response releases its unread body before the idle watchdog stops (#552)", async () => {
+    let cancelled = 0;
+    const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new TextEncoder().encode("rate limited")); },
+        cancel() { cancelled += 1; },
+    });
+    router = (url) => url === CONTENTS_URL
+        ? new Response(body, { status: 429 })
+        : new Response("nf", { status: 404 });
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // fail-soft, marker rides the feed
+    assert.equal(getBlogFeed().error, "offline");
+    assert.equal(cancelled, 1, "the rejected 429 body must not retain its transport once the watchdog stops");
+});
+
 test("healthy raw path never touches the API file endpoints (overseas unchanged)", async () => {
     installGithubRouter();
     await runBlogRefreshRound({ force: true });

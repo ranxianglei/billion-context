@@ -299,6 +299,19 @@ function sourceChainFor(rel: string): { name: SourceName; url: string }[] {
     ];
 }
 
+/** Release an unread response body, then stop the idle watchdog (fetch-util
+ *  #552): a rejected or early-returned response is never consumed, so without
+ *  an explicit cancel the stopped watchdog can no longer reclaim the still-open
+ *  connection. The cancel is fire-and-forget so cleanup never delays the
+ *  fail-soft result; cancelling an already-consumed body is a no-op, hence the
+ *  bodyUsed guard. */
+function releaseAndStop(result: { response: Response; stopIdleTimer: () => void }): void {
+    if (!result.response.bodyUsed) {
+        void result.response.body?.cancel().catch(() => {});
+    }
+    result.stopIdleTimer();
+}
+
 async function getJsonList(url: string): Promise<ContentsEntry[]> {
     const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
     try {
@@ -307,7 +320,7 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
         if (!Array.isArray(raw)) throw new Error("contents listing is not a JSON array");
         return raw as ContentsEntry[];
     } finally {
-        result.stopIdleTimer(); // body fully consumed (fetch-util #552 contract)
+        releaseAndStop(result);
     }
 }
 
@@ -327,7 +340,7 @@ async function fetchPlainText(url: string, account?: (bytes: number) => void): P
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
-        result.stopIdleTimer();
+        releaseAndStop(result);
     }
 }
 
@@ -352,7 +365,7 @@ async function fetchApiText(rel: string, account?: (bytes: number) => void): Pro
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
-        result.stopIdleTimer();
+        releaseAndStop(result);
     }
 }
 
@@ -399,7 +412,7 @@ async function fetchPlainImage(url: string, account?: (bytes: number) => void): 
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
-        result.stopIdleTimer();
+        releaseAndStop(result);
     }
 }
 
@@ -425,7 +438,7 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
-        result.stopIdleTimer();
+        releaseAndStop(result);
     }
 }
 
