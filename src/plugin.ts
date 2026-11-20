@@ -3062,7 +3062,7 @@ export async function pipePluginChatWithStrip(
         // the complete visible output, so no second thinking block is appended.
         if (sawThinking && answerChars === 0 && !sawToolUse && !stalledTail) {
             log?.("[plugin] degenerate terminal turn (thinking-then-stop); not refetching, emitting in-band error for host retry (#7410)");
-            emitStreamError(res, protocol, "the turn degenerated (thinking-then-stop); not refetching, handing back to host for retry", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
+            emitStreamError(res, protocol, "the turn degenerated (thinking-then-stop)", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
         degenerateRetried = true;
