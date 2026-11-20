@@ -37,10 +37,15 @@ interface EgressSourceMsg {
  * which is what makes the next diff sparse. `tokens` is a chars/4 estimate
  * for v1 (segment 4 replaces it with the rendered tag triple when the serve
  * path lands); it only needs to be stable while the content is unchanged. */
-export function buildEgressViewRows(conversation: readonly EgressSourceMsg[], systemText: string | undefined): EgressViewRow[] {
+export function buildEgressViewRows(
+    conversation: readonly EgressSourceMsg[],
+    systemText: string | undefined,
+    cas?: { put(text: string): string },
+): EgressViewRow[] {
     const rows: EgressViewRow[] = [];
     if (systemText !== undefined && systemText.length > 0) {
-        rows.push({ msgid: "system:" + rowHash(systemText), ref: "", tokens: Math.max(1, Math.ceil(systemText.length / 4)), type: "system", contentHash: rowHash(systemText) });
+        const sysHash = rowHash(systemText);
+        rows.push({ msgid: "system:" + sysHash, ref: "", tokens: Math.max(1, Math.ceil(systemText.length / 4)), type: "system", role: "system", contentHash: sysHash, casRef: cas ? cas.put(systemText) : undefined });
     }
     for (const m of conversation) {
         const text = typeof m.text === "string" ? m.text : "";
@@ -49,17 +54,23 @@ export function buildEgressViewRows(conversation: readonly EgressSourceMsg[], sy
             ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
             type: m.id.startsWith("acp_summary") ? "acp_summary" : m.role === "tool" ? "tool" : "text",
+            role: m.role,
             contentHash: rowHash(JSON.stringify([m.id, m.role, m.contentType ?? null, text])),
+            casRef: cas ? cas.put(JSON.stringify(m)) : undefined,
         });
     }
     return rows;
 }
 
-/** The storage seam (UnifiedStore today; keeps the recorder testable). */
+/** The storage seam (UnifiedStore today; keeps the recorder testable).
+ * `egressPutContent` is the unified-content-CAS seam — seg 4 stores each
+ * message's FINAL core JSON under its hash so serve-from-log can rebuild
+ * byte-exact without re-running the pipeline (absent → no casRef rows). */
 export interface EgressOpLogStore {
     egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[];
     egressStateView(sessionId: string): EgressViewRow[];
     egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number;
+    egressPutContent?(text: string): string;
 }
 
 /** Record this turn's outbound conversation view as sparse ops. Returns the
@@ -78,7 +89,7 @@ export function recordEgressTurn(args: {
 }): EgressViewRow[] {
     const { store, sessionId, conversation, systemText, nowMs } = args;
     const prev = args.prev ?? store.egressStateView(sessionId);
-    const next = buildEgressViewRows(conversation, systemText);
+    const next = buildEgressViewRows(conversation, systemText, store.egressPutContent ? { put: (t) => store.egressPutContent!(t) } : undefined);
     const ops = diffEgressView(prev, next);
     if (ops.length > 0) {
         store.egressStateAppendOps(sessionId, ops, nowMs);

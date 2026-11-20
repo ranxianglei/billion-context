@@ -159,6 +159,7 @@ billion-context/
 │   │   ├── identity.ts           #   messages-table identity hash: strips position metadata (#4390)
 │   │   ├── egress-state.ts         #   Egress op-log outbound view: dual-table state+flow, replay, compaction, any-seq rollback (#7398)
 │   │   ├── egress-record.ts        #   Egress op-log RECORDING: build the outbound view rows, diff vs prev, append sparse ops, fold-triggered compaction (#7398 seg 3, rollout egressOpLog)
+│   │   ├── egress-serve.ts         #   Egress op-log SERVE: rebuild the outbound elements from the CAS-backed view (byte-identity chain, whole-turn degrade) + shadow byte comparison (#7398 seg 4a, rollout egressServeLog)
 │   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
 │   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)
 │   │   ├── mysql.ts              #   MySQL 8.0 backend implementing the storage contract (#3388)

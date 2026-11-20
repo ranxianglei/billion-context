@@ -51,7 +51,8 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recordEgressTurn } from "../storage/egress-record.js";
+import { recordEgressTurn, type EgressSourceMsg } from "../storage/egress-record.js";
+import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -127,6 +128,13 @@ export async function prepareOpenai(
     let nudgeStampsBefore: Prepared["nudgeStampsBefore"];
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
+    // #7398 seg 4: the legacy core-portion elements (captured at the
+    // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
+    let legacyCoreElements: unknown = undefined;
+    // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
+    // image-rescale) — segment 3 records this, not processedMessages, so the
+    // log view is position-for-position what outbound saw.
+    let egressRecordSource: readonly EgressSourceMsg[] | undefined;
     // #2483: single source for the effective render strategy — processTurn, the
     // diag log and Prepared must all report what was actually rendered (the
     // log label used to hardcode "text-only" and lie under renderNone).
@@ -570,6 +578,8 @@ export async function prepareOpenai(
         // friends) are conversation data — they re-emit verbatim through the
         // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
         rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+        legacyCoreElements = rebuiltMessages;
+        egressRecordSource = egressMessages;
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -813,7 +823,7 @@ export async function prepareOpenai(
                     store: st,
                     sessionId,
                     prev: session.egressView,
-                    conversation: processedMessages.length > 0 ? processedMessages : originalMessages,
+                    conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
@@ -821,6 +831,28 @@ export async function prepareOpenai(
         } catch (err) {
             session.egressView = undefined;
             log("warn", `[${sessionId}] egress op-log recording disabled for this session: ${String(err)}`);
+        }
+    }
+    // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
+    // from the log + CAS and byte-compare against the legacy elements. NO
+    // swap: the pipeline always sends the legacy bytes; this measures the
+    // identity rate the swap will rely on (rollout egressServeLog, default 0;
+    // requires egressOpLog on, since it reads the recorded view).
+    if (!isTitleGen && featureEnabled("egressServeLog")) {
+        try {
+            const st = getStore().egressOpLogStore();
+            const view = session.egressView;
+            if (st && view && legacyCoreElements !== undefined) {
+                const reb = rebuildOutboundFromLog(view, st);
+                if (reb === null) {
+                    log("info", `[${sessionId}] egress-serve shadow: unrebuildable (log/CAS gap or out-of-scope row) — legacy kept`);
+                } else {
+                    const same = JSON.stringify(reb.elements) === JSON.stringify(legacyCoreElements);
+                    log("info", `[${sessionId}] egress-serve shadow: ${same ? "IDENTICAL" : "DIVERGENT"} (${view.length} rows)`);
+                }
+            }
+        } catch (err) {
+            log("warn", `[${sessionId}] egress-serve shadow comparison failed: ${String(err)}`);
         }
     }
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;

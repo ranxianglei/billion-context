@@ -1041,6 +1041,18 @@ export class UnifiedStore {
         return hash;
     }
 
+    /** #7398 seg 4: public seam over the content CAS for the egress op-log
+     *  (recording stores each message's FINAL core JSON under its sha256 so
+     *  serve-from-log rebuilds byte-exact without re-running the pipeline).
+     *  Refcount-aware like every other CAS user. */
+    egressPutContent(text: string): string {
+        return this.putContent(text);
+    }
+
+    egressGetContent(hash: string): string | null {
+        return this.getContent(hash);
+    }
+
     /** refcount-aware release; the CAS body itself never leaves. */
     /** #6785 step 7: the orphan journal moved OFF the sessions row — one
      *  row per block in orphan_blocks (immutable content; a refreshed view

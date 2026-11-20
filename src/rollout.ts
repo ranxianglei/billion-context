@@ -136,6 +136,13 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // Force with `rollout.features.egressOpLog: true` or
     // `BILI_ROLLOUT_EGRESS_OP_LOG=1`.
     egressOpLog: { percent: 0 },
+    // #7398 seg 4a: serve-from-log SHADOW comparison — rebuilds the outbound
+    // core portion from the op log + content CAS and byte-compares it against
+    // the legacy chain's elements (log only; NEVER swaps the outbound bytes).
+    // Requires egressOpLog on (it reads the recorded view). Measuring the
+    // identity rate the eventual swap will rely on. Force with
+    // `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
+    egressServeLog: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

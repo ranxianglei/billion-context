@@ -50,6 +50,13 @@ export interface EgressViewRow {
     tokens: number;
     type: string;
     contentHash: string;
+    /** #7398 seg 4: the kernel-space role (rebuild needs it; the diff keys on
+     *  msgid so a role-only drift is impossible — kernel ids are one-shot). */
+    role?: string;
+    /** #7398 seg 4: unified-content-CAS key of the message's FINAL core
+     *  JSON (post reasoning-drop / image-rescale, pre outbound convert).
+     *  Absent on rows recorded before seg 4 — serve-from-log skips them. */
+    casRef?: string;
 }
 
 type EgressOpType = "B" | "I" | "D" | "U";
@@ -81,6 +88,9 @@ interface InsertOp {
     tokens: number;
     typeTag: string;
     contentHash: string;
+    /** #7398 seg 4: row metadata carried through ops (base + replay). */
+    role?: string;
+    casRef?: string;
 }
 interface DeleteOp {
     type: "D";
@@ -91,6 +101,10 @@ interface UpdateOp {
     type: "U";
     msgid: string;
     contentHash: string;
+    /** #7398 seg 4: an edit changes the CAS bytes too — the ref rides the
+     *  op or the replayed view keeps pointing at the pre-edit content. */
+    role?: string;
+    casRef?: string;
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
@@ -104,7 +118,10 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError("diff", `duplicate msgid ${op.msgid}`);
             const at = op.after === null ? -1 : idxOf(op.after);
             if (at < -1) throw new EgressStateCorruptError("diff", `insert anchor ${op.after} missing`);
-            view.splice(at + 1, 0, { msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, contentHash: op.contentHash });
+            const entry: EgressViewRow = { msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, contentHash: op.contentHash };
+            if (op.role !== undefined) entry.role = op.role;
+            if (op.casRef !== undefined) entry.casRef = op.casRef;
+            view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
             const e = idxOf(op.end);
@@ -115,7 +132,7 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
         } else {
             const i = idxOf(op.msgid);
             if (i < 0) throw new EgressStateCorruptError("diff", `update target ${op.msgid} missing`);
-            view[i] = { ...view[i], contentHash: op.contentHash };
+            view[i] = { ...view[i], contentHash: op.contentHash, ...(op.role !== undefined ? { role: op.role } : {}), ...(op.casRef !== undefined ? { casRef: op.casRef } : {}) };
         }
     }
     return view;
@@ -163,13 +180,21 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
     for (const r of next) {
         if (spine.has(r.msgid)) {
             const old = prevByMsg.get(r.msgid)!;
-            if (old.contentHash !== r.contentHash) ops.push({ type: "U", msgid: r.msgid, contentHash: r.contentHash });
+            if (old.contentHash !== r.contentHash) {
+                const u: UpdateOp = { type: "U", msgid: r.msgid, contentHash: r.contentHash };
+                if (r.role !== undefined) u.role = r.role;
+                if (r.casRef !== undefined) u.casRef = r.casRef;
+                ops.push(u);
+            }
         }
     }
     let last: string | null = null;
     for (const r of next) {
         if (!spine.has(r.msgid)) {
-            ops.push({ type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, contentHash: r.contentHash });
+            const ins: InsertOp = { type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, contentHash: r.contentHash };
+            if (r.role !== undefined) ins.role = r.role;
+            if (r.casRef !== undefined) ins.casRef = r.casRef;
+            ops.push(ins);
         }
         last = r.msgid;
     }
@@ -202,6 +227,8 @@ export function egressStateAppend(
                     tokens: op.tokens,
                     type: op.typeTag,
                     content_hash: op.contentHash,
+                    role: op.role,
+                    cas_ref: op.casRef,
                 });
             } else if (op.type === "D") {
                 rowType = "D";
@@ -210,7 +237,7 @@ export function egressStateAppend(
             } else {
                 rowType = "U";
                 msgid = op.msgid;
-                payload = JSON.stringify({ content_hash: op.contentHash });
+                payload = JSON.stringify({ content_hash: op.contentHash, role: op.role, cas_ref: op.casRef });
             }
             db.prepare(INSERT_STATE).run(sessionId, seq, rowType, msgid, payload, nowMs);
             db.prepare(INSERT_FLOW).run(sessionId, seq, rowType, msgid, payload, nowMs);
@@ -297,6 +324,8 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 type: p.type as string,
                 contentHash: p.content_hash as string,
             };
+            if (p.role !== undefined) entry.role = p.role as string;
+            if (p.cas_ref !== undefined) entry.casRef = p.cas_ref as string;
             if (p.after == null) {
                 view.push(entry);
             } else if (typeof p.after !== "string") {
@@ -322,7 +351,12 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             }
             const i = idxOf(row.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${row.msgid} missing at log_seq=${row.log_seq}`);
-            view[i] = { ...view[i], contentHash: p.content_hash };
+            view[i] = {
+                ...view[i],
+                contentHash: p.content_hash as string,
+                ...(p.role !== undefined ? { role: p.role as string } : {}),
+                ...(p.cas_ref !== undefined ? { casRef: p.cas_ref as string } : {}),
+            };
         } else {
             throw new EgressStateCorruptError(sessionId, `unknown row_type ${String(row.row_type)} at log_seq=${row.log_seq}`);
         }
