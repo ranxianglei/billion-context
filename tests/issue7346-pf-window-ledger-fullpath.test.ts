@@ -150,15 +150,27 @@ async function runClient(origin: string, upstreamUrl: string, sid: string, turns
     return stamps;
 }
 
+/** Windows cannot unlink a directory while index.db is open (the shadow
+ *  UnifiedStore holds a file lock); rmSync with bounded retries, swallowed on
+ *  persistent EBUSY (same pattern as #3397/#4986/#6780). */
+function rmBestEffort(p: string): void {
+    try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* leaked temp dir on a Windows runner is harmless */
+    }
+}
+
 test("#7346 full-path: a watermark-HIT window save keeps the verified prefix in the ledger", async () => {
     const savedRollout = process.env[ROLLOUT_ENV];
     const savedUnified = process.env[UNIFIED_ENV];
     const roots: string[] = [];
     const sid = "7346-fullpath-sid";
+    let h0: Harness | undefined;
     try {
         process.env[ROLLOUT_ENV] = "1";
         process.env[UNIFIED_ENV] = "shadow";
-        const h0 = makeHarness("fullpath");
+        h0 = makeHarness("fullpath");
         roots.push(h0.root);
         const h = await bringUp(h0);
         const stamps = await runClient(h.origin, h.upstreamUrl, sid, scriptTurns());
@@ -187,15 +199,14 @@ test("#7346 full-path: a watermark-HIT window save keeps the verified prefix in 
             db.close();
         }
         await closeServers([h.proxy, h0.upstream], "7346 fullpath");
-        // Release the store's shadow SQLite handle before rmSync — Windows
-        // cannot delete a directory while index.db is open, so a leaked
-        // handle pins the temp dir and the teardown unlink fails with EBUSY.
-        h0.store.closeQuietly();
     } finally {
         if (savedRollout === undefined) delete process.env[ROLLOUT_ENV];
         else process.env[ROLLOUT_ENV] = savedRollout;
         if (savedUnified === undefined) delete process.env[UNIFIED_ENV];
         else process.env[UNIFIED_ENV] = savedUnified;
-        for (const root of roots) rmSync(root, { recursive: true, force: true });
+        // Release the shadow's index.db handle before cleanup — Windows cannot
+        // unlink a directory while the SQLite file is locked (#3397 class).
+        h0?.store.closeQuietly();
+        for (const root of roots) rmBestEffort(root);
     }
 });
