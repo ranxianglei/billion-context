@@ -191,7 +191,7 @@ test("a purpose header without the x-bili-plugin marker is inert", async () => {
     }
 });
 
-test("#7380: a declared compaction on a session with NO fold blocks is a plugin background call — forwarded, not refused", async () => {
+test("#7379: a declared compaction on a session with NO fold blocks is a plugin background call — forwarded, not refused", async () => {
     const h = await harness();
     try {
         // dsh-mneme's dream consolidation declares purpose=compaction but rides

@@ -2616,7 +2616,7 @@ async function handleRequest(
         // installs; dsh-only, like the text path's trust domain.
         const declaredDshCompaction = pluginAgentHeader(req.headers) === "dsh"
             && declaredPurpose === "compaction";
-        // #7380: a DECLARED compaction (post-#6880 x-bili-plugin-purpose:
+        // #7379: a DECLARED compaction (post-#6880 x-bili-plugin-purpose:
         // compaction) on a session with no active fold block is a plugin
         // background call (e.g. dsh-mneme's dream consolidation), not a real
         // dsh compaction — no compression substrate to shadow, so the #1729

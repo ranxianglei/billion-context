@@ -388,7 +388,7 @@ test("e2e: knob off → the #1729 refusal still stands (status quo pinned)", asy
     });
 });
 
-test("#7380: declared compaction WITH fold blocks is still guarded (knob off) — the #6880 intent preserved", async () => {
+test("#7379: declared compaction WITH fold blocks is still guarded (knob off) — the #6880 intent preserved", async () => {
     await withHarness(async (h) => {
         await armBlock(h, "s-decl");
         process.env.BILI_DSH_AUTHORED_COMPACTION = "0";
