@@ -136,12 +136,13 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // Force with `rollout.features.egressOpLog: true` or
     // `BILI_ROLLOUT_EGRESS_OP_LOG=1`.
     egressOpLog: { percent: 0 },
-    // #7398 seg 4a: serve-from-log SHADOW comparison — rebuilds the outbound
-    // core portion from the op log + content CAS and byte-compares it against
-    // the legacy chain's elements (log only; NEVER swaps the outbound bytes).
-    // Requires egressOpLog on (it reads the recorded view). Measuring the
-    // identity rate the eventual swap will rely on. Force with
-    // `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
+    // #7398 seg 4b: serve-from-log — when on (AND egressOpLog is on), the
+    // outbound conversation elements are REBUILT from the op log + content
+    // CAS (same legacy chain, bytes identical by construction) instead of the
+    // in-memory kernel view; any unrebuildable row (tool rows in v1, missing
+    // CAS) → whole turn stays on the legacy path (degrade, never guess).
+    // seg 4a's shadow byte-comparison remains for the fallback turns. Force
+    // with `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
     egressServeLog: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+

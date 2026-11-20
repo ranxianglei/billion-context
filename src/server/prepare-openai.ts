@@ -51,7 +51,15 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recordEgressTurn, type EgressSourceMsg } from "../storage/egress-record.js";
+import { recordEgressTurn } from "../storage/egress-record.js";
+// Structural mirror of egress-record.ts's EgressSourceMsg (kept private
+// there by the unused-export gate): the recording seam only reads this shape.
+interface EgressRecordSourceMsg {
+    id: string;
+    role: string;
+    contentType?: unknown;
+    text?: unknown;
+}
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -131,10 +139,11 @@ export async function prepareOpenai(
     // #7398 seg 4: the legacy core-portion elements (captured at the
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
+    let egressServedFromLog = false;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
     // image-rescale) — segment 3 records this, not processedMessages, so the
     // log view is position-for-position what outbound saw.
-    let egressRecordSource: readonly EgressSourceMsg[] | undefined;
+    let egressRecordSource: readonly EgressRecordSourceMsg[] | undefined;
     // #2483: single source for the effective render strategy — processTurn, the
     // diag log and Prepared must all report what was actually rendered (the
     // log label used to hardcode "text-only" and lie under renderNone).
@@ -577,16 +586,10 @@ export async function prepareOpenai(
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
         // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
-        rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
-        legacyCoreElements = rebuiltMessages;
-        egressRecordSource = egressMessages;
-
-        // ONLY the static compress prompt goes into the system message — the
-        // system prompt is the prefix-cache anchor and must be byte-stable
-        // across turns. The nudge (which changes every turn: token count,
-        // growth %, dynamic example) is appended as a trailing user message
-        // instead, mirroring pai-acp's design. Putting the nudge in system
-        // would invalidate the cache every turn.
+        // #7398 seg 4b: egress serve-from-log decision. The sysParts block that
+        // used to follow this line is computed FIRST (moved up) because the
+        // op-log recording stores the outbound system text and the rebuild
+        // replaces the conversation elements below.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         let acpStandingPushed = false;
@@ -601,15 +604,50 @@ export async function prepareOpenai(
         if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
+        openaiOutboundSystem = sysParts.join("\n\n");
+        if (!isTitleGen && featureEnabled("egressServeLog")) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                try {
+                    session.egressView = recordEgressTurn({
+                        store: st,
+                        sessionId,
+                        prev: session.egressView,
+                        conversation: egressMessages,
+                        systemText: openaiOutboundSystem,
+                        nowMs: Date.now(),
+                    });
+                    const reb = rebuildOutboundFromLog(session.egressView, st);
+                    if (reb !== null) {
+                        rebuiltMessages = reb.elements;
+                        egressServedFromLog = true;
+                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log+CAS`);
+                    }
+                } catch (err) {
+                    egressServedFromLog = false;
+                    log("warn", `[${sessionId}] egress-serve rebuild failed — legacy kept: ${String(err)}`);
+                }
+            }
+        }
+        if (!egressServedFromLog) {
+            rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+        }
+        legacyCoreElements = rebuiltMessages;
+        egressRecordSource = egressMessages;
+
+        // ONLY the static compress prompt goes into the system message — the
+        // system prompt is the prefix-cache anchor and must be byte-stable
+        // across turns. The nudge (which changes every turn: token count,
+        // growth %, dynamic example) is appended as a trailing user message
+        // instead, mirroring pai-acp's design. Putting the nudge in system
+        // would invalidate the cache every turn.
+        // sysParts was computed above (seg 4b serve decision needs it).
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
-        // #532: capture what bili injects outside the fold space (client system
-        // + compress prompt). A head system message already in the rebuilt view
-        // is classified by the kernel breakdown — counting only these parts
-        // avoids double-counting it.
-        openaiOutboundSystem = sysParts.join("\n\n");
+        // #532: openaiOutboundSystem was captured above (seg 4b moved it up so
+        // the op-log recording stores the outbound system text).
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : []), ...(blockOpsActive ? blockOps.openai : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
@@ -818,7 +856,7 @@ export async function prepareOpenai(
     if (!isTitleGen && featureEnabled("egressOpLog")) {
         try {
             const st = getStore().egressOpLogStore();
-            if (st) {
+            if (st && session.egressView === undefined) {
                 session.egressView = recordEgressTurn({
                     store: st,
                     sessionId,
@@ -838,7 +876,7 @@ export async function prepareOpenai(
     // swap: the pipeline always sends the legacy bytes; this measures the
     // identity rate the swap will rely on (rollout egressServeLog, default 0;
     // requires egressOpLog on, since it reads the recorded view).
-    if (!isTitleGen && featureEnabled("egressServeLog")) {
+    if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = session.egressView;

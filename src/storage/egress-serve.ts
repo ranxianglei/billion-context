@@ -1,14 +1,14 @@
 /**
- * Egress serve-from-log — segment 4a of the op-log outbound view (proposal
- * discussions/7398, #6785 perf work). RECONSTRUCTION ONLY: rebuilds the
- * outbound core-message portion from the replayed log + unified content CAS
- * and runs it through the SAME legacy chain (systemToUser → coreToOpenai →
- * hardenOpenaiAssistantContent) the pipeline uses, so the output is
- * byte-identical by construction when the CAS bytes are the final core JSON
- * (which segment 3's recording guarantees). The shadow comparison in
- * prepare-openai (rollout `egressServeLog`, default 0) measures the identity
- * rate against real traffic BEFORE any swap can happen; serving actual
- * outbound bytes from this is a later step behind the same key.
+ * Egress serve-from-log — segment 4b of the op-log outbound view (proposal
+ * discussions/7398, #6785 perf work). Rebuilds the outbound core-message
+ * portion from the replayed log + unified content CAS and runs it through the
+ * SAME legacy chain (systemToUser → coreToOpenai → hardenOpenaiAssistantContent)
+ * the pipeline uses, so the output is byte-identical by construction when the
+ * CAS bytes are the final core JSON (which segment 3's recording guarantees).
+ * prepare-openai (rollout `egressServeLog`, default 0) SERVES these elements
+ * as the outbound conversation when the rebuild succeeds, and falls back to
+ * the legacy path — with the 4a shadow byte-comparison still running on
+ * fallback turns — when it cannot (degrade, never guess).
  *
  * v1 scope (honest, pinned in tests):
  *   - text and acp_summary rows rebuild (that is the entire 10w-row
