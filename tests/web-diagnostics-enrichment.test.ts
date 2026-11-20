@@ -4,13 +4,15 @@
 // hand. These tests pin the enriched sections AND the publish discipline: the
 // blob lands in a PUBLIC GitHub issue body, so secrets must be masked and no
 // absolute path (username leak) may survive into it.
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import * as path from "node:path";
 import { buildDiagnostics, _candidateLogReadsForTest, _resetCandidateLogReadsForTest } from "../src/web/diagnostics.js";
 import { isMaskHostsEnabled, setMaskHostsEnabled } from "../src/log-mask.js";
+import { sealActiveLog } from "../src/log-retention.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 
@@ -72,6 +74,100 @@ function makeFixture(): { root: string; dshHome: string; stateHome: string; conf
     ].join("\n") + "\n");
     return { root, dshHome, stateHome, configPath };
 }
+
+function observeLogReads(t: TestContext, beforeOpen?: (file: string) => void): string[] {
+    const files: string[] = [];
+    const original = fs.createReadStream;
+    const hook = t.mock.method(fs, "createReadStream", (...args: Parameters<typeof fs.createReadStream>) => {
+        const file = String(args[0]);
+        files.push(file);
+        beforeOpen?.(file);
+        return original(...args);
+    });
+    syncBuiltinESMExports();
+    t.after(() => {
+        hook.mock.restore();
+        syncBuiltinESMExports();
+    });
+    return files;
+}
+
+function writeLogGenerations(file: string, payloads: string[][]): string[] {
+    const files: string[] = [];
+    for (let i = 0; i < payloads.length; i++) {
+        writeFileSync(file, payloads[i]!.join("\n") + "\n");
+        if (i < payloads.length - 1) {
+            const sealed = sealActiveLog(file, Date.UTC(2026, 10, 1) + i).sealed;
+            assert.ok(sealed);
+            files.push(sealed);
+        } else files.push(file);
+    }
+    return files;
+}
+
+for (const topic of ["attribution", "snapshot-shadow"]) {
+    test(`${topic} diagnostics do not read log evidence absent from their report`, async (t) => {
+        const fx = makeFixture();
+        t.after(() => rmSync(fx.root, { recursive: true, force: true }));
+        const reads = observeLogReads(t);
+        const report = await withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
+            () => buildDiagnostics(topic));
+        assert.ok(report.blob.includes(topic === "attribution" ? "--- takeover attribution ---" : "--- per-session shadow blobs ---"));
+        assert.deepEqual(reads, [], "a report without a log section must not open retained log files");
+    });
+}
+
+for (const { topic, marker, cap } of [
+    { topic: "storage-legacy-only", marker: "[storage] history-", cap: 12 },
+    { topic: "conflict-banner", marker: "codex compact intercepted: history-", cap: 20 },
+]) {
+    for (const sparseActive of [false, true]) {
+        test(`${topic} reads only the newest generations needed for its ${cap}-line tail (sparse=${sparseActive})`, async (t) => {
+            const fx = makeFixture();
+            t.after(() => rmSync(fx.root, { recursive: true, force: true }));
+            const entries = (generation: number, count: number) => Array.from({ length: count }, (_, i) => `${marker}${generation}-${i}`);
+            const oldest = entries(0, cap + 3);
+            const middle = entries(1, cap + 3);
+            const newest = entries(2, sparseActive ? 3 : cap + 3);
+            const files = writeLogGenerations(path.join(fx.stateHome, "billion-context", "bili.log"), [oldest, middle, newest]);
+            const reads = observeLogReads(t);
+            const report = await withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
+                () => buildDiagnostics(topic));
+            assert.deepEqual(report.blob.split("\n").filter((line) => line.includes(marker)).map((line) => line.trimStart()),
+                [...middle, ...newest].slice(-cap), "the bounded tail must retain chronological order across generations");
+            assert.deepEqual([...reads].sort(), (sparseActive ? [files[2], files[1]] : [files[2]]).sort(), "older generations cannot add a newer matching line once the tail is full");
+            assert.ok(!report.blob.includes("INCOMPLETE:"));
+        });
+    }
+}
+
+test("diagnostic tails retain unreadable-generation warnings while filling from older evidence", async (t) => {
+    const fx = makeFixture();
+    t.after(() => rmSync(fx.root, { recursive: true, force: true }));
+    const file = path.join(fx.stateHome, "billion-context", "bili.log");
+    const marker = "[storage] history-";
+    const older = Array.from({ length: 15 }, (_, i) => `${marker}${i}`);
+    const files = writeLogGenerations(file, [older, ["[storage] rotated before open"]]);
+    const reads = observeLogReads(t, (opening) => { if (opening === file) rmSync(file); });
+    const report = await withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
+        () => buildDiagnostics("storage-legacy-only"));
+    assert.deepEqual(report.blob.split("\n").filter((line) => line.includes(marker)).map((line) => line.trimStart()), older.slice(-12));
+    assert.ok(report.blob.includes("INCOMPLETE: 1 log generation(s) could not be read"));
+    assert.deepEqual([...reads].sort(), [...files].sort());
+});
+
+test("diagnostic tails scan all retained generations when matches do not fill the tail", async (t) => {
+    const fx = makeFixture();
+    t.after(() => rmSync(fx.root, { recursive: true, force: true }));
+    const marker = "[storage] history-";
+    const evidence = [`${marker}oldest`, `${marker}newest`];
+    const files = writeLogGenerations(path.join(fx.stateHome, "billion-context", "bili.log"), [[evidence[0]!], ["unrelated middle"], [evidence[1]!]]);
+    const reads = observeLogReads(t);
+    const report = await withEnv({ DSH_HOME: fx.dshHome, XDG_STATE_HOME: fx.stateHome, XDG_CONFIG_HOME: fx.root, XDG_DATA_HOME: fx.root, XDG_CACHE_HOME: fx.root, BILI_CONFIG_FILE: fx.configPath },
+        () => buildDiagnostics("storage-legacy-only"));
+    assert.deepEqual(report.blob.split("\n").filter((line) => line.includes(marker)).map((line) => line.trimStart()), evidence);
+    assert.deepEqual([...reads].sort(), [...files].sort());
+});
 
 test("#3611 conflict-banner report carries versions, masked config, and evidence-log tail", async (t) => {
     const fx = makeFixture();
@@ -175,12 +271,8 @@ test("#3611 oversized config is capped with a truncation note", async (t) => {
     assert.ok(cfgSection.length < 2200, `config section bounded, got ${cfgSection.length} chars`);
 });
 
-// #3813: buildDiagnostics used to read the rotated log pair ONCE PER TAIL, so a
-// conflict-banner request (which sets both the storage tail and the conflict
-// tail) did two full synchronous reads. The fix pre-fetches the candidate lines
-// once and hands the SAME array to both tails — output must stay identical while
-// each tail still selects ONLY its own pattern (no cross-leak between the two).
-test("#3813 single-read: storage tail and conflict tail share one candidate set without cross-leak", async (t) => {
+// #3813: each report must collect its own evidence only once.
+test("#3813 single-read: each report collects its own tail without cross-leak", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-oneread-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const stateHome = path.join(root, "state");
@@ -191,12 +283,12 @@ test("#3813 single-read: storage tail and conflict tail share one candidate set 
     const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
     _resetCandidateLogReadsForTest();
     const conflictBlob = (await withEnv(env, () => buildDiagnostics("conflict-banner"))).blob;
-    assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner reads the rotated pair exactly once (pre-fix: twice)");
+    assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner collects evidence exactly once (pre-fix: twice)");
     const storageBlob = (await withEnv(env, () => buildDiagnostics("storage-legacy-only"))).blob;
-    assert.equal(_candidateLogReadsForTest(), 2, "each report costs exactly one full-pair read");
-    assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line from the shared read");
+    assert.equal(_candidateLogReadsForTest(), 2, "each report collects its evidence once");
+    assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line");
     assert.ok(!conflictBlob.includes(storageMarker), "conflict tail must not leak [storage] lines");
-    assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line from the shared read");
+    assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line");
     assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
     await withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
     assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
