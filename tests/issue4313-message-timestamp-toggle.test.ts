@@ -25,6 +25,7 @@ import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap 
 import { FUNCTION_ACP_TAGS_TIMESTAMPED, LEAN_HOW_TO_COMPRESS, LEAN_HOW_TO_COMPRESS_TIMESTAMPED } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { resolveMessageTimestamps } from "../src/config.ts";
 import { messageTimestampSections } from "../src/external-summary-surface.ts";
@@ -117,7 +118,7 @@ type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void };
 function makeCtx(): Ctx {
     return {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: MESSAGES,
         session: {
             id: "toggle-span-gate",

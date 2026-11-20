@@ -7,6 +7,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { liveCompressionRanges } from "../src/acp-status.ts";
 
 function spanContains(start: string, end: string, n: number): boolean {
@@ -32,7 +33,7 @@ function makeCtx(count: number, preserveRecentMessages = 5): RewriteCtx {
     storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session,
         log: () => {},
@@ -136,11 +137,11 @@ test("token-based recent protection is honored even beyond the last-message coun
 
 test("failure recovery does not stop an active block-distillation nudge", () => {
     const ctx = makeCtx(12, 0);
-    ctx.config = defaultConfig(200000, {
+    ctx.config = { ...defaultConfig(200000, {
         preserveRecentMessages: 0,
         preserveRecentTokens: 0,
         tiers: { enabled: true, tier2Trigger: 2, tier3Trigger: 3 },
-    });
+    }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
     ctx.session.stats.lastInputTokens = 200000;
     ctx.session.stats.lastInputTokensSource = "usage";
     for (const [start, end] of [["m00001", "m00004"], ["m00005", "m00008"], ["m00009", "m00012"]]) {

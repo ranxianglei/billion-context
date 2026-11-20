@@ -13,6 +13,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
@@ -30,7 +31,7 @@ function makeCtx(opts?: { messages?: CoreMessage[]; refs?: boolean }): Ctx {
         // Explicit protect-zone override (same recipe as tests/compress-span-hint.test.ts):
         // the bare default would fence m00010..m00040 under "most recent user
         // message" protection and mask the gate behavior under test.
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: opts?.messages ?? [],
         session: {
             id: "issue3126-test",

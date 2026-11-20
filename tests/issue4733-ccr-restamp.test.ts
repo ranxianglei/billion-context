@@ -49,7 +49,7 @@ function foldWithPoisonedAlias(): { core: ReturnType<typeof createCore>; config:
     const config = applyCompressSettings(
         defaultConfig(200_000),
         200_000,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
+        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 }, minFoldBenefitTokens: 0 },
     ) as Config;
     const session = getSession(`issue4733-${Math.random().toString(36).slice(2)}`);
     storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });

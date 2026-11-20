@@ -59,7 +59,7 @@ function ccrConfig(on: boolean): Config {
         // whole fold range nondeterministically.
         defaultConfig(LIMIT, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 10, minSummaryLength: 20, maxSummaryLength: 5000 } }),
         LIMIT,
-        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: on, minToolTokens: 50 } },
+        { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: on, minToolTokens: 50 }, minFoldBenefitTokens: 0 },
     ) as Config;
 }
 

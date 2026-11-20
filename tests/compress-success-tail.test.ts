@@ -5,6 +5,7 @@ import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig 
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // #1387: post-compress success tail — remaining-ranges snapshot (pi #420) and
 // explicit stop signal (pi #521). Cross-host wording must stay verbatim.
@@ -17,7 +18,7 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, overrides as never),
+        config: { ...defaultConfig(200000, overrides as never), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: {
             id: "compress-tail-test",

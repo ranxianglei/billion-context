@@ -12,6 +12,7 @@ import type { CoreMessage } from "acp-kernel";
 import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap } from "acp-kernel";
 import { normalizeCompressInput, parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
@@ -20,7 +21,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [] as CoreMessage[],
         session: {
             id: `i1494-${Math.random().toString(36).slice(2)}`,

@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap, hideConsumedCompressCalls } from "acp-kernel";
 import { applyRanges, findVisibleStubResubmissions, visibleSummaryStubs, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -32,7 +33,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [] as CoreMessage[],
         session: {
             id: `stub-${Math.random().toString(36).slice(2)}`,
