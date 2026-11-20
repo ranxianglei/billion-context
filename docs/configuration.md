@@ -1111,6 +1111,7 @@ Security boundary: the file controls ONLY *when* to upgrade and *which published
 - **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
 - **Status:** ACTIVE
 - **Description:** Fake-completion safety net for hosts that abort mid-stream (#371) — **opt-in**, `retries: 0` (default) is the pre-#371 passthrough. `bufCapBytes` is the OOM guard on the buffered response. Twins `BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP`.
+- A response exceeding `bufCapBytes` continues through the normal streaming path, including its already-read prefix. The incomplete inspection neither retries nor changes the session's fake-completion streak; the cap does not truncate the answer. This applies to the first response and hinted retries.
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
