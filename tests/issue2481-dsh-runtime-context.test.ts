@@ -45,6 +45,35 @@ Approval prompts are disabled in this session: actions that require approval are
 // Cleared variant from the same emitter (deepseek-harness
 // packages/core/agent-loop/src/runtime-context.ts):
 const RT_CLEARED_MSG = `Current runtime context: none. Earlier runtime-context snapshots no longer apply.`;
+// #7085: dsh 0.2.2-rc.3 reworded the populated snapshot — it no longer
+// contains "Current runtime context" but opens with the lead-in "The
+// following information describes your current session:" wrapped in a
+// \x3csystem-reminder\x3e envelope (the cleared form still uses the old
+// literal, so both shapes coexist in transition sessions).
+const RT_MSG_NEW = `\x3csystem-reminder\x3e
+The following information describes your current session:
+
+Current working directory: "/path/to/repo".
+
+Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.
+
+Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set \`sandbox_permissions\`).
+\x3c/system-reminder\x3e`;
+// #7085: the RE-SEND variant — after the first snapshot is committed and a
+// context section changes, the emitter continues the lead-in with a period
+// ("…session. It replaces earlier versions of this context, including any
+// retained in conversation summaries.") instead of a colon. The classifier
+// marker must be the shared prefix without the trailing colon or every
+// state-change re-send (approval policy flip, cwd change) goes blind again.
+const RT_MSG_NEW_RESEND = `\x3csystem-reminder\x3e
+The following information describes your current session. It replaces earlier versions of this context, including any retained in conversation summaries.
+
+Current working directory: "/path/to/repo".
+
+Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.
+
+Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set \`sandbox_permissions\`).
+\x3c/system-reminder\x3e`;
 
 function filler(tag: string): string {
     return `${tag}-` + "z".repeat(900);
@@ -142,6 +171,8 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     const msg = (contentType: string, text: unknown) => ({ id: "id-1", createdAt: 0, contentType, text }) as never;
     assert.equal(dshRuntimeContextPath(msg("text", RT_MSG)), "durable/runtime-context", "the populated sandbox/approval snapshot projects");
     assert.equal(dshRuntimeContextPath(msg("text", RT_CLEARED_MSG)), "durable/runtime-context", "the cleared form projects too (it invalidates the older pinned snapshots)");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_MSG_NEW)), "durable/runtime-context", "the 0.2.2-rc.3 reworded snapshot projects too (#7085 — the old literal alone went blind)");
+    assert.equal(dshRuntimeContextPath(msg("text", RT_MSG_NEW_RESEND)), "durable/runtime-context", "the re-send intro (period, no colon) projects too (#7085 — the colon-terminated marker missed it)");
     // Deliberately foldable neighbors stay consumable:
     assert.equal(dshRuntimeContextPath(msg("text", "Time sampled while preparing turn: Fri Oct 09 2026 15:20:00 CST")), undefined, "the per-turn time-context carrier stays foldable");
     assert.equal(dshRuntimeContextPath(msg("text", "The approval policy changed from 'ask' to 'never' (changed by the user).")), undefined, "the approval-change DELTA is transient history (current state rides in the snapshot's approval:policy section)");
@@ -153,6 +184,8 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
     assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG)), "durable/runtime-context", "lane entry covers the #2481 snapshot shape");
+    assert.equal(dshClassifier!(msg("text", RT_MSG_NEW)), "durable/runtime-context", "lane entry covers the #7085 reworded snapshot shape");
+    assert.equal(dshClassifier!(msg("text", RT_MSG_NEW_RESEND)), "durable/runtime-context", "lane entry covers the #7085 re-send intro shape");
     assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
 });
 
@@ -160,7 +193,7 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
  *  runtime-context snapshot (it sits mid-history between two tagged fillers),
  *  execute a real compress through /__bili/plugin/tool, and return the next
  *  turn's upstream body. */
-async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
+async function runFoldScenario(agent: string, conv: string, snapshot: string = RT_MSG): Promise<{ postFoldBody: string; toolJson: Record<string, unknown> }> {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -174,7 +207,7 @@ async function runFoldScenario(agent: string, conv: string): Promise<{ postFoldB
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A1") });
         // …turn 2 drops the snapshot mid-history…
-        msgs.push({ role: "user", content: RT_MSG });
+        msgs.push({ role: "user", content: snapshot });
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A2") });
         // …and turns 3–8 grow past it.
@@ -224,6 +257,24 @@ test("dsh lane (#2481): the runtime-context snapshot survives a fold that positi
     // wire even when a block covers it (kernel/src/prune.ts rebuildMessages,
     // DESIGN.md §8.1 — strict providers reject user-less conversations), so
     // F1 would survive any fold and cannot witness consumption.
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the snapshot must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
+});
+
+test("dsh lane (#7085): the 0.2.2-rc.3 reworded snapshot survives a fold that positionally covers it", async () => {
+    const { postFoldBody } = await runFoldScenario("dsh", "i7085-dsh", RT_MSG_NEW);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("danger-full-access"), "the sandbox policy must survive the fold (hard-protected, stays fully visible)");
+    assert.ok(postFoldBody.includes("Approval prompts are disabled"), "the approval policy must survive too (one message carries both sections)");
+    assert.ok(!postFoldBody.includes("A1-"), "folded filler before the snapshot must be gone (the fold really consumed its range)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
+});
+
+test("dsh lane (#7085): the 0.2.2-rc.3 re-send snapshot survives a fold that positionally covers it", async () => {
+    const { postFoldBody } = await runFoldScenario("dsh", "i7085-dsh-resend", RT_MSG_NEW_RESEND);
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened (protection may not veto the whole range)");
+    assert.ok(postFoldBody.includes("danger-full-access"), "the sandbox policy must survive the fold (hard-protected, stays fully visible)");
+    assert.ok(postFoldBody.includes("Approval prompts are disabled"), "the approval policy must survive too (one message carries both sections)");
     assert.ok(!postFoldBody.includes("A1-"), "folded filler before the snapshot must be gone (the fold really consumed its range)");
     assert.ok(!postFoldBody.includes("F5-"), "folded filler after the snapshot must be gone");
 });

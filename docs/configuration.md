@@ -310,7 +310,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
-| `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
+| `compress.reasoning` | { drop?, threshold?, tail? } | drop true · threshold 2048 · tail false | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
 | `compress.blockOps` | object | off | — | Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
@@ -353,6 +353,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
+| `compress.reasoning.tail` | boolean | false | — | (#7144 follow-up) Also drop reasoning from any CLOSED round in the protected tail, not only compress turns — a tool call whose result arrived with at least one message after it, or an assistant text turn that is no longer the last message. Those rounds leave the protected window at the next fold anyway, so dropping early reclaims the tokens now; the in-flight round is never touched. Strict-echo upstreams are unaffected: #762/#2169 blank-echo normalization runs after the drop. |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
 
 **Provider route fields**
@@ -410,6 +411,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait. |
 | `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two. |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | number | (built-in) | — | Bounded grace (ms) inside the pre-spawn second-writer gate (#7156): after a same-lane predecessor's listener is gone, how long to wait for the PROCESS to actually exit — its final flush still writes index.db while it drains. Non-numeric or non-positive values fall back to the default (envMillis contract, #1365). |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
 | `BILI_SILENT_DIRECT_MAX_MB` | number | (built-in) | — | Silent-direct oversized guard ceiling (MiB). |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
@@ -919,6 +921,7 @@ Top-level keys that control how the proxy listens and behaves globally.
       "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
     },
     "notifyIfRead": "skip",      // "skip" — no completion nudge if the model already read the result file
+    "notifyStructured": false,   // true — notices become typed custom messages carrying a versioned details envelope (runId/status + launch provenance) for third-party UIs; model-visible text unchanged (#5750)
     "fleetShortcut": "ctrl+alt+d", // "" disables the keyboard shortcut (/acp-fleet still works)
     "prompt": null,              // replace (string) or remove (null) the ACP_DELEGATE NOTIFICATIONS appendix
     "debug": false               // debug events in ~/.pi/acp.log, scoped to sub-agents
@@ -2170,6 +2173,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_SILENT_DIRECT_MAX_MB` | Ceiling (MiB, > 0; fractions allowed) for the raw-body byte guard that refuses direct model requests locally with a 422 when the plugin's live-state slot is missing or request attribution is lost (#5405/#5408). The guard counts RAW bytes — base64-inflated media included — so image-heavy sessions can legitimately exceed 2 MiB; default `8`. Invalid values fall back to the default. See #5405, #5826. |
 | `BILI_SPAWN_WAIT_MS` | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher logs `still starting up` and extends the wait (default `20000`). Widen it when the proxy's pre-bind open path runs long: a large `index.db` opens whole-DB before bind (integrity check, WAL recovery — see #4939), and two lanes sharing one store cold-starting together contend for the SQLite write lock (observed 28s+ to first log line, 60s+ with zero output, on Windows with a 1.7 GiB store). Non-numeric or non-positive values fall back to the default (same `envMillis` contract as #1365). |
 | `BILI_SLOW_START_GRACE_MS` | Slow-start grace (ms) beyond `BILI_SPAWN_WAIT_MS` for a spawned child that is still ALIVE and starting (#2187: Windows spawn windows of 26-45s from AV / first-run disk activity; a large or contended shared store can push total pre-bind time past 60s). The total spawn budget is the sum of the two knobs; a child that EXITS still fails fast (default `40000`). |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | Bounded grace (ms) inside the pre-spawn second-writer gate (#7156): after a same-lane predecessor's listener is gone, how long to wait for the PROCESS to actually exit — its final flush still writes index.db while it drains, so "the port is free" is not the safety condition. Typical drains finish in seconds; the default stays small because the host's own child budget (~`SPAWN_BUDGET_MS`) caps the whole bring-up (default `10000`). Non-numeric or non-positive values fall back to the default (same `envMillis` contract as #1365). |
 | `BILI_PLUGIN_BYPASS` | Operator override of the `x-bili-plugin-bypass` passthrough decision (#6220), read per-request (no restart). Three-state: **unset**/`auto` = current behavior (the inbound header decides per request); **`1`/`on`/`true`** = force bypass (every request forwarded verbatim — no tool injection, no nudge, no session binding); **`0`/`off`/`false`** = never bypass (any inbound `x-bili-plugin-bypass` header is ignored); unrecognized values are treated as `auto`. Env-only by owner sign-off in #6220 (no config-file twin). |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |

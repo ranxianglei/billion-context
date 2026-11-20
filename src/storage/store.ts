@@ -483,11 +483,21 @@ export class UnifiedStore {
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
     private readonly dbPath: string;
-    /** #4609: the last completed check (sync, cache hit, or background
+    /** #4609: a check that RAN IN THIS LIFETIME (sync scan or background
      * verdict) said the file set is sound — a clean close then refreshes the
      * verdict cache onto the post-checkpoint stats so the next boot skips
-     * the rescan. Never true while a check is still in flight or failed. */
+     * the rescan. A boot-time CACHED-ok deliberately does NOT arm this
+     * (#7156 review): re-stamping a verdict we never re-verified would
+     * perpetuate a poisoned .chk forever (cache hit → close → re-stamp →
+     * cache hit ...); without the re-stamp the post-close stat change forces
+     * the next boot to rescan fresh. Never true while a check is still in
+     * flight or failed. */
     private lastIntegrityOk = false;
+    /** #7156 review: a live foreign writer was observed at any point in this
+     * lifetime (boot, background-check completion, close). While true, NO ok
+     * verdict may be cached: the file moved outside this process's verified
+     * writes, so every cache write site defers to the next boot's fresh scan. */
+    private sawForeignWriter = false;
     /** #5539 secondary finding: releaseContent runs once per released hash
      * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
      * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
@@ -543,11 +553,30 @@ export class UnifiedStore {
         // stale FAIL left behind by an older version is treated as a miss and
         // re-scanned fresh. BILI_STORAGE_QUICK_CHECK=0 opts out of all
         // of it (no check, no cache IO).
-        let integrityOk = false;
+        // #7156 review: read the ownership lock BEFORE any ok verdict is
+        // cached (the claim below at #4175 happens AFTER the integrity block
+        // and would overwrite this evidence). A live foreign holder means the
+        // file may change outside this process's writes while our scan runs —
+        // an ok verdict stamped in that window poisons every later boot
+        // (cache hit skips the rescan; the incident's .chk ok at 19:19:23 was
+        // written by exactly such a scan while the wedged predecessor was
+        // still writing). Fail-open like the #4175 block: unreadable means
+        // "no evidence".
+        let foreignLockPidAtBoot: number | null = null;
+        try {
+            const bootLockPath = `${path}.lock`;
+            if (existsSync(bootLockPath)) {
+                const parsed = JSON.parse(readFileSync(bootLockPath, "utf8")) as { pid?: unknown };
+                const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                if (pid !== null && pid !== process.pid && processAlive(pid)) foreignLockPidAtBoot = pid;
+            }
+        } catch {
+            /* unreadable lockfile: no evidence of a foreign writer */
+        }
+        let bootVerdictFresh = false; // this lifetime actually scanned ok (sync or background)
         const mode = integrityModeFor(path);
         if (mode.kind === "cached-ok") {
             recordIntegrityOutcome(path, true, 0, "verdict cache hit (file set unchanged since the last check)");
-            integrityOk = true;
         } else if (mode.kind === "sync") {
             noteIntegrityCheckRun();
             const started = Date.now();
@@ -591,8 +620,16 @@ export class UnifiedStore {
                 db.close();
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
-            writeIntegrityCache(path, true);
-            integrityOk = true;
+            // #7156 review: never cache an ok verdict stamped while a live
+            // foreign writer holds the lock — same reasoning as the boot-time
+            // pre-read above; the next boot re-scans fresh instead of trusting
+            // a scan that raced a second writer.
+            if (foreignLockPidAtBoot === null) {
+                writeIntegrityCache(path, true);
+            } else {
+                loggerLog("info", `[storage] quick_check passed for ${path}, but live foreign writer pid ${foreignLockPidAtBoot} holds ${path}.lock — NOT caching the ok verdict (the file may change outside this process's writes); the next boot re-scans fresh (#7156)`);
+            }
+            bootVerdictFresh = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
         // is surfaced (web wire + banner) as INFORMATIONAL ONLY. #5082: sharing
@@ -691,6 +728,9 @@ export class UnifiedStore {
             if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
             throw err;
         }
+        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+        if (foreignLockHolder !== null) store.noteForeignWriterSeen(foreignLockHolder.pid);
+        if (bootVerdictFresh) store.noteIntegrityOk();
         // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
         // loss never reaches close()). Moving committed frames into the main db
         // now shortens the NEXT crash's recovery replay. Isolated from the open
@@ -698,27 +738,62 @@ export class UnifiedStore {
         // (#2671) a TRUNCATE can come back busy while a foreign connection is
         // mid-transaction — that must log, not fail the open; the periodic and
         // close-time passes retry the reclamation.
-        try {
-            db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-        } catch (err) {
-            loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+        // #7156 fix 2 (owner 2026-11-20): a TRUNCATE checkpoint does not merely
+        // move frames — it RECLAIMS the WAL file and its -shm index state out
+        // from under every peer. A live peer holding a STALE view of that index
+        // (a wedged predecessor mid-fold, a predecessor still draining after
+        // accepting shutdown) then writes or checkpoints from the invalidated
+        // view, and its frames land in reclaimed offsets — the #7156 damage
+        // shape (child pointers beyond EOF, "2nd reference to page", ptrmap
+        // mismatches). So while a live foreign writer is proven present, skip
+        // the truncate: the WAL simply stays until the peer exits, and the
+        // periodic/close/next-open passes converge it then. With no live
+        // foreign writer the behavior is byte-identical to before.
+        const foreignAtOpen = store.activeForeignWriter();
+        if (foreignAtOpen === null) {
+            try {
+                db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch (err) {
+                loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
+            }
+        } else {
+            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on open for ${path}: live foreign writer pid ${foreignAtOpen} present — truncating the WAL index under a live peer risks the #7156 corruption shape; the periodic/close/next-open passes converge the WAL after it exits`);
         }
-        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
-        if (integrityOk) store.noteIntegrityOk();
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status as an ALARM ONLY (2026-10-30 owner policy:
         // a running store's background verdict never refuses future boots —
         // each next boot re-scans fresh; no automatic file moves, #4175).
-        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
+        // #7156 review: the completion-side ok cache write is gated on the
+        // same foreign-writer evidence as the close-time refresh — the
+        // incident's .chk ok was written by THIS path (background quick_check
+        // started 19:19:02 while the wedged predecessor was still writing).
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(
+            path,
+            (ok) => { if (ok) store.noteIntegrityOk(); },
+            () => store.activeForeignWriter(),
+            (pid) => store.noteForeignWriterSeen(pid),
+        );
         return store;
     }
 
-    /** #4609: mark this instance's file set as verified (sync check ok,
-     * cache hit, or background verdict ok) so a clean close refreshes the
-     * verdict cache onto the post-checkpoint stats. */
+    /** #4609: mark this instance's file set as verified by a scan that ran IN
+     * THIS LIFETIME (sync or background ok) so a clean close refreshes the
+     * verdict cache onto the post-checkpoint stats. A boot-time cached ok
+     * does NOT call this — see the field comment for why re-stamping an
+     * unverified verdict would perpetuate a poisoned cache. */
     noteIntegrityOk(): void {
         this.lastIntegrityOk = true;
+    }
+
+    /** #7156 review: a live foreign writer was proven present at some point
+     * in this lifetime — suppress every ok-verdict cache write from here on
+     * (the file moved outside this process's verified writes; the next boot
+     * re-scans fresh). Idempotent; the first sighting logs. */
+    noteForeignWriterSeen(pid: number): void {
+        if (this.sawForeignWriter) return;
+        this.sawForeignWriter = true;
+        loggerLog("info", `[storage] live foreign writer pid ${pid} observed in this lifetime — the ${this.dbPath} verdict cache will not be refreshed by this process; the next boot re-scans fresh (#7156)`);
     }
 
     /** Keep paged reads on one generation without taking the writer lock. */
@@ -744,10 +819,21 @@ export class UnifiedStore {
         // leaves nothing for the next boot's recovery to replay. Same isolation
         // as open(): a checkpoint hiccup logs and never throws — callers treat
         // close() as best-effort shutdown work.
-        try {
-            this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-        } catch (err) {
-            loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+        // #7156 fix 2: the same live-foreign-writer guard as open(). The dying
+        // process's FINAL checkpoint is the proven vector — the incident's old
+        // sidecar ran its shutdown checkpoint while its replacement was already
+        // writing, and that truncate reclaimed the WAL under a live peer. A
+        // skip only delays reclamation: the WAL stays, the peer's next clean
+        // pass converges it, nothing is lost.
+        const foreignAtClose = this.activeForeignWriter();
+        if (foreignAtClose === null) {
+            try {
+                this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+            } catch (err) {
+                loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
+            }
+        } else {
+            loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on close for ${this.dbPath}: live foreign writer pid ${foreignAtClose} present (#7156) — the WAL is left for the peer's next clean pass to converge`);
         }
         this.db.close();
         // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
@@ -755,8 +841,28 @@ export class UnifiedStore {
         // are alarm-only by owner policy (2026-10-30) and are never cached,
         // so there is nothing else to carry here. Deferred while a background
         // check is still in flight (its own completion writes the cache).
+        // #7156: the refresh must NOT run while a live foreign writer is present.
+        // lastIntegrityOk is a boot-time flag that is never invalidated, so a
+        // store that booted healthy but whose file was corrupted by a concurrent
+        // second writer (the #7156 dual-writer incident: the wedged predecessor
+        // shut down 7s AFTER its replacement had already opened index.db) would
+        // otherwise stamp a FRESH ok verdict onto the corrupted file's stats at
+        // close — and every boot after that skips the rescan (cache hit) and
+        // dies on the first write. A live foreign writer means the file may have
+        // moved outside this process's verified writes: skip the refresh so the
+        // next boot re-scans fresh. A read-only foreign opener is a safe false
+        // positive (it only costs one extra rescan, never a wrong verdict).
         if (!backgroundIntegrityInflightForTests(this.dbPath)) {
-            if (this.lastIntegrityOk) writeIntegrityCache(this.dbPath, true);
+            if (this.lastIntegrityOk && !this.sawForeignWriter) {
+                const foreign = this.activeForeignWriter();
+                if (foreign === null) {
+                    writeIntegrityCache(this.dbPath, true);
+                } else {
+                    loggerLog("info", `[storage] skipping the close-time integrity-cache refresh for ${this.dbPath}: live foreign writer pid ${foreign} present — the file may have changed outside this process's verified writes, so the next boot re-scans fresh (#7156)`);
+                }
+            } else if (this.lastIntegrityOk && this.sawForeignWriter) {
+                loggerLog("info", `[storage] skipping the close-time integrity-cache refresh for ${this.dbPath}: a live foreign writer was seen during this lifetime — the file may have changed outside this process's verified writes, so the next boot re-scans fresh (#7156)`);
+            }
         }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a
@@ -1579,10 +1685,11 @@ export class UnifiedStore {
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
         const existing = this.db
-            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null }[];
+            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?")
+            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null; ref: string | null }[];
         const seqByIdentity = new Map<string, number>();
         const hashBySeq = new Map<number, string>();
+        const storedRefBySeq = new Map<number, string | null>();
         const retiredSeqs: number[] = [];
         let nextSeq = 0;
         for (const row of existing) {
@@ -1594,6 +1701,7 @@ export class UnifiedStore {
             if (row.retired_at !== null) retiredSeqs.push(row.seq);
             seqByIdentity.set(`${row.msg_id}\u0000${row.identity}`, row.seq);
             hashBySeq.set(row.seq, row.content_hash);
+            storedRefBySeq.set(row.seq, row.ref);
             if (row.seq + 1 > nextSeq) nextSeq = row.seq + 1;
         }
         // #3133 watermark gate (full path): the watermark names the abs seq
@@ -1604,6 +1712,12 @@ export class UnifiedStore {
         // save runs the full ingest.
         const planToAbs = new Map<number, number>();
         const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
+        // #6947: rows written by the turn-final handoff write-back carry
+        // ref=NULL — their ref is minted only when a LATER request re-sends
+        // the message. This join hit is the first moment the minted ref can
+        // reach the stored row; backfill NULL only (a non-null stored ref is
+        // the frozen index-time projection and must never be rewritten).
+        const refBackfills: { seq: number; ref: string; refNum: number }[] = [];
         const messages = input.messages.map((m) => {
             // #3133: plan rows carry the intern-pass hash; only direct
             // callers without a planner pay the sha256 here.
@@ -1625,10 +1739,21 @@ export class UnifiedStore {
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
                 if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
+                // #6947: minted-ref backfill for turn-final write-back rows.
+                // Never "BLOCKED" (a byRaw-only token, #ingest note) and never
+                // over an already-stored ref.
+                if (m.ref !== null && m.ref !== "BLOCKED" && m.refNum !== null && storedRefBySeq.get(abs) === null) {
+                    refBackfills.push({ seq: abs, ref: m.ref, refNum: m.refNum });
+                }
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        for (const b of refBackfills) {
+            // The ref IS NULL re-check inside the statement keeps the update
+            // idempotent if two plan rows join the same stored row.
+            this.db.prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL").run(b.ref, b.refNum, s.sessionId, b.seq);
+        }
         for (const r of repairs) {
             // #4793: a sibling row may already hold the target bytes for this
             // msg_id — e.g. an old generation stamped with an EMPTY identity
@@ -2967,25 +3092,35 @@ export class UnifiedStore {
      *  compressed-token sum). Replaces the bounded envelope-file decode the
      *  disk index performs per refresh. */
     webSummaryRows(): WebSummaryRow[] {
+        // #7156: a corrupt/empty payload_json (e.g. left by an interrupted
+        // .recover) made json_extract throw "malformed JSON" and fail the WHOLE
+        // .all() — the panel then silently fell back to 0 historical sessions.
+        // Guard each extract with json_valid so a bad row degrades to NULL
+        // (skipped by the filters, ignored by SUM) instead of killing the list.
         const rows = this.db
             .prepare(
-                `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
+                `WITH bl AS (
+                     SELECT b.session_id, b.ord, b.active,
+                            CASE WHEN json_valid(b.payload_json) THEN b.payload_json END AS payload
+                     FROM blocks b
+                 )
+                 SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
                         s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
                         s.stats_json AS statsJson, s.metadata_json AS metadataJson,
-                        (SELECT COUNT(*) FROM blocks b WHERE b.session_id = s.session_id) AS blocks,
-                        (SELECT json_extract(b.payload_json, '$.topic') FROM blocks b
-                          WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
-                          ORDER BY b.ord LIMIT 1) AS firstTopic,
-                        (SELECT json_extract(b.payload_json, '$.summary') FROM blocks b
-                          WHERE b.session_id = s.session_id
-                            AND (json_extract(b.payload_json, '$.topic') IS NOT NULL
-                                 OR json_extract(b.payload_json, '$.summary') IS NOT NULL)
-                          ORDER BY b.ord LIMIT 1) AS firstSummary,
-                        (SELECT COALESCE(SUM(json_extract(b.payload_json, '$.compressedTokens')), 0)
-                          FROM blocks b WHERE b.session_id = s.session_id AND b.active = 1) AS activeCompressed
-                 FROM sessions s`,
+                        (SELECT COUNT(*) FROM bl WHERE bl.session_id = s.session_id) AS blocks,
+                        (SELECT json_extract(bl.payload, '$.topic') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstTopic,
+                        (SELECT json_extract(bl.payload, '$.summary') FROM bl
+                          WHERE bl.session_id = s.session_id
+                            AND (json_extract(bl.payload, '$.topic') IS NOT NULL
+                                 OR json_extract(bl.payload, '$.summary') IS NOT NULL)
+                          ORDER BY bl.ord LIMIT 1) AS firstSummary,
+                        (SELECT COALESCE(SUM(json_extract(bl.payload, '$.compressedTokens')), 0)
+                          FROM bl WHERE bl.session_id = s.session_id AND bl.active = 1) AS activeCompressed
+                  FROM sessions s`,
             )
             .all() as Array<{
                 sessionId: string;

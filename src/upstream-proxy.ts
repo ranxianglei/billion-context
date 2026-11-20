@@ -530,10 +530,12 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
                 if (chunk === null) return;
                 buffer = Buffer.concat([buffer, chunk]);
                 const end = buffer.indexOf("\r\n\r\n");
-                if (end < 0) {
-                    if (buffer.length > 64 * 1024) finishError(new Error("upstream proxy CONNECT response header is too large"));
+                const headerBytes = end < 0 ? buffer.length : end + 4;
+                if (headerBytes > 64 * 1024) {
+                    finishError(new Error("upstream proxy CONNECT response header is too large"));
                     return;
                 }
+                if (end < 0) return;
                 socket.removeListener("readable", onReadable);
                 const head = buffer.subarray(0, end).toString("latin1");
                 const statusLine = head.split("\r\n", 1)[0] ?? "";
