@@ -771,6 +771,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(headers["x-bili-plugin"], "pi");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
+        assert.equal(headers["x-bili-plugin-purpose"], "conversation", "#6884: every pi dispatch is a declared main turn (pi has no aux calls)");
         assert.equal(pi.tools.length, 2);
         assert.equal(pi.tools[0]!.name, "compress");
         assert.deepEqual(pi.tools[0]!.parameters, { type: "object", properties: { content: { type: "array" } }, required: ["content"] });
@@ -869,6 +870,7 @@ test("#1214: before_provider_headers awaits tool registration — one-shot (-p) 
         const again: Record<string, string> = {};
         await pi.events.get("before_provider_headers")!({ headers: again }, fakeCtx(proxy));
         assert.equal(again["x-bili-plugin"], "pi");
+        assert.equal(again["x-bili-plugin-purpose"], "conversation", "#6884: one-shot `pi -p` sessions are main turns too");
     } finally {
         await proxy.close();
     }
@@ -885,6 +887,7 @@ test("before_provider_headers stamps after a session_start prewarm too", async (
         await pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
         assert.equal(late["x-bili-plugin"], "pi");
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
+        assert.equal(late["x-bili-plugin-purpose"], "conversation");
     } finally {
         await proxy.close();
     }

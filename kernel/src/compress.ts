@@ -2121,6 +2121,9 @@ function pendingByTier(
     pending: effective.reduce((s, r) => s + r.tokens, 0),
     targetBlocks: [],
   };
+  // #5765: retired summaries are not resident mass and their blocks are not
+  // foldable targets — counting them here would nudge distillation ranges the
+  // apply side refuses.
   const active = activeBlocks(state).filter((b) => !b.retired);
   if (active.length === 0) {
     out[2] = { pending: 0, targetBlocks: [] };
