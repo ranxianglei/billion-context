@@ -155,6 +155,26 @@ test("claudeSubagentAgentId: two-signal discrimination (headers + main system pr
     assert.equal(claudeSubagentAgentId(subagentHeaders, ["  You are Claude Code..."]), undefined, "main prefix matched after leading whitespace");
 });
 
+test("claudeSubagentAgentId: explicit channel header outranks the text signals (#5724, CC 2.1.326 capture)", () => {
+    const declaredSub = { "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "subagent" };
+    assert.equal(claudeSubagentAgentId(declaredSub, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "declared subagent splits");
+    assert.equal(claudeSubagentAgentId({ ...declaredSub, "x-claude-code-request-class": "blocking-subagent" }, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "declared blocking-subagent splits");
+    assert.equal(
+        claudeSubagentAgentId(declaredSub, ["You are Claude Code, Anthropic's official CLI for Claude, reworded banner."]),
+        SUB_AGENT,
+        "the channel header keeps splitting even when the banner is reworded (text-only would collapse to main)",
+    );
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-parent-agent-id": "a47c8f3e8bac7386b", "x-claude-code-request-class": "blocking-subagent" }, CLAUDE_CODE_SDK_SUB_SYSTEM), "a47c8f3e8bac7386b", "parent-header-only declared subagent falls back to the parent id");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "main" }, CLAUDE_CODE_SDK_SUB_SYSTEM), undefined, "declared main never splits, even with agent-id and subagent-shaped system");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-1p-request-class": "main" }, CLAUDE_CODE_SDK_SUB_SYSTEM), undefined, "the 1p twin declares main too");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "main", "x-claude-1p-request-class": "blocking-subagent" }, CLAUDE_CODE_SDK_SUB_SYSTEM), undefined, "x-claude-code-request-class wins over the 1p twin");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "task" }, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "unrecognized class falls through to the text rule (subagent text splits)");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "task" }, MAIN_INTERACTIVE_SYSTEM), undefined, "unrecognized class falls through to the text rule (main text stays main)");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-request-class": "subagent" }, CLAUDE_CODE_SDK_SUB_SYSTEM), undefined, "declared subagent without any agent id stays on the main lane (persona fork still isolates it)");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": "  subagent  " }, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "class value is trimmed before matching");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-request-class": ["subagent", "main"] }, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "array-valued (repeated) class header is ambiguous, treated as absent, text rule decides");
+});
+
 test("claudeSubagentSplit: stable namespace, main untouched", () => {
     assert.equal(claudeSubagentSplit(SESSION, subagentHeaders, GENERAL_PURPOSE_SUB_SYSTEM), SUB_SESSION);
     assert.equal(claudeSubagentSplit(SESSION, subagentHeaders, GENERAL_PURPOSE_SUB_SYSTEM), SUB_SESSION, "same agent id reuses the split id across turns");

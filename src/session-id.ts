@@ -570,8 +570,18 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  * first request head-of-line-blocks the main turn (and vice versa) for the
  * full upstream latency.
  *
- * Discrimination is two-signal, both verified against live Claude Code
- * 2.1.274 traffic (`-p` mode AND custom agent types like Explore):
+ * Discrimination is layered, each signal verified against live Claude Code
+ * traffic (2.1.274 `-p` mode AND custom agent types like Explore; 2.1.308+
+ * / 2.1.326 SDK field captures, #5724):
+ *
+ * 0. CHANNEL HEADER (decisive when present): the host names its own lane in
+ *    `x-claude-code-request-class` (plus the `x-claude-1p-request-class`
+ *    twin) — `subagent` / `blocking-subagent` → split on agentId ??
+ *    parentId, `main` → main session. It is the host's protocol declaration,
+ *    not prose, so it survives any rewording of the system prompts and
+ *    short-circuits signals 1-2 below. Absent or unrecognized values fall
+ *    through to them (older clients; an unknown future class is never
+ *    guessed).
  *
  * 1. HEADER: the request carries `x-claude-code-agent-id` and/or
  *    `x-claude-code-parent-agent-id`. Main-turn requests carry agent-id only
@@ -596,12 +606,14 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  *    and subagents stop splitting (pre-SDK serial behavior) instead of a
  *    main session whose text merely mentions the phrase being mis-split.
  *
- * A request splits only when BOTH signals say subagent (header present AND
- * no main prefix in system). Failure modes degrade in the safe direction:
- * if a future Claude Code rewords its main prompts, subagents stop being
- * split (back to today's serial behavior) — the main session can never be
- * mis-split, because its prefixes are the gate and its system legitimately
- * mutates turn to turn without ever losing the prefix block.
+ * Without the channel header, a request splits only when BOTH text-era
+ * signals say subagent (agent header present AND no main prefix in system).
+ * Failure modes degrade in the safe direction: if a future Claude Code
+ * rewords its main prompts, subagents on clients WITHOUT the channel header
+ * stop being split (back to the serial behavior) — the main session can
+ * never be mis-split, because its prefixes are the gate and its system
+ * legitimately mutates turn to turn without ever losing the prefix block;
+ * an explicit `main` channel header short-circuits before any text is read.
  *
  * Split sessions keep per-subagent compression state (a subagent is its own
  * conversation; isolation matches the codex #316/#150 semantics) and get
@@ -634,6 +646,22 @@ export function claudeSubagentAgentId(
     const parent = headers["x-claude-code-parent-agent-id"];
     const agentId = typeof agent === "string" && agent.trim().length > 0 ? agent.trim() : undefined;
     const parentId = typeof parent === "string" && parent.trim().length > 0 ? parent.trim() : undefined;
+    // Explicit channel declaration (CC 2.1.308+ field capture, #5724): the
+    // host names its own lane in x-claude-code-request-class (plus the
+    // x-claude-1p-request-class twin). It is protocol, not prose — immune
+    // to system-prompt rewording — so it outranks the text signals below.
+    // Absent or unrecognized values fall through (older clients; unknown
+    // future classes are never guessed). Client-controlled in proxy mode,
+    // but the key it shapes is namespaced by the sender's OWN session id:
+    // a spoofed class can only fragment the sender's own traffic — the
+    // same trust class as x-claude-code-session-id itself.
+    const rawClass = headers["x-claude-code-request-class"];
+    const rawClass1p = headers["x-claude-1p-request-class"];
+    const requestClass =
+        (typeof rawClass === "string" && rawClass.trim().length > 0 ? rawClass.trim() : undefined) ??
+        (typeof rawClass1p === "string" && rawClass1p.trim().length > 0 ? rawClass1p.trim() : undefined);
+    if (requestClass === "subagent" || requestClass === "blocking-subagent") return agentId ?? parentId;
+    if (requestClass === "main") return undefined;
     if (agentId === undefined && parentId === undefined) return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
