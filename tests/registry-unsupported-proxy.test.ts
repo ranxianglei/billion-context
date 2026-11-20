@@ -149,3 +149,30 @@ test("after a failed fetch the request path serves the fallback instead of refet
         await restore();
     }
 });
+
+// The fetch watchdog is an idle timer: a models.dev that trickles bytes keeps
+// the load open long past its 15 s budget. The request path must not wait for
+// it — it answers from the current cache and lets the load finish behind it.
+test("the request path does not wait on a stalled fetch beyond its budget", async () => {
+    const restore = await isolateLoaderEnv();
+    let release: ((err: Error) => void) | undefined;
+    let reg: typeof import("../src/registry.ts") | undefined;
+    try {
+        reg = await import("../src/registry.ts");
+        reg._resetForTest();
+        reg._setRequestPathBudgetForTest(50);
+        reg._setRegistryFetchForTest(() => new Promise((_, reject) => { release = reject; }));
+
+        const started = Date.now();
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.ok(Date.now() - started < 5_000, "answered within the budget, not after the stalled fetch");
+    } finally {
+        // Settle the in-flight load before resetting so it cannot write the
+        // fallback back into the module state after this test.
+        if (release) { release(new Error("network down")); await reg?.loadRegistry(); }
+        reg?._setRequestPathBudgetForTest(undefined);
+        reg?._setRegistryFetchForTest(undefined);
+        reg?._resetForTest();
+        await restore();
+    }
+});
