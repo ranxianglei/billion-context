@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, evaluateDeltaResend, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_DELTA_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
@@ -534,5 +534,131 @@ test("pinned (2x2) steady state still HITS — host-id stash must not break the 
     const t4 = runTurnPinned(session, { [PF_COUNT_HEADER]: "6", ...TAIL([ids(6)[4]!, ids(6)[5]!]) }, b4);
     assert.equal(t4.out.decision, "head-prefix-drift", LOGS.join("\n"));
     assert.equal(t4.out.creditedMiss, false);
+    _resetStoreForTest();
+});
+
+// #5403 family, delta arm (x-bili-pf-delta): the body carries ONLY the tail
+// slice [T-L .. T-1] (anchor = the previous turn's last element), the full
+// logical count rides x-bili-pf-count, per-element ids ride x-bili-pf-tail-ids
+// (width exactly L). A satisfiable claim yields the SAME FastpathHit the
+// full-body lane would — every assertion is against the legacy full-parse
+// oracle over the WHOLE logical body. An unsatisfiable claim is a re-anchor
+// (the 400 the client answers with a full-form resend).
+
+const dTail = (n: number): string[] => Array.from({ length: n }, (_, i) => `dhost-${i}`);
+
+const runDeltaTurn = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    sliceMessages: unknown[],
+    model = "m1",
+): { verdict: { hit: import("../src/server/fastpath.ts").FastpathHit; receivedTailIds?: string[] }; headers: Record<string, string> } => {
+    const bodyText = bodyOf(sliceMessages, model);
+    const verdict = evaluateDeltaResend(JSON.parse(bodyText) as Parameters<typeof evaluateDeltaResend>[0], bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    assert.ok(verdict !== null && "hit" in verdict, `expected a delta hit, got ${JSON.stringify(verdict)}\n${LOGS.slice(-6).join("\n")}`);
+    const hit = verdict;
+    const headers = finalizeWatermarkTurn(session, { hit: hit.hit, measuredT: hit.hit.totalT, decision: "delta-hit", creditedMiss: false, receivedTailIds: hit.receivedTailIds }, {
+        model,
+        legacyCores: hit.hit.view,
+        rawSystemText: hit.hit.systemText,
+        turnStripCounts: hit.hit.markerCounts,
+    });
+    return { verdict: hit, headers };
+};
+
+test("delta arm: hit reconstructs EXACTLY the legacy full-parse oracle across consecutive slices", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    const session = freshSession("pf-delta-hit");
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    // Seed carries NO pf headers (field: the first request of a session
+    // never stamps) — the first delta turn opens unverified, from then on
+    // every list is chained on the previous turn's stamped last id.
+    const t1 = runTurn(session, {}, bodyOf(full));
+    assert.equal(t1.out.decision, "no-stamp"); // seed stampT=3
+    // t2: logical T=5, L=5-3=2 -> body = NEW elements only [USR c, ASST d],
+    // tail-ids = anchor(b)+new = [dhost-2, dhost-3, dhost-4]
+    full.push(USR("c"), ASST("d"));
+    const r2 = runDeltaTurn(session, { [PF_COUNT_HEADER]: "5", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(5).slice(2)) }, full.slice(3));
+    assert.equal(r2.headers[PF_SEQ_HEADER], "5");
+    let oracle = openaiToCore(JSON.parse(bodyOf(full)));
+    assert.deepEqual(r2.verdict.hit!.view.map((m) => String((m as { text?: unknown }).text ?? "")), oracle.msgs.map((m) => m.text), "texts");
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(r2.verdict.hit!.view[i]!.id, oracle.msgs[i]!.id, `id @${i}`);
+        assert.equal((r2.verdict.hit!.view[i]! as { wireIndex?: number }).wireIndex, (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i}`);
+    }
+    assert.equal(r2.verdict.hit!.systemText, oracle.systemText);
+    assert.equal(r2.verdict.hit!.totalT, 5);
+    // t3: logical T=6, L=1 -> body = [USR e], tail-ids = anchor(d)+new = [dhost-4, dhost-5]
+    full.push(USR("e"));
+    const r3 = runDeltaTurn(session, { [PF_COUNT_HEADER]: "6", [PF_DELTA_HEADER]: "1", ...TAIL(dTail(6).slice(4)) }, full.slice(5));
+    assert.equal(r3.headers[PF_SEQ_HEADER], "6");
+    oracle = openaiToCore(JSON.parse(bodyOf(full)));
+    assert.deepEqual(r3.verdict.hit!.view.map((m) => String((m as { text?: unknown }).text ?? "")), oracle.msgs.map((m) => m.text), "texts after second slice");
+    for (let i = 0; i < oracle.msgs.length; i++) {
+        assert.equal(r3.verdict.hit!.view[i]!.id, oracle.msgs[i]!.id, `id @${i} (t3)`);
+        assert.equal((r3.verdict.hit!.view[i]! as { wireIndex?: number }).wireIndex, (oracle.msgs[i]! as { wireIndex?: number }).wireIndex, `wireIndex @${i} (t3)`);
+    }
+    // t4: a delta turn must NOT disturb the full lane — a full-form turn right
+    // after a delta hit still hits against the delta-advanced seed.
+    full.push(ASST("f"));
+    const t4 = runTurn(session, { [PF_COUNT_HEADER]: "6", ...TAIL(dTail(7).slice(5)) }, bodyOf(full));
+    assert.equal(t4.out.decision, "hit", LOGS.slice(-6).join("\n"));
+    assert.ok(t4.out.hit);
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
+    _resetStoreForTest();
+});
+
+test("delta arm: every unsatisfiable claim re-anchors (both directions, #3617)", () => {
+    makeStubStore();
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "1";
+    const session = freshSession("pf-delta-reanchor");
+    const full: unknown[] = [SYS("s"), USR("a"), USR("b")];
+    runTurn(session, {}, bodyOf(full)); // seed stampT=3 (no pf headers — field)
+    full.push(USR("c"), ASST("d")); // logical T=5, L=2 -> body = [USR c, ASST d]
+    const deltaBody = JSON.stringify({ model: "m1", stream: false, messages: full.slice(3) });
+    const delta = { [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "5", ...TAIL(dTail(5).slice(2)) } as Record<string, string>;
+    const ev = (h: Record<string, string>, bodyText = deltaBody) =>
+        evaluateDeltaResend(JSON.parse(bodyText) as Parameters<typeof evaluateDeltaResend>[0], bodyText, headersOf(h), session, { pluginMode: true, titleGen: false, model: JSON.parse(bodyText).model as string }, log);
+
+    // negative: no header = not a delta request (full lane owns it)
+    assert.equal(ev({}), null);
+    // bad header value
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "0", [PF_COUNT_HEADER]: "5" }), { reanchor: "delta-bad-value" });
+    // wrong model for the seed
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "OTHER", stream: false, messages: full.slice(3) })), { reanchor: "model" });
+    // missing count
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "1" }), { reanchor: "no-count" });
+    // behind the stamp (client desynced backwards: L = T - stampT <= 0)
+    assert.deepEqual(ev({ ...delta, [PF_COUNT_HEADER]: "3" }), { reanchor: "behind" });
+    // window above the bound
+    assert.deepEqual(ev({ ...delta, [PF_COUNT_HEADER]: String(3 + 2048 + 1) }), { reanchor: "window-too-large" });
+    // body length does not match L
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: [USR("c")] })), { reanchor: "body-length" });
+    // messages not an array
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: "oops" })), { reanchor: "body-length" });
+    // tail-ids absent / wrong width / garbage
+    assert.deepEqual(ev({ [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "5" }), { reanchor: "tail-ids-shape" });
+    assert.deepEqual(ev({ ...delta, ...TAIL(["x", "y"]) }), { reanchor: "tail-ids-shape" });
+    assert.deepEqual(ev({ ...delta, [PF_TAIL_IDS_HEADER]: "a,b%2Cc%%" }), { reanchor: "tail-ids-shape" });
+    // a system element riding the new slice (pre-chain: stamp still 3)
+    assert.deepEqual(ev(delta, JSON.stringify({ model: "m1", stream: false, messages: [SYS("intruder"), ASST("d")] })), { reanchor: "window-system-head" });
+    // anchor continuity: after a delta hit stamps a list, the NEXT list must
+    // open with its last id — wrong head re-anchors (both directions #3617)
+    const rChain = runDeltaTurn(session, { ...delta }, full.slice(3));
+    void rChain; // stamps lastTailIds = dhost-2..4, next anchor must be dhost-4
+    full.push(USR("e")); // T=6, L=1
+    const delta2 = { [PF_DELTA_HEADER]: "1", [PF_COUNT_HEADER]: "6", ...TAIL(dTail(6).slice(4)) } as Record<string, string>;
+    const ev2 = (h: Record<string, string>) =>
+        evaluateDeltaResend({ model: "m1", stream: false, messages: [USR("e")] } as Parameters<typeof evaluateDeltaResend>[0], JSON.stringify({ model: "m1", stream: false, messages: [USR("e")] }), headersOf(h), session, { pluginMode: true, titleGen: false, model: "m1" }, log);
+    assert.deepEqual(ev2({ ...delta2, ...TAIL(["WRONG", "dhost-5"]) }), { reanchor: "tail-ids-prev" });
+    assert.ok("hit" in (ev2(delta2) as object), "chained head dhost-4 must pass");
+    // unseeded session: a fresh id can never delta
+    const cold = freshSession("pf-delta-cold");
+    assert.deepEqual(evaluateDeltaResend(JSON.parse(deltaBody) as Parameters<typeof evaluateDeltaResend>[0], deltaBody, headersOf(delta), cold, { pluginMode: true, titleGen: false, model: "m1" }, log), { reanchor: "unseeded" });
+    // rollout off = the rollback kill switch (LAST: it mutes every gate below it)
+    process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND = "0";
+    assert.deepEqual(ev(delta), { reanchor: "rollout-off" });
+    delete process.env.BILI_ROLLOUT_PLUGIN_DELTA_RESEND;
     _resetStoreForTest();
 });

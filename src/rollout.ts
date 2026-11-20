@@ -116,6 +116,19 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL=0`. Requires
     // pluginLaneServerHistory.
     pluginMsgIdIncremental: { percent: 100 },
+    // #5403 family, delta arm: the client sends body.messages as the TAIL
+    // SLICE [T-L .. T-1] (anchor included) plus x-bili-pf-count = T and
+    // x-bili-pf-tail-ids (width L) — the server rebuilds the view from the
+    // stashed prefix cores + the small re-parsed slice. Inbound bytes drop
+    // from O(history) to O(delta). Every unsatisfiable claim is a 400
+    // re-anchor the client answers with a full-form resend (one-round
+    // convergence); flipping the key back to 0 400s every delta turn, which
+    // is the rollback path (clients converge to the full form within one
+    // turn). Default OFF until the shim send-sides ship — a delta body is
+    // unprocessable by older servers, so both ends must roll together.
+    // Force with `rollout.features.pluginDeltaResend: true` or
+    // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
+    pluginDeltaResend: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

@@ -77,7 +77,8 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { DeltaReanchorError } from "./fastpath.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -3604,7 +3605,23 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            const pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+            // #5403 family delta arm: a prefix-less tail-slice body cannot be
+            // processed by the legacy path — the re-anchor is a 400 the client
+            // answers by resending THIS turn in full form (one-round
+            // convergence, the same contract as every pf miss). No pf-seq
+            // stamp; mode relearned as "full" via the header.
+            let pendingForward;
+            try {
+                pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+            } catch (err) {
+                if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
+                    log("warn", `[${session.id}] watermark delta re-anchor 400 (${err.reason}) — client resends in full form`);
+                    res.writeHead(400, { "content-type": "application/json", [MSGID_MODE_HEADER]: "full" });
+                    res.end(JSON.stringify({ error: { type: "pf_delta_reanchor", message: err.reason } }));
+                    return;
+                }
+                throw err;
+            }
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an

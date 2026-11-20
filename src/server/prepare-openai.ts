@@ -51,7 +51,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { PF_TAIL_IDS_HEADER, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -163,8 +163,19 @@ export async function prepareOpenai(
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
     if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
-        wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
-        log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
+        // Delta arm first: a delta claim is EXCLUSIVE — the body carries only
+        // the tail slice, so the full-body lane cannot evaluate it at all. A
+        // satisfiable claim yields the same FastpathHit the full lane would;
+        // an unsatisfiable one throws the 400 re-anchor (handle.ts).
+        const wpDelta = evaluateDeltaResend(parsed, bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+        if (wpDelta !== null) {
+            if ("reanchor" in wpDelta) throw new DeltaReanchorError(wpDelta.reanchor);
+            wpOutcome = { hit: wpDelta.hit, measuredT: wpDelta.hit.totalT, decision: "delta-hit", creditedMiss: false, receivedTailIds: wpDelta.receivedTailIds };
+            log("debug", `[${session.id}] fastpath ${wpOutcome.decision} T=${wpDelta.hit.totalT}`);
+        } else {
+            wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+            log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
+        }
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
             // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
