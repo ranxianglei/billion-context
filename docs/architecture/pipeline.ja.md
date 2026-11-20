@@ -19,6 +19,8 @@
 
 **受信 (Inbound)。** マーカーストリップ (`src/marker/`) は、ワイヤーごとに ACP レンダリングタグを認識・除去する順序付きパイプラインです。`handle.ts` はルートをトリアージし、ワイヤーを検出してから、対応する `prepare-*` に引き継ぎます。
 
+**Codex WebSocket リプレイ。** 非プラグインの Codex Responses WebSocket レーンでは、`src/codex-ws-replay.ts` が checkpoint リプレイと履歴全体の再送の間で、厳しく限定された assistant メッセージの metadata とフィールド順を統一します。prepare と内部 loop の再構築でも同じ形式を使い、上流の継続判定は確認済みの表現差だけを無視します。本文、ツール呼び出し、reasoning、未知の構造、他のクライアント、プラグイントラフィックは従来どおり扱います。
+
 **準備 (Prepare) (ワイヤーごと)。** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` は、リクエストを正規コアに変換します（ホスト msgid などのインフライトエンベロープフィールドはここでストリップされます — [identity](./identity.md) を参照）、フォールド→再構築→注入のシーケンスを実行し、そのワイヤーが要求する場所にシステムメッセージとナッジを配置します。
 
 **カーネル。** 正規コアとセッションの `CompressionState` が acp-kernel に渡され、判定とその成果物が返されます — [カーネルモジュール](./kernel.md) を参照してください。

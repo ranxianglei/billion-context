@@ -19,6 +19,8 @@
 
 **入站。** marker strip（`src/marker/`）是有序管道，按 wire 识别并剥掉 ACP 渲染标签。`handle.ts` 分诊路由、检测 wire、交给对应的 `prepare-*`。
 
+**Codex WebSocket 重放。** 对非插件的 Codex Responses WebSocket 通道，`src/codex-ws-replay.ts` 在 checkpoint 重放与全量历史重发之间统一严格限定的 assistant 消息 metadata 和字段顺序。准备阶段与内部 loop 重建使用同一形式，上游续接比较只忽略已识别的表示差异。正文、工具调用、reasoning、未知结构、其他客户端及插件流量保持原有处理。
+
 **准备（按 wire）。** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` 把请求转成 canonical cores（宿主 msgid 等 in-flight 信封字段在此剥掉——见 [identity](./identity.zh-CN.md)），跑折叠→重建→注入，把 system 与 nudge 落到该 wire 要求的位置。
 
 **内核。** canonical cores 加会话的 `CompressionState` 进 acp-kernel，判定与产物回来——见 [kernel 模块](./kernel.zh-CN.md)。

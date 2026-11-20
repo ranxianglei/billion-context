@@ -19,6 +19,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Inbound.** The marker strip (`src/marker/`) is an ordered pipeline that recognizes and removes ACP render tags, per wire. `handle.ts` triages the route, detects the wire, and hands off to the matching `prepare-*`.
 
+**Codex WebSocket replay.** For the Codex Responses WebSocket lane outside plugin mode, `src/codex-ws-replay.ts` normalizes a strictly limited set of assistant-message metadata and field order across checkpoint replay and full-history resend. The prepare and internal loop rebuilds use the same form, and the upstream continuation comparison ignores only the recognized representation differences. Text, tool calls, reasoning, unrecognized structures, other clients, and plugin traffic retain their existing handling.
+
 **Prepare (per-wire).** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` convert the request to canonical cores (in-flight envelope fields such as host msgids are stripped here — see [identity](./identity.md)), run the fold→rebuild→injection sequence, and place the system message and the nudge where that wire requires it.
 
 **Kernel.** The canonical cores plus the session's `CompressionState` go to acp-kernel; the decision and its artifacts come back — see the [kernel module](./kernel.md).
