@@ -56,10 +56,11 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
     return { id, role, contentType: "text", text };
 }
 
-/** Nine 5000-char messages; preserveRecentMessages 2 keeps m8-m9 protected,
- *  so m1-m7 are the live fold space. */
+/** Nine 10000-char messages (2500 tok); preserveRecentMessages 2 keeps
+ *  m8-m9 protected, so m1-m7 are the live fold space. #7333: 10000 chars so
+ *  a 2-message subdivided span (m2-m3) reclaims ≥ 4096 tok (min-benefit floor). */
 function freshCtx(): Ctx {
-    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(10000)));
     return withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
 }
 
