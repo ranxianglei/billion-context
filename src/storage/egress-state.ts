@@ -52,7 +52,7 @@ export interface EgressViewRow {
     contentHash: string;
 }
 
-export type EgressOpType = "B" | "I" | "D" | "U";
+type EgressOpType = "B" | "I" | "D" | "U";
 
 interface EgressStateRow {
     log_seq: number;
