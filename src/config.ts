@@ -264,6 +264,21 @@ export type CompressSettings = {
      *  level wins PER FIELD across global → provider → model, like every
      *  other compress field. */
     minPressureBenefitTokens?: number;
+    /** #7333: minimum net-reclaim (tokens) a model-initiated compress must
+     *  achieve to be committed, BELOW the pressure band. Every committed fold
+     *  rewrites the context prefix and re-bills the prompt-cache tail, so a
+     *  burst of tiny model-initiated folds (one nudge → many small folds)
+     *  re-bills the tail repeatedly for almost no reclaim. This floor refuses
+     *  such sub-benefit folds with a teaching receipt (batch the listed ranges
+     *  into ONE call, or continue) instead of committing them. At/above
+     *  `maxContextLimit` or in emergency the floor drops to 1 — survival folds
+     *  are never blocked. Default: `AUTO_FOLD_MIN_BENEFIT_TOKENS` (4096) — the
+     *  same bar bili's own auto-fold producer already applies (#3444), so both
+     *  fold producers share one benefit floor. Set 0 to restore the legacy
+     *  any-positive-shrink gate. Host-side only (the model-initiated
+     *  `applyRanges` commit gate); does NOT map to a kernel `nudge.*` field.
+     *  Deepest level wins PER FIELD, like every other compress field. */
+    minFoldBenefitTokens?: number;
     /** Phantom-pressure guard: when the decision meter for this round is a
      *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
      *  report — e.g. right after an aborted turn or a short cache TTL that
