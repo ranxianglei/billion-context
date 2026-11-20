@@ -1044,31 +1044,6 @@ export class UnifiedShadow {
         return this.sync.getCcr(sessionId);
     }
 
-    /** #4739: narrow single-column metadata read for lazy-field restore.
-     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
-     *  gate on readsUnified; network backends degrade to null (the caller
-     *  falls back to the envelope, exactly like today's sync loadSync). */
-    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getSessionMetadata(sessionId);
-        } catch {
-            return null;
-        }
-    }
-
-    /** #4739: narrow blockContents read for lazy-field restore (block rows +
-     *  orphans journal, no message rows). Same trust/degrade contract as
-     *  getSessionMetadata. */
-    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
-        } catch {
-            return null;
-        }
-    }
-
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
      *  one-time ledger re-stamp. Shadow mode's index may lag files it has
      *  not re-recorded, so like getCcr this is full-trust only: sync store
