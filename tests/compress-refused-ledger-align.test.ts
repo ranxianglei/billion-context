@@ -26,12 +26,13 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import type { Session } from "../src/session.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 type Marked = Session & { pendingLedgerAlign?: boolean };
 
-const cfg = defaultConfig(200000, { preserveRecentMessages: 2, preserveRecentTokens: 0 } as never);
+const cfg = { ...defaultConfig(200000, { preserveRecentMessages: 2, preserveRecentTokens: 0 } as never), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
 const timeOf = (t: string | undefined): string | undefined => / time="([^"]+)"/.exec(t ?? "")?.[1];
 
 function conversation(): CoreMessage[] {

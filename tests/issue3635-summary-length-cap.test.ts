@@ -10,7 +10,7 @@ import { ExternalSummaryExecutor, describeExternalSummaryFailure, summaryLengthB
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { parseCompressSettings } from "../src/config.ts";
-import { mergeCompress, applyCompressSettings } from "../src/compress-settings.ts";
+import { mergeCompress, applyCompressSettings, type ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { createSession } from "../src/session.ts";
 import type { RewriteCtx } from "../src/stream.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -103,7 +103,7 @@ const WIRE_RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; sti
 
 function wireContext(settings: unknown, cap?: number): RewriteCtx {
     const core = createCore();
-    const config = defaultConfig(400_000) as Config & { externalSummary?: unknown };
+    const config = { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as Config & { externalSummary?: unknown; minFoldBenefitTokens?: number };
     config.externalSummary = settings;
     config.preserveRecentMessages = 0;
     config.preserveRecentTokens = 0;
