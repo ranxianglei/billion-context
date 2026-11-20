@@ -36,6 +36,10 @@ let costCache: CostsShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
 const FAILED_FETCH_BACKOFF_MS = 10 * 60 * 1000;
 let lastFailedFetchMs = 0;
+let requestPathBudgetMs = 3_000;
+export function _setRequestPathBudgetForTest(ms: number | undefined): void {
+    requestPathBudgetMs = ms ?? 3_000;
+}
 const warnedConflicts = new Set<string>();
 const warnedPriceConflicts = new Set<string>();
 // Case-folded key indexes for the roster maps (#2074): models.dev keys are
@@ -366,13 +370,22 @@ export function providerFromHost(host: string): string | undefined {
 
 export async function contextFromRegistry(model: string, host?: string): Promise<number | undefined> {
     // Request path (server/handle.ts awaits this for a model the warm cache
-    // misses). A failed fetch leaves `cache` on a fallback, so loadRegistry()
-    // fetches again on every call: with models.dev slow or unreachable each
-    // such request stalled for the full fetch timeout. Serve the fallback
-    // during the backoff; loadRegistry() itself still retries per call.
+    // misses). The fetch watchdog is an idle timer, so a models.dev that
+    // trickles bytes holds the load open far past its 15 s budget, and a
+    // failed fetch leaves `cache` on a fallback so loadRegistry() fetches
+    // again on every call. Wait at most requestPathBudgetMs (the load keeps
+    // warming the cache in the background) and skip the wait entirely during
+    // the backoff after a failure; loadRegistry() itself still retries per call.
     if (cache && Date.now() - lastFailedFetchMs < FAILED_FETCH_BACKOFF_MS) return registryLookup(cache, model, host);
-    const reg = await loadRegistry();
-    return registryLookup(reg, model, host);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<RegistryShape | null>((resolve) => {
+        timer = setTimeout(() => resolve(cache), requestPathBudgetMs);
+    });
+    try {
+        return registryLookup(await Promise.race([loadRegistry(), budget]), model, host);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** Synchronous cache-only lookup: returns the window when the models.dev
