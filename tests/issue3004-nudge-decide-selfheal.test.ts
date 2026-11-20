@@ -179,8 +179,8 @@ async function startHarness(sessionId: string, modelDecided: boolean): Promise<H
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
-            // The decision call is the only request with the tiny output budget (default 200).
-            if (typeof body.max_tokens === "number" && body.max_tokens <= 200) {
+            // The decision call is the only request with the small output budget (default 1024 since #5030).
+            if (typeof body.max_tokens === "number" && body.max_tokens <= 1024) {
                 sides.push(body);
                 const content = verdict ?? "";
                 res.writeHead(200, { "content-type": "application/json" });
