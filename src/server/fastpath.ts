@@ -325,6 +325,18 @@ export function evaluateWatermarkFastpath(
         // histories the 8-element head fragment legitimately reaches INTO the
         // fresh tail region, whose content differs from nothing stashed yet —
         // positions >= coverage are verified by the window conversion itself.
+        // #7064 2×2 (2026-11-20 perf, 100k-session field data): the id field
+        // is EXCLUDED from the comparison. The stash re-seeds from the
+        // post-pin cores (prepare-openai rebinds originalMessages to
+        // s0.pinned before finalizeWatermarkTurn), whose ids live in the
+        // host-msgid/ledger namespace — structurally different from the
+        // fresh content-hash ids openaiToCore mints, on EVERY turn of a
+        // pinned session. Comparing ids therefore produced a permanent
+        // head-prefix-drift miss: the watermark fastpath never hit exactly
+        // for the 2×2 traffic it was designed for, and every turn paid the
+        // full legacy parse + re-anchor. Content drift is still caught: the
+        // same-body comparison below covers role/content, shape/length via
+        // head-shape, and remint-with-identical-bytes is not a rewrite.
         const headElements = Array.isArray((headFragment as { messages?: unknown }).messages)
             ? ((headFragment as { messages: unknown[] }).messages.filter((m): m is { role?: unknown } => typeof m === "object" && m !== null && (m as { role?: unknown }).role !== "system")).length
             : -1;
@@ -335,7 +347,7 @@ export function evaluateWatermarkFastpath(
             for (let hi = 0; hi < seedHead.length; hi++) {
                 const a = headCores.msgs[hi];
                 const b = seedHead[hi];
-                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false, tailIds);
+                if (JSON.stringify({ ...a, id: undefined }) !== JSON.stringify({ ...b, id: undefined })) return miss("head-prefix-drift", false, tailIds);
             }
         }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);

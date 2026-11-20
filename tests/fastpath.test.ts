@@ -464,3 +464,75 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
 });
+
+// #7064 2×2 perf regression (2026-11-20, 100k-message sessions): in a
+// pinned session prepare-openai rebinds originalMessages to s0.pinned
+// BEFORE finalizeWatermarkTurn, so the prefix stash carries HOST-MSGID ids
+// (host/ledger namespace), while a fresh turn's openaiToCore mints
+// content-hash ids. The head check must not treat the id field as drift
+// evidence or the fastpath misses (head-prefix-drift) on EVERY steady
+// turn — the exact traffic the watermark was built for. runTurnPinned
+// simulates that reseed: a full host-id list pins, and the reseed takes
+// the pinned (host-id) cores.
+const runTurnPinned = (
+    session: Session,
+    reqHeaders: Record<string, string>,
+    bodyText: string,
+    hostIds?: string[],
+): { out: ReturnType<typeof evaluateWatermarkFastpath>; headers: Record<string, string> } => {
+    const model = JSON.parse(bodyText).model as string;
+    const out = evaluateWatermarkFastpath(bodyText, headersOf(reqHeaders), session, { pluginMode: true, titleGen: false, model }, log);
+    const oracle = openaiToCore(JSON.parse(bodyText));
+    const stripCounts = stripRawStage(JSON.parse(bodyText), "openai");
+    const base = out.hit !== null ? out.hit.view : oracle.msgs;
+    const legacyCores = hostIds !== undefined && hostIds.length === base.length
+        ? base.map((m, i) => ({ ...m, id: hostIds[i]! }))
+        : base;
+    const headers = finalizeWatermarkTurn(session, out, {
+        model,
+        legacyCores,
+        rawSystemText: out.hit !== null ? out.hit.systemText : oracle.systemText,
+        turnStripCounts: stripCounts,
+    });
+    return { out, headers };
+};
+
+test("pinned (2x2) steady state still HITS — host-id stash must not break the head check", () => {
+    _resetStoreForTest();
+    makeStubStore();
+    const session = freshSession("pf-pinned");
+    const ids = (n: number): string[] => Array.from({ length: n }, (_, i) => `host-id-${i}`); // n = NON-system core count
+    // t1: SEED turn already carries the full host-id list → stage0 pins →
+    // prepare-openai reseeds the stash from the PINNED cores (host-id
+    // namespace). This is the field sequence (first 100k turn sends the
+    // full biliMsgIds list); pre-fix the stash carried host ids from the
+    // very first stamp and every later turn missed head-prefix-drift.
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c")]);
+    const t1 = runTurnPinned(session, {}, b1, ids(3));
+    assert.equal(t1.out.decision, "no-stamp", LOGS.join("\n"));
+    // t2: steady state — tail-ids only (anchor + new), no body list.
+    // Pre-fix: head-prefix-drift (fresh content-hash ids vs stashed host ids).
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d")]);
+    const t2 = runTurnPinned(session, { [PF_COUNT_HEADER]: "4", ...TAIL([ids(4)[2]!, ids(4)[3]!]) }, b2);
+    assert.equal(t2.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(t2.out.hit, "hit view expected");
+    // t3: one more steady growth — the bug was PERMANENT drift, so a second
+    // consecutive hit proves the stash stays consistent after a hit-turn
+    // reseed (hit paths stash outcome.hit.view, a mixed namespace).
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("c"), USR("d"), ASST("e")]);
+    const t3 = runTurnPinned(session, { [PF_COUNT_HEADER]: "5", ...TAIL([ids(5)[3]!, ids(5)[4]!]) }, b3);
+    assert.equal(t3.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(t3.out.hit, "second consecutive hit expected");
+    assert.deepEqual(
+        t3.out.hit.view.map((m) => String((m as { text?: unknown }).text ?? "")),
+        ["a", "b", "c", "d", "e"],
+        "view = stashed prefix + rekeyed window, byte-identical texts",
+    );
+    // id-excluded head check must STILL catch a real in-place content edit
+    // in a pinned session (both directions, #3617).
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b-EDITED"), ASST("c"), USR("d"), ASST("e"), USR("f")]);
+    const t4 = runTurnPinned(session, { [PF_COUNT_HEADER]: "6", ...TAIL([ids(6)[4]!, ids(6)[5]!]) }, b4);
+    assert.equal(t4.out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(t4.out.creditedMiss, false);
+    _resetStoreForTest();
+});
