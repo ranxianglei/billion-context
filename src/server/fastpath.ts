@@ -70,7 +70,7 @@ export class DeltaReanchorError extends Error {
 }
 
 /** A satisfiable delta claim: the verified hit plus the tail-id list it rode on. */
-export interface DeltaVerdict {
+interface DeltaVerdict {
     readonly hit: FastpathHit;
     readonly receivedTailIds?: string[];
 }
