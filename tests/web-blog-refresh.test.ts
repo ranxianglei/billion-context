@@ -226,6 +226,30 @@ test("raw unreachable → the contents-API chain serves the whole round", async 
         "first-party hosts only: no third-party host was ever contacted");
 });
 
+for (const lineWrapped of [false, true]) {
+    for (const delta of [-1, 0, 1]) {
+        test(`API text byte cap counts decoded bytes (${lineWrapped ? "wrapped" : "plain"} base64, delta ${delta})`, async () => {
+            const prefix = "# Fresh\n\n";
+            const text = prefix + "x".repeat(512 * 1024 + delta - prefix.length);
+            const encoded = Buffer.from(text).toString("base64");
+            const content = lineWrapped ? encoded.replace(/.{1,60}/g, "$&\n") : encoded;
+            router = (url) => {
+                if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]));
+                if (url.startsWith("https://raw.githubusercontent.com/")) throw new Error("raw down");
+                if (url === apiFileUrl(`${POSTS_REL}/2026-10-09_fresh.md`)) {
+                    return new Response(JSON.stringify({ content, encoding: "base64" }));
+                }
+                return new Response("nf", { status: 404 });
+            };
+
+            await runBlogRefreshRound({ force: true });
+
+            assert.equal(getBlogFeed().error, delta > 0 ? "offline" : undefined);
+            assert.equal(getBlogFeed().items.some((item) => item.id === "fresh"), delta <= 0);
+        });
+    }
+}
+
 test("raw AND contents-API dead (rate-limited) → the round fails soft with the offline marker", async () => {
     router = (url) => {
         if (url === CONTENTS_URL) return new Response(CHAIN_LISTING, { status: 200 }); // listing still reachable
@@ -534,6 +558,88 @@ test("#4906 P3 lying-small content-length: the post-read byte check stays the au
     };
     assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // fail-soft
     assert.equal(getBlogFeed().error, "offline", "header said 10 bytes; the real 512KB+1 body still blew the limit");
+});
+
+function chunkedBody(chunkSize: number, chunkCount: number, headers?: Record<string, string>): {
+    response: Response;
+    reads(): number;
+    cancelled(): boolean;
+} {
+    let reads = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (reads === chunkCount) {
+                controller.close();
+                return;
+            }
+            reads++;
+            controller.enqueue(Buffer.alloc(chunkSize, "x"));
+        },
+        cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    return { response: new Response(body, { headers }), reads: () => reads, cancelled: () => cancelled };
+}
+
+for (const headers of [undefined, { "content-length": "10" }]) {
+    test(`text download stops at its byte cap with ${headers === undefined ? "no" : "understated"} content-length`, async () => {
+        installGithubRouter();
+        await runBlogRefreshRound({ force: true });
+        const body = chunkedBody(64 * 1024, 32, headers);
+        router = (url) => {
+            if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]));
+            if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return body.response;
+            return new Response("not here", { status: 404 });
+        };
+
+        await runBlogRefreshRound({ force: true });
+
+        assert.equal(body.cancelled(), true, "oversized body is canceled before EOF");
+        assert.ok(body.reads() <= 10, `expected the cap plus one prefetched chunk, read ${body.reads()}`);
+        assert.equal(getBlogFeed().error, "offline");
+        assert.ok(getBlogFeed().items.some((item) => item.id === "demo"), "the last good overlay survives");
+    });
+}
+
+test("an oversized streamed image is canceled and remains a clean miss", async () => {
+    installGithubRouter();
+    const base = router;
+    const body = chunkedBody(256 * 1024, 32);
+    router = (url) => url === rawUrl("website/blog/posts/figures/good.png") ? body.response : base(url);
+
+    await runBlogRefreshRound({ force: true });
+
+    assert.equal(body.cancelled(), true);
+    assert.ok(body.reads() <= 10, `expected the cap plus one prefetched chunk, read ${body.reads()}`);
+    assert.equal(getBlogFeed().error, undefined);
+    assert.equal(getRemoteBlogAsset("website/blog/posts/figures/good.png"), undefined);
+    assert.doesNotMatch(getBlogFeed().items.find((item) => item.id === "fresh")?.html ?? "", /good\.png/);
+});
+
+test("a streamed image exactly at the byte cap is retained", async () => {
+    installGithubRouter();
+    const base = router;
+    const body = chunkedBody(256 * 1024, 8);
+    router = (url) => url === rawUrl("website/blog/posts/figures/good.png") ? body.response : base(url);
+
+    await runBlogRefreshRound({ force: true });
+
+    assert.equal(body.cancelled(), false);
+    assert.equal(getBlogFeed().error, undefined);
+    assert.equal(getRemoteBlogAsset("website/blog/posts/figures/good.png")?.buf.byteLength, 2 * 1024 * 1024);
+});
+
+test("content-length rejection cancels the unread image body", async () => {
+    installGithubRouter();
+    const base = router;
+    const body = chunkedBody(256 * 1024, 32, { "content-length": String(3 * 1024 * 1024) });
+    router = (url) => url === rawUrl("website/blog/posts/figures/good.png") ? body.response : base(url);
+
+    await runBlogRefreshRound({ force: true });
+
+    assert.equal(body.cancelled(), true);
+    assert.ok(body.reads() <= 1, "only the fetch wrapper's prefetch may run");
+    assert.equal(getBlogFeed().error, undefined);
 });
 
 test("#4906 P3 settleRoundImmune: a rejecting round never leaks an unhandledRejection", async () => {
