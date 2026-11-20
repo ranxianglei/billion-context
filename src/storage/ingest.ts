@@ -611,14 +611,29 @@ interface LegacyView {
 
 type BlockContents = LegacyView["blockContents"];
 
-/** Shared by full-view and resident-field reads; each page is released after parsing. */
-export function appendBlockContents(contents: BlockContents, rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[]): void {
+/** Shared by full-view and resident-field reads; each page is released after
+ *  parsing. #7337: a corrupt block summary/one CAS row is skipped and returned
+ *  (not thrown) so one bad row cannot abort the whole load — before this it
+ *  threw out of finish()/readResidentFieldsFor and the session fell back to the
+ *  legacy file (or was discarded when none exists). */
+export function appendBlockContents(
+    contents: BlockContents,
+    rows: Pick<LegacyViewRows["blocks"][number], "blockId" | "summary" | "one">[],
+): { blockId: string; error: string }[] {
+    const skipped: { blockId: string; error: string }[] = [];
     for (const b of rows) {
-        contents.set(b.blockId, {
-            one: b.one === null ? null : (JSON.parse(b.one) as BlockView),
-            full: JSON.parse(b.summary) as BlockView,
-        });
+        let one: BlockView | null;
+        let full: BlockView;
+        try {
+            one = b.one === null ? null : (JSON.parse(b.one) as BlockView);
+            full = JSON.parse(b.summary) as BlockView;
+        } catch (err) {
+            skipped.push({ blockId: b.blockId, error: String(err) });
+            continue;
+        }
+        contents.set(b.blockId, { one, full });
     }
+    return skipped;
 }
 
 export function mergeOrphanBlockContents(contents: BlockContents, orphansJson: string | null | undefined): void {
@@ -709,7 +724,9 @@ export class LegacyViewBuilder {
                 this.skippedCorruptRows.push({ table: "blocks", key: String(b.blockId), error: String(err) });
             }
         }
-        appendBlockContents(this.blockContents, rows);
+        for (const s of appendBlockContents(this.blockContents, rows)) {
+            this.skippedCorruptRows.push({ table: "blocks", key: String(s.blockId), error: s.error });
+        }
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {

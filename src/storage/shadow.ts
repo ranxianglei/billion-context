@@ -757,11 +757,20 @@ export class UnifiedShadow {
                 }
                 if (fields.blockContents) {
                     const contents: NonNullable<ResidentFields["blockContents"]> = new Map();
+                    const skipped: { blockId: string; error: string }[] = [];
                     for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
                         const page = store.getBlockContents(id, { limit: VIEW_READ_BATCH_SIZE, offset });
                         const blocks = Array.isArray(page) ? page : [];
-                        appendBlockContents(contents, blocks);
+                        for (const s of appendBlockContents(contents, blocks)) skipped.push(s);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    if (skipped.length > 0) {
+                        loggerLog(
+                            "warn",
+                            `[storage] resident block contents degraded for ${id}: ${skipped.length} unparseable row(s) skipped (${skipped
+                                .map((s) => `${s.blockId}: ${s.error}`)
+                                .join("; ")}); loaded without them (#7337)`,
+                        );
                     }
                     mergeOrphanBlockContents(contents, store.getOrphansJson(id));
                     result.blockContents = contents;
