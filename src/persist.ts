@@ -2705,7 +2705,11 @@ export class SessionStore {
         if (!shadow) return null;
         try {
             return shadow.webSummaryRows();
-        } catch {
+        } catch (e) {
+            // #7156: this catch used to swallow the error silently — a corrupt
+            // payload_json made the panel show "0 historical sessions" with NO
+            // trace in the server log. Log it so the fallback is diagnosable.
+            loggerLog("warn", `[persist] unifiedWebSummaries: ${String(e)} — falling back to the disk-index walk`);
             return null; // sidecar degraded mid-call: fall back to the walk
         }
     }

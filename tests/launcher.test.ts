@@ -1610,6 +1610,11 @@ test("ensureProxyRunning: unarmed LANE'D listener is not attached by default —
             },
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
+            // #7156: the mock "daemon" never really ran here — nothing is
+            // actually listening on 8787, so the second-writer gate must not
+            // wait out the drain grace for a process that is, for gate
+            // purposes, already gone.
+            isPidAlive: () => false,
         },
     );
     assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed lane'd daemon");

@@ -34,6 +34,7 @@ import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSu
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
+import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
@@ -346,20 +347,41 @@ export class UnifiedShadow {
             store.resetAllIngestWatermarks();
         } catch (err) {
             const errStr = String(err);
-            // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
-            // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
-            // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
-            // session state in unified-full mode). The Node.js upgrade lever is surfaced via
-            // /__bili/status + the bootstrap warn.
-            // Corruption-shaped failures never reach here — the inner catch
-            // above handles them (loud alarm + boot WITHOUT the index).
+            // #7156: corruption-shaped failures CAN reach here. When the
+            // integrity check did not run synchronously — a store over the
+            // 512 MiB sync threshold checks in the background, or a poisoned
+            // .chk verdict cache skipped the rescan (see the close-time gate
+            // in store.ts) — the corruption surfaces at the FIRST post-open
+            // write (resetAllIngestWatermarks) instead of at quick_check.
+            // Classify it exactly like the inner catch: proven-corrupt →
+            // start WITHOUT the index, files left in place, loud alarm naming
+            // the manual fix (2026-10-30 owner policy).
+            const corruptionDetail = sqliteCorruptionDetail(err);
+            if (corruptionDetail !== null) {
+                // The opened handle is abandoned (GC releases it) rather than
+                // close()'d: close() would run the close-time integrity-cache
+                // refresh, and a runtime corruption finding must NOT write the
+                // verdict cache (owner policy 2026-10-30: runtime findings are
+                // alarm-only, no cache write — writing "ok" here would re-stamp
+                // the poisoned verdict). The operator moves the files aside by
+                // hand, so the uncheckpointed -wal state is moot.
+                loggerLog(
+                    "error",
+                    `[storage] index.db FAILED at the first post-open write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
+                );
+                recordSidecarOpenFailure(`first post-open write failed: ${corruptionDetail}`);
+                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
+                return null;
+            }
+            // Deleting the index cannot fix a no-engine failure (the engine is
+            // missing from the process, not from the file), so the deletion
+            // hint below must not be offered for those shapes.
             // #4626-era owner decision chain (2026-10-30): every OTHER
             // sidecar-open failure REFUSES TO START instead of degrading —
-            // no-engine/CANTOPEN/readonly/OS-level: availability at the
-            // price of a silently different storage path was withdrawn by
-            // owner instruction "在任何情况下不降级". Intentional opt-outs
-            // (legacy mode / encryption opt-out / persistence off) resolve to
-            // mode===legacy above and never reach here.
+            // a boot that silently falls back to legacy JSON is exactly the
+            // "degraded mode" that policy forbids. The hint below names the
+            // two manual moves for the shapes that CAN be fixed by hand, and
+            // the loud log line carries the file path + the exact reason.
             const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
