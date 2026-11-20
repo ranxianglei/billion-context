@@ -10,13 +10,14 @@
  * the legacy path — with the 4a shadow byte-comparison still running on
  * fallback turns — when it cannot (degrade, never guess).
  *
- * v1 scope (honest, pinned in tests):
- *   - text and acp_summary rows rebuild (that is the entire 10w-row
- *     uncompressed workload);
+ * Scope (honest, pinned in tests):
+ *   - text, tool, and acp_summary rows rebuild (the entire 10w-row
+ *     uncompressed workload, coding sessions included); tool rows ride the
+ *     CAS body — the recorded bytes are the FULL core message JSON, so the
+ *     toolCallId/toolName sidecars are present and the same legacy chain
+ *     reproduces the bytes;
  *   - a row without casRef (recorded before seg 4) or a missing CAS body →
- *     null (caller stays on the legacy path — degrade, never guess);
- *   - tool rows → null for v1 (toolCallId/toolName sidecars are not log
- *     metadata; tool traffic is small and fold-heavy by design).
+ *     null (caller stays on the legacy path — degrade, never guess).
  */
 
 import { isRenderedSummaryMessage } from "acp-kernel";
@@ -43,7 +44,7 @@ export function rebuildOutboundFromLog(view: readonly EgressViewRow[], store: Eg
     const msgs: BiliMessage[] = [];
     for (const r of view) {
         if (r.type === "system") continue;
-        if (r.type === "tool" || r.casRef === undefined || r.casRef === "") return null;
+        if (r.casRef === undefined || r.casRef === "") return null;
         const bytes = store.egressGetContent(r.casRef);
         if (bytes === null) return null;
         let m: unknown;

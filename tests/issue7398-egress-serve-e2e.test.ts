@@ -1,15 +1,16 @@
 // #7398 seg 4b: egress serve-from-log — when rollout egressServeLog is on the
 // outbound conversation elements come from the op-log + unified content CAS
 // (rebuildOutboundFromLog) instead of the legacy re-conversion, and are
-// byte-identical to the legacy bytes by construction. Degrade direction
-// (#3617): a view that cannot be rebuilt (tool rows in v1) stays on the
-// legacy path for the whole turn — never a partial serve.
+// byte-identical to the legacy bytes by construction. Direction asserts
+// (#3617): the served sessions (text AND tool — tool rows ride the CAS body)
+// log "egress-serve: served"; the rollout-off controls never do.
 //
 // Method: one server, two sessions with IDENTICAL message sequences. Session A
 // runs with the rollouts off (control = legacy). Session B runs with
 // egressOpLog+egressServeLog on (served). The fake upstream captures every
 // request body; A[n] and B[n] must be byte-identical, and B's log must show
-// "egress-serve: served" (text scenario) or its absence (tool scenario).
+// "egress-serve: served" lines scoped to the served sessions (both scenarios
+// serve now — tool rows ride the CAS body); the -A controls never do.
 
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -41,7 +42,7 @@ function buildBody(history: unknown[]): string {
 
 async function runSession(
     base: string,
-    sessionHeader: string,
+    sessionName: string,
     script: Array<{ messages: unknown[] }>,
     captured: string[],
 ): Promise<void> {
@@ -50,7 +51,10 @@ async function runSession(
         for (const turn of script) {
             const res = await fetch(`${base}/v1/chat/completions`, {
                 method: "POST",
-                headers: { "content-type": "application/json", authorization: "Bearer k", [sessionHeader]: "serve-e2e" },
+                // The server only honors opts.sessionHeader ("x-acp-session");
+                // send the session NAME as its value so session.id (and every
+                // egress-serve log line) carries it for the direction asserts.
+                headers: { "content-type": "application/json", authorization: "Bearer k", "x-acp-session": sessionName },
                 body: buildBody(turn.messages),
                 signal: ctrl.signal,
             });
@@ -63,7 +67,7 @@ async function runSession(
     }
 }
 
-test("egress serve-from-log: served bytes == legacy bytes; tool rows fall back (#7398 seg 4b)", async () => {
+test("egress serve-from-log: served bytes == legacy bytes, text and tool alike (#7398 seg 4b)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "egress-serve-e2e-"));
     test.after(() => rmSync(dir, { recursive: true, force: true }));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
@@ -145,15 +149,16 @@ test("egress serve-from-log: served bytes == legacy bytes; tool rows fall back (
             assert.deepEqual(b.messages, a.messages, `text turn ${i + 1}: served bytes must equal legacy bytes`);
         }
         const textBLogs = logs.filter((l) => l.includes("egress-serve"));
-        assert.ok(textBLogs.some((l) => l.includes("egress-serve: served")), "text session must be served from the op-log at least on a steady turn");
+        assert.ok(textBLogs.some((l) => l.includes("egress-serve: served") && l.includes("serve-e2e-text-B")), "text session B must be served from the op-log at least on a steady turn");
+        assert.ok(!logs.some((l) => l.includes("egress-serve: served") && (l.includes("serve-e2e-text-A") || l.includes("serve-e2e-tool-A"))), "control sessions (rollouts off) must never be served");
         for (let i = 0; i < toolScript.length; i++) {
             const a = JSON.parse(ctrlAT[i]);
             const b = JSON.parse(servedT[i]);
-            assert.deepEqual(b.messages, a.messages, `tool turn ${i + 1}: fallback bytes must equal legacy bytes`);
+            assert.deepEqual(b.messages, a.messages, `tool turn ${i + 1}: served bytes must equal legacy bytes`);
         }
-        // Degrade direction: the tool scenario must NEVER log a served turn
-        // (v1 scope: tool rows are not in the log metadata).
-        assert.ok(!logs.some((l) => l.includes("egress-serve: served") && l.includes("serve-e2e-tool")), "tool session must stay legacy (no served line)");
+        // Both directions (#3617): the tool session IS served now (the CAS
+        // body carries the toolCallId/toolName sidecars) and byte-identical.
+        assert.ok(logs.some((l) => l.includes("egress-serve: served") && l.includes("serve-e2e-tool-B")), "tool session B must be served from the op-log too");
 
         srv.closeAllConnections?.();
         await new Promise((r) => srv.close(() => r(undefined)));

@@ -4,8 +4,8 @@
  * the legacy chain (systemToUser → coreToOpenai → hardenOpenaiAssistantContent)
  * produces for the same messages — that is the claim the shadow comparison
  * in prepare-openai measures, and the precondition for any future swap.
- * Also pins the degrade directions (#3617): missing CAS body / no casRef /
- * tool row → null (caller keeps the legacy path), never a partial rebuild.
+ * Also pins the degrade directions (#3617): missing CAS body / no casRef →
+ * null (caller keeps the legacy path), never a partial rebuild.
  */
 
 import { test } from "node:test";
@@ -131,13 +131,17 @@ test("degrade #2: rows recorded without CAS (pre-seg-4) → null", () => {
     }
 });
 
-test("degrade #3: a tool row → null in v1 (scope pinned)", () => {
+test("byte identity: tool rows rebuild (the CAS body carries the sidecars)", () => {
     const H = open();
     try {
         const S = "sess-s5";
+        const callMsg = { id: "t0", role: "assistant", contentType: "tool-call", text: "\"{\\\"q\\\":1}\"", toolCallId: "call_1", toolName: "bash" } as BiliMessage;
         const toolMsg = { id: "t1", role: "tool", contentType: "text", text: "result", toolCallId: "call_1", toolName: "bash" } as BiliMessage;
-        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: [M("a", "hello"), toolMsg], systemText: undefined, nowMs: 1000 });
-        assert.equal(rebuildOutboundFromLog(view, H.store), null, "tool rows are out of v1 scope");
+        const msgs: BiliMessage[] = [M("a", "hello"), callMsg, toolMsg, M("b", "after", "assistant")];
+        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
+        const reb = rebuildOutboundFromLog(view, H.store);
+        assert.ok(reb !== null, "tool rows rebuild — the recorded CAS bytes are the full core message (toolCallId/toolName included)");
+        assert.equal(JSON.stringify(reb!.elements), JSON.stringify(legacyChain(msgs)), "tool-heavy conversation is byte-identical to the legacy chain");
     } finally {
         close(H);
     }
