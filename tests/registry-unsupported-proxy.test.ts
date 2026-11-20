@@ -119,3 +119,33 @@ test("an unsupported proxy scheme neither rejects the loader nor poisons its mem
         await restore();
     }
 });
+
+// server/handle.ts awaits contextFromRegistry() on the request path for a model
+// the warm cache misses. A failed fetch leaves the cache on the fallback, so
+// before the backoff every such request refetched models.dev and stalled for
+// the full fetch timeout when it was slow or unreachable.
+test("after a failed fetch the request path serves the fallback instead of refetching", async () => {
+    const restore = await isolateLoaderEnv();
+    let calls = 0;
+    let reg: typeof import("../src/registry.ts") | undefined;
+    try {
+        reg = await import("../src/registry.ts");
+        reg._resetForTest();
+        reg._setRegistryFetchForTest(async () => {
+            calls += 1;
+            throw new Error("network down");
+        });
+
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.equal(calls, 1);
+        assert.equal(await reg.contextFromRegistry("no-such-model"), undefined);
+        assert.equal(calls, 1, "a second request inside the backoff must not refetch");
+
+        await reg.loadRegistry();
+        assert.equal(calls, 2, "loadRegistry itself still retries per call");
+    } finally {
+        reg?._setRegistryFetchForTest(undefined);
+        reg?._resetForTest();
+        await restore();
+    }
+});

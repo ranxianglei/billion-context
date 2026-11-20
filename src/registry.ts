@@ -34,6 +34,8 @@ type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 let cache: RegistryShape | null = null;
 let costCache: CostsShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
+const FAILED_FETCH_BACKOFF_MS = 10 * 60 * 1000;
+let lastFailedFetchMs = 0;
 const warnedConflicts = new Set<string>();
 const warnedPriceConflicts = new Set<string>();
 // Case-folded key indexes for the roster maps (#2074): models.dev keys are
@@ -242,6 +244,7 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
     if (loading) return loading;
     const pending = (async () => {
         const fresh = await fetchFresh();
+        lastFailedFetchMs = fresh ? 0 : Date.now();
         if (fresh) {
             cache = fresh.reg;
             costCache = fresh.costs;
@@ -358,6 +361,12 @@ export function providerFromHost(host: string): string | undefined {
 }
 
 export async function contextFromRegistry(model: string, host?: string): Promise<number | undefined> {
+    // Request path (server/handle.ts awaits this for a model the warm cache
+    // misses). A failed fetch leaves `cache` on a fallback, so loadRegistry()
+    // fetches again on every call: with models.dev slow or unreachable each
+    // such request stalled for the full fetch timeout. Serve the fallback
+    // during the backoff; loadRegistry() itself still retries per call.
+    if (cache && Date.now() - lastFailedFetchMs < FAILED_FETCH_BACKOFF_MS) return registryLookup(cache, model, host);
     const reg = await loadRegistry();
     return registryLookup(reg, model, host);
 }
@@ -639,6 +648,7 @@ export function _resetForTest(): void {
     cache = null;
     costCache = null;
     loading = null;
+    lastFailedFetchMs = 0;
     regLowerIdx = null;
     costLowerIdx = null;
     warnedConflicts.clear();
