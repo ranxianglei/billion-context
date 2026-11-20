@@ -187,6 +187,10 @@ test("#7346 full-path: a watermark-HIT window save keeps the verified prefix in 
             db.close();
         }
         await closeServers([h.proxy, h0.upstream], "7346 fullpath");
+        // Release the store's shadow SQLite handle before rmSync — Windows
+        // cannot delete a directory while index.db is open, so a leaked
+        // handle pins the temp dir and the teardown unlink fails with EBUSY.
+        h0.store.closeQuietly();
     } finally {
         if (savedRollout === undefined) delete process.env[ROLLOUT_ENV];
         else process.env[ROLLOUT_ENV] = savedRollout;
