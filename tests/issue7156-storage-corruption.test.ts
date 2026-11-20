@@ -74,15 +74,16 @@ function seedSessionWithBlock(dir: string, payload: string): string {
     return p;
 }
 
-/** Zero one 4096-byte page. Page 2 (the schema-overflow page for the real 12-table
- *  DDL) is the deterministic recipe: open() survives (the pragmas + migration only
- *  touch the header + page 1) but the first write that resolves the schema throws
- *  "database disk image is malformed" — verified against the real store, stable
- *  across runs and row counts. */
+/** Zero one 4096-byte page (1-indexed SQLite page number). The deterministic recipe
+ *  is to zero the sessions table's ROOT page (looked up from sqlite_master, so it is
+ *  stable across schema sizes): open() survives (async mode — the sync quick_check
+ *  never runs, and the migrations only touch the schema on page 1) but the first
+ *  write that traverses the sessions b-tree (resetAllIngestWatermarks) throws
+ *  "database disk image is malformed". */
 function zeroPage(p: string, page: number): void {
     const fd = openSync(p, "r+");
     try {
-        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, page * 4096);
+        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, (page - 1) * 4096);
     } finally {
         closeSync(fd);
     }
@@ -195,10 +196,12 @@ test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (
             ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, 1, 1)").run("s" + i + "-" + "x".repeat(300));
         }
         ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        const rootPage = (ro.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'sessions'").get() as { rootpage: number }).rootpage;
         ro.close();
-        // Corrupt page 2: open() survives (async mode — the sync quick_check never
-        // runs), but the first write (resetAllIngestWatermarks) throws CORRUPT.
-        zeroPage(p, 2);
+        // Corrupt the sessions root page: open() survives (async mode — the sync
+        // quick_check never runs), but the first write (resetAllIngestWatermarks)
+        // traverses the sessions b-tree and throws CORRUPT.
+        zeroPage(p, rootPage);
         setIntegritySyncThresholdForTests(1); // force async mode for any size
         const errors: string[] = [];
         setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
