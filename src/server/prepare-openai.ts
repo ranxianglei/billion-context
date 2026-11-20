@@ -51,6 +51,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
+import { recordEgressTurn } from "../storage/egress-record.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -800,6 +801,28 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
+    // #7398 seg 3: shadow-record this turn's outbound conversation view as
+    // sparse ops (rollout-gated, default off — zero rows, zero cost). Never
+    // touches outbound bytes; a corrupt log disables recording for the
+    // session and the turn proceeds legacy.
+    if (!isTitleGen && featureEnabled("egressOpLog")) {
+        try {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                session.egressView = recordEgressTurn({
+                    store: st,
+                    sessionId,
+                    prev: session.egressView,
+                    conversation: processedMessages.length > 0 ? processedMessages : originalMessages,
+                    systemText: openaiOutboundSystem ?? openaiSystemText,
+                    nowMs: Date.now(),
+                });
+            }
+        } catch (err) {
+            session.egressView = undefined;
+            log("warn", `[${sessionId}] egress op-log recording disabled for this session: ${String(err)}`);
+        }
+    }
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 

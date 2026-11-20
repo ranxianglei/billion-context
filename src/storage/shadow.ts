@@ -1028,6 +1028,14 @@ export class UnifiedShadow {
         return this.sync.snapMsgIdLiveIds(sessionId);
     }
 
+    /** #7398 seg 3: the sqlite UnifiedStore behind this shadow — the egress
+     *  op-log recorder's narrow seam. Null on network backends (mysql): the
+     *  shadow tables are sqlite-lane only, and the recorder skips the turn
+     *  exactly as it does when no sidecar opened. */
+    egressOpLogSync(): UnifiedStore | null {
+        return this.sync;
+    }
+
     /** #6181 M3: persisted R3 breaker latch (see UnifiedStore.snapR3Latched). */
     snapR3Latched(sessionId: string): boolean {
         if (this.sync === null) return false;

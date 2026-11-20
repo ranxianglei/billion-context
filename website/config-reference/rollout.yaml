@@ -74,6 +74,15 @@ entries:
     desc_en: "Plugin-lane server-owned history (#4491): for enabled installs, (a) plugin-lane requests may carry an internal `biliMsgIds` array parallel to `messages` that pins message identity to client-supplied ids (always stripped before upstream forwarding; malformed arrays are ignored with a warning, id-poisoning shapes hard-fail on the incremental lane); (b) the loopback-only `POST /__bili/plugin/render` endpoint serves the outbound prefix rendered from the unified transcript (folded regions collapse to summary anchors; any desync degrades to a non-2xx so the shim falls back to its local history); (c) the incremental-lane probe advertises `serverHistory`. Default 0% — no behavior change until rolled out."
     desc_zh: "插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。"
     desc_ja: "プラグインレーンのサーバー所有履歴 (#4491)：有効化されたインストールにおいて、(a) プラグインレーンのリクエストは `messages` と並行して内部 `biliMsgIds` 配列を持ち、メッセージIDをクライアント提供のIDに固定できる（上流転送前に常に除去；不正な配列は警告付きで無視、ID汚染形状は増分レーンでハードフェイル）；(b) ループバック専用の `POST /__bili/plugin/render` エンドポイントは、統合トランスクリプトからレンダリングされた送信プレフィックスを提供する（折り畳み領域はサマリアンカーに縮小；デシンクは非2xxにデグレードし、シムはローカル履歴にフォールバック）；(c) 増分レーンのプローブは `serverHistory` をアドバタイズする。デフォルト 0% — ロールアウトされるまで挙動は変わらない。"
+  - key: rollout.features.egressOpLog
+    type: "boolean | number"
+    default: "0 (off)"
+    default_zh: "0(关)"
+    env: BILI_ROLLOUT_EGRESS_OP_LOG
+    group: behavior
+    desc_en: "Egress op-log shadow recording (#7398 seg 3): each turn diffs the outbound conversation view against the previous turn's and appends the sparse op batch (I/D/U) to the egress_state/egress_flow dual tables. RECORDING ONLY — outbound bytes are not read from or written through the log (that is seg 4, its own key). Default 0 = zero rows, zero cost. See discussions/7398."
+    desc_zh: "出站 op 日志影子记账(#7398 第三段):每轮把出站会话视图与上一轮做 diff,把稀疏 op 批(I/D/U)追加到 egress_state/egress_flow 双表。**只记账**——不读不写出站字节(那是第四段,独立灰度键)。默认 0 = 零行零开销。见 discussions/7398。"
+    desc_ja: "Egress op-log シャドー記録(#7398 セグメント3):各ターンで送信会話ビューを前ターンと diff し、スパース op バッチ(I/D/U)を egress_state/egress_flow デュアルテーブルに追記する。**記録のみ** — 送信バイトはログから読み書きしない(セグメント4、独立キー)。デフォルト 0 = 0行・0コスト。discussions/7398 参照。"
   - key: rollout.features.pluginDeltaResend
     type: "boolean | number"
     default: "0 (off)"

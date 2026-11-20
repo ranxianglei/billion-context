@@ -129,6 +129,13 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // Force with `rollout.features.pluginDeltaResend: true` or
     // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
     pluginDeltaResend: { percent: 0 },
+    // #7398 seg 3: shadow-record each turn's outbound conversation view as
+    // sparse ops into the egress dual tables (egress_state/egress_flow).
+    // RECORDING ONLY — outbound bytes are not read from or written through
+    // the log (that is seg 4, own key). Default 0 = zero rows, zero cost.
+    // Force with `rollout.features.egressOpLog: true` or
+    // `BILI_ROLLOUT_EGRESS_OP_LOG=1`.
+    egressOpLog: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite

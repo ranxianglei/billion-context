@@ -2511,6 +2511,14 @@ export class SessionStore {
         return this.liveShadow().snapMsgIdLiveIds(sessionId);
     }
 
+    /** #7398 seg 3: egress op-log surface (dual tables egress_state/
+     *  egress_flow). Null when the sqlite lane is unavailable (legacy mode,
+     *  network backends) — callers skip recording for the turn (shadow lane,
+     *  zero impact). */
+    egressOpLogStore(): import("./storage/store.js").UnifiedStore | null {
+        return this.replicasAvailable() ? this.liveShadow().egressOpLogSync() : null;
+    }
+
     /** #6181 M3: whether this sid's R3 breaker latch persisted from a
      *  previous process (a restart must not re-arm a misbehaving host). */
     snapR3Latched(sessionId: string): boolean {
