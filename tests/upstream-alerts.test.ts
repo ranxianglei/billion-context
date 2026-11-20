@@ -612,3 +612,29 @@ test("#1682: banner renders active alerts, dismisses per instance, hides on reco
         _resetUpstreamAlertsForTest();
     }
 });
+
+test("banner drops the skipped-proxy advice when the latest failure did not skip a proxy", async () => {
+    _resetUpstreamAlertsForTest();
+    const url = "https://relay.example.com/v1/messages";
+    const error = netError("UND_ERR_CONNECT_TIMEOUT");
+    const deadPort = await freePort();
+    const { proxy, proxyPort } = await startProxyFor(deadPort, false);
+    const base = `http://127.0.0.1:${proxyPort}`;
+    try {
+        recordUpstreamAlert(url, error, false, { proxy: "http://127.0.0.1:7890", source: "HTTPS_PROXY" });
+        const first = await runWebClient(base, "#/overview", new Map());
+        await waitFor(() => first.els.get("alerts-banner")?.hidden === false, "initial skipped-proxy banner");
+        assert.match(first.els.get("alerts-banner")!.children[1].children[0].textContent, /127\.0\.0\.1:7890/);
+
+        recordUpstreamAlert(url, error, true);
+        const current = await runWebClient(base, "#/overview", new Map());
+        await waitFor(() => current.els.get("alerts-banner")?.hidden === false, "current failure banner");
+        const message = current.els.get("alerts-banner")!.children[1].children[0].textContent;
+        assert.match(message, /relay\.example\.com \(connect-timeout ×2/);
+        assert.ok(!message.includes("127.0.0.1:7890"));
+        assert.ok(!message.includes("HTTPS_PROXY"));
+    } finally {
+        await close(proxy);
+        _resetUpstreamAlertsForTest();
+    }
+});
