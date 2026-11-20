@@ -730,7 +730,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -3887,7 +3887,7 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):
