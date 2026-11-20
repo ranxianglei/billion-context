@@ -1056,7 +1056,12 @@ async function mergedSummaries(): Promise<WebSessionSummary[]> {
     }
     if (!fromRows) {
         const files = await ensureIndex();
-        for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
+        // The index already chooses each id's freshest savedAt, then mtime.
+        // Replaying every file here would let directory order pick a stale twin.
+        for (const abs of byId?.values() ?? []) {
+            const summary = files.get(abs)?.summary;
+            if (summary) out.set(summary.id, summary);
+        }
     }
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
