@@ -175,6 +175,7 @@
 | `BILI_CLAUDE_NATIVE_PORT` / `BILI_ZCODE_PORT` | 显式 zone 端口覆盖（strict-port 语义，#1660） |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` / `BILI_ATTACH_HEALTH_DEADLINE_MS` | native attach 证据宽限窗 / 健康截止窗 |
 | `BILI_SPAWN_WAIT_MS` / `BILI_SLOW_START_GRACE_MS` | launcher spawn 初始健康等待窗 / LIVE 子进程慢启动宽限；总 spawn 预算 = 两者之和（#4947） |
+| `BILI_PREDECESSOR_DRAIN_GRACE_MS` | spawn 前第二写者闸（#7156）内的有界宽限：前任监听器消失后等待进程真正退出的时长（排空期最终 flush 仍写 index.db）；默认 10s，非法值回落默认（envMillis，#1365） |
 | `BILI_SILENT_DIRECT_MAX_MB` | silent-direct 超大请求守卫上限（MiB，默认 8；非法值回退默认，#5405/#5826） |
 | `BILI_DSH_BIN` / `BILI_PI_BIN` | dsh / pi 可执行文件覆盖 |
 | `BILI_PLUGIN_AGENT` | `--plugin` 目标 agent 选择（默认 claude） |
