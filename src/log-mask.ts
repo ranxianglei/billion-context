@@ -113,13 +113,15 @@ export function maskUrlForLog(url: string): string {
 // carried their inline credentials verbatim into logs / diagnostics / publish
 // blobs. No leading \b on purpose: a word-char-glued URL (xhttps://…) must
 // stay masked exactly as before; over-matching is safe, under-matching leaks.
-const EMBEDDED_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+// Try each scheme-character run once; retain any non-letter prefix outside
+// the URL rather than retrying the same suffix from every letter in the run.
+const EMBEDDED_URL_RE = /(?<![a-z0-9+.-])([0-9+.-]*)([a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+)/gi;
 
 /** Mask every scheme://… URL embedded anywhere in an arbitrary string
  *  (request paths like /bili/http://relay.internal/v1/..., error text,
  *  socks5://user:pass@host forwarding addresses — #4191). */
 export function maskUrlsInText(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForLog(m));
+    return text.replace(EMBEDDED_URL_RE, (_m, prefix: string, url: string) => prefix + maskUrlForLog(url));
 }
 
 /** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
@@ -145,7 +147,7 @@ function maskUrlForPublish(url: string): string {
  *  wherever they appear in serialized text — object values AND object keys (the
  *  providers table uses upstream URLs as keys). */
 export function maskUrlsForPublish(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForPublish(m));
+    return text.replace(EMBEDDED_URL_RE, (_m, prefix: string, url: string) => prefix + maskUrlForPublish(url));
 }
 
 function escapeRegExp(s: string): string {
@@ -230,10 +232,10 @@ export function maskUrlForDiagnostics(url: string): string {
  *  unparseable fragments pass through (the IP scrubber neutralizes bare IP
  *  literals separately). */
 export function maskUrlsForDiagnostics(text: string): string {
-    return text.replace(EMBEDDED_URL_RE, (m) => {
+    return text.replace(EMBEDDED_URL_RE, (m, prefix: string, url: string) => {
         try {
-            void new URL(m);
-            return maskUrlForDiagnostics(m);
+            void new URL(url);
+            return prefix + maskUrlForDiagnostics(url);
         } catch {
             return m;
         }
