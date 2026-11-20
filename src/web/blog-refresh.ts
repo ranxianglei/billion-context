@@ -307,7 +307,8 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
         if (!Array.isArray(raw)) throw new Error("contents listing is not a JSON array");
         return raw as ContentsEntry[];
     } finally {
-        result.stopIdleTimer(); // body fully consumed (fetch-util #552 contract)
+        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
+        result.stopIdleTimer();
     }
 }
 
@@ -322,11 +323,12 @@ async function fetchPlainText(url: string, account?: (bytes: number) => void): P
         if (declared !== undefined && declared > MAX_TEXT_BYTES) {
             throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes (content-length ${declared}): ${url}`);
         }
-        const buf = Buffer.from(await result.response.arrayBuffer());
-        if (buf.byteLength > MAX_TEXT_BYTES) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${url}`);
+        const buf = await readCappedBytes(result.response.body, MAX_TEXT_BYTES);
+        if (buf === undefined) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${url}`);
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
+        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
         result.stopIdleTimer();
     }
 }
@@ -343,15 +345,12 @@ async function fetchApiText(rel: string, account?: (bytes: number) => void): Pro
         if (typeof data.content !== "string") {
             throw new Error(`contents API omitted the body (>1 MiB cap): ${rel}`);
         }
-        // Size gate BEFORE decoding: base64 inflates payloads by ~4/3.
-        if (Math.ceil(data.content.length * 3 / 4) > MAX_TEXT_BYTES) {
-            throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
-        }
-        const buf = Buffer.from(data.content, "base64");
-        if (buf.byteLength > MAX_TEXT_BYTES) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
+        const buf = decodeCappedBase64(data.content, MAX_TEXT_BYTES);
+        if (buf === undefined) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
         account?.(buf.byteLength);
         return buf.toString("utf8");
     } finally {
+        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
         result.stopIdleTimer();
     }
 }
@@ -394,11 +393,12 @@ async function fetchPlainImage(url: string, account?: (bytes: number) => void): 
         if (!result.response.ok) throw new Error(`image GET ${url} → HTTP ${result.response.status}`);
         const declared = contentLengthOf(result.response.headers);
         if (declared !== undefined && declared > MAX_IMAGE_BYTES) return undefined; // never download the body
-        const buf = Buffer.from(await result.response.arrayBuffer());
-        if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return undefined;
+        const buf = await readCappedBytes(result.response.body, MAX_IMAGE_BYTES);
+        if (buf === undefined || buf.byteLength === 0) return undefined;
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
+        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
         result.stopIdleTimer();
     }
 }
@@ -419,14 +419,44 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
         if (!result.response.ok) throw new Error(`contents image GET ${url} → HTTP ${result.response.status}`);
         const data = (await result.response.json()) as { content?: unknown };
         if (typeof data.content !== "string") return undefined; // >1 MiB omission → next source
-        if (Math.ceil(data.content.length * 3 / 4) > MAX_IMAGE_BYTES) return undefined;
-        const buf = Buffer.from(data.content, "base64");
-        if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return undefined;
+        const buf = decodeCappedBase64(data.content, MAX_IMAGE_BYTES);
+        if (buf === undefined || buf.byteLength === 0) return undefined;
         account?.(buf.byteLength);
         return { buf, type };
     } finally {
+        if (!result.response.bodyUsed) await result.response.body?.cancel().catch(() => {});
         result.stopIdleTimer();
     }
+}
+
+function decodeCappedBase64(content: string, maxBytes: number): Buffer | undefined {
+    const compact = content.replace(/\s/g, "");
+    if (Buffer.byteLength(compact, "base64") > maxBytes) return undefined;
+    const buf = Buffer.from(compact, "base64");
+    return buf.byteLength > maxBytes ? undefined : buf;
+}
+
+async function readCappedBytes(body: Response["body"], maxBytes: number): Promise<Buffer | undefined> {
+    if (body === null) return Buffer.alloc(0);
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value.byteLength === 0) continue;
+            if (value.byteLength > maxBytes - total) {
+                await reader.cancel().catch(() => {});
+                return undefined;
+            }
+            total += value.byteLength;
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks, total);
 }
 
 /** Image fetch through the fallback chain. Misses (true 404s / >1 MiB API
