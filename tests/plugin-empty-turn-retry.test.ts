@@ -573,3 +573,41 @@ test("plugin chat (anthropic) defaults to a native error event, not a synthetic 
     assert.ok(text.includes('"code":"stream_error"'), "the error carries the stream_error code");
     assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block by default");
 });
+
+// #7410: thinking-then-stop — the model thought but produced no answer or tool
+// call. Refetching the same request + same nudge degenerates again 41% of the
+// time (measured), so the proxy skips the refetch and hands the turn back to the
+// host as a retryable in-band error (same frame shape as the exhausted-retry
+// path). The first attempt's thinking block is the complete visible output, so
+// no second thinking block is appended.
+function anthropicThinkingThenStopTurn(): string[] {
+    return [
+        sse("message_start", { type: "message_start", message: { id: "msg_3", role: "assistant", usage: { input_tokens: 40 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "I need to think about this carefully." } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 10 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ];
+}
+
+test("plugin chat (anthropic) thinking-then-stop: no refetch, in-band error for host retry", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf(anthropicProseTurn("unwanted refetch")));
+    };
+    await pipePluginChatWithStrip(streamOf(anthropicThinkingThenStopTurn()), makeRes(out), "anthropic", makeSession(), (msg) => { logs.push(msg); }, refetch);
+    const text = out.join("");
+    assert.equal(calls, 0, "thinking-then-stop must NOT refetch — the host's retry is the right recovery path");
+    assert.ok(text.includes("event: error"), "a native Anthropic error event marks the failure");
+    assert.ok(text.includes('"code":"stream_error"'), "the error carries the stream_error code");
+    assert.ok(text.includes("thinking-then-stop"), "the error message identifies the thinking-then-stop case");
+    assert.ok(!text.includes("[ACP] stream error"), "no synthetic completed-turn error block by default");
+    assert.ok(
+        logs.some((l) => l.includes("thinking-then-stop") && l.includes("not refetching")),
+        `the log line identifies the thinking-then-stop case, got: ${JSON.stringify(logs)}`,
+    );
+});
