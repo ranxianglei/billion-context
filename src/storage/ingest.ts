@@ -748,6 +748,11 @@ export class LegacyViewBuilder {
      *  tell an older build's default from a value written after the rows
      *  (#7574 rollback). */
     private columnKstate: Record<string, unknown> = {};
+    /** #7335 poison-row isolation: rows whose stored bytes no longer parse as
+     *  JSON are skipped and recorded here instead of aborting the whole load —
+     *  before this, one bad row threw out of finish() and the session was
+     *  rebuilt from scratch (all blocks and refs discarded). */
+    readonly skippedCorruptRows: { table: "messages" | "blocks"; key: string; error: string }[] = [];
 
     constructor(
         private readonly session: LegacyViewRows["session"],
@@ -835,12 +840,24 @@ export class LegacyViewBuilder {
     }
 
     addBlocks(rows: LegacyViewRows["blocks"]): void {
-        for (const b of rows) this.blocks.push(JSON.parse(b.payloadJson));
+        for (const b of rows) {
+            try {
+                this.blocks.push(JSON.parse(b.payloadJson));
+            } catch (err) {
+                this.skippedCorruptRows.push({ table: "blocks", key: String(b.blockId), error: String(err) });
+            }
+        }
         appendBlockContents(this.blockContents, rows);
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {
-        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+        for (const m of rows) {
+            try {
+                this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+            } catch (err) {
+                this.skippedCorruptRows.push({ table: "messages", key: `seq=${m.seq}`, error: String(err) });
+            }
+        }
     }
 
     /** #6785 step 6: the ccr_entries ledger (CAS content) that backs a slim

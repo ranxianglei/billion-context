@@ -1033,11 +1033,17 @@ export class UnifiedStore {
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
     private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-        // #3133: planner-produced rows carry the digest from their intern or
-        // delta pass — skip the per-message re-hash here (same value: sha256
-        // over the same utf8 bytes). Only direct callers without a planner
-        // pay the hash at this layer.
-        const hash = precomputedHash ?? sha256Hex(bytes);
+        // #3133 kept the planner digest as the CAS key to skip the per-message
+        // re-hash; #7335 turns the same digest into a VERIFIED one — the CAS
+        // key is what every reader resolves by, so a caller-supplied hash that
+        // does not match its bytes silently poisons the store (observed: 26
+        // mismatched rows from an older dev build killed an entire session).
+        const hash = sha256Hex(bytes);
+        if (precomputedHash !== undefined && precomputedHash !== hash) {
+            throw new Error(
+                `content CAS digest mismatch: caller supplied ${precomputedHash} but ${bytes.byteLength} bytes hash to ${hash} — refusing to persist an unverified row`,
+            );
+        }
         const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
             | { refcount: number }
             | undefined;
