@@ -109,6 +109,10 @@ async function runCheck(): Promise<void> {
             }
             state = { releases, lastCheckAt: Date.now() };
         } finally {
+            // A rejected non-2xx body is never consumed; cancel it before
+            // stopping the idle watchdog, or the stopped watchdog can no longer
+            // reclaim the still-open connection (fetch-util #552). Fire-and-
+            // forget so cleanup never delays the fail-soft result.
             if (!result.response.bodyUsed) {
                 void result.response.body?.cancel().catch(() => {});
             }
