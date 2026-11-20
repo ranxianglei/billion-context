@@ -150,6 +150,12 @@ export const LIVE_FILES = [
     // One Linux-only Node child reads fixture system CAs and exits within 10s;
     // no child ports or network I/O. In-process HTTPS fixtures use listen(0).
     "tests/upstream-ca-default-trust.test.ts",
+    // #7156: the close-time cache-refresh gate test spawns ONE bare `node -e`
+    // dummy child purely as a live PID holder for the <db>.lock fixture — no
+    // ports, no servers, mkdtemp-isolated per test, SIGKILL'd in t.after, so
+    // the zone band is irrelevant; the entry is for the tripwire, like
+    // #5046/#4612.
+    "tests/storage-integrity-cache.test.ts",
     // #5241 phase-0 startup-contract stakes: both spawn children — verify-attach
     // drives one child per lane (sequential await), latches drives the stderr
     // flip child. No shared ports (mock bili server + spawn stubs are listen(0)
