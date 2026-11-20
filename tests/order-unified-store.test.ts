@@ -85,3 +85,43 @@ test("pre-hydration mutations fall back to the file, which hydration then import
     assert.ok(row.entries.some((e) => e.id === "early-bird"), "late import covered the early file write");
     assert.ok(orderSnapshot().some((e) => e.id === "early-bird"));
 });
+
+// #7378: a skeleton that exceeds the 4 MiB kv inline cap (the field report:
+// 179 entries, ~4–8 MiB) used to throw on the migration write → kvReady=false →
+// the whole process stuck on the legacy file path. Now the oversized doc is
+// routed into the content CAS and the kv row keeps a small ref.
+test("oversized skeleton (>4 MiB) migrates into the kv via the CAS and survives a restart", async () => {
+    const t = Date.now() + 100;
+    // ~6 MiB of frags across 200 entries — comfortably over the 4 MiB cap.
+    const entries = Array.from({ length: 200 }, (_, i) => ({
+        id: `big-skel-${i}`,
+        kinds: ["acp"],
+        frags: ["f".repeat(30 * 1024)],
+        tagHash: `th-${i}`,
+        lastSeen: t + i,
+    }));
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({ version: 1, entries }));
+
+    _resetOrderPersistForTest();
+    resetSessionOrderForTest();
+    await hydrateOrderUnified();
+
+    // The migration write must NOT have thrown — the kv row exists and carries
+    // all 200 big entries (plus the few from the earlier tests in this file).
+    const row = await kvRow();
+    assert.ok(row, "oversized skeleton migrated into kv (no throw)");
+    const bigIds = new Set(row.entries.map((e) => e.id).filter((id) => typeof id === "string" && id.startsWith("big-skel-")));
+    assert.equal(bigIds.size, 200, "all 200 big entries present");
+    assert.ok(orderSnapshot().some((e) => e.id === "big-skel-0"), "hydrated into memory");
+
+    // Simulated restart: caches gone, bootstrap file gone, MEMORY WIPED — the
+    // skeletons can only come back through the kv row (now a CAS ref).
+    _resetOrderPersistForTest();
+    fs.rmSync(legacyFile, { force: true });
+    resetSessionOrderForTest();
+    await hydrateOrderUnified();
+    const ids = new Set(orderSnapshot().map((e) => e.id));
+    assert.ok(ids.has("big-skel-0"), "big skeleton survived the restart via kv/CAS");
+    assert.ok(ids.has("big-skel-199"), "last big skeleton survived too");
+});
