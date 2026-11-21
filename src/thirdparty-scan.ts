@@ -207,6 +207,19 @@ export function isDshLiveCompactEntry(entry: string): boolean {
     return bare === "dsh-live-compact" || /^dsh-live-compact@/.test(bare) || /(^|[/\\])dsh-live-compact([/\\]|$)/.test(trimmed);
 }
 
+/** #7379: dsh-mneme entry identity — the DSH "dream" memory-consolidation
+ *  plugin (0.16.x). Like dsh-live-compact it replays the full conversation and
+ *  declares purpose=compaction to re-organize memory, which is a third-party
+ *  compression whose landed checkpoint would durably shadow the raw history
+ *  bili owns on this lane (#1729). Bounded segment match mirroring
+ *  isDshLiveCompactEntry's discipline so lookalikes ("dsh-mneme-viewer") stay
+ *  out of the known tier and at most keyword-suspected. */
+export function isDshMnemeEntry(entry: string): boolean {
+    const trimmed = entry.trim();
+    const bare = trimmed.replace(/^npm:/, "");
+    return bare === "dsh-mneme" || /^dsh-mneme@/.test(bare) || /(^|[/\\])dsh-mneme([/\\]|$)/.test(trimmed);
+}
+
 // #2324/#2545/#2969: third-party plugins VERIFIED to never compress the model
 // context — so their names must not raise a compression-conflict alarm. Two
 // evidence classes: read-only display/viewer plugins, and protocol adapters
@@ -456,6 +469,19 @@ function scanDsh(env: NodeJS.ProcessEnv): ScanResult {
                     // structurally invisible to it and its checkpoints land
                     // outside bili's knowledge.
                     add(c, { client: "dsh", entry: dep, source: file, match: "known", knownId: "dsh-live-compact" });
+                    continue;
+                }
+                if (isDshMnemeEntry(dep)) {
+                    // #7379: the DSH "dream" memory-consolidation plugin
+                    // (dsh-mneme, 0.16.x). It replays the whole conversation and
+                    // declares purpose=compaction to re-organize memory — a
+                    // third-party compressor whose landed checkpoint would
+                    // durably shadow the raw history bili owns on this lane
+                    // (#1729). Conflicting by design: a KNOWN conflict (alarm),
+                    // never a keyword suspicion and never design-benign. The
+                    // request is still refused by #1729 — this only makes the
+                    // conflict visible in the scan/reminder (cf. #5984).
+                    add(c, { client: "dsh", entry: dep, source: file, match: "known", knownId: "dsh-mneme" });
                     continue;
                 }
                 if (isKnownDisplayOnlyPlugin(dep)) continue;

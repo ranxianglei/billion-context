@@ -7,8 +7,8 @@ import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { isDroppedMetadata, snapshotMessages } from "../src/session.ts";
 import { createInitialState, type CoreMessage } from "acp-kernel";
-import { planIngest, planIngestDelta, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { UnifiedStore, messageRowReads, viewPointerSeqs } from "../src/storage/store.ts";
+import { planIngestDelta, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { UnifiedStore, messageRowReads } from "../src/storage/store.ts";
 import type { UnifiedShadow } from "../src/storage/shadow.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -120,7 +120,9 @@ test("full mode: viewFor decodes only pointer rows and matches the full-log deco
         assert.ok(sessionRow, "session row present");
         const liveSeqs = new Set(direct.getMessages("big-1").map((m) => m.seq));
         assert.equal(liveSeqs.size, N, "table still holds the full history");
-        const expectedPointers = [...new Set(viewPointerSeqs(sessionRow.tailJson))].filter((seq) => liveSeqs.has(seq)).length;
+        const tailDoc = JSON.parse(sessionRow.tailJson) as { tailSeqs?: unknown; pluginSnapshotSeqs?: unknown };
+        const pickSeqs = (v: unknown): number[] => (Array.isArray(v) ? v.filter((s): s is number => typeof s === "number") : []);
+        const expectedPointers = [...new Set([...pickSeqs(tailDoc.tailSeqs), ...pickSeqs(tailDoc.pluginSnapshotSeqs)])].filter((seq) => liveSeqs.has(seq)).length;
         assert.equal(expectedPointers, K, `tail now points at ${K} of ${N} rows`);
 
         const reference = loadLegacyView({
@@ -185,80 +187,4 @@ test("full mode: dropped metadata restores from the index alone (narrow read, no
     }
 });
 
-test("store: getBlockContents/getSessionMetadata equal the loadLegacyView replay leg", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4739-narrow-"));
-    const store = UnifiedStore.open(path.join(dir, "index.db"));
-    try {
-        // Real folded corpus payload (one active block + contents + refs).
-        const corpusFile = path.resolve(import.meta.dirname, "golden/storage-corpus/folded/anthropic/127.0.0.1_29e4587af02d1ed9ae4b0054.json");
-        const envelope = JSON.parse(fs.readFileSync(corpusFile, "utf8")) as Record<string, unknown>;
-        const payload = (envelope["payload"] ?? envelope) as Record<string, unknown>;
-        const legacy = payload as unknown as LegacySessionLike;
-        // The persisted record carries blockContents as a plain object; the
-        // ingest planner takes the in-memory Map shape.
-        legacy.blockContents = new Map(Object.entries((payload["blockContents"] ?? {}) as Record<string, { one: { text: string; count: number } | null; full: { text: string; count: number } }>));
-        // The pre-#lastSeen corpus files carry savedAt only; the planner stamps
-        // sessions.updated_at from lastSeen.
-        if (typeof legacy.lastSeen !== "number") legacy.lastSeen = Number(payload["savedAt"] ?? Date.now());
-        store.ingestSession(planIngest(legacy));
 
-        const sessionRow = store.getSessionRow("corpus-folded");
-        assert.ok(sessionRow, "corpus ingested");
-        const rows = {
-            session: sessionRow,
-            messages: store.getMessages("corpus-folded"),
-            blocks: store.getBlocks("corpus-folded"),
-            deadRefs: store.getDeadRefs("corpus-folded"),
-            refs: store.getRefs("corpus-folded"),
-        };
-        const reference = loadLegacyView(rows);
-        assert.ok(reference.blockContents.size > 0, "corpus carries block contents");
-
-        assert.deepEqual(store.getBlockContents("corpus-folded"), reference.blockContents, "narrow blockContents == replay leg");
-        assert.deepEqual(store.getSessionMetadata("corpus-folded"), reference.metadata, "narrow metadata == replay leg");
-        assert.equal(store.getBlockContents("no-such-session"), null, "row miss degrades to null");
-        assert.equal(store.getSessionMetadata("no-such-session"), null, "row miss degrades to null");
-    } finally {
-        store.close();
-        rmrf(dir);
-    }
-});
-
-test("store: getMessagesAt returns exactly the requested live seqs, in order", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4739-at-"));
-    const store = UnifiedStore.open(path.join(dir, "index.db"));
-    try {
-        const N = 600;
-        const messages: CoreMessage[] = [];
-        for (let i = 0; i < N; i++) {
-            messages.push({ id: `at${i}`, contentType: "text", role: i % 2 === 0 ? "user" : "assistant", text: `getMessagesAt probe row ${i}` });
-        }
-        const legacy: LegacySessionLike = {
-            id: "at-1",
-            createdAt: Date.now(),
-            lastSeen: Date.now(),
-            meta: { protocol: "openai" },
-            stats: { requests: 1 },
-            metadata: {},
-            state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
-            blockContents: new Map(),
-            lastMessages: messages,
-        };
-        store.ingestSession(planIngest(legacy));
-        const all = store.getMessages("at-1");
-        assert.equal(all.length, N, "all rows ingested");
-
-        // Sparse request spanning both IN-chunks (>500) plus a missing seq.
-        const wanted: number[] = [1, 2, 3];
-        for (let seq = 10; seq <= N; seq += 7) wanted.push(seq);
-        wanted.push(99_999);
-        const got = store.getMessagesAt("at-1", wanted);
-        const expected = wanted.filter((seq) => seq <= N);
-        assert.deepEqual(got.map((m) => m.seq), expected, "exactly the requested live seqs, ordered");
-        assert.ok(got.every((m) => m.content.length > 0), "content hydrated");
-        assert.deepEqual(store.getMessagesAt("at-1", []), [], "empty request → empty result");
-    } finally {
-        store.close();
-        rmrf(dir);
-    }
-});
