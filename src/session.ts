@@ -717,6 +717,18 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
+    /** #6522 in-memory only (NOT persisted): the "Uncovered history remains"
+     *  receipt note has already fired in the current nudge-injection cycle.
+     *  The note fires once per cycle — repeating it after every successful
+     *  fold drove models into an infinite compress→note loop (#6522). Each
+     *  ACTUAL nudge injection (nudgeOutcome === "injected", stamped in
+     *  src/server/handle.ts) re-opens the latch: a fresh nudge is a new
+     *  "big enough, compress while you are at it" moment. The same detail
+     *  stays available on demand via acp_status(scope:"uncompressed").
+     *  Lost on restart (at most one extra note). #7318: only read while
+     *  compress.postComPressTail is on; with the recommendation off the note
+     *  never fires and the latch is inert. */
+    uncoveredReceiptNoted?: boolean;
     /** In-memory only (NOT persisted): request-only injections riding the
      *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
      *  full text in the tool result itself — this carrier now only serves
@@ -957,12 +969,17 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     return (stats.localInputEstimate ?? 0) > 0;
 }
 
+/** Last measured usage or bounded overflow evidence, before status fallbacks. */
+export function evidenceInputBaseline(stats: Session["stats"]): number {
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
     if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
-    const baseline = stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
-        ? stats.lastInputTokens
-        : stats.lastUsageGradeTokens ?? 0;
+    const baseline = evidenceInputBaseline(stats);
     return staleSmallAnchorFallback(stats, baseline) ?? baseline;
 }
 

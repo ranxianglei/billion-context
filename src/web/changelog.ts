@@ -109,8 +109,9 @@ async function runCheck(): Promise<void> {
             }
             state = { releases, lastCheckAt: Date.now() };
         } finally {
-            // Fully consumed the body — stop the idle watchdog so the timer
-            // cannot pin the event loop (fetch-util's #552 contract).
+            if (!result.response.bodyUsed) {
+                void result.response.body?.cancel().catch(() => {});
+            }
             result.stopIdleTimer();
         }
     } catch (e) {
