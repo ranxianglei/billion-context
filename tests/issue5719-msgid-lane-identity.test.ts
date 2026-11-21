@@ -74,7 +74,11 @@ function fakeStore(): { rows: Map<string, string[]>; lookup: (k: string) => read
  *  position [2]). Reused by several pins with different id sets. */
 function incidentHistory(tag: string, survivor: string, filler: string): Msg[] {
     return [
-        { role: "user", content: `<bili-snapshot v1 conv="${tag}" seq="9" /> checkpoint condensing the prior exchange. ` + "z".repeat(120) },
+        // conv is deliberately FOREIGN: an OWN declaration would trip the
+        // #5734 E5 self-checkpoint rung (pinned in
+        // issue5719-self-checkpoint-reanchor) and shadow the msgid/store
+        // rungs this file exists to pin.
+        { role: "user", content: `<bili-snapshot v1 conv="${tag}-other" seq="9" /> checkpoint condensing the prior exchange. ` + "z".repeat(120) },
         { role: "user", content: "continuation probe after the restart. " + "q".repeat(120) },
         { role: "assistant", content: "surviving cell, original slot 7. " + "w".repeat(120) },
         { role: "user", content: "the new live turn. " + filler },
