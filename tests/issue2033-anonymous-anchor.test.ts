@@ -46,13 +46,16 @@ import { setLogCapture } from "../src/logger.ts";
 
 const WINDOW = 120_000;
 const NUDGE_MARKER = "Context limit reached";
-const ANCHOR_INPUT = 5000;
 
 // Dense ASCII code fixture (same shape as the #1839/#1569 suites): the
-// char-count upper bound of this history sits well ABOVE the 5000-token usage
-// anchor (so the pre-fix raw-bound ghost is observable) but far below the 120k
+// char-count upper bound of this history sits well ABOVE the usage anchor
+// (so the pre-fix raw-bound ghost is observable) but far below the 120k
 // window (so NO turn may trigger preflight — any summary call means the sizing
-// regressed).
+// regressed). The relay bills at chars/4 (billing caliber) so every report
+// tracks its payload's scale: the #4425 non-main settle gate rejects reports
+// an order of magnitude below the established session load, and a constant
+// tiny-billing fixture would read as aux-shaped once a failure arm inflates
+// the incumbent (the arm carries the char-count bound, ~4× the billing scale).
 const LINE = (i: number) =>
     `const handler_${i} = (req: Request, res: Response) => { res.status(200).json({ status: "ok", id: ${i}, ts: Date.now() }); };`;
 const HEAVY = (i: number) => `CODE_${i}_` + LINE(i).repeat(62);
@@ -77,6 +80,7 @@ type VerdictRule = { when?: string; status?: number; body?: string };
  *  calls (kernel summary lane) always get a plain completion. */
 function makeRelay(rules: VerdictRule[], reportUsage: boolean) {
     const received: Buffer[] = [];
+    const billedCalls: number[] = [];
     let nonStream = 0;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -112,13 +116,17 @@ function makeRelay(rules: VerdictRule[], reportUsage: boolean) {
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] })}\n\n`);
             const done: Record<string, unknown> = { id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
-            if (reportUsage) done.usage = { prompt_tokens: ANCHOR_INPUT, completion_tokens: 3 };
+            if (reportUsage) {
+                const billed = Math.round(raw.length / 4);
+                billedCalls.push(billed);
+                done.usage = { prompt_tokens: billed, completion_tokens: 3 };
+            }
             res.write(`data: ${JSON.stringify(done)}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
         });
     });
-    return { server, received, nonStreamCalls: () => nonStream };
+    return { server, received, nonStreamCalls: () => nonStream, billedCalls };
 }
 
 function lastNudgeSized(logs: string[], sessionId: string): number {
@@ -198,7 +206,7 @@ test("#2033 A1: anchored anonymous session keeps sizing on the usage anchor afte
         await r1.text();
         let s = h.anonSession();
         assert.ok(s.id.startsWith("pfa-"), `anonymous session resolved by prefix affinity (${s.id})`);
-        assert.equal(s.stats.lastUsageGradeTokens, ANCHOR_INPUT, "real usage report anchored the session");
+        assert.equal(s.stats.lastUsageGradeTokens, h.relay.billedCalls[0], "real usage report anchored the session");
         assert.equal(s.stats.lastInputTokensSource, "usage");
 
         const msgs2: Msg[] = [...base, { role: "assistant", content: "ok, done." }, { role: "user", content: "step two?" }];
@@ -209,7 +217,7 @@ test("#2033 A1: anchored anonymous session keeps sizing on the usage anchor afte
         // The #604 arm IS still written — load-bearing for the emergency-band
         // rescue on anchor-less sessions — but it carries ESTIMATE grade and
         // must not reach a sizing decision while a usage-grade anchor exists.
-        assert.ok(s.stats.lastInputTokens > ANCHOR_INPUT, `failure arm raised the baseline to an outbound estimate (${s.stats.lastInputTokens})`);
+        assert.ok(s.stats.lastInputTokens > h.relay.billedCalls[0], `failure arm raised the baseline above the real anchor to an outbound estimate (${s.stats.lastInputTokens})`);
         assert.equal(s.stats.lastInputTokensSource, "estimate", "the arm is tagged estimate-grade");
         assert.ok(h.logs.some((l) => l.includes("armed emergency shrink with local estimate")), "armFailureShrink warn present");
 
@@ -224,7 +232,7 @@ test("#2033 A1: anchored anonymous session keeps sizing on the usage anchor afte
         // resubmitted history (58701 here, measured pre-fix): the anonymous early return ran
         // before the usage-grade anchor check, the exact ghost path #1839
         // closed for explicit sessions.
-        assert.equal(sized, ANCHOR_INPUT, "anchored anonymous session sizes on the last real usage report, not the raw-history bound");
+        assert.equal(sized, h.relay.billedCalls[0], "anchored anonymous session sizes on the last real usage report, not the raw-history bound");
         assert.equal(s.stats.contextTokensSource, "usage", "display grade follows the anchor, not the estimate");
         assert.equal(h.relay.nonStreamCalls(), 0, "no preflight summary calls");
         const streamed = streamedBodies(h.relay.received);

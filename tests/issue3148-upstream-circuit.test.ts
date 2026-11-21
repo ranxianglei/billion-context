@@ -261,7 +261,10 @@ test("#3148: acp_status stays quiet about all three when none is active", () => 
 test("#3148: a real usage report clears the emergency-shrink visibility marker", () => {
     _resetUpstreamCircuitsForTest();
     const session = makeSession({ emergencyShrinkAt: Date.now(), emergencyShrinkEstimate: 699777, lastInputTokensSource: "estimate" });
-    settleUsageReport(session, { total: 1000, reportedCached: 0 });
+    // #4425: the report must be main-grade relative to the fixture's 15K
+    // established scale — a sub-10% sample is an aux-sidecar shape now kept
+    // off the decision state (see issue4425-aux-settle-gate.test.ts).
+    settleUsageReport(session, { total: 15_000, reportedCached: 0 });
     assert.equal(session.stats.emergencyShrinkAt, undefined, "marker cleared");
     assert.equal(session.stats.emergencyShrinkEstimate, undefined, "estimate cleared");
     assert.equal(session.stats.lastInputTokensSource, "usage", "baseline back to usage grade");
