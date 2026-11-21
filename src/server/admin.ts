@@ -59,6 +59,10 @@ interface AdminCtx {
     log: (level: string, msg: string) => void;
     instanceId: string;
     instanceStartedAt: number;
+    /** #4705: boot-time config-file content epoch (optional — absent on contexts
+     *  built before #4705); served on /__bili/health for the launcher's attach-time
+     *  stale-config check. */
+    startupConfigEpoch?: string;
     proxyWatchers: Set<number>;
     initialWatcherPid: number | null;
     /** #3544: last-heartbeat timestamps for hb-opted watchers (optional —
@@ -200,7 +204,7 @@ function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: strin
 }
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
-    const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
+    const { opts, core, config, log, instanceId, instanceStartedAt, startupConfigEpoch, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
     // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
@@ -311,7 +315,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
         const aux = auxProxyShot(opts);
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, configEpoch: startupConfigEpoch, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
