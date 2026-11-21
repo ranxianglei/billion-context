@@ -224,18 +224,45 @@ test("createForkAdopter lets responses children reach the protocol — no termin
     assert.ok(!lines.some((l) => l.includes("wire requests are not supported")), "no unsupported-wire skip for responses");
 });
 
-test("createForkAdopter never throws — an exploding network soft-degrades and closes the window", async () => {
+test("createForkAdopter never throws — an unreachable proxy defers adoption until the cap (#4266 item ⑨)", async () => {
     resetForkCapabilityCacheForTest();
     const boom = (async () => { throw new Error("network exploded"); }) as unknown as typeof fetch;
     const lines: string[] = [];
     const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl: boom });
-    // manifestForkCapable swallows the explosion (false = not capable), so the
-    // child degrades on the capability line and maybeAdopt never rejects.
+    // probeForkCapability swallows the explosion (capable=false, definitive=false),
+    // so the child DEFERS instead of terminating: maybeAdopt never rejects, and the
+    // window stays open for retries within the budget rather than closing on the
+    // first failed probe (the pre-fix behavior permanently retired the child).
     await adopter.maybeAdopt(adoptInput());
-    assert.ok(lines.some((l) => l.includes("does not advertise the fork capability")), "the failure is logged, not thrown");
-    const callsBefore = lines.length;
+    assert.ok(lines.some((l) => l.includes("could not confirm fork capability yet")), "the unreachable probe is logged as deferred, not thrown");
     await adopter.maybeAdopt(adoptInput());
-    assert.equal(lines.length, callsBefore, "the child is done after the first terminal outcome");
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(lines.filter((l) => l.includes("could not confirm fork capability yet")).length, 3, "each attempt within the cap re-probes");
+    const afterCap = lines.length;
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(lines.length, afterCap, "past the cap the window is closed");
+});
+
+test("createForkAdopter adopts once the proxy comes up — a failed probe does not retire the child (#4266 item ⑨)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    // The proxy is down for the first request (manifest probe gets a 5xx / connection
+    // refused) and comes up before the second — exactly the host-startup window the
+    // production incident hit. Pre-fix the first failed probe marked the child done
+    // forever; now the window stays open and the second request adopts.
+    let manifestHits = 0;
+    const flakyManifest = { match: manifestRoute.match, respond: () => { manifestHits += 1; return manifestHits === 1 ? new Response("{}", { status: 503 }) : Response.json({ capabilities: { fork: { protocolVersion: 1 } } }); } };
+    const { fetchImpl, calls } = fakeFetchRouting([flakyManifest, matchSnapshot, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    await adopter.maybeAdopt(adoptInput());
+    assert.ok(!lines.some((l) => l.includes("degraded")) && !lines.some((l) => l.includes("does not advertise")), "the transient probe failure neither degrades nor terminally skips");
+    assert.ok(lines.some((l) => l.includes("could not confirm fork capability yet")), "the first request defers");
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "no fork POST while the proxy is down");
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 1, "the next request adopts once the proxy is reachable");
+    assert.equal(lines.filter((l) => l.includes("could not confirm fork capability yet")).length, 1, "exactly one deferral — the retry succeeded");
 });
 
 test("createForkAdopter retries transient failures until the cap, then closes (#2403 review)", async () => {
