@@ -2244,10 +2244,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
             log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
-        } else {
+        } else if (req.method !== "HEAD") {
             // #821: a 2xx with a null body (e.g. upstream answered 204/304) is a
             // SILENT empty response — the client receives zero SSE chunks and
             // reports an "empty stream" with no trace in the log. Name it.
+            // HEAD is excluded: a HEAD response carries no body by definition
+            // (RFC 9110 §9.3.2), so a 200 HEAD with a null body is normal, not
+            // the #821 anomaly — health probes (e.g. HEAD /api/hello) would
+            // otherwise log a warn on every request (#7072).
             loggerLog("warn", `[${prepared?.session.id ?? "unknown"}] ← upstream ${upstream.status} returned a null body; responding empty to client`);
         }
         return;
