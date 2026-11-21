@@ -136,3 +136,54 @@ test("svg: recovery chart derives old-stock brackets from server-shaped episodes
     assert.ok(svg.includes("310%"), "true >100% value labeled");
     assert.ok(svg.includes('r="6" fill="none" stroke="#0969da"'), "over-100% halo dot");
 });
+
+test("svg: the complete long-session trajectory survives the call-argument limit", () => {
+    const count = 200_000;
+    const lines = Array.from({ length: count }, (_, i) => ({ seq: i + 1, input: i + 1, cached: i / 2 }));
+    const { svg } = buildSessionReportSvg({ ledger: { lines } }, { lang: "en" });
+    const points = svg.match(/<polyline points="([^"]+)" fill="none" stroke="#0969da" stroke-width="1\.6"\/>/);
+    assert.ok(points, "the complete input trajectory is present");
+    assert.equal(points[1].split(" ").length, count, "large histories are not silently truncated");
+    assert.match(svg, />200K<\/text>/, "the last sample determines the numeric axis");
+    assert.match(svg, />200000<\/text>/, "the final request is retained in the detail table");
+    assert.ok(svg.endsWith("</svg>"));
+});
+
+test("svg: a long recovery window retains its measured growth extrema", () => {
+    const count = 200_000;
+    const at = 1_760_000_000_000;
+    const lines = Array.from({ length: count }, (_, i) => ({ at: at + i, input: i === count - 1 ? 300_000 : 120_000, cached: 60_000 }));
+    const { svg } = buildSessionReportSvg({ ledger: {
+        lines,
+        recovery: {
+            events: [
+                { at, kind: "n", pending: 100_000, paired: true },
+                { at: at + count, kind: "f", folded: 90_000, mode: "n", pending: 100_000, pct: 90 }
+            ],
+            episodes: [{ at, pending: 100_000, folded: 90_000, pct: 90 }]
+        }
+    } }, { lang: "en" });
+    assert.match(svg, /<title>growth 180K → folded 90K · 50%<\/title>/);
+    assert.match(svg, />300K<\/text>/, "the full window's peak is visible");
+    assert.ok(!svg.includes("NaN") && !svg.includes("Infinity"));
+});
+
+test("svg: axis reference values and recovery outlier filtering retain their semantics", () => {
+    for (const [contextWindow, systemPromptTokens, axis] of [[400_000, 50_000, "400K"], [50_000, 500_000, "500K"], [0, 0, "300K"]] as const) {
+        const at = 1_760_000_000_000;
+        const { svg } = buildSessionReportSvg({ contextWindow, systemPromptTokens, ledger: {
+            lines: [
+                { at: at - 1, input: 10_000 },
+                { at, input: 120_000 },
+                { at: at + 1, input: 20_000 },
+                { at: at + 2, input: 300_000 }
+            ],
+            recovery: {
+                events: [{ at, kind: "n", pending: 100_000 }, { at: at + 3, kind: "f", folded: 90_000, mode: "n", pct: 90 }],
+                episodes: [{ at, folded: 90_000, pending: 100_000, pct: 90 }]
+            }
+        } }, { lang: "en" });
+        assert.ok(svg.includes(">" + axis + "</text>"), axis);
+        assert.match(svg, /<title>growth 180K → folded 90K · 50%<\/title>/, "sub-quarter-peak samples do not set the growth floor");
+    }
+});

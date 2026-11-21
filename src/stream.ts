@@ -737,7 +737,21 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     const remaining = ctx.lastNudge
         ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
         : base;
+    // #7318: the receipt's "fold more" recommendation — the remaining-offer
+    // range list AND the uncovered-history note — is opt-in via
+    // compress.postComPressTail (default OFF, stamped per round on
+    // session.transient by src/server/handle.ts). Re-advertising ranges after
+    // every successful fold drove models into endless fold loops against
+    // explicit user stop requests (#7318: 200+ folds in one night; #6522 and
+    // #5872 are the same family), each fold rewriting the context prefix and
+    // re-billing the prompt cache. The per-turn growth nudge (KDD #8) is a
+    // separate channel and is untouched by this knob. The verbatim stop
+    // signal below is NOT part of the recommendation — it stays in both
+    // modes; with the recommendation off, ranges still outstanding mean the
+    // receipt says nothing (no list, no "no ranges remain" claim).
+    const recommend = unpromptedGateOf(ctx.session).postComPressTail;
     if (remaining.length > 0) {
+        if (!recommend) return "";
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
     }
     // A tier-distillation nudge means block-boundary compress calls (bN..bM) are
@@ -766,7 +780,36 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
-                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                // #7318: recommendation off -> honest silence: no re-nag, and
+                // no "already at its minimum" claim while material mass sits
+                // uncovered (#4331).
+                if (!recommend) return "";
+                // #6522 anti-nag latch: notify at most ONCE per nudge-injection
+                // cycle. Re-emitting the note after every subsequent successful
+                // fold drove models into an infinite compress→note loop — as the
+                // session grows the newly offered ranges sit INSIDE the big
+                // uncovered tail run, so each fold split/shrunk a run and a
+                // span-level "changed set" check still re-fired. The note is
+                // advisory and the same detail stays available on demand via
+                // acp_status(scope:"uncompressed") (read-only, no gate), so one
+                // notice per cycle is enough. Each ACTUAL nudge injection
+                // (src/server/handle.ts, nudgeOutcome === "injected") re-opens
+                // the latch: a fresh nudge means the context grew big enough
+                // again, a new compress-while-you-are-at-it moment. Restart
+                // resets the latch (in-memory field) — at most one extra note.
+                if (!ctx.session.uncoveredReceiptNoted) {
+                    ctx.session.uncoveredReceiptNoted = true;
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                }
+                // Latch already fired this cycle but material mass still sits
+                // uncovered (totalTok >= floor): stay silent, do NOT fall
+                // through to the "No compressible ranges remain" claim below —
+                // that would assert the context is at its minimum while a
+                // >=floor run sits outside every active block (#4331 honesty;
+                // the pre-#7318 code always returned the note here, never the
+                // minimum claim). The detail stays available on demand via
+                // acp_status(scope:"uncompressed").
+                return "";
             }
         }
     } catch {
