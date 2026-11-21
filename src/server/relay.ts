@@ -2740,7 +2740,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode
                 ? createCommandcodeAdapter(parsedReq, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.systemNotes)
-                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+                : pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive, prepared.codexResponsesReplay);
             // #564/#2627: separator slots for the CURRENT round's body, refreshed
             // by each fold. The loop reads this through `ctx.separatorSlots` so the
             // continuity judge sees the same producer record prepare sees.

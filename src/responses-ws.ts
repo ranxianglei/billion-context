@@ -9,7 +9,9 @@ import { featureEnabled } from "./rollout.js";
 import { getStore } from "./persist.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { identitySig, SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
-import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
+import { markCodexWsReplayTransport, markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
+import { isCodexHost } from "./codex-compact.js";
+import { normalizeCodexResponsesEgressItem, normalizeCodexWsReplayInput } from "./codex-ws-replay.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
@@ -230,7 +232,7 @@ class ResponsesWsOutput {
 
 export class ResponsesWsHistory {
     private checkpoint?: Checkpoint;
-    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
+    constructor(private readonly limitBytes = limitsReceiveBytes(), private readonly codexReplay = false) {}
 
     expand(frame: JsonObject): JsonObject {
         const { type: _type, previous_response_id: previous, ...request } = frame;
@@ -277,7 +279,8 @@ export class ResponsesWsHistory {
         const { input: _priorInput, ...priorFields } = prior.request;
         if (canonical(fields) !== canonical(priorFields)) return request;
         const baseline = [...prior.request.input, ...prior.output];
-        if (items.length <= baseline.length || !baseline.every((item, i) => canonical(comparable(item)) === canonical(comparable(items[i])))) return request;
+        const comparison = (item: unknown): unknown => comparable(this.codexReplay ? normalizeCodexResponsesEgressItem(item) : item);
+        if (items.length <= baseline.length || !baseline.every((item, i) => canonical(comparison(item)) === canonical(comparison(items[i])))) return request;
         return { ...fields, input: items.slice(baseline.length), previous_response_id: prior.id };
     }
 
@@ -332,10 +335,12 @@ export class ResponsesWsUpstream {
     private connectionGeneration = 0;
     private sendSequence = 0;
     private key?: string;
-    private history = new ResponsesWsHistory();
+    private readonly history: ResponsesWsHistory;
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false, codexReplay = false) {
+        this.history = new ResponsesWsHistory(limitsReceiveBytes(), codexReplay);
+    }
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -760,12 +765,14 @@ class ResponsesWsResponse extends http.ServerResponse {
 export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
     private readonly history = new ResponsesWsHistory();
+    private readonly codexReplay: boolean;
     private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
 
     constructor(private readonly context: WsBridgeContext) {
-        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
+        this.codexReplay = context.codec.name === "codex-responses-ws" && context.source.headers["x-bili-plugin"] === undefined && isCodexHost(context.source.headers);
+        this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true, this.codexReplay);
         context.log("info", "Responses socket connected (ACP request pipeline)");
     }
 
@@ -830,6 +837,10 @@ export class ResponsesWsSession implements WsBridgeSession {
                 // string the envelope pushes below, against the receive budget knob
                 // instead of the fixed 100 MiB cap that killed long sessions pre-dispatch.
                 body = { ...this.history.expand(frame), stream: true };
+            }
+            if (this.codexReplay && Array.isArray(body.input)) {
+                body.input = normalizeCodexWsReplayInput(body.input);
+                if (deltaContinuation) deltaContinuation.tail = normalizeCodexWsReplayInput(deltaContinuation.tail);
             }
             wire = JSON.stringify(body);
             if (Buffer.byteLength(wire) > this.budget) {
@@ -937,7 +948,9 @@ export class ResponsesWsSession implements WsBridgeSession {
         this.active = res;
         // markWsLaneTransport (#3701 Finding 1): the egress-shed byte budget keys on
         // this tag — managed HTTP transports (dsh-inline) stay out of the shed.
-        void withFetchTransport(markWsLaneTransport((url, options) => this.transport.fetch(url, options)), async () => {
+        const transport = markWsLaneTransport((url, options) => this.transport.fetch(url, options));
+        if (this.codexReplay) markCodexWsReplayTransport(transport);
+        void withFetchTransport(transport, async () => {
             try {
                 await this.context.dispatch(req, res);
                 if (res.response) {
