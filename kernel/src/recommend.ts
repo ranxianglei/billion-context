@@ -37,6 +37,7 @@ import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
+import { activeBlockSpans, blocksSpannedByRange } from "./block-map.js";
 import {
   projectUnit,
   collectCoverage,
@@ -461,6 +462,9 @@ export function buildCompressibleRanges(
   // split at real array gaps and at user messages once a group has >= 3 messages.
   // Splitting at user boundaries keeps each range aligned to roughly one turn.
   const compressible: CompressibleRange[] = [];
+  // #5667 B: active-block spans resolved once so each range can record the
+  // folded interior its label bridges (display-only, never feeds foldability).
+  const activeSpansForSpan = activeBlockSpans(state);
   for (const group of segmentGroups(compressibleMsgs)) {
     const first = group[0]!;
     const range: CompressibleRange = {
@@ -494,6 +498,12 @@ export function buildCompressibleRanges(
       }
       range.textPct = 100 - range.toolPct;
     }
+    const spanned = blocksSpannedByRange(
+      range.startRef,
+      range.endRef,
+      activeSpansForSpan,
+    );
+    if (spanned.length > 0) range.crossesCoveredBy = spanned;
     compressible.push(range);
   }
 
@@ -566,6 +576,8 @@ function mergeBatch(batch: CompressibleRange[]): CompressibleRange {
   // position-based merging (formatRanges) still sees it after this batch is
   // re-emitted as a single range.
   if (first.noMergeBefore === true) merged.noMergeBefore = true;
+  const spanned = batch.flatMap((r) => r.crossesCoveredBy ?? []);
+  if (spanned.length > 0) merged.crossesCoveredBy = [...new Set(spanned)];
   return merged;
 }
 
