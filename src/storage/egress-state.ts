@@ -19,9 +19,12 @@
  * Two tables (dual-table, owner ruling):
  *   egress_state  — what serving reads; compaction PHYSICALLY deletes rows
  *                   below the watermark, so it stays bounded;
- *   egress_flow   — append-only, NEVER deleted; reconstructs ANY historical
- *                   log_seq (rollback is based on this table, not on client
- *                   resends).
+ *   egress_flow   — the rollback source (reconstructs historical log_seq
+ *                   without client resends). Compaction reclaims its dead
+ *                   prefix (rows older than the previous base — never read
+ *                   by the bounded walk-back, #7475), so it stays bounded
+ *                   to one fold period while every walk-back-reachable
+ *                   log_seq stays reconstructible.
  *
  * Row types (payload shapes are the contract — see the discussion post):
  *   B  base            msgid NULL      {"entries": viewRow[], watermark}
@@ -80,8 +83,9 @@ const INSERT_STATE = `INSERT INTO egress_state (session_id, log_seq, row_type, m
 const INSERT_FLOW = `INSERT INTO egress_flow (session_id, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
 
 function nextLogSeq(db: SqliteDatabase, sessionId: string): number {
-    // egress_flow is append-only and superset of egress_state after every
-    // compaction, so the flow max IS the session's sequence high-water.
+    // egress_flow is a superset of egress_state after every compaction (the
+    // reclamation only deletes the dead prefix, never the head), so the flow
+    // max IS the session's sequence high-water.
     const row = db
         .prepare("SELECT MAX(log_seq) AS m FROM egress_flow WHERE session_id = ?")
         .get(sessionId) as { m: number | null } | undefined;
@@ -268,10 +272,21 @@ export function egressStateAt(db: SqliteDatabase, sessionId: string, x: number):
 }
 
 /** Compaction: persist the replayed view as a new base row, then physically
- * delete every STATE row below it (flow untouched — rollback stays total).
- * The base carries the entries themselves (bytes inline in the payload);
- * base + later ops must reproduce the current view WITHOUT any deleted row
- * (that is the only constraint the base form has). One transaction. */
+ * delete every STATE row below it. The base carries the entries themselves
+ * (bytes inline in the payload); base + later ops must reproduce the current
+ * view WITHOUT any deleted row (that is the only constraint the base form
+ * has). One transaction.
+ *
+ * FLOW RECLAMATION (#7475): egress_flow used to be append-only-forever, so a
+ * long session accumulated one full inline view per fold (100k session →
+ * 101k rows / 417MB). Its only historical reader is the walk-back recovery
+ * (recoverEgressBase), which replays log_seq in [maxSeq-16, maxSeq-1] and
+ * restarts at the newest base ≤ x. Rows older than the PREVIOUS base (Bn-1)
+ * are therefore never read: every x in the walk-back window is ≥ Bn-1 (fold
+ * period ≫ 16) and replays from Bn-1 or Bn. Deleting the dead prefix keeps
+ * the flow bounded to one fold period WITHOUT narrowing the recoverable
+ * window. (Deleting to "Bn-16" instead would break the walk-back when the
+ * last op was a compaction: x = maxSeq-1 = Bn-1 then needs the Bn-1 row.) */
 export function egressStateCompact(
     db: SqliteDatabase,
     sessionId: string,
@@ -284,6 +299,12 @@ export function egressStateCompact(
         db.prepare(INSERT_STATE).run(sessionId, seq, "B", null, payload, null, nowMs);
         db.prepare(INSERT_FLOW).run(sessionId, seq, "B", null, payload, null, nowMs);
         db.prepare("DELETE FROM egress_state WHERE session_id = ? AND log_seq < ?").run(sessionId, seq);
+        const prevBase = db
+            .prepare("SELECT MAX(log_seq) AS m FROM egress_flow WHERE session_id = ? AND row_type = 'B' AND log_seq < ?")
+            .get(sessionId, seq) as { m: number | null } | undefined;
+        if (prevBase?.m != null) {
+            db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND log_seq < ?").run(sessionId, prevBase.m);
+        }
     });
     return seq;
 }
