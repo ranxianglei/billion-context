@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { ServerResponse } from "node:http";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { createResponsesAdapter } from "../src/loop/adapter-responses.ts";
 import { pipePluginResponsesWithStrip } from "../src/plugin.ts";
 import { emitStreamError } from "../src/stream-error.ts";
@@ -33,7 +34,7 @@ function collector(): { res: ServerResponse; chunks: string[] } {
 
 async function consume(raw: string) {
     const requireSdk = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-    const { default: OpenAI } = await import(requireSdk.resolve("openai"));
+    const { default: OpenAI } = await import(pathToFileURL(requireSdk.resolve("openai")).href);
     const client = new OpenAI({
         apiKey: "synthetic-test-key",
         fetch: async () => new Response(raw, { headers: { "content-type": "text/event-stream" } }),
