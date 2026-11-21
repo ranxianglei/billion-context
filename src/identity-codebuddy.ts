@@ -18,6 +18,16 @@
 //
 // Turn-level X-Conversation-Request-ID stays UNCONSUMED (owner decision A in
 // #5825 comments: new human-gated semantics, not this PR).
+//
+// WorkBuddy Desktop (#7456, wb 5.11.4 decompiled): the app embeds a CodeBuddy
+// CLI fork that reuses this exact persistence code path (getHomeProjectsDir +
+// compressPath(canonicalizeStorePath(cwd)) + `${conversationId}.jsonl`), with
+// the config root at $WORKBUDDY_CONFIG_DIR / ~/.workbuddy instead of
+// $CODEBUDDY_CONFIG_DIR / ~/.codebuddy — so the same X-Conversation-ID header
+// (measured on WorkBuddy traffic per #5488/#5526) resolves to the same layout
+// under the workbuddy config dirs added to configDirs() below. A conversation
+// id present under BOTH config roots yields two files and the snapshot
+// degrades to null (no ids) — conservative by construction.
 
 import os from "node:os";
 import path from "node:path";
@@ -25,7 +35,9 @@ import { alignTailIds, findProjectJsonlFiles, headerFirst, readJsonlTail, regist
 
 function configDirs(env: NodeJS.ProcessEnv = process.env): string[] {
     const dirs: string[] = [];
-    for (const v of [env.CODEBUDDY_CONFIG_DIR, path.join(os.homedir(), ".codebuddy")]) {
+    // CodeBuddy CLI + its WorkBuddy Desktop fork (#7456): same header, same
+    // transcript layout, two config roots.
+    for (const v of [env.CODEBUDDY_CONFIG_DIR, path.join(os.homedir(), ".codebuddy"), env.WORKBUDDY_CONFIG_DIR, path.join(os.homedir(), ".workbuddy")]) {
         if (typeof v !== "string" || v.trim().length === 0) continue;
         const r = v.trim();
         if (!dirs.includes(r)) dirs.push(r);

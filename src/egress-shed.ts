@@ -61,6 +61,7 @@ interface Occurrence {
     entryIndex: number;
     b64: string;
     mediaType: string;
+    exempt: boolean;
     protectedTail: boolean;
     /** Set once rung A replaced this occurrence — rung B must never shrink a detached part. */
     archived: boolean;
@@ -140,17 +141,17 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
 
 function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
-    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean): void => {
+    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean, exemptOutput = false): void => {
         parts.forEach((part, pos) => {
             if (!isObj(part) || part.type !== "image") return;
             const src = part.source;
             if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
-            if (toolOutput && matchesOriginalImageReceipt(src.data, parts)) return;
             const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
             occ.push({
                 entryIndex,
                 b64: src.data,
                 mediaType,
+                exempt: exemptOutput || (toolOutput && matchesOriginalImageReceipt(src.data, parts)),
                 protectedTail: false,
                 archived: false,
                 applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
@@ -169,12 +170,12 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
                 if (typeof inline.mimeType !== "string" || !/^image\//i.test(inline.mimeType)) return;
-                if (matchesOriginalImageReceipt(inline.data, parts)) return;
                 const mediaType = inline.mimeType;
                 occ.push({
                     entryIndex,
                     b64: inline.data,
                     mediaType,
+                    exempt: matchesOriginalImageReceipt(inline.data, parts),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { text: note }; },
@@ -192,16 +193,17 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             if (!isObj(item)) return;
             const partsKey = item.type === "message" ? "content" : item.type === "function_call_output" || item.type === "custom_tool_call_output" ? "output" : undefined;
             if (partsKey === undefined || !Array.isArray(item[partsKey])) return;
-            if ((item.type === "function_call_output" || item.type === "custom_tool_call_output") && isExemptOutput(protocol, item, names)) return;
+            const exemptOutput = partsKey === "output" && isExemptOutput(protocol, item, names);
             const parts = item[partsKey] as unknown[];
             parts.forEach((part, pos) => {
                 if (!isObj(part) || part.type !== "input_image" || typeof part.image_url !== "string") return;
                 const d = parseDataUrl(part.image_url);
-                if (!d || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) return;
+                if (!d) return;
                 occ.push({
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
+                    exempt: exemptOutput || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts)),
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { parts[pos] = { type: "input_text", text: note }; },
@@ -217,8 +219,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const names = callNameMap(protocol, body);
     messages.forEach((m, entryIndex) => {
         if (!isObj(m)) return;
-        if (protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names)) return;
-        if (protocol === "anthropic" && Array.isArray(m.content) && m.content.some((b) => isObj(b) && b.type === "tool_result" && isExemptOutput(protocol, b, names))) return;
+        const exemptOutput = protocol === "openai" && m.role === "tool" && isExemptOutput(protocol, m, names);
         if (!Array.isArray(m.content)) return;
         const content = m.content as unknown[];
         if (protocol === "anthropic") addAnthropicImages(content, entryIndex, false);
@@ -236,13 +237,14 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     entryIndex,
                     b64: d.base64,
                     mediaType: d.mediaType,
+                    exempt: exemptOutput,
                     protectedTail: false,
                     archived: false,
                     applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
                 });
             } else if (p.type === "tool_result" && Array.isArray(p.content)) {
-                addAnthropicImages(p.content, entryIndex, true);
+                addAnthropicImages(p.content, entryIndex, true, isExemptOutput(protocol, p, names));
             }
         });
     });
@@ -268,7 +270,7 @@ export async function shedWireImages(
         return { body, stats: noop };
     }
     if (!isObj(parsed)) return { body, stats: noop };
-    const occurrences = collectOccurrences(protocol, parsed);
+    const occurrences = collectOccurrences(protocol, parsed).filter((o) => !o.exempt);
     if (occurrences.length === 0) return { body, stats: noop };
 
     const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
@@ -336,8 +338,8 @@ export async function shedWireImages(
  *   - the protected tail YIELDS to the cap: an upstream count wall is HARD (sending
  *     over it fails the whole request), unlike the WS byte budget which is soft —
  *     once non-tail images are exhausted, tail images are archived too (oldest-first).
- *  Exempt read_original_image occurrences never enter the walk (collectOccurrences
- *  skips them); if exempt images alone exceed the cap the body cannot be brought
+ *  Exempt read_original_image occurrences count toward the cap but never enter the
+ *  archive walk; if exempt images alone exceed the cap the body cannot be brought
  *  under it and the rejection stays visible. Pure on the string; byte-identical
  *  passthrough when the count is already within maxImages or nothing was sheddable. */
 export async function shedWireImagesToCount(
@@ -371,6 +373,7 @@ export async function shedWireImagesToCount(
         if (remaining <= maxImages) break;
         for (const o of occurrences) {
             if (remaining <= maxImages) break;
+            if (o.exempt) continue;
             if (o.archived) continue;
             if (!allowTail && o.protectedTail) continue;
             const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);

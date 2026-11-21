@@ -152,6 +152,10 @@ RC_GATE=${PIPESTATUS[0]}
 log "5.5 plugin + 5.7 restart lanes (concurrent)"
 CONCURRENT=${GATE_CONCURRENT:-1}
 P_PID=""; R_PID=""
+# Fresh per-run rc files: a stale copy left in a persistent outDir by an
+# earlier run must never be read back if the subshell dies before its final
+# echo (that failure direction HIDES a red in release verification).
+rm -f "$WORK/.rc-plugins" "$WORK/.rc-restart"
 if echo ",${SKIP}," | grep -q ",p,"; then
   sub "GATE_SKIP contains p — plugin lanes skipped"
   RC_PLUGINS=0
@@ -168,7 +172,7 @@ else
   echo "plugin-lanes: using $PL"
   P_ENV=(TGZ="$TGZ" REPO="$REPO" WORKDIR="$WORK"
     MODEL1_BASE_URL="$MODEL1_BASE_URL" MODEL1_MODEL="$MODEL1_MODEL" MODEL1_API_KEY="$MODEL1_API_KEY"
-    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude}"
+    GATE_AGENTS="${GATE_AGENTS:-dsh,pi,codex,opencode,claude,dsh-google}"
     GATE_TURN_TIMEOUT_MS="${GATE_TURN_TIMEOUT_MS:-300000}"
     GATE_OC2_BIN="${GATE_OC2_BIN:-}" GATE_OC1_BIN="${GATE_OC1_BIN:-}")
   if [ "$CONCURRENT" = "1" ]; then

@@ -93,7 +93,19 @@ test("a proven-corrupt index alarms ONCE and the reopen hooks never re-scan it (
         assert.equal(hadIntegrityQuickCheckFailure(), true, "integrity latch tripped");
         // Now the actual boot: fresh in-boot scan (every boot decides from
         // fresh evidence), ONE more alarm, then the process runs anyway.
-        return new SessionStore({ dir, debounceMs: 1, enabled: true });
+        // Pin the DUAL-WRITE stance for the boot: this suite pins the
+        // round-5 degrade contract (boot proceeds envelope-served), which
+        // holds for explicit dual-write. The pure-sqlite DEFAULT stance
+        // (nothing set, the 2026-11-13 default) now REFUSES to start on a
+        // proven-corrupt index instead (#7156, pinned in
+        // tests/issue7156-pure-sqlite-refusal.test.ts) — so an ambient
+        // (default-stance) boot would throw here, not proceed.
+        process.env.BILI_STORAGE_UNIFIED = "full";
+        try {
+            return new SessionStore({ dir, debounceMs: 1, enabled: true });
+        } finally {
+            delete process.env.BILI_STORAGE_UNIFIED;
+        }
     })();
     try {
         assert.ok(store !== undefined, "round-5 policy: boot proceeds envelope-served");
