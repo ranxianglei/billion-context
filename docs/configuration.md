@@ -409,6 +409,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_ZCODE_PORT` | number | unset | — | Port pin for the zcode lane. |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | Fixed-signing mode for the zcode credential lane. |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
+| `BILI_WB_PROXY` | string | unset | — | Origin pin for the workbuddy lane (default: the resident `http://127.0.0.1:8787`). |
+| `BILI_WB_UPSTREAM` | string | unset | — | Upstream pin for the workbuddy lane (default: `https://www.workbuddy.ai`). |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait. |

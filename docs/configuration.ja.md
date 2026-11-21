@@ -406,6 +406,8 @@
 | `BILI_ZCODE_PORT` | number | unset | — | zcode レーン用のポート固定。 |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 認証情報レーン用の固定署名モード。 |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude レーン用のアップストリーム固定。 |
+| `BILI_WB_PROXY` | string | unset | — | workbuddy レーン用の origin 固定（既定：レジデント `http://127.0.0.1:8787`）。 |
+| `BILI_WB_UPSTREAM` | string | unset | — | workbuddy レーン用のアップストリーム固定（既定：`https://www.workbuddy.ai`）。 |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状態の処理: auto（モダン codex では CODEX_SQLITE_HOME 経由の共有 DB、それ以外はレガシーオーバーレイコピー）、shared、または legacy。shared モードでは最大 16 個の並行セッションを処理し、それぞれに 1 つのセッション別オーバーレイスロットを使用する。legacy は同時に 1 つの排他オーバーレイを保持する。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 外部デーモンに参加する際のヘルスチェック接続の期限。 |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新規に生成されたプロキシ子プロセスについて、ランチャーが待機を延長するまでの初期ヘルスウェイトウィンドウ（ms）。 |
