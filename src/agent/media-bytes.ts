@@ -14,6 +14,16 @@
 // names/types), never by content: a base64 blob pasted as TEXT (a
 // {type:"text"} block or plain string content) is NOT media on any wire and
 // stays billed as text — the genuinely-huge-text direction keeps its teeth.
+// DSH official-API extension plugins attach transport-only top-level sibling fields
+// (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
+// tokens and are stripped/ignored before inference, whereas nested fields inside
+// `messages[]` remain model-visible and must still be counted.
+const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
+export function isNonModelTopLevelKey(key: string): boolean {
+    return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
+}
+
 export function mediaBytesOfWireBody(raw: string): number {
     let parsed: unknown;
     try {

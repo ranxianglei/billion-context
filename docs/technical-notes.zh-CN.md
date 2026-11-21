@@ -196,3 +196,7 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 灰度:`rollout.features.pluginDeltaResend`(默认 0 —— **关**)。delta body 对未上车的服务端不可处理,故保持 0 直到客户端发送端就位;env 覆盖 `BILI_ROLLOUT_PLUGIN_DELTA_RESEND`。带 `x-bili-pf-delta` 的请求打到灰度关的服务端得到同样的 400 重锚(rollout-off 门)——绝不静默错解。所有 pf-* 头保持上游 hop(转发模型前剥掉)。
 
 实测(10w 条原始会话,loopback):全量重发 15.9s/轮 → 12.7s/轮(入站 155MB → KB 量级;残余成本是整份渲染视图的出站重建——真实压缩场景见下)。压缩稳态(上下文 ≈ 10w token ≈ 400KB body):36ms/轮 全量 → 21ms/轮 delta;≈ 30w token ≈ 1.2MB body:128ms → 53ms。1w 条原始会话:880ms → 550ms。
+
+## DSH 原生客户端的窗口估算
+
+原生客户端的窗口估算复用服务端已有的 DSH 顶层字段排除规则（`dsh_session_log`、`dsh_plugin_packages` 及其他 `dsh_*` 同级字段）。这些字段只从用于测量的私有副本中移除，再进行媒体字节统计；实际请求连同日志仍原样转发。消息内部的嵌套字段和未知的非 DSH 字段继续计入。现有字节校准系数和窗口下限保持不变，独立的静默直发字节上限仍按完整请求计算。无法解析或嵌套过深而无法生成测量副本时，继续使用原来的字节检查。

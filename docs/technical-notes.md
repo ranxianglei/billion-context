@@ -404,6 +404,16 @@ when sessions of that client were active within the last **10 minutes**.
 
 ## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
 
+The native window estimate uses the server meter's existing DSH top-level
+field exclusions (`dsh_session_log`, `dsh_plugin_packages`, and other `dsh_*`
+siblings). These fields are removed from a private measurement copy before
+the media walk; the original request, including its logs, is forwarded
+unchanged. Nested fields inside messages and unknown non-DSH fields still
+count. The existing byte calibration and minimum window stay in place, and
+the independent silent-direct byte ceiling still measures the full request.
+Unreadable or excessively nested measurement copies retain the original
+byte guard.
+
 When a native lane's proxy is unavailable, model traffic falls back to direct
 sends (`directSendOrRefuse`, `src/agent/native-intercept.ts`). That path is a
 degraded mode with three contracts, all shared by every lane (the gateless

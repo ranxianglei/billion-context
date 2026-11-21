@@ -11,7 +11,7 @@ import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
-import { mediaBytesOfWireBody } from "./media-bytes.js";
+import { isNonModelTopLevelKey, mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
@@ -949,6 +949,22 @@ function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; c
 // The media-aware byte walk lives in media-bytes.ts (#4111) — the shared
 // home dsh/opencode-native also import from; do not redefine it here.
 
+function bodyForWindowEstimate(raw: string): string {
+    try {
+        const body: unknown = JSON.parse(raw);
+        if (!body || typeof body !== "object" || Array.isArray(body)) return raw;
+        const fields = Object.keys(body).filter(isNonModelTopLevelKey);
+        if (fields.length === 0) return raw;
+        // Match the server's DSH exclusions in this private estimate only.
+        // Remove their media too, before the media walk can credit it twice.
+        for (const field of fields) delete (body as Record<string, unknown>)[field];
+        return JSON.stringify(body);
+    } catch {
+        // Unreadable or too deeply nested bodies retain the existing byte guard.
+        return raw;
+    }
+}
+
 /** Every oversize-refusal arm prices media-excluded core text at TWO tiers:
  *  the optimistic bytes/4 FLOOR (a strict lower bound) and the CALIBRATED
  *  estimate — session-ledger measurement shows this host family's real bodies
@@ -975,8 +991,10 @@ export function bodyOverWindowDetail(
     // Worst case: zero media credits → core = full mass. If even THAT fits
     // the calibrated bar, no raw body can refuse — skip the JSON walk.
     if (Math.ceil(Math.ceil(bodyBytes / 4) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
-    const mediaBytes = rawBody === undefined ? 0 : mediaBytesOfWireBody(rawBody);
-    const coreBytes = Math.max(bodyBytes - mediaBytes, 0);
+    const estimatedBody = rawBody === undefined ? undefined : bodyForWindowEstimate(rawBody);
+    const estimatedBytes = estimatedBody !== undefined && estimatedBody !== rawBody ? Buffer.byteLength(estimatedBody) : bodyBytes;
+    const mediaBytes = estimatedBody === undefined ? 0 : mediaBytesOfWireBody(estimatedBody);
+    const coreBytes = Math.max(estimatedBytes - mediaBytes, 0);
     const floorTokens = Math.ceil(coreBytes / 4);
     const estTokens = Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO);
     if (estTokens <= window) return undefined;
