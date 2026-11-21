@@ -344,9 +344,10 @@ test("e2e unregistered lane: no classifier → nothing changes even with durable
         assert.equal(r.status, 200);
         await r.text();
         // Projection sanity for the unit layer while we are here: the dsh
-        // classifier maps the catalog shape, the lane registry stays dsh-only.
+        // classifier maps the catalog shape; only evidence-backed lanes are
+        // registered (KDD #9).
         assert.equal(dshSkillCatalogPath({ id: "x", role: "user", contentType: "text", text: CATALOG_V1 } as never), "durable/skill-catalog");
-        assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"]);
+        assert.deepEqual(Object.keys(durableMessageToolPaths).sort(), ["dsh", "opencode"]);
     } finally {
         await closeRig(rig);
     }
