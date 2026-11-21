@@ -56,6 +56,19 @@ test("line-format call, segment below the stub floor -> anchor kept (stub-class,
     assert.deepEqual(ids(out), ids(messages));
 });
 
+// #4032 interaction: the kernel's line-form stubbing (serializeLineCompacted)
+// truncates a re-sent line-form summary to EXACTLY 200 chars (199 + "…"). The
+// old bare `segment.trim().length >= 200` floor read that stubbed entry as
+// FULL (200-char stub + topic > 200) -> stripped the anchor -> zero full
+// carriers on the wire. The stub-signature half of the check must keep it.
+test("line-format call with the kernel's 200-char stub signature -> anchor kept (stub is not a full carrier)", () => {
+    const stub = `${"s".repeat(199)}…`;
+    const body = `m00150–m00220 topic\n${stub}`;
+    const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+    const out = stripKernelSummaries(messages, pluginState("m00150", "m00220"));
+    assert.deepEqual(ids(out), ids(messages));
+});
+
 test("line-format call quoting a different range -> anchor kept", () => {
     const body = "m00300–m00310 topic\n" + "s".repeat(250);
     const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];

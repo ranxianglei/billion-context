@@ -2892,8 +2892,19 @@ function parseCarrierEntries(text: string): CarrierEntry[] {
             // Header detection per line mirrors the kernel's entry split
             // (splitLineEntries: a line starting with a ref pair or single ref
             // starts a new entry); a range block's segment runs from its
-            // header line to the next header line; full = the segment is not
-            // stub-length.
+            // header line to the next header line. Fullness = the summary part
+            // (after the header line) clears the stub-length floor AND is not
+            // the kernel's 200-char stub signature (clampPrefix(summary,199)+
+            // "…", see summaryIsFull — the same rule the JSON shape applies).
+            // The bare `segment.trim().length >= 200` floor alone misread a
+            // stubbed line-form entry (exactly 200 chars + topic) as FULL →
+            // stripped the anchor → zero full carriers on the wire once the
+            // kernel's line-form stubbing (#4032 serializeLineCompacted) lands;
+            // the stub-signature half of the check closes that. The summary
+            // part is taken verbatim after the first newline (no leading trim —
+            // a stub whose first char is a space must keep its 200-char length)
+            // with only trailing whitespace dropped (the newline before the
+            // next header line).
             const content = obj.content;
             const headers: Array<{ startRef: string; endRef: string; index: number; matchEnd: number }> = [];
             let lineStart = 0;
@@ -2909,7 +2920,10 @@ function parseCarrierEntries(text: string): CarrierEntry[] {
             headers.forEach((h, i) => {
                 const segStart = h.matchEnd;
                 const segEnd = i + 1 < headers.length ? headers[i + 1]!.index : content.length;
-                out.push({ startRef: h.startRef, endRef: h.endRef, carryingFull: content.slice(segStart, segEnd).trim().length >= CARRIER_STUB_SIGNATURE });
+                const rawSeg = content.slice(segStart, segEnd);
+                const nl = rawSeg.indexOf("\n");
+                const summaryRaw = (nl === -1 ? "" : rawSeg.slice(nl + 1)).replace(/\s+$/, "");
+                out.push({ startRef: h.startRef, endRef: h.endRef, carryingFull: summaryRaw.length >= CARRIER_STUB_SIGNATURE && summaryIsFull(summaryRaw) });
             });
         }
     } else {
