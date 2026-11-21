@@ -42,7 +42,7 @@ async function until(condition: () => boolean): Promise<void> {
     }
 }
 
-async function fixture() {
+async function fixture(warmupEncoding?: (frame: Item) => string, splitWarmup = false) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ws-httpfb-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -91,12 +91,28 @@ async function fixture() {
             }
             const id = `resp_http_${++serial}`;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            const send = (type: string, fields: Item): void => { res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`); };
+            const warmupChunks: Buffer[] = [];
+            const send = (type: string, fields: Item): void => {
+                const frame = { type, ...fields };
+                const encoded = parsed.generate === false && warmupEncoding ? warmupEncoding(frame) : `event: ${type}\ndata: ${JSON.stringify(frame)}\n\n`;
+                if (parsed.generate === false && splitWarmup) warmupChunks.push(Buffer.from(encoded));
+                else res.write(encoded);
+            };
             if (parsed.generate === false) {
                 // No-generation warmup: terminal with empty output, whatever the input.
                 send("response.created", { response: { id, status: "in_progress", output: [] } });
                 send("response.completed", { response: { id, object: "response", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } } });
-                res.end();
+                if (splitWarmup) {
+                    void (async () => {
+                        for (const chunk of warmupChunks) {
+                            for (let index = 0; index < chunk.length; index++) {
+                                res.write(chunk.subarray(index, index + 1));
+                                await new Promise<void>(resolve => setImmediate(resolve));
+                            }
+                        }
+                        res.end();
+                    })();
+                } else res.end();
                 return;
             }
             const item: Item = toolArguments !== undefined
@@ -153,7 +169,9 @@ async function fixture() {
             const timer = setTimeout(() => { cleanup(); reject(new Error("WS turn timed out")); }, 15000);
             const onClose = (): void => { cleanup(); reject(new Error("WS client closed")); };
             const onMessage = (raw: WebSocket.RawData): void => {
-                const event = JSON.parse(raw.toString()) as Item;
+                let event: Item;
+                try { event = JSON.parse(raw.toString()) as Item; }
+                catch (error) { cleanup(); reject(error); return; }
                 events.push(event);
                 if (["response.completed", "response.failed", "response.incomplete", "error"].includes(String(event.type))) { cleanup(); resolve(events); }
             };
@@ -192,6 +210,82 @@ const errorEvent = (events: Item[]): Item => {
     assert.ok(event, `expected an error frame in ${JSON.stringify(events.map(e => e.type))}`);
     return event;
 };
+
+const warmupEncodings: Array<{ name: string; encode: (frame: Item) => string }> = [
+    { name: "LF control", encode: frame => `data: ${JSON.stringify(frame)}\n\n` },
+    { name: "CRLF", encode: frame => `event: ${frame.type}\r\ndata: ${JSON.stringify(frame)}\r\n\r\n` },
+    { name: "lone CR", encode: frame => `event: ${frame.type}\rdata: ${JSON.stringify(frame)}\r\r` },
+    { name: "no optional data space", encode: frame => `data:${JSON.stringify(frame)}\n\n` },
+    { name: "multiple data fields", encode: frame => JSON.stringify(frame, null, 2).split("\n").map(line => `data: ${line}`).join("\n") + "\n\n" },
+];
+
+for (const { name, encode } of warmupEncodings) {
+    test(`warmup SSE ${name} preserves the terminal event and usable checkpoint`, { timeout: 30000 }, async () => {
+        const fx = await fixture(encode);
+        try {
+            const events = await fx.probe();
+            const warm = completed(events);
+            assert.deepEqual(events.map(event => event.type), ["response.created", "response.completed"]);
+            assert.equal(warm.status, "completed");
+            assert.deepEqual(warm.output, []);
+            assert.equal(fx.lastHttpRequest.generate, false);
+            assert.deepEqual(fx.lastHttpRequest.input, []);
+            const continued = completed(await fx.turn([user("follow up after warmup")], { previous_response_id: warm.id }));
+            assert.equal(continued.status, "completed");
+            assert.ok(fx.httpRows.some(row => JSON.stringify(row.request.input).includes("follow up after warmup")));
+            assert.ok(fx.upgradesRefused > 0, "real WS refusal exercised HTTP fallback");
+            assertAllEgress(fx.httpRows);
+        } finally {
+            await fx.close();
+        }
+    });
+}
+
+for (const status of ["failed", "incomplete"]) {
+    test(`warmup SSE keeps a multiline ${status} terminal unsuccessful`, { timeout: 30000 }, async () => {
+        const fx = await fixture(frame => {
+            const event = frame.type === "response.completed"
+                ? { ...frame, type: `response.${status}`, response: { ...(frame.response as Item), status } }
+                : frame;
+            return JSON.stringify(event, null, 2).split("\n").map(line => `data:${line}`).join("\r\n") + "\r\n\r\n";
+        });
+        try {
+            const events = await fx.probe();
+            const terminal = events[events.length - 1]!;
+            assert.equal(terminal.type, `response.${status}`);
+            assert.equal((terminal.response as Item).status, status);
+            const continued = await fx.turn([user("retry after failed warmup")], { previous_response_id: (terminal.response as Item).id });
+            assert.match(JSON.stringify(errorEvent(continued)), /previous_response_not_found/);
+        } finally {
+            await fx.close();
+        }
+    });
+}
+
+test("warmup SSE does not accept a terminal without its final blank line", { timeout: 30000 }, async () => {
+    const fx = await fixture(frame => `data: ${JSON.stringify(frame)}\n${frame.type === "response.completed" ? "" : "\n"}`);
+    try {
+        const events = await fx.probe();
+        assert.equal(events[0]!.type, "response.created");
+        assert.match(JSON.stringify(errorEvent(events)), /incomplete_response/);
+        assert.ok(!events.some(event => event.type === "response.completed"));
+    } finally {
+        await fx.close();
+    }
+});
+
+test("warmup SSE keeps split CRLF and UTF-8 bytes intact", { timeout: 30000 }, async () => {
+    const fx = await fixture(frame => `data:${JSON.stringify({ ...frame, marker: "é中🙂" })}\r\n\r\n`, true);
+    try {
+        const events = await fx.probe();
+        const warm = completed(events);
+        assert.deepEqual(events.map(event => event.marker), ["é中🙂", "é中🙂"]);
+        assert.equal(completed(await fx.turn([user("continue after split bytes")], { previous_response_id: warm.id })).status, "completed");
+        assertAllEgress(fx.httpRows);
+    } finally {
+        await fx.close();
+    }
+});
 // The HTTP egress must carry the full effective input with no local checkpoint
 // marker and no WS-only frame field, and force streaming so the SSE sink works.
 function assertHttpEgressShape(request: Item): void {

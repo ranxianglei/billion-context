@@ -76,7 +76,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
-import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
+import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
@@ -2296,6 +2296,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // leaked a live idle timer. (#721/#2563: the SSE pipes themselves no
         // longer rethrow an upstream cut — they emit an in-band truncation
         // signal, or end raw for permitlist hosts that own the handling.)
+        let clearFakeRetryTimer: (() => void) | undefined;
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             // #1295: the JSONL wire has no fake-completion shape to detect —
@@ -2308,7 +2309,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // fake completion. The agent owning compression does not change this:
                 // the retry is a proxy→upstream HTTP call whose base must be what
                 // upstream just accepted (aligned with the proxy lane below).
-                const resolvedBuf = await resolveFakeCompletion(pluginBody, {
+                const resolved = await resolveFakeCompletion(pluginBody, {
                     protocol: prepared.protocol,
                     wireBody,
                     upstreamUrl,
@@ -2319,7 +2320,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     log,
                     model: prepared.model ?? prepared.google?.model,
                 });
-                pluginBody = bufferToStream(resolvedBuf);
+                pluginBody = resolved.body;
+                clearFakeRetryTimer = resolved.clearTimer;
             }
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.
@@ -2425,7 +2427,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             clearUpstreamTimer();
             // #2347: finish the dump before the turn closes — its value is the
             // full upstream tail, which the client may have stopped reading early.
-            if (dumpRaw) await dumpRaw;
+            try { if (dumpRaw) await dumpRaw; }
+            finally { clearFakeRetryTimer?.(); }
         }
         return;
     }
@@ -2461,6 +2464,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // response (any turn, not just compress-injected). Buffering is required:
     // the retry re-requests before the client sees the fake completion.
     let responseBody: ReadableStream<Uint8Array> = upstream.body;
+    let clearFakeRetryTimer: (() => void) | undefined;
     // #411: every body-consuming path below must clear the upstream idle timer
     // even when it throws (client abort / upstream cut) — previously an abort
     // skipped the trailing clearUpstreamTimer and leaked a live idle
@@ -2474,7 +2478,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // never the raw client body: upstream may have rejected those raw
             // bytes earlier in this session, and a 400'd hint would present the
             // fake completion instead of a corrected turn.
-            const resolvedBuf = await resolveFakeCompletion(upstream.body, {
+            const resolved = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
                 wrapBody: v1Active ? v1Wrap : undefined,
@@ -2486,7 +2490,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 log,
                 model: prepared.model ?? prepared.google?.model,
             });
-            responseBody = bufferToStream(resolvedBuf);
+            responseBody = resolved.body;
+            clearFakeRetryTimer = resolved.clearTimer;
         }
     // #2347: dump the FINAL upstream body for every prepared streaming turn,
     // regardless of rewriter branch — the previous tee sat INSIDE the useRewriter
@@ -2983,13 +2988,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // the full upstream tail, which the client may have stopped reading
         // early. Idempotent where the rewriter lane already awaited it in its
         // own finally; this covers the non-rewriter branch's throw paths too.
-        if (dumpRaw) await dumpRaw;
+        try { if (dumpRaw) await dumpRaw; }
+        finally { clearFakeRetryTimer?.(); }
     }
 }
 
 // #371: buffer the raw upstream response, detect a fake completion (tool-call
 // XML, no real tool block), and — bounded per turn and per session — re-request
-// upstream with a corrective hint. Returns the bytes to stream to the client
+// upstream with a corrective hint. Returns the body to stream to the client
 // (the retry's response when a retry recovered, else the original). The session
 // streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
 // turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
@@ -3022,8 +3028,11 @@ async function resolveFakeCompletion(
          *  must go back out inside the CloudCode envelope. */
         wrapBody?: (body: string | Buffer) => string | Buffer;
     },
-): Promise<Buffer> {
-    let buffer = await readStreamToBuffer(stream, fakeBufCap());
+): Promise<{ body: ReadableStream<Uint8Array>; clearTimer?: () => void }> {
+    const buffered = await bufferStreamIfFits(stream, fakeBufCap());
+    // An incomplete inspection cannot classify this turn or change its streak.
+    if (!Buffer.isBuffer(buffered)) return { body: buffered };
+    let buffer = buffered;
     const max = maxFakeCompletionRetries();
     const sid = opts.session.id;
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
@@ -3051,14 +3060,20 @@ async function resolveFakeCompletion(
                 opts.log("warn", `[${sid}] fake-completion retry failed: ${String(e)}; presenting original`);
                 break;
             }
+            let handedOff = false;
             try {
                 if (!r.response.ok || !r.response.body) {
                     opts.log("warn", `[${sid}] fake-completion retry rejected (HTTP ${r.response.status}); presenting original`);
                     break;
                 }
-                buffer = await readStreamToBuffer(r.response.body, fakeBufCap());
+                const retried = await bufferStreamIfFits(r.response.body, fakeBufCap());
+                if (!Buffer.isBuffer(retried)) {
+                    handedOff = true;
+                    return { body: retried, clearTimer: r.clearTimer };
+                }
+                buffer = retried;
             } finally {
-                r.clearTimer();
+                if (!handedOff) r.clearTimer();
             }
             if (!isFakeCompletion(opts.protocol, buffer.toString("utf8"))) break;
         }
@@ -3066,5 +3081,5 @@ async function resolveFakeCompletion(
     const stillFake = isFakeCompletion(opts.protocol, buffer.toString("utf8"));
     opts.session.metadata.fakeCompletionStreak = stillFake ? priorStreak + 1 : 0;
     markDirty(opts.session);
-    return buffer;
+    return { body: bufferToStream(buffer) };
 }

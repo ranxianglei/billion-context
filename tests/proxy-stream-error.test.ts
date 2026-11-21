@@ -163,6 +163,7 @@ test("emitStreamError: responses errorShape=\"completion\" emits a full item lif
     for (const block of itemEvents) {
         assert.match(block, new RegExp(`"item_id":"${itemId}"`));
         assert.match(block, /"output_index":0/);
+        assert.match(block, /"content_index":0/);
     }
     // The completed response contains the error item in its output array.
     const completed = out.split("\n\n").find((b) => b.includes("response.completed"));

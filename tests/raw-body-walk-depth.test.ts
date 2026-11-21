@@ -112,18 +112,18 @@ test("#6844: otherTop inherits the top-level field through nesting", () => {
     const nested = "N".repeat(1000);
     const body = {
         messages: [{ role: "user", content: "hi" }],
-        dsh_session_log: { entries: [{ seq: 1, text: nested }] },
+        custom_extension: { entries: [{ seq: 1, text: nested }] },
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic);
-    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(nested), bytes: Buffer.byteLength(nested, "utf8") }], "only the string leaf counts, attributed to the top-level field");
+    assert.deepEqual(bd.otherTop, [{ field: "custom_extension", tokens: t(nested), bytes: Buffer.byteLength(nested, "utf8") }], "only the string leaf counts, attributed to the top-level field");
     assert.equal(bd.other, bd.otherTop[0]!.tokens);
 });
 
 test("#7090: otherTop bytes are UTF-8 byte length (multi-byte aware), not code-unit count", () => {
     // "会话日志" is 4 CJK chars = 12 UTF-8 bytes; value.length would say 4.
     const cjk = "会话日志";
-    const bd = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }], dsh_session_log: cjk });
-    assert.deepEqual(bd.otherTop, [{ field: "dsh_session_log", tokens: t(cjk), bytes: 12 }], "bytes must count UTF-8 bytes, not JS code units");
+    const bd = estimateRawBodyBreakdown({ messages: [{ role: "user", content: "hi" }], custom_extension: cjk });
+    assert.deepEqual(bd.otherTop, [{ field: "custom_extension", tokens: t(cjk), bytes: 12 }], "bytes must count UTF-8 bytes, not JS code units");
     assert.equal(bd.otherTop[0]!.bytes, Buffer.byteLength(cjk, "utf8"));
 });
 
@@ -189,7 +189,7 @@ test("#7013: anthropic prompt mass includes top-level system", () => {
         system: "top-level anthropic system",
         messages: [{ role: "user", content: "hello" }],
         tools: [{ name: "n", description: "d" }],
-        dsh_session_log: "big telemetry blob",
+        custom_extension: "big telemetry blob",
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.anthropic);
     assert.equal(bd.prompt, bd.messages + bd.tools + bd.system);
@@ -201,7 +201,7 @@ test("#7013: google prompt mass = contents + systemInstruction + tools", () => {
         contents: [{ role: "user", parts: [{ text: "hello" }] }],
         systemInstruction: "google system",
         tools: [{ name: "n", description: "d" }],
-        dsh_session_log: "big telemetry blob",
+        custom_extension: "big telemetry blob",
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.google);
     // #7090: google's prompt keys land in their named buckets (contents→messages,
@@ -209,7 +209,7 @@ test("#7013: google prompt mass = contents + systemInstruction + tools", () => {
     const expectedPrompt = t("user") + t("hello") + t("google system") + t("n") + t("d");
     assert.equal(bd.prompt, expectedPrompt);
     assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, "prompt mass = named buckets on the google lane");
-    assert.ok(bd.other > 0 && bd.total > bd.prompt, "dsh_session_log is non-prompt mass");
+    assert.ok(bd.other > 0 && bd.total > bd.prompt, "custom_extension is non-prompt mass");
 });
 
 test("#7013: responses prompt mass = input + instructions + tools", () => {
@@ -217,13 +217,13 @@ test("#7013: responses prompt mass = input + instructions + tools", () => {
         input: [{ role: "user", content: "hello" }],
         instructions: "responses instructions",
         tools: [{ name: "n", description: "d" }],
-        dsh_session_log: "big telemetry blob",
+        custom_extension: "big telemetry blob",
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.responses);
     const expectedPrompt = t("user") + t("hello") + t("responses instructions") + t("n") + t("d");
     assert.equal(bd.prompt, expectedPrompt);
     assert.equal(bd.prompt, bd.messages + bd.tools + bd.system, "prompt mass = named buckets on the responses lane");
-    assert.ok(bd.other > 0 && bd.total > bd.prompt, "dsh_session_log is non-prompt mass");
+    assert.ok(bd.other > 0 && bd.total > bd.prompt, "custom_extension is non-prompt mass");
 });
 
 // #7090: the responses lane's `input` (the main prompt content) must land in a
@@ -268,14 +268,14 @@ test("#7090: the prompt/named-bucket invariant holds on every lane", () => {
     }
 });
 
-test("#7013: a giant dsh_session_log upload does not inflate the prompt mass", () => {
-    // The issue's repro: ~100K-token prompt + an 8 MiB dsh_session_log upload.
+test("#7013: a giant non-prompt upload does not inflate the prompt mass", () => {
+    // The issue's repro: ~100K-token prompt + an 8 MiB non-prompt upload.
     // The prompt mass must stay at the prompt's size; only total grows.
     const promptText = "x".repeat(400_000); // ~100K tokens
     const telemetry = "t".repeat(8_000_000); // ~2M tokens of non-prompt upload
     const body = {
         messages: [{ role: "user", content: promptText }],
-        dsh_session_log: telemetry,
+        custom_extension: telemetry,
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.openai);
     assert.equal(bd.prompt, t("user") + t(promptText));

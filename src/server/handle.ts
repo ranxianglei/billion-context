@@ -522,8 +522,10 @@ async function handleRequest(
                 // session). Any TEXT-dominated parseable body above the ingest
                 // cost band is already ≥ ~8M tokens — beyond every real model
                 // window — so refuse it HERE, after decode (which can balloon
-                // 10:1) but before the sweep that costs the seconds. 0 disables
-                // the cap (legacy parse-everything).
+                // 10:1) but before the sweep that costs the seconds. DISABLED
+                // by default for all lanes (#7426: on the re-send lanes the raw
+                // inbound byte count is not a valid "beyond model window"
+                // proxy); set a byte value to re-enable.
                 //
                 // Image-bearing bodies are exempt on EVERY lane: base64 pixels
                 // are excluded from the token meter by design ("images billed
@@ -3394,8 +3396,23 @@ async function handleRequest(
                     nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    postComPressTail: preparedCs?.postComPressTail === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment,
+                // so the receipt may note the uncovered runs once more in this
+                // cycle; folds without a new injection stay silent (anti-nag,
+                // #6522 loop). Only the post-gate delivery fact "injected"
+                // resets — the same fact that mints the nudge credit above;
+                // "gated"/"vetoed"/"skipped" never reached the model and never
+                // re-open the note. The note itself only exists while
+                // compress.postComPressTail is on (#7318) — with it off this
+                // latch is inert.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).

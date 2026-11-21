@@ -229,7 +229,7 @@ test("#4124 D2: read_original_image outputs stay exempt (best-effort boundary)",
         ],
     });
     const r = await shedWireImagesToCount(body, "responses", 1);
-    assert.equal(r.stats.archived, 2, "only the two oldest ARCHIVABLE images go");
+    assert.equal(r.stats.archived, 3, "the exempt original consumes the only available image slot");
     const parsed = JSON.parse(r.body) as { input: Array<Record<string, unknown>> };
     const out = parsed.input.find((x) => x.type === "function_call_output")!;
     assert.ok(JSON.stringify(out.output).includes(b64(99)), "the exempt output rides untouched");

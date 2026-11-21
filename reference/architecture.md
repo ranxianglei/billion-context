@@ -314,6 +314,7 @@ billion-context/
 │   ├── startup-failure-page.ts   # Port-holding failure page when a launcher-spawned proxy dies (#5096)
 │   ├── state-gc.ts               # Opt-in retention GC for dump directories (size/age bounds) (#2412)
 │   ├── state-hydration.ts        # Single mergeState truth; persisted field list derived mechanically (#4242)
+│   ├── storage-backup-repair.ts  # bili storage backup / repair: verified index.db snapshot + corruption recovery (#7156)
 │   ├── storage-maintenance.ts    # bili sessions / bili storage gc CLI over store maintenance APIs (#3911)
 │   ├── turn-separator.ts         # Responses turn-separator id helpers, zero-dependency leaf (#2627)
 │   ├── uncovered.ts              # Uncovered-history audit: runs no active block can reach (#4331)
