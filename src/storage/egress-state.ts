@@ -17,18 +17,27 @@
  *
  * Row types (payload shapes are the contract — see the discussion post):
  *   B  base            msgid NULL      {"entries": viewRow[], watermark}
- *   I  insert          msgid required  {"after": msgid|null, ref, tokens,
- *                                       type, content_hash}
+ *                                       (entries carry their bytes inline)
+ *   I  insert          msgid required  bytes BLOB column = message bytes;
+ *                                       payload {"after": msgid|null, ref,
+ *                                       tokens, type, role?}
  *   D  delete-range    msgid NULL      {"start": msgid, "end": msgid}  inclusive
- *   U  update-content  msgid required  {"content_hash": …}  (ref/tokens/type/
+ *   U  update-content  msgid required  bytes BLOB column = new message bytes;
+ *                                       payload {role?}  (ref/tokens/type/
  *                                       position untouched)
+ *
+ * #7439 ruling 1 (self-contained bytes): the row carries the message BYTES,
+ * not a content-CAS hash reference. I/U ops store the bytes in the `bytes`
+ * BLOB column; B rows embed the entries (each with its bytes) in the payload.
+ * Content identity is BYTE EQUALITY — no hash, no fingerprint, no pointer to
+ * the content table (the flow tables are decoupled from the content CAS).
  *
  * Anchors are MSGIDS, never display positions — positions shift under other
  * ops, msgids do not (KDD#11: content may change, msgid does not). Any
- * anchor/endpoint violation, missing update target, or duplicate msgid is a
- * HARD ERROR: the session is corrupt and the caller degrades to the legacy
- * full path (no fuzzy guessing — same discipline as every other lane's
- * "any doubt, fall back whole-turn" rule).
+ * anchor/endpoint violation, missing update target, missing bytes, or
+ * duplicate msgid is a HARD ERROR: the session is corrupt and the caller
+ * degrades to the legacy full path (no fuzzy guessing — same discipline as
+ * every other lane's "any doubt, fall back whole-turn" rule).
  */
 
 import type { SqliteDatabase } from "./driver.js";
@@ -41,22 +50,24 @@ export class EgressStateCorruptError extends Error {
 }
 
 /** One row of the current view. The tag triple (ref, tokens, type) is
- * permanent while the content hash is unchanged (ref is never re-issued by
- * the kernel contract; tokens are deterministic over content). Content BYTES
- * live in the content CAS — only the pointer lands here. */
+ * permanent while the bytes are unchanged (ref is never re-issued by the
+ * kernel contract; tokens are deterministic over content). #7439 ruling 1:
+ * the row carries the message BYTES directly (self-contained) — no content
+ * CAS pointer, no hash. For a message row the bytes are the message's FINAL
+ * core JSON (post reasoning-drop / image-rescale, pre outbound convert); for
+ * the leading system row they are the outbound system text. */
 export interface EgressViewRow {
     msgid: string;
     ref: string;
     tokens: number;
     type: string;
-    contentHash: string;
+    /** The message's bytes — FINAL core JSON for a message row, the outbound
+     *  system text for the leading system row. Content identity is byte
+     *  equality (Ruling 1: no hash, no CAS). */
+    bytes: string;
     /** #7398 seg 4: the kernel-space role (rebuild needs it; the diff keys on
      *  msgid so a role-only drift is impossible — kernel ids are one-shot). */
     role?: string;
-    /** #7398 seg 4: unified-content-CAS key of the message's FINAL core
-     *  JSON (post reasoning-drop / image-rescale, pre outbound convert).
-     *  Absent on rows recorded before seg 4 — serve-from-log skips them. */
-    casRef?: string;
 }
 
 type EgressOpType = "B" | "I" | "D" | "U";
@@ -66,10 +77,12 @@ interface EgressStateRow {
     row_type: EgressOpType;
     msgid: string | null;
     payload: string;
+    /** #7439 ruling 1: the message bytes (I/U ops); NULL for B/D rows. */
+    bytes: Buffer | null;
 }
 
-const INSERT_STATE = `INSERT INTO egress_state (session_id, log_seq, row_type, msgid, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`;
-const INSERT_FLOW = `INSERT INTO egress_flow (session_id, log_seq, row_type, msgid, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`;
+const INSERT_STATE = `INSERT INTO egress_state (session_id, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+const INSERT_FLOW = `INSERT INTO egress_flow (session_id, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`;
 
 function nextLogSeq(db: SqliteDatabase, sessionId: string): number {
     // egress_flow is append-only and superset of egress_state after every
@@ -87,10 +100,10 @@ interface InsertOp {
     ref: string;
     tokens: number;
     typeTag: string;
-    contentHash: string;
+    /** #7439 ruling 1: the message bytes (self-contained, no CAS). */
+    bytes: string;
     /** #7398 seg 4: row metadata carried through ops (base + replay). */
     role?: string;
-    casRef?: string;
 }
 interface DeleteOp {
     type: "D";
@@ -100,11 +113,10 @@ interface DeleteOp {
 interface UpdateOp {
     type: "U";
     msgid: string;
-    contentHash: string;
-    /** #7398 seg 4: an edit changes the CAS bytes too — the ref rides the
-     *  op or the replayed view keeps pointing at the pre-edit content. */
+    /** #7439 ruling 1: the NEW message bytes — an edit replaces the bytes;
+     *  the replayed view carries the post-edit content (no CAS ref to drift). */
+    bytes: string;
     role?: string;
-    casRef?: string;
 }
 export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 
@@ -118,9 +130,8 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
             if (idxOf(op.msgid) >= 0) throw new EgressStateCorruptError("diff", `duplicate msgid ${op.msgid}`);
             const at = op.after === null ? -1 : idxOf(op.after);
             if (at < -1) throw new EgressStateCorruptError("diff", `insert anchor ${op.after} missing`);
-            const entry: EgressViewRow = { msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, contentHash: op.contentHash };
+            const entry: EgressViewRow = { msgid: op.msgid, ref: op.ref, tokens: op.tokens, type: op.typeTag, bytes: op.bytes };
             if (op.role !== undefined) entry.role = op.role;
-            if (op.casRef !== undefined) entry.casRef = op.casRef;
             view.splice(at + 1, 0, entry);
         } else if (op.type === "D") {
             const s = idxOf(op.start);
@@ -132,7 +143,7 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
         } else {
             const i = idxOf(op.msgid);
             if (i < 0) throw new EgressStateCorruptError("diff", `update target ${op.msgid} missing`);
-            view[i] = { ...view[i], contentHash: op.contentHash, ...(op.role !== undefined ? { role: op.role } : {}), ...(op.casRef !== undefined ? { casRef: op.casRef } : {}) };
+            view[i] = { ...view[i], bytes: op.bytes, ...(op.role !== undefined ? { role: op.role } : {}) };
         }
     }
     return view;
@@ -180,10 +191,9 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
     for (const r of next) {
         if (spine.has(r.msgid)) {
             const old = prevByMsg.get(r.msgid)!;
-            if (old.contentHash !== r.contentHash) {
-                const u: UpdateOp = { type: "U", msgid: r.msgid, contentHash: r.contentHash };
+            if (old.bytes !== r.bytes) {
+                const u: UpdateOp = { type: "U", msgid: r.msgid, bytes: r.bytes };
                 if (r.role !== undefined) u.role = r.role;
-                if (r.casRef !== undefined) u.casRef = r.casRef;
                 ops.push(u);
             }
         }
@@ -191,9 +201,8 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[]): Eg
     let last: string | null = null;
     for (const r of next) {
         if (!spine.has(r.msgid)) {
-            const ins: InsertOp = { type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, contentHash: r.contentHash };
+            const ins: InsertOp = { type: "I", msgid: r.msgid, after: last, ref: r.ref, tokens: r.tokens, typeTag: r.type, bytes: r.bytes };
             if (r.role !== undefined) ins.role = r.role;
-            if (r.casRef !== undefined) ins.casRef = r.casRef;
             ops.push(ins);
         }
         last = r.msgid;
@@ -218,17 +227,17 @@ export function egressStateAppend(
             let rowType: EgressOpType;
             let msgid: string | null;
             let payload: string;
+            let bytes: Buffer | null = null;
             if (op.type === "I") {
                 rowType = "I";
                 msgid = op.msgid;
+                bytes = Buffer.from(op.bytes, "utf8");
                 payload = JSON.stringify({
                     after: op.after,
                     ref: op.ref,
                     tokens: op.tokens,
                     type: op.typeTag,
-                    content_hash: op.contentHash,
                     role: op.role,
-                    cas_ref: op.casRef,
                 });
             } else if (op.type === "D") {
                 rowType = "D";
@@ -237,10 +246,11 @@ export function egressStateAppend(
             } else {
                 rowType = "U";
                 msgid = op.msgid;
-                payload = JSON.stringify({ content_hash: op.contentHash, role: op.role, cas_ref: op.casRef });
+                bytes = Buffer.from(op.bytes, "utf8");
+                payload = JSON.stringify({ role: op.role });
             }
-            db.prepare(INSERT_STATE).run(sessionId, seq, rowType, msgid, payload, nowMs);
-            db.prepare(INSERT_FLOW).run(sessionId, seq, rowType, msgid, payload, nowMs);
+            db.prepare(INSERT_STATE).run(sessionId, seq, rowType, msgid, payload, bytes, nowMs);
+            db.prepare(INSERT_FLOW).run(sessionId, seq, rowType, msgid, payload, bytes, nowMs);
         }
     });
     return Array.from({ length: ops.length }, (_, i) => first + i);
@@ -252,7 +262,7 @@ export function egressStateAppend(
 export function egressStateView(db: SqliteDatabase, sessionId: string): EgressViewRow[] {
     const rows = db
         .prepare(
-            "SELECT log_seq, row_type, msgid, payload FROM egress_state WHERE session_id = ? ORDER BY log_seq ASC",
+            "SELECT log_seq, row_type, msgid, payload, bytes FROM egress_state WHERE session_id = ? ORDER BY log_seq ASC",
         )
         .all(sessionId) as unknown as EgressStateRow[];
     return applyOps(sessionId, rows);
@@ -264,7 +274,7 @@ export function egressStateView(db: SqliteDatabase, sessionId: string): EgressVi
 export function egressStateAt(db: SqliteDatabase, sessionId: string, x: number): EgressViewRow[] {
     const rows = db
         .prepare(
-            "SELECT log_seq, row_type, msgid, payload FROM egress_flow WHERE session_id = ? AND log_seq <= ? ORDER BY log_seq ASC",
+            "SELECT log_seq, row_type, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND log_seq <= ? ORDER BY log_seq ASC",
         )
         .all(sessionId, x) as unknown as EgressStateRow[];
     return applyOps(sessionId, rows);
@@ -282,13 +292,25 @@ export function egressStateCompact(
     nowMs: number,
 ): number {
     const seq = nextLogSeq(db, sessionId);
+    // #7439 ruling 1: the base row embeds the entries (each with its bytes)
+    // in the payload — the `bytes` column is NULL for a B row.
     const payload = JSON.stringify({ entries: view, watermark: seq });
     db.transaction(() => {
-        db.prepare(INSERT_STATE).run(sessionId, seq, "B", null, payload, nowMs);
-        db.prepare(INSERT_FLOW).run(sessionId, seq, "B", null, payload, nowMs);
+        db.prepare(INSERT_STATE).run(sessionId, seq, "B", null, payload, null, nowMs);
+        db.prepare(INSERT_FLOW).run(sessionId, seq, "B", null, payload, null, nowMs);
         db.prepare("DELETE FROM egress_state WHERE session_id = ? AND log_seq < ?").run(sessionId, seq);
     });
     return seq;
+}
+
+/** Decode the `bytes` BLOB column of an I/U row into the message string.
+ *  NULL/absent bytes is a HARD ERROR (a pre-#7439 row, or corruption) — the
+ *  caller degrades the whole session to the legacy path (never a partial). */
+function decodeRowBytes(row: EgressStateRow, seq: number, sessionId: string): string {
+    if (row.bytes === null || row.bytes === undefined) {
+        throw new EgressStateCorruptError(sessionId, `row at log_seq=${seq} has no bytes (pre-#7439 row or corruption)`);
+    }
+    return Buffer.from(row.bytes).toString("utf8");
 }
 
 function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
@@ -305,7 +327,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             const entries = Array.isArray(p.entries) ? (p.entries as EgressViewRow[]) : null;
             if (!entries) throw new EgressStateCorruptError(sessionId, `base at log_seq=${row.log_seq} has no entries`);
             view = entries.map((e) => ({ ...e }));
-            if (view.some((e) => typeof e.msgid !== "string" || typeof e.ref !== "string")) {
+            if (view.some((e) => typeof e.msgid !== "string" || typeof e.ref !== "string" || typeof e.bytes !== "string")) {
                 throw new EgressStateCorruptError(sessionId, `base at log_seq=${row.log_seq} has malformed entries`);
             }
             continue;
@@ -314,7 +336,7 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
         if (row.row_type === "I") {
             if (typeof row.msgid !== "string") throw new EgressStateCorruptError(sessionId, `insert at log_seq=${row.log_seq} has no msgid`);
             if (idxOf(row.msgid) >= 0) throw new EgressStateCorruptError(sessionId, `duplicate msgid ${row.msgid} at log_seq=${row.log_seq}`);
-            if (typeof p.ref !== "string" || typeof p.tokens !== "number" || typeof p.type !== "string" || typeof p.content_hash !== "string") {
+            if (typeof p.ref !== "string" || typeof p.tokens !== "number" || typeof p.type !== "string") {
                 throw new EgressStateCorruptError(sessionId, `insert at log_seq=${row.log_seq} has a malformed payload`);
             }
             const entry: EgressViewRow = {
@@ -322,10 +344,9 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
                 ref: p.ref as string,
                 tokens: p.tokens as number,
                 type: p.type as string,
-                contentHash: p.content_hash as string,
+                bytes: decodeRowBytes(row, row.log_seq, sessionId),
             };
             if (p.role !== undefined) entry.role = p.role as string;
-            if (p.cas_ref !== undefined) entry.casRef = p.cas_ref as string;
             if (p.after == null) {
                 view.push(entry);
             } else if (typeof p.after !== "string") {
@@ -346,16 +367,15 @@ function applyOps(sessionId: string, rows: EgressStateRow[]): EgressViewRow[] {
             if (s > e) throw new EgressStateCorruptError(sessionId, `delete range inverted (start after end) at log_seq=${row.log_seq}`);
             view.splice(s, e - s + 1);
         } else if (row.row_type === "U") {
-            if (typeof row.msgid !== "string" || typeof p.content_hash !== "string") {
-                throw new EgressStateCorruptError(sessionId, `update at log_seq=${row.log_seq} has a malformed payload`);
+            if (typeof row.msgid !== "string") {
+                throw new EgressStateCorruptError(sessionId, `update at log_seq=${row.log_seq} has no msgid`);
             }
             const i = idxOf(row.msgid);
             if (i < 0) throw new EgressStateCorruptError(sessionId, `update target ${row.msgid} missing at log_seq=${row.log_seq}`);
             view[i] = {
                 ...view[i],
-                contentHash: p.content_hash as string,
+                bytes: decodeRowBytes(row, row.log_seq, sessionId),
                 ...(p.role !== undefined ? { role: p.role as string } : {}),
-                ...(p.cas_ref !== undefined ? { casRef: p.cas_ref as string } : {}),
             };
         } else {
             throw new EgressStateCorruptError(sessionId, `unknown row_type ${String(row.row_type)} at log_seq=${row.log_seq}`);

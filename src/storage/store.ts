@@ -1041,18 +1041,6 @@ export class UnifiedStore {
         return hash;
     }
 
-    /** #7398 seg 4: public seam over the content CAS for the egress op-log
-     *  (recording stores each message's FINAL core JSON under its sha256 so
-     *  serve-from-log rebuilds byte-exact without re-running the pipeline).
-     *  Refcount-aware like every other CAS user. */
-    egressPutContent(text: string): string {
-        return this.putContent(text);
-    }
-
-    egressGetContent(hash: string): string | null {
-        return this.getContent(hash);
-    }
-
     /** refcount-aware release; the CAS body itself never leaves. */
     /** #6785 step 7: the orphan journal moved OFF the sessions row — one
      *  row per block in orphan_blocks (immutable content; a refreshed view
@@ -2075,33 +2063,16 @@ export class UnifiedStore {
         return egressStateCompact(this.db, sessionId, view, nowMs);
     }
 
-    /** #7398: delete the session's egress op-log rows (state AND flow) and
-     *  return the unified-content-CAS refs the rows carried (cas_ref on I/U
-     *  ops, casRef on B-row entries). The recorder's puts are the sole owner
-     *  of those refs (message bodies are additionally pinned by their own
-     *  messages rows); callers release + collect exactly as for other CAS.
-     *  Runs inside the caller's sweep transaction. */
+    /** #7398: delete the session's egress op-log rows (state AND flow).
+     *  #7439 ruling 1: the rows are SELF-CONTAINED — the message bytes ride
+     *  the rows (no content-CAS refs), so there is nothing to release. The
+     *  method still deletes the rows and returns the (now always empty)
+     *  CAS-ref list for caller compatibility. Runs inside the caller's sweep
+     *  transaction. */
     deleteEgressOps(sessionId: string): string[] {
-        const refs: string[] = [];
-        const take = (payload: string): void => {
-            let parsed: { cas_ref?: unknown; entries?: unknown };
-            try {
-                parsed = JSON.parse(payload) as { cas_ref?: unknown; entries?: unknown };
-            } catch {
-                return;
-            }
-            if (typeof parsed.cas_ref === "string") refs.push(parsed.cas_ref);
-            if (Array.isArray(parsed.entries)) {
-                for (const e of parsed.entries as Array<{ casRef?: unknown }>) {
-                    if (typeof e.casRef === "string") refs.push(e.casRef);
-                }
-            }
-        };
-        for (const r of this.db.prepare("SELECT payload FROM egress_state WHERE session_id = ?").all(sessionId) as Array<{ payload: string }>) take(r.payload);
-        for (const r of this.db.prepare("SELECT payload FROM egress_flow WHERE session_id = ?").all(sessionId) as Array<{ payload: string }>) take(r.payload);
         this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
         this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
-        return refs;
+        return [];
     }
 
     /** #5874 v2 (step 3): the egress READ — serve the newest cut row's CAS

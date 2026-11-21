@@ -1,18 +1,15 @@
 /**
- * Egress op-log lifecycle fixes found while writing the PR #6785 report
- * (docs/pr-6785-unified-storage-and-flows.md §5.3):
- *   1. buildEgressViewRows must REUSE the previous turn's casRef for an
- *      unchanged row instead of putContent-ing the same CAS body again —
- *      putContent refcount-bumps on hit, so the old code inflated every
- *      row's refcount by +1/turn with the only release at the session sweep
- *      (storage-only-grows). Pinned: turn 2 unchanged = 0 puts; turn 3 with
- *      one edit + one append = exactly 2 puts.
- *   2. deleteSession must cascade-delete egress_state/egress_flow (and
- *      release their CAS refs) — the old cascade listed every v12 table
- *      except the two op-log tables, so recorded sessions orphaned the op
- *      log + its CAS bodies forever.
- * Both directions asserted (#3617): the put IS skipped on reuse AND still
- * happens when the content changes / the row is new.
+ * Egress op-log lifecycle (proposal discussions/7398, #6785 perf work;
+ * #7439 ruling 1: self-contained bytes). Pinned contract:
+ *   1. buildEgressViewRows produces SELF-CONTAINED rows — the message bytes
+ *      ride the row inline (no content-CAS hash/ref), so the op-log has zero
+ *      cross-table pointers into the (now stale) content table.
+ *   2. deleteSession cascades egress_state/egress_flow — the cascade must
+ *      list the two op-log tables, so a recorded session does not orphan its
+ *      op log forever. (With self-contained bytes there is no CAS body to
+ *      release — the rows carry their own bytes.)
+ * Both directions asserted (#3617): the rows DO carry bytes AND carry no CAS
+ * ref.
  */
 
 import { test } from "node:test";
@@ -33,27 +30,25 @@ process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 const M = (id: string, text: string, role: string = "user") => ({ id, role, contentType: "text", text });
 
-test("buildEgressViewRows reuses the prev casRef for unchanged rows (no putContent re-bump)", () => {
-    const puts: string[] = [];
-    const cas = { put: (t: string) => { puts.push(t); return `cas-${puts.length}`; } };
+test("buildEgressViewRows produces self-contained rows (bytes inline, no CAS ref)", () => {
     const conv = [M("m1", "alpha"), M("m2", "beta")];
-    const t1 = buildEgressViewRows(conv, "sys", cas);
-    assert.equal(puts.length, 3); // system row + every first-seen message row
-
-    const t2 = buildEgressViewRows(conv, "sys", cas, t1);
-    assert.equal(puts.length, 3); // unchanged rows (incl. system) reuse casRefs — ZERO new puts
-    for (const r of t2) assert.ok(r.casRef, "reused rows keep their casRef");
-
-    // a content edit and a new row both put fresh
-    const t3 = buildEgressViewRows([M("m1", "alpha!"), M("m2", "beta"), M("m3", "gamma")], "sys", cas, t2);
-    assert.equal(puts.length, 5);
-    assert.equal(t3[0].casRef, t2[0].casRef, "system block unchanged → reused");
-    assert.notEqual(t3[1].casRef, t2[1].casRef, "edited m1 → fresh put");
-    assert.equal(t3[2].casRef, t2[2].casRef, "unchanged m2 → reused");
-    assert.ok(t3[3].casRef && t3[3].casRef.startsWith("cas-5"), "new m3 → fresh put");
+    const rows = buildEgressViewRows(conv, "sys");
+    // system row + two message rows
+    assert.equal(rows.length, 3);
+    for (const r of rows) {
+        assert.equal(typeof r.bytes, "string", `row ${r.msgid} carries inline bytes`);
+        assert.ok(r.bytes.length > 0, `row ${r.msgid} bytes are non-empty`);
+        // #7439 ruling 1: NO content-CAS hash/ref on the row
+        assert.equal("contentHash" in r, false, "no contentHash field");
+        assert.equal("casRef" in r, false, "no casRef field");
+    }
+    // the message bytes are the FINAL core JSON — they round-trip to the message
+    const m1 = JSON.parse(rows[1].bytes) as { id: string; text: string };
+    assert.equal(m1.id, "m1");
+    assert.equal(m1.text, "alpha");
 });
 
-test("deleteSession cascades egress_state/egress_flow and releases their CAS refs", () => {
+test("deleteSession cascades egress_state/egress_flow (self-contained bytes, no CAS release)", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-egress-lifecycle-"));
     let store: UnifiedStore | undefined;
     try {
@@ -62,13 +57,12 @@ test("deleteSession cascades egress_state/egress_flow and releases their CAS ref
         migrateSchema(db);
         const sid = "sess-egress-cascade";
 
-        const h1 = store.egressPutContent('{"id":"m1","role":"user","text":"alpha"}');
-        const h2 = store.egressPutContent('{"id":"m2","role":"user","text":"beta"}');
+        // #7439 ruling 1: the ops carry the message BYTES inline (no CAS ref)
         egressStateAppend(db, sid, [
-            { type: "I", msgid: "m1", after: null, ref: "", tokens: 5, typeTag: "text", contentHash: "a", role: "user", casRef: h1 },
-            { type: "I", msgid: "m2", after: "m1", ref: "", tokens: 5, typeTag: "text", contentHash: "b", role: "user", casRef: h2 },
+            { type: "I", msgid: "m1", after: null, ref: "", tokens: 5, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"alpha"}', role: "user" },
+            { type: "I", msgid: "m2", after: "m1", ref: "", tokens: 5, typeTag: "text", bytes: '{"id":"m2","role":"user","text":"beta"}', role: "user" },
             { type: "D", start: "m1", end: "m1" },
-            { type: "U", msgid: "m2", contentHash: "b2", role: "user", casRef: h2 },
+            { type: "U", msgid: "m2", bytes: '{"id":"m2","role":"user","text":"beta2"}', role: "user" },
         ], Date.now());
         const count = (t: string) => (db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n;
         assert.equal(count("egress_state"), 4);
@@ -78,8 +72,6 @@ test("deleteSession cascades egress_state/egress_flow and releases their CAS ref
 
         assert.equal(count("egress_state"), 0, "egress_state rows cascade-deleted");
         assert.equal(count("egress_flow"), 0, "egress_flow rows cascade-deleted");
-        const gone = (h: string) => (db.prepare("SELECT count(*) AS n FROM content WHERE hash = ?").get(h) as { n: number }).n;
-        assert.equal(gone(h1), 0, "egress CAS body released to zero and collected");
     } finally {
         // close the store before rmSync — Windows cannot unlink an open SQLite
         // db (EPERM/EBUSY on index.db). Precedent: tests/archive-reference-counts.test.ts.

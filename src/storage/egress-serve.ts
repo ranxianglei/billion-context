@@ -1,33 +1,32 @@
 /**
  * Egress serve-from-log — segment 4b of the op-log outbound view (proposal
- * discussions/7398, #6785 perf work). Rebuilds the outbound core-message
- * portion from the replayed log + unified content CAS and runs it through the
- * SAME legacy chain (systemToUser → coreToOpenai → hardenOpenaiAssistantContent)
- * the pipeline uses, so the output is byte-identical by construction when the
- * CAS bytes are the final core JSON (which segment 3's recording guarantees).
- * prepare-openai (rollout `egressServeLog`, default 0) SERVES these elements
- * as the outbound conversation when the rebuild succeeds, and falls back to
- * the legacy path — with the 4a shadow byte-comparison still running on
- * fallback turns — when it cannot (degrade, never guess).
+ * discussions/7398, #6785 perf work; #7439 ruling 1: self-contained bytes).
+ * Rebuilds the outbound core-message portion from the replayed log and runs
+ * it through the SAME legacy chain (systemToUser → coreToOpenai →
+ * hardenOpenaiAssistantContent) the pipeline uses, so the output is
+ * byte-identical by construction when the row bytes are the final core JSON
+ * (which the recording guarantees). #7439 ruling 1: the bytes are
+ * SELF-CONTAINED in the rows (no content-CAS lookup) — the rebuild reads them
+ * straight from the view. prepare-openai (rollout `egressServeLog`, default 0)
+ * SERVES these elements as the outbound conversation when the rebuild
+ * succeeds, and falls back to the legacy path — with the 4a shadow
+ * byte-comparison still running on fallback turns — when it cannot (degrade,
+ * never guess).
  *
  * Scope (honest, pinned in tests):
  *   - text, tool, and acp_summary rows rebuild (the entire 10w-row
  *     uncompressed workload, coding sessions included); tool rows ride the
- *     CAS body — the recorded bytes are the FULL core message JSON, so the
+ *     row bytes — the recorded bytes are the FULL core message JSON, so the
  *     toolCallId/toolName sidecars are present and the same legacy chain
  *     reproduces the bytes;
- *   - a row without casRef (recorded before seg 4) or a missing CAS body →
- *     null (caller stays on the legacy path — degrade, never guess).
+ *   - a row with empty/missing bytes (a pre-#7439 row, or corruption) → null
+ *     (caller stays on the legacy path — degrade, never guess).
  */
 
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import type { EgressViewRow } from "./egress-state.js";
-
-export interface EgressContentStore {
-    egressGetContent(hash: string): string | null;
-}
 
 interface EgressRebuildResult {
     /** The rebuilt outbound elements for the conversation rows (system
@@ -36,20 +35,20 @@ interface EgressRebuildResult {
 }
 
 /** Rebuild the outbound core-message portion from a replayed log view.
- *  Returns null when ANY row cannot be rebuilt byte-exactly (the caller
- *  must stay on the legacy path for the whole turn — a partial rebuild
- *  would splice two code paths into one outbound body). */
-export function rebuildOutboundFromLog(view: readonly EgressViewRow[], store: EgressContentStore): EgressRebuildResult | null {
+ *  #7439 ruling 1: the rows are SELF-CONTAINED — the message bytes ride the
+ *  row (no content-CAS lookup), so the rebuild reads them straight from the
+ *  view. Returns null when ANY row cannot be rebuilt byte-exactly (the caller
+ *  must stay on the legacy path for the whole turn — a partial rebuild would
+ *  splice two code paths into one outbound body). */
+export function rebuildOutboundFromLog(view: readonly EgressViewRow[]): EgressRebuildResult | null {
     const ROLES = ["system", "developer", "user", "assistant", "tool"] as const;
     const msgs: BiliMessage[] = [];
     for (const r of view) {
         if (r.type === "system") continue;
-        if (r.casRef === undefined || r.casRef === "") return null;
-        const bytes = store.egressGetContent(r.casRef);
-        if (bytes === null) return null;
+        if (r.bytes === undefined || r.bytes === "") return null;
         let m: unknown;
         try {
-            m = JSON.parse(bytes);
+            m = JSON.parse(r.bytes);
         } catch {
             return null;
         }

@@ -1,8 +1,8 @@
 // #7398 seg 4b: egress serve-from-log — when rollout egressServeLog is on the
-// outbound conversation elements come from the op-log + unified content CAS
-// (rebuildOutboundFromLog) instead of the legacy re-conversion, and are
-// byte-identical to the legacy bytes by construction. Direction asserts
-// (#3617): the served sessions (text AND tool — tool rows ride the CAS body)
+// outbound conversation elements come from the op-log (rebuildOutboundFromLog,
+// self-contained bytes per #7439 ruling 1) instead of the legacy re-conversion,
+// and are byte-identical to the legacy bytes by construction. Direction asserts
+// (#3617): the served sessions (text AND tool — tool rows ride the row bytes)
 // log "egress-serve: served"; the rollout-off controls never do.
 //
 // Method: one server, two sessions with IDENTICAL message sequences. Session A
@@ -10,7 +10,7 @@
 // egressOpLog+egressServeLog on (served). The fake upstream captures every
 // request body; A[n] and B[n] must be byte-identical, and B's log must show
 // "egress-serve: served" lines scoped to the served sessions (both scenarios
-// serve now — tool rows ride the CAS body); the -A controls never do.
+// serve now — tool rows ride the row bytes); the -A controls never do.
 
 import assert from "node:assert/strict";
 import http from "node:http";

@@ -138,11 +138,12 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     egressOpLog: { percent: 0 },
     // #7398 seg 4b: serve-from-log — when on, each OpenAI-lane turn
     // self-records its outbound view as sparse ops (egressOpLog NOT required),
-    // rebuilds the outbound conversation elements from the op log + content
-    // CAS (same legacy chain, bytes identical by construction) and swaps them
-    // into the outbound body; any unrebuildable row (missing casRef / missing
-    // CAS body — pre-seg-4 rows, unknown role) or a corrupt log degrades the
-    // WHOLE turn to the legacy path (never a partial swap). seg 4a's shadow
+    // rebuilds the outbound conversation elements from the op log (rows are
+    // SELF-CONTAINED — the message bytes ride the row, no content CAS, #7439
+    // ruling 1; same legacy chain, bytes identical by construction) and swaps
+    // them into the outbound body; any unrebuildable row (missing/empty bytes
+    // — pre-#7439 rows, unknown role) or a corrupt log degrades the WHOLE turn
+    // to the legacy path (never a partial swap). seg 4a's shadow
     // byte-comparison keeps running on the fallback turns. Force with
     // `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
     egressServeLog: { percent: 0 },

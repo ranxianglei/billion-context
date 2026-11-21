@@ -627,11 +627,11 @@ export async function prepareOpenai(
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                     });
-                    const reb = rebuildOutboundFromLog(session.egressView, st);
+                    const reb = rebuildOutboundFromLog(session.egressView);
                     if (reb !== null) {
                         rebuiltMessages = reb.elements;
                         egressServedFromLog = true;
-                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log+CAS`);
+                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log (self-contained bytes)`);
                     }
                 } catch (err) {
                     egressServedFromLog = false;
@@ -883,18 +883,19 @@ export async function prepareOpenai(
         }
     }
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
-    // from the log + CAS and byte-compare against the legacy elements. NO
-    // swap: the pipeline always sends the legacy bytes; this measures the
-    // identity rate the swap will rely on (rollout egressServeLog, default 0;
-    // requires egressOpLog on, since it reads the recorded view).
+    // from the log (self-contained bytes, #7439) and byte-compare against the
+    // legacy elements. NO swap: the pipeline always sends the legacy bytes;
+    // this measures the identity rate the swap will rely on (rollout
+    // egressServeLog, default 0; requires egressOpLog on, since it reads the
+    // recorded view).
     if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = session.egressView;
             if (st && view && legacyCoreElements !== undefined) {
-                const reb = rebuildOutboundFromLog(view, st);
+                const reb = rebuildOutboundFromLog(view);
                 if (reb === null) {
-                    log("info", `[${sessionId}] egress-serve shadow: unrebuildable (log/CAS gap or out-of-scope row) — legacy kept`);
+                    log("info", `[${sessionId}] egress-serve shadow: unrebuildable (log gap or out-of-scope row) — legacy kept`);
                 } else {
                     const same = JSON.stringify(reb.elements) === JSON.stringify(legacyCoreElements);
                     log("info", `[${sessionId}] egress-serve shadow: ${same ? "IDENTICAL" : "DIVERGENT"} (${view.length} rows)`);

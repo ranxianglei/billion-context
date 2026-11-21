@@ -3,7 +3,7 @@
  * work): shadow recording of the outbound conversation view as sparse ops.
  * Pinned contract:
  *   - buildEgressViewRows determinism (same inputs → same rows; content
- *     edit → contentHash change only; system block row present);
+ *     edit → bytes change only; system block row present);
  *   - turn 1 = one +I per row; turn 2 tail append = exactly ONE +I op;
  *   - the four upper-layer shapes produce the expected op batches
  *     (append / nudge-excluded / fold = -D + +I summary / edit = +U);
@@ -68,7 +68,7 @@ test("buildEgressViewRows: deterministic, system row first, content-edit visible
     assert.equal(r1[1].msgid, "a");
     assert.equal(r1[1].type, "text");
     const edited = buildEgressViewRows([M("a", "hello"), M("b", "EDITED", "assistant")], "SYS");
-    assert.equal(edited[2].contentHash !== r1[2].contentHash, true, "content edit changes contentHash");
+    assert.equal(edited[2].bytes !== r1[2].bytes, true, "content edit changes bytes");
     assert.equal(edited[2].msgid, "b", "msgid stable across the edit");
     assert.deepEqual(buildEgressViewRows([], undefined), []);
     // summary rows are typed acp_summary
@@ -137,7 +137,7 @@ test("recording: content edit of one row = exactly one +U, no D/I churn", () => 
         assert.equal(rows[0].msgid, "b", "targeting the edited row");
         const expected = buildEgressViewRows([M("a", "1"), M("b", "2-edited", "assistant"), M("c", "3")], "SYS");
         const got = egressStateView(H.db, S);
-        assert.deepEqual(got.map((r) => [r.msgid, r.contentHash]), expected.map((r) => [r.msgid, r.contentHash]), "replayed view carries the edited contentHash");
+        assert.deepEqual(got.map((r) => [r.msgid, r.bytes]), expected.map((r) => [r.msgid, r.bytes]), "replayed view carries the edited bytes");
     } finally {
         close(H);
     }
