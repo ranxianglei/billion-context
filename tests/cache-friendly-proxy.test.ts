@@ -42,6 +42,7 @@ import { rmrf } from "./tmp-rm.ts";
 import { buildAbsorbSystemPrompt, ABSORB_TOOL_NAME } from "../src/compress-tool.ts";
 import { GENERATION_BOUNDARY_NOTE } from "../src/generation-boundary.ts";
 import { RESPONSES_SYSTEM_SECTION_SEPARATOR } from "../src/responses-system-sections.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Item = Record<string, unknown>;
 type Wire = "responses" | "chat" | "anthropic" | "google";
@@ -333,7 +334,7 @@ function proxyOptions(upstreamPort: number, model: string, ctx: number): ProxyOp
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [model]: { context: ctx } } } },
         modelContextLimit: ctx,
-        kernelConfig: { ...defaultConfig(ctx), minFoldBenefitTokens: 0 },
+        kernelConfig: { ...defaultConfig(ctx), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

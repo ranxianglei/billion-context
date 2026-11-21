@@ -31,6 +31,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest, REF_FLOOR_RAW_ID, preCompactionArchiveOf, type Session } from "../src/session.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { CODEX_COMPACT_PROMPT_ANCHOR } from "../src/codex-compact.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 const MODEL = "gpt-resp";
 const WINDOW = 30_000;
@@ -117,7 +118,7 @@ async function startHarness(modelFold: boolean): Promise<Harness> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW } } } },
         modelContextLimit: WINDOW,
-        kernelConfig: { ...defaultConfig(WINDOW), minFoldBenefitTokens: 0 },
+        kernelConfig: { ...defaultConfig(WINDOW), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

@@ -16,6 +16,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // Some tests inspect raw on-disk session files directly (bypassing the store
 // codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
@@ -46,7 +47,7 @@ function makeCtx(id: string, messages: CoreMessage[]): {
 } {
     return {
         core: createCore(),
-        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: makeSession(id),
         log: () => {},
@@ -392,7 +393,7 @@ test("#408/#660: prepareOpenai — post-fold provider usage reaches the host ver
             preserveRecentMessages: 5,
             preserveRecentTokens: 0,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
-        }), minFoldBenefitTokens: 0 },
+        }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -494,7 +495,7 @@ test("#590: pi plugin mode reports folded usage verbatim", async () => {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "claude-test": { context: 400_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 400_000,
-        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -621,7 +622,7 @@ test("#623: omp plugin mode reports folded usage verbatim", async () => {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "claude-test": { context: 400_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 400_000,
-        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
