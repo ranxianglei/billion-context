@@ -86,6 +86,14 @@ test("plugin block: stub-shaped summary (exactly 200 chars + tail) is not a full
     assert.deepEqual(ids(out), ids(messages));
 });
 
+test("plugin block: messageId-only entry (single-message fold, kernel historical API shape) -> stripped with full summary, kept when stubbed", () => {
+    const full = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ messageId: "m7", summary: "x".repeat(300) }] })), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(full, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m7", endRef: "m7" }]))), ["tc_c1", "u0"]);
+    const stub = `${"x".repeat(199)}…`;
+    const stubbed = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ messageId: "m7", summary: stub }] })), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(stubbed, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m7", endRef: "m7" }]))), ids(stubbed));
+});
+
 test("plugin block: range mismatch -> anchor kept", () => {
     const messages = [summary("pb0"), toolCall("c1", "compress", '{"startId":"m1","endId":"m8"}'), tail(0)];
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
