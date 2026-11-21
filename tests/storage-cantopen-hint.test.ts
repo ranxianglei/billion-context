@@ -75,12 +75,24 @@ test("hint: non-CANTOPEN errors stay silent even on win32", () => {
     const restore = stubPlatform("win32");
     try {
         assert.equal(sqliteOpenFailureHint("Error: [storage:node:sqlite] file is not a database"), "");
-        assert.equal(
-            sqliteOpenFailureHint("no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)"),
-            "",
-        );
     } finally {
         restore();
+    }
+});
+
+// owner 2026-10-31: the no-engine failure needs exactly one actionable line
+// ("requires Node.js 22+") — platform-independent, because node:sqlite is
+// missing on every OS below v22.
+test("hint: no-engine says Node.js 22+ on every platform", () => {
+    for (const p of ["win32", "linux", "darwin"]) {
+        const restore = stubPlatform(p);
+        try {
+            const hint = sqliteOpenFailureHint("no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)");
+            assert.ok(hint.includes("Node.js 22"), `expected a Node.js 22+ hint on ${p}, got: ${JSON.stringify(hint)}`);
+            assert.match(hint, /requires Node\.js 22 or newer/, `owner-minimal wording on ${p}`);
+        } finally {
+            restore();
+        }
     }
 });
 
