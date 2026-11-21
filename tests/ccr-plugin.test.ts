@@ -14,7 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -284,8 +284,14 @@ test("native retrieval exports preserve each session's original when refs collid
         for (let i = 0; i < results.length; i++) {
             assert.equal(results[i].ok, true);
             assert.equal(results[i].retrievalExport?.text, originals[i], "export snapshot retains exact CRLF bytes from its own session");
-            assert.ok(results[i].result.includes(results[i].retrievalExport?.path ?? "MISSING"));
+            const p = results[i].retrievalExport?.path ?? "MISSING";
+            assert.ok(results[i].result.includes(p));
+            // #4699: the in-memory snapshot above passed even while the on-disk
+            // files overwrote each other (flat naming) — read the files back.
+            assert.ok(existsSync(p), `session ${i} export file exists at ${p}`);
+            assert.equal(readFileSync(p, "utf8"), originals[i], `session ${i} pointer file holds ITS OWN original`);
         }
+        assert.notEqual(results[0]!.retrievalExport?.path, results[1]!.retrievalExport?.path, "same ref number lands in per-session paths");
         assert.ok(listSessions().filter(ccrEnabled).every(session => session.metadata.pluginAgent === undefined));
     } finally {
         await closeRig(rig);
