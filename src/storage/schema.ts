@@ -497,31 +497,25 @@ CREATE TABLE IF NOT EXISTS state_fields (
 );
 `;
 
-/** #6785 perf (proposal discussions/7398, owner design 2026-11-20; #7439
- *  ruling 1, 2026-11-21 — SELF-CONTAINED BYTES): the EGRESS STATE LOG — the
- *  op-log view of the outbound conversation (B base / I insert / D
- *  delete-range / U update-content; anchors are msgids, never positions).
- *  DUAL TABLES: egress_state is what serving reads and compaction physically
- *  trims below the watermark; egress_flow is append-only and never deleted
- *  (any log_seq stays reconstructible — rollback is based on this table, not
- *  on client resends).
- *
- *  #7439 ruling 1: the row carries the message BYTES, not a content-CAS hash
- *  reference. I/U ops store the bytes in the `bytes` BLOB column; B (base)
- *  rows embed the entries (each with its bytes) in the payload. Content
- *  identity is byte equality — no hash, no fingerprint, no content-table
- *  pointer (the flow tables are decoupled from the content CAS). The
- *  secondary index serves +U targeting and -D endpoint resolution.
- *  Probe-first, no version bump (the tables are #6785-introduced and were
- *  never released — the row model is free to reshape, no migration burden). */
-const EGRESS_STATE_DDL = `-- #6785 perf (proposal discussions/7398; #7439 ruling 1: self-contained bytes): op-log outbound view (state + flow).
+/** #6785 perf (proposal discussions/7398 + revised design discussions/7439,
+ *  owner design 2026-11-20/21): the EGRESS STATE LOG — the op-log view of the
+ *  outbound conversation (B base / I insert / D delete-range / U
+ *  update-content; anchors are msgids, never positions). DUAL TABLES:
+ *  egress_state is what serving reads and compaction physically trims below
+ *  the watermark; egress_flow is append-only and never deleted (any log_seq
+ *  stays reconstructible — rollback is based on this table, not on client
+ *  resends). SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
+ *  the message's final core JSON for I/U rows — no hash refs, no content
+ *  table; replay needs only this table pair. The secondary index serves +U
+ *  targeting and -D endpoint resolution. Probe-first, no version bump. */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes.
 CREATE TABLE IF NOT EXISTS egress_state (
     session_id TEXT NOT NULL,
     log_seq INTEGER NOT NULL,
     row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
     msgid TEXT,
     payload TEXT NOT NULL,
-    bytes BLOB,
+    bytes TEXT,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, log_seq)
 );
@@ -532,7 +526,7 @@ CREATE TABLE IF NOT EXISTS egress_flow (
     row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
     msgid TEXT,
     payload TEXT NOT NULL,
-    bytes BLOB,
+    bytes TEXT,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, log_seq)
 );
@@ -629,17 +623,14 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
         .get();
     if (!hasEgressState) db.exec(EGRESS_STATE_DDL);
-    // #7439 ruling 1: the self-contained bytes column (probe-first ADD for a
-    // dev db that created the tables before the column landed; fresh dbs have
-    // it from the DDL above). Additive — pre-column rows read NULL bytes and
-    // degrade the whole session to the legacy path (never a partial view).
-    if (hasEgressState) {
-        const esCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
-            .map((c) => c.name);
-        if (!esCols.includes("bytes")) db.exec("ALTER TABLE egress_state ADD COLUMN bytes BLOB");
-        const efCols = (db.prepare("PRAGMA table_info(egress_flow)").all() as unknown as { name?: unknown }[])
-            .map((c) => c.name);
-        if (!efCols.includes("bytes")) db.exec("ALTER TABLE egress_flow ADD COLUMN bytes BLOB");
+    // 7439 ruling 1: a dev DB created before the self-contained-bytes column
+    // upgrades with one probe-first ALTER (additive; the tables never
+    // shipped, so there is no real-migration burden).
+    const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    if (egressCols.length > 0 && !egressCols.includes("bytes")) {
+        db.exec("ALTER TABLE egress_state ADD COLUMN bytes TEXT");
+        db.exec("ALTER TABLE egress_flow ADD COLUMN bytes TEXT");
     }
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the

@@ -60,9 +60,8 @@ interface EgressRecordSourceMsg {
     contentType?: unknown;
     text?: unknown;
 }
-import { rebuildOutboundFromLog, rebuildOutboundWithLadder } from "../storage/egress-serve.js";
-import type { EgressViewRow } from "../storage/egress-state.js";
-import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -142,11 +141,6 @@ export async function prepareOpenai(
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
     let egressServedFromLog = false;
-    // #7439 ruling 3: the in-memory view cache (session.egressView) is GONE —
-    // the flow table is the single source of truth. This local is only the
-    // current turn's recorded view (for the shadow-compare below); the prev
-    // view for the NEXT turn is read from the flow table, not from memory.
-    let egressViewThisTurn: EgressViewRow[] | null = null;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
     // image-rescale) — segment 3 records this, not processedMessages, so the
     // log view is position-for-position what outbound saw.
@@ -624,37 +618,24 @@ export async function prepareOpenai(
         if (!isTitleGen && featureEnabled("egressServeLog")) {
             const st = getStore().egressOpLogStore();
             if (st) {
-                let ladder: { elements: ReturnType<typeof coreToOpenai>; logSeq: number; rows: number } | null = null;
                 try {
-                    // #7439 ruling 3: no in-memory cache — the prev view is
-                    // read from the flow table (single source of truth); the
-                    // current turn's ops are appended, then the outbound is
-                    // rebuilt from the flow.
-                    egressViewThisTurn = recordEgressTurn({
+                    session.egressView = recordEgressTurn({
                         store: st,
                         sessionId,
+                        prev: session.egressView,
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                     });
-                    // #7439 ruling 5: the degradation ladder — current point
-                    // first, then walk back to the nearest healthy flow point
-                    // (NEVER a fallback to client bytes).
-                    ladder = rebuildOutboundWithLadder(st, sessionId);
+                    const reb = rebuildOutboundFromLog(session.egressView);
+                    if (reb !== null) {
+                        rebuiltMessages = reb.elements;
+                        egressServedFromLog = true;
+                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log`);
+                    }
                 } catch (err) {
-                    log("warn", `[${sessionId}] egress-serve rebuild failed: ${String(err)}`);
-                }
-                if (ladder !== null) {
-                    rebuiltMessages = ladder.elements;
-                    egressServedFromLog = true;
-                    log("info", `[${sessionId}] egress-serve: served ${ladder.rows} rows from flow (logSeq=${ladder.logSeq})`);
-                } else {
-                    // whole flow unreadable — session-level recovery (log +
-                    // admin surface); the request fails rather than serving
-                    // client bytes (#7439 ruling 5).
-                    log("error", `[${sessionId}] egress-serve: WHOLE flow unreadable — session recovery, request fails`);
-                    session.metadata.egressFlowUnreadable = true;
-                    throw new Error(`[egress-serve] whole flow unreadable for session ${sessionId} — session recovery`);
+                    egressServedFromLog = false;
+                    log("warn", `[${sessionId}] egress-serve rebuild failed — legacy kept: ${String(err)}`);
                 }
             }
         }
@@ -849,7 +830,6 @@ export async function prepareOpenai(
     // #5403/#5418: on a watermark hit pin only this turn's window — the
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
-
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     // #5874 P2-final: the in-request snapshot flush above already persisted
@@ -877,13 +857,6 @@ export async function prepareOpenai(
             wpResponseHeaders[MSGID_MODE_HEADER] = s0PinMode;
         }
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
-    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
-        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
-        // heartbeat still must flow or the client's watermark freezes and its
-        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
-        // saved state (the fastpath re-establishes both when it next runs).
-        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
-        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
     // #7398 seg 3: shadow-record this turn's outbound conversation view as
@@ -893,34 +866,30 @@ export async function prepareOpenai(
     if (!isTitleGen && featureEnabled("egressOpLog")) {
         try {
             const st = getStore().egressOpLogStore();
-            // #7439 ruling 3: no in-memory cache — skip if the serve path
-            // already recorded this turn (egressViewThisTurn is set);
-            // otherwise record without prev (the prev view is read from the
-            // flow table, the single source of truth).
-            if (st && egressViewThisTurn === null) {
-                egressViewThisTurn = recordEgressTurn({
+            if (st && session.egressView === undefined) {
+                session.egressView = recordEgressTurn({
                     store: st,
                     sessionId,
+                    prev: session.egressView,
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
             }
         } catch (err) {
-            egressViewThisTurn = null;
+            session.egressView = undefined;
             log("warn", `[${sessionId}] egress op-log recording disabled for this session: ${String(err)}`);
         }
     }
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
-    // from the log (self-contained bytes, #7439) and byte-compare against the
-    // legacy elements. NO swap: the pipeline always sends the legacy bytes;
-    // this measures the identity rate the swap will rely on (rollout
-    // egressServeLog, default 0; requires egressOpLog on, since it reads the
-    // recorded view).
+    // from the log and byte-compare against the legacy elements. NO
+    // swap: the pipeline always sends the legacy bytes; this measures the
+    // identity rate the swap will rely on (rollout egressServeLog, default 0;
+    // requires egressOpLog on, since it reads the recorded view).
     if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
-            const view = egressViewThisTurn;
+            const view = session.egressView;
             if (st && view && legacyCoreElements !== undefined) {
                 const reb = rebuildOutboundFromLog(view);
                 if (reb === null) {

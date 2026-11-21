@@ -25,7 +25,7 @@ import {
     egressStateCompact,
     egressStateView,
 } from "../src/storage/egress-state.ts";
-import { buildEgressViewRows, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
+import { EGRESS_SYSTEM_MSGID, buildEgressViewRows, recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
 import { featureEnabled } from "../src/rollout.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -63,7 +63,7 @@ test("buildEgressViewRows: deterministic, system row first, content-edit visible
     const r1 = buildEgressViewRows(conv, "SYS");
     const r2 = buildEgressViewRows([M("a", "hello"), M("b", "world", "assistant")], "SYS");
     assert.deepEqual(r1, r2, "same inputs → identical rows");
-    assert.equal(r1[0].msgid.startsWith("system:"), true);
+    assert.equal(r1[0].msgid, EGRESS_SYSTEM_MSGID, "system row carries the constant msgid (no hash)");
     assert.equal(r1.length, 3);
     assert.equal(r1[1].msgid, "a");
     assert.equal(r1[1].type, "text");
@@ -93,7 +93,7 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
         const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });
-        assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["system:" + view[0].msgid.slice(7), "a", "b", "c"]);
+        assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "c"]);
     } finally {
         close(H);
     }

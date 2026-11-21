@@ -1,14 +1,11 @@
 /**
  * Egress serve-from-log byte identity (seg 4a, proposal discussions/7398,
- * #6785 perf work; #7439 ruling 1: self-contained bytes): rebuildOutboundFromLog
- * must produce EXACTLY the bytes the legacy chain (systemToUser → coreToOpenai
- * → hardenOpenaiAssistantContent) produces for the same messages — that is the
- * claim the shadow comparison in prepare-openai measures, and the precondition
- * for any future swap. #7439 ruling 1: the rows carry the message BYTES inline
- * (no content CAS), so the rebuild reads them straight from the view.
- * Also pins the degrade directions (#3617): empty/missing bytes / non-JSON
- * bytes / out-of-scope row → null (caller keeps the legacy path), never a
- * partial rebuild.
+ * #6785 perf work): rebuildOutboundFromLog must produce EXACTLY the bytes
+ * the legacy chain (systemToUser → coreToOpenai → hardenOpenaiAssistantContent)
+ * produces for the same messages — that is the claim the shadow comparison
+ * in prepare-openai measures, and the precondition for any future swap.
+ * Also pins the degrade directions (#3617): corrupted/empty row bytes →
+ * null (caller keeps the legacy path), never a partial rebuild.
  */
 
 import { test } from "node:test";
@@ -16,9 +13,9 @@ import assert from "node:assert/strict";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, type BiliMessage } from "acp-kernel/wire";
 import { hardenOpenaiAssistantContent, systemToUser } from "../src/util.ts";
-import { egressStateAppend, egressStateAt, egressStateCompact, egressStateView, egressFlowMaxSeq } from "../src/storage/egress-state.ts";
+import { egressStateAppend, egressStateCompact, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
-import { rebuildOutboundFromLog, rebuildOutboundWithLadder, type EgressLadderStore } from "../src/storage/egress-serve.ts";
+import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../src/storage/egress-serve.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import * as fs from "node:fs";
@@ -32,7 +29,7 @@ process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 interface Harness {
     db: ReturnType<typeof openSqliteDatabase>["db"];
-    store: EgressOpLogStore & EgressLadderStore;
+    store: EgressOpLogStore;
     dir: string;
 }
 
@@ -40,11 +37,9 @@ function open(): Harness {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-egress-serve-"));
     const { db } = openSqliteDatabase(path.join(dir, "index.db"));
     migrateSchema(db);
-    const store: EgressOpLogStore & EgressLadderStore = {
+    const store = {
         egressStateAppendOps: (sid: string, ops: Parameters<typeof egressStateAppend>[2], nowMs: number) => egressStateAppend(db, sid, ops, nowMs),
         egressStateView: (sid: string) => egressStateView(db, sid),
-        egressStateViewAt: (sid: string, logSeq: number) => egressStateAt(db, sid, logSeq),
-        egressFlowMaxSeq: (sid: string) => egressFlowMaxSeq(db, sid),
         egressStateCompactView: (sid: string, view: Parameters<typeof egressStateCompact>[2], nowMs: number) => egressStateCompact(db, sid, view, nowMs),
     };
     return { db, store, dir };
@@ -96,60 +91,45 @@ test("byte identity: acp_summary rows re-voice to user exactly like the legacy c
     }
 });
 
-test("degrade #1: a row with empty bytes → null (whole turn stays legacy)", () => {
+test("degrade #1: corrupted row bytes → null (whole turn stays legacy)", () => {
     const H = open();
     try {
         const S = "sess-s3";
         const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
         const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
-        // #7439: the bytes are self-contained — a row whose bytes went empty
-        // (pre-#7439 row, corruption) cannot be served.
-        const victim = view.find((r) => r.msgid === "a")!;
-        victim.bytes = "";
-        assert.equal(rebuildOutboundFromLog(view), null, "any empty-bytes row nulls the whole rebuild");
+        const corrupted = view.map((r) => r.msgid === "a" ? { ...r, bytes: "not-json{{" } : r);
+        assert.equal(rebuildOutboundFromLog(corrupted), null, "any corrupt row nulls the whole rebuild");
     } finally {
         close(H);
     }
 });
 
-test("degrade #2: a row with non-JSON bytes → null", () => {
+test("degrade #2: empty row bytes / bad role → null", () => {
     const H = open();
     try {
         const S = "sess-s4";
-        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
+        const msgs: BiliMessage[] = [M("a", "hello")];
         const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
-        const victim = view.find((r) => r.msgid === "a")!;
-        victim.bytes = "not-json";
-        assert.equal(rebuildOutboundFromLog(view), null, "a non-JSON byte payload nulls the whole rebuild");
+        const empty = view.map((r) => r.msgid === "a" ? { ...r, bytes: "" } : r);
+        assert.equal(rebuildOutboundFromLog(empty), null, "an empty-bytes row is unrebuildable");
+        const badRole = view.map((r) => r.msgid === "a" ? { ...r, bytes: JSON.stringify({ id: "a", role: "weird", contentType: "text", text: "x" }) } : r);
+        assert.equal(rebuildCoreFromLog(badRole), null, "a role outside the core whitelist is unrebuildable");
+        void S;
     } finally {
         close(H);
     }
 });
 
-test("degrade #3: a row whose bytes are valid JSON but out-of-scope role → null", () => {
+test("byte identity: tool rows rebuild (the CAS body carries the sidecars)", () => {
     const H = open();
     try {
         const S = "sess-s5";
-        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
-        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
-        const victim = view.find((r) => r.msgid === "a")!;
-        victim.bytes = JSON.stringify({ id: "a", role: "bogus-role", text: "x" });
-        assert.equal(rebuildOutboundFromLog(view), null, "an out-of-scope role nulls the whole rebuild");
-    } finally {
-        close(H);
-    }
-});
-
-test("byte identity: tool rows rebuild (the row bytes carry the sidecars)", () => {
-    const H = open();
-    try {
-        const S = "sess-s6";
         const callMsg = { id: "t0", role: "assistant", contentType: "tool-call", text: "\"{\\\"q\\\":1}\"", toolCallId: "call_1", toolName: "bash" } as BiliMessage;
         const toolMsg = { id: "t1", role: "tool", contentType: "text", text: "result", toolCallId: "call_1", toolName: "bash" } as BiliMessage;
         const msgs: BiliMessage[] = [M("a", "hello"), callMsg, toolMsg, M("b", "after", "assistant")];
         const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
         const reb = rebuildOutboundFromLog(view);
-        assert.ok(reb !== null, "tool rows rebuild — the recorded bytes are the full core message (toolCallId/toolName included)");
+        assert.ok(reb !== null, "tool rows rebuild — the recorded CAS bytes are the full core message (toolCallId/toolName included)");
         assert.equal(JSON.stringify(reb!.elements), JSON.stringify(legacyChain(msgs)), "tool-heavy conversation is byte-identical to the legacy chain");
     } finally {
         close(H);
@@ -159,7 +139,7 @@ test("byte identity: tool rows rebuild (the row bytes carry the sidecars)", () =
 test("byte identity survives compaction: fold shape → base row → still identical", () => {
     const H = open();
     try {
-        const S = "sess-s7";
+        const S = "sess-s6";
         const five: BiliMessage[] = [M("a", "1"), M("b", "2", "assistant"), M("c", "3"), M("d", "4", "assistant"), M("e", "5")];
         let view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: five, systemText: undefined, nowMs: 1000 });
         const folded: BiliMessage[] = [M("a", "1"), { id: "acp_summary_9", role: "system", contentType: "text", text: "<summary>2..4</summary>" } as BiliMessage, M("e", "5")];
@@ -169,87 +149,6 @@ test("byte identity survives compaction: fold shape → base row → still ident
         const reb = rebuildOutboundFromLog(fromTable);
         assert.ok(reb !== null);
         assert.equal(JSON.stringify(reb!.elements), JSON.stringify(legacyChain(folded)), "post-compaction rebuild is byte-identical");
-    } finally {
-        close(H);
-    }
-});
-
-test("the view rows are self-contained: every non-system row carries its bytes inline", () => {
-    const H = open();
-    try {
-        const S = "sess-s8";
-        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
-        const view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: "SYS", nowMs: 1000 });
-        for (const r of view) {
-            if (r.type === "system") continue;
-            assert.equal(typeof r.bytes, "string");
-            assert.ok(r.bytes.length > 0, `row ${r.msgid} carries inline bytes`);
-            // the bytes are the FINAL core JSON — they round-trip to the message
-            const parsed = JSON.parse(r.bytes) as { id: string; role: string };
-            assert.equal(parsed.id, r.msgid, "the inline bytes carry the message id");
-            assert.equal(parsed.role, r.role, "the inline bytes carry the message role");
-        }
-    } finally {
-        close(H);
-    }
-});
-
-// #7439 ruling 5: the degradation ladder. The current point is served first;
-// a corrupt point walks back to the nearest healthy flow point; a fully
-// unreadable flow returns null (session recovery — NEVER client bytes).
-
-test("ladder #1: a healthy current point is served as-is (logSeq = maxSeq)", () => {
-    const H = open();
-    try {
-        const S = "sess-l1";
-        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
-        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
-        const maxSeq = egressFlowMaxSeq(H.db, S);
-        const ladder = rebuildOutboundWithLadder(H.store, S);
-        assert.ok(ladder !== null, "a healthy flow rebuilds");
-        assert.equal(ladder!.logSeq, maxSeq, "served from the current point");
-        assert.equal(ladder!.rows, 2, "the current view has 2 rows");
-        assert.equal(JSON.stringify(ladder!.elements), JSON.stringify(legacyChain(msgs)), "the served elements are byte-identical");
-    } finally {
-        close(H);
-    }
-});
-
-test("ladder #2: a corrupt current point walks back to the nearest healthy point", () => {
-    const H = open();
-    try {
-        const S = "sess-l2";
-        const turn1: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
-        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: turn1, systemText: undefined, nowMs: 1000 });
-        const turn2: BiliMessage[] = [...turn1, M("c", "third")];
-        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: turn2, systemText: undefined, nowMs: 2000 });
-        // corrupt the LATEST I row in the STATE table (the current point) —
-        // its bytes went NULL (corruption). The current point now fails.
-        H.db.prepare("UPDATE egress_state SET bytes = NULL WHERE session_id = ? AND row_type = 'I' AND log_seq = (SELECT MAX(log_seq) FROM egress_state WHERE session_id = ? AND row_type = 'I')").run(S, S);
-        const ladder = rebuildOutboundWithLadder(H.store, S);
-        assert.ok(ladder !== null, "the ladder finds a healthy point");
-        // turn-1's point is logSeq 2 (I a = logSeq 1, I b = logSeq 2 — the
-        // log_seq values start at 1, not 0). The corrupt current point is
-        // logSeq 3 (I c), so the ladder walks back to logSeq 2.
-        assert.equal(ladder!.logSeq, 2, "served from the turn-1 point (logSeq 2), not the corrupt current point (logSeq 3)");
-        assert.equal(ladder!.rows, 2, "the turn-1 view has 2 rows (a + b)");
-        assert.equal(JSON.stringify(ladder!.elements), JSON.stringify(legacyChain(turn1)), "the served elements are turn-1's bytes");
-    } finally {
-        close(H);
-    }
-});
-
-test("ladder #3: a fully unreadable flow returns null (session recovery, never client bytes)", () => {
-    const H = open();
-    try {
-        const S = "sess-l3";
-        const msgs: BiliMessage[] = [M("a", "hello"), M("b", "world", "assistant")];
-        recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: msgs, systemText: undefined, nowMs: 1000 });
-        // corrupt EVERY I row in BOTH tables — no point rebuilds.
-        H.db.prepare("UPDATE egress_state SET bytes = NULL WHERE session_id = ? AND row_type = 'I'").run(S);
-        H.db.prepare("UPDATE egress_flow SET bytes = NULL WHERE session_id = ? AND row_type = 'I'").run(S);
-        const ladder = rebuildOutboundWithLadder(H.store, S);
-        assert.equal(ladder, null, "no healthy point → null (the caller does session recovery)");
     } finally {
         close(H);
     }

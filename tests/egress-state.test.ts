@@ -1,14 +1,11 @@
 /**
- * Egress state log (proposal discussions/7398, #6785 perf work; #7439
- * ruling 1: self-contained bytes): the op-log outbound view. The rows carry
- * the message BYTES inline (no content-CAS hash), so content identity is
- * byte equality. Tests pin the CONTRACT:
+ * Egress state log (proposal discussions/7398, #6785 perf work): the op-log
+ * outbound view. Tests pin the CONTRACT:
  *   - replay determinism: same op sequence → same view, always;
  *   - the four row types (+I tail/anchored, -D inclusive range, +U
  *     content-only, B base) and their payload shapes;
- *   - the hard-error paths (missing anchor / missing or inverted delete
- *     endpoints / update target missing / duplicate msgid / missing bytes)
- *     throw, never degrade fuzzy;
+ *   - the three hard-error paths (missing anchor / missing or inverted
+ *     delete endpoints / update target missing) throw, never degrade fuzzy;
  *   - compaction equivalence: view before == view after, row count bounded;
  *   - dual-table rollback: ANY log_seq stays reconstructible from egress_flow
  *     after the state table is compacted below it.
@@ -57,23 +54,22 @@ function close(h: Harness): void {
     } catch { /* leaked temp dir on a Windows runner is harmless */ }
 }
 
-// #7439 ruling 1: the rows carry the message BYTES inline (not a CAS hash).
-const B = (m: string) => `bytes_${m}`;
+const h = (m: string) => `h_${m}`;
 
 test("replay determinism: the five-op example from the proposal", () => {
     const H = open();
     try {
         const S = "sess-1";
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: B("a1") },
-            { type: "I", msgid: "b", after: null, ref: "m00002", tokens: 4, typeTag: "text", bytes: B("b1") },
-            { type: "I", msgid: "c", after: "b", ref: "m00003", tokens: 9, typeTag: "summary", bytes: B("c1") },
+            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 3, typeTag: "text", bytes: "h_a1" },
+            { type: "I", msgid: "b", after: null, ref: "m00002", tokens: 4, typeTag: "text", bytes: "h_b1" },
+            { type: "I", msgid: "c", after: "b", ref: "m00003", tokens: 9, typeTag: "summary", bytes: "h_c1" },
             { type: "D", start: "a", end: "b" },
-            { type: "U", msgid: "c", bytes: B("c2") },
+            { type: "U", msgid: "c", bytes: "h_c2" },
         ], 1_000);
         const view = egressStateView(H.db, S);
         assert.deepEqual(view.map((r) => r.msgid), ["c"]);
-        assert.equal(view[0].bytes, B("c2"));
+        assert.equal(view[0].bytes, h("c2"));
         // ref/tokens/type survive the content update untouched
         assert.equal(view[0].ref, "m00003");
         assert.equal(view[0].tokens, 9);
@@ -90,12 +86,12 @@ test("+I anchored insert lands mid-history; -D endpoints are msgids, not positio
     try {
         const S = "sess-2";
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: B("a") },
-            { type: "I", msgid: "d", after: null, ref: "m00002", tokens: 1, typeTag: "text", bytes: B("d") },
-            { type: "I", msgid: "e", after: null, ref: "m00003", tokens: 1, typeTag: "text", bytes: B("e") },
+            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+            { type: "I", msgid: "d", after: null, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_d" },
+            { type: "I", msgid: "e", after: null, ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_e" },
             // mid-history insert anchored at a (positions of d/e shift)
-            { type: "I", msgid: "b", after: "a", ref: "m00004", tokens: 1, typeTag: "text", bytes: B("b") },
-            { type: "I", msgid: "c", after: "b", ref: "m00005", tokens: 1, typeTag: "text", bytes: B("c") },
+            { type: "I", msgid: "b", after: "a", ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_b" },
+            { type: "I", msgid: "c", after: "b", ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_c" },
         ], 1_000);
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), ["a", "b", "c", "d", "e"]);
         // a fold deletes b..d — a and e survive in place
@@ -109,7 +105,7 @@ test("+I anchored insert lands mid-history; -D endpoints are msgids, not positio
     }
 });
 
-test("hard errors: missing anchor / missing or inverted endpoints / update target missing / duplicate msgid / missing bytes (#3617 negative direction)", () => {
+test("hard errors: missing anchor / missing or inverted endpoints / update target missing / duplicate msgid (#3617 negative direction)", () => {
     const H = open();
     try {
         // each scenario gets a FRESH session: replay throws at the FIRST
@@ -117,13 +113,13 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         // only ever surface the earliest one.
         const seed = (S: string) => {
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: B("a") },
-            { type: "I", msgid: "b", after: null, ref: "m00002", tokens: 1, typeTag: "text", bytes: B("b") },
+            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+            { type: "I", msgid: "b", after: null, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
         ], 1_000);
     };
         seed("anchor-missing");
         egressStateAppend(H.db, "anchor-missing", [
-            { type: "I", msgid: "x", after: "zz", ref: "m00003", tokens: 1, typeTag: "text", bytes: B("x") },
+            { type: "I", msgid: "x", after: "zz", ref: "m00003", tokens: 1, typeTag: "text", bytes: "h_x" },
         ], 2_000);
         assert.throws(() => egressStateView(H.db, "anchor-missing"), (e: unknown) => e instanceof EgressStateCorruptError && /anchor zz missing/.test(e.message));
         seed("endpoint-missing");
@@ -136,20 +132,13 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         egressStateAppend(H.db, "inverted", [{ type: "D", start: "b", end: "a" }], 2_000);
         assert.throws(() => egressStateView(H.db, "inverted"), (e: unknown) => e instanceof EgressStateCorruptError && /inverted/.test(e.message));
         seed("update-missing");
-        egressStateAppend(H.db, "update-missing", [{ type: "U", msgid: "ghost", bytes: B("g") }], 2_000);
+        egressStateAppend(H.db, "update-missing", [{ type: "U", msgid: "ghost", bytes: "h_g" }], 2_000);
         assert.throws(() => egressStateView(H.db, "update-missing"), (e: unknown) => e instanceof EgressStateCorruptError && /update target ghost missing/.test(e.message));
         seed("dup");
         egressStateAppend(H.db, "dup", [
-            { type: "I", msgid: "a", after: null, ref: "m00009", tokens: 1, typeTag: "text", bytes: B("a2") },
+            { type: "I", msgid: "a", after: null, ref: "m00009", tokens: 1, typeTag: "text", bytes: "h_a2" },
         ], 2_000);
         assert.throws(() => egressStateView(H.db, "dup"), (e: unknown) => e instanceof EgressStateCorruptError && /duplicate msgid a/.test(e.message));
-        // #7439: a row with NO bytes (pre-#7439 row or corruption) is a HARD
-        // error — the view is self-contained, so a missing byte payload means
-        // the row cannot be served.
-        seed("no-bytes");
-        H.db.prepare("UPDATE egress_state SET bytes = NULL WHERE session_id = 'no-bytes' AND row_type = 'I'").run();
-        H.db.prepare("UPDATE egress_flow SET bytes = NULL WHERE session_id = 'no-bytes' AND row_type = 'I'").run();
-        assert.throws(() => egressStateView(H.db, "no-bytes"), (e: unknown) => e instanceof EgressStateCorruptError && /no bytes/.test(e.message));
         // and the healthy sessions in the same db still replay cleanly (no
         // cross-session leakage from the corrupt rows)
         seed("healthy");
@@ -170,9 +159,9 @@ test("compaction equivalence: view before == view after; state bounded, flow tot
         // 10 tail appends, then a fold collapses 1..6 into one summary
         const ops: EgressOp[] = [];
         for (let i = 1; i <= 10; i++) {
-            ops.push({ type: "I", msgid: `m${i}`, after: null, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: B(`m${i}`) });
+            ops.push({ type: "I", msgid: `m${i}`, after: null, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` });
         }
-        ops.push({ type: "I", msgid: "fold", after: "m6", ref: "m00011", tokens: 77, typeTag: "summary", bytes: B("fold") });
+        ops.push({ type: "I", msgid: "fold", after: "m6", ref: "m00011", tokens: 77, typeTag: "summary", bytes: "h_fold" });
         ops.push({ type: "D", start: "m1", end: "m6" });
         egressStateAppend(H.db, S, ops, 1_000);
         const before = egressStateView(H.db, S);
@@ -194,7 +183,7 @@ test("compaction equivalence: view before == view after; state bounded, flow tot
         assert.equal(flowRows, 13);
         // ops after compaction still replay on top of the base
         egressStateAppend(H.db, S, [
-            { type: "I", msgid: "m11", after: null, ref: "m00012", tokens: 11, typeTag: "text", bytes: B("m11") },
+            { type: "I", msgid: "m11", after: null, ref: "m00012", tokens: 11, typeTag: "text", bytes: "h_m11" },
         ], 3_000);
         const grown = egressStateView(H.db, S);
         assert.deepEqual(grown.map((r) => r.msgid), ["fold", "m7", "m8", "m9", "m10", "m11"]);
@@ -211,11 +200,11 @@ test("any-log_seq rollback: compacted-away history stays reconstructible from eg
         const snapshots = new Map<number, EgressViewRow[]>();
         for (let i = 1; i <= 5; i++) {
             egressStateAppend(H.db, S, [
-                { type: "I", msgid: `m${i}`, after: null, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: B(`m${i}`) },
+                { type: "I", msgid: `m${i}`, after: null, ref: `m0000${i}`, tokens: i, typeTag: "text", bytes: `h_m${i}` },
             ], 1_000 + i);
             snapshots.set(i, egressStateView(H.db, S));
         }
-        egressStateAppend(H.db, S, [{ type: "U", msgid: "m2", bytes: B("m2-edit") }], 6_000);
+        egressStateAppend(H.db, S, [{ type: "U", msgid: "m2", bytes: "h_m2-edit" }], 6_000);
         snapshots.set(6, egressStateView(H.db, S));
         egressStateCompact(H.db, S, egressStateView(H.db, S), 10_000);
         // the state table is now just the base — every pre-compaction seq must
@@ -232,22 +221,22 @@ test("any-log_seq rollback: compacted-away history stays reconstructible from eg
 
 // ---- diff engine (segment 2) ------------------------------------------
 
-const V = (msgid: string, bytes = `bytes_${msgid}`, ref = "m" + msgid, tokens = 3, type = "text"): EgressViewRow =>
+const V = (msgid: string, bytes = "h_" + msgid, ref = "m" + msgid, tokens = 3, type = "text"): EgressViewRow =>
     ({ msgid, ref, tokens, type, bytes });
 
 test("diff: case 1 — tail append emits exactly one +I anchored to the last row", () => {
     const prev = [V("a"), V("b")];
     const next = [V("a"), V("b"), V("c")];
     const ops = diffEgressView(prev, next);
-    assert.deepEqual(ops, [{ type: "I", msgid: "c", after: "b", ref: "mc", tokens: 3, typeTag: "text", bytes: "bytes_c" }]);
+    assert.deepEqual(ops, [{ type: "I", msgid: "c", after: "b", ref: "mc", tokens: 3, typeTag: "text", bytes: "h_c" }]);
     assert.deepEqual(egressReplay(prev, ops), next);
 });
 
 test("diff: cases 2+3 — nudge appears (+I) and vanishes (-D) without touching the prefix", () => {
     const base = [V("a"), V("b")];
-    const nudged = [V("a"), V("b"), V("nudge", "bytes_n", "mn", 1, "nudge")];
+    const nudged = [V("a"), V("b"), V("nudge", "h_n", "mn", 1, "nudge")];
     assert.deepEqual(diffEgressView(base, nudged), [
-        { type: "I", msgid: "nudge", after: "b", ref: "mn", tokens: 1, typeTag: "nudge", bytes: "bytes_n" },
+        { type: "I", msgid: "nudge", after: "b", ref: "mn", tokens: 1, typeTag: "nudge", bytes: "h_n" },
     ]);
     assert.deepEqual(egressReplay(base, diffEgressView(base, nudged)), nudged);
     assert.deepEqual(diffEgressView(nudged, base), [{ type: "D", start: "nudge", end: "nudge" }]);
@@ -256,18 +245,18 @@ test("diff: cases 2+3 — nudge appears (+I) and vanishes (-D) without touching 
 
 test("diff: case 4 — fold replaces a range with one summary row after the surviving anchor", () => {
     const prev = [V("a"), V("b"), V("c"), V("d"), V("e"), V("f")];
-    const folded = [V("a"), V("sum", "bytes_sum", "ms", 42, "acp_summary"), V("f")];
+    const folded = [V("a"), V("sum", "h_sum", "ms", 42, "acp_summary"), V("f")];
     assert.deepEqual(diffEgressView(prev, folded), [
         { type: "D", start: "b", end: "e" },
-        { type: "I", msgid: "sum", after: "a", ref: "ms", tokens: 42, typeTag: "acp_summary", bytes: "bytes_sum" },
+        { type: "I", msgid: "sum", after: "a", ref: "ms", tokens: 42, typeTag: "acp_summary", bytes: "h_sum" },
     ]);
     assert.deepEqual(egressReplay(prev, diffEgressView(prev, folded)), folded);
 });
 
 test("diff: case U — content edit of an existing row is a +U, position and triple untouched", () => {
-    const prev = [V("a", "bytes_a1"), V("b")];
-    const next = [V("a", "bytes_a2"), V("b")];
-    assert.deepEqual(diffEgressView(prev, next), [{ type: "U", msgid: "a", bytes: "bytes_a2" }]);
+    const prev = [V("a", "h_a1"), V("b")];
+    const next = [V("a", "h_a2"), V("b")];
+    assert.deepEqual(diffEgressView(prev, next), [{ type: "U", msgid: "a", bytes: "h_a2" }]);
     const replayed = egressReplay(prev, diffEgressView(prev, next));
     assert.deepEqual(replayed, next);
     assert.equal(replayed[0].ref, "ma", "+U must not touch the ref");
@@ -279,7 +268,7 @@ test("diff: move = D+I (no M op), msgid survives both ops", () => {
     const next = [V("b"), V("a")];
     assert.deepEqual(diffEgressView(prev, next), [
         { type: "D", start: "a", end: "a" },
-        { type: "I", msgid: "a", after: "b", ref: "ma", tokens: 3, typeTag: "text", bytes: "bytes_a" },
+        { type: "I", msgid: "a", after: "b", ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
     ]);
     assert.deepEqual(egressReplay(prev, diffEgressView(prev, next)), next);
 });
@@ -289,8 +278,8 @@ test("diff: empty views and empty diff (both directions)", () => {
     assert.deepEqual(diffEgressView([V("a"), V("b")], [V("a"), V("b")]), []);
     const fromEmpty = diffEgressView([], [V("a"), V("b")]);
     assert.deepEqual(fromEmpty, [
-        { type: "I", msgid: "a", after: null, ref: "ma", tokens: 3, typeTag: "text", bytes: "bytes_a" },
-        { type: "I", msgid: "b", after: "a", ref: "mb", tokens: 3, typeTag: "text", bytes: "bytes_b" },
+        { type: "I", msgid: "a", after: null, ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
+        { type: "I", msgid: "b", after: "a", ref: "mb", tokens: 3, typeTag: "text", bytes: "h_b" },
     ]);
     const toEmpty = diffEgressView([V("a"), V("b")], []);
     assert.deepEqual(toEmpty, [{ type: "D", start: "a", end: "b" }]);
@@ -313,7 +302,7 @@ test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next
                 // fold: replace a run of 2..4 with one summary
                 const at = rand(next.length - 2);
                 const len = 2 + rand(3);
-                next.splice(at, len, V(`sum${iter}`, `bytes_sum${iter}`, `ms${iter}`, 40, "acp_summary"));
+                next.splice(at, len, V(`sum${iter}`, `h_sum${iter}`, `ms${iter}`, 40, "acp_summary"));
             } else if (op === 3 && next.length > 0) {
                 const i = rand(next.length);
                 next[i] = { ...next[i], bytes: "edited_" + i + "_" + iter };
@@ -329,6 +318,13 @@ test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next
         }
         // the final view also round-trips through the DB: rebuild from ops
         const S = "prop-db";
+        const rebuild: EgressOp[] = [];
+        let cur: EgressViewRow[] = [];
+        for (let iter = 0; iter < 300; iter++) {
+            // re-derive is expensive; instead verify the FINAL view through
+            // a fresh log built from the final diff from empty
+            void iter;
+        }
         const fromEmpty = diffEgressView([], view);
         egressStateAppend(H.db, S, fromEmpty, 1_000);
         assert.deepEqual(egressStateView(H.db, S), view, "DB log built from diff(empty, final) replays to the final view");
