@@ -30,7 +30,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createCore, createInitialState, defaultConfig, assignRefs, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { flatFileNameFor } from "acp-kernel/persist";
-import { SessionStore, relPathFor, type Session } from "../src/persist.ts";
+import { SessionStore, relPathFor } from "../src/persist.ts";
+import type { Session } from "../src/session.ts";
 import { canonicalize, sha256 } from "../tests/golden-canonical.ts";
 
 const CORPUS_ROOT = path.resolve(import.meta.dirname, "../tests/golden/storage-corpus");
@@ -93,10 +94,12 @@ type SessionLike = Omit<Session,
     inFlight: number;
 };
 
-function baseSession(id: string, protocol: Session["meta"]["protocol"], e: Engine, patch: Partial<SessionLike> = {}): Session {
+function baseSession(id: string, protocol: string, e: Engine, patch: Partial<SessionLike> = {}): Session {
     const s: SessionLike = {
         id,
-        meta: { protocol, upstreamOrigin: "http://127.0.0.1:8199", label: `corpus-${id}`, title: `Corpus ${id}`, activePack: undefined, hostTitle: undefined },
+        // The corpus deliberately stores non-WireProtocol labels ("chat" in
+        // the tier2/fork-* cases — see the committed fixtures).
+        meta: { protocol, upstreamOrigin: "http://127.0.0.1:8199", label: `corpus-${id}`, title: `Corpus ${id}`, activePack: undefined, hostTitle: undefined } as Session["meta"],
         stats: {
             requests: 7, tokensSaved: 12345, inputTokens: 234567, cachedTokens: 123456, outputTokens: 3456,
             cacheSamples: 7, lastInputTokens: 45678, contextTokens: 45678, contextTokensSource: "usage",
@@ -276,7 +279,7 @@ async function main(): Promise<void> {
             version: 1,
             byHash: { [sha256("original tool output corpus-1")]: "original tool output corpus-1" },
             byRef: {
-                [refFor(e, "raw4")!]: { kind: "tool_result", rawId: "raw4", ref: refFor(e, "raw4")!, text: "original tool output corpus-1", tokens: 40, chars: 27, head: "original tool output c" },
+                [refFor(e, "raw4")!]: { kind: "tool_result", rawId: "raw4", hash: sha256("original tool output corpus-1"), tokens: 40, chars: 27, head: "original tool output c" },
             },
         };
         const session = baseSession("corpus-fork-receipt", "chat", e, {
@@ -377,8 +380,8 @@ async function main(): Promise<void> {
                 [sha256("ccr original two")]: "ccr original two",
             },
             byRef: {
-                [refFor(e, "raw6")!]: { kind: "tool_result", rawId: "raw6", ref: refFor(e, "raw6")!, text: "ccr original one", tokens: 33, chars: 16, head: "ccr original one" },
-                [refFor(e, "raw8")!]: { kind: "tool_result", rawId: "raw8", ref: refFor(e, "raw8")!, text: "ccr original two", tokens: 33, chars: 16, head: "ccr original two" },
+                [refFor(e, "raw6")!]: { kind: "tool_result", rawId: "raw6", hash: sha256("ccr original one"), tokens: 33, chars: 16, head: "ccr original one" },
+                [refFor(e, "raw8")!]: { kind: "tool_result", rawId: "raw8", hash: sha256("ccr original two"), tokens: 33, chars: 16, head: "ccr original two" },
             },
         };
         const session = baseSession("corpus-ccr", "responses", e, {
