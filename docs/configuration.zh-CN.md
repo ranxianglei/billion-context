@@ -292,6 +292,7 @@
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.requireNudge` | boolean | off (unset) | — | 禁止未提示的模型主动压缩（#5683/#5943）：只有 nudge 信用存活时才允许 compress——即距最近一次真正送达模型的压缩提醒不超过 20 个 MODEL 轮的窗口（advisory、模型自决指令、紧急提醒都算铸券；"gated"/"vetoed"/"skipped" 不算）；每次新注入刷新窗口，每个未提示的模型轮衰减 1（非模型请求形态既不刷新也不衰减）。成功折叠**不消耗**信用，分几轮压完 nudge 推荐的剩余范围仍然合法。否则拒绝并回错误回执；bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。 |
 | `compress.requireRecommendation` | boolean | off (unset) | — | 禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。 |
+| `compress.postComPressTail` | boolean | off (unset) | — | 在压缩成功回执里推荐「继续压缩」（#7318）：剩余可折叠范围列表与「Uncovered history remains」审计提示仅在开启时打印；默认关闭时两者都不出现（上下文已到底的停止信号不受影响）。开启后，未覆盖历史提示每个 nudge 注入周期最多发一次，新注入会重新打开（#6522/#6526）。之所以默认关闭：回执里反复推荐曾驱使模型无视用户停止指令无限折叠。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |

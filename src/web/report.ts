@@ -355,8 +355,8 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
     else {
         const CH = 150, PL = 52, PR = 14, PT = 8, PB = 20;
         const top = y + PT, bot = y + CH - PB, left = PAD + PL, right = W - PAD - PR;
-        const vals = lines.map((l) => Number(l.input) || 0);
-        let maxV = Math.max.apply(null, vals.concat(win ? [win] : []).concat(Number(d.systemPromptTokens) ? [Number(d.systemPromptTokens)] : []));
+        let maxV = lines.reduce((max, l) => Math.max(max, Number(l.input) || 0), -Infinity);
+        maxV = Math.max(maxV, win || -Infinity, Number(d.systemPromptTokens) || -Infinity);
         if (!(maxV > 0)) maxV = 1;
         const Xp = (i: number) => left + (lines.length <= 1 ? (right - left) / 2 : (i / (lines.length - 1)) * (right - left));
         const Yp = (v: number) => bot - (v / maxV) * (bot - top);
@@ -511,9 +511,9 @@ export function buildSessionReportSvg(d: ReportData, opts: ReportOpts = {}): Svg
                 }
                 const wAll = uLines.filter((ln) => (ln.at || 0) >= gs && (ln.at || 0) <= geT + 120000).map((ln) => ln.input || 0);
                 if (!wAll.length) return;
-                const gPeakAll = Math.max(...wAll);
-                const gPeak = Math.max(...wAll.filter((v) => v >= 0.25 * gPeakAll));
-                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : Math.min(...wAll.filter((v) => v >= 0.25 * gPeak));
+                const gPeakAll = wAll.reduce((max, v) => Math.max(max, v), -Infinity);
+                const gPeak = wAll.filter((v) => v >= 0.25 * gPeakAll).reduce((max, v) => Math.max(max, v), -Infinity);
+                const gBase = preMin !== null && preMin >= 0.25 * gPeak ? preMin : wAll.filter((v) => v >= 0.25 * gPeak).reduce((min, v) => Math.min(min, v), Infinity);
                 const gGrow = Math.max(0, gPeak - gBase);
                 gPts.push({ at: geT, s: folded, g: gGrow, pct: gGrow > 0 ? Math.round(folded / gGrow * 1000) / 10 : null });
                 gPrevEnd = geT;
