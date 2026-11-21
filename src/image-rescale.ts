@@ -150,9 +150,13 @@ function loadJimp(): Promise<JimpModule | null> {
 }
 
 // force (#3701 byte-shed ladder): adopts ANY strict byte reduction (not just <80%).
-// The 100 KiB trigger gate applies equally to both; a within-maxDim image is
-// re-encoded only if it exceeds the trigger. The byte-shed caller pre-filters
-// maxDim-fitting images before calling (egress-shed rung B).
+// Above-maxDim images are always re-encoded (downscaled) — no trigger gate. For
+// within-maxDim images the 100 KiB trigger gate IS applied as a cheap pre-filter:
+// an image at/below the trigger is skipped (re-encoding a small image rarely pays),
+// while one above it is re-encoded at the same dims and adopted only if strictly
+// smaller. The byte-shed caller pre-filters known-dim maxDim-fitting images before
+// calling (egress-shed rung B), so the within-maxDim branch is defensive — only hit
+// when the header dim parse fails or disagrees with the authoritative Jimp.read decode.
 async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();
@@ -220,10 +224,12 @@ export function clearRescaleEncodeCache(maxBytesForTest = ENCODE_CACHE_MAX_BYTES
 }
 
 /** #3701 byte-shed ladder step: forced re-encode at an explicit longest-edge dim.
- *  Unlike rescaleImage there is no trigger gate and no keep-ratio floor — any strict
- *  reduction is adopted; images already within maxDim are left alone. Returns the new
- *  base64 (same mime) or null when nothing was saved (unsupported format, jimp absent,
- *  or the re-encode did not shrink). Cached per hash+dim. */
+ *  Unlike rescaleImage there is no keep-ratio floor — any strict reduction is adopted.
+ *  Above-maxDim images are always re-encoded (downscaled). Within-maxDim images are
+ *  skipped at/below the 100 KiB trigger (cheap pre-filter) and re-encoded at the same
+ *  dims above it, adopted only if strictly smaller. Returns the new base64 (same mime)
+ *  or null when nothing was saved (unsupported format, jimp absent, at/below the
+ *  trigger, or the re-encode did not shrink). Cached per hash+dim. */
 export async function shedDownscaleImage(mediaType: string, b64: string, maxDim: number): Promise<string | null> {
     const mime = normalizeMime(mediaType);
     if (!mime || typeof b64 !== "string" || b64.length === 0 || !Number.isFinite(maxDim) || maxDim <= 0) return null;

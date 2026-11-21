@@ -151,3 +151,19 @@ test("a normal reset restores the production budget after a test override", asyn
     await shedDownscaleImage("image/png", input(0), 1);
     assert.equal(reads, 3, "the default reset restores normal cache admission");
 });
+
+test("forced within-maxDim: the 100 KiB trigger gate skips small, re-encodes large", async (t) => {
+    // A 1x1 image is within maxDim=1 (scale=1, no downscale). The forced path's
+    // trigger gate is a cheap pre-filter: below-trigger images are skipped entirely
+    // (no decode/re-encode), above-trigger images are re-encoded at the same dims and
+    // adopted only if strictly smaller. Pins both directions (#3617).
+    const pixels = new Jimp({ width: 1, height: 1 });
+    t.mock.method(pixels, "getBuffer", async () => Buffer.alloc(8));
+    t.mock.method(Jimp, "read", async () => pixels);
+
+    const below = "a".repeat(136532); // b64Bytes = 102399, below the 100 KiB trigger
+    const above = "a".repeat(136536); // b64Bytes = 102402, above the trigger
+
+    assert.equal(await shedDownscaleImage("image/png", below, 1), null, "below trigger is skipped");
+    assert.equal(await shedDownscaleImage("image/png", above, 1), Buffer.alloc(8).toString("base64"), "above trigger is re-encoded and adopted");
+});
