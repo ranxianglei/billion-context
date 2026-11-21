@@ -969,6 +969,14 @@ function resolveForeignSessionState(id: string): CompressionState | null {
     return getStore().loadStateForSearch(id);
 }
 
+// A search result that surfaced nothing — neither a summary block nor a folded
+// original. The derived-session fallback uses this to decide whether an
+// ancestor actually answered the query (#7001): the old summary-only precheck
+// skipped an ancestor whose only hit lived in its folded originals.
+function isSearchNoResult(text: string): boolean {
+    return text.startsWith("[No compressed blocks exist yet") || text.startsWith('[No blocks matched "');
+}
+
 export function executeSearchContextTarget(
     args: Record<string, unknown>,
     core: CompressionCore,
@@ -993,12 +1001,16 @@ export function executeSearchContextTarget(
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".
-        if (local.text.startsWith("[No compressed blocks exist yet") || local.text.startsWith('[No blocks matched "')) {
+        // #7001: run the FULL original-aware search per ancestor (not a
+        // summary-only precheck) and stop at the first real hit — a keyword
+        // retained only in an ancestor's folded originals must still be found,
+        // matching what the explicit conversation_id path below returns.
+        if (isSearchNoResult(local.text)) {
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
-                    const inherited = executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
-                    if (inherited.text.startsWith("Found ")) return inherited;
+                    const ancResult = executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    if (!isSearchNoResult(ancResult.text)) return ancResult;
                 }
             }
         }
