@@ -142,6 +142,9 @@ export const LIVE_FILES = [
     "tests/pack-install.test.ts",
     // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
     "tests/ci-janitor-fork-heads.test.ts",
+    // #4661: spawns real MCP shim children over stdio; the canned mock proxy
+    // is listen(0), so no zone band is needed — the entry is for the tripwire
+    "tests/issue4661-stale-binding.test.ts",
     // Heap-bounded log readers in isolated children; private files, no sockets.
     "tests/web-logs-query.test.ts",
     // Native-zstd absence is simulated in an isolated Node child; it binds
