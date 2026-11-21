@@ -156,6 +156,11 @@ export const LIVE_FILES = [
     // the zone band is irrelevant; the entry is for the tripwire, like
     // #5046/#4612.
     "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
     // #5625: opencode V2 hook-payload pins — three rows are in-process with a
     // fake fetch sink (no sockets bound), the setup-gate row starts a listen(0)
     // probe server and spawns `node --import tsx -e` children against it

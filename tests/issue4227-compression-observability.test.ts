@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { getCacheLedger } from "../src/cache-ledger.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.js";
 
@@ -38,7 +39,7 @@ type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] 
 
 function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): Ctx {
     const logs: string[] = [];
-    return {
+    const ctx: Ctx = {
         core: createCore(),
         config: defaultConfig(200000, overrides as never),
         messages,
@@ -58,6 +59,10 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
         log: (m: string) => { logs.push(m); },
         logs,
     };
+    // #7318: these tests assert the legacy recommendation tail — opt into
+    // compress.postComPressTail (default is now OFF).
+    storeUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
+    return ctx;
 }
 
 function withRefs(ctx: Ctx): Ctx {
@@ -178,6 +183,9 @@ test("#4227 wiring: internal-lane receipts judge on the round's own offer, not t
         pendingRetrievals: [], createdAt: Date.now(), lastSeen: Date.now(), blockContents: new Map(), inFlight: 0, persisted: false,
     };
     session.stats.lastInputTokensSource = "usage"; // usage-grade: statusInputBaseline returns it verbatim
+    // #7318: the recommendation tail is opt-in (default OFF) — this suite asserts the
+    // legacy tail, so enable compress.postComPressTail on the wiring session.
+    storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     const logs: string[] = [];
     const deps: PreflightDeps = {
         core, session, config, prompts: defaultPrompts, protocol: "responses",
