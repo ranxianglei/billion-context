@@ -2763,8 +2763,21 @@ export function warnResponsesReasoningPairs(
  *  reused. Compress-call args are parsed lazily (only when an active plugin
  *  block with recorded refs needs exact matching) and each call's args are
  *  parsed at most ONCE, whereas the old per-block scan reparsed them for
- *  every block. */
-function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>> } {
+ *  every block.
+ *
+ *  #7478: the CURRENT compress args shape is `content` as a PLAIN STRING of
+ *  line blocks ("m00150–m0220 topic\n<summary>…") per the kernel COMPRESS_TOOL
+ *  contract — the two JSON shapes above were the plugin-era formats. The line
+ *  format is now indexed too, and the strip verdict is upgraded from "range
+ *  matches" to "range matches AND the call carries the FULL summary text for
+ *  that range": hideConsumedCompressCalls (kernel/src/hide-consumed.ts) stubs
+ *  long JSON-shape summaries to exactly SUMMARY_STUB_CHARS chars + "…", so a
+ *  stubbed call is NOT a complete carrier — stripping its anchor would leave
+ *  zero full summaries on the wire (#5866). A line-format segment counts as
+ *  full when its length reaches the same stub signature threshold; unparseable
+ *  args, missing summaries, and stub-shaped text all fail safe to KEEP the
+ *  anchor. */
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>>; ensureFullRangeKeys: () => Set<string> } {
     const callIds = new Set<string>();
     const compressCalls: BiliMessage[] = [];
     for (const m of messages) {
@@ -2773,33 +2786,103 @@ function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; com
         if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
     }
     let rangePairs: Map<string, Set<string>> | null = null;
+    let fullRangeKeys: Set<string> | null = null;
     const ensureRangePairs = (): Map<string, Set<string>> => {
         if (!rangePairs) {
             rangePairs = new Map<string, Set<string>>();
+            fullRangeKeys = new Set<string>();
             for (const c of compressCalls) {
-                let parsed: unknown;
-                try {
-                    parsed = JSON.parse(c.text ?? "");
-                } catch {
-                    continue;
-                }
-                const obj = parsed as { startId?: string; endId?: string; content?: unknown };
-                const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
-                for (const r of ranges) {
-                    if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
-                    let ends = rangePairs.get(r.startId);
-                    if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
-                    ends.add(r.endId);
+                const entries = parseCarrierEntries(c.text ?? "");
+                for (const e of entries) {
+                    let ends = rangePairs.get(e.startRef);
+                    if (!ends) { ends = new Set<string>(); rangePairs.set(e.startRef, ends); }
+                    ends.add(e.endRef);
+                    if (e.carryingFull) fullRangeKeys.add(`${e.startRef}::${e.endRef}`);
                 }
             }
         }
         return rangePairs;
     };
-    return { callIds, compressCalls, ensureRangePairs };
+    return { callIds, compressCalls, ensureRangePairs, ensureFullRangeKeys: () => { ensureRangePairs(); return fullRangeKeys!; } };
+}
+
+// #7478: one parsed range entry of a compress call's args — which range it
+// quotes and whether the args still carry its FULL summary text (a call stubbed
+// by the kernel's consumed-call compaction no longer does; see #5866).
+interface CarrierEntry { startRef: string; endRef: string; carryingFull: boolean }
+
+// Stub signature of hideConsumedCompressCalls (kernel/src/hide-consumed.ts:
+// `clampPrefix(summary, 200 - 1) + "…"` → exactly 200 chars ending in "").
+// A genuine 200-char summary ending in "…" reads as a stub here → anchor kept
+// → the safe direction (never zero carriers). Mirrored, not imported: the
+// kernel constant is not exported and the host already mirrors kernel rules
+// at their seams (#17 discipline).
+const CARRIER_STUB_SIGNATURE = 200;
+function summaryIsFull(s: unknown): boolean {
+    return typeof s === "string" && !(s.length === CARRIER_STUB_SIGNATURE && s.endsWith("…"));
+}
+// #7478: the line-format header of one range block in a `content` string —
+// "m00150–m0220 optional topic" per the kernel COMPRESS_TOOL contract (en dash,
+// ASCII hyphen tolerated; canonical padded refs only, so prose mentions mid-
+// line never register).
+const LINE_CARRIER_HEADER = /^m(\d{5})(?:–|-)m(\d{5})\b/gm;
+function parseCarrierEntries(text: string): CarrierEntry[] {
+    const out: CarrierEntry[] = [];
+    // Adapters may persist rendered tag text in front of the args JSON — start
+    // at the first "{" like the kernel's parseCallText (hide-consumed.ts).
+    const start = text.indexOf("{");
+    if (start < 0) return out;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text.slice(start));
+    } catch {
+        return out;
+    }
+    if (!parsed || typeof parsed !== "object") return out;
+    const obj = parsed as { startId?: unknown; endId?: unknown; messageId?: unknown; content?: unknown };
+    const register = (r: { startId?: unknown; endId?: unknown; messageId?: unknown; summary?: unknown }, fullOverride?: boolean): void => {
+        const s = typeof r.startId === "string" ? r.startId : typeof r.messageId === "string" ? r.messageId : "";
+        const e = typeof r.endId === "string" ? r.endId : typeof r.messageId === "string" ? r.messageId : "";
+        if (!s || !e) return;
+        out.push({ startRef: s, endRef: e, carryingFull: fullOverride ?? summaryIsFull(r.summary) });
+    };
+    if (Array.isArray(obj.content)) {
+        for (const r of obj.content) {
+            if (r && typeof r === "object") register(r as { startId?: unknown; endId?: unknown; messageId?: unknown; summary?: unknown });
+        }
+    } else if (typeof obj.content === "string") {
+        // Stringified JSON array inside the args (#230, non-strict providers):
+        // same entries, same fullness rule.
+        let inner: unknown;
+        try {
+            inner = JSON.parse(obj.content);
+        } catch {
+            inner = undefined;
+        }
+        if (Array.isArray(inner)) {
+            for (const r of inner) {
+                if (r && typeof r === "object") register(r as { startId?: unknown; endId?: unknown; messageId?: unknown; summary?: unknown });
+            }
+        } else {
+            // #7478 line format: "m00150–m0220 topic\n<summary>…\nm00300–…". A
+            // range block's segment runs from its header line to the next
+            // header line; full = the segment is not stub-length.
+            const content = obj.content;
+            const headers = [...content.matchAll(LINE_CARRIER_HEADER)];
+            headers.forEach((h, i) => {
+                const segStart = h.index! + h[0].length;
+                const segEnd = i + 1 < headers.length ? headers[i + 1]!.index! : content.length;
+                out.push({ startRef: `m${h[1]}`, endRef: `m${h[2]}`, carryingFull: content.slice(segStart, segEnd).trim().length >= CARRIER_STUB_SIGNATURE });
+            });
+        }
+    } else {
+        register(obj);
+    }
+    return out;
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
-    const { callIds, compressCalls, ensureRangePairs } = buildCarrierIndex(messages);
+    const { callIds, compressCalls, ensureFullRangeKeys } = buildCarrierIndex(messages);
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
@@ -2810,10 +2893,15 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
         // while that pair actually rides the (post-prepare) history: a pruned
         // or contract-violating client must never lose the summary outright
         // (zero carriers).
+        // #7478: "rides" is now "rides carrying the FULL summary" — a call
+        // stubbed by consumed-call compaction is not a complete carrier
+        // (#5866), and the current line-format args are recognized too (the
+        // two JSON shapes alone misjudged every dsh-style fold as carrier-less,
+        // double-billing each summary as anchor + call).
         // Preflight blocks (no compressCallId) keep skipping above: no tool
         // call exists for them, so their anchor is the only carrier.
         const present = isPluginFoldCallId(b.compressCallId)
-            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureRangePairs().get(b.startRef)?.has(b.endRef) ?? false)
+            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureFullRangeKeys().has(`${b.startRef}::${b.endRef}`))
             : callIds.has(b.compressCallId);
         if (present) {
             carried.add(`acp_summary_${b.blockId}`);
