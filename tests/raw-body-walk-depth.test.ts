@@ -84,3 +84,38 @@ test("non-object top-level bodies land whole in the other bucket", () => {
     assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body") });
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
 });
+
+// #7168: a client (the DeepSeek harness) rides its incremental session log on the
+// model request under the top-level `dsh_session_log` field. The model never
+// reads it, so a seeded session's full-log resend (capped at 8 MiB per turn) must
+// NOT count toward the egress window — otherwise it dooms every turn and the 413
+// freezes the client's own delivery watermark, deadlocking the session.
+test("#7168: top-level dsh_session_log never counts toward the window (both walks)", () => {
+    const logBlob = "e".repeat(200_000); // ~200 KB of log mass the model ignores
+    const body = {
+        messages: [{ role: "user", content: [{ type: "text", text: "small real turn" }] }],
+        dsh_session_log: { version: 1, afterSeq: -1, throughSeq: 9999, events: [{ seq: 1, data: logBlob }] },
+    };
+    const bd = estimateRawBodyBreakdown(body);
+    // Only the real messages[] mass is counted; the 200 KB log is invisible.
+    assert.equal(bd.messages, t("user") + t("text") + t("small real turn"));
+    assert.equal(bd.tools, 0);
+    assert.equal(bd.system, 0);
+    assert.equal(bd.other, 0);
+    assert.equal(bd.total, bd.messages);
+    // The documented total invariant still holds once the field is excluded.
+    assert.equal(estimateRawBodyTokens(body), bd.total);
+    // Sanity: had the blob been counted, it would dwarf the counted window mass.
+    assert.ok(t(logBlob) > bd.total);
+});
+
+test("#7168: a nested dsh_session_log key is still counted (only top-level is exempt)", () => {
+    const logBlob = "f".repeat(50_000);
+    const body = {
+        messages: [{ role: "user", content: [{ type: "text", text: "hi", dsh_session_log: logBlob }] }] as Record<string, unknown>[],
+    };
+    // The field inside a message block is model-visible text, so it counts.
+    const bd = estimateRawBodyBreakdown(body);
+    assert.equal(bd.messages, t("user") + t("text") + t("hi") + t(logBlob));
+    assert.equal(estimateRawBodyTokens(body), bd.total);
+});

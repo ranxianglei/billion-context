@@ -465,6 +465,18 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
+// #7168: top-level fields a client rides on the model request for its OWN
+// bookkeeping — the model never reads them, so they must not count toward the
+// egress window (estimateRawBodyBreakdown) or the input-token meter
+// (estimateRawBodyTokens → session.metadata.rawInputTokens, side-request guard).
+// The DeepSeek harness uploads its incremental session log under this key; a
+// seeded session that resends the full log (8 MiB/turn cap) doomed every turn
+// once the blob was counted as model text, and the 413 in turn froze the
+// client's own delivery watermark (#7379 lane). Skipped at the top level in BOTH
+// walks so the documented `breakdown.total === estimateRawBodyTokens(parsed)`
+// invariant keeps holding.
+const NON_MODEL_TOPLEVEL_KEYS = new Set(["dsh_session_log"]);
+
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
     const pending: [unknown, string | undefined][] = [[parsed, undefined]];
@@ -479,7 +491,12 @@ export function estimateRawBodyTokens(parsed: unknown): number {
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+                // #7168: at the root (key === undefined) skip client-bookkeeping
+                // fields — nested keys of that name are never a real collision.
+                if (key === undefined && NON_MODEL_TOPLEVEL_KEYS.has(k)) continue;
+                pending.push([v, k]);
+            }
         }
     }
     return tokens;
@@ -505,6 +522,8 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            // #7168: top-level client-bookkeeping fields are not model context.
+            if (NON_MODEL_TOPLEVEL_KEYS.has(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
