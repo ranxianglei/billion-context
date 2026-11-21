@@ -35,7 +35,7 @@ import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
-import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
+import { estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyBreakdown } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
@@ -279,6 +279,11 @@ export async function prepareResponses(
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "responses", parsed, opts, billingUpstream ?? upstreamOrigin));
+        // #6876: the nudge's meter on the ACTUAL parsed body — live wire
+        // evidence that keeps working while the usage reading is frozen behind
+        // the egress fuse (a blocked request never reports usage). Under the
+        // window the kernel ignores it (byte-identical nudge, #4383 guard).
+        const measuredBodyTokens = estimateRawBodyBreakdown(parsed).total;
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -378,7 +383,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, measuredBodyTokens, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);

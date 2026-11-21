@@ -126,6 +126,15 @@ export interface ProcessTurnInput {
    * (guard off). Non-pressure tiers are unaffected.
    */
   tokenCountSource?: "usage" | "estimate";
+  /** #6876: the #554 meter on the ACTUAL serialized outbound body (every
+   *  string field, CJK-aware — tools[], system, extension fields, encrypted
+   *  reasoning replay), measured by the host from the parsed request. When it
+   *  exceeds the model window the nudge arms a measured-pressure EMERGENCY no
+   *  matter how the (possibly frozen — a fuse-blocked request never reaches
+   *  the upstream, so its usage reading never lands) usage meter reads. A
+   *  reading under the window is ignored: nudge behavior stays byte-identical
+   *  (#4383 guard). Omit for legacy behavior. */
+  measuredBodyTokens?: number;
   /**
    * Which messages get an <acp> ref tag injected into their text
    * (the render-refs pipeline node). Refs are ALWAYS assigned regardless
@@ -1015,6 +1024,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       config: input.config,
       tokenCount: input.tokenCount,
       tokenCountSource: input.tokenCountSource,
+      measuredBodyTokens: input.measuredBodyTokens,
       countTokens,
       contentStore,
     };
@@ -1506,6 +1516,7 @@ const nudgeNode: PipelineNode = {
     const nudge = decideNudge({
       tokenCount: ctx.tokenCount,
       tokenCountSource: ctx.tokenCountSource,
+      measuredBodyTokens: ctx.measuredBodyTokens,
       config: ctx.config,
       state: io.state,
       messages: io.messages,
@@ -2079,6 +2090,8 @@ function validateSummaryLength(
 interface NudgeInput {
   tokenCount: number;
   tokenCountSource?: "usage" | "estimate";
+  /** #6876: see ProcessTurnInput.measuredBodyTokens. */
+  measuredBodyTokens?: number;
   config: Config;
   state: CompressionState;
   messages: CoreMessage[];
@@ -2160,9 +2173,22 @@ function pendingByTier(
 }
 
 function decideNudge(input: NudgeInput): NudgeDecision {
-  const { config, state, tokenCount, recommendation, countTokens } = input;
+  const { config, state, tokenCount, recommendation, countTokens, measuredBodyTokens } = input;
   const limit = config.modelContextLimit;
   const usage = limit > 0 ? tokenCount / limit : 0;
+
+  // #6876 measured-pressure backstop: the usage meter can be FROZEN while the
+  // wire body is already over the window — a fuse-blocked request never
+  // reaches the upstream, so no usage report ever lands and every usage-keyed
+  // gate (pressure band, growth floor, estimate hold) keeps judging the stale
+  // reading (field: usage-grade 437,971 = 43% frozen, body measured 1,068,060
+  // > 1,048,576, nudge idle "below gate", egress fuse 413 every round). The
+  // host's meter on the ACTUAL parsed outbound body is live wire evidence, not
+  // a billing sample, so it arms EMERGENCY pressure directly — bypassing the
+  // phantom-pressure guard's estimate deferral AND the growth floor — while a
+  // reading under the window leaves every path byte-identical (#4383 guard).
+  const measuredPressure =
+    measuredBodyTokens !== undefined && limit > 0 && measuredBodyTokens > limit;
 
   const nudgeGrowthTokens = resolveAdaptiveGrowth(limit, config.nudge);
   const minPressureBenefit = resolveMinPressureBenefit(limit, config.nudge);
@@ -2170,8 +2196,10 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const overLimit = usage >= config.nudge.maxContextLimitPct;
   const emergencyOverride = usage >= config.nudge.emergencyThresholdPct;
   // High-pressure band: over maxContextLimitPct (subsumes the emergency
-  // threshold). Bypasses growth gate + cadence; gated on effective pending.
-  const pressure = overLimit || emergencyOverride;
+  // threshold), OR the measured outbound body already exceeds the window
+  // (#6876 — the usage reading may be frozen behind the egress fuse).
+  // Bypasses growth gate + cadence; gated on effective pending.
+  const pressure = overLimit || emergencyOverride || measuredPressure;
   // Phantom-pressure guard: `tokenCount` above can rest on a LOCAL ESTIMATE
   // instead of a billing sample (char-bound fallback — typically while no
   // usage report has landed after an aborted turn, or after a cache-TTL
@@ -2207,6 +2235,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   );
   const pressureDeferredNoSample =
     pressure &&
+    !measuredPressure &&
     input.tokenCountSource === "estimate" &&
     config.nudge.requireUsageSampleForPressure !== false &&
     estimateHoldStreak <= maxEstimateHoldRounds;
@@ -2380,7 +2409,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     ) {
       injectedTier = best;
       stallEscalated = t1HarvestStall && best !== 1;
-      const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+      const label = emergencyOverride || measuredPressure ? "EMERGENCY" : "OVER-LIMIT";
       injectedReason =
         best === 1
           ? `${label} T1: max effective pending ${bestPending}, usage ${Math.round(usage * 100)}%`
@@ -2458,6 +2487,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   if (shouldInject && stallEscalated) {
     injectedReason += " [T1 harvest stall]";
   }
+  if (shouldInject && measuredPressure && !overLimit) {
+    injectedReason += ` [egress-measured ${measuredBodyTokens} tok > window ${limit}]`;
+  }
 
   let reason: string;
   if (injectedTier !== null) {
@@ -2466,11 +2498,17 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection held (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) until a usage-grade reading decides or the estimate-hold backstop elapses; hard-overflow backstop unaffected`;
   } else if (pressure) {
-    const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+    const label = emergencyOverride || measuredPressure ? "EMERGENCY" : "OVER-LIMIT";
+    // #6876: when the measured body is what armed the band, say so — the usage
+    // percentage is the (possibly frozen) billing reading, not the trigger.
+    const pressureReading =
+      measuredPressure && !overLimit
+        ? `egress-measured body ${measuredBodyTokens} tok > window ${limit} (usage reading ${Math.round(usage * 100)}% — possibly frozen behind the egress fuse, #6876)`
+        : `usage ${Math.round(usage * 100)}%`;
     reason =
       bestPending === 0
-        ? `${label}: usage ${Math.round(usage * 100)}% but no tier has effective compressible content (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}) — nudge suppressed to avoid offering ranges below minCompressRange`
-        : `${label}: usage ${Math.round(usage * 100)}% but max pending ${bestPending} < min benefit ${minPressureBenefit} tokens (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}) — suppressed: rewriting below the benefit floor reclaims almost nothing while usage stays high; truncate.threshold remains the safety valve`;
+        ? `${label}: ${pressureReading} but no tier has effective compressible content (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}) — nudge suppressed to avoid offering ranges below minCompressRange`
+        : `${label}: ${pressureReading} but max pending ${bestPending} < min benefit ${minPressureBenefit} tokens (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}) — suppressed: rewriting below the benefit floor reclaims almost nothing while usage stays high; truncate.threshold remains the safety valve`;
   } else {
     const tiersList = [1, 2, 3] as const;
     const eligible = tiersList.filter((t) => config.tiers.enabled || t === 1);
@@ -2560,6 +2598,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
       pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
+      measuredPressure: measuredPressure ? 1 : 0,
+      measuredBodyTokens: measuredBodyTokens ?? 0,
       estimateHoldStreak,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,
