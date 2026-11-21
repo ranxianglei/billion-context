@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import WebSocket, { WebSocketServer } from "ws";
 import { defaultConfig } from "acp-kernel";
+import { responsesToCore } from "acp-kernel/wire";
 import { startServer, BILI_HOP_HEADER } from "../src/server.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -358,6 +359,27 @@ test("codex WS: folding covered history shrinks the replayed turn", { timeout: 3
         assert.ok(JSON.stringify(row.request.input).includes("SUMMARY-CODEX-WS-FOLD"));
         assert.ok(peekSession(f.sid)?.state.blocks.some(b => b.active));
         assert.equal(f.httpRequests, 0);
+    } finally { await f.close(); }
+});
+
+test("codex WS: replayed ACP status-only items never get message references", { timeout: 30000 }, async () => {
+    const f = await fixture();
+    try {
+        await f.probe();
+        const item = {
+            type: "message" as const, id: "msg_replayed_status", role: "assistant" as const, status: "completed" as const,
+            content: [{ type: "output_text" as const, text: "📦 [ACP] Compressed m00001–m00002 → b1", annotations: [] }],
+            internal_chat_message_metadata_passthrough: { turn: 2 },
+        };
+        const blank = { ...item, content: [{ ...item.content[0]!, text: " " }] };
+        const blankId = responsesToCore({ input: [blank] }).msgs[0]?.id;
+        assert.ok(blankId);
+        completed(await f.turn([user("prior turn"), item, user("new turn")]));
+        const session = peekSession(f.sid);
+        assert.ok(session);
+        assert.equal(session.state.messageRefs.byRaw[blankId], undefined, "the ingress path must not number the ACP placeholder");
+        assert.ok(!(f.rows.at(-1)!.request.input as Item[]).some((entry) => entry.id === item.id));
+        assert.ok(JSON.stringify(f.rows.at(-1)!.request.input).includes("new turn"));
     } finally { await f.close(); }
 });
 
