@@ -24,14 +24,27 @@ import { listSessions } from "../src/session.ts";
 // (dedicated summarization calls sized to fit the smaller window), then
 // rebuild and forward a payload that fits.
 //
+// #6430: the usage baseline is scoped to the MODEL that measured it — a
+// cross-model baseline (same route) is demoted, so after the switch the
+// session carries no current-model upstream evidence. The #2313 forward-once
+// escape then applies: the FIRST request after the switch is forwarded to
+// acquire the new model's usage/overflow evidence (in the real world the
+// over-window forward 400s and arms the overflow baseline instead), and the
+// SECOND request folds. This test pins that two-request self-heal.
+//
 // Scenario:
 //   1. Request 1 on claude-big (400k window), upstream reports
-//      input_tokens=300000 → session.lastInputTokens = 300000.
-//   2. Request 2 on claude-small (12k window) with a ~13k-token
-//      conversation: the payload itself overflows → preflight fires: the
-//      oldest compressible ranges are summarized (non-streaming JSON calls
-//      to the upstream) and folded into blocks; the rebuilt payload (recent
-//      protected messages + summaries) is forwarded and gets a 200.
+//      input_tokens=300000 → session.lastInputTokens = 300000 (model
+//      claude-big).
+//   2. Request 2 on claude-small (12k window) with a ~19k-token
+//      conversation: the cross-model 300k baseline is demoted (#6430) → the
+//      trigger fires on the payload's own estimate, but the #2313
+//      forward-once escape forwards it for evidence — NO summarization call;
+//      the successful turn settles a fresh claude-small usage baseline.
+//   3. Request 3 on claude-small with the same conversation: the fresh
+//      same-model baseline is trusted, preflight folds BEFORE forwarding
+//      (non-streaming JSON summarization calls, blocks), and the rebuilt
+//      payload (recent protected messages + summaries) is forwarded with 200.
 
 const SUMMARY_TEXT =
     "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. " +
@@ -146,7 +159,10 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         assert.equal(s1.stats.lastInputTokens, 300_000, "session context is 300k tokens");
         assert.equal(calls.filter((c) => !c.stream).length, 0, "no summarization on the first request");
 
-        // --- Request 2: switch to the 260k model with a long conversation ---
+        // --- Request 2: switch to claude-small with a long conversation ---
+        // #6430: the cross-model 300k baseline is demoted → the trigger fires
+        // on the payload's own estimate, but the #2313 forward-once escape
+        // forwards it for evidence — NO summarization call this turn.
         const r2 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers,
@@ -155,14 +171,38 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         assert.equal(r2.status, 200, "the switched-model request succeeds (no context-full error)");
         await r2.text();
 
+        assert.equal(calls.filter((c) => !c.stream).length, 0, "forward-once: no summarization on the first switched-model request");
+        const s2 = listSessions().find((x) => x.id === s1.id);
+        assert.equal((s2?.state.blocks ?? []).filter((b) => b.active).length, 0, "no compression block on the forward-once turn");
+        // The forwarded payload is the ORIGINAL (not rebuilt): the oldest
+        // messages are still in the payload because nothing was folded.
+        const f2 = calls.filter((c) => c.stream);
+        assert.ok(f2[f2.length - 1]!.body.includes("MARKER_1_"), "forward-once sends the original payload (oldest messages intact)");
+        // The successful turn settled a fresh claude-small usage baseline.
+        assert.equal(s2?.stats.lastInputTokens, 1000, "fresh claude-small baseline settled");
+        assert.equal(s2?.stats.lastInputTokensModel, "claude-small", "baseline is scoped to the new model");
+
+        // --- Request 3: same model, same conversation → preflight folds ---
+        // The fresh same-model baseline is trusted; the trigger fires and the
+        // forward-once escape no longer applies (baselineFloor > 0) → the
+        // oldest compressible ranges are summarized and folded BEFORE the
+        // rebuilt payload is forwarded.
+        const r3 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        });
+        assert.equal(r3.status, 200, "the third request succeeds after the fold");
+        await r3.text();
+
         const summaryCalls = calls.filter((c) => !c.stream);
         assert.ok(summaryCalls.length >= 1, `preflight made summarization call(s) before forwarding (got ${summaryCalls.length})`);
         for (const c of summaryCalls) {
             assert.ok(c.body.includes("Compression") || c.body.includes("compress"), "summarization call carries the compression rules");
         }
 
-        const s2 = listSessions().find((x) => x.id === s1.id);
-        const activeBlocks = (s2?.state.blocks ?? []).filter((b) => b.active);
+        const s3 = listSessions().find((x) => x.id === s1.id);
+        const activeBlocks = (s3?.state.blocks ?? []).filter((b) => b.active);
         assert.ok(activeBlocks.length >= 1, `preflight created compression block(s) (got ${activeBlocks.length})`);
         assert.ok(activeBlocks.every((b) => b.summary === SUMMARY_TEXT), "blocks hold the upstream-written summaries");
 
@@ -179,8 +219,8 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 
-        // The successful turn's usage report overwrote the 300k figure.
-        assert.equal(s2?.stats.lastInputTokens, 1000);
+        // The third turn's usage report overwrote the second turn's figure.
+        assert.equal(s3?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

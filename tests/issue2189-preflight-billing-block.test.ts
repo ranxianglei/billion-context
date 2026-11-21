@@ -191,7 +191,7 @@ test("#2189 anthropic summary carries the client billing-attribution block at sy
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 200, "");
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-main", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -233,7 +233,7 @@ test("#2189 legacy string system keeps the byte-identical summary shape", async 
     try {
         const sys = "You are a helpful assistant.";
         const r1 = await drive(proxyPort, upstreamPort, "s2189-legacy", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: sys, messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: sys, messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -268,7 +268,7 @@ test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, retrie
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 429, SHAPE_429_BODY, true);
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-shape", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -314,7 +314,7 @@ test("#2189 a genuine rate limit keeps the legacy 3-attempt replay and retryable
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 429, GENUINE_429_BODY, true);
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-genuine", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
