@@ -19,6 +19,8 @@
 
 **セルフアップデータ (`update.ts`)。** デフォルトでは 3 分ごとに npm レジストリをチェックする (`CHECK_INTERVAL_MS`、ノブで上書き可能 #2030; プロセスごとの最初のチェックはスロットリングを無視する)。更新は tarball の展開であり、`npm install` ではない——ユーザーの環境ではライフサイクルスクリプトは決して実行されない。グローバルインストールはインプレースで切り替わる。プラグインモードでは、注入されたコードは HOST プロセス内に存在する: 新しいコードはホストの再起動後にのみ有効になり、壊れた注入はモデルトラフィックを非圧縮の直接通信に劣化させる——パネルのバナーと `/__bili/status` の `attribution` で確認可能 (#3581)。
 
+**バージョンゲート (#6804)。** ロールアウトポリシーの前に、ユーザーに見える 2 つのルールがある: リリースチャネル (`tag="latest"`) にインストールされたプリリリース/一時ビルドは、リリースに自動的に前へ掃き上げられることは決してない——チェックは実行され、新しいバージョンは報告されるが、インストールはされない（`updateTag=dev` のようなプリリリースチャネルは一時ビルドのあいだを依然として移動する）。また、`bili pin [duration]` でピンされたバージョンはチェック専用——新しいバージョンは発見・報告されるが、自動的にインストールされることはなく、ピンは期限で自動的に解除される（`bili unpin` で早期解除）。明示的な `bili update` は両方のゲートを貫通する。ピン状態はマシンレベルのランタイム状態 (`update-pin.ts`) であり、設定キーではない。
+
 **インストールレーン。** グローバル (`npm i -g`、自己更新) · 参照レーン (omp/claude/codex/kimi/zcode/hermes — コピーなし、グローバル dist を指す) · ホストワールド (dsh プロファイルバンドル、opencode/pi ツリー — ホスト自身のチャネルを通じて更新され、グローバル自己更新と、グローバルが実行されない場合のコピー自身の定期的チェックによって駆動される、#1196) · ランチャー (`bili <client>` オーバーレイモード: 永続コピーゼロ)。
 
 **台帳の収束。** デスクトップの dsh プロファイルは、bili が完全に所有する唯一のコピーである; その自己修復は `node_modules/billion-context` を直接切り替えるため、`convergeDshLedger` (`src/dsh-ledger.ts`) は、プロファイルマニフェストの宣言された spec と、ロックファイルに記録された解決結果を同じ操作で移動する (#3496) — コピーのみを移動するライターは、#3224 が検出するドリフトを生み出す。既存のドリフトは明示的な要求時のみ収束する: `bili doctor --fix`。`plugin-install.ts` はホスト自身のチャネル (`dsh plugin add`) のみ駆動し、その隣に第二のコピーをインストールすることは決してしない (#966)。
@@ -31,7 +33,7 @@
 
 ## 主要エントリ
 
-`src/update.ts` (アップデータ — 重要) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
+`src/update.ts` (アップデータ — 重要) · `src/update-pin.ts` (マシンレベルのバージョンピン, #6804) · `src/advisory.ts` · `src/restart.ts` · `src/plugin-install.ts` · `src/dsh-ledger.ts` · `src/dsh-channel.ts` · `src/pi-channel.ts` · `src/launcher.ts`
 
 ## 関連
 

@@ -687,10 +687,13 @@ function makeHarness(): Harness {
     };
 }
 
-/** Route registry + policy + tarball URLs to hermetic fixtures. */
+/** Route registry + policy + tarball URLs to hermetic fixtures.
+ *  `devVersion`: the version behind the "dev" dist-tag (prerelease channel
+ *  scenarios, #6804). */
 function mockRegistry(opts: {
     latestVersion: string;
     published: string[];
+    devVersion?: string;
     policyBody?: string | (() => string);
     policyFail?: boolean;
 }): { restore: () => void; hits: string[] } {
@@ -719,6 +722,13 @@ function mockRegistry(opts: {
                 return new Response(JSON.stringify({
                     name: "billion-context", version: opts.latestVersion,
                     dist: { tarball: `http://registry.test/tar/${opts.latestVersion}.tgz`, integrity },
+                }), { status: 200 });
+            }
+            if (version === "dev" && opts.devVersion) {
+                const { integrity } = makeHarnessTarball(tarballs, opts.devVersion);
+                return new Response(JSON.stringify({
+                    name: "billion-context", version: opts.devVersion,
+                    dist: { tarball: `http://registry.test/tar/${opts.devVersion}.tgz`, integrity },
                 }), { status: 200 });
             }
             if (opts.published.includes(version)) {
@@ -778,6 +788,18 @@ async function runCheck(mod: UpdateModule, harness: Harness, force: boolean): Pr
     }, force);
 }
 
+/** #6804 gate scenarios: run a check with an explicit tag / check-only flag
+ *  and capture the structured verdict (the auto path returns void). */
+async function runCheckOpts(mod: UpdateModule, harness: Harness, opts: { force?: boolean; checkOnly?: boolean; updateTag?: string }): Promise<import("../src/update.ts").UpdateCheckOutcome | undefined> {
+    return mod.checkForUpdate({
+        packageName: "billion-context",
+        currentVersion: "1.2.3",
+        autoUpdate: true,
+        installDir: harness.installDir,
+        ...(opts.updateTag ? { updateTag: opts.updateTag } : {}),
+    }, opts.force ?? false, opts.checkOnly ?? false);
+}
+
 function swapEnv(vars: Record<string, string>): () => void {
     const saved: Record<string, string | undefined> = {};
     for (const [k, v] of Object.entries(vars)) {
@@ -795,6 +817,7 @@ function swapEnv(vars: Record<string, string>): () => void {
 interface ScenarioOpts {
     policyBody?: string;
     policyFail?: boolean;
+    devVersion?: string;
 }
 
 async function withPolicyScenario(name: string, opts: ScenarioOpts, scenario: (mod: UpdateModule, harness: Harness, reg: { hits: string[] }) => Promise<void>): Promise<void> {
@@ -824,6 +847,7 @@ async function withPolicyScenario(name: string, opts: ScenarioOpts, scenario: (m
         const reg = mockRegistry({
             latestVersion: "1.2.5",
             published: ["1.2.3", "1.2.4", "1.2.5"],
+            devVersion: opts.devVersion,
             policyBody: opts.policyBody ?? JSON.stringify({ schemaVersion: 1 }),
             policyFail: opts.policyFail,
         });
@@ -936,6 +960,97 @@ test("H7: unreachable policy source fails open to local defaults (stagger still 
         const raw = JSON.parse(readFileSync(path.join(cacheDir(), ".update-stagger.json"), "utf-8")) as { draws: Record<string, number> };
         const draw = raw.draws["latest:1.2.5"];
         assert.ok(draw !== undefined && draw > Date.now() + STAGGER_MIN_DELAY_DEFAULT_MS - 1000, "built-in 15min floor still staggers");
+    });
+});
+
+// ---------------------------------------------------------------------------
+// I. #6804: tag-channel gate + local pin gate (end-to-end through checkForUpdate)
+// ---------------------------------------------------------------------------
+
+test("I1: a prerelease on the release channel is never auto-swept to a release (#6804)", async () => {
+    await withPolicyScenario("tag-channel gate: prerelease on 'latest' stays put", {}, async (mod, harness, reg) => {
+        writeBiliPackage(harness.installDir, "1.2.3-pr.1.1");
+        // pre-date the draw so the GATE is what blocks, not the stagger
+        writeFileSync(path.join(cacheDir(), ".update-stagger.json"), JSON.stringify({ v: 1, draws: { "latest:1.2.5": Date.now() - 1000 } }));
+        await runCheck(mod, harness, false);
+        assert.equal(harness.diskVersion(), "1.2.3-pr.1.1");
+        assert.ok(!reg.hits.some((u) => u.includes("/tar/")), "no tarball download for a gated prerelease");
+
+        // check-only still DISCOVERS and REPORTS the new version
+        mod._resetUpdateThrottleForTest();
+        const out = await runCheckOpts(mod, harness, { checkOnly: true });
+        assert.equal(out?.status, "update-available");
+        assert.equal(out?.latest, "1.2.5");
+        assert.match(out?.note ?? "", /prerelease/);
+    });
+});
+
+test("I2: control — a release on the release channel still auto-upgrades (#6804)", async () => {
+    await withPolicyScenario("release sweep unaffected by the tag-channel gate", {}, async (mod, harness, reg) => {
+        writeFileSync(path.join(cacheDir(), ".update-stagger.json"), JSON.stringify({ v: 1, draws: { "latest:1.2.5": Date.now() - 1000 } }));
+        await runCheck(mod, harness, false);
+        assert.equal(harness.diskVersion(), "1.2.5");
+        assert.ok(reg.hits.some((u) => u.endsWith("/tar/1.2.5.tgz")));
+    });
+});
+
+test("I3: a prerelease on a prerelease channel still moves between temp builds (#6804)", async () => {
+    await withPolicyScenario("dev channel keeps moving between temp builds", { devVersion: "1.2.3-pr.2.1" }, async (mod, harness, reg) => {
+        writeBiliPackage(harness.installDir, "1.2.3-pr.1.1");
+        writeFileSync(path.join(cacheDir(), ".update-stagger.json"), JSON.stringify({ v: 1, draws: { "dev:1.2.3-pr.2.1": Date.now() - 1000 } }));
+        await runCheckOpts(mod, harness, { updateTag: "dev" });
+        assert.equal(harness.diskVersion(), "1.2.3-pr.2.1");
+        assert.ok(reg.hits.some((u) => u.endsWith("/tar/1.2.3-pr.2.1.tgz")));
+    });
+});
+
+test("I4: a pinned version is check-only — reported, never auto-installed (#6804)", async () => {
+    await withPolicyScenario("pin gate: auto stays, check-only reports", {}, async (mod, harness, reg) => {
+        const { setPin, _resetPinForTest } = await import("../src/update-pin.js");
+        try {
+            assert.ok(await setPin("1.2.3"));
+            writeFileSync(path.join(cacheDir(), ".update-stagger.json"), JSON.stringify({ v: 1, draws: { "latest:1.2.5": Date.now() - 1000 } }));
+            await runCheck(mod, harness, false);
+            assert.equal(harness.diskVersion(), "1.2.3");
+            assert.ok(!reg.hits.some((u) => u.includes("/tar/")), "no tarball download for a pinned version");
+
+            mod._resetUpdateThrottleForTest();
+            const out = await runCheckOpts(mod, harness, { checkOnly: true });
+            assert.equal(out?.status, "update-available");
+            assert.equal(out?.latest, "1.2.5");
+            assert.match(out?.note ?? "", /pinned/);
+        } finally {
+            await _resetPinForTest();
+        }
+    });
+});
+
+test("I5: an explicit force breaks through both the tag-channel and pin gates (#6804)", async () => {
+    await withPolicyScenario("force bypasses both #6804 gates", {}, async (mod, harness, reg) => {
+        writeBiliPackage(harness.installDir, "1.2.3-pr.1.1");
+        const { setPin, _resetPinForTest } = await import("../src/update-pin.js");
+        try {
+            assert.ok(await setPin("1.2.3-pr.1.1"));
+            await runCheck(mod, harness, true);
+            assert.equal(harness.diskVersion(), "1.2.5");
+            assert.ok(reg.hits.some((u) => u.endsWith("/tar/1.2.5.tgz")));
+        } finally {
+            await _resetPinForTest();
+        }
+    });
+});
+
+test("I6: an expired pin lifts itself — auto-upgrade resumes (#6804)", async () => {
+    await withPolicyScenario("expired pin lifts the gate", {}, async (mod, harness) => {
+        const { writePin, _resetPinForTest } = await import("../src/update-pin.js");
+        try {
+            await writePin({ v: 1, version: "1.2.3", setAt: Date.now() - 7_200_000, until: Date.now() - 3_600_000 });
+            writeFileSync(path.join(cacheDir(), ".update-stagger.json"), JSON.stringify({ v: 1, draws: { "latest:1.2.5": Date.now() - 1000 } }));
+            await runCheck(mod, harness, false);
+            assert.equal(harness.diskVersion(), "1.2.5");
+        } finally {
+            await _resetPinForTest();
+        }
     });
 });
 

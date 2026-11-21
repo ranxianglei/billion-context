@@ -20,7 +20,7 @@ import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handleP
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
-import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
+import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot, pinAction, unpinAction } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
@@ -410,6 +410,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "POST" && req.url === "/__bili/update/check") return handleUpdateCheck(res);
     if (req.method === "POST" && req.url === "/__bili/update/install") return handleUpdateInstall(req, res, log);
+    if (req.method === "POST" && req.url === "/__bili/update/pin") return handleUpdatePin(req, res, log);
+    if (req.method === "POST" && req.url === "/__bili/update/unpin") return handleUpdateUnpin(res, log);
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();
@@ -1025,6 +1027,47 @@ async function handleUpdateInstall(req: http.IncomingMessage, res: http.ServerRe
     log("info", `[update] web panel requested install ${version}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(await installVersionAction(version), null, 2));
+}
+
+/** POST /__bili/update/pin {"version":"x.y.z","duration":"1h|12h|1d|7d|forever"}
+ *  — #6804: set a pin on the installed version. Malformed JSON or an invalid
+ *  duration → 400; execution always answers 200 {ok, error?, pin?}. */
+async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let version: string | undefined;
+    let duration: string | undefined;
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object") {
+            const d = doc as { version?: unknown; duration?: unknown };
+            if (typeof d["version"] === "string") version = d["version"].trim();
+            if (typeof d["duration"] === "string") duration = d["duration"].trim();
+        }
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"version": "<x.y.z>", "duration": "<1h|12h|1d|7d|forever>"}' }, null, 2));
+        return;
+    }
+    if (version === undefined || version.length === 0 || !/^[0-9A-Za-z.+-]+$/.test(version)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "version must be plain semver characters (digits, dots, +, -) only" }, null, 2));
+        return;
+    }
+    if (duration !== undefined && duration !== "forever" && !/^\d+[hd]$/.test(duration)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "duration must be 1h, 12h, 1d, 7d, or forever" }, null, 2));
+        return;
+    }
+    log("info", `[update] web panel requested pin ${version}${duration ? ` for ${duration}` : " (indefinite)"}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await pinAction(version, duration), null, 2));
+}
+
+/** POST /__bili/update/unpin — #6804: lift the pin early. Always 200
+ *  {ok, error?}. */
+async function handleUpdateUnpin(res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    log("info", `[update] web panel requested unpin`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await unpinAction(), null, 2));
 }
 
 // #2861: server-side dismissal of a host-plugin notice (body {"id": string}).

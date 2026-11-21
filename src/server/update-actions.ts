@@ -16,6 +16,7 @@
  * nothing here throws into the HTTP handlers.
  */
 import { checkForUpdate, findInstallDir, forceInstallVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
+import { activePin, setPin, clearPin, parsePinDuration, type PinState } from "../update-pin.js";
 import { getUpdateVisibility } from "../update-notes.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -44,6 +45,8 @@ interface UpdateStateSnapshotData {
     checking: boolean;
     /** True while a pinned install is in flight in this process. */
     installing: boolean;
+    /** #6804: the active pin state (undefined = no pin). */
+    pin?: PinState;
 }
 
 let registeredOpts: UpdateOptions | undefined;
@@ -139,6 +142,7 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         }
     }
     const lastCheckAt = await lastUpdateCheckTime();
+    const pin = await activePin();
     return {
         running: runningVersion,
         ...(disk !== undefined ? { disk } : {}),
@@ -148,7 +152,32 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
         ...(lastCheckAt !== undefined ? { lastCheckAt } : {}),
         checking,
         installing,
+        ...(pin !== undefined ? { pin } : {}),
     };
+}
+
+/** #6804: set a pin on the installed version. `duration` is a string like
+ *  "1h", "12h", "1d", "7d", or "forever" (indefinite). Returns the pin state
+ *  that was written, or an error. Never throws. */
+export async function pinAction(version: string, duration?: string): Promise<{ ok: boolean; error?: string; pin?: PinState }> {
+    if (duration === undefined || duration === "forever") {
+        const pin = await setPin(version);
+        if (!pin) return { ok: false, error: "pin state could not be persisted (cache dir unwritable)" };
+        return { ok: true, pin };
+    }
+    const ms = parsePinDuration(duration);
+    if (ms === undefined) return { ok: false, error: `invalid duration: ${duration} (expected 1h, 12h, 1d, 7d, or forever)` };
+    const pin = await setPin(version, ms);
+    if (!pin) return { ok: false, error: "pin state could not be persisted (cache dir unwritable)" };
+    return { ok: true, pin };
+}
+
+/** #6804: lift the pin early. `hadPin` reports whether a pin was actually
+ *  active and cleared (false = there was nothing to clear). Never throws. */
+export async function unpinAction(): Promise<{ ok: boolean; error?: string; hadPin: boolean }> {
+    const hadPin = (await activePin()) !== undefined;
+    await clearPin();
+    return { ok: true, hadPin };
 }
 
 /** Test seam: clear the registered options and both in-flight flags. */

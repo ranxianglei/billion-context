@@ -38,6 +38,7 @@ import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs, updatePolicyUrl as knobUpdatePolicyUrl, updateStaggerMinDelayMs as knobUpdateStaggerMinDelayMs, updateStaggerMaxDelayMs as knobUpdateStaggerMaxDelayMs } from "./knobs.js";
+import { activePin, isVersionPinned } from "./update-pin.js";
 import { POLICY_URL_DEFAULT, ensureStaggerDraw, loadUpdatePolicy, resolveStaggerWindow, resolveUpgradeCandidate, setPlannedUpgrade, staggerKey } from "./update-policy.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
@@ -1693,6 +1694,39 @@ export async function checkForUpdate(opts: UpdateOptions, force = false, checkOn
                 return { status: "blocked-advisory", latest, note: `${latest} is covered by a critical-bug advisory's affected range (#1588)` };
             }
             loggerLog("info", `[update] skipping ${latest}: covered by a critical-bug advisory's affected range (#1588) — not pulling this install back into the defect; retrying next cycle`);
+            return;
+        }
+
+        // #6804: tag-channel rule — an installed prerelease/temp build is never
+        // auto-swept forward to a release when the updateTag is the release
+        // channel ("latest"). The check runs, the new version is reported,
+        // nothing is installed. A prerelease channel target (e.g.
+        // updateTag=dev) still moves between temp builds (tag !== "latest").
+        // Explicit `bili update` (force=true) bypasses this rule.
+        if (!force && tag === "latest") {
+            const parsed = parseSemVer(currentVersion);
+            if (parsed !== undefined && parsed.pre.length > 0) {
+                if (checkOnly) {
+                    loggerLog("info", `[update] manual web check: installed ${currentVersion} is a prerelease/temp build on the release channel — new version ${latest} reported but not auto-installed (#6804)`);
+                    return { status: "update-available", latest, note: `installed ${currentVersion} is a prerelease/temp build — not auto-swept to a release (#6804)` };
+                }
+                loggerLog("info", `[update] installed ${currentVersion} is a prerelease/temp build on the release channel (tag "latest") — new version ${latest} reported but not auto-installed (#6804)`);
+                return;
+            }
+        }
+
+        // #6804: pin check-only gate — a pinned version is check-only: the
+        // updater keeps discovering and reporting new versions but never
+        // auto-installs. An explicit `bili update` (force=true) breaks
+        // through the pin (explicit action = user intent). The #1481
+        // advisory force-install lane overrides the pin (it calls
+        // forceInstallVersion directly, bypassing checkForUpdate).
+        if (!force && (await isVersionPinned(currentVersion))) {
+            if (checkOnly) {
+                loggerLog("info", `[update] manual web check: version ${currentVersion} is pinned — new version ${latest} reported but not auto-installed (#6804)`);
+                return { status: "update-available", latest, note: `version ${currentVersion} is pinned — not auto-installing (#6804)` };
+            }
+            loggerLog("info", `[update] version ${currentVersion} is pinned — new version ${latest} reported but not auto-installed (#6804)`);
             return;
         }
 
