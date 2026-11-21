@@ -67,7 +67,7 @@ import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEnd
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyManifestVersion, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
@@ -771,9 +771,13 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     // path (e.g. an admin-gated port) that never exposes the plugin manifest.
     const explicitAttachOrigin = nativeAttachOrigin(process.env);
     const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
-    const version = await fetchProxyVersion(home).catch(() => undefined);
+    // #6899: compare the CLEAN manifest version — fetchProxyVersion's display
+    // string appends ` (commit)`, which parseSemVer rejects, so comparing it
+    // always reads "not newer" and the rotation below never fires.
+    const manifest = await fetchProxyManifestVersion(home).catch(() => undefined);
     if (gen !== originGen) return undefined;
-    if (version !== undefined) {
+    if (manifest !== undefined) {
+        const version = manifest.version;
         // #3544: healthy is NOT sufficient — a STRICTLY OLDER build is never
         // replaced by waiting (its fingerprint differs, so no bring-up can
         // attach or reuse it either, and the detached process outlives every
@@ -791,7 +795,8 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             register.base = home;
             return home;
         }
-        persistClientEvent(`attach target ${home} runs v${version} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
+        const display = manifest.commit !== undefined ? `${version} (${manifest.commit})` : version;
+        persistClientEvent(`attach target ${home} runs v${display} (ours v${VERSION}) — requesting its graceful shutdown before spawning the current build`);
         const rotated = await rotatePinnedStaleProxy(home);
         if (gen !== originGen) return undefined;
         if (!rotated) {
