@@ -277,7 +277,8 @@ test("#7156 pure-sqlite: a first-post-open-write corruption REFUSES TO START too
         // The first-write corruption branch abandons the opened handle (GC
         // releases it — close() would re-stamp the poisoned integrity
         // verdict), and the background quick_check may still hold the file.
-        // On Windows that keeps index.db locked, so rmSync can hit EBUSY.
+        // On Windows that keeps index.db locked, so rmSync can hit EBUSY
+        // (or EPERM on Node 24 runners, same locked-file condition).
         // Retry briefly; if it still fails, leave the temp dir (the OS
         // reclaims it) — the test's assertions already ran.
         for (let attempt = 0; ; attempt++) {
@@ -286,7 +287,7 @@ test("#7156 pure-sqlite: a first-post-open-write corruption REFUSES TO START too
                 break;
             } catch (err) {
                 const code = (err as NodeJS.ErrnoException).code;
-                if (code !== "EBUSY") throw err;
+                if (code !== "EBUSY" && code !== "EPERM") throw err;
                 if (attempt >= 10) break;
                 const until = Date.now() + 50;
                 while (Date.now() < until) { /* spin-wait for GC to release the handle */ }
