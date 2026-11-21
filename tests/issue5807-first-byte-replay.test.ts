@@ -8,7 +8,7 @@ import {
 } from "../src/fetch-util.ts";
 import {
     classifyUpstreamFailure,
-    isFailFastUpstreamKind,
+    isTransparentReplayableKind,
     UPSTREAM_FIRST_BYTE_TIMEOUT_CODE,
 } from "../src/upstream-fail.ts";
 import { replayMaxAttempts } from "../src/knobs.ts";
@@ -71,14 +71,14 @@ test("classification: the first-byte marker is its own fail-fast kind; timeouts 
     inner.name = "AbortError";
     (wrapped as Error & { cause?: unknown }).cause = inner;
     assert.equal(classifyUpstreamFailure(wrapped), "upstream-headers-timeout");
-    assert.ok(isFailFastUpstreamKind("upstream-headers-timeout"), "first-byte timeout is fail-fast (replayable)");
+    assert.ok(isTransparentReplayableKind("upstream-headers-timeout"), "first-byte timeout is fail-fast (replayable)");
 
     // Plain internal abort (no marker) — the pre-#5807 default shape — stays
     // non-replayed "upstream-timeout".
     const plainAbort = new Error("The operation was aborted") as Error;
     plainAbort.name = "AbortError";
     assert.equal(classifyUpstreamFailure(plainAbort), "upstream-timeout");
-    assert.equal(isFailFastUpstreamKind("upstream-timeout"), false, "upstream-timeout must stay non-replayed");
+    assert.equal(isTransparentReplayableKind("upstream-timeout"), false, "upstream-timeout must stay non-replayed");
 
     // undici's own transport timeouts are distinct sources and must NOT be
     // swept into the new kind (they are the full-budget transport caps, #551).
