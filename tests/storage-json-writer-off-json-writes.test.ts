@@ -5,6 +5,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore, contentStoreRelPathFor, relPathFor, storageStatusLabel } from "../src/persist.ts";
+// Strict SQL reads verify every original against its sha256 key, so the
+// grafted stores use real content hashes.
+const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+const H1 = sha256("THE ORIGINAL LONG TEXT");
 
 
 /**
@@ -154,8 +158,8 @@ test("jsonWriter=off: only whitelisted .json files may be written in the session
         const session = loadCorpusCase(seed, "ccr", "corpus-ccr", "responses");
         session.contentStore = {
             version: 1,
-            byHash: { h1: "THE ORIGINAL LONG TEXT" },
-            byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
+            byHash: { [H1]: "THE ORIGINAL LONG TEXT" },
+            byRef: { m00001: { hash: H1, rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
         } as typeof session.contentStore;
         session.contentStoreDirty = true;
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-jwgate-full-"));

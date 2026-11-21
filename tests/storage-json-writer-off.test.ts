@@ -1,10 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore, storageStatusLabel } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
+// Strict SQL reads verify every original against its sha256 key, so the
+// grafted stores use real content hashes.
+const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+const H1 = sha256("THE ORIGINAL LONG TEXT");
+const H2 = sha256("SHADOW WRITE");
 
 
 /**
@@ -165,8 +171,8 @@ test("jsonWriter=off (full): CCR content-store sidecar is not written; the index
             // original entries, the graft holds only h1).
             session.contentStore = {
                 version: 1,
-                byHash: { h1: "THE ORIGINAL LONG TEXT" },
-                byRef: { m00001: { hash: "h1", rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
+                byHash: { [H1]: "THE ORIGINAL LONG TEXT" },
+                byRef: { m00001: { hash: H1, rawId: "raw-1", kind: "file read", tokens: 5, chars: 22, head: "ORIGINAL HEAD" } },
             } as typeof session.contentStore;
             session.contentStoreDirty = true;
             const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
@@ -185,7 +191,7 @@ test("jsonWriter=off (full): CCR content-store sidecar is not written; the index
             try {
                 const mirror = fresh.unifiedCcrFor(session.id);
                 assert.ok(mirror, "the unified ccr mirror must carry the store");
-                assert.equal(mirror!.byHash["h1"], "THE ORIGINAL LONG TEXT", "CCR originals must survive via the index mirror");
+                assert.equal(mirror!.byHash[H1], "THE ORIGINAL LONG TEXT", "CCR originals must survive via the index mirror");
                 fresh.cancelAll();
             } finally {
                 fresh.closeQuietly();
@@ -201,8 +207,8 @@ test("jsonWriter=off (full): CCR content-store sidecar is not written; the index
                 assert.ok(again, "session must still load for the control leg");
                 again.contentStore = {
                     version: 1,
-                    byHash: { h2: "SHADOW WRITE" },
-                    byRef: { m00002: { hash: "h2", rawId: "raw-2", kind: "tool result", tokens: 3, chars: 12, head: "SHADOW HEAD" } },
+                    byHash: { [H2]: "SHADOW WRITE" },
+                    byRef: { m00002: { hash: H2, rawId: "raw-2", kind: "tool result", tokens: 3, chars: 12, head: "SHADOW HEAD" } },
                 } as typeof again.contentStore;
                 again.contentStoreDirty = true;
                 await store2.writeNow(again);
