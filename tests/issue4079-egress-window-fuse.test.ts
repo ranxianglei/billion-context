@@ -175,7 +175,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
     }
 });
 
-test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte floor — is still stopped by the measured tier, not forwarded", async () => {
+test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte floor — is stopped by the #7167 irreducible gate before the fold, not forwarded", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-4079t-"));
     const { ctx, calls, close } = await setup();
     try {
@@ -183,8 +183,11 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         // which the core-text byte floor never sees (it prices m.text only).
         // 120 tools × 40KB descriptions ≈ 4.8MB of tool text ≈ ~1.2M measured
         // tokens — over the floored 1M bar — while the core text is ~1.5KB,
-        // ~5000× under the 7.5MB byte floor. With `model` present the preflight
-        // measured gate fires before the relay fuse; same verdict either way.
+        // ~5000× under the 7.5MB byte floor. With `model` present the #7167
+        // irreducible-dimension gate fires BEFORE the fold (tools[] alone clear
+        // the doom bar, so no amount of message folding can fit the body) —
+        // no history rewrite, no summary billing — and answers the same 413
+        // the post-fold measured doom would have, with the irreducible message.
         const tools = Array.from({ length: 120 }, (_, i) => ({
             type: "function",
             function: { name: `tool_${i}`, description: "d".repeat(40_000) },
@@ -199,9 +202,10 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
 
         assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
+        assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the irreducible gate answers before the fold)");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
+        assert.match(parsed.error?.message ?? "", /tools\[\] \+ system \+ other alone measure ~[\d,]+ tokens/, "the #7167 irreducible gate names the dimensions folding cannot touch (text-only; image payloads are #496 arbitration, never doom)");
+        assert.match(parsed.error?.message ?? "", /Compaction was NOT attempted/, "no history rewrite, no summary billing — the fold never ran");
         assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream
         // (before the measured tier it cleared the byte floor and rode forward
