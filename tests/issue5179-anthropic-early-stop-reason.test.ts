@@ -80,27 +80,29 @@ function stopReasons(out: string): unknown[] {
 // #5220 contract: the FIRST failed-only compress round feeds the model a
 // recovery receipt and re-requests; this fixture resubmits the identical
 // failing call on round 2, where the restored #156 signature breaker ends the
-// turn — and whatever the reason, it arrives as "max_tokens", never "length".
-test("a failed-only compress round that resubmits its failure ends the Anthropic turn with stop_reason max_tokens, so Claude Code resumes", async () => {
+// turn. #6465: no assistant text in any round → the breaker surfaces an
+// interrupted outcome (protocol-native error event), not a fake success.
+test("a failed-only compress round that resubmits its failure ends the Anthropic turn with an error event (interrupted outcome, #6465)", async () => {
     const { out, reRequests } = await runAnthropicLoop(
         toolRound("compress", { content: [{ startId: "m00001", endId: "m00002", summary: "s" }] }),
     );
     assert.equal(reRequests, 1, "first-time failure re-requests once (recovery receipt, #5220); the identical round-2 resubmit trips the #156 signature breaker");
     assert.ok(out.includes("❌"), "the failure receipt still reaches the client");
-    assert.deepEqual(stopReasons(out), ["max_tokens"]);
+    assert.ok(/event: error/.test(out), "interrupted outcome: protocol-native error event (NOT a fake success, #6465)");
 });
 
-test("the round limit ends the Anthropic turn with stop_reason max_tokens", async () => {
+test("the round limit ends the Anthropic turn with an error event (interrupted outcome, #6465)", async () => {
     const { out, reRequests } = await runAnthropicLoop(toolRound("acp_status", {}));
     assert.equal(reRequests, MAX_LOOP_ROUNDS - 1, "ran to the loop limit");
-    assert.deepEqual(stopReasons(out), ["max_tokens"]);
+    assert.ok(/event: error/.test(out), "interrupted outcome: protocol-native error event (NOT a fake success, #6465)");
 });
 
 // #5220 guard-branch: on a threads-continue turn the server-side thread delta
 // structurally excludes visibility markers (client-side noise, #2701), so a
-// receipt could never ride it — such turns keep the old break contract, and
-// the break still arrives as max_tokens.
-test("a failed-only compress round on a threads-continue turn breaks WITHOUT re-requesting, ending max_tokens", async () => {
+// receipt could never ride it — such turns keep the old break contract.
+// #6465: no assistant text in any round → the break surfaces an interrupted
+// outcome (protocol-native error event), not a fake success.
+test("a failed-only compress round on a threads-continue turn breaks WITHOUT re-requesting, ending with an error event (interrupted outcome, #6465)", async () => {
     const body = { model: "claude-opus-5-5", stream: true, messages: [{ role: "user", content: "go on" }], thread: { type: "continue" } };
     let reRequests = 0;
     const orig = globalThis.fetch;
@@ -124,7 +126,7 @@ test("a failed-only compress round on a threads-continue turn breaks WITHOUT re-
     }
     assert.equal(reRequests, 0, "threads-delta cannot carry the receipt → old break contract, zero re-requests");
     assert.ok(out.includes("❌"), "the failure receipt still reaches the client");
-    assert.deepEqual(stopReasons(out), ["max_tokens"]);
+    assert.ok(/event: error/.test(out), "interrupted outcome: protocol-native error event (NOT a fake success, #6465)");
 });
 
 test("upstream's own stop reasons reach the client unchanged", () => {
