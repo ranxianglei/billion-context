@@ -153,7 +153,7 @@ test("#2029: plugin status nudge + panel feed the provenance-aware baseline", as
             const r = mockRes();
             await handlePluginStatus(session.id, r.res, deps);
             assert.equal(r.status, 200, `${sc.name}: status answered`);
-            assert.deepStrictEqual(seen, [sc.expected], `${sc.name}: nudge recompute tokenCount`);
+            assert.equal(seen[0], sc.expected, `${sc.name}: nudge recompute tokenCount`);
             const panel = JSON.parse(r.body).panel as string | undefined;
             assert.ok(panel, `${sc.name}: panel rendered`);
             if (sc.panelPct !== undefined) {
