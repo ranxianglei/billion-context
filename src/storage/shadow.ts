@@ -43,7 +43,7 @@ import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
-import type { CoreMessage, MessageContentStore } from "acp-kernel";
+import type { CompressionBlock, CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
 // alarm-only by design (files stay put; the operator repairs/moves them by
@@ -857,6 +857,7 @@ export class UnifiedShadow {
                 for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                     builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                 }
+                warnCorruptSkips(id, builder);
                 // The builder preserves every MERGE_STATE_FIELDS key; its
                 // generic state declaration only needs widening here.
                 return builder.finish() as LegacySessionLike;
@@ -886,11 +887,15 @@ export class UnifiedShadow {
                 }
                 if (fields.blockContents) {
                     const contents: NonNullable<ResidentFields["blockContents"]> = new Map();
+                    const corruptSkips: { table: "messages" | "blocks"; key: string; error: string }[] = [];
                     for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
                         const page = store.getBlockContents(id, { limit: VIEW_READ_BATCH_SIZE, offset });
                         const blocks = Array.isArray(page) ? page : [];
-                        appendBlockContents(contents, blocks);
+                        appendBlockContents(contents, blocks, corruptSkips);
                         if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    if (corruptSkips.length > 0) {
+                        loggerLog("warn", `[storage] resident block contents degraded for ${id}: ${corruptSkips.length} unparseable row(s) skipped (${corruptSkips.map((s) => s.key).join(", ")})`);
                     }
                     mergeOrphanBlockContents(contents, store.getOrphansJson(id));
                     result.blockContents = contents;
@@ -1422,6 +1427,7 @@ export class UnifiedShadow {
                     for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
                         builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
                     }
+                    warnCorruptSkips(id, builder);
                     return builder.finish() as LegacySessionLike;
                 });
                 if (!loaded) return null;
@@ -1649,6 +1655,25 @@ function warnTailGaps(id: string, view: { tailGaps?: number }): void {
     }
 }
 
+/** #7335: poison-row isolation report — unparseable rows the builder skipped
+ *  so a single corrupt row cannot abort the whole load (previously one bad
+ *  row threw out of finish(), the session was rebuilt from scratch and every
+ *  block and ref was discarded). */
+function warnCorruptSkips(
+    id: string,
+    builder: { skippedCorruptRows: { table: string; key: string; error: string }[] },
+): void {
+    const rows = builder.skippedCorruptRows;
+    if (rows.length > 0) {
+        loggerLog(
+            "warn",
+            `[storage] unified view degraded for ${id}: ${rows.length} unparseable row(s) skipped (${rows
+                .map((r) => `${r.table} ${r.key}: ${r.error}`)
+                .join("; ")}); the session loaded without them (#7335)`,
+        );
+    }
+}
+
 function shadowDigest(view: unknown): string {
     return canonicalDigest(view);
 }
@@ -1720,11 +1745,28 @@ class BatchedViewVerification {
 
     addBlocks(rows: BlockRow[]): void {
         for (const row of rows) {
-            const payload = JSON.parse(row.payloadJson);
+            let payload: CompressionBlock;
+            try {
+                payload = JSON.parse(row.payloadJson);
+            } catch {
+                // #7335: a poisoned block row must not abort the whole save —
+                // mark drift so the comparison surfaces it loudly, and keep
+                // positional alignment for the slots that follow.
+                this.changed("state");
+                this.blockCount++;
+                continue;
+            }
             if (payload?.active === true) this.activeBlocks++;
             if (this.blockCount >= this.legacy.state.blocks.length || shadowDigest(payload) !== shadowDigest(this.legacy.state.blocks[this.blockCount])) this.changed("state");
             this.blockCount++;
-            this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
+            try {
+                this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
+            } catch {
+                // #7335: poisoned summary/one CAS row — the block slot above
+                // already compared; the unreadable text is drift, not a crash.
+                this.changed("blockContents");
+                this.remainingContents.delete(row.blockId);
+            }
             // A current block wins over an identically named journal entry.
             this.orphans.delete(row.blockId);
         }
@@ -1732,7 +1774,17 @@ class BatchedViewVerification {
 
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
-            const raw = JSON.parse(row.content);
+            let raw: unknown;
+            try {
+                raw = JSON.parse(row.content);
+            } catch {
+                // #7335: a poisoned row must not abort the whole save — the
+                // verify-sample throw retried on every subsequent save until
+                // the store was cleaned. Skip it and mark drift so the
+                // comparison surfaces the disagreement loudly instead.
+                this.changed("messages");
+                continue;
+            }
             this.messages.set(row.seq, { sig: messageSignature(raw), raw });
         }
     }
