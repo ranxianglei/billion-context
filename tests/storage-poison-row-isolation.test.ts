@@ -1,0 +1,170 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, type TestContext } from "node:test";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
+import { appendBlockContents, planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
+import type { BlockView } from "../src/session.js";
+import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { UnifiedStore } from "../src/storage/store.ts";
+
+// #7335: one corrupt row must not destroy a session. Field data: 26 content
+// rows of a single pi session (poisoned by an older dev build — CAS hash did
+// not match the stored bytes, JSON unparseable) made the unified cold load
+// throw, the legacy fallback found no file, the state was discarded and a
+// 600K-token context re-folded from scratch (32 serial summary rounds,
+// 67–84s each — user-visible freeze). Two structural gaps fixed here:
+//   1. writer: putContent trusted caller-supplied digests without verifying
+//      them against the bytes (#3133 skipped the re-hash); a mismatched pair
+//      now fails the save loudly instead of persisting poison.
+//   2. reader: LegacyViewBuilder addBlocks/addMessages parsed every row
+//      without isolation; an unparseable row now degrades the view (recorded
+//      in skippedCorruptRows, counted into tailGaps, logged) instead of
+//      aborting the whole load.
+
+function seed(id: string): LegacySessionLike {
+    const messages = Array.from({ length: 4 }, (_, i) => ({ id: `m${i}`, role: "user" as const, contentType: "text" as const, text: `original ${i}`, ts: 1000 + i }));
+    const blocks: LegacySessionLike["state"]["blocks"] = messages.map((message, i) => ({
+        blockId: `b${i}`, runId: "r1", tier: 1, summary: `summary ${i}`, directMessageIds: [message.id],
+        effectiveMessageIds: [message.id], directBlockIds: [], compressedTokens: 1, createdAt: 1,
+        survivedCount: 0, generation: "young", active: i % 2 === 0,
+    }));
+    return {
+        id, createdAt: 1, lastSeen: 2, meta: {}, stats: {}, metadata: {},
+        state: { blocks, nextBlockId: 5, nextRunId: 2, messageRefs: { byRaw: {}, byRef: {} } },
+        blockContents: new Map(blocks.map((block, i) => [block.blockId, {
+            full: { text: `full 海🌊 ${i}`, count: 1 }, one: { text: `one ${i}`, count: 1 },
+        }])), lastMessages: messages, lastMessagesFolded: false,
+    };
+}
+
+function fixture(t: TestContext): { store: UnifiedStore; db: ReturnType<typeof openSqliteDatabase>["db"]; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), "bili-poison-row-"));
+    process.env.BILI_CONFIG_FILE = join(dir, "no-config.json");
+    const store = UnifiedStore.open(join(dir, "index.db"));
+    const db = openSqliteDatabase(join(dir, "index.db"), "node:sqlite").db;
+    t.after(() => { store.close(); db.close(); rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+    return { store, db, dir };
+}
+
+test("writer: mismatched precomputed digest is refused, nothing persists", (t) => {
+    const { store, db } = fixture(t);
+    const clean = planIngest(seed("target"));
+    assert.equal(store.ingestSession(clean, undefined, { completeLog: true }), true);
+
+    const poisoned = planIngest(seed("target2"));
+    assert.ok(poisoned.messages.length > 0);
+    poisoned.messages[0] = { ...poisoned.messages[0], contentHash: "0".repeat(64) };
+    assert.throws(
+        () => store.ingestSession(poisoned, undefined, { completeLog: true }),
+        /content CAS digest mismatch/,
+    );
+    // The failed save must leave no row behind (transaction rolled back).
+    const rows = db.prepare("SELECT COUNT(*) AS n FROM messages WHERE session_id = ?").get("target2") as { n: number };
+    assert.equal(rows.n, 0);
+    const cas = db.prepare("SELECT COUNT(*) AS n FROM content WHERE hash = ?").get("0".repeat(64)) as { n: number };
+    assert.equal(cas.n, 0);
+});
+
+test("reader: one unparseable message row degrades the view instead of aborting the load", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    const row = db.prepare("SELECT seq, content_hash FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT 1").get("target") as { seq: number; content_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.content_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
+    assert.ok(view, "the session must still load with one corrupt row");
+    // The corrupt row is skipped; everything else survives.
+    assert.ok((view!.tailGaps ?? 0) >= 1, "corrupt tail row counted as a gap");
+    assert.equal(view!.lastMessages!.length, 3);
+    assert.equal(view!.state.blocks!.length, 4, "blocks survive a corrupt message row");
+});
+
+test("reader: one unparseable block payload degrades the view instead of aborting the load", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    db.prepare("UPDATE blocks SET payload_json = X'7b6f6f7073' WHERE session_id = ? AND block_id = ?").run("target", "b0");
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
+    assert.ok(view, "the session must still load with one corrupt block row");
+    assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt block row");
+    assert.equal(view!.state.blocks!.length, 3);
+    // Block summaries live in the content CAS (summary_hash/one_hash), not in
+    // payload_json — they survive the payload corruption.
+    assert.equal(view!.blockContents.size, 4);
+});
+
+// #7337: the block summary/one CAS content (appendBlockContents) was the one
+// poison carrier #7335 left unisolated. A corrupt summary/one row — bad CAS
+// bytes, or a missing CAS row leaving summary="" — threw out of the shared
+// helper and aborted the whole load on BOTH the full-view and resident-field
+// paths. Now it degrades the same way as the message/payload rows: the row is
+// skipped, recorded, and the rest of the session loads.
+
+test("appendBlockContents: corrupt summary/one CAS rows are skipped and returned, not thrown", (t) => {
+    const contents = new Map<string, { one: BlockView | null; full: BlockView }>();
+    const skipped = appendBlockContents(contents, [
+        { blockId: "ok", summary: '{"text":"full","count":1}', one: '{"text":"one","count":1}' },
+        { blockId: "bad-summary", summary: '{"oops', one: '{"text":"one","count":1}' },
+        { blockId: "empty-summary", summary: "", one: '{"text":"one","count":1}' },
+        { blockId: "bad-one", summary: '{"text":"full","count":1}', one: '{"oops' },
+        { blockId: "missing-one", summary: '{"text":"full","count":1}', one: null },
+    ]);
+    // The three corrupt rows are skipped and returned; the two good rows land in the map.
+    assert.equal(skipped.length, 3);
+    assert.deepEqual(skipped.map((s) => s.blockId).sort(), ["bad-one", "bad-summary", "empty-summary"]);
+    assert.ok(skipped.every((s) => s.error.length > 0));
+    assert.equal(contents.size, 2);
+    assert.ok(contents.has("ok"));
+    assert.ok(contents.has("missing-one"));
+    assert.equal((contents.get("missing-one") as { one: unknown }).one, null);
+});
+
+test("reader: one unparseable block summary CAS row degrades the full view instead of aborting", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    // Poison the block summary's CAS bytes (the full/one content — NOT payload_json).
+    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    const view = shadow.viewFor("target") as LegacySessionLike & { tailGaps?: number } | null;
+    assert.ok(view, "the session must still load with one corrupt block summary CAS row");
+    assert.equal(view!.state.blocks!.length, 4, "block metadata survives a corrupt summary CAS row");
+    assert.equal(view!.lastMessages!.length, 4, "messages survive a corrupt summary CAS row");
+    assert.equal(view!.blockContents.size, 3, "the corrupt block's content row is skipped");
+    assert.ok(!view!.blockContents.has("b0"), "the corrupt block's content is dropped");
+});
+
+test("reader: one unparseable block summary CAS row degrades the resident-field read instead of aborting", (t) => {
+    const { store, db, dir } = fixture(t);
+    const plan = planIngest(seed("target"));
+    assert.equal(store.ingestSession(plan, undefined, { completeLog: true }), true);
+
+    const row = db.prepare("SELECT summary_hash FROM blocks WHERE session_id = ? AND block_id = ?").get("target", "b0") as { summary_hash: string };
+    db.prepare("UPDATE content SET bytes = X'7b6f6f7073' WHERE hash = ?").run(row.summary_hash);
+
+    const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
+    assert.ok(shadow);
+    t.after(() => shadow.close());
+    const fields = shadow.readResidentFieldsFor("target", { blockContents: true });
+    assert.ok(fields, "the resident fields must still load with one corrupt block summary CAS row");
+    assert.equal(fields!.blockContents!.size, 3, "the corrupt block's content row is skipped");
+    assert.ok(!fields!.blockContents!.has("b0"), "the corrupt block's content is dropped");
+    assert.ok(fields!.blockContents!.has("b1"), "the other blocks' content survives");
+});

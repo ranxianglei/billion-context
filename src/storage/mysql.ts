@@ -595,7 +595,15 @@ export class MysqlBackend implements StorageBackend {
     /** Atomic refcount-aware CAS insert-or-bump. */
     private async putContent(c: PoolConnection | Pool, content: string, precomputedHash?: string): Promise<string> {
         const bytes = Buffer.from(content, "utf8");
-        const hash = precomputedHash ?? sha256Hex(bytes);
+        // #7335: verify the caller-supplied digest against the bytes — the CAS
+        // key is what every reader resolves by, so a mismatched pair poisons
+        // the store (sqlite twin has the same guard).
+        const hash = sha256Hex(bytes);
+        if (precomputedHash !== undefined && precomputedHash !== hash) {
+            throw new Error(
+                `content CAS digest mismatch: caller supplied ${precomputedHash} but ${bytes.byteLength} bytes hash to ${hash} — refusing to persist an unverified row`,
+            );
+        }
         await c.query(
             "INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, ?, 1, 'sha256', ?) " +
                 "ON DUPLICATE KEY UPDATE refcount = refcount + 1",
