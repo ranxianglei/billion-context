@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createCore } from "../src/compress.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
 import { formatRanges } from "../src/nudge-text.js";
 import { resolveBoundaries } from "../src/boundaries.js";
@@ -243,3 +244,79 @@ test("resolveBlockSpan canonicalizes stored reversed spans (#2168)", () => {
   ]);
   assert.equal(formatCreatedBlocks(state, [block]), "blocks: b1=m00651–m00760");
 });
+
+// ─── #5680: apply path under mixed-era refs ───────────────────────────────────
+
+// After a session-generation reset the ledger mixes eras: early messages keep
+// previous-generation refs while newer ones mint from m00001, so a positional
+// group straddling the boundary stores startRef > endRef. The per-turn
+// statusLine that once printed those pairs was removed in #6928 (it
+// contradicted the same turns' compress receipt); the apply path must still
+// fold exactly the offered positional span for either label order.
+
+const STATUS_LIMIT = 872_000;
+
+function statusConfig(): Config {
+  return {
+    tiers: { enabled: true, tier2Trigger: 5, tier3Trigger: 10 },
+    nudge: {
+      maxContextLimitPct: 0.75,
+      minContextLimitPct: 0.05,
+      frequency: 1,
+      iterationThreshold: 15,
+      force: "soft",
+      growthRatio: 0.06,
+      growthFloor: 50_000,
+      growthCap: 50_000,
+      minGrowthFloor: 22_500,
+      minGrowthRatio: 0.45,
+      emergencyThresholdPct: 0.98,
+    },
+    promotionThreshold: 5,
+    truncate: { threshold: 1 },
+    merge: { maxSummaryLength: 3000, minOldGenBlocks: 3 },
+    compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 1 },
+    protectedTools: [],
+    preserveRecentMessages: 0,
+    preserveRecentTokens: 0,
+    modelContextLimit: STATUS_LIMIT,
+  };
+}
+
+test("applyCompression folds the exact offered span for either label order (#5680)", () => {
+  // Host-side normalizeRangeOrder (#1001) swaps a reversed spec before it
+  // reaches the kernel; resolveBoundaries (#310) swaps back positionally. The
+  // composition must fold exactly the offered positional span — pin it in BOTH
+  // label orders so neither half of the double swap regresses alone.
+  const A = msg("A", "x".repeat(1000));
+  const B = msg("B", "y".repeat(1000));
+  const C = msg("C", "z".repeat(1000));
+  const D = msg("D", "u".repeat(1000));
+  const E = msg("E", "w".repeat(1000));
+  const messages = [A, B, C, D, E];
+  const refs = { A: "m00760", B: "m00755", C: "m00651", D: "m00650", E: "m00649" };
+  const core = createCore();
+  const cfg = statusConfig();
+
+  for (const [startRef, endRef] of [
+    ["m00760", "m00649"], // model echoes the offered (inverted) span verbatim
+    ["m00649", "m00760"], // host-normalized shape
+  ] as const) {
+    const r = core.applyCompression({
+      ranges: [{ startRef, endRef, summary: "work recap" }],
+      messages,
+      state: assignRaw(messages, refs),
+      config: cfg,
+    });
+    assert.equal(r.result.errors.length, 0, `${startRef}–${endRef}: ${r.result.errors.join("; ")}`);
+    assert.equal(r.result.blocksCreated, 1, `${startRef}–${endRef}: one block`);
+    const block = r.state.blocks.find((b) => b.active);
+    assert.ok(block, "a block was created");
+    assert.deepEqual(
+      [...block.directMessageIds].sort(),
+      ["A", "B", "C", "D", "E"],
+      `${startRef}–${endRef}: exactly the offered positional span`,
+    );
+  }
+});
+
