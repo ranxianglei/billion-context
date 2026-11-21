@@ -32,6 +32,11 @@ import { getSession, peekSession, _resetSessionsForTest } from "../src/session.t
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
+// #4634 changed the DEFAULT for dsh auto-review traffic (answered locally, not
+// forwarded). This file pins the #4438 LANE contract (stateless passthrough
+// forwarding, no |sub: fork) — run it with the #4634 block opted out so the two
+// suites cover complementary behaviors instead of colliding on the default.
+process.env.BILI_DSH_AUTOREVIEW_BLOCK = "0";
 
 const MODEL = "claude-sonnet-4-5";
 const MAIN_SYSTEM = "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp.";

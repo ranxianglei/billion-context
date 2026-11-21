@@ -12,6 +12,8 @@ import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { getResolverWedgeState } from "../resolver-wedge.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
+import { autoReviewBlockStats } from "./dsh-auto-review-block.js";
+import { dshAutoReviewBlockEnabled } from "../knobs.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
@@ -1386,6 +1388,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         pckSuppressions: pckAblations(),
         storage: storageStatusWire(),
         attribution: attributionStatusWire(),
+        autoReviewBlock: { enabled: dshAutoReviewBlockEnabled(), ...autoReviewBlockStats() },
     }, null, 2));
 }
 
