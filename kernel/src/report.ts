@@ -398,6 +398,14 @@ function renderOverview(
   return lines.join("\n");
 }
 
+// #6936: unrefed rows (successful compress call/result pairs — the kernel
+// assigns them the BLOCKED sentinel instead of minting a ref) are visible
+// mass and stay in the token accounting, but no model-facing surface may
+// print the internal sentinel: it reads as corruption and the span can never
+// be foldable by name (ranges resolve ref → message id; an unrefed row has
+// no id to resolve to). Label such spans with this marker instead.
+const UNREFED_LABEL = "(unrefed)";
+
 function renderUncompressedRanges(
   visible: VisibleMessageInfo[],
   sort: string,
@@ -423,6 +431,8 @@ function renderUncompressedRanges(
   interface Merged {
     startRef: string;
     endRef: string;
+    /** True when the group contains unrefed (BLOCKED) rows. */
+    hasUnrefed: boolean;
     startIndex: number;
     count: number;
     tokens: number;
@@ -442,9 +452,16 @@ function renderUncompressedRanges(
   const merged: Merged[] = [];
   for (const group of segmentGroups(visible)) {
     const first = group[0]!;
+    // #6936: name the span by its RESOLVABLE endpoints only — the raw
+    // first/last ref used to leak the BLOCKED sentinel verbatim
+    // ("m00644–BLOCKED"). A fully-unrefed group carries no name at all.
+    const resolvable = group.filter((m) => m.ref !== BLOCKED_REF);
     const r: Merged = {
-      startRef: first.ref,
-      endRef: first.ref,
+      startRef:
+        resolvable.length > 0 ? resolvable[0]!.ref : UNREFED_LABEL,
+      endRef:
+        resolvable.length > 0 ? resolvable[resolvable.length - 1]!.ref : UNREFED_LABEL,
+      hasUnrefed: resolvable.length < group.length,
       startIndex: first.index,
       count: 1,
       tokens: first.tokens,
@@ -452,7 +469,7 @@ function renderUncompressedRanges(
     };
     for (let i = 1; i < group.length; i++) {
       const m = group[i]!;
-      r.endRef = m.ref;
+      if (m.ref !== BLOCKED_REF) r.endRef = m.ref;
       r.count += 1;
       r.tokens += m.tokens;
       r.toolTokens.set(m.tool, (r.toolTokens.get(m.tool) ?? 0) + m.tokens);
@@ -492,6 +509,8 @@ function renderUncompressedRanges(
       return parts.join(" and ") || "turn structure";
     };
     flagFor = (r): string | null => {
+      if (r.startRef === UNREFED_LABEL)
+        return "\u26a0 not foldable: rows carry no refs";
       let proj: UnitProjection;
       try {
         proj = projectUnit({
@@ -505,6 +524,9 @@ function renderUncompressedRanges(
           shared,
         });
       } catch {
+        // #6936: BLOCKED endpoints no longer reach projection — this catch
+        // now means a genuinely broken ref map, so the wording stays a
+        // canary rather than a routine label.
         return "\u26a0 not foldable: refs unresolvable";
       }
       if (proj.fatal?.kind === "zone")
@@ -513,6 +535,10 @@ function renderUncompressedRanges(
         return `\u26a0 not foldable: would split ${splitDescOf(proj)}`;
       if (proj.filteredIds.length === 0 && proj.consumedBlockIds.length === 0)
         return "\u26a0 not foldable: nothing new to fold";
+      // Foldable, but the span hides unrefed rows the named range cannot
+      // reach — say so instead of letting the fold result surprise.
+      if (r.hasUnrefed)
+        return "\u26a0 unrefed rows inside stay after fold";
       return null;
     };
   }
@@ -520,11 +546,14 @@ function renderUncompressedRanges(
   lines.push("");
   for (const r of merged.slice(0, limit)) {
     // Ascending endpoint labels: non-monotonic refs (#1001) can make a
-    // positional span's labels numerically descending (#2168).
+    // positional span's labels numerically descending (#2168). Fully-unrefed
+    // spans carry the marker as their whole label (#6936).
     const range =
-      r.count === 1
-        ? r.startRef
-        : orderedRefPair(r.startRef, r.endRef).join("–");
+      r.startRef === UNREFED_LABEL
+        ? UNREFED_LABEL
+        : r.count === 1
+          ? r.startRef
+          : orderedRefPair(r.startRef, r.endRef).join("–");
     const flag = flagFor ? flagFor(r) : null;
     lines.push(
       `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
@@ -560,8 +589,9 @@ function renderMessageDrilldown(
   const lines = [header, `Sorted by ${sort}`, ""];
   const shown = filtered.slice(0, limit);
   for (const message of shown) {
+    // #6936: never leak the internal sentinel into the per-message listing.
     lines.push(
-      `  ${message.ref} (${formatTokens(message.tokens)}) ${message.tool}`,
+      `  ${message.ref === BLOCKED_REF ? UNREFED_LABEL : message.ref} (${formatTokens(message.tokens)}) ${message.tool}`,
     );
   }
   if (filtered.length > shown.length) {
