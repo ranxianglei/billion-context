@@ -69,7 +69,7 @@ export function installInlineTransport(): boolean {
                 throw err;
             }
         };
-    });
+    }, { inlineOrigin: INLINE_ORIGIN });
     return true;
 }
 
