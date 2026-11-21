@@ -23,7 +23,9 @@ import type { Session } from "../src/session.ts";
 const makeSession = (reference: number, lastInputTokens: number): Session =>
     ({
         id: "s5415",
-        stats: { lastInputTokens },
+        // usage-grade meter: noteAbortedTurn only stamps trustworthy scalars
+        // since #5500 (estimate-grade/unprovenanced arms carry false information).
+        stats: { lastInputTokens, lastInputTokensSource: "usage" },
         state: {
             nudge: {
                 lastPerMessageNudgeTokens: reference,
