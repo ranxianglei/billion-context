@@ -171,14 +171,14 @@ test("zero folds: anonymous unknown baseline — measured over-window body is do
     const f = await run({ windowRatio: 0.6, anonymous: true });
     assert.ok("failFast" in f.result, JSON.stringify(f.logs));
     assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.logs.some(line => line.includes("prompt ITSELF exceeds the window")));
 });
 
 test("zero folds: a prior scoped refusal keeps the anonymous body locally doomed", { timeout: 15_000 }, async () => {
     const f = await run({ windowRatio: 0.6, anonymous: true, localRefusal: true });
     assert.ok("failFast" in f.result, JSON.stringify(f.logs));
     assert.equal(f.result.status, 413);
-    assert.ok(f.logs.some(line => line.includes("body ITSELF exceeds the window")));
+    assert.ok(f.logs.some(line => line.includes("prompt ITSELF exceeds the window")));
 });
 
 test("zero folds: image reserve is not deflated by text calibration", { timeout: 15_000 }, async () => {

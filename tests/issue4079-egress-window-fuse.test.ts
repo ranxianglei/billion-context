@@ -164,7 +164,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured prompt-mass math is in the operator-facing message (#7013)");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
@@ -201,7 +201,7 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
+        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured tier names itself (prompt-mass; non-prompt fields excluded — #7013; image payloads are #496 arbitration, never doom)");
         assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream
         // (before the measured tier it cleared the byte floor and rode forward
@@ -234,7 +234,7 @@ test("e2e #4543: a CJK body whose CORE TEXT alone measures over the floored fuse
         assert.equal(r.status, 413, `the CJK-measured body must stop at the fuse (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
         assert.equal(parsed.error?.retryable, false, "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the measured prompt-mass math is in the operator-facing message (#7013)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
@@ -264,6 +264,71 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
 
         assert.equal(calls.length, 2, "both requests reached the upstream");
         assert.ok(calls[1]!.bytes > 1_500_000, `the multi-MB body really was forwarded (got ${calls[1]!.bytes}B)`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+// #7013: the fuse prices the wire-format's PROMPT mass, not the whole body.
+// A non-prompt upload field (DSH's dsh_session_log — telemetry that rides the
+// wire but consumes no window) must NOT 413 a fitting prompt. This reproduces
+// the issue's exact repro: ~100K-token prompt + an 8 MiB dsh_session_log that
+// used to measure ~2M tokens and doom the send.
+test("e2e #7013: a giant non-prompt upload field does not doom a fitting prompt at the egress fuse", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7013-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // No `model` in the body → preflight's `!model` early return skips its
+        // doom math; forward()'s egress fuse is the last line (#4079). The
+        // prompt is small (~1K tokens); the dsh_session_log upload is 8 MiB of
+        // non-prompt telemetry (~2M tokens if it were priced). Before #7013 the
+        // fuse's meter counted the upload and answered 413; now it prices only
+        // the prompt mass and forwards.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello, a small fitting prompt" }],
+                dsh_session_log: "t".repeat(8_000_000),
+            }),
+        });
+        const body = await r.text();
+        assert.equal(r.status, 200, `the fitting prompt must forward despite the 8 MiB non-prompt upload (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, `the request reached the upstream exactly once (got ${calls.length})`);
+        assert.ok(calls[0]!.bytes > 8_000_000, "the upload rode the wire (the upstream ignores it; bili only mis-priced it)");
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+// #7013 both-ways: a prompt that GENUINELY exceeds the window still dooms, even
+// with a large non-prompt upload field present — the fix must not over-suppress
+// the fuse (#3617). The prompt mass alone clears the floored 1M bar.
+test("e2e #7013 both-ways: a genuinely over-window prompt still dooms at the egress fuse", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7013b-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // ~1.2M CJK chars ≈ ~1.2M tokens of PROMPT mass — over the floored 1M
+        // bar on its own. Plus a 2 MiB non-prompt upload (which the fix ignores
+        // for the window budget). The prompt mass alone dooms the send.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "数".repeat(1_200_000) }],
+                dsh_session_log: "t".repeat(2_000_000),
+            }),
+        });
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { code?: string; message?: string } };
+        assert.equal(r.status, 413, `the over-window prompt must still doom (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
+        assert.match(parsed.error?.message ?? "", /outbound prompt measures ~[\d,]+ tokens/, "the prompt-mass math is in the message");
+        assert.equal(calls.length, 0, "the doomed payload never reached the upstream");
     } finally {
         await close();
         rmrf(root);
