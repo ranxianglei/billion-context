@@ -228,16 +228,16 @@ function writeSnapshotLegacy(): void {
 /** #5753: one durable unified-store RMW — read the live row (cross-lane
  *  union), merge ours in fresher-wins, re-apply bounds, write back. Writes are
  *  chained so back-to-back schedules never lose updates against each other. */
-function persistUnifiedNow(): void {
+function persistUnifiedNow(): Promise<void> {
+    // This batch now owns its queued write; later mutations need a fresh
+    // debounce window even while the store is still settling this one.
+    pendingSince = null;
     const store = kvStore();
-    if (!store) return;
+    if (!store) return kvChain;
     kvChain = kvChain.then(async () => {
-        let live: OrderSkeletonEntry[] | null = null;
-        try {
-            live = parseStoreDoc(await store.getKvAsync(ORDER_NS, ORDER_KEY));
-        } catch {
-            live = null;
-        }
+        // A failed read is not an absent snapshot: leave the durable row
+        // untouched and let the outer handler select the legacy fallback.
+        const live = parseStoreDoc(await store.getKvAsync(ORDER_NS, ORDER_KEY));
         const mine = orderSnapshot();
         const merged = live === null ? mine : mergeWithDisk(mine, live);
         const entries = normalizeForWrite(merged);
@@ -249,6 +249,7 @@ function persistUnifiedNow(): void {
         // matching what the warning promises; a healthy store stays primary.
         kvReady = false;
     });
+    return kvChain;
 }
 
 /** Once per process (wired at cli start): layer the kv snapshot over what the
@@ -258,12 +259,9 @@ export async function hydrateOrderUnified(): Promise<void> {
     const store = kvStore();
     if (kvReady || !store) return;
     try {
-        let raw: unknown;
-        try {
-            raw = await store.getKvAsync(ORDER_NS, ORDER_KEY);
-        } catch {
-            raw = undefined;
-        }
+        // Preserve the stored row and allow a later hydration retry if
+        // the current snapshot cannot be read.
+        const raw = await store.getKvAsync(ORDER_NS, ORDER_KEY);
         const kvEntries = parseStoreDoc(raw) ?? [];
         // Presence-based predicate (mirrors the affinity twin): an empty but
         // PRESENT row still counts as migrated, so sibling lanes' empties are

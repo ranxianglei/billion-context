@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { CoreMessage } from "acp-kernel";
-import { createGoogleAdapter } from "../src/loop/index.ts";
+import { createCore, defaultConfig, type CoreMessage } from "acp-kernel";
+import { coreToGoogle, googleToCore, type GooglePart } from "acp-kernel/wire";
+import { createGoogleAdapter, runCompressLoop } from "../src/loop/index.ts";
 import type { CompressLoopAdapter, ParsedStreamEvent } from "../src/loop/index.ts";
+import { createSession } from "../src/session.ts";
+import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
 
 function sse(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
@@ -348,4 +351,419 @@ test("google parseStream: a null sibling part does not break the edited frame", 
     );
     const frames = framesOf(events);
     assert.ok(frames.some((f) => f.includes("kept prose")), `the prose still reaches the client, got: ${frames.join(" | ")}`);
+});
+
+test("google parseStream: parallel [compress (signed), write_file (unsigned)] in same chunk promotes thoughtSignature onto write_file", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-4-argon-medium");
+    const events = await collect(
+        adapter,
+        sse({
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [
+                        {
+                            functionCall: {
+                                name: "compress",
+                                args: { content: "m00046-m00129: folded context\nsummary body" },
+                                id: "call_compress_1",
+                            },
+                            thoughtSignature: "sig-parallel-same-chunk",
+                        },
+                        {
+                            functionCall: {
+                                name: "write_file",
+                                args: { path: "src/app.ts", content: "export const ok = true;\n" },
+                                id: "call_write_2",
+                            },
+                        },
+                        {
+                            functionCall: {
+                                name: "read_file",
+                                args: { path: "README.md" },
+                                id: "call_read_3",
+                            },
+                        },
+                    ],
+                },
+                index: 0,
+            }],
+        }) +
+            sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] }),
+    );
+
+    const toolCalls = events.filter((e): e is Extract<ParsedStreamEvent, { kind: "tool_call" }> => e.kind === "tool_call");
+    const writeEvent = toolCalls.find((e) => e.name === "write_file");
+    const readEvent = toolCalls.find((e) => e.name === "read_file");
+    const compressEvent = toolCalls.find((e) => e.name === "compress");
+    assert.ok(writeEvent && writeEvent.passthrough === true, "write_file emitted as passthrough real call");
+    assert.equal(writeEvent.signature, "sig-parallel-same-chunk", "first surviving real call event inherits thoughtSignature");
+    assert.ok(readEvent && readEvent.passthrough === true, "read_file emitted as passthrough real call");
+    assert.equal(readEvent.signature, undefined, "subsequent sibling real call stays unsigned");
+    assert.ok(compressEvent && compressEvent.passthrough !== true, "compress emitted as server-side proxy call");
+
+    const callMeta = events.find((e) => e.kind === "meta" && e.chunk.toString("utf8").includes("write_file"));
+    assert.ok(callMeta && callMeta.kind === "meta", "replayed call frame present");
+    const replayedParts = partsOf(frameJson(callMeta.chunk));
+    assert.equal(replayedParts.length, 2, "compress stripped; two real calls kept");
+    assert.deepEqual(replayedParts[0].functionCall, {
+        name: "write_file",
+        args: { path: "src/app.ts", content: "export const ok = true;\n" },
+        id: "call_write_2",
+    });
+    assert.equal(replayedParts[0].thoughtSignature, "sig-parallel-same-chunk", "first surviving real functionCall part carries promoted thoughtSignature");
+    assert.equal(replayedParts[1].thoughtSignature, undefined, "second surviving real functionCall part stays unsigned");
+});
+
+test("google parseStream: parallel [compress (signed), write_file (unsigned)] across separate chunks promotes thoughtSignature onto write_file chunk", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-4-argon-medium");
+    const events = await collect(
+        adapter,
+        sse({
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [{
+                        functionCall: {
+                            name: "compress",
+                            args: { content: "m00001-m00010: folded\nsummary" },
+                            id: "call_compress_chunk1",
+                        },
+                        thoughtSignature: "sig-parallel-chunk1",
+                    }],
+                },
+                index: 0,
+            }],
+        }) +
+            sse({
+                candidates: [{
+                    content: {
+                        role: "model",
+                        parts: [{
+                            functionCall: {
+                                name: "write_file",
+                                args: { path: "src/index.ts", content: "console.log(1);\n" },
+                                id: "call_write_chunk2",
+                            },
+                        }],
+                    },
+                    index: 0,
+                }],
+            }) +
+            sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] }),
+    );
+
+    const allFrames = framesOf(events).join("");
+    assert.equal(allFrames.includes("call_compress_chunk1"), false, "proxy-only chunk 1 is dropped from client stream");
+    const callMeta = events.find((e) => e.kind === "meta" && e.chunk.toString("utf8").includes("write_file"));
+    assert.ok(callMeta && callMeta.kind === "meta", "chunk 2 replayed with write_file");
+    const replayedParts = partsOf(frameJson(callMeta.chunk));
+    assert.equal(replayedParts.length, 1);
+    assert.equal(replayedParts[0].thoughtSignature, "sig-parallel-chunk1", "chunk 2 real functionCall part inherits chunk 1 proxy call's thoughtSignature");
+});
+
+test("google parseStream: real call with its own thoughtSignature is never overwritten by a sibling proxy call", async () => {
+    const adapter = createGoogleAdapter(REQUEST_BODY, "client system", "bili_absorb", "gemini-4-argon-medium");
+    const events = await collect(
+        adapter,
+        sse({
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [
+                        {
+                            functionCall: { name: "write_file", args: { path: "a.ts" }, id: "call_1" },
+                            thoughtSignature: "sig-own-real",
+                        },
+                        {
+                            functionCall: { name: "compress", args: {}, id: "call_2" },
+                            thoughtSignature: "sig-proxy-other",
+                        },
+                    ],
+                },
+                index: 0,
+            }],
+        }) +
+            sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] }),
+    );
+
+    const callMeta = events.find((e) => e.kind === "meta" && e.chunk.toString("utf8").includes("write_file"));
+    assert.ok(callMeta && callMeta.kind === "meta");
+    const replayedParts = partsOf(frameJson(callMeta.chunk));
+    assert.equal(replayedParts.length, 1);
+    assert.equal(replayedParts[0].thoughtSignature, "sig-own-real", "real call's own signature is preserved");
+});
+
+test("rewriteGoogleJsonResponseAsync: promotes stripped proxy call thoughtSignature onto surviving real functionCall part", async () => {
+    const core = createCore();
+    const config = defaultConfig(400_000);
+    const session = createSession("google-json-sig");
+    const messages: CoreMessage[] = [
+        { id: "m1", role: "user", contentType: "text", text: "step 1" },
+        { id: "m2", role: "assistant", contentType: "text", text: "ack 1" },
+        { id: "m3", role: "user", contentType: "text", text: "step 2" },
+        { id: "m4", role: "assistant", contentType: "text", text: "ack 2" },
+        { id: "m5", role: "user", contentType: "text", text: "step 3" },
+        { id: "m6", role: "assistant", contentType: "text", text: "ack 3" },
+        { id: "m7", role: "user", contentType: "text", text: "step 4" },
+    ];
+    const turn = core.processTurn({ messages, state: session.state, config, tokenCount: 0 });
+    session.state = turn.state;
+
+    const responseBody = {
+        candidates: [{
+            content: {
+                role: "model",
+                parts: [
+                    {
+                        functionCall: {
+                            name: "compress",
+                            args: { content: "m00001-m00003: early steps\ncompleted step 1 and step 2" },
+                            id: "fc_compress",
+                        },
+                        thoughtSignature: "sig-json-parallel",
+                    },
+                    {
+                        functionCall: {
+                            name: "write_file",
+                            args: { path: "out.txt", content: "done" },
+                            id: "fc_write",
+                        },
+                    },
+                ],
+            },
+            finishReason: "STOP",
+        }],
+    };
+
+    const rewritten = (await rewriteGoogleJsonResponseAsync(responseBody, {
+        core,
+        config,
+        messages,
+        session,
+        log: () => {},
+    })) as { candidates: Array<{ content: { parts: GooglePart[] } }> };
+
+    const outParts = rewritten.candidates[0].content.parts;
+    const fcParts = outParts.filter((p) => p.functionCall !== undefined);
+    assert.equal(fcParts.length, 1, "compress stripped, write_file kept");
+    assert.equal(fcParts[0].functionCall?.name, "write_file");
+    assert.equal(fcParts[0].thoughtSignature, "sig-json-parallel", "write_file inherited thoughtSignature from stripped compress call");
+});
+
+test("runCompressLoop + next-turn Google replay: mixed [compress, write_file] turn keeps thoughtSignature on write_file after fold", async () => {
+    const core = createCore();
+    const config = defaultConfig(400_000);
+    const session = createSession("google-loop-mixed-sig");
+
+    const initialContents = [
+        { role: "user", parts: [{ text: "task 1" }] },
+        { role: "model", parts: [{ text: "done 1" }] },
+        { role: "user", parts: [{ text: "task 2" }] },
+        { role: "model", parts: [{ text: "done 2" }] },
+        { role: "user", parts: [{ text: "task 3" }] },
+        { role: "model", parts: [{ text: "done 3" }] },
+        { role: "user", parts: [{ text: "now compress and write file" }] },
+    ];
+    const flat1 = googleToCore({ contents: initialContents });
+    const turn1 = core.processTurn({ messages: flat1.msgs, state: session.state, config, tokenCount: 0 });
+    session.state = turn1.state;
+
+    const upstreamSse =
+        sse({
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [
+                        { thought: true, text: "I will compress m00001-m00004 and call write_file." },
+                        {
+                            functionCall: {
+                                name: "compress",
+                                args: { content: "m00001-m00004: tasks 1-2\ncompleted tasks 1 and 2" },
+                                id: "call_compress_mixed",
+                            },
+                            thoughtSignature: "sig-gemini4-active-turn",
+                        },
+                        {
+                            functionCall: {
+                                name: "write_file",
+                                args: { path: "result.txt", content: "hello" },
+                                id: "call_write_mixed",
+                            },
+                        },
+                    ],
+                },
+                index: 0,
+            }],
+        }) +
+        sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] });
+
+    const reqBody: Record<string, unknown> = { contents: initialContents };
+    const adapter = createGoogleAdapter(reqBody, undefined, undefined, "gemini-4-argon-medium");
+    const streamedChunks: string[] = [];
+    for await (const chunk of runCompressLoop(
+        new Response(upstreamSse, { status: 200 }).body!,
+        {
+            core,
+            config,
+            messages: turn1.messages,
+            compressMessages: flat1.msgs,
+            session,
+            protocol: "google",
+            log: () => {},
+        },
+        reqBody,
+        { url: "http://127.0.0.1:1/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse", headers: {} },
+        adapter,
+        "system prompt",
+    )) {
+        streamedChunks.push(chunk.toString("utf8"));
+    }
+
+    // Reconstruct the model turn parts exactly as a Google SSE client accumulates them.
+    const clientReceivedParts: GooglePart[] = [];
+    for (const raw of streamedChunks.join("").split("\n\n")) {
+        const line = raw.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        const parsed = JSON.parse(line.slice(5).trim()) as {
+            candidates?: Array<{ content?: { parts?: GooglePart[] } }>;
+        };
+        const ps = parsed.candidates?.[0]?.content?.parts ?? [];
+        clientReceivedParts.push(...ps);
+    }
+
+    const writePartOnWire = clientReceivedParts.find((p) => p.functionCall?.name === "write_file");
+    assert.ok(writePartOnWire, "client received write_file functionCall part");
+    assert.equal(writePartOnWire.thoughtSignature, "sig-gemini4-active-turn", "streamed write_file part carries thoughtSignature");
+
+    // Next turn: client appends the model turn + functionResponse for write_file, and bili prepares the folded outbound body.
+    const nextTurnContents = [
+        ...initialContents,
+        { role: "model", parts: clientReceivedParts },
+        {
+            role: "user",
+            parts: [{
+                functionResponse: {
+                    name: "write_file",
+                    id: "call_write_mixed",
+                    response: { output: "ok" },
+                },
+            }],
+        },
+    ];
+    const flat2 = googleToCore({ contents: nextTurnContents });
+    const turn2 = core.processTurn({ messages: flat2.msgs, state: session.state, config, tokenCount: 0 });
+    const outboundContents = coreToGoogle(turn2.messages);
+    const modelTurnWithWrite = outboundContents.find(
+        (c) => c.role === "model" && c.parts.some((p) => p.functionCall?.name === "write_file"),
+    );
+    assert.ok(modelTurnWithWrite, "outbound Google contents contain the write_file model turn");
+    const outboundWritePart = modelTurnWithWrite.parts.find((p) => p.functionCall?.name === "write_file");
+    assert.ok(outboundWritePart, "write_file part present on outbound wire");
+    assert.equal(
+        outboundWritePart.thoughtSignature,
+        "sig-gemini4-active-turn",
+        "surviving write_file part retains thoughtSignature after fold on next turn",
+    );
+});
+
+test("runCompressLoop Google re-request: parallel proxy-only calls [compress (signed), acp_status (unsigned)] keep thoughtSignature on every rebuilt model functionCall turn", async () => {
+    const core = createCore();
+    const config = defaultConfig(400_000);
+    const session = createSession("google-loop-multi-proxy-sig");
+
+    const initialContents = [
+        { role: "user", parts: [{ text: "step 1" }] },
+        { role: "model", parts: [{ text: "done 1" }] },
+        { role: "user", parts: [{ text: "step 2" }] },
+        { role: "model", parts: [{ text: "done 2" }] },
+        { role: "user", parts: [{ text: "compress and check status" }] },
+    ];
+    const flat = googleToCore({ contents: initialContents });
+    const turn = core.processTurn({ messages: flat.msgs, state: session.state, config, tokenCount: 0 });
+    session.state = turn.state;
+
+    const round1Sse =
+        sse({
+            candidates: [{
+                content: {
+                    role: "model",
+                    parts: [
+                        {
+                            functionCall: {
+                                name: "compress",
+                                args: { content: "m00001-m00002: step 1\ncompleted step 1" },
+                                id: "call_proxy_compress",
+                            },
+                            thoughtSignature: "sig-multi-proxy-round1",
+                        },
+                        {
+                            functionCall: {
+                                name: "acp_status",
+                                args: {},
+                                id: "call_proxy_status",
+                            },
+                        },
+                    ],
+                },
+                index: 0,
+            }],
+        }) +
+        sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] });
+
+    const round2Sse =
+        sse({ candidates: [{ content: { role: "model", parts: [{ text: "All folded and checked." }] }, index: 0 }] }) +
+        sse({ candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }] });
+
+    let capturedRound2Body: { contents?: Array<{ role?: string; parts?: GooglePart[] }> } | undefined;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+        capturedRound2Body = JSON.parse(String(init?.body ?? "{}")) as {
+            contents?: Array<{ role?: string; parts?: GooglePart[] }>;
+        };
+        return new Response(round2Sse, {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+        });
+    }) as typeof fetch;
+
+    try {
+        const reqBody: Record<string, unknown> = { contents: initialContents };
+        const adapter = createGoogleAdapter(reqBody, undefined, undefined, "gemini-4-argon-medium");
+        for await (const _ of runCompressLoop(
+            new Response(round1Sse, { status: 200 }).body!,
+            {
+                core,
+                config,
+                messages: turn.messages,
+                compressMessages: flat.msgs,
+                session,
+                protocol: "google",
+                log: () => {},
+            },
+            reqBody,
+            { url: "http://127.0.0.1:1/v1beta/models/gemini-4-argon-medium:streamGenerateContent?alt=sse", headers: {} },
+            adapter,
+            "system prompt",
+        )) {
+            // drain
+        }
+    } finally {
+        globalThis.fetch = origFetch;
+    }
+
+    assert.ok(capturedRound2Body?.contents, "round 2 re-request body captured");
+    const modelFcTurns = capturedRound2Body.contents.filter(
+        (c) => c.role === "model" && (c.parts ?? []).some((p) => p.functionCall !== undefined),
+    );
+    assert.ok(modelFcTurns.length >= 2, "both proxy tool calls are present in round 2 re-request");
+    for (const modelTurn of modelFcTurns) {
+        const firstFc = (modelTurn.parts ?? []).find((p) => p.functionCall !== undefined);
+        assert.ok(firstFc, "model turn has functionCall part");
+        assert.equal(
+            firstFc.thoughtSignature,
+            "sig-multi-proxy-round1",
+            `functionCall ${firstFc.functionCall?.name} carries round thoughtSignature`,
+        );
+    }
 });

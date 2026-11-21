@@ -19,7 +19,6 @@ import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
-import { relocateCompressCarriers } from "./relocate-compress.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
@@ -206,10 +205,6 @@ function numericBlockId(id: string): number {
   return parsed ? Number(parsed[1]) : 0;
 }
 
-function formatK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
-}
-
 function refGateDiagnostics(
   state: CompressionState,
   requestedRanges: number,
@@ -293,13 +288,17 @@ function coveringBlockIds(
 // fire yet (the misleading hint behind ranxianglei/billion-context-pi#470).
 function tierActionHint(config: Config, state: CompressionState): string {
   if (!config.tiers.enabled) return "";
-  const t2 = activeBlocks(state).filter((b) => b.tier === 2);
+  // #5765: retired blocks are excluded from distillation targets — a hint
+  // spanning one would point the model at a range apply refuses (#5765 guard
+  // below), and folding them would pull their material back into the view.
+  const live = activeBlocks(state).filter((b) => !b.retired);
+  const t2 = live.filter((b) => b.tier === 2);
   if (t2.length >= config.tiers.tier3Trigger) {
-    return ` Tier condensation is actionable now: compress({ content: [{ startId: "${t2[0]!.blockId}", endId: "${t2[t2.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-2 blocks into one tier-3 block.`;
+    return ` Tier condensation is actionable now: compress({ content: "${t2[0]!.blockId}–${t2[t2.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-2 blocks into one tier-3 block.`;
   }
-  const t1 = activeBlocks(state).filter((b) => b.tier === 1);
+  const t1 = live.filter((b) => b.tier === 1);
   if (t1.length >= config.tiers.tier2Trigger) {
-    return ` Tier distillation is actionable now: compress({ content: [{ startId: "${t1[0]!.blockId}", endId: "${t1[t1.length - 1]!.blockId}", summary: "...", topic: "..." }] }) merges those tier-1 blocks into one tier-2 block.`;
+    return ` Tier distillation is actionable now: compress({ content: "${t1[0]!.blockId}–${t1[t1.length - 1]!.blockId} optional topic\\nsummary markdown..." }) merges those tier-1 blocks into one tier-2 block.`;
   }
   return "";
 }
@@ -384,7 +383,12 @@ export function createCore(ports: Ports = {}): CompressionCore {
         countTokens,
       );
 
-    const preExistingCoverage = collectCoverage(state);
+    // This snapshot is refreshed at the top of the apply loop below (each
+    // sibling range claims against what earlier siblings in the SAME batch
+    // already cover — a frozen pre-batch snapshot let two adjacent ranges
+    // both claim the tool pair on their shared seam, breaking the
+    // no-overlapping-active-siblings invariant at the top of this file).
+    let preExistingCoverage = collectCoverage(state);
 
     // Classify every requested range ONCE. The result feeds overlap
     // skipSpecs, the minCompressRange pre-check, and the per-range loop —
@@ -802,6 +806,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
 
     for (const spec of input.ranges) {
+      // The batch applies every range to ONE shared state in order, so each
+      // projection must judge "already covered" against the siblings that
+      // landed EARLIER in this same batch, not only the pre-batch snapshot:
+      // without the refresh, two adjacent ranges whose spans share the seam
+      // tool pair both claimed it (two active sibling blocks directly owning
+      // the same messages). First-come-first-served: the earlier range keeps
+      // the seam; the later one shrinks to its own new messages or becomes
+      // the #4521 idempotent no-op. Cheap: active blocks × their id sets.
+      preExistingCoverage = collectCoverage(state);
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
@@ -1033,38 +1046,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
-    // #4521: between banner deliveries a compression round can stay armed for
-    // many requests (backoff, tier cadence, model-decided timing). During that
-    // window the model sees NO current refs and starts guessing beyond the
-    // highest allocated ref — every guess a failed round-trip. Emit a compact
-    // boundary line whenever a nudge plan carries offered ranges but its
-    // banner is not being delivered this turn; hosts append it as an ephemeral
-    // trailing user message (same carrier as the nudge, same cache safety).
-    let statusLine: string | undefined;
-    const nudge = result.effects.nudge;
-    // Two shapes authorize the refresh line: a real tiered arm whose banner
-    // is deferred this turn (tier !== null: pressure crossed a threshold but
-    // cadence/backoff holds it), or any plan after at least one banner was
-    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
-    // this line only refreshes them). A fresh session's below-threshold plan
-    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
-    // must stay fully silent: same regime promise as the nudge itself
-    // (#196 regime scoping, #3910 lane baseline).
-    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
-    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
-      const highest = highestUsedIndex(state.messageRefs);
-      const offered = nudge.compressibleRanges!
-        .slice(0, 3)
-        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
-        .join(", ");
-      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
-      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
-    }
+    // #6928: the #4521 armed-but-silent refresh line ("[ACP status: …]",
+    // emitted on turns where a nudge plan is armed but its banner is not
+    // delivered) is removed. It fired precisely when the banner was withheld,
+    // so its "compressible now" list was always below-gate residue — a
+    // standing fold directive contradicting the same turns' compress receipt
+    // ("named for visibility, not as fold suggestions" / "No compressible
+    // ranges remain"). Ref-guessing backstops remain: the compress receipt and
+    // the unknown-ref refusal both report the session's highest allocated ref.
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
-      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
@@ -1144,11 +1137,6 @@ export function createCore(ports: Ports = {}): CompressionCore {
       absorbPromptNode,
       filterNode,
       hideCompressCallsNode,
-      // EXPERIMENTAL, default off (Config.compressAtFoldPoint): move still-visible
-      // carrier pairs onto their fold point. Must run AFTER hide-compress-calls
-      // (whose orphan sweep just settled which carriers survive) and BEFORE
-      // view-latch so the latch records the relocated bytes.
-      relocateCompressCarriersNode,
       viewLatchNode,
       recommendNode,
       nudgeNode,
@@ -1459,22 +1447,6 @@ const hideCompressCallsNode: PipelineNode = {
       ...io,
       messages: hidden.messages,
       state: { ...io.state, ...patch },
-    };
-  },
-};
-
-const relocateCompressCarriersNode: PipelineNode = {
-  name: "relocate-compress-carriers",
-  run(io, ctx) {
-    const cfg = ctx.config;
-    if (!cfg.compressAtFoldPoint) return io;
-    return {
-      ...io,
-      messages: relocateCompressCarriers(io.messages, io.state, {
-        isCompressTool: cfg.isCompressTool,
-        clearThinking: cfg.compressAtFoldPointClearThinking === true,
-        reasoningDroppable: cfg.reasoningDroppable,
-      }),
     };
   },
 };
@@ -1843,6 +1815,19 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     isBlockBoundary,
   } = projection;
 
+  // #5765 retire: consuming a retired block would re-summarize its material
+  // into the new parent's RESIDENT summary and flip the block inactive —
+  // acp_restore would then reject it forever, breaking the rollback
+  // guarantee. Refuse the range; the model excludes the id or restores first.
+  const retiredConsumed = consumedBlockIds.filter(
+    (id) => blockById(input.state, id)?.retired === true,
+  );
+  if (retiredConsumed.length > 0) {
+    throw new Error(
+      `Range ${input.spec.startRef}..${input.spec.endRef} would consume retired block(s) ${retiredConsumed.join(", ")} — their summaries are out of the resident view by explicit user decision. Re-target the range excluding them, or call acp_restore({ blockId }) first if they should be foldable again.`,
+    );
+  }
+
   // Livelock guard (billion-context-pi#199): a message-ref range whose entire
   // content is already owned by active block(s) — its raw ids are all covered
   // or dropped as protected tool pairs — resolves with zero NEW direct
@@ -1908,11 +1893,22 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // reason (e.g. a merge skipped because its turn cannot be closed now) —
     // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
+    // Every resolvable message in the range is covered by an active block
+    // that is not fully inside the range — a same-batch sibling that claimed
+    // the seam tool pair, or a pre-existing block straddling the range edge.
+    // Name that class instead of the generic "protected or filtered" one.
+    // The wording must NOT claim same-batch involvement: the pre-existing
+    // straddling case lands here too, with no block created in this batch.
+    const allCovered =
+      effectiveMessageIds.size > 0 &&
+      [...effectiveMessageIds].every((id) => input.preExistingCoverage.has(id));
     return {
       tokens: 0,
       warnings: [
         ...warnings,
-        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+        allCovered
+          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s). Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
+          : `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
     };
@@ -2146,7 +2142,10 @@ function pendingByTier(
     pending: effective.reduce((s, r) => s + r.tokens, 0),
     targetBlocks: [],
   };
-  const active = activeBlocks(state);
+  // #5765: retired summaries are not resident mass and their blocks are not
+  // foldable targets — counting them here would nudge distillation ranges the
+  // apply side refuses.
+  const active = activeBlocks(state).filter((b) => !b.retired);
   const t1 = active.filter((b) => b.tier === 1);
   const t2 = active.filter((b) => b.tier === 2);
   out[2] = {

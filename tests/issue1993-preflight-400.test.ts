@@ -202,7 +202,7 @@ test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cas
         assert.ok(
             j2.error?.message?.includes("rejected by the upstream (HTTP 400)")
                 && j2.error?.message?.includes("request too large: 523200 tokens exceeds the 128000 input limit")
-                && j2.error?.message?.includes("The over-window payload was NOT forwarded."),
+                && j2.error?.message?.includes("This request's over-window payload was NOT forwarded to the upstream."),
             `regenerated diagnosis must carry the same rejection core, got: ${j2.error?.message}`,
         );
         const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);

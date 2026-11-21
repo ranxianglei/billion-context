@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, healAnthropicSystemPositions, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
@@ -7,7 +7,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
+import { createSseFramer, sseEventData, replaceSseEventData } from "../sse-util.js";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -24,7 +24,7 @@ interface ToolUseBuffer {
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const framer = createSseFramer();
     try {
         while (true) {
             let done: boolean;
@@ -35,23 +35,13 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.push(decoder.decode(value, { stream: true }))) {
                 if (raw.trim().length > 0) yield raw;
             }
         }
-        buf = finalizeSseLineEndings(buf);
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-            const raw = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
+        for (const raw of framer.finish()) {
             if (raw.trim().length > 0) yield raw;
         }
-        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -76,26 +66,24 @@ function parseAnthropicSse(eventStr: string): { type: string; data: Record<strin
 }
 
 function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    let touched = false;
-    for (const l of lines) {
-        if (!touched && l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    touched = true;
-                    continue;
-                }
-            } catch {
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        return true;
+    });
+}
+
+function rewriteEventData(eventStr: string, edit: (obj: Record<string, unknown>) => boolean): Buffer {
+    const data = sseEventData(eventStr);
+    if (data !== null) {
+        try {
+            const obj = JSON.parse(data) as unknown;
+            if (typeof obj === "object" && obj !== null && !Array.isArray(obj) && edit(obj as Record<string, unknown>)) {
+                return Buffer.from(replaceSseEventData(eventStr, JSON.stringify(obj)) + "\n\n", "utf8");
             }
-        }
-        rebuilt.push(l);
+        } catch { /* malformed events keep their original bytes */ }
     }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return Buffer.from(eventStr + "\n\n", "utf8");
 }
 
 /** #1310: zero the usage object of a forwarded `message_start`. The real
@@ -108,49 +96,23 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
  *  Neutralizing the start makes the synthetic terminal the SOLE usage
  *  authority on the wire; a zeroed usage object stays schema-valid. */
 function neutralizeStartUsage(eventStr: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && obj.type === "message_start") {
-                    const msg = obj.message as Record<string, unknown> | undefined;
-                    if (msg && typeof msg === "object") {
-                        msg.usage = { input_tokens: 0, output_tokens: 0 };
-                        rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                        continue;
-                    }
-                }
-            } catch { /* fall through to verbatim */ }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (obj.type !== "message_start") return false;
+        const msg = obj.message as Record<string, unknown> | undefined;
+        if (!msg || typeof msg !== "object") return false;
+        msg.usage = { input_tokens: 0, output_tokens: 0 };
+        return true;
+    });
 }
 
 function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: string): Buffer {
-    const lines = eventStr.split("\n");
-    const rebuilt: string[] = [];
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            const jsonStr = l.slice(5).replace(/^ /, "");
-            try {
-                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
-                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
-                    obj.index = newIndex;
-                    const d = obj.delta as Record<string, unknown> | undefined;
-                    if (d && typeof d.text === "string") d.text = newText;
-                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
-                    continue;
-                }
-            } catch {
-            }
-        }
-        rebuilt.push(l);
-    }
-    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+    return rewriteEventData(eventStr, obj => {
+        if (typeof obj.index !== "number") return false;
+        obj.index = newIndex;
+        const d = obj.delta as Record<string, unknown> | undefined;
+        if (d && typeof d.text === "string") d.text = newText;
+        return true;
+    });
 }
 
 // The loop's own early ends say "length", OpenAI's word; Anthropic has no
@@ -316,8 +278,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
+            // #5432: notes go BEFORE a trailing client system run; the #4570
+            // backstop heals whatever still arrives illegal (fold orphans).
             const withNotes = notes && notes.length > 0
-                ? healAnthropicSystemPositions([...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))])
+                ? healAnthropicSystemPositions(insertBeforeTrailingSystemRun(messages, notes.map((text) => ({ role: "user" as const, content: text }))))
                 : messages;
             return { ...body, system: stamped, messages: withNotes };
         },
@@ -358,8 +322,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             const requestText = JSON.stringify(requestBody);
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
-                    createTagEchoFilter((snippet) => {
-                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    createTagEchoFilter((snippet, duringDrain) => {
+                        const what = duringDrain === true ? "held head dropped during drain" : "stripped model-emitted render tag";
+                        loggerLog("warn", `[tag-echo] ${what}: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }, (snippet) => {
                         // #2190: residue audit — log-only, see plugin.ts twins.
                         loggerLog("warn", `[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);

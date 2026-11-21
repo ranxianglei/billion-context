@@ -435,7 +435,7 @@ export function resolveDshBinary(
  *  launcher.ts import, which would cycle through plugin-install). */
 function quoteWinToken(token: string): string {
     if (!/\s/.test(token) || token.includes('"')) return token;
-    return `"${token}"`;
+    return `"${token.replace(/(\\+)$/, "$1$1")}"`;
 }
 
 /** #679: which spawn form `dsh` needs. On Windows only .cmd/.bat shims and
