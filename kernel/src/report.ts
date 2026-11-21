@@ -511,6 +511,8 @@ function renderUncompressedRanges(
         return "\u26a0 not foldable: protected zone only";
       if (proj.fatal?.kind === "split")
         return `\u26a0 not foldable: would split ${splitDescOf(proj)}`;
+      if (proj.fatal?.kind === "window")
+        return "\u26a0 not foldable: would merge block(s) beyond the requested ref window";
       if (proj.filteredIds.length === 0 && proj.consumedBlockIds.length === 0)
         return "\u26a0 not foldable: nothing new to fold";
       return null;

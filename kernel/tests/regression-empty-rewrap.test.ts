@@ -126,6 +126,25 @@ function withRefs(
   return state;
 }
 
+// A production-shaped ledger: pruned messages KEEP their original refs (ids
+// are never re-minted), so covered-but-pruned ids retain numbers with gaps
+// relative to whatever remains visible. withRefs cannot express that gap.
+function inheritedLedger(
+  specs: {
+    blockId: string;
+    effectiveMessageIds: string[];
+  }[],
+  order: [string, number][],
+): CompressionState {
+  const state = makeState(specs);
+  for (const [raw, n] of order) {
+    const ref = `m${String(n).padStart(5, "0")}`;
+    state.messageRefs.byRaw[raw] = ref;
+    state.messageRefs.byRef[ref] = raw;
+  }
+  return state;
+}
+
 test("#199: message-ref range that only re-wraps an active block is rejected, not fake-success", () => {
   const core = createCore();
   const cfg = config();
@@ -205,6 +224,55 @@ test("#199: message-ref range that pulls in NEW messages plus a nested block is 
     msg("raw-9", "x".repeat(6000)),
     ...loopedView().slice(3),
   ];
+  // b1's covered raw-2..raw-5 were pruned from the view but keep their
+  // original refs — inside the requested window m00001..m00009.
+  const state = inheritedLedger(
+    [
+      {
+        blockId: "b1",
+        effectiveMessageIds: ["raw-2", "raw-3", "raw-4", "raw-5"],
+      },
+    ],
+    [
+      ["raw-1", 1],
+      ["tool-1", 2],
+      ["raw-2", 3],
+      ["raw-3", 4],
+      ["raw-4", 5],
+      ["raw-5", 6],
+      ["raw-9", 7],
+      ["raw-6", 8],
+      ["tool-2", 9],
+    ],
+  );
+  const startRef = state.messageRefs.byRaw["raw-1"]!;
+  const endRef = state.messageRefs.byRaw["tool-2"]!;
+
+  const applied = core.applyCompression({
+    ranges: [{ startRef, endRef, summary: "S".repeat(80) }],
+    messages,
+    state,
+    config: cfg,
+  });
+
+  assert.deepEqual(applied.result.errors, []);
+  assert.equal(applied.result.blocksCreated, 1);
+  const newBlock = applied.state.blocks[applied.state.blocks.length - 1]!;
+  assert.deepEqual(newBlock.directMessageIds, ["raw-9"]);
+  assert.deepEqual(newBlock.directBlockIds, ["b1"]);
+});
+
+test("#5830 fail-closed: unmappable consumed-block coverage rejects instead of guessing containment", () => {
+  const core = createCore();
+  const cfg = config();
+  const messages = [
+    ...loopedView().slice(0, 3),
+    msg("raw-9", "x".repeat(6000)),
+    ...loopedView().slice(3),
+  ];
+  // Fresh nextIndex=1 numbering leaves b1's pruned covered ids out of byRaw
+  // entirely — containment is unprovable, so the fold must reject atomically
+  // (the positive direction is pinned by the inherited-ledger test above).
   const state = withRefs(
     messages,
     makeState([
@@ -224,9 +292,9 @@ test("#199: message-ref range that pulls in NEW messages plus a nested block is 
     config: cfg,
   });
 
-  assert.deepEqual(applied.result.errors, []);
-  assert.equal(applied.result.blocksCreated, 1);
-  const newBlock = applied.state.blocks[applied.state.blocks.length - 1]!;
-  assert.deepEqual(newBlock.directMessageIds, ["raw-9"]);
-  assert.deepEqual(newBlock.directBlockIds, ["b1"]);
+  assert.equal(applied.result.blocksCreated, 0, "containment unprovable -> no merge");
+  assert.equal(applied.result.errors.length, 1);
+  assert.match(applied.result.errors[0]!, /unmapped coverage/);
+  assert.equal(applied.state.blocks.length, 1, "atomic: nothing committed");
+  assert.equal(applied.state.blocks[0]!.active, true, "b1 untouched");
 });

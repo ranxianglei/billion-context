@@ -53,21 +53,19 @@ async function startReceiver(dir: string): Promise<Receiver> {
     const portFile = `${log}.port`;
     const child = spawn(process.execPath, [RECEIVER, log], { stdio: "ignore", detached: true });
     child.unref();
-    // Poll for a VALID port, not mere file existence: the receiver creates the
-    // file before its write lands, so existsSync can win that race on a loaded
-    // runner and read back an empty file (Number("") === 0).
+    // Wait until the published port VALIDATES, not merely until the file
+    // exists: a partial/empty read must never be mistaken for a real port
+    // (Number("") === 0), even though the receiver now publishes tmp+rename.
     let port = 0;
-    let portText = "";
     const deadline = Date.now() + 15_000;
-    while (port === 0 && Date.now() < deadline) {
+    while (!(Number.isInteger(port) && port > 0) && Date.now() < deadline) {
         if (existsSync(portFile)) {
-            portText = readFileSync(portFile, "utf8").trim();
-            const parsed = Number(portText);
-            if (Number.isInteger(parsed) && parsed > 0) port = parsed;
+            port = Number(readFileSync(portFile, "utf8").trim());
         }
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
-    assert.ok(port > 0, `receiver must publish its port (file held "${portText}")`);
+    assert.ok(existsSync(portFile), "receiver must publish its port");
+    assert.ok(Number.isInteger(port) && port > 0, `receiver port must be a number, got ${port}`);
     return {
         port,
         beats: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(Number) : []),
