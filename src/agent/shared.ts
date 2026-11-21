@@ -367,6 +367,20 @@ export async function reportAttributionHealth(proxyBase: string, health: Attribu
     if (!ok) throw new Error(`attribution report failed (${status})`);
 }
 
+/** #6641: client-side bypass report — a host plugin (dsh lane) detected a
+ *  model request whose URL is not a recognized model endpoint and sent it
+ *  DIRECT (uncompressed), so the proxy never saw it. Fire-and-forget: a missed
+ *  report delays visibility, never touches the request path. The host reports
+ *  each distinct endpoint once per process (bounded at the call site). */
+export async function reportUnroutedModelEndpoint(proxyBase: string, url: string): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/bypass`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url }),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`bypass report failed (${status})`);
+}
+
 /** #2204: business outcome of a forwarded tool call. ok:true means the tool
  *  RAN; whether it achieved its effect rides the endpoint's machine-readable
  *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
