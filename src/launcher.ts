@@ -1054,6 +1054,15 @@ interface EnvClientPreset {
 
 const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
 
+// #6862: hermes' own toolchain children (git/uv/npm update runners, shell tasks) inherit the
+// routed env and would ride the lane for code/dependency hosts the MITM whitelist does not cover —
+// a flaky lane egress or a dead port then takes the host's whole toolchain down. Keep those hosts
+// direct (mirrors the hermes-plugin default; same host list). Model hosts are NOT in this list, so
+// model traffic still rides the lane.
+const HERMES_NONMODEL_NO_PROXY = ("github.com,api.github.com,objects.githubusercontent.com,"
+    + "codeload.github.com,pypi.org,files.pythonhosted.org,registry.npmjs.org");
+const HERMES_DEFAULT_NO_PROXY = LAUNCHER_LOOPBACK_NO_PROXY + "," + HERMES_NONMODEL_NO_PROXY;
+
 const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     codex: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
@@ -7309,6 +7318,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
+        // #6862: keep hermes' own toolchain children (git/uv/npm update runners, shell tasks) off
+        // the lane for code/dependency hosts — they inherit HTTPS_PROXY and a flaky lane egress or
+        // dead port then takes the host's whole toolchain down. Model hosts are not listed, so
+        // model traffic still rides the lane.
+        env.NO_PROXY = HERMES_DEFAULT_NO_PROXY;
+        env.no_proxy = HERMES_DEFAULT_NO_PROXY;
         env.HERMES_CA_BUNDLE = ca;
         env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
         if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
