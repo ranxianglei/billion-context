@@ -259,6 +259,8 @@ export interface PreflightDeps {
     imageReserve?: number;
     /** Rebuild the protocol image view after folds; archived images no longer consume the window. */
     measureImageReserve?: (messages: CoreMessage[]) => number;
+    /** Measure the final Responses projection after each fold, including opaque items that core text estimates omit. */
+    measureWireTokens?: (messages: CoreMessage[]) => number;
     /** Constant wire overhead for this request (system prompt + tool definitions, #470). Folding never removes it, so every fit decision must add it — otherwise the loop stops with "text fits" while the billed input still overflows. */
     wireOverhead?: number;
     /** #553: the caller knows this session's input size is unmeasured AND its
@@ -1790,17 +1792,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     // #5974: measured view-vs-reconstruction divergence (see PreflightDeps.viewDeltaCorrection).
     // Every fit judgment in this pass runs on the corrected scale; 0 keeps legacy behavior.
-    const viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let viewDeltaCorrection = Math.max(0, deps.viewDeltaCorrection ?? 0);
+    let reconstructionCorrection: number | undefined;
     let foldTarget = Math.min(limit, deps.compressionTarget ?? limit);
     let textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     const refreshImages = (view: CoreMessage[]): void => {
         if (deps.measureImageReserve) imageReserve = deps.measureImageReserve(view);
+        if (deps.measureWireTokens) {
+            const coreEstimate = calibrateFoldMass(estimateCoreMessages(view) + wireOverhead);
+            const projectedDifference = Math.max(0, deps.measureWireTokens(view) - coreEstimate);
+            reconstructionCorrection ??= Math.max(0, viewDeltaCorrection - projectedDifference);
+            viewDeltaCorrection = reconstructionCorrection + projectedDifference;
+        }
         textTarget = Math.max(0, foldTarget - imageReserve - viewDeltaCorrection);
     };
     // Removing every nominated source gives an upper bound on image savings.
     // This is only a futility bound: the real post-fold view decides fit.
     const imageSavingBound = (ranges: Array<{ startRef: string; endRef: string }>, view: CoreMessage[]): number => {
-        if (!deps.measureImageReserve || imageReserve <= 0) return 0;
+        if (!deps.measureWireTokens && (!deps.measureImageReserve || imageReserve <= 0)) return 0;
         const { refToIdx } = refMaps(messages, deps.session.state);
         const removed = new Set<string>();
         for (const range of ranges) {
@@ -1808,7 +1817,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (start === undefined || end === undefined || start > end) continue;
             for (let i = start; i <= end; i++) removed.add(messages[i]!.id);
         }
-        return Math.max(0, imageReserve - deps.measureImageReserve(view.filter(message => !removed.has(message.id))));
+        const remaining = view.filter(message => !removed.has(message.id));
+        return Math.max(
+            0,
+            deps.measureImageReserve ? imageReserve - deps.measureImageReserve(remaining) : 0,
+            deps.measureWireTokens ? deps.measureWireTokens(view) - deps.measureWireTokens(remaining) : 0,
+        );
     };
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
     // #4288: set when the round-top fit exit fired — the walk ended in a
@@ -1830,7 +1844,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // pass through, and the latch clears only after a turn is forwarded, so a
     // paused over-window session was refused on every turn. Fold it instead.
     if (epochConfirmPending(deps.session)) {
-        if (result.payloadEstimate + viewDeltaCorrection < limit) {
+        if (Math.max(result.payloadEstimate + viewDeltaCorrection, deps.measureWireTokens?.(messages) ?? 0) < limit) {
             deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
             return result;
         }
