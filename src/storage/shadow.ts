@@ -1251,6 +1251,11 @@ export class UnifiedShadow {
     // checkpoints), not part of the legacy load path.
     // ------------------------------------------------------------------
 
+    withSessionExtTransaction<T>(action: () => T): T {
+        if (this.sync === null) throw new Error('Synchronous extension transaction unavailable');
+        return this.sync.withSessionExtTransaction(action);
+    }
+
     setSessionExt(sessionId: string, key: string, value: unknown): void {
         if (this.sync === null) return;
         this.sync.setSessionExt(sessionId, key, value);
@@ -1683,7 +1688,7 @@ class BatchedViewVerification {
     // #5677: the parsed row rides along with its signature so the FIRST
     // divergent slot can be field-diffed without re-reading the store; the
     // verifier is per-sample and short-lived, so the extra retention is bounded.
-    private readonly messages = new Map<number, { sig: ReturnType<typeof messageSignature>; raw: unknown }>();
+    private readonly messages = new Map<number, { sig: ReturnType<typeof messageSignature>; raw: unknown; ts: MessageRow["ts"] }>();
     private readonly keys = new Set<string>();
     private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
@@ -1736,7 +1741,7 @@ class BatchedViewVerification {
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
             const raw = JSON.parse(row.content);
-            this.messages.set(row.seq, { sig: messageSignature(raw), raw });
+            this.messages.set(row.seq, { sig: messageSignature(raw), raw, ts: row.ts });
         }
     }
 
@@ -1789,8 +1794,13 @@ class BatchedViewVerification {
                 continue;
             }
             const wantIndex = index - offset;
-            const want = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length ? messageSignature(expected[wantIndex]) : undefined;
-            if (want !== undefined && want.digest !== rec.sig.digest) {
+            const message = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length ? expected[wantIndex] : undefined;
+            const stamp = message?.ts;
+            const body = message && typeof stamp === "number" ? { ...message, ts: undefined } : message;
+            const want = message !== undefined ? messageSignature(body) : undefined;
+            // Ingest stores kernel timestamps separately; historical unstamped bodies use a batch-time fallback.
+            const stampMatches = typeof stamp !== "number" || stamp === rec.ts;
+            if (want !== undefined && (want.digest !== rec.sig.digest || !stampMatches)) {
                 this.changed(key);
                 if (key === "lastMessages" && expected && !this.tailSlot) {
                     const fields = diffFieldNames(expected[wantIndex], rec.raw);
