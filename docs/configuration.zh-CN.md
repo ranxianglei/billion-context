@@ -150,6 +150,8 @@
 | `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。 |
 | `pi.commands` | string[] \| boolean | ["acp", "acp-cache"] |  | bili pi 插件注册哪些斜杠命令："acp"、"acp-cache"、"acp-rule"、"acp-fleet"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。 |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
+| `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 限制每个插件会话为公开 fork API 保留的原始线路历史快照字节数（#2017 D-B）；超限时会话直接失败关闭（409），而不是保留无界原始副本。默认值已从 16 MiB 上调（#2394 G3）；0 完全禁用保留。 |
+| `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | 快照渲染影子观测开关（#3756 后续）：在每个激活的代理轮次上计算快照视图但不使用它（出站字节仍走 legacy 路径），与实际发送内容对比分类差异，并记录由 web 面板和 snapshot-shadow 诊断主题展示的每会话计数器。默认开启（渲染车道本身仍灰度钉在 0%，影子车道是纯观测）。 |
 
 **MITM 通道**
 
@@ -210,6 +212,16 @@
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
+| `sessions` | object | {} (all defaults) | — | 会话池与 GC 旋钮（#2030）——原 BILI_MAX_SESSIONS / BILI_SESSION_GC* 仅环境变量。 |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 会话池上限：内存中最多持有的会话数；超出时最冷的会话被 LRU 逐出（其文件仍留在磁盘上）。 |
+| `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：监听前预热最近保存的多少个会话；0 = 不预热（未预热会话首次触及时按需加载一次）。设 8 可恢复 #2803 的急切预热集。 |
+| `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）；单文件超过预算则永不预热。 |
+| `sessions.residentMaxBytes` | number | 4294967296 (4 GiB) | BILI_SESSION_RESIDENT_MAX_BYTES | 常驻会话字节的软目标（#2803）；活动/在途状态保持钉住。默认值在 #5779 中从 512 MiB 上调。 |
+| `sessions.hardMaxBytes` | number | = sessions.residentMaxBytes (0 disables) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话常驻权重的硬字节上限（#4788 D1-A）：约束单个会话，即使对豁免/唯一活跃会话也触发轮间字段丢弃；0 完全禁用该上限检查。 |
+| `sessions.gc.enabled` | boolean | false (off) | BILI_SESSION_GC | 会话文件垃圾回收（#1082，需手动开启）：周期性磁盘扫描仅在两道门同时满足时删除会话文件——最后活动早于 gc.maxAgeDays 且该会话从未被压缩、重发大小 <= gc.maxTokens。每次删除都有审计日志。 |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄门（#1082）：会话文件仅在最后活动早于该天数时才可被清扫——阈值刻意远大于任何可能的恢复窗口，因为 id 永不复用，恢复的会话会从 m00001 重新编号。 |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 大小门（#1082）：会话文件仅在重发大小（rawInputTokens，旧文件为 contextTokens）不超过该 token 数时才可被清扫——有折叠的会话上下文读起来很小却可能携带巨大原始历史，这类文件永远保留。 |
+| `sessions.gc.intervalMs` | number | 3600000 (1 h) | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔（毫秒，#1082）。 |
 | `storage` | object | {} (all defaults) | — | 统一 SQLite 存储边车设置（#2671）。 |
 | `storage.unified` | legacy\|shadow\|full\|sqlite | unset (sqlite) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）；sqlite = 纯 SQLite 模式 —— 与 full 同一套存储机构，但 JSON 信封写入默认 OFF（SQLite 索引是唯一持久副本，不写 JSON 信封）。默认值（两处均未设置）现在是纯 SQLite：双写车队自 #3818 起运行、digest 对账稳定，因此 JSON 信封默认不再写入 —— 显式 full 保留 #3818 的历史双写默认，legacy 仍是一行逃生口（未来拼写沿用同形：mysql = 网络后端，json = 纯信封）。文件层只接受 legacy/shadow/full/sqlite；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | 存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend("mysql", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export/fork 走异步孪生（#4911：fork 车道经它们 await lastLiveSeq + 行克隆；fold-anchor 回填/快照渲染用的同步窗口读按设计仍走信封）。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。 |
@@ -447,6 +459,7 @@
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
 | `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | x-bili-plugin-bypass 透传判定的运维覆盖开关（#6220），逐请求读取（无需重启）。三态：未设置（或 auto）= 现状——由入站头逐请求决定（legacy opencode-acp 会话绕过，其余走完整管线）；1/on/true = 强制 bypass——所有入站请求原样透传（不注入工具、不注入 nudge、不绑定会话）；0/off/false = 永不 bypass——忽略任何入站 x-bili-plugin-bypass 头，即使 legacy opencode-acp 会话也走完整管线。无法识别的取值按 auto 处理（= 现状）。按 #6220 owner 拍板仅环境变量（该头是宿主盖戳的线路契约，覆盖是逐进程运维姿态，而非逐路由配置项）。 |
+| `BILI_SESSION_CONTENT_STORE_PIN` | 1/true | unset (fold after save) | — | 让每个会话的 CCR 内容存储（{byRef}/{byHash} 原文）常驻内存，而不是在落盘后折叠掉（#4788 二期，讨论 #3916-E）；存储会在首次触及时从统一 ccr 镜像或 .content-store.json 侧车重新物化。未设置、0/false 或其他值 = 折叠（默认）。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
 
@@ -1967,6 +1980,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
+| `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
 | `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
@@ -1993,6 +2007,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (100 MiB) |
 | `BILI_RECEIVE_BODY_BYTES` | `network.receiveBodyBytes` | 5368709120 |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
@@ -2010,6 +2025,15 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | = sessions.residentMaxBytes (0 disables) |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 (4 GiB) |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 (warms none) |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 (64 MiB) |
+| `BILI_SNAPSHOT_SHADOW` | `snapshot.shadow` | true |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | `storage.archiveAfterDays` | 365 |

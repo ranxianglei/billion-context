@@ -150,6 +150,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | Pi inline lane (#3278; DEFAULT-ON since #5428, superseding the #4687 opt-in rule): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Unset env+file now runs INLINE; an ANNOUNCED attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, so `bili pi` keeps its launcher proxy. Opt OUT with BILI_PI_INLINE=0/false/no/off or this key set false — restores the old attach/spawn posture. Resolved env > file > default; an explicit inline choice always beats an announced attach target. Human surface: `bili -i/--inline pi` (≡ the one-command lane) and `bili -s/--server pi` (pin the proxy posture, beats an inherited inline env). |
 | `pi.commands` | string[] \| boolean | ["acp", "acp-cache"] |  | Which bili pi-plugin slash commands register: "acp", "acp-cache", "acp-rule", "acp-fleet". The default keeps the status (/acp) and cache-reconciliation (/acp-cache) entry points while leaving the rarer /acp-rule and /acp-fleet off the slash-completion list; true registers all four, [] or false registers none. Unknown names warn once and are ignored. Read at session start, so a config edit applies to the next session (no proxy restart needed). Pure UI surface: disabling a command never removes the underlying tool (acp_cache / acp_rule stay available to the model) or affects the proxy. |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | OpenCode inline lane (#3278 port; OPT-IN — the default stays the spawned proxy, per owner decision on #4687): the opencode plugin's compression runs IN-PROCESS — no spawned proxy, no ephemeral port, no MITM certs; model traffic and the /__bili/ tool surface are served by an in-process engine through a pseudo-origin (verified on the Bun host). Set true (or BILI_OPENCODE_INLINE=1) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target, an absent choice falls back to attach/spawn as before. `bili opencode-inline` is the one-command lane. |
+| `plugin.snapshotCapBytes` | number | 104857600 (100 MiB) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | Caps the raw wire-history snapshot retained per plugin session for the public fork API (#2017 D-B); beyond it the session fails closed (409) instead of retaining an unbounded raw copy. Default raised from 16 MiB (#2394 G3); 0 disables retention entirely. |
+| `snapshot.shadow` | boolean | true | BILI_SNAPSHOT_SHADOW | Snapshot-render SHADOW observability switch (#3756 follow-up): compute the snapshot view on every armed proxy turn WITHOUT using it (outbound bytes stay the legacy path), classify the diff against what was actually sent, and record per-session counters surfaced by the web panel + the snapshot-shadow diagnostics topic. ON by default (the render lane itself stays rollout-gated at 0%, so the shadow lane is pure observation). |
 
 **MITM lane**
 
@@ -210,6 +212,16 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | Token-size tail of recent messages kept as raw text for export fidelity. |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | Consecutive EPERM write failures before alerting in the log. |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | Repeat interval for the EPERM alert; 0 logs it once. |
+| `sessions` | object | {} (all defaults) | — | Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC* env-only. |
+| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | Session pool cap: the maximum number of sessions held in memory; the coldest session is LRU-evicted beyond it (its file stays on disk). |
+| `sessions.warmMax` | number | 0 (warms none) | BILI_SESSION_WARM_MAX | Bounded startup (#2803/#3050): how many most-recently-saved sessions boot hydrates before listening; 0 warms none (an un-warmed session pays one on-demand load on first touch). Set 8 to restore the #2803 eager warm set. |
+| `sessions.warmMaxBytes` | number | 67108864 (64 MiB) | BILI_SESSION_WARM_MAX_BYTES | Decoded-byte budget for the boot warm set (#2803); a single file over the budget is never warmed. |
+| `sessions.residentMaxBytes` | number | 4294967296 (4 GiB) | BILI_SESSION_RESIDENT_MAX_BYTES | Soft target for estimated resident session bytes (#2803); active/in-flight state stays pinned. Default raised from 512 MiB in #5779. |
+| `sessions.hardMaxBytes` | number | = sessions.residentMaxBytes (0 disables) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | Per-session HARD byte cap on estimated resident weight (#4788 D1-A): bounds ONE session and triggers the between-turns field drops even for an exempt/only-active session; 0 disables the cap check entirely. |
+| `sessions.gc.enabled` | boolean | false (off) | BILI_SESSION_GC | OPT-IN session-file garbage collection (#1082): a periodic disk sweep deletes a session file only when BOTH gates hold — last activity older than gc.maxAgeDays AND the session was never compressed with re-send size <= gc.maxTokens. Every deletion is audit-logged. |
+| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC age gate (#1082): a session file is sweep-eligible only when its last activity is older than this many days — kept far beyond any plausible resume window, since ids are never reused and a resumed session restarts numbering from m00001. |
+| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC size gate (#1082): a session file is sweep-eligible only when its re-send size (rawInputTokens, or contextTokens for legacy files) is at most this many tokens — a session WITH folds can read small in context yet carry huge raw history, so those files are always kept. |
+| `sessions.gc.intervalMs` | number | 3600000 (1 h) | BILI_SESSION_GC_INTERVAL_MS | GC sweep interval in milliseconds (#1082). |
 | `storage` | object | {} (all defaults) | — | Unified SQLite storage sidecar settings (#2671). |
 | `storage.unified` | legacy\|shadow\|full\|sqlite | unset (sqlite) | BILI_STORAGE_UNIFIED | Tiered storage-migration switch (#2671): shadow = unified SQLite double-write dry-run with digest reconciliation; full = drop-in read path (unified-first loads with organic import, legacy fallback); sqlite = pure-SQLite mode — same store machinery as full, but the JSON envelope writer defaults to OFF (the SQLite index is the only persistent copy; no JSON envelope is written). The default (absent everywhere) is now PURE-SQLITE: the dual-write fleet has run since #3818 with digest reconciliation holding, so JSON envelopes stop being written by default — explicit full keeps the historical #3818 dual-write default, and legacy remains the one-line escape hatch (future spellings follow the same shape: mysql = network backend, json = envelope-only). File tier is strict legacy/shadow/full/sqlite; the env tier also accepts 1/true (=shadow) and unified (=full) and wins over the file. Resolved once per lane boot - hot edits need a restart. Encryption (BILI_ENCRYPTION_KEY) hard-blocks the sidecar. |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | Storage backend selection (#3388 / #3931): the unified store consumes an operation-level async StorageBackend contract. sqlite is the default (the existing UnifiedStore behind a Promise-wrapped adapter). mysql is FULLY WIRED (steps 2+3): openBackend("mysql", dsn) opens the real MysqlBackend against MySQL 8.0 — the full contract surface (ingest with CAS refcounts, reads, session_ext, reap journal, archive/restore/gc, checkpoints, conversations), with mysql2 bundled as a regular dependency and loaded lazily (boots that never select mysql never load it). The proxy hot path is wired through the async shadow facade: saves enqueue onto a serial backend queue (watermark deltas, orphan/reap journal, digest sampling — sqlite keeps its zero-await sync fast path unchanged), SYNC reads ride the JSON envelope (the sidecar attaches asynchronously via ready(); viewFor/importRecord sync facades miss by design), replicas/ext/GC/export/fork speak the async twins (#4911: the fork lane awaits lastLiveSeq + the row clone through them; the sync window reads for fold-anchor backfill / snapshot render stay envelope-served by design). writerOff stays sqlite-only (the envelope is the mysql sync read path). Unknown names fall back to sqlite with a notice. Resolved once per lane boot. |
@@ -447,6 +459,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design. |
 | `BILI_PLUGIN_BYPASS` | string | auto (unset = the inbound header decides) | — | Operator override of the `x-bili-plugin-bypass` passthrough decision (#6220), read per-request (no restart). Three-state: unset (or `auto`) = current behavior — the inbound header decides per request (legacy opencode-acp sessions bypass, everything else gets the full pipeline); `1`/`on`/`true` = force bypass — every inbound request is forwarded verbatim (no tool injection, no nudge, no session binding); `0`/`off`/`false` = never bypass — any inbound `x-bili-plugin-bypass` header is ignored, so even legacy opencode-acp sessions get the full pipeline. Unrecognized values are treated as `auto` (current behavior). Env-only per the owner-approved design in #6220 (the header is a wire contract stamped by hosts; the override is a per-process operator posture, not a per-route config field). |
+| `BILI_SESSION_CONTENT_STORE_PIN` | 1/true | unset (fold after save) | — | Keep each session's CCR content store ({byRef}/{byHash} originals) RESIDENT in memory instead of folding it away after its save lands (#4788 phase 2, discussion #3916-E); the store re-materializes on first touch from the unified ccr mirror or the .content-store.json sidecar. Unset, 0/false or any other value = fold (the default). Env-only by design. |
 
 <!-- /bili:gen -->
 
@@ -1990,6 +2003,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
+| `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
 | `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
@@ -2016,6 +2030,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
+| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (100 MiB) |
 | `BILI_RECEIVE_BODY_BYTES` | `network.receiveBodyBytes` | 5368709120 |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
@@ -2033,6 +2048,15 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
+| `BILI_SESSION_GC` | `sessions.gc.enabled` | false (off) |
+| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 (1 h) |
+| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
+| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | = sessions.residentMaxBytes (0 disables) |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 (4 GiB) |
+| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 (warms none) |
+| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 (64 MiB) |
+| `BILI_SNAPSHOT_SHADOW` | `snapshot.shadow` | true |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | `storage.archiveAfterDays` | 365 |

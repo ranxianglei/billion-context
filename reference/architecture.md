@@ -18,6 +18,7 @@ billion-context/
 │   │   ├── codex-catalog-cache.ts #   Same-credential, bounded offline model metadata for Codex discovery
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
+│   │   ├── egress-lane-io.ts     #   Egress plane record/serve seam for the non-OpenAI lanes: serve rebuilds the recorded core view from the flow tables, record appends the turn's outbound core as sparse ops (#7398 ruling 7439-4)
 │   │   ├── handle.ts             #   Proxy request pipeline (route triage, compat relay, compress orchestration) (#1440 P2 cut 3)
 │   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots; turn-final reply stashed in metadata.handoffReply for durable DB persistence (never lastMessages/messages table — the view is the ref-ledger's territory, #6947)
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)

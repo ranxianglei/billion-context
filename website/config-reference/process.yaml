@@ -380,6 +380,89 @@ entries:
     desc_en: "Repeat interval for the EPERM alert; 0 logs it once."
     desc_zh: "EPERM 告警的重复间隔；0 只记录一次。"
     desc_ja: "EPERM アラートの繰り返し間隔。0 の場合は 1 回のみログ出力する。"
+  - key: sessions
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.sessions
+    site_group: proc
+    desc_en: "Session pool & GC knobs (#2030) — was BILI_MAX_SESSIONS / BILI_SESSION_GC* env-only."
+    desc_zh: "会话池与 GC 旋钮（#2030）——原 BILI_MAX_SESSIONS / BILI_SESSION_GC* 仅环境变量。"
+    desc_ja: "セッションプールと GC のノブ（#2030）— 以前は BILI_MAX_SESSIONS / BILI_SESSION_GC* が環境変数のみ。"
+    site_en: "<code>sessions</code> — session pool & GC: <span class='mech'>max 256 · warmMax 0 · warmMaxBytes 67108864 · residentMaxBytes 4294967296 · hardMaxBytes = residentMaxBytes · gc { enabled false · maxAgeDays 7 · maxTokens 1000000 · intervalMs 3600000 }</span>."
+    site_zh: "<code>sessions</code> —— 会话池与 GC：<span class='mech'>max 256 · warmMax 0 · warmMaxBytes 67108864 · residentMaxBytes 4294967296 · hardMaxBytes = residentMaxBytes · gc { enabled false · maxAgeDays 7 · maxTokens 1000000 · intervalMs 3600000 }</span>。"
+  - key: sessions.max
+    type: number
+    default: "256"
+    env: BILI_MAX_SESSIONS
+    group: process
+    desc_en: "Session pool cap: the maximum number of sessions held in memory; the coldest session is LRU-evicted beyond it (its file stays on disk)."
+    desc_zh: "会话池上限：内存中最多持有的会话数；超出时最冷的会话被 LRU 逐出（其文件仍留在磁盘上）。"
+    desc_ja: "セッションプールの上限：メモリに保持するセッション数の最大値。超過すると最も冷たいセッションが LRU で退避されます（ファイルはディスクに残ります）。"
+  - key: sessions.warmMax
+    type: number
+    default: "0 (warms none)"
+    env: BILI_SESSION_WARM_MAX
+    group: process
+    desc_en: "Bounded startup (#2803/#3050): how many most-recently-saved sessions boot hydrates before listening; 0 warms none (an un-warmed session pays one on-demand load on first touch). Set 8 to restore the #2803 eager warm set."
+    desc_zh: "有界启动（#2803/#3050）：监听前预热最近保存的多少个会话；0 = 不预热（未预热会话首次触及时按需加载一次）。设 8 可恢复 #2803 的急切预热集。"
+    desc_ja: "有界起動（#2803/#3050）：リッスン前に最近保存されたセッションのうち何個をウォームするか。0 = ウォームしない（未ウォームのセッションは初回アクセス時にオンデマンドで 1 回読み込み）。8 にすると #2803 のイージートウォームセットが復元されます。"
+  - key: sessions.warmMaxBytes
+    type: number
+    default: "67108864 (64 MiB)"
+    env: BILI_SESSION_WARM_MAX_BYTES
+    group: process
+    desc_en: "Decoded-byte budget for the boot warm set (#2803); a single file over the budget is never warmed."
+    desc_zh: "启动预热集的解码字节预算（#2803）；单文件超过预算则永不预热。"
+    desc_ja: "起動ウォームセットのデコードバイト予算（#2803）。予算を超える単一ファイルはウォームされません。"
+  - key: sessions.residentMaxBytes
+    type: number
+    default: "4294967296 (4 GiB)"
+    env: BILI_SESSION_RESIDENT_MAX_BYTES
+    group: process
+    desc_en: "Soft target for estimated resident session bytes (#2803); active/in-flight state stays pinned. Default raised from 512 MiB in #5779."
+    desc_zh: "常驻会话字节的软目标（#2803）；活动/在途状态保持钉住。默认值在 #5779 中从 512 MiB 上调。"
+    desc_ja: "推定レジデントセッションバイト数のソフト目標（#2803）。アクティブ/実行中の状態はピン留めされます。デフォルトは #5779 で 512 MiB から引き上げられました。"
+  - key: sessions.hardMaxBytes
+    type: number
+    default: "= sessions.residentMaxBytes (0 disables)"
+    env: BILI_SESSION_RESIDENT_HARD_MAX_BYTES
+    group: process
+    desc_en: "Per-session HARD byte cap on estimated resident weight (#4788 D1-A): bounds ONE session and triggers the between-turns field drops even for an exempt/only-active session; 0 disables the cap check entirely."
+    desc_zh: "单会话常驻权重的硬字节上限（#4788 D1-A）：约束单个会话，即使对豁免/唯一活跃会话也触发轮间字段丢弃；0 完全禁用该上限检查。"
+    desc_ja: "セッション単位のレジデント重みのハードバイト上限（#4788 D1-A）。1 つのセッションを拘束し、免除/唯一アクティブのセッションでもターン間のフィールド破棄をトリガーします。0 で上限チェックを完全に無効化します。"
+  - key: sessions.gc.enabled
+    type: boolean
+    default: "false (off)"
+    env: BILI_SESSION_GC
+    group: process
+    desc_en: "OPT-IN session-file garbage collection (#1082): a periodic disk sweep deletes a session file only when BOTH gates hold — last activity older than gc.maxAgeDays AND the session was never compressed with re-send size <= gc.maxTokens. Every deletion is audit-logged."
+    desc_zh: "会话文件垃圾回收（#1082，需手动开启）：周期性磁盘扫描仅在两道门同时满足时删除会话文件——最后活动早于 gc.maxAgeDays 且该会话从未被压缩、重发大小 <= gc.maxTokens。每次删除都有审计日志。"
+    desc_ja: "セッションファイルのガベージコレクション（#1082、オプトイン）。定期的なディスクスウィープは 2 つのゲートが両方成立する時のみセッションファイルを削除します — 最終アクティビティが gc.maxAgeDays より古く、かつセッションが未圧縮で再送サイズが gc.maxTokens 以下。すべての削除は監査ログに記録されます。"
+  - key: sessions.gc.maxAgeDays
+    type: number
+    default: "7"
+    env: BILI_SESSION_GC_MAX_AGE_DAYS
+    group: process
+    desc_en: "GC age gate (#1082): a session file is sweep-eligible only when its last activity is older than this many days — kept far beyond any plausible resume window, since ids are never reused and a resumed session restarts numbering from m00001."
+    desc_zh: "GC 年龄门（#1082）：会话文件仅在最后活动早于该天数时才可被清扫——阈值刻意远大于任何可能的恢复窗口，因为 id 永不复用，恢复的会话会从 m00001 重新编号。"
+    desc_ja: "GC の年齢ゲート（#1082）。セッションファイルは最終アクティビティがこの日数より古い時のみスウィープ対象になります — id は再利用されないため（再開したセッションは m00001 から番号をやり直す）、あらゆる現実的な再開ウィンドウを大きく超える値に保たれます。"
+  - key: sessions.gc.maxTokens
+    type: number
+    default: "1000000"
+    env: BILI_SESSION_GC_MAX_TOKENS
+    group: process
+    desc_en: "GC size gate (#1082): a session file is sweep-eligible only when its re-send size (rawInputTokens, or contextTokens for legacy files) is at most this many tokens — a session WITH folds can read small in context yet carry huge raw history, so those files are always kept."
+    desc_zh: "GC 大小门（#1082）：会话文件仅在重发大小（rawInputTokens，旧文件为 contextTokens）不超过该 token 数时才可被清扫——有折叠的会话上下文读起来很小却可能携带巨大原始历史，这类文件永远保留。"
+    desc_ja: "GC のサイズゲート（#1082）。セッションファイルは再送サイズ（rawInputTokens、旧ファイルは contextTokens）がこのトークン数以下の場合のみスウィープ対象になります — フォールドのあるセッションはコンテキスト上は小さく読めても巨大な生履歴を保持し得るため、そうしたファイルは常に保持されます。"
+  - key: sessions.gc.intervalMs
+    type: number
+    default: "3600000 (1 h)"
+    env: BILI_SESSION_GC_INTERVAL_MS
+    group: process
+    desc_en: "GC sweep interval in milliseconds (#1082)."
+    desc_zh: "GC 清扫间隔（毫秒，#1082）。"
+    desc_ja: "GC スウィープの間隔（ミリ秒、#1082）。"
   - key: storage
     type: object
     default: "{} (all defaults)"
