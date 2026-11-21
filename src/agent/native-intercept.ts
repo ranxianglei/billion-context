@@ -522,8 +522,8 @@ function isLoopbackTarget(url: string): boolean {
     } catch {
         return false;
     }
-    const h = u.hostname;
-    return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+    const h = u.hostname; // URL.hostname brackets IPv6 literals ([::1])
+    return h === "localhost" || h === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 const droppedHopsLogged = new Set<string>();
@@ -587,7 +587,9 @@ function envHopForUrl(url: string, env: NodeJS.ProcessEnv): string | undefined {
  *  the base values are captured lazily on the first hold and restored EXACTLY
  *  on the last release. Bun honors runtime NO_PROXY changes immediately
  *  (probed on bun 1.4.0); node hosts treat these vars as inert for their
- *  fetch — a harmless no-op there. */
+ *  fetch. The mutation is process-wide — children spawned during the hold
+ *  window inherit the entries forever — so only NO_PROXY-safe hosts are ever
+ *  held (no IPv6 literals; #7319). */
 const noProxyHolds = new Map<string, number>();
 let noProxyBase: { upper: string | undefined; lower: string | undefined } | undefined;
 
@@ -1712,7 +1714,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     } catch {
                         // no parseable host → nothing to scope
                     }
-                    if (host !== undefined && !hostExemptedByNoProxy(host, process.env)) {
+                    // #7319: never write an IPv6 literal into NO_PROXY — URL.hostname
+                    // brackets it ([::1]) and Python httpx (trust_env) crashes at
+                    // client construction on bracketed/bare IPv6 entries (InvalidURL:
+                    // Invalid port). No bracket convention satisfies both Node's URL
+                    // output and httpx's parsing, so IPv6 hosts skip the hold: a
+                    // fallback send to one rides the env hop on Bun (Node fetch is
+                    // env-inert) — accepted over poisoning every child of the host
+                    // process.
+                    if (host !== undefined && !host.includes(":") && !hostExemptedByNoProxy(host, process.env)) {
                         heldHost = host;
                         acquireNoProxyHold(host);
                     }

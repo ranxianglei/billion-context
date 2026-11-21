@@ -2104,6 +2104,17 @@ test("#4566: rewrite drops the host's stale hop — loopback proxy origin needs 
     assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
 });
 
+test("#4566: rewrite drops the host's stale hop — IPv6 loopback proxy origin needs no hop", async () => {
+    const state: NativeInterceptState = { origin: "http://[::1]:41008", ready: Promise.resolve("http://[::1]:41008") };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8199/v1/messages", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://[::1]:41008/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale init.proxy must not ride the rewritten dispatch");
+});
+
 test("#4566: self branch drops the host's stale hop", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:41002", ready: Promise.resolve("http://127.0.0.1:41002") };
     const stale: HopInit = { proxy: "http://127.0.0.1:18788" };
@@ -2187,6 +2198,31 @@ test("#4566: fallback neutralizes a bili-owned env hop with a scoped NO_PROXY ho
         assert.ok((sink[0].noProxyDuringSend ?? "").includes("api.anthropic.com"), "target host exempted while the send is in flight");
     });
     assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored exactly once the last hold releases");
+});
+
+test("#7319: fallback to an IPv6 literal host arms no NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTPS_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("https://[::1]:11434/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.deepEqual(sink.map((c) => c.url), ["https://[::1]:11434/v1/messages"]);
+        assert.equal(sink[0].noProxyDuringSend, undefined, "bracketed IPv6 must never be written into NO_PROXY — Python httpx children crash on it");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY untouched after the send");
+});
+
+test("#7319 negative: fallback to an IPv4 loopback host still arms the NO_PROXY hold", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+    await withHopEnv({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:18791", HTTP_PROXY: "http://127.0.0.1:18791" }, async () => {
+        const { sink } = await withHopPatch(state, async (fetch) => {
+            const res = await fetch("http://127.0.0.1:11434/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200);
+        });
+        assert.ok((sink[0].noProxyDuringSend ?? "").includes("127.0.0.1"), "IPv4 loopback is NO_PROXY-safe and must stay held");
+    });
+    assert.equal(process.env.NO_PROXY, undefined, "NO_PROXY restored once the hold releases");
 });
 
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
