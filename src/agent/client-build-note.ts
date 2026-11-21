@@ -17,7 +17,12 @@
 // take down a working session. At-or-below-cap builds stay silent: known
 // break modes on OLDER builds already have their own detectors (dsh: the
 // compaction overlay-latch gap probe + its #3806 boot warning + #2474
-// fallback). Unparseable versions fail open to "not newer" (silence).
+// fallback). Unparseable versions fail open to "not newer" (silence). An
+// UNRESOLVED version means something different (#5302): the layout hides the
+// host from the resolver (packaged desktop hosts bundle the host package
+// inside app.asar), so the composer emits one explicit-unknown note instead
+// of staying silent — an invisible safety net is worse than none. The knob
+// silences everything, including that note.
 //
 // Per-lane ops knob (house env style, cf. retryIntervalMs):
 // BILI_<LANE>_MAX_TESTED_VERSION — move the cap to a newly verified build, or
@@ -54,8 +59,8 @@ export function maxTestedVersion(check: ClientBuildCheck, env: Record<string, st
  *  our injected bundle in desktop/profile layouts alike. Several candidate
  *  paths are tried at EVERY level before hopping up (nearest wins; e.g. pi
  *  ships under two npm spellings). Returns the first non-empty `version`
- *  field found; absent/unreadable/malformed everywhere → undefined, callers
- *  stay silent. */
+ *  field found; absent/unreadable/malformed everywhere → undefined (the
+ *  composer turns that into the explicit-unknown note, #5302). */
 export function walkUpNodeModuleVersion(startDir: string, pkgJsonRelPaths: string | string[], maxHops = 8): string | undefined {
     const candidates = (Array.isArray(pkgJsonRelPaths) ? pkgJsonRelPaths : [pkgJsonRelPaths])
         .map((rel) => rel.split("/").filter(Boolean))
@@ -86,16 +91,20 @@ export const DSH_BUILD_CHECK: ClientBuildCheck = {
 };
 
 /** Compose the one-shot bilingual note, or null when nothing needs saying:
- *  no version resolved (absence of evidence ≠ broken build), check switched
- *  off via the knob, at-or-below the cap, or either side unparseable
- *  (comparison fails open to silence). */
+ *  check switched off via the knob (always null — the user chose silence),
+ *  resolved-but-at-or-below the cap, or either side unparseable (comparison
+ *  fails open to silence). An UNRESOLVED version with the check still on
+ *  returns the explicit-unknown note instead of null (#5302): the layout
+ *  hides the host from the resolver and the check cannot run, so say so
+ *  once rather than fail silently. */
 export function newerClientBuildMessage(
     check: ClientBuildCheck,
     found: string | undefined,
     env: Record<string, string | undefined> = process.env,
 ): string | null {
     const cap = maxTestedVersion(check, env);
-    if (found === undefined || cap === undefined) return null;
+    if (cap === undefined) return null;
+    if (found === undefined) return `[${check.label}] Could not detect the running ${check.pkgId} version in this install layout (packaged hosts bundle the host package inside app.asar, which the node_modules walk-up cannot see), so the newer-than-tested build check is INACTIVE here. Everything keeps running as usual; set ${check.knobEnv}="" to silence this note. （当前安装布局下未能检测到运行中的 ${check.pkgId} 版本（打包宿主把宿主包打进 app.asar，node_modules 上溯探测不可见），「高于已测版本」检查在本机不生效。功能照常运行；设置 ${check.knobEnv}="" 可关闭本提示。）`;
     if (!isVersionNewer(found, cap)) return null;
     return `[${check.label}] You are running ${check.pkgId} v${found} — NEWER than the newest build billion-context has tested against (v${cap}). Everything keeps running as usual, but compression may misbehave on a build we have not tested; if you hit compression conflicts or lose history, roll the client back to v${cap} until support lands. （当前运行的 ${check.pkgId} v${found} 高于我们测试过的最高版本 v${cap}：功能照常运行，但压缩能力在该构建上未经我们验证、可能不稳定；如出现压缩冲突或历史丢失，请先将客户端回滚到 v${cap}。）`;
 }
