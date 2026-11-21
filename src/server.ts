@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
 import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { parseCarrierEntries } from "./carrier-args.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -2763,8 +2764,21 @@ export function warnResponsesReasoningPairs(
  *  reused. Compress-call args are parsed lazily (only when an active plugin
  *  block with recorded refs needs exact matching) and each call's args are
  *  parsed at most ONCE, whereas the old per-block scan reparsed them for
- *  every block. */
-function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>> } {
+ *  every block.
+ *
+ *  #7478: the CURRENT compress args shape is `content` as a PLAIN STRING of
+ *  line blocks ("m00150–m0220 topic\n<summary>…") per the kernel COMPRESS_TOOL
+ *  contract — the two JSON shapes above were the plugin-era formats. The line
+ *  format is now indexed too, and the strip verdict is upgraded from "range
+ *  matches" to "range matches AND the call carries the FULL summary text for
+ *  that range": hideConsumedCompressCalls (kernel/src/hide-consumed.ts) stubs
+ *  long JSON-shape summaries to exactly SUMMARY_STUB_CHARS chars + "…", so a
+ *  stubbed call is NOT a complete carrier — stripping its anchor would leave
+ *  zero full summaries on the wire (#5866). A line-format segment counts as
+ *  full when its length reaches the same stub signature threshold; unparseable
+ *  args, missing summaries, and stub-shaped text all fail safe to KEEP the
+ *  anchor. */
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureFullRangeKeys: () => Set<string> } {
     const callIds = new Set<string>();
     const compressCalls: BiliMessage[] = [];
     for (const m of messages) {
@@ -2772,34 +2786,23 @@ function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; com
         if (m.toolCallId) callIds.add(m.toolCallId);
         if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
     }
-    let rangePairs: Map<string, Set<string>> | null = null;
-    const ensureRangePairs = (): Map<string, Set<string>> => {
-        if (!rangePairs) {
-            rangePairs = new Map<string, Set<string>>();
+    let fullRangeKeys: Set<string> | null = null;
+    const ensureFullRangeKeys = (): Set<string> => {
+        if (!fullRangeKeys) {
+            fullRangeKeys = new Set<string>();
             for (const c of compressCalls) {
-                let parsed: unknown;
-                try {
-                    parsed = JSON.parse(c.text ?? "");
-                } catch {
-                    continue;
-                }
-                const obj = parsed as { startId?: string; endId?: string; content?: unknown };
-                const ranges: Array<{ startId?: string; endId?: string }> = Array.isArray(obj?.content) ? (obj.content as Array<{ startId?: string; endId?: string }>) : [obj];
-                for (const r of ranges) {
-                    if (typeof r?.startId !== "string" || !r.startId || typeof r?.endId !== "string" || !r.endId) continue;
-                    let ends = rangePairs.get(r.startId);
-                    if (!ends) { ends = new Set<string>(); rangePairs.set(r.startId, ends); }
-                    ends.add(r.endId);
+                for (const e of parseCarrierEntries(c.text ?? "")) {
+                    if (e.carryingFull) fullRangeKeys.add(`${e.startRef}::${e.endRef}`);
                 }
             }
         }
-        return rangePairs;
+        return fullRangeKeys;
     };
-    return { callIds, compressCalls, ensureRangePairs };
+    return { callIds, compressCalls, ensureFullRangeKeys };
 }
 
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
-    const { callIds, compressCalls, ensureRangePairs } = buildCarrierIndex(messages);
+    const { callIds, compressCalls, ensureFullRangeKeys } = buildCarrierIndex(messages);
     const carried = new Set<string>();
     for (const b of state.blocks) {
         if (!b.active || !b.compressCallId) continue;
@@ -2810,10 +2813,15 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
         // while that pair actually rides the (post-prepare) history: a pruned
         // or contract-violating client must never lose the summary outright
         // (zero carriers).
+        // #7478: "rides" is now "rides carrying the FULL summary" — a call
+        // stubbed by consumed-call compaction is not a complete carrier
+        // (#5866), and the current line-format args are recognized too (the
+        // two JSON shapes alone misjudged every dsh-style fold as carrier-less,
+        // double-billing each summary as anchor + call).
         // Preflight blocks (no compressCallId) keep skipping above: no tool
         // call exists for them, so their anchor is the only carrier.
         const present = isPluginFoldCallId(b.compressCallId)
-            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureRangePairs().get(b.startRef)?.has(b.endRef) ?? false)
+            ? (!b.startRef || !b.endRef ? compressCalls.length > 0 : ensureFullRangeKeys().has(`${b.startRef}::${b.endRef}`))
             : callIds.has(b.compressCallId);
         if (present) {
             carried.add(`acp_summary_${b.blockId}`);

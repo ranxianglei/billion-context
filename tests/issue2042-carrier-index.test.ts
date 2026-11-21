@@ -5,6 +5,15 @@
 // directions, preflight/inactive handling, order preservation) plus two
 // deterministic complexity probes: no per-block full scan, and each
 // compress call's args parsed at most once.
+//
+// #7478: the plugin range-match verdict moved from "range matches" to
+// "range matches AND the call carries the FULL summary text" (a stubbed
+// call is not a complete carrier — #5866), and the current line-format
+// args shape is recognized too. The four expectations below that pinned
+// the old range-match-only branch were updated in place (each test's
+// args carry no summary text, so the anchor now stays); the fail-safe
+// directions, preflight/inactive handling, order preservation, and both
+// complexity probes are unchanged.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createInitialState, type CompressionBlock, type CompressionState } from "acp-kernel";
@@ -50,16 +59,39 @@ test("non-tool-call message carrying the same toolCallId does not count", () => 
     assert.deepEqual(ids(out), ids(messages));
 });
 
-test("plugin block: exact range match via flat args -> stripped", () => {
-    const messages = [summary("pb0"), toolCall("c1", "compress", '{"startId":"m1","endId":"m9"}'), tail(0)];
+test("plugin block: exact range match via flat args with full summary -> stripped", () => {
+    const messages = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ startId: "m1", endId: "m9", summary: "x".repeat(300) })), tail(0)];
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
     assert.deepEqual(ids(out), ["tc_c1", "u0"]);
 });
 
-test("plugin block: exact range match via content array -> stripped", () => {
-    const messages = [summary("pb0"), toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m9"}]}'), tail(0)];
+test("plugin block: exact range match via content array with full summary -> stripped", () => {
+    const messages = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ startId: "m1", endId: "m9", summary: "x".repeat(300) }] })), tail(0)];
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
     assert.deepEqual(ids(out), ["tc_c1", "u0"]);
+});
+
+test("plugin block: range matches but args carry no summary text -> anchor kept (#7478: a call is a carrier only while it carries the full summary)", () => {
+    const flat = [summary("pb0"), toolCall("c1", "compress", '{"startId":"m1","endId":"m9"}'), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(flat, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]))), ids(flat));
+    const array = [summary("pb0"), toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m9"}]}'), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(array, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]))), ids(array));
+});
+
+test("plugin block: stub-shaped summary (exactly 200 chars + tail) is not a full carrier -> anchor kept (#5866)", () => {
+    const stub = `${"x".repeat(199)}…`;
+    assert.equal(stub.length, 200);
+    const messages = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ startId: "m1", endId: "m9", summary: stub }] })), tail(0)];
+    const out = stripKernelSummaries(messages, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m1", endRef: "m9" }]));
+    assert.deepEqual(ids(out), ids(messages));
+});
+
+test("plugin block: messageId-only entry (single-message fold, kernel historical API shape) -> stripped with full summary, kept when stubbed", () => {
+    const full = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ messageId: "m7", summary: "x".repeat(300) }] })), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(full, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m7", endRef: "m7" }]))), ["tc_c1", "u0"]);
+    const stub = `${"x".repeat(199)}…`;
+    const stubbed = [summary("pb0"), toolCall("c1", "compress", JSON.stringify({ content: [{ messageId: "m7", summary: stub }] })), tail(0)];
+    assert.deepEqual(ids(stripKernelSummaries(stubbed, stateWith([{ blockId: "pb0", active: true, compressCallId: "plugin_1", startRef: "m7", endRef: "m7" }]))), ids(stubbed));
 });
 
 test("plugin block: range mismatch -> anchor kept", () => {
@@ -103,11 +135,12 @@ test("inactive block keeps its anchor even when its carrier rides along", () => 
     assert.deepEqual(ids(out), ids(messages));
 });
 
-test("mixed branches: only blocks with carriers are stripped, order preserved", () => {
+test("mixed branches: only blocks with full-text carriers are stripped, order preserved", () => {
+    const full = "s".repeat(300);
     const messages = [
         summary("p_hit"), summary("p_miss"), summary("pl_hit"), summary("pl_bad"),
         toolCall("proxy_call_p_hit", "bash"),
-        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2"},{"startId":"m3","endId":"m4"}]}'),
+        toolCall("c1", "compress", JSON.stringify({ content: [{ startId: "m1", endId: "m2", summary: full }, { startId: "m3", endId: "m4", summary: full }] })),
         toolCall("c2", "compress", "{bad json"),
         tail(0),
     ];
@@ -124,7 +157,7 @@ test("mixed branches: only blocks with carriers are stripped, order preserved", 
 test("one content array serving two plugin blocks parses the args exactly once", () => {
     const messages = [
         summary("a0"), summary("a1"),
-        toolCall("c1", "compress", '{"content":[{"startId":"m1","endId":"m2"},{"startId":"m3","endId":"m4"}]}'),
+        toolCall("c1", "compress", JSON.stringify({ content: [{ startId: "m1", endId: "m2", summary: "s".repeat(300) }, { startId: "m3", endId: "m4", summary: "s".repeat(300) }] })),
         tail(0),
     ];
     const state = stateWith([
