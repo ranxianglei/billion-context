@@ -206,8 +206,14 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(alpha.enabled, true);
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
-        // never true) — "off" is reserved for features with no percent at all.
-        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
+        // never true); "off" appears only for nested features (base:) whose
+        // base cohort excludes this install (e.g. watermarkCompactionPassthrough
+        // inside the 5% pluginFullResendWatermark grey).
+        for (const d of ds) {
+            const base = rollout.ROLLOUT_FEATURES[d.feature].base;
+            const baseEnabled = base !== undefined ? ds.find((x) => x.feature === base)?.enabled ?? false : true;
+            assert.equal(d.source, base !== undefined && !baseEnabled ? "off" : "bucket", d.feature);
+        }
     });
 });
 
