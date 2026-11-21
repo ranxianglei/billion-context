@@ -57,13 +57,33 @@ cold-start claim race (#3397). Every incoming request walks, in order:
 5. **Same persona, diverged order.** Tail-aligned re-anchor (skeleton follows
    the living end); genuinely unaligned shape → derived-task lane
    `${sessionID}|sub:task:<skel8(kinds)>`.
-6. **Last-resort message-id rung** (#5719, `tryMsgIdRescue`). Consulted only at
-   the exits where every byte-level rung failed *because the byte evidence was
-   destroyed in that same turn* (client compaction deleted rows while the
-   volatile system-prompt field was rewritten — the #5719 incident). If ≥1
-   incoming host id matches a row recorded under the session id's key in the
-   unified store → same conversation, re-anchor. Zero overlap → confirms the
-   fork. No ids on the request → fork proceeds exactly as pre-#5719.
+6. **Last-resort message-id rungs.** Consulted only at the exits where every
+   byte-level rung failed *because the byte evidence was destroyed in that same
+   turn* (client compaction deleted rows while the volatile system-prompt field
+   was rewritten — the #5719 incident):
+   - **Raw-key rescue** (#5719, `tryMsgIdRescue`). If ≥1 incoming host id
+     matches a row recorded under the session id's key in the unified store →
+     same conversation, re-anchor. Zero overlap → confirms the fork.
+    - **Sub-lane sibling continuation** (#6011, `trySiblingLane`). The raw-key
+      rescue generalized to the id's children: candidate keys = the skeleton
+      table's `${sessionID}|sub:*` entries ∪ the unified store's session list
+      prefix-filtered the same way; each candidate's Pinned rows (live AND
+      retired) are matched against the incoming ids with the #5719 overlap
+      semantics. Exactly one candidate overlaps ≥1 → the request is the SAME
+      sub-run continuing on its own lane (`action: continue`). Several
+      candidates overlap → warn log + degrade to a fresh mint (never guess).
+      None → mint. This closes the #6011 collision family: parallel Claude Code
+      Task subagents share one session id AND byte-identical boilerplate heads,
+      so every byte-level rung above misreads them as one conversation until
+      message ids separate them.
+    - **Mint.** Still a fork with ids present → the lane key becomes
+      `${sessionID}|sub:m:<first inbound id>` — the FULL untruncated id (host
+      uuids are unique by construction; truncating to fingerprints would
+      collide) — at all three exits, deterministic across rounds and restarts;
+      the sibling rung takes over from round two once the run's ids are pinned
+      under the lane key.
+    No ids on the request → fork proceeds exactly as pre-#5719 (legacy
+    disc/skel8 key shapes, byte-identical).
 
 Everything downstream (storage rows, fold blocks, watermark seeds, ledger seqs)
 is keyed by the key the ladder returned — raw or suffixed — so two
@@ -99,13 +119,43 @@ keep as-is):
 3. **Availability.** Most lanes carry no message ids at all (un-stamped,
    un-wired); the rung simply does not exist for those requests.
 
+    Lane attribution (#6011) joined later because it needed one ingredient the
+    raw-key rescue deliberately lacks: a per-LANE id record. That record
+    already exists in the unified store — rows pinned under the lane key — so
+    the sibling rung reuses the standard sessionId+msgid query instead of
+    inventing a parallel ledger (the "RECORDED side lives in the UNIFIED STORE"
+    principle the handle seam documents). It still slots in at the same exits,
+    not as a global first step, for the same reasons above.
+
+### How sub-lane store matching works (#6011)
+
+The witness is the unified-store rows under each candidate `<raw>|sub:` key —
+the SAME rows the raw-key rescue reads, just queried per child lane. Two
+properties make this robust where a volatile witness would not be:
+
+- **Retire-don't-delete.** Compaction retires rows (tombstone), it does not
+  erase them, and the id query spans live AND retired rows — so a client-side
+  compaction deleting the run's FIRST message cannot break continuity; any
+  surviving pinned row keeps the lane reachable. Only archive/delete-class
+  wipes remove rows outright, and then a fresh mint is the correct outcome
+  anyway (bounded split, never a silent merge).
+- **No parallel ledger.** Nothing new is persisted for the rung itself: the
+  skeleton table contributes only CANDIDATE KEYS (and survives via the existing
+  order file), the store contributes the id evidence. A lost skeleton file
+  degrades to store-list-only candidate discovery, not to a broken rung.
+
+Disjoint runs hold disjoint host-minted id sets, so a unique overlap identifies
+the lane without guessing; the multi-overlap case (a genuinely forked history
+shared by two lanes) refuses to pick and mints fresh instead.
+
 ## Switching layers (what merges vs what stays off)
 
 | Layer | Mechanism | Default after merge |
 |---|---|---|
 | Session-id recognition (incl. new names `x-conversation-id`, `agent-session-id`) | ungated; value is client-supplied, used as a local key only, never forwarded | active for all installs |
 | Message-id harvesting (proxy reads client-local transcripts/sqlite: claude-code, codebuddy, mcode, goose, qwen-code) | `env BILI_IDENTITY_HARVEST` **or** cohort `rollout.features.identityChannelHarvest` (either alone enables) × loopback source only | **off** everywhere until opted in |
-| Row pinning (stamped/harvested ids written into stored-row identity, both wires) | pre-existing cohort `pluginLaneServerHistory` | 0% (unchanged) |
+| Row pinning (stamped/harvested ids written into stored-row identity, both wires) | pre-existing cohort `pluginLaneServerHistory`; #6011 adds: verified-HARVEST ids pin regardless of pluginMode/cohort (the harvest registry already enforced rollout-or-env × loopback × full content verification upstream) — stamped traffic keeps the old double gate | stamped lanes 0% (unchanged); harvested ids ride the harvest opt-in |
+| Sub-lane msgid attribution + `|sub:m:` fork mint (#6011) | standard sessionId+msgid store matching over candidate `<id>|sub:` keys (skeleton table ∪ store session list); active whenever inbound ids survive normalization | active for stamped lanes immediately; for harvested lanes rides the same opt-in as harvesting (off everywhere until opted in) |
 | Strip-before-upstream of internal id fields/headers | unconditional | neutral (fields were never supposed to leave) |
 
 Full per-lane status table (wired / closure memo / deferred, with audit
@@ -129,14 +179,18 @@ reasons): `docs/identity-channels.md`.
   aux call can arrive first and race for an empty id; the main conversation
   then recovers or separates via the persisted-prefix-chain rungs — regression-
   pinned (first-sight claim rules, #316; #1916 aux branch).
-- **Reachability caveat on the #5719 rung.** Whether review/aux dispatches ever
+- **Reachability caveat on the id rungs.** Whether review/aux dispatches ever
   ride stamped ids overlapping the parent's rows is conditional on host
   behavior — tracked as a one-line trace log follow-up (PR #5826 review
-  finding P1), deliberately NOT closed by guess. The promised trace line now
-  exists: every firing logs `[session-resolve][msgid-rescue] <rawId>
-  hits=N/M exit=<tag-changed|diverged-order|shorter-divergent>` at warn
-  (`src/session-resolve.ts`, #5865 review P2) — the ≥2-vs-≥1 threshold
-  decision is to be made from that field evidence, not by guess.
+  finding P1), deliberately NOT closed by guess. The promised trace lines now
+   exist (`src/session-resolve.ts`, #5865 review P2): every raw-key rescue fires
+   log `[session-resolve][msgid-rescue] <rawId> hits=N/M exit=…` at warn, and
+   since #6011 every sub-lane store match logs
+   `[session-resolve][msgid-sibling] <key> hits=N/M exit=… firstHit=…` while an
+   ambiguous multi-lane overlap logs
+   `[session-resolve][msgid-sibling] ambiguous: <keyA> and <keyB> both overlap …`.
+   The ≥2-vs-≥1 threshold decision is to be made from that field evidence, not
+   by guess.
 
 ## Change checklist
 
