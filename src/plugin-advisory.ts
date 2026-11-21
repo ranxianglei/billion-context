@@ -15,10 +15,18 @@
 // deps is NOT a reliable on/off signal — the plugin usually arrives through a
 // bundle rather than a direct dep, and installed-but-disabled would be a false
 // alarm — so we scan the patch layer instead.
+//
+// The loader id alone is NOT package identity (#7068: the second false
+// positive — community plugin PerryLink/dsh-auto-review ships `id: auto-review`
+// and the advisory named the official package it never installed). The entry's
+// `name` line is the package dsh actually loads for that id: identity = name
+// match when the entry carries a name (a present-but-different name is a
+// verdict — the entry loads another package), on-disk presence in a profile
+// bundle when it does not (entries predating the name convention).
 
 import fs from "node:fs";
 import path from "node:path";
-import { dshProfileDirs, parseDshPatchEntries } from "./dsh-channel.js";
+import { dshProfileDirs, parseDshPatchEntries, type DshPatchEntry } from "./dsh-channel.js";
 
 interface CostAdvisory {
     id: string;
@@ -40,18 +48,18 @@ const KNOWN_COST_PLUGINS: ReadonlyArray<{ client: string; id: string; name: stri
 const SCAN_TTL_MS = 5 * 60 * 1000;
 let cache: { key: string; at: number; result: CostAdvisory[] } | undefined;
 
-// Enabled top-level patch-entry loader ids across every dsh profile's
-// cordis.patch.yml — entries carrying `disabled: true` in their own block do
-// NOT count (#3838: presence of the id line alone used to fire the advisory
-// for explicitly disabled plugins). Parsed by the shared dsh-channel entry
-// scanner so this gate and the #2861 disable check share one discipline.
-function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
-    const ids = new Set<string>();
+// Enabled top-level patch entries across every dsh profile's cordis.patch.yml
+// — entries carrying `disabled: true` in their own block do NOT count (#3838:
+// presence of the id line alone used to fire the advisory for explicitly
+// disabled plugins). Parsed by the shared dsh-channel entry scanner so this
+// gate and the #2861 disable check share one discipline.
+function dshEnabledPatchEntries(env: NodeJS.ProcessEnv): DshPatchEntry[] {
+    const entries: DshPatchEntry[] = [];
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
-        return ids;
+        return entries;
     }
     for (const dir of dirs) {
         let text: string;
@@ -61,21 +69,58 @@ function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
             continue;
         }
         for (const e of parseDshPatchEntries(text)) {
-            if (!e.disabled) ids.add(e.id);
+            if (!e.disabled) entries.push(e);
         }
     }
-    return ids;
+    return entries;
+}
+
+// #7068: the entry's `name` line is the package dsh loads for that loader id.
+// Full package-name match, or the unscoped tail (a hand-written entry may omit
+// the @scope/ prefix). A present-but-different name is a verdict — it never
+// falls through to the disk check.
+function patchEntryLoadsPackage(name: string | undefined, pkg: string): boolean {
+    if (name === undefined) return false;
+    if (name === pkg) return true;
+    const slash = pkg.indexOf("/");
+    return slash > 0 && name === pkg.slice(slash + 1);
+}
+
+// #7068: fallback for entries without a name line — the package must actually
+// be installed in some profile bundle (same on-disk probe shape as
+// probeDshIotThinking in notices.ts).
+function dshPackageInstalled(env: NodeJS.ProcessEnv, pkg: string): boolean {
+    let dirs: string[];
+    try {
+        dirs = dshProfileDirs(env);
+    } catch {
+        return false;
+    }
+    for (const dir of dirs) {
+        try {
+            if (fs.existsSync(path.join(dir, "node_modules", ...pkg.split("/"), "package.json"))) return true;
+        } catch {
+            // unreadable profile: keep scanning the rest
+        }
+    }
+    return false;
 }
 
 export function detectCostAdvisories(env: NodeJS.ProcessEnv = process.env): CostAdvisory[] {
     const key = `${env.DSH_HOME ?? ""}|${env.HOME ?? ""}|${env.USERPROFILE ?? ""}`;
     if (cache && cache.key === key && Date.now() - cache.at < SCAN_TTL_MS) return cache.result;
     const found: CostAdvisory[] = [];
-    const enabled = KNOWN_COST_PLUGINS.some((p) => p.client === "dsh") ? dshEnabledPatchIds(env) : undefined;
+    const entries = KNOWN_COST_PLUGINS.some((p) => p.client === "dsh") ? dshEnabledPatchEntries(env) : undefined;
     for (const p of KNOWN_COST_PLUGINS) {
         if (p.client !== "dsh") continue;
-        if (!p.patchIds.some((pid) => enabled?.has(pid))) continue;
-        found.push({ id: p.id, name: p.name, client: p.client, issueUrl: p.issueUrl });
+        const hit = entries?.some((e) =>
+            p.patchIds.includes(e.id) &&
+            // #7068: an id match alone is not enough — the entry must load the
+            // official package (name match, or on-disk presence when the entry
+            // predates the name convention).
+            (patchEntryLoadsPackage(e.name, p.id) || (e.name === undefined && dshPackageInstalled(env, p.id)))
+        );
+        if (hit) found.push({ id: p.id, name: p.name, client: p.client, issueUrl: p.issueUrl });
     }
     cache = { key, at: Date.now(), result: found };
     return found;
