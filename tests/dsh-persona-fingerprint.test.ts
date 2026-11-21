@@ -71,6 +71,33 @@ test("openaiSystemTextForPersona: joins every system message's text", () => {
     );
 });
 
+// #6303: pi-ai emits the system prompt as role:"developer" (string content)
+// when the model declares reasoning + the upstream supports the developer
+// role (openai-completions instructionRole) — the carrier MUST match
+// openaiToCore (kernel/src/wire/openai.ts), which hoists system OR developer.
+test("openaiSystemTextForPersona: developer-role system is the same carrier as system (#6303)", () => {
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "developer", content: "A" }, { role: "user", content: "u" }, { role: "developer", content: "B" }] }),
+        "A\n\nB",
+        "developer-role string content is read",
+    );
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "developer", content: [{ type: "text", text: "part-1" }, { type: "text", text: "part-2" }] }] }),
+        "part-1\n\npart-2",
+        "developer-role text parts are joined",
+    );
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "developer", content: "" }] }),
+        "",
+        "empty developer content contributes nothing",
+    );
+    assert.equal(
+        openaiSystemTextForPersona({ messages: [{ role: "user", content: "hi" }] }),
+        "",
+        "no system/developer message still yields empty (non-anchoring)",
+    );
+});
+
 type Rig = { proxyPort: number; upstreamPort: number; proxy: http.Server; upstream: http.Server };
 
 type UpstreamHandler = (req: http.IncomingMessage, res: http.ServerResponse) => void;
@@ -220,6 +247,73 @@ test("e2e openai lane #4438: review persona rides the stateless side passthrough
         assert.equal(r5.status, 200);
         await r5.text();
         assert.equal(getSession(CONV)?.stats.requests, 3, "system-less request keeps the raw key");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// #6303: dsh's pi-ai lane emits BOTH the main agent and the auto-reviewer
+// system as role:"developer" (string content) when the model declares
+// reasoning + the upstream supports the developer role. Pre-fix, the persona
+// extractor read only role:"system", so personaSystemText was "" for BOTH
+// lanes, the gate at handle.ts:1410 was false, and both silently rode the
+// verbatim raw key — the reviewer's divergent all-user history clobbered the
+// main lane's fold state (30 blocks coverage-lost) and, after a client abort
+// mid-compression, `compress` resolved against the side lane and died on
+// gate:cannot-anchor (refs DEAD, 0 active blocks). Post-fix the extractor
+// matches openaiToCore's carrier, the gate fires, and the reviewer forks onto
+// its own |sub:<fp> lane.
+test("e2e openai lane #6303: developer-role systems — main lane keeps the raw key, the no-tools reviewer lane forks to |sub:", async () => {
+    const rig = await startRig();
+    const CONV = "dshp-developer";
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+        const tools = [{ type: "function", function: { name: "bash", description: "run", parameters: { type: "object", properties: {} } } }];
+        const DEV_MAIN = "You are DeepSeek Harness, the main coding agent.\nWorkspace: /tmp.";
+        const DEV_REVIEW = "You are the final authorization reviewer for exactly one pending tool call.\nAnswer with one word.";
+
+        // Phase 1 — main lane: developer-role system + tools + assistant turns
+        // claims the raw key (anchor).
+        const mainMsgsDev = [
+            { role: "user", content: "main-1-" + "z".repeat(6000) },
+            { role: "assistant", content: "a-1-" + "z".repeat(6000) },
+            { role: "user", content: "main-2-" + "z".repeat(6000) },
+            { role: "assistant", content: "a-2-" + "z".repeat(6000) },
+            { role: "user", content: "main-3-" + "z".repeat(6000) },
+        ];
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, tools, messages: [{ role: "developer", content: DEV_MAIN }, ...mainMsgsDev] }),
+        });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const main = getSession(CONV);
+        assert.ok(main, "main session exists under the raw conversation key");
+        assert.ok(Object.keys(main.state.messageRefs.byRaw).length >= 5, "refs assigned to the main history");
+        const mainRefs = Object.keys(main.state.messageRefs.byRaw).length;
+
+        // Phase 2 — reviewer lane: developer-role system (DIFFERENT), no tools,
+        // all-user text msgs, no assistant turns, under the SAME conversation id.
+        // Must fork onto |sub:<fp> — NOT clobber the raw key.
+        const reviewMsgsDev = [
+            { role: "user", content: "ENVIRONMENT {\"cwd\": \"/tmp\"}" },
+            { role: "user", content: "user: build it\nassistant: ok" },
+            { role: "user", content: "user: build it again\nassistant: done" },
+            { role: "user", content: "Decide: risky?" },
+        ];
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ model: MODEL, max_tokens: 384_000, messages: [{ role: "developer", content: DEV_REVIEW }, ...reviewMsgsDev] }),
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        const fork = forkKey(CONV, DEV_REVIEW);
+        assert.ok(peekSession(fork), "reviewer lane (developer-role system) forked onto |sub:<fp>");
+        assert.equal(getSession(CONV)?.stats.requests, 1, "main session request count unchanged by the reviewer");
+        assert.equal(Object.keys(getSession(CONV).state.messageRefs.byRaw).length, mainRefs, "main refs intact — the reviewer did NOT clobber the raw key");
     } finally {
         await closeRig(rig);
     }
