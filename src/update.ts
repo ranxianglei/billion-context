@@ -559,7 +559,12 @@ export function isVersionNewer(latest: string, current: string): boolean {
 }
 
 function parseSemVer(version: string): { parts: number[]; pre: string[] } | undefined {
-    const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.+)?$/);
+    // #6900: tolerate bili's own display suffix ` (commit)` — fetchProxyVersion,
+    // --version and /__bili/status all render `X.Y.Z (hexcommit)`. Strip it
+    // before matching so a display string fed into isVersionNewer still compares
+    // on the semver core; clean semvers are unaffected (the strip is a no-op).
+    const core = version.replace(/\s*\([0-9A-Fa-f]+\)$/, "");
+    const match = core.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.+)?$/);
     if (!match) return undefined;
     return {
         parts: [Number(match[1]), Number(match[2]), Number(match[3])],

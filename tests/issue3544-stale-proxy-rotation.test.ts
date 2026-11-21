@@ -346,7 +346,7 @@ interface Resident {
     close: () => Promise<void>;
 }
 
-function startResident(version: string, exitOnShutdown: boolean): Promise<Resident> {
+function startResident(version: string, exitOnShutdown: boolean, commit?: string): Promise<Resident> {
     let shutdowns = 0;
     let down = false;
     const server = http.createServer((req, res) => {
@@ -360,7 +360,9 @@ function startResident(version: string, exitOnShutdown: boolean): Promise<Reside
         if (req.url === "/__bili/plugin/manifest") {
             if (down && exitOnShutdown) { res.writeHead(503); res.end(); return; }
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ version }));
+            // #6900: a commit mirrors a real build's manifest (every normal build
+            // carries one) — the display string becomes `version (commit)`.
+            res.end(JSON.stringify(commit !== undefined ? { version, commit } : { version }));
             return;
         }
         res.writeHead(404);
@@ -455,3 +457,40 @@ for (const [label, version] of [["equal", VERSION], ["newer", "999.0.0"], ["unpa
         }
     });
 }
+
+// #6900: the regression the suite above never reproduced — a resident whose
+// manifest carries a COMMIT (every normal build does) renders its version as
+// `0.0.1 (abc123)`. Pre-fix, isVersionNewer rejected the suffix (parseSemVer
+// → undefined → false), so the rotation silently never fired and the stale
+// resident was attached as-is. The strictly-older test above uses a bare
+// "0.0.1" (no commit), so it passed both before and after — this case is the
+// one that was actually broken in the field.
+test("#3544/#6900 pinned attach: a strictly older resident WITH a commit suffix is still rotated out", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3544pin-commit-home-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3544pin-commit-state-"));
+    const resident = await startResident("0.0.1", true, "abc123");
+    let spawnCalls = 0;
+    try {
+        _resetRoutedForTest();
+        _resetRegisterForTest(resident.origin);
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        await withPinnedEnv({ DSH_HOME: home, XDG_STATE_HOME: stateHome, BILLION_CONTEXT_PROXY: resident.origin }, async () => {
+            const landed = await verifyAttachAndRecover(resident.origin);
+            assert.equal(landed, "http://127.0.0.1:2", "rotated out: the spawned origin wins");
+            assert.equal(spawnCalls, 1, "spawn fallback ran exactly once");
+            assert.equal(resident.shutdowns, 1, "graceful shutdown requested exactly once");
+            assert.equal(_registerStateForTest().base, "http://127.0.0.1:2", "register re-based onto the fresh spawn");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined, "preset unfrozen");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        await resident.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
