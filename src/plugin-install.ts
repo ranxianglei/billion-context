@@ -43,7 +43,7 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome, readClaudeSettings } from "./client-config.js";
 import { stripBiliWrappers, vertexBaseUrlForLocation } from "./vertex.js";
 import { resolveClaudeNativePort } from "./config.js";
-import { isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, isProxyInstanceFile, lanePreferredPort, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { piNpmCopyRoot } from "./pi-channel.js";
 import { clearOwnerLaneBackoff, fetchRegistryVersion } from "./update.js";
@@ -2286,12 +2286,7 @@ function pinnedOriginLive(origin: string): boolean {
     const inst = readProxyInstanceFile();
     if (inst === undefined || inst.origin !== origin) return false;
     if (!isProxyInstanceFile(inst)) return true;
-    try {
-        process.kill(inst.pid, 0);
-        return true;
-    } catch {
-        return false;
-    }
+    return isPidAlive(inst.pid);
 }
 
 /** Pure merge of the #7456 managed block into parsed settings (install
