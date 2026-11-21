@@ -25,9 +25,13 @@
  *       the corrupt file into a freshly-migrated schema, bisecting broken
  *       page ranges down to single rows and re-reading row columns
  *       individually (a corrupt overflow cell kills only its own column,
- *       the rest of the row survives). Same quarantine+swap+verify
- *       choreography. Read-only opens only; the corrupt file is never
- *       written to.
+ *       the rest of the row survives). WITHOUT ROWID tables have no rowid
+ *       to walk, so they are copied whole — the read on the read-only src
+ *       handle throws if the table's pages are corrupt, and the write is
+ *       one transaction on the fresh db (all rows land or none do). Any
+ *       table the salvager cannot read is reported as skipped and counts
+ *       as loss (exit 1). Same quarantine+swap+verify choreography.
+ *       Read-only opens only; the corrupt file is never written to.
  *
  * Both refuse to run the swap while another live process holds
  * index.db.lock (#4175 pid discipline) — the quarantined file would be
@@ -355,6 +359,19 @@ function readColumns(db: RoDb, table: string): string[] | null {
     }
 }
 
+/** WITHOUT ROWID tables have no rowid column to walk — `SELECT max(rowid)`
+ *  throws `no such column: rowid` on them, which is a STRUCTURAL property,
+ *  not corruption. Detected from the DDL in sqlite_master (the same source
+ *  the table list comes from), not from error-text matching. */
+function isWithoutRowid(src: RoDb, table: string): boolean {
+    try {
+        const r = src.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql?: string } | undefined;
+        return typeof r?.sql === "string" && /WITHOUT ROWID/i.test(r.sql);
+    } catch {
+        return false;
+    }
+}
+
 function insertRows(fresh: ReturnType<typeof openSqliteDatabase>["db"], table: string, cols: string[], rows: Array<Record<string, unknown>>): void {
     if (rows.length === 0) return;
     const colList = cols.map(quoteId).join(", ");
@@ -405,6 +422,29 @@ function salvageTable(src: RoDb, fresh: ReturnType<typeof openSqliteDatabase>["d
     }
     const max = report.rowsTotal;
     if (max === null) {
+        if (isWithoutRowid(src, table)) {
+            // No rowid to bisect over: copy the whole table. The read runs
+            // on the read-only src handle (a corrupt page throws mid-scan)
+            // and the write is one transaction on the fresh db — a fault
+            // rolls back with zero partial rows, so either every row lands
+            // or none do. (A cross-connection INSERT...SELECT is not an
+            // option: without ATTACH the SELECT side resolves to the fresh
+            // db's own empty table and "succeeds" with 0 rows.)
+            try {
+                const colList = cols.map(quoteId).join(", ");
+                const ph = cols.map(() => "?").join(", ");
+                const rows = src.prepare(`SELECT ${colList} FROM ${quoteId(table)}`).all() as Array<Record<string, unknown>>;
+                const stmt = fresh.prepare(`INSERT INTO ${quoteId(table)} (${colList}) VALUES (${ph})`);
+                fresh.transaction(() => {
+                    for (const row of rows) stmt.run(...cols.map((c) => row[c]));
+                });
+                report.rowsTotal = rows.length;
+                report.rowsSalvaged = rows.length;
+            } catch {
+                report.note = "WITHOUT ROWID table unreadable (corrupt) — skipped";
+            }
+            return report;
+        }
         report.note = "max(rowid) unreadable — table skipped";
         return report;
     }
@@ -505,19 +545,26 @@ function salvageNoBackup(dir: string, dbPath: string, json: boolean, ts: string)
     }
     const lost = reports.reduce((a, r) => a + r.rowsLost, 0);
     const nulls = reports.reduce((a, r) => a + r.nulls, 0);
+    // A table the salvager could not read at all (note set) is loss too:
+    // its rows are absent from the result, and the contract is "exit 1 and
+    // report per table when anything is lost" — a silently-emptied table
+    // is the worst kind of loss.
+    const skipped = reports.filter((r) => r.note !== undefined);
+    const complete = lost === 0 && skipped.length === 0;
     const moved = quarantine(dbPath, ts);
     renameSync(tmpPath, dbPath);
     const data = {
-        ok: lost === 0,
+        ok: complete,
         mode: "salvage",
         tables: reports.map((r) => ({ table: r.table, total: r.rowsTotal, salvaged: r.rowsSalvaged, lost: r.rowsLost, nulls: r.nulls, note: r.note })),
         rowsLost: lost,
+        skippedTables: skipped.map((r) => r.table),
         columnsNullified: nulls,
         schemaVersion: STORAGE_SCHEMA_VERSION,
         quarantined: moved,
-        note: lost === 0 ? "restart bili to pick up the salvaged index" : "partial salvage — lost rows are unrecoverable from this file; restart bili, then verify the sessions you care about",
+        note: complete ? "restart bili to pick up the salvaged index" : "partial salvage — lost rows and skipped tables are unrecoverable from this file; restart bili, then verify the sessions you care about",
     };
-    if (json) return { code: lost === 0 ? 0 : 1, text: `${JSON.stringify(data, null, 2)}\n` };
+    if (json) return { code: complete ? 0 : 1, text: `${JSON.stringify(data, null, 2)}\n` };
     const lines = [`salvaged ${dbPath} from the corrupt file (no backup used)`];
     lines.push("");
     lines.push(renderTable(
@@ -527,11 +574,12 @@ function salvageNoBackup(dir: string, dbPath: string, json: boolean, ts: string)
     for (const r of reports) if (r.note) lines.push(`  ${r.table}: ${r.note}`);
     lines.push("");
     lines.push(`  rows lost:          ${lost}${nulls > 0 ? ` (plus ${nulls} column(s) nullified on surviving rows)` : ""}`);
+    if (skipped.length > 0) lines.push(`  skipped tables:     ${skipped.map((r) => r.table).join(", ")}`);
     lines.push(`  quick_check:        ok (verified before the swap)`);
     lines.push(`  quarantined:        ${moved.join(", ")}`);
     lines.push("");
-    lines.push(lost === 0 ? "restart bili (stop the proxy first) to pick up the salvaged index." : "partial salvage — restart bili, then verify the sessions you care about still load.");
-    return { code: lost === 0 ? 0 : 1, text: `${lines.join("\n")}\n` };
+    lines.push(complete ? "restart bili (stop the proxy first) to pick up the salvaged index." : "partial salvage — restart bili, then verify the sessions you care about still load.");
+    return { code: complete ? 0 : 1, text: `${lines.join("\n")}\n` };
 }
 
 export async function runStorageRepairCommand(opts: { from?: string; dir?: string; json?: boolean }): Promise<CmdResult> {
