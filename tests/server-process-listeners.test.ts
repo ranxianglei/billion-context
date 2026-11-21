@@ -144,8 +144,9 @@ test("graceful shutdown keeps signal handlers until the process exits", async ()
     const server = await start();
     try {
         const serving = snapshot();
+        const closed = once(server, "close");
         sendSignal("SIGINT");
-        await once(server, "close");
+        await closed;
         // Let the shutdown chain reach (the stubbed) process.exit first: the
         // test process must not drain out from under the assertions while the
         // flush is still running. Bounded wait instead of a fixed 500ms sleep
@@ -168,7 +169,6 @@ test("graceful shutdown keeps signal handlers until the process exits", async ()
         // would kill the runner before the TAP summary is written. The node
         // --test child ends via event-loop drain, not process.exit, so the
         // pending chain's exit(0) is then harmlessly recorded instead of fired.
-        if (exits.length === 0) return;
-        process.exit = realExit;
+        if (exits.length > 0) process.exit = realExit;
     }
 });
