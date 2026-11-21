@@ -708,6 +708,7 @@ export class SessionStore {
                 fileStorageWalJournalSizeLimit(),
                 fileStorageBackend(),
                 fileStorageMysqlDsn(),
+                fileStorageJsonWriter(),
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
             });
@@ -730,7 +731,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -2614,7 +2615,11 @@ export class SessionStore {
         if (!shadow) return null;
         try {
             return shadow.webSummaryRows();
-        } catch {
+        } catch (e) {
+            // #7156: this catch used to swallow the error silently — a corrupt
+            // payload_json made the panel show "0 historical sessions" with NO
+            // trace in the server log. Log it so the fallback is diagnosable.
+            loggerLog("warn", `[persist] unifiedWebSummaries: ${String(e)} — falling back to the disk-index walk`);
             return null; // sidecar degraded mid-call: fall back to the walk
         }
     }
@@ -3639,63 +3644,6 @@ export class SessionStore {
         this.drainFlushWaiters(session.id, true);
     }
 
-    /** #4739: where this id's record lives RIGHT NOW — the one build-scoped
-     *  source decision shared by both lazy-field restores after a save.
-     *  Mirrors loadSync's routing exactly: no readable unified index (never
-     *  opened, 3-strike disabled, shadow mode serving files) or a drift latch
-     *  (the envelope outranks the index while it exists, #3135 ④) → file;
-     *  else index. Bound at save time, deliberately NOT re-evaluated at
-     *  restore time — a later racing writer converges on the next save, and
-     *  re-routing mid-burst could flip the source between the two fields of
-     *  one saved record. */
-    private lazySource(id: string): "index" | "file" {
-        const sh = this.shadow;
-        if (!sh || !sh.readsUnified || sh.stats.disabled) return "file";
-        if (sh.driftedSessions.has(id)) return "file";
-        return "index";
-    }
-
-    /** #4739: narrow metadata restore for the dropped-metadata proxy —
-     *  single-column index read or single-file-field envelope read instead
-     *  of the full-session loadSync rebuild. Tries the bound source first,
-     *  then the other copy; null only when BOTH miss/fail (keeps the proxy's
-     *  refuse-empty throw semantics). Never imports, never schedules a save,
-     *  never touches the drift latch. */
-    private narrowMetadata(id: string, source: "index" | "file", meta?: { protocol?: string; upstreamOrigin?: string }): Record<string, unknown> | null {
-        const fromIndex = (): Record<string, unknown> | null => this.shadow?.getSessionMetadata(id) ?? null;
-        const fromFile = (): Record<string, unknown> | null => {
-            const env = this.loadEnvelope(id, meta);
-            return env ? (env.payload.metadata ?? {}) : null;
-        };
-        if (source === "index") {
-            const idx = fromIndex();
-            return idx !== null ? idx : fromFile();
-        }
-        const file = fromFile();
-        return file !== null ? file : fromIndex();
-    }
-
-    /** #4739: narrow blockContents restore for the dropped-blockContents
-     *  proxy — block rows + orphans journal (index) or the persisted
-     *  record's map (file), never message rows. Same bound-source-first /
-     *  other-copy-fallback / refuse-empty contract as narrowMetadata. */
-    private narrowBlockContents(id: string, source: "index" | "file", meta?: { protocol?: string; upstreamOrigin?: string }): Record<string, BlockContent> | null {
-        const fromIndex = (): Record<string, BlockContent> | null => {
-            const rows = this.shadow?.getBlockContents(id);
-            return rows ? Object.fromEntries(rows) : null;
-        };
-        const fromFile = (): Record<string, BlockContent> | null => {
-            const env = this.loadEnvelope(id, meta);
-            return env ? (env.payload.blockContents ?? {}) : null;
-        };
-        if (source === "index") {
-            const idx = fromIndex();
-            return idx !== null ? idx : fromFile();
-        }
-        const file = fromFile();
-        return file !== null ? file : fromIndex();
-    }
-
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
      *  unified messages table via the ⑤ rawTail override), an idle session
      *  keeps only the bounded folded view resident — the exact shape a
@@ -3774,7 +3722,6 @@ export class SessionStore {
         // loader degrades to the id-only lookup, same as a protocol-less file.
         const meta = session.meta ?? undefined;
         // #4739: one narrow read per field instead of a full-session rebuild.
-        const source = this.lazySource(session.id);
         session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
             return this.loadResidentFields(id, m, { metadata: true })?.metadata ?? null;
         });
@@ -3796,7 +3743,6 @@ export class SessionStore {
         }
         if (existing.size === 0) return;
         // #4739: one narrow read per field instead of a full-session rebuild.
-        const source = this.lazySource(session.id);
         const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
             return this.loadResidentFields(id, meta, { blockContents: true })?.blockContents ?? null;
         });
@@ -3883,12 +3829,16 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):
             // record loudly once per window, keep serving from envelopes.
-            this.log("error", `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
+            // The 2026-11-21 proven-corruption refusal latches: no further
+            // in-process retries, the operator fixes the files by hand.
+            this.log("error", hadIntegrityQuickCheckFailure()
+                ? `[storage] sidecar reopen attempt REFUSED — the index is proven corrupt (${String(err)}); no further in-process retries (2026-11-21 refusal policy; operator hand-fix or BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1)`
+                : `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
             return;
         }
         if (this.shadow !== undefined) {

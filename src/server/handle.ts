@@ -56,6 +56,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
+import { opencodeForkParent } from "../opencode-fork-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
@@ -522,8 +523,10 @@ async function handleRequest(
                 // session). Any TEXT-dominated parseable body above the ingest
                 // cost band is already ≥ ~8M tokens — beyond every real model
                 // window — so refuse it HERE, after decode (which can balloon
-                // 10:1) but before the sweep that costs the seconds. 0 disables
-                // the cap (legacy parse-everything).
+                // 10:1) but before the sweep that costs the seconds. DISABLED
+                // by default for all lanes (#7426: on the re-send lanes the raw
+                // inbound byte count is not a valid "beyond model window"
+                // proxy); set a byte value to re-enable.
                 //
                 // Image-bearing bodies are exempt on EVERY lane: base64 pixels
                 // are excluded from the token meter by design ("images billed
@@ -2193,6 +2196,28 @@ async function handleRequest(
                     log("warn", `[${sessionId}] [resume-inheritance] transcript lineage lookup failed (${String(err)}); falling back to prefix match (#1486)`);
                 }
             }
+            // #7421: opencode records its fork parent in the local SQLite DB
+            // (session_v2.fork_session_id); the host plugin only learns it from
+            // session.created's parentID, which some builds do not emit on fork.
+            // Declaring the true parent here scopes the prefix match below to
+            // that chain (findResumeParentWithin) instead of the unscoped scan
+            // a mid-chain fork can't satisfy — the unscoped miss then weak-adopts
+            // a globally-closest chain, which can be an UNRELATED session
+            // (crosstalk). Loopback only (the DB is a local file); opencode lane
+            // only (ses_ ids are opencode-specific). A parent this proxy doesn't
+            // know still degrades safely: the scoped match misses, the weak-adopt
+            // stays scoped to it, and the derived-fork link below reports the miss.
+            if (!resume && derivedParent === undefined && pluginAgent === "opencode" && isLoopbackAddress(req.socket.remoteAddress)) {
+                try {
+                    const parent = opencodeForkParent(sessionId);
+                    if (parent !== undefined) {
+                        derivedParent = parent;
+                        log("info", `[${sessionId}] [resume-inheritance] opencode fork lineage from session_v2.fork_session_id -> ${parent} (#7421)`);
+                    }
+                } catch (err) {
+                    log("warn", `[${sessionId}] [resume-inheritance] opencode fork lineage lookup failed (${String(err)}); falling back to prefix match (#7421)`);
+                }
+            }
             if (!resume) {
                 const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
@@ -2355,7 +2380,13 @@ async function handleRequest(
         // derivedFromSessionId set and skips this link.
         if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
             try {
-                const parentSession = resolveConversation(derivedParent)?.session;
+                // #7421: resolveConversation is memory-only (conversations map +
+                // peekSession), so after a proxy restart even a corrected parent
+                // id was dropped ("unknown to this proxy"). For plugin lanes the
+                // conversation id IS the session id (opencode ses_…), so a disk
+                // load by that id recovers the parent; a non-session id safely
+                // returns undefined and keeps the miss path below.
+                const parentSession = resolveConversation(derivedParent)?.session ?? getStore().loadSync(derivedParent, { protocol, upstreamOrigin }) ?? undefined;
                 if (parentSession) {
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
@@ -3394,8 +3425,23 @@ async function handleRequest(
                     nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    postComPressTail: preparedCs?.postComPressTail === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment,
+                // so the receipt may note the uncovered runs once more in this
+                // cycle; folds without a new injection stay silent (anti-nag,
+                // #6522 loop). Only the post-gate delivery fact "injected"
+                // resets — the same fact that mints the nudge credit above;
+                // "gated"/"vetoed"/"skipped" never reached the model and never
+                // re-open the note. The note itself only exists while
+                // compress.postComPressTail is on (#7318) — with it off this
+                // latch is inert.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
@@ -3426,6 +3472,17 @@ async function handleRequest(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
+                        // #7376: this is the only egress decision point for the
+                        // main payload. preflightCompressIfNeeded (above) runs
+                        // to completion BEFORE forward() is ever reached (below,
+                        // only when this branch is NOT taken) — it is a local
+                        // token-estimate + fold computation with no upstream I/O
+                        // for the MAIN body, so a fail-fast verdict means the
+                        // main payload was never sent upstream. The only egress
+                        // during preflight is the separate, smaller
+                        // summarization call (external summary chain) — a
+                        // different request, not the fail-fasted payload. The
+                        // "NOT forwarded" wording is therefore always true.
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
