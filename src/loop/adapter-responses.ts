@@ -811,14 +811,14 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             return buildCompleted(resp);
         },
 
-        emitError(message) {
+        emitError(message, rejection) {
             const parts: Buffer[] = [];
             const created = ensureCreated();
             if (created) parts.push(created);
             const resp = {
                 id: createdRespId ?? `resp-error-${Date.now()}`,
                 status: "failed",
-                error: { code: "server_error", message },
+                error: { code: rejection?.code ?? rejection?.type ?? "server_error", message },
             };
             parts.push(Buffer.from(
                 `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: resp })}\n\n`,

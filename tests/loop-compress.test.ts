@@ -702,6 +702,41 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
 // compress fold (host refreshFolded hook), not the stale pre-compress view.
 // The stale view is what made the model stop: it was told "~N tokens saved"
 // while staring at the identical context it had just compressed.
+test("loop: content rejection after committed compression preserves error identity and the committed block", async () => {
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    const summary = "Synthetic migration task: continue the authorized implementation; earlier analysis is complete.";
+    const args = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary }] });
+    const round1 = sse("response.created", { response: { id: "resp_1", status: "in_progress" } })
+        + fcEvents(0, "call_content_reject", "compress", args) + COMPLETED;
+    const error = { code: "content-blocked", type: "agent_router_content_blocked", message: "Synthetic rejection. " + "detail ".repeat(40) + "request id: fixture-after-compress" };
+    const originalFetch = globalThis.fetch;
+    let sends = 0;
+    let refreshes = 0;
+    ctx.refreshFolded = (messages) => { refreshes++; return messages; };
+    globalThis.fetch = async () => { sends++; return new Response(JSON.stringify({ error }), { status: 400 }); };
+    try {
+        const output = await drain(new Response(round1).body!, ctx,
+            { model: "gpt-test", input: [], stream: true }, { url: "http://mock", headers: {} });
+        assert.equal(sends, 1, "explicit rejection must not replay the committed operation");
+        assert.equal(refreshes, 1, "compression completed before rejection");
+        assert.ok(ctx.session.state.blocks.some((block) => block.summary === summary), "keep the committed summary");
+        const events = output.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+        const failure = events.find((event) => event.type === "response.failed");
+        assert.equal(failure?.response.error.code, error.code, "do not relabel a content rejection as server_error");
+        assert.equal(failure?.response.error.message, error.message, "retain the full diagnostic and trailing request id");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 test("loop #422a: successful compress → re-request carries the refreshed fold + round records", async () => {
     // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
     const ctx = withRefs(

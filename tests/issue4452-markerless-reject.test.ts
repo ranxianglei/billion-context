@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectContextOverflow, isMarkerlessOverflowReject } from "../src/util.ts";
+import { inspectContextOverflow, isMarkerlessOverflowReject, parseContentRejection } from "../src/util.ts";
 
 // #4452: an intermediate gateway that rewrites a payload-size rejection into one
 // generic body (Cherry Studio strips the token counts / window) defeats the
@@ -33,6 +33,40 @@ const OPENAI_OVERFLOW_BODY = JSON.stringify({
 });
 
 const CJK_OVERFLOW_BODY = JSON.stringify({ error: { message: "上下文长度超出限制", type: "invalid_request_error" } });
+
+test("explicit content rejection takes precedence over quoted overflow and image diagnostics", () => {
+    const message = "Quoted context_length_exceeded; Too many images: maximum 5 images. request id: fixture-classify";
+    for (const identity of [{ code: "content-blocked" }, { type: "agent_router_content_blocked" }]) {
+        const body = JSON.stringify({ error: { ...identity, message } });
+        assert.equal(parseContentRejection(400, body)?.message, message);
+        assert.deepEqual(inspectContextOverflow(400, body), { isOverflow: false, message: body.slice(0, 300) });
+        assert.equal(isMarkerlessOverflowReject(400, body), false);
+    }
+});
+
+test("quoted markers, malformed envelopes and other HTTP statuses are not explicit content rejection", () => {
+    const bodies = [
+        "content-blocked", "null", "[]", "{}", '{"error":null}',
+        JSON.stringify({ error: { message: "content-blocked agent_router_content_blocked", code: "bad_request" } }),
+        JSON.stringify({ error: { code: { value: "content-blocked" }, type: ["agent_router_content_blocked"] } }),
+        OPENAI_OVERFLOW_BODY, CJK_OVERFLOW_BODY, MALFORMED_BODY, GENERIC_BODY,
+    ];
+    for (const body of bodies) assert.equal(parseContentRejection(400, body), null, body);
+    for (const status of [200, 401, 403, 413, 429, 500, 503]) {
+        assert.equal(parseContentRejection(status, '{"error":{"code":"content-blocked"}}'), null);
+    }
+});
+
+test("content rejection retains request IDs carried outside the message", () => {
+    for (const envelope of [
+        { error: { code: "content-blocked", message: "Synthetic rejection", request_id: "fixture-nested-id" } },
+        { error: { code: "content-blocked", message: "Synthetic rejection" }, request_id: "fixture-root-id" },
+    ]) {
+        const body = JSON.stringify(envelope);
+        assert.ok(body.length < 200, "the previous diagnostic retained these short bodies");
+        assert.match(parseContentRejection(400, body)?.message ?? "", /fixture-(nested|root)-id/);
+    }
+});
 
 test("generic gateway body on 413 is the markerless SIZE verdict and is flagged", () => {
     // The first-order failure: the marker gate itself says "not overflow".

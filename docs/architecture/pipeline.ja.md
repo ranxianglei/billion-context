@@ -1,6 +1,6 @@
 # モジュール: リクエストパイプライン (`src/server` + `src/loop`)
 
-> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-10 時点, master
+> [アーキテクチャハブ](../architecture.ja.md) の一部 · 中国語版: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · 2026-11-15 時点, candidate
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (ビットマップフォールバック: [pipeline.en.png](./assets/pipeline.en.png))
@@ -28,6 +28,8 @@
 **送信 (Egress)。** `stream-*` はワイヤーごとにアップストリームの SSE を書き換えます（チャンクフレーミング、キャッシュコントロールブレークポイント #1637、`wire-body` トレーリングユーザーターン追加）。リクエスト側では、ユーザー登録可能な `egressTransforms[]` パイプライン (`src/egress-transforms.ts`, #6003) が、セッション処理の後で再署名/v1Wrap の前に、すべての送信モデルリクエストボディに対して ESM プラグインを実行します — プラグインごとにフェイルオープン、`/__bili/config/reload` によるホットリロード可能、未設定時は完全な何もしません (no-op)。プロトコルヘッダー (pf-*/envelope) はプロキシから決して外に出ません — アップストリームのホップヘッダーリストがそれらを除去します。
 
 **ゲートとリカバリ。** `preflight.ts` (ホールドグレース、デッドエンドクールダウン)、`reasoning-guard` (署名済みペイロードは決してフォールド入力にならない)、`request-body-budget` (受信/デコード/送信バイト上限、パフォーマンスより可用性 #3128)、`content-encoding` (デコンプレッションボムガード、413)。エラー形状: `stream-error` (最小限の SSE エラー + 終了)、`fake-completion` (オプトインのリトライヒント)、`degenerate-turn` / `degenerate-retry`、および `exit-matrix` (ワイヤー終了 × 懸念事項、#588)。
+
+**明示的なコンテンツ拒否。** HTTP 400 の code が `content-blocked`、または type が `agent_router_content_blocked` なら、一般的な再送、キャッシュキー探査、thinking 削除、overflow 回復を停止する。回復ループは元の試行の usage を記録してから拒否を返す。Anthropic の EOF は既知の部分 usage を保持するが、完了とは扱わない。ネイティブエラーは本文・`x-request-id` / `request-id` ヘッダーの診断 ID を保持する。Responses は `error.code`、Google は 400 / `INVALID_ARGUMENT` を使う。明示的な `streamErrorShape="completion"` の互換動作は維持する。未知の 400 や実際の schema／キャッシュ／context エラー、一時的障害は従来の回復経路を使う。`WC-026` の fake は観測された判決のみを再現する。
 
 ## 主要エントリ
 
