@@ -237,6 +237,27 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #6636 production 400 (dsh-fish-soul TTS through bili 0.1.213, Xiaomi MiMo mimo-v2.5-tts over an OpenAI-compatible /chat/completions endpoint): the plugin sends {model, messages:[user, assistant], audio:{format:"mp3",voice:"mimo_default"}, stream:false} with no tools; bili injected the FUNCTION_ACP_TAGS_TIMESTAMPED system prompt as messages[0] plus an <acp> prefix on every message, and the upstream answered 400 "messages[0] system role is not allowed for TTS model". Control experiment in the issue: the same messages undecorated return 200 with audio. Repair: isAudioOutputCall (src/server/side-request.ts) routes tool-less audio requests through the #388 verbatim side passthrough, so neither the system prompt nor the tags are ever injected. The validator keys on the `audio` field, not the model name — the shape, not the spelling, is what makes the call a TTS request.',
     },
+    {
+        // Landed as WC-023 on the feature branch; master's #5432 took WC-023,
+        // #5998 took WC-024, and #6636 took WC-025 first, so this rule
+        // renumbers to WC-026 on rebase (its call-side mirror takes WC-027).
+        id: "WC-026",
+        wire: "responses",
+        summary:
+            "an output item (function_call_output / custom_tool_call_output / tool_search_output) whose call_id matches no call item in the same input array is unrecoverable upstream — strict Responses backends 400 the whole request with 'No tool call found for tool output <id>' and every later turn re-fails until restart; bili drops such orphaned outputs at the wire boundary (dropOrphanToolOutputs, src/tool-pair-order.ts)",
+        provenance:
+            "bili #5670 production 400 (Codex 0.166 + DeepSeek via Magpie, bili 0.1.208/0.1.212/master): Codex's new tool_search_call/tool_search_output pair was absent from src/tool-pair-order.ts, and a compression round dropped a tool_search_call while keeping its output (invariant-judge: I2 mid-history-drop x39); DeepSeek answered invalid_request_error 'No tool call found for tool output with call_id call_00_...' and the session was stuck on that model until restart. Second observation (2026-11-19, Codex Desktop behind a Responses gateway, provider unstated): HTTP 400 'No tool call found for tool search output with call_id <redacted>' — the same constraint with the item type name interpolated into the message; corroborates the shape, does not locate the historical loss. The error string mirrors OpenAI's own validation shape, so the constraint is enforced for the whole responses wire, not a DeepSeek-only lane.",
+    },
+    {
+        // Landed as WC-024 on the feature branch; renumbers to WC-027 on
+        // rebase (see the WC-026 note above).
+        id: "WC-027",
+        wire: "responses",
+        summary:
+            "a call item (function_call / custom_tool_call / tool_search_call) whose call_id matches no output item anywhere in the same input array is unrecoverable upstream — strict Responses backends 400 the whole request with 'No tool output found for tool call <id>' (#766's production error string). The only legal output-less call is an in-flight one, which structurally sits in the trailing run of the array (calls and post-call reasoning only). bili completes such mid-history orphans with an honest synthesized lost-output result at the wire boundary (completeOrphanToolCalls, src/tool-pair-order.ts)",
+        provenance:
+            "bili #5670 production evidence (Codex 0.166 + DeepSeek via Magpie): the invariant-judge log cited in the issue flagged 'I1 violation: mid-history-rewrite @118 — inbound[118] tool-result#call_94ffd9dc... absent from outbound frozen prefix' — a compression round dropped the OUTPUT while the CALL survived, the mirror of WC-026's shape. One compression bug thus produces two distinct unshippable requests. The rejecting error string is #766's production 400 text, so the constraint holds for the whole responses wire, not one provider lane.",
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -593,6 +614,56 @@ export function validateResponsesBody(body: unknown): string[] {
             if (typeof item.id === "string" && item.id.startsWith("msg")) return;
             out.push(`WC-015 input[${i}].id: expected an ID that begins with 'msg'`);
         });
+        // WC-026 (#5670): an output whose call_id matches no call in the array can never
+        // resolve upstream. bili's repair drops these at the wire boundary (src/tool-pair-order.ts);
+        // this clause catches any future path that bypasses it. Missing/empty call_id is not
+        // flagged — the #5670 evidence only covers identified orphans.
+        {
+            const callIds = new Set<string>();
+            for (const item of body.input) {
+                if (!isPlainObject(item)) continue;
+                if ((item.type === "function_call" || item.type === "custom_tool_call" || item.type === "tool_search_call") && typeof item.call_id === "string")
+                    callIds.add(item.call_id);
+            }
+            body.input.forEach((item, i) => {
+                if (!isPlainObject(item)) return;
+                const t = item.type;
+                if (t !== "function_call_output" && t !== "custom_tool_call_output" && t !== "tool_search_output") return;
+                if (typeof item.call_id !== "string" || item.call_id.length === 0) return;
+                if (!callIds.has(item.call_id))
+                    out.push(`WC-026 input[${i}]: ${t} references call_id "${item.call_id}" but no matching call item exists in input — strict backends 400 'No tool call found for tool output' (#5670)`);
+            });
+        }
+        // WC-027 (#5670 I1 direction): the mirror of WC-026 — a call with no surviving
+        // output before the trailing run was abandoned mid-history by compression
+        // ('No tool output found for tool call <id>', #766's error string). In-flight
+        // calls are exempt: they can only legally sit in the trailing {call, reasoning}
+        // suffix. Mirrors completeOrphanToolCalls (src/tool-pair-order.ts) exactly;
+        // calls with missing/empty call_id are not flagged — unjudgeable, same as WC-026.
+        {
+            const outIds = new Set<string>();
+            for (const item of body.input) {
+                if (!isPlainObject(item)) continue;
+                const t = item.type;
+                if ((t === "function_call_output" || t === "custom_tool_call_output" || t === "tool_search_output") && typeof item.call_id === "string" && item.call_id.length > 0)
+                    outIds.add(item.call_id);
+            }
+            let tail = body.input.length;
+            while (tail > 0) {
+                const it = body.input[tail - 1];
+                const t = isPlainObject(it) ? it.type : undefined;
+                if (t === "function_call" || t === "custom_tool_call" || t === "tool_search_call" || t === "reasoning") tail--;
+                else break;
+            }
+            body.input.forEach((item, i) => {
+                if (!isPlainObject(item) || i >= tail) return;
+                const t = item.type;
+                if (t !== "function_call" && t !== "custom_tool_call" && t !== "tool_search_call") return;
+                if (typeof item.call_id !== "string" || item.call_id.length === 0) return;
+                if (!outIds.has(item.call_id))
+                    out.push(`WC-027 input[${i}]: ${t} has call_id "${item.call_id}" but no matching output item exists in input (and it sits before the trailing in-flight run) — strict backends 400 'No tool output found for tool call' (#5670)`);
+            });
+        }
     }
     // WC-013 (#1757): runs before the tools early-return — reasoning.summary
     // exists on bodies without tools.
