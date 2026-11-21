@@ -2081,7 +2081,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
@@ -3774,10 +3779,11 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
+                const signed = typeof p["thoughtSignature"] === "string" && p["thoughtSignature"].length > 0;
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
                         keptText = true;
                         appendReply(field, index, raw);
@@ -4619,13 +4625,13 @@ export async function pipePluginResponsesWithStrip(
         if (proseAcc.length === 0 || !session) return;
         scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
-    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown; content_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
             answerProse += tail;
-            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            const meta = inRetry && heldItemId !== undefined ? { ...lastDeltaMeta, item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
@@ -5077,7 +5083,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         const clean = tagFilter.push(delta);
-                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"], content_index: ev["content_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
@@ -5215,12 +5221,16 @@ function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string
             ...cand,
             content: {
                 ...cont,
-                parts: (cont["parts"] as unknown[]).map((p) =>
-                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
-                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
-                        : p,
-                ),
+                parts: (cont["parts"] as unknown[]).map((p) => {
+                    if (!p || typeof p !== "object") return p;
+                    const part = p as Record<string, unknown>;
+                    // #1960/KDD#10: ordinary text can carry a signature too.
+                    return part["thought"] !== true
+                        && !(typeof part["thoughtSignature"] === "string" && part["thoughtSignature"].length > 0)
+                        && typeof part["text"] === "string"
+                        ? { ...part, text: stripAcpTags(part["text"], drop, requestText) }
+                        : p;
+                }),
             },
         };
     });

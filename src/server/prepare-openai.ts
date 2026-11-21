@@ -44,12 +44,12 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, outputBudgetField, readOutputBudget, writeOutputBudget } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -153,6 +153,16 @@ export async function prepareOpenai(
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
         if (wpOutcome.hit) {
             wpHit = wpOutcome.hit;
+            // #6752: handle.ts already ran restoreOutputBudget on `parsed` —
+            // the rebind below re-parses scalar fields from the raw wire text,
+            // which would silently discard the restored budget (the log claims
+            // the restore while the wire still carries the client's shrunk
+            // value). Carry the restored budget across the rebind.
+            const budgetField = outputBudgetField(parsed);
+            const restoredBudget =
+                budgetField !== null
+                    ? readOutputBudget(parsed as Record<string, unknown>, budgetField)
+                    : undefined;
             const fields: Record<string, unknown> = {};
             for (const [key, span] of wpHit.fieldSpans) {
                 // "messages" keeps its WIRE POSITION (the scanner records it
@@ -160,6 +170,9 @@ export async function prepareOpenai(
                 // span so no bytes of the prefix are ever decoded.
                 if (key === "messages") fields[key] = wpHit.windowMessages;
                 else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
+            }
+            if (budgetField !== null && restoredBudget !== undefined) {
+                writeOutputBudget(fields, budgetField, restoredBudget);
             }
             parsed = fields as OpenAIRequestBody;
             inboundMessageCount = wpHit.totalT;
@@ -701,6 +714,14 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+    // #7346: on a HIT the pin is this turn's window (the new tail), NOT the
+    // complete raw log. snapshotMessages stamps it raw (folded=false), so the
+    // save presents the window as the full log and the #3285 authoritative-set
+    // sweep retires every verified prefix row the window omits — a 100k-session
+    // ledger drained to the ~2-row window each turn. Mark the pin non-raw so
+    // the save ingests the window through the bounded envelope view and does
+    // NOT sweep the prefix.
+    if (wpHit !== undefined) session.lastMessagesFolded = true;
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
@@ -712,6 +733,13 @@ export async function prepareOpenai(
             rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
             turnStripCounts: wpTurnStrip,
         });
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
+        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
+        // heartbeat still must flow or the client's watermark freezes and its
+        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
+        // saved state (the fastpath re-establishes both when it next runs).
+        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);

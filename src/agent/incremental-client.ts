@@ -339,9 +339,17 @@ function contentWithoutCacheControl(content: unknown): unknown {
     return changed ? out : content;
 }
 
-/** Alignment hash: the wire hash with cache_control decorations stripped. */
-function alignHash(m: IncrementalWireMessage): string {
-    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(contentWithoutCacheControl(m.content))}`).digest("hex").slice(0, 16);
+/** One pass per message: the raw wire hash plus, ONLY when cache_control
+ *  decorations are actually present, the stripped alignment hash. Without
+ *  decorations both formulas feed byte-identical input to sha256, so the
+ *  pair is (h, h) and undecorated messages pay one hash instead of two.
+ *  contentWithoutCacheControl returns the ORIGINAL reference when nothing
+ *  changed, which is the cheap "decorated?" probe. */
+function wireHashPair(m: IncrementalWireMessage): { raw: string; align: string } {
+    const raw = wireHash(m);
+    const stripped = contentWithoutCacheControl(m.content);
+    if (stripped === m.content) return { raw, align: raw };
+    return { raw, align: createHash("sha256").update(`${m.role}\u0000${JSON.stringify(stripped)}`).digest("hex").slice(0, 16) };
 }
 
 /** Public twin of the internal wire hash for boundary comparisons. The
@@ -458,7 +466,8 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
         return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem, fullIds) };
     }
-    const hashes = args.messages.map(alignHash);
+    const pairs = args.messages.map(wireHashPair);
+    const hashes = pairs.map((p) => p.align);
     // Prefix alignment: everything previously acked must still lead the list
     // (cache_control decorations ignored — they ride as retouch below).
     const n = Math.min(state.sent.length, hashes.length);
@@ -473,7 +482,7 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
     const retouch: { index: number; message: IncrementalWireMessage }[] = [];
     if (state.sentRaw !== undefined && state.sentRaw.length === state.sent.length) {
         for (let i = 0; i < state.sent.length; i++) {
-            if (state.sentRaw[i] !== wireHash(args.messages[i])) retouch.push({ index: i, message: args.messages[i] });
+            if (state.sentRaw[i] !== pairs[i]!.raw) retouch.push({ index: i, message: args.messages[i] });
         }
     } else {
         for (let i = 0; i < state.sent.length; i++) retouch.push({ index: i, message: args.messages[i] });
@@ -506,10 +515,11 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
  * rejection circuit — the conversation is healthy again. */
 export function noteIncrementalAck(conversationId: string, appliedSeq: number, messages: IncrementalWireMessage[], system: unknown): void {
     rejectionCircuit.delete(conversationId);
+    const pairs = messages.map(wireHashPair);
     convs.set(conversationId, {
         sinceSeq: appliedSeq,
-        sent: messages.map(alignHash),
-        sentRaw: messages.map(wireHash),
+        sent: pairs.map((p) => p.align),
+        sentRaw: pairs.map((p) => p.raw),
         systemJson: system === undefined ? undefined : JSON.stringify(system),
         dead: false,
     });

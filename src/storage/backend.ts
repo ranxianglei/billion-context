@@ -33,7 +33,6 @@ export type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
     L1WorldRow,
     SnapRow,
     SnapLogEntry,
@@ -51,7 +50,6 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
     L1WorldRow,
     SnapRow,
     SnapLogEntry,
@@ -70,7 +68,7 @@ export interface StorageBackend {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
-        opts?: { completeLog?: boolean },
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): Promise<boolean>;
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null>;
     sessionUpdatedAt(sessionId: string): Promise<number | null>;
@@ -94,9 +92,6 @@ export interface StorageBackend {
      *  `includeRetired`. Every row carries `retiredAt` (null = live). */
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]>;
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
-    /** #4739: the viewFor bundle from ONE consistent read snapshot (messages
-     *  fetched only at the tail/pluginSnapshot pointer seqs). */
-    sessionViewRows(sessionId: string): Promise<SessionViewRows>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
     /** All reads, including CAS hydration, use one short read-only snapshot. */
@@ -199,7 +194,7 @@ export class SqliteBackend implements StorageBackend {
         return new SqliteBackend(UnifiedStore.open(indexPath, engine));
     }
 
-    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean }): Promise<boolean> {
+    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean; envelopeImport?: boolean }): Promise<boolean> {
         return Promise.resolve(this.store.ingestSession(input, delta, opts));
     }
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
@@ -240,9 +235,6 @@ export class SqliteBackend implements StorageBackend {
     }
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId, opts));
-    }
-    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
-        return Promise.resolve(this.store.sessionViewRows(sessionId));
     }
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
         return Promise.resolve(this.store.getDeadRefs(sessionId));

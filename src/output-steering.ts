@@ -211,8 +211,10 @@ function normalizeGoogle(contents: unknown): StructuralMessage[] {
     for (const raw of parts) {
         const p = asRecord(raw);
         if (!p) return [{ role: "user", text: "" }];
-        if (p.functionResponse) blocks.push({ kind: "tool_result" });
-        else if (typeof p.text === "string") {
+        if (p.functionResponse) {
+            const response = asRecord(asRecord(p.functionResponse)?.response);
+            blocks.push({ kind: "tool_result", isError: response !== null && Object.hasOwn(response, "error") });
+        } else if (typeof p.text === "string") {
             if (p.text.trim() !== "") blocks.push({ kind: "text" });
         } else if (p.inlineData || p.fileData || p.videoMetadata) blocks.push({ kind: "image" });
         else return [{ role: "user", text: "" }];

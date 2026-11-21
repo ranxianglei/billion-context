@@ -364,10 +364,15 @@ function rebuildSystemMessage(
 }
 
 // #4292 hardening, kept for #4457's backstop: a directive-only system
-// (empty content + output_config) is accepted at ANY position by
-// Anthropic's mid-conversation-system rule, so it is never healed; demoting
-// it would mint an empty-content user message that 400s on its own
-// (mirrors the reporter's isAnthropicDirectiveOnlySystem).
+// (empty content + output_config) carries effort/tool-control semantics that
+// a user re-voice would destroy (demoting mints an empty-content user message
+// that 400s on its own). #7270: the "accepted at ANY position" assumption does
+// NOT hold on every upstream — a real Anthropic endpoint rejected
+// `system(content:[]+output_config) → user` adjacency with the same
+// 'must precede an assistant' 400 as content-bearing systems. healIllegalSystemPositions
+// therefore no longer skips these unconditionally: it moves a directive-only
+// system to the trailing run when its PRECEDE side is illegal, preserving the
+// directive semantics while landing it in a legal position.
 function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   return (
     e.role === "system" &&
@@ -400,11 +405,12 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
 // predecessor (array start) follows the existing contract and is untouched.
 // Demotion re-voices to user with tool_addition/tool_removal blocks stripped
 // first (WC-022 forbids them outside system) and drops the entry when
-// nothing remains; a
-// directive-only system (empty content + output_config) is accepted at ANY
-// position, so it is never healed (and never legitimizes a neighbour). Fresh
-// objects only — sidecars stay intact for future verbatim emission once
-// re-legitimized.
+// nothing remains. A directive-only system (empty content + output_config) is
+// never re-voiced — a demotion would mint an empty-content user message that
+// 400s on its own — but per #7270 it is no longer exempt at illegal PRECEDE
+// positions: it is moved to the trailing run there instead (see
+// isDirectiveOnlySystem above). Fresh objects only — sidecars stay intact for
+// future verbatim emission once re-legitimized.
 function isToolUpdateBlock(b: { type?: unknown }): boolean {
   return b.type === "tool_addition" || b.type === "tool_removal";
 }
@@ -430,37 +436,41 @@ function legitimatesFollowSide(m: AnthropicWireMessage | undefined): boolean {
 
 function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
   let prevNonSystem = -1;
+  // #7270: directive-only systems in an illegal PRECEDE position are moved to
+  // the trailing run (preserving effort/tool-control semantics) instead of
+  // being skipped unconditionally.
+  const movedDirectives: AnthropicWireMessage[] = [];
   for (let j = 0; j < out.length; j++) {
     const e = out[j];
     if (!e) continue;
     if (e.role !== "system") {
-      // prevNonSystem indexes an earlier slot only — splices below happen
-      // strictly after it, demotions keep length — so the index stays valid
-      // through the mutating pass.
       prevNonSystem = j;
       continue;
     }
-    if (isDirectiveOnlySystem(e)) continue;
+    if (isDirectiveOnlySystem(e)) {
+      let k = j + 1;
+      while (k < out.length && out[k]!.role === "system") k++;
+      const next = out[k];
+      const badPrecede = !!next && next.role !== "assistant";
+      if (badPrecede) {
+        out.splice(j, 1);
+        movedDirectives.push(e);
+        j--;
+      }
+      continue;
+    }
     let k = j + 1;
     while (k < out.length && out[k]!.role === "system") k++;
     const next = out[k];
     const badPrecede = !!next && next.role !== "assistant";
-    // #5438/follow side: the nearest non-system predecessor must be a user
-    // or a server-tool-result-terminated assistant. Out[prevNonSystem] is
-    // post-heal state by construction (left-to-right pass), which is exactly
-    // what the API will see.
     const badFollow = !legitimatesFollowSide(out[prevNonSystem]);
     if (!badPrecede && !badFollow) continue;
     if (typeof e.content === "string") {
-      // An empty string demoted to user would mint an empty-content user
-      // message, which 400s on its own — drop instead.
       if (e.content === "") {
         out.splice(j, 1);
         j--;
       } else {
         out[j] = { role: "user", content: e.content };
-        // The demoted entry is a user NOW — later run members are judged
-        // against post-heal state, exactly what the API will see.
         prevNonSystem = j;
       }
       continue;
@@ -475,6 +485,9 @@ function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
     }
     out[j] = { role: "user", content: kept };
     prevNonSystem = j;
+  }
+  for (const d of movedDirectives) {
+    out.push(d);
   }
 }
 

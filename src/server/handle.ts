@@ -53,9 +53,10 @@ function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
-import { executeThreadsReforge } from "./threads-lane.js";
+import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
+import { opencodeForkParent } from "../opencode-fork-lineage.js";
 import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
@@ -70,7 +71,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -323,6 +324,17 @@ function memProbe(debug: boolean, log: (level: string, msg: string) => void, ses
     log("debug", `[${sessionId}] mem-probe ${stage}: heap=${mi(mu.heapUsed)} external=${mi(mu.external)} rss=${mi(mu.rss)}${payloadBytes !== undefined ? ` payload=${payloadBytes}B` : ""}`);
 }
 
+// #6884: non-empty header presence, proto-agnostically over Node's header map
+// (string values, string[] tolerated for folded multi-values; anything else
+// counts as absent). Lane evidence for the wire-client sidecar clauses in
+// handleRequest — same trust tier as the verbatim session-id roster
+// (src/session-id.ts): the header is client-stamped, not bili-derived.
+function hasNonEmptyHeader(h: Record<string, unknown>, name: string): boolean {
+    const v = h[name];
+    if (typeof v === "string") return v.length > 0;
+    if (Array.isArray(v)) return v.some((x) => typeof x === "string" && x.length > 0);
+    return false;
+}
 async function handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -512,8 +524,10 @@ async function handleRequest(
                 // session). Any TEXT-dominated parseable body above the ingest
                 // cost band is already ≥ ~8M tokens — beyond every real model
                 // window — so refuse it HERE, after decode (which can balloon
-                // 10:1) but before the sweep that costs the seconds. 0 disables
-                // the cap (legacy parse-everything).
+                // 10:1) but before the sweep that costs the seconds. DISABLED
+                // by default for all lanes (#7426: on the re-send lanes the raw
+                // inbound byte count is not a valid "beyond model window"
+                // proxy); set a byte value to re-enable.
                 //
                 // Image-bearing bodies are exempt on EVERY lane: base64 pixels
                 // are excluded from the token meter by design ("images billed
@@ -695,6 +709,17 @@ async function handleRequest(
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
+    // Only Claude Code answers the decline by dropping threads. It defers MCP tools behind tool
+    // search, so its bili MCP registration (keyed by its session id) counts when the tools are off the wire.
+    const ccSessionId = req.headers["x-claude-code-session-id"];
+    const biliCompressesThis = typeof ccSessionId === "string" && (declaresMcpBiliToolsOnWire(parsed) || consumePluginRegisterFor(ccSessionId) !== undefined);
+    const declinedThreadsBeta = protocol === "anthropic" ? threadsBetaToDecline(parsed, req.headers["anthropic-beta"], biliCompressesThis) : undefined;
+    if (declinedThreadsBeta !== undefined) {
+        log("info", `[threads] declined ${declinedThreadsBeta} for a session bili compresses — the client retries without threads and sends full history (#2701)`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: `Unexpected value(s) \`${declinedThreadsBeta}\` for the \`anthropic-beta\` header. Please consult our documentation at docs.claude.com or try again without the header.` } }));
+        return;
+    }
     // #3129: CloudCode/Antigravity v1internal dialect — unwrap the outer envelope
     // so the pipeline sees a standard GoogleRequest, and decide identity. The
     // inner request.sessionId is a constant FNV-1a hash, so identity comes from
@@ -1089,7 +1114,7 @@ async function handleRequest(
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim. #1421: `chainSkip` is the
     // content-level twin of the same decision (verifiable checkpoint present).
-    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1250,8 +1275,78 @@ async function handleRequest(
         // the plugin only stamps the real value).
         const rawDeclaredPurpose = pluginPurposeHeader(req.headers);
         const declaredPurpose = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION ? undefined : rawDeclaredPurpose;
+        // #6884 (pi's leg of the #6880 declaration; cross-agent session-id
+        // audit in discussions/6884): the "conversation" sentinel means
+        // DIFFERENT things per client. dsh derives it ("dsh left
+        // GenerateOptions.purpose unset on this dispatch" — possibly a brand-
+        // new aux feature the KNOWN_AUXILIARY_PURPOSES documentation set does
+        // not know yet), so for dsh it stays ≡ absent: the body heuristics
+        // classify, byte-for-byte as before #6884. pi has NO auxiliary-call
+        // concept at all (no title-gen, no compaction summarizer, no
+        // auto-review; subagents/forks mint FRESH session ids, so their turns
+        // ride their own ids) — its sentinel is a FACT about the dispatch:
+        // "this is the session's main conversation turn". A declared pi main
+        // turn therefore rides the #1699 explicit-"main" intent rung inside
+        // isSideRequest: it outranks every body heuristic (the budget <= 200
+        // demotion, the single-shot shapes) instead of being demoted to the
+        // #388 side passthrough by a shape guess — a `pi -p` one-shot with a
+        // small maxTokens and no tools must enter the kernel pipeline.
+        const declaredPiMainTurn = rawDeclaredPurpose === PLUGIN_PURPOSE_CONVERSATION
+            && pluginAgentHeader(req.headers) === "pi";
+        // #6884 wire-client legs (the cross-agent session-identity audit;
+        // follow-on to #7077): every client on the verbatim roster
+        // (src/session-id.ts) mints ONE id per logical conversation and
+        // source review confirmed the lifecycles are healthy — but each fires
+        // auxiliary LLM calls (titles, compaction, suggestions, memory,
+        // naming) UNDER THE SAME id, and those shapes defeat isSideRequest,
+        // so they enter the main session's kernel pipeline as conversation
+        // turns. Each clause is gated on the client's OWN wire signal (its
+        // session header / its compaction header / its constant User-Agent) —
+        // the same trust tier as the roster itself; no clause identifies a
+        // client from body shape alone. Upstream evidence per client:
+        //  - grok-shell: main turns ALWAYS stamp x-grok-turn-idx
+        //    (turn.rs:3002-3003); every auxiliary path (/btw, compaction,
+        //    title refresh, recap, memory, ...) stamps x-grok-session-id
+        //    WITHOUT the turn index — grok's own test-support contract
+        //    (README:32): "a non empty x-grok-turn-idx makes it foreground,
+        //    else a non empty x-grok-req-id makes it auxiliary". One header
+        //    clause covers every present AND future auxiliary path.
+        //  - mcode: title-gen's entire tool surface is the single
+        //    submit_session_title tool; the prompt suggestion (default on,
+        //    every accepted answer) and the Goal evaluator are tool-less,
+        //    budget-less single user messages reusing the main turn's
+        //    headers (prompt-suggestion-service.ts:655-692).
+        //  - goose: every auxiliary (naming, compaction, tool-pair summaries,
+        //    labels, adversarial review, apps, summarize) is the dsh
+        //    single-shot shape — no tools + exactly one user + a system
+        //    carrier holding the context — so isDshSingleShotSidecar covers
+        //    it as-is; the lane evidence is the roster header
+        //    agent-session-id. Residual, accepted: the permission judge
+        //    carries one tool (#546 main rung) and a user who configures
+        //    zero tools loses the first turn only (#5687 class).
+        //  - CodeBuddy: the compaction request itself carries x-compaction
+        //    on the wire (identity-codebuddy.ts) — consume it. Deliberately
+        //    NOT x-context-compacted: that marks "context already compacted"
+        //    and appears on ordinary POST-compaction MAIN turns; consuming
+        //    it would demote the real mainline.
+        //  - opencode: the built-in title agent fires concurrently with the
+        //    first main turn of every root session, under the root's own id,
+        //    no tools, no budget, single user framed by a fixed template
+        //    (session/title.ts:37-41); the User-Agent (app.ts:22 constant
+        //    format) is the lane evidence and the template text the shape.
+        const grokAuxSidecar = hasNonEmptyHeader(req.headers, "x-grok-session-id")
+            && !hasNonEmptyHeader(req.headers, "x-grok-turn-idx");
+        const mcodeLane = hasNonEmptyHeader(req.headers, "x-mavis-session-id");
+        const mcodeTitleSidecar = mcodeLane && isMcodeTitleRequest(parsed);
+        const mcodeOneShotSidecar = mcodeLane && isMcodeOneShotAuxRequest(protocol, parsed);
+        const gooseSingleShotSidecar = hasNonEmptyHeader(req.headers, "agent-session-id")
+            && isDshSingleShotSidecar(protocol, parsed);
+        const codebuddyCompactionSidecar = hasNonEmptyHeader(req.headers, "x-compaction");
+        const opencodeTitleSidecar = isOpencodeTitleRequest(protocol, parsed)
+            && (typeof req.headers["user-agent"] === "string"
+                && req.headers["user-agent"].startsWith("opencode/"));
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
-            && (isSideRequest(parsed, sideAgent, declaredPurpose)
+            && (isSideRequest(parsed, declaredPiMainTurn ? "main" : sideAgent, declaredPurpose)
                 // #2503: dsh title sidecar — its output budget grew past the
                 // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
                 // recognize it by system text so it keeps the raw key instead
@@ -1280,6 +1375,14 @@ async function handleRequest(
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
                  || ccTitleSidecar
+                 // #6884: the wire-client auxiliary sidecars (clause evidence
+                 // above) — same raw-key/anchor discipline as ccTitleSidecar:
+                 // verbatim passthrough, kernel state untouched, no |sub: fork.
+                 || grokAuxSidecar
+                 || mcodeTitleSidecar || mcodeOneShotSidecar
+                 || gooseSingleShotSidecar
+                 || codebuddyCompactionSidecar
+                 || opencodeTitleSidecar
                  || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                      && req.headers["x-bili-ws-lane"] === undefined
                      && hasLeakedBiliToolsOnly(parsed)
@@ -2094,6 +2197,28 @@ async function handleRequest(
                     log("warn", `[${sessionId}] [resume-inheritance] transcript lineage lookup failed (${String(err)}); falling back to prefix match (#1486)`);
                 }
             }
+            // #7421: opencode records its fork parent in the local SQLite DB
+            // (session_v2.fork_session_id); the host plugin only learns it from
+            // session.created's parentID, which some builds do not emit on fork.
+            // Declaring the true parent here scopes the prefix match below to
+            // that chain (findResumeParentWithin) instead of the unscoped scan
+            // a mid-chain fork can't satisfy — the unscoped miss then weak-adopts
+            // a globally-closest chain, which can be an UNRELATED session
+            // (crosstalk). Loopback only (the DB is a local file); opencode lane
+            // only (ses_ ids are opencode-specific). A parent this proxy doesn't
+            // know still degrades safely: the scoped match misses, the weak-adopt
+            // stays scoped to it, and the derived-fork link below reports the miss.
+            if (!resume && derivedParent === undefined && pluginAgent === "opencode" && isLoopbackAddress(req.socket.remoteAddress)) {
+                try {
+                    const parent = opencodeForkParent(sessionId);
+                    if (parent !== undefined) {
+                        derivedParent = parent;
+                        log("info", `[${sessionId}] [resume-inheritance] opencode fork lineage from session_v2.fork_session_id -> ${parent} (#7421)`);
+                    }
+                } catch (err) {
+                    log("warn", `[${sessionId}] [resume-inheritance] opencode fork lineage lookup failed (${String(err)}); falling back to prefix match (#7421)`);
+                }
+            }
             if (!resume) {
                 const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
@@ -2256,7 +2381,13 @@ async function handleRequest(
         // derivedFromSessionId set and skips this link.
         if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined) {
             try {
-                const parentSession = resolveConversation(derivedParent)?.session;
+                // #7421: resolveConversation is memory-only (conversations map +
+                // peekSession), so after a proxy restart even a corrected parent
+                // id was dropped ("unknown to this proxy"). For plugin lanes the
+                // conversation id IS the session id (opencode ses_…), so a disk
+                // load by that id recovers the parent; a non-session id safely
+                // returns undefined and keeps the miss path below.
+                const parentSession = resolveConversation(derivedParent)?.session ?? getStore().loadSync(derivedParent, { protocol, upstreamOrigin }) ?? undefined;
                 if (parentSession) {
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
@@ -2672,7 +2803,8 @@ async function handleRequest(
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, declaredPiMainTurn ? "main" : requestAgent, declaredPurpose) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar
+            || grokAuxSidecar || mcodeTitleSidecar || mcodeOneShotSidecar || gooseSingleShotSidecar || codebuddyCompactionSidecar || opencodeTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2696,7 +2828,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: declaredPurpose !== undefined ? `declared purpose=${declaredPurpose} (#6880)` : serverToolUtility ? "server-tool utility call (#2500)" : structuredOutputUtility ? "structured-output utility call (#5073)" : audioOutputUtility ? "audio-output utility call (#6636)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : grokAuxSidecar ? "grok auxiliary sidecar (#6884)" : mcodeTitleSidecar ? "mcode title sidecar (#6884)" : mcodeOneShotSidecar ? "mcode one-shot aux sidecar (#6884)" : gooseSingleShotSidecar ? "goose single-shot sidecar (#6884)" : codebuddyCompactionSidecar ? "codebuddy compaction sidecar (#6884)" : opencodeTitleSidecar ? "opencode title-gen sidecar (#6884)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
@@ -3294,8 +3426,23 @@ async function handleRequest(
                     nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    postComPressTail: preparedCs?.postComPressTail === true,
                     modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
+                // #6522: an ACTUAL injection re-opens the uncovered-history note
+                // latch (postCompressTail, src/stream.ts). A fresh nudge is a new
+                // "context is big enough — compress while you are at it" moment,
+                // so the receipt may note the uncovered runs once more in this
+                // cycle; folds without a new injection stay silent (anti-nag,
+                // #6522 loop). Only the post-gate delivery fact "injected"
+                // resets — the same fact that mints the nudge credit above;
+                // "gated"/"vetoed"/"skipped" never reached the model and never
+                // re-open the note. The note itself only exists while
+                // compress.postComPressTail is on (#7318) — with it off this
+                // latch is inert.
+                if (prepared.nudgeOutcome === "injected") {
+                    session.uncoveredReceiptNoted = false;
+                }
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
@@ -3326,6 +3473,17 @@ async function handleRequest(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
+                        // #7376: this is the only egress decision point for the
+                        // main payload. preflightCompressIfNeeded (above) runs
+                        // to completion BEFORE forward() is ever reached (below,
+                        // only when this branch is NOT taken) — it is a local
+                        // token-estimate + fold computation with no upstream I/O
+                        // for the MAIN body, so a fail-fast verdict means the
+                        // main payload was never sent upstream. The only egress
+                        // during preflight is the separate, smaller
+                        // summarization call (external summary chain) — a
+                        // different request, not the fail-fasted payload. The
+                        // "NOT forwarded" wording is therefore always true.
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
