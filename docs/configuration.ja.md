@@ -2350,7 +2350,7 @@ export ANTHROPIC_VERTEX_BASE_URL="http://localhost:8787/bili/anthropic/https://a
 
 このレーンでは認証は変更されない: Claude Code は独自の ADC アクセストークンを発行し、bili はそれのために認証を発行しない。`bili claude` は上記すべてを自動的に実行する — `ANTHROPIC_VERTEX_BASE_URL` を同じルーティング形式に設定し、プレーンキーはそのまま残す（Vertex 下では無効なので、プロバイダーがオフに切り替わっても 1 回の起動で動作する）。
 
-> **Auto-compact の整合性（手動モードのみ）.** `bili claude` ランチャーは、モデルに対する bili の有効ウィンドウに `CLAUDE_CODE_AUTO_COMPACT_WINDOW` を自動的に設定するため、claude 自身の auto-compact しきい値が bili の圧縮バジェットと一致する。手動 `/bili/` モードではこれを手動で行う必要がある — さもないと、claude は bili のウィンドウと一致しないしきい値で独自のローカル auto-compact（「会話を要約する」ターン）を実行する可能性がある。**claude が auto-compact するたびに、bili は会話を新しい derived-persona レーンに fork し、accumulated な圧縮状態（fold ブロック、使用量ベースライン）をすべて失う — 新しいレーンはゼロから始まり、次の圧縮まで再構築が必要になる。** これを避けるには、claude の auto-compact を無効にする（`DISABLE_AUTO_COMPACT=1`）、または `CLAUDE_CODE_AUTO_COMPACT_WINDOW` を bili のウィンドウより大きな値に設定する（モデルが認識するウィンドウが許可する場合）ことで、bili が先に圧縮するようにする。ベースラインとして、モデルに対する bili の有効ウィンドウに設定すること:
+> **Auto-compact の整合性（手動モードのみ）.** `bili claude` ランチャーは、モデルに対する bili の有効ウィンドウに `CLAUDE_CODE_AUTO_COMPACT_WINDOW` を自動的に設定するため、claude 自身の auto-compact しきい値が bili の圧縮バジェットと一致する。手動 `/bili/` モードではこれを手動で行う必要がある — さもないと、claude は bili のウィンドウと一致しないしきい値で独自のローカル auto-compact（「会話を要約する」ターン）を実行する可能性がある。**claude が auto-compact するたびに、bili は同じレーンに再アンカーし、accumulated な圧縮状態（fold ブロック、使用量ベースライン）を保持する — 新しいゼロ状態レーンに fork しない。** 状態は安全だが、しきい値が一致しない auto-compact は依然としてノイズが多い（claude が自分のスケジュールで圧縮し、bili がその後で再度圧縮する可能性がある）。静かに保つには、claude の auto-compact を無効にする（`DISABLE_AUTO_COMPACT=1`）、または `CLAUDE_CODE_AUTO_COMPACT_WINDOW` を bili のウィンドウより大きな値に設定する（モデルが認識するウィンドウが許可する場合）ことで、bili が先に圧縮するようにする。ベースラインとして、モデルに対する bili の有効ウィンドウに設定すること:
 >
 > ```bash
 > export CLAUDE_CODE_AUTO_COMPACT_WINDOW=<bili effective window in tokens>
