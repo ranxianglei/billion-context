@@ -3,7 +3,7 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
+import { COMPRESS_LOOP_KEY, FAIL_STREAK_KEY, type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { recordCompressCommit } from "./context-analysis.js";
@@ -178,8 +178,9 @@ function reversedRanges(ranges: ParsedRange[]): ParsedRange[] {
 // call 7x over ~13 min while usage climbed 76%→89%). Track recent failed
 // specs per session and escalate on repeat instead of echoing the plain gate
 // error again. Stored on metadata (persisted) so the streak survives LRU
-// eviction/reload; stale keys after a ref reset are harmless (no match).
-const FAIL_STREAK_KEY = "compressFailKeys";
+// eviction/reload; stale keys after a ref reset are harmless (no match). The
+// key NAME is defined in session.ts (#5984) so the rebase reset can clear it
+// too — imported above; only the cap is stream-local.
 const FAIL_STREAK_CAP = 5;
 function normalizedSpecKey(ranges: ParsedRange[]): string {
     return ranges
@@ -227,10 +228,29 @@ function compressFailOccurrencesOf(session: Session, key: string): number {
 // design (config-surface discipline, cf. DEGENERATE_FOLD_COVERAGE). Disarm is
 // success or 10 min of quiet — refs keep advancing DURING the loop (each
 // failed round appends messages), so a frontier-based decay would disarm
-// mid-loop and be defeated the same way.
-const COMPRESS_LOOP_KEY = "compressFailStreak";
+// mid-loop and be defeated the same way. The key NAME is defined in session.ts
+// (#5984) so the rebase reset can clear it too — imported above; threshold and
+// decay are stream-local.
 const COMPRESS_LOOP_THRESHOLD = 3;
 const COMPRESS_LOOP_DECAY_MS = 10 * 60 * 1000;
+
+// #5984: how long after a native-compaction rebase a stale-ref compress failure
+// is attributed to the proxy (its own rebase killed every pre-rebase ref the
+// model still carries in its persisted history) rather than to the model. While
+// the session sits inside this window, a stale-ref failure does NOT advance the
+// model-failure breaker — otherwise the inevitable re-anchor round-trips arm a
+// hard-stop that then scrubs the very acp_status recovery that would let the
+// model out. Hardcoded by design like COMPRESS_LOOP_* (config-surface
+// discipline); generous enough for a slow model working through stale history,
+// bounded so a genuine post-rebase loop still arms once the grace elapses.
+const REBASE_STALE_GRACE_MS = 30 * 60 * 1000;
+function withinRebaseGrace(session: Session): boolean {
+    // nativeCompactionAt is set ONLY by resetSessionCompression (which runs in
+    // reconcileNativeCompactionBoundary), so a number here is a reliable
+    // "recently rebased" marker — no other path writes it.
+    const at = session.metadata.nativeCompactionAt;
+    return typeof at === "number" && Date.now() - at <= REBASE_STALE_GRACE_MS;
+}
 
 type CompressLoopStreak = { n: number; lastAt: number; cause?: string };
 
@@ -303,20 +323,38 @@ const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Re
  *  it: successful calls always go through, and one success clears the streak
  *  (clearCompressLoopStreak). The pause paragraph branches on the failure
  *  cause (#2432): substrate-destruction gets the single-recovery-step
- *  wording, everything else keeps the verbatim loop-noise paragraph. */
-function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
+ *  wording, everything else keeps the verbatim loop-noise paragraph.
+ *  #5984: a stale-ref failure inside the post-rebase grace window is
+ *  proxy-caused (bili itself rebased, killing the model's retained refs) and is
+ *  NOT counted against the model breaker — it returns "" so the non-armed
+ *  recovery hints (rebaseNote + currentRefsSnapshot + acp_status guidance) stay
+ *  visible until one success clears everything. Exported for direct testing. */
+export function noteCompressLoopFailure(ctx: RewriteCtx, specLabel: string, errs?: string, forcedCause?: string): string {
     const now = Date.now();
+    // #2432: derive the cause FIRST so the #5984 rebase-grace exemption below
+    // can branch on it. A cause only ever moves forward: an unknown-cause
+    // failure keeps the last known verdict rather than erasing it. #3126:
+    // host-side gates that know their own verdict before the kernel runs pass
+    // it as forcedCause — deriving it from kernel error text would misattribute
+    // a gate refusal to content.
+    const freshCause = forcedCause ?? (errs !== undefined ? compressFailureCause(errs, ctx.session) : "");
+    // #5984: a native-compaction rebase invalidates every pre-rebase ref the
+    // model still carries in its own persisted history, so the staleness is the
+    // proxy's own doing, not the model's. While the session sits in the
+    // post-rebase grace window, do NOT advance the model-failure breaker for it:
+    // returning "" leaves the non-armed hint cluster (rebaseNote +
+    // currentRefsSnapshot + the kernel's acp_status guidance) visible until one
+    // success clears everything. acp_status independently surfaces the rebase
+    // via nativeCompactionBoundary, so it does not depend on this streak to know
+    // the refs changed. Non-stale causes (parse / covered / content-changed) are
+    // unaffected and still count even right after a rebase.
+    if (freshCause.startsWith("stale-ref") && withinRebaseGrace(ctx.session)) {
+        ctx.log(`[info: compress-loop] stale-ref failure within ${REBASE_STALE_GRACE_MS / 60000} min of a native-compaction rebase — counted as proxy-caused, model breaker not advanced`);
+        return "";
+    }
     let streak = readCompressLoopStreak(ctx.session);
     if (streak && now - streak.lastAt > COMPRESS_LOOP_DECAY_MS) streak = undefined;
     const n = (streak?.n ?? 0) + 1;
-    // #2432: persist the failure cause on the streak so surfaces OUTSIDE the
-    // receipt (acp_status) can react to a substrate/stale-ref verdict at n=1
-    // instead of waiting for the third failure to arm the breaker. A cause
-    // only ever moves forward: an unknown-cause failure keeps the last known
-    // verdict rather than erasing it. #3126: host-side gates that know their
-    // own verdict before the kernel runs pass it as forcedCause — deriving it
-    // from kernel error text would misattribute a gate refusal to content.
-    const freshCause = forcedCause ?? (errs !== undefined ? compressFailureCause(errs, ctx.session) : "");
     const cause = freshCause !== "" ? freshCause : streak?.cause;
     writeCompressLoopStreak(ctx.session, { n, lastAt: now, ...(cause !== undefined ? { cause } : {}) });
     if (n < COMPRESS_LOOP_THRESHOLD) return "";
