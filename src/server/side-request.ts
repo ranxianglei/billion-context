@@ -823,20 +823,21 @@ function noCeilingWarnText(sessionId: string, model: string, from: number, to: n
     return `[${sessionId}] output-budget restore has NO known output ceiling for model=${model} (raised ${from} -> ${to}) — the target was the client's own raw-history estimate, which decays unbounded; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${model}".output) or have the client report it to floor the restore higher (#1840/#3071)`;
 }
 
-// #3438: one-shot per SESSION+MODEL warn for the UNRESCUABLE dsh-lane mid-band —
-// a tool-carrying budget above the <=200 starve gate with NO known output ceiling
-// cannot be told apart from a deliberate cap, so it forwards verbatim; this warn
-// gives the previously silent high-water branch observability without spamming.
-const warnedDshMidBandNoCeiling = new Set<string>();
-function noteDshMidBandNoCeilingWarning(sessionId: string, model: string): boolean {
+// #3438/#6955: one-shot per SESSION+MODEL warn for the UNRESCUABLE mid-band on a
+// collapse-rescue lane — a tool-carrying budget above the <=200 starve gate with
+// NO known output ceiling cannot be told apart from a deliberate cap, so it
+// forwards verbatim; this warn gives the previously silent high-water branch
+// observability without spamming.
+const warnedMidBandNoCeiling = new Set<string>();
+function noteMidBandNoCeilingWarning(sessionId: string, model: string): boolean {
     const key = `${sessionId}|${model}`;
-    if (warnedDshMidBandNoCeiling.has(key)) return false;
-    if (warnedDshMidBandNoCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedDshMidBandNoCeiling.clear();
-    warnedDshMidBandNoCeiling.add(key);
+    if (warnedMidBandNoCeiling.has(key)) return false;
+    if (warnedMidBandNoCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedMidBandNoCeiling.clear();
+    warnedMidBandNoCeiling.add(key);
     return true;
 }
-export function _resetDshMidBandWarningsForTest(): void {
-    warnedDshMidBandNoCeiling.clear();
+export function _resetMidBandWarningsForTest(): void {
+    warnedMidBandNoCeiling.clear();
 }
 
 // #2904: the no-ceiling degraded state surfaced by the /acp panel, the
@@ -884,9 +885,12 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  #3128). A non-starved value is always trusted and recorded verbatim as the
  *  high-water. The no-ceiling condition warns once per SESSION+model (the
  *  degradation is session-scoped).
- *  #3438: on lanes whose host stamps the model-declared maxTokens onto every
- *  main turn by contract (`dshLane` — the dsh host's pi-ai buildBaseOptions
- *  default), a tool-carrying budget BELOW the known ceiling is a raw-history
+ *  #3438/#6955: on collapse-rescue lanes (`collapseRescueLane` — hosts whose
+ *  pi-ai derives the main-turn budget from the model declaration rather than
+ *  user intent: the dsh host's buildBaseOptions default, and the pi plugin
+ *  host's clampMaxTokensToContext, which stamps the model's maxTokens in the
+ *  healthy state and only drops below it when the raw history nears the
+ *  window), a tool-carrying budget BELOW the known ceiling is a raw-history
  *  collapse, not intent: the client's estimator sees zero real usage on
  *  replayed history and falls back to chars/4 over the unfolded history, which
  *  shrinks toward zero as the raw history approaches the window. Such mid-band
@@ -895,15 +899,15 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  (they are collapse evidence, not proven health). With NO known ceiling the
  *  lane cannot judge collapse from intent: the value forwards verbatim but
  *  warns once per SESSION+model so the operator can declare the model's output
- *  cap to arm the rescue. Non-dsh lanes keep the old behavior byte-exact — a
- *  deliberately small budget elsewhere is intent, not collapse. */
+ *  cap to arm the rescue. Non-rescue lanes keep the old behavior byte-exact —
+ *  a deliberately small budget elsewhere is intent, not collapse. */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
     outputCeiling?: number,
-    /** #3438: true when this lane's host stamps the model-declared maxTokens onto every main turn by contract (dsh/pi-ai buildBaseOptions default) — see the doc above. */
-    dshLane?: boolean,
+    /** #3438/#6955: true when this lane's host derives the main-turn budget from the model declaration (dsh/pi plugin pi-ai) — a below-ceiling tool-carrying budget is a collapse. See the doc above. */
+    collapseRescueLane?: boolean,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -914,20 +918,21 @@ export function restoreOutputBudget(
     // A usable ceiling is known from some source (runtime-info / launcher /
     // configured route / registry); a value at/below the side threshold is not usable.
     const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
-    // #3438: on the dsh lane a below-ceiling tool-carrying budget IS the collapse
-    // signature (see the doc above) — it must not pass through as "healthy", and
-    // it must not seed the high-water as if it were proven health.
-    const collapsed = dshLane === true && ceiling !== undefined && value < ceiling;
+    // #3438/#6955: on a collapse-rescue lane a below-ceiling tool-carrying budget
+    // IS the collapse signature (see the doc above) — it must not pass through as
+    // "healthy", and it must not seed the high-water as if it were proven health.
+    const collapsed = collapseRescueLane === true && ceiling !== undefined && value < ceiling;
     if (value > SIDE_REQUEST_MAX_TOKENS && !collapsed) {
         session.metadata.outputBudgetHighWater = value;
         // #2904: a healthy (non-starved) budget means the client's own estimate
         // recovered — the active no-ceiling pin for THIS model is gone, so drop
         // its marker (other models' markers are untouched).
         clearNoCeilingDegraded(session, modelName);
-        // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
-        // collapse from intent here, so forward verbatim but surface the gap once.
-        if (dshLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
-            log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
+        // #3438/#6955: collapse-rescue-lane mid-band with NO known ceiling — bili
+        // cannot judge collapse from intent here, so forward verbatim but surface
+        // the gap once.
+        if (collapseRescueLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteMidBandNoCeilingWarning(session.id, modelName)) {
+            log("warn", `[${session.id}] main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438/#6955)`);
         }
         return;
     }
@@ -979,10 +984,10 @@ export function restoreOutputBudget(
             : (target === highWater
                 ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
                 : "; no known output ceiling — floored to the absolute capability minimum (#3071)");
-        // #3438: the <=200 starve keeps its original wording; a mid-band
+        // #3438/#6955: the <=200 starve keeps its original wording; a mid-band
         // collapse names itself so the incident log distinguishes the two entries.
         const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
-            ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
+            ? "#3438/#6955: mid-band collapse above the <=200 starve gate"
             : "#546: client shrank it from its raw-history estimate";
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
     }
