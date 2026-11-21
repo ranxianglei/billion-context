@@ -57,7 +57,7 @@ function startHarness(scripts: string[][]): Promise<Harness> {
             upstream: "http://127.0.0.1",
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
             modelContextLimit: 400_000,
-            kernelConfig: defaultConfig(400_000),
+            kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
             compress: { injectTool: true, injectNudge: true },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",

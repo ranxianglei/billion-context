@@ -151,7 +151,7 @@ test("#2733: chain re-folds keep the first history item byte-stable (direct-rang
             upstream: "http://127.0.0.1",
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 200_000 } } } },
             modelContextLimit: 200_000,
-            kernelConfig: defaultConfig(200_000),
+            kernelConfig: { ...defaultConfig(200_000), minFoldBenefitTokens: 0 },
             compress: { injectTool: true, injectNudge: true },
             promptCache: { routing: "auto" },
             sessionHeader: "x-acp-session",

@@ -59,7 +59,7 @@ type FoldResult = {
 function fold(): FoldResult {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 },
         200_000,
         { ccr: { enabled: false, minToolTokens: 50 } },
     ) as Config;

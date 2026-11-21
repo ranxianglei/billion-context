@@ -237,11 +237,11 @@ function proxyOptions(upstreamPort: number): ProxyOptions {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gemini-test": { context: 1_000_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, {
+        kernelConfig: { ...defaultConfig(1_000_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 800,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
-        }),
+        }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

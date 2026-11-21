@@ -85,7 +85,7 @@ async function startRig(): Promise<Rig> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
         modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000),
+        kernelConfig: { ...defaultConfig(200_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

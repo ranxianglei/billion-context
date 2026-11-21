@@ -152,7 +152,7 @@ async function withProxy(upstreamHandler: (req: http.IncomingMessage, res: http.
             [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-drift-e2e": { context: 400_000 } } },
         },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

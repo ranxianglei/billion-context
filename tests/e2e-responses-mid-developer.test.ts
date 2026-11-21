@@ -179,11 +179,11 @@ async function withHarness(handler: (raw: string, bodies: string[]) => string, f
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000, {
+        kernelConfig: { ...defaultConfig(400_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 800,
             compress: { minCompressRange: 1, maxSummaryLength: 20000, minSummaryLength: 1 },
-        }),
+        }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

@@ -45,7 +45,7 @@ type FoldResult = {
 function fold(opts: { ccr: boolean; plugin?: string }): FoldResult {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 },
         200_000,
         { ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
     ) as Config;
@@ -163,7 +163,7 @@ function readManifest(config: Config): ManifestBody {
 }
 
 test("#1712: manifest (CCR off by default) never advertises decompress range args on any wire", () => {
-    const m = readManifest(defaultConfig(200_000));
+    const m = readManifest({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 });
     for (const wire of ["anthropic", "openai", "responses"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.ok(props, `${wire}: decompress present`);
@@ -174,7 +174,7 @@ test("#1712: manifest (CCR off by default) never advertises decompress range arg
 });
 
 test("#1712: manifest with base CCR on advertises range args on anthropic/openai only — responses never arms CCR in plugin mode (#1271)", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
     for (const wire of ["anthropic", "openai"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.equal(props?.startId?.type, "string", `${wire}: startId advertised with base CCR on`);

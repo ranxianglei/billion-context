@@ -46,7 +46,7 @@ function makeCtx(id: string, messages: CoreMessage[]): {
 } {
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
         messages,
         session: makeSession(id),
         log: () => {},
@@ -385,14 +385,14 @@ test("#408/#660: prepareOpenai — post-fold provider usage reaches the host ver
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "gpt-test": { context: 1_000_000 } }, compressProtocol: "marker" } } as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, {
+        kernelConfig: { ...defaultConfig(1_000_000, {
             // preserveRecentTokens defaults to 5000 — the whole small fixture
             // conversation would sit inside the token window and every range
             // would be protected. Disable it; the last-5-messages window stays.
             preserveRecentMessages: 5,
             preserveRecentTokens: 0,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
-        }),
+        }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -494,7 +494,7 @@ test("#590: pi plugin mode reports folded usage verbatim", async () => {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "claude-test": { context: 400_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -621,7 +621,7 @@ test("#623: omp plugin mode reports folded usage verbatim", async () => {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "claude-test": { context: 400_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -792,7 +792,7 @@ async function withZCodeHarness(fn: (h: { proxy: http.Server; upstream: http.Ser
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 100_000 } } } },
         modelContextLimit: 100_000,
-        kernelConfig: defaultConfig(100_000),
+        kernelConfig: { ...defaultConfig(100_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -940,7 +940,7 @@ async function withCodexHarness(fn: (h: { proxy: http.Server; upstream: http.Ser
         // carrying the injected compress prompt + ACP tools); setup must not fail-fast.
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
         modelContextLimit: 15_000,
-        kernelConfig: defaultConfig(15_000),
+        kernelConfig: { ...defaultConfig(15_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

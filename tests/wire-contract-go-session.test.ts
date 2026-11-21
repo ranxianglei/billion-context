@@ -99,7 +99,7 @@ test("WC-016: a non-Go target keeps the existing no-session-header invariant", a
 // A resolved-config rail carrying a single OpenCode Go target (expanded form, inline key).
 function goContext(sessionId: string): RewriteCtx {
     const core = createCore();
-    const config = defaultConfig(400_000) as Config & { externalSummary?: unknown };
+    const config = { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as Config & { externalSummary?: unknown };
     config.externalSummary = { enabled: true, targets: [{ name: "go", protocol: "openai", url: GO_URL, model: "deepseek-v4.1-flash", apiKey: "go-test-key" }] };
     config.preserveRecentMessages = 0;
     config.preserveRecentTokens = 0;

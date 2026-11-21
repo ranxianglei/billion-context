@@ -124,7 +124,7 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

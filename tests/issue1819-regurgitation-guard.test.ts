@@ -65,7 +65,7 @@ test("#1819 preflight: a summary that exceeds its range is rejected, never folde
     const regurgitated = "R".repeat(400_000);
     const attempted = await startSummaryServer(regurgitated);
     const session = getSession(`issue1819-${randomUUID()}`);
-    const config = defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }) as Config;
+    const config = { ...defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as Config;
     // Disable the length cap so ONLY the monotonicity guard can reject —
     // otherwise #861's cap would mask the regression.
     config.compress.maxSummaryLength = 0;
@@ -100,7 +100,7 @@ test("#1819 preflight: a genuinely shrinking summary still folds (no false rejec
     const compact = "SUMMARY: keep the task goal, exact acceptance criteria and next step; the repeated filler output is disposable.";
     const attempted = await startSummaryServer(compact);
     const session = getSession(`issue1819-${randomUUID()}`);
-    const config = defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }) as Config;
+    const config = { ...defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as Config;
     config.compress.maxSummaryLength = 0;
     const logs: Array<[string, string]> = [];
     const deps: PreflightDeps = {
@@ -128,7 +128,7 @@ test("#1819 preflight: a genuinely shrinking summary still folds (no false rejec
 // cache — instead of committing and appending a "[Net context change]" note.
 test("#2748 manual compress: an expanding fold is refused BEFORE commit (state + cache untouched)", () => {
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as Config;
     config.compress.maxSummaryLength = 0;
     const session = getSession(`issue2748-${randomUUID()}`);
     const msgs: CoreMessage[] = [];
@@ -173,7 +173,7 @@ test("#2748 manual compress: an expanding fold is refused BEFORE commit (state +
 
 test("#2748 mixed batch: a net-negative batch is refused wholesale; a net-positive batch applies", () => {
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as Config;
     config.compress.maxSummaryLength = 0;
     const session = getSession(`issue2748mix-${randomUUID()}`);
     const msgs: CoreMessage[] = [];

@@ -160,7 +160,7 @@ test("#2336 endpoint + web GET/PUT contract through a real server", async () => 
         proxyMode: "direct",
         proxySource: "direct",
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -255,7 +255,7 @@ const RAW = "Historical source for the inline-key dial test. ".repeat(120);
 
 function context(externalSummary: unknown): RewriteCtx {
     const core = createCore();
-    const config = defaultConfig(400_000) as Config & { externalSummary?: unknown };
+    const config = { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as Config & { externalSummary?: unknown };
     config.externalSummary = externalSummary;
     config.preserveRecentMessages = 0;
     config.preserveRecentTokens = 0;

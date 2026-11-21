@@ -106,7 +106,7 @@ async function rig(plugin = false) {
         port: 0, host: "127.0.0.1", upstream,
         routes: { [upstream]: { models: { "gpt-test": { context: 1_000_000 } }, compressProtocol: "marker" } },
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, { preserveRecentMessages: 2, preserveRecentTokens: 400, compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 } }),
+        kernelConfig: { ...defaultConfig(1_000_000, { preserveRecentMessages: 2, preserveRecentTokens: 400, compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 } }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false,
         compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null,

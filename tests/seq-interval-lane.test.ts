@@ -78,7 +78,7 @@ async function harness(): Promise<Harness> {
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: { ...defaultConfig(400000), minFoldBenefitTokens: 0 }, compress: { injectTool: true, injectNudge: false }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     if (!(proxy as unknown as { listening?: boolean }).listening) await once(proxy, "listening");
     const proxyUrl = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
     const turn = async (t: { sinceSeq: number; messages: unknown[]; msgIds?: string[]; resync?: boolean }) => {
