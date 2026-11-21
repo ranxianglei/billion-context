@@ -303,6 +303,7 @@ billion-context/
 │   ├── notices.ts                # Built-in notice registry: activity predicates + i18n key table (#5548)
 │   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
 │   ├── nudge-debug.ts            # Nudge-injection bus: mirrors the exact wire nudge text to the pi lane's debug terminal notify (transient, never in LLM context, never persisted)
+│   ├── opencode-fork-lineage.ts # Fork lineage from opencode's local SQLite DB (session_v2.fork_session_id) (#7421)
 │   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
 │   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
 │   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)

@@ -84,7 +84,17 @@ const ingest = (store: UnifiedStore, legacy: LegacySessionLike) => {
 };
 
 const loadView = (store: UnifiedStore, id: string) => {
-    const rows = store.readSnapshot(() => store.sessionViewRows(id));
+    const rows = store.readSnapshot(() => {
+        const session = store.getSessionRow(id);
+        if (session === null) return null;
+        return {
+            session,
+            messages: store.getMessages(id),
+            blocks: store.getBlocks(id),
+            refs: store.getRefs(id),
+            deadRefs: store.getDeadRefs(id),
+        };
+    });
     if (rows === null) throw new Error(`no rows for ${id}`);
     const builder = new LegacyViewBuilder(rows.session, rows.refs, rows.deadRefs);
     builder.addBlocks(rows.blocks);

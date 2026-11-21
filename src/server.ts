@@ -4284,7 +4284,7 @@ export async function preflightCompressIfNeeded(
             `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
             shrinkNote +
-            ` The over-window payload was NOT forwarded.`;
+            ` This request's over-window payload was NOT forwarded to the upstream.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };

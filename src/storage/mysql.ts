@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
+import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -53,7 +53,6 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
-    SessionViewRows,
 } from "./store.js";
 
 /** The mysql2/promise driver module, injected by openBackend() at open time.
@@ -1718,52 +1717,6 @@ export class MysqlBackend implements StorageBackend {
             ccrJson: nullableStr(r.ccr_json),
             lastIngestedSeq: nullableNum(r.last_ingested_seq),
             orphansJson: nullableStr(r.orphans_json),
-        };
-    }
-
-    /** #4739: bounded view bundle (messages only at tail/pluginSnapshot
-     *  pointer seqs). Per-statement reads like today's viewForAsync — no
-     *  cross-query snapshot — which is safe here because ingest writes each
-     *  session row and its pointed-at message rows in ONE transaction, so
-     *  every pointer ever read resolves to rows that already exist. The
-     *  sqlite lane carries the explicit read-transaction instead. */
-    async sessionViewRows(sessionId: string): Promise<SessionViewRows> {
-        const session = await this.getSessionRow(sessionId);
-        if (!session) return null;
-        const pointers = viewPointerSeqs(session.tailJson);
-        const messages: (MessageRow & { contentHash: string })[] = [];
-        const CHUNK = 500;
-        for (let i = 0; i < pointers.length; i += CHUNK) {
-            const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
-            if (chunk.length === 0) continue;
-            const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts, c.bytes AS content_bytes FROM messages
-                 LEFT JOIN content c ON c.hash = messages.content_hash
-                 WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
-                [sessionId, ...chunk],
-            )) as unknown as Row[][];
-            for (const r of rows) {
-                const contentHash = str(r.content_hash);
-                messages.push({
-                    seq: num(r.seq),
-                    msgId: str(r.msg_id),
-                    ref: nullableStr(r.ref),
-                    refNum: nullableNum(r.ref_num),
-                    role: str(r.role),
-                    kind: str(r.kind),
-                    contentHash,
-                    ts: nullableNum(r.ts),
-                    content: await this.hydrateMediaAsync(str(r.content_bytes), this.pool),
-                });
-            }
-        }
-        messages.sort((a, b) => a.seq - b.seq);
-        return {
-            session,
-            messages,
-            blocks: await this.getBlocks(sessionId),
-            deadRefs: await this.getDeadRefs(sessionId),
-            refs: await this.getRefs(sessionId),
         };
     }
 
