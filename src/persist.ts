@@ -708,6 +708,7 @@ export class SessionStore {
                 fileStorageWalJournalSizeLimit(),
                 fileStorageBackend(),
                 fileStorageMysqlDsn(),
+                fileStorageJsonWriter(),
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
             });
@@ -730,7 +731,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -4041,12 +4042,16 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileStorageJsonWriter()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):
             // record loudly once per window, keep serving from envelopes.
-            this.log("error", `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
+            // The 2026-11-21 proven-corruption refusal latches: no further
+            // in-process retries, the operator fixes the files by hand.
+            this.log("error", hadIntegrityQuickCheckFailure()
+                ? `[storage] sidecar reopen attempt REFUSED — the index is proven corrupt (${String(err)}); no further in-process retries (2026-11-21 refusal policy; operator hand-fix or BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1)`
+                : `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
             return;
         }
         if (this.shadow !== undefined) {

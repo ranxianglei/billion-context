@@ -62,7 +62,7 @@ interface EgressRecordSourceMsg {
 }
 import { rebuildOutboundFromLog, rebuildOutboundWithLadder } from "../storage/egress-serve.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
-import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, stampOnlyWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -876,6 +876,13 @@ export async function prepareOpenai(
         if (s0PinMode === "full" || (featureEnabled("pluginMsgIdIncremental") && s0PinMode !== null)) {
             wpResponseHeaders[MSGID_MODE_HEADER] = s0PinMode;
         }
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (bodyText !== undefined && pluginMode && !isTitleGen && !featureEnabled("pluginFullResendWatermark")) {
+        // #7367: flag off — the fastpath never evaluates, but the x-bili-pf-seq
+        // heartbeat still must flow or the client's watermark freezes and its
+        // tail-ids grow past the 16 KB header limit. Stamp-only: no seed, no
+        // saved state (the fastpath re-establishes both when it next runs).
+        wpResponseHeaders = stampOnlyWatermarkTurn(bodyText);
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);

@@ -58,7 +58,7 @@ export interface StorageBackend {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
-        opts?: { completeLog?: boolean },
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): Promise<boolean>;
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null>;
     sessionUpdatedAt(sessionId: string): Promise<number | null>;
@@ -171,7 +171,7 @@ export class SqliteBackend implements StorageBackend {
         return new SqliteBackend(UnifiedStore.open(indexPath, engine));
     }
 
-    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean }): Promise<boolean> {
+    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean; envelopeImport?: boolean }): Promise<boolean> {
         return Promise.resolve(this.store.ingestSession(input, delta, opts));
     }
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
