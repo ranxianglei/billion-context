@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { runSessionStartHook } from "../src/agent/shared.js";
+import { hookMainWithDeps } from "../src/claude-native-bootstrap.ts";
 
 const here = (p: string) => path.resolve(path.dirname(fileURLToPath(import.meta.url)), p);
 
@@ -45,6 +47,73 @@ describe("runSessionStartHook (#2943)", () => {
         } finally {
             clearInterval(leak);
         }
+    });
+});
+
+describe("claude bootstrap-hook entry contract (#2943)", () => {
+    it("normal path: drains stdin and never force-exits", async () => {
+        const prevExitCode = process.exitCode;
+        const calls: number[] = [];
+        const input = new PassThrough();
+        try {
+            hookMainWithDeps({
+                input,
+                runImpl: async () => {},
+                exit: (code) => { calls.push(code); },
+                backstopMs: 60,
+            });
+            input.write("{}");
+            input.end();
+            const deadline = Date.now() + 2_000;
+            while (!input.destroyed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+            assert.equal(input.destroyed, true, "stdin must be torn down before draining");
+            assert.deepEqual(calls, [], "process.exit must NOT be called on the normal path (libuv race)");
+            assert.equal(process.exitCode, 0, "exit code must stay 0 (fails open)");
+        } finally {
+            process.exitCode = prevExitCode;
+        }
+    });
+
+    it("leak path: unref'd backstop force-exits 0 when something holds the loop", async () => {
+        const calls: number[] = [];
+        const input = new PassThrough();
+        input.end();
+        const leak = setInterval(() => {}, 1000); // ref'd handle keeps the loop alive
+        try {
+            hookMainWithDeps({
+                input,
+                runImpl: async () => {},
+                exit: (code) => { calls.push(code); },
+                backstopMs: 40,
+            });
+            await new Promise((r) => setTimeout(r, 130)); // > backstop
+            assert.deepEqual(calls, [0], "backstop must force a clean exit(0) when the loop would otherwise stay up");
+        } finally {
+            clearInterval(leak);
+        }
+    });
+});
+
+describe("claude real entry contract (#2943)", () => {
+    it("real entry exits 0 promptly and does not hang", async () => {
+        const hookPath = here("../src/claude-native-bootstrap.ts");
+        const env = { ...process.env };
+        // BILLION_CONTEXT_PROXY -> planClaudeNativeBootstrap action "exit": earliest
+        // safe return, no proxy/config side effects (the entry gate is argv-based,
+        // so NODE_TEST_CONTEXT needs no special handling here).
+        env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:1";
+        const child = spawn(process.execPath, ["--import", "tsx", hookPath], { env, stdio: ["pipe", "pipe", "pipe"] });
+        const stderr: string[] = [];
+        child.stderr.on("data", (d) => stderr.push(String(d)));
+        child.stdin.write(JSON.stringify({ hook_event_name: "SessionStart", session_id: "t" }));
+        child.stdin.end();
+        const kill = setTimeout(() => child.kill("SIGKILL"), 8000); // bounded: never hang the suite
+        const code = await new Promise<number | null>((resolve) => {
+            child.on("close", (c) => resolve(c));
+            child.on("error", () => resolve(null));
+        });
+        clearTimeout(kill);
+        assert.equal(code, 0, `claude hook must exit 0 (got ${code}); stderr=${stderr.join("")}`);
     });
 });
 
