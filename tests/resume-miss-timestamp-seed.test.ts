@@ -118,6 +118,9 @@ test("applyForkAdoption carries the timestamp ledger into the adopted child (#56
             messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
         },
         blockContents: new Map(),
+        // Session metadata is a required field (persist assigns it on every load);
+        // applyForkAdoption writes the #5519 ladder-init flag into it.
+        metadata: {},
     } as unknown as Session;
     const plan = planForkAdoption(parent, new Set(["r1"]), { seedAllRefs: true, includeBlocks: false });
     applyForkAdoption(child, plan, parent);
@@ -144,6 +147,9 @@ test("applyForkAdoption without a parent ledger leaves the child stamp-free (hon
             messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
         },
         blockContents: new Map(),
+        // Session metadata is a required field (persist assigns it on every load);
+        // applyForkAdoption writes the #5519 ladder-init flag into it.
+        metadata: {},
     } as unknown as Session;
     const plan = planForkAdoption(parent, new Set(["p1", "r1"]), { seedAllRefs: true, includeBlocks: false });
     applyForkAdoption(child, plan, parent);
@@ -324,6 +330,9 @@ function weakFixtures() {
             messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
         },
         blockContents: new Map(),
+        // Session metadata is a required field (persist assigns it on every load);
+        // applyForkAdoption writes the #5519 ladder-init flag into it.
+        metadata: {},
     } as unknown as Session;
     return { parsed, msgs, parent, child };
 }
