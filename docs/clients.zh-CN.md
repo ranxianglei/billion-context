@@ -119,11 +119,11 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 WorkBuddy Desktop 是 Electron 应用（`@genie/workbuddy-desktop`），内嵌一个 CodeBuddy Code CLI 分支：所有 agent 会话 —— 桌面托管的 sidecar 与手动终端运行 —— 都是那个 CLI。应用用显式 env 白名单拉起 CLI，shell 里的 export 永远到不了它；但 CLI 会先从用户配置文件读 `env.CODEBUDDY_BASE_URL`（优先于 process.env）—— 这个文件就是接缝（#7456）：
 
-- **安装：** `bili plugin install wb` 写 `~/.workbuddy/settings.json`（配置目录可被 `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR` 覆盖）：把 `env.CODEBUDDY_BASE_URL` 包进常驻代理（`http://127.0.0.1:8787/bili/https://www.workbuddy.ai`），并置 `autoCompactEnabled: false`，关掉 WorkBuddy 自带自动压缩、让 bili 接管压缩（手动压缩仍可用）。外来的 `CODEBUDDY_BASE_URL` 只报告、不动；显式的 `autoCompactEnabled: true` 尊重；每次写入前把先前状态快照到 `.bili-bak`。钉死的 origin 上没有存活代理记录时，安装会响亮警告。
-- **卸载：** `bili plugin remove wb` 精确移除安装写入的内容，用户自己的键不动。
+- **安装：** `bili plugin install workbuddy` 写 `~/.workbuddy/settings.json`（配置目录可被 `WORKBUDDY_CONFIG_DIR` / `CODEBUDDY_CONFIG_DIR` 覆盖）：把 `env.CODEBUDDY_BASE_URL` 包进常驻代理（`http://127.0.0.1:8787/bili/https://www.workbuddy.ai`），并置 `autoCompactEnabled: false`，关掉 WorkBuddy 自带自动压缩、让 bili 接管压缩（手动压缩仍可用）。外来的 `CODEBUDDY_BASE_URL` 只报告、不动；显式的 `autoCompactEnabled: true` 尊重；每次写入前把先前状态快照到 `.bili-bak`。钉死的 origin 上没有存活代理记录时，安装会响亮警告。
+- **卸载：** `bili plugin remove workbuddy` 精确移除安装写入的内容，用户自己的键不动。
 - **纯 wire 模式（无宿主工具面）。** 压缩由代理承载（`acp_summary`），与所有 OpenAI-wire 车道一致。宿主 MCP 工具面在应用自身会话里*不可能*：桌面拉起的 CLI sidecar 带 `--strict-mcp-config`，屏蔽 user/project/local MCP 作用域；而全局打 plugin-mode 头恰恰会让那些会话降级（zcode degraded 模式，#4344）。仅终端的 MCP 面可作为 v2 后续（双工具面的权衡）。
-- **保持常驻 bili 运行**（面板或 `bili start`）：配置块钉死常驻 origin —— 没有按会话引导。bili 跑在自定义端口：安装前设 `BILI_WB_PROXY=http://127.0.0.1:<端口>`；`BILI_WB_UPSTREAM=https://<relay>` 可改包自建中转而不是 `https://www.workbuddy.ai`。
-- **状态：** `bili plugin list` / `bili doctor` 的 `wb` 行报告路由 origin 与自动压缩开关。
+- **保持常驻 bili 运行**（面板或 `bili start`）：配置块钉死常驻 origin —— 没有按会话引导。bili 跑在自定义端口：安装前设 `BILI_WORKBUDDY_PROXY=http://127.0.0.1:<端口>`；`BILI_WORKBUDDY_UPSTREAM=https://<relay>` 可改包自建中转而不是 `https://www.workbuddy.ai`。
+- **状态：** `bili plugin list` / `bili doctor` 的 `workbuddy` 行报告路由 origin 与自动压缩开关。
 - **已知局限：** 路由在 WorkBuddy 重启后生效（设置随 CLI 会话启动加载）。鉴权（SSO bearer + `X-User-Id`）由内嵌 CLI 添加，经 `/bili/` 转发原样透传；模型流量无 TLS 钉死或客户端签名，无需证书 MITM。应用登录/SSO 流量走浏览器，不碰 bili。
 
 ## Codex(OpenAI Codex CLI)

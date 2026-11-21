@@ -2209,7 +2209,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
 
         const rows = pluginStatusAll();
         assert.equal(rows.length, 10);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode", "wb"]);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode", "workbuddy"]);
     });
     rmrf(home);
 });
