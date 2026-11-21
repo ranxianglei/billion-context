@@ -197,7 +197,7 @@
 | `BILI_RELEASE_NOTES_CHECK` | 发布说明检查（#1870，默认 ON） |
 | `BILI_RELEASE_NOTES_URL` | 发布说明 URL 覆盖 |
 | `BILI_UPDATE_POLICY_URL` | update.policyUrl——更新策略 URL 覆盖（**测试专用**：生产固定官方 repo，#3619 安全边界） |
-| `BILI_UPDATE_STAGGER_MIN_MS` / `BILI_UPDATE_STAGGER_MAX_MS` | update.staggerMin/MaxDelayMs——升级错峰窗口（env 为裸 ms；file 层另收 "15m"/"1d12h" 人读时长；0/0 = 本机回立即升级旧行为；默认上限窗 48h，#3619） |
+| `BILI_UPDATE_STAGGER_MIN_MS` / `BILI_UPDATE_STAGGER_MAX_MS` | update.staggerMin/MaxDelayMs——升级错峰窗口（env 为裸 ms；file 层另收 "15m"/"1d12h" 人读时长；0/0 = 本机回立即升级旧行为；默认上限窗 7d，#3619） |
 
 ### 2.8 图像计费 / zcode 兼容
 
