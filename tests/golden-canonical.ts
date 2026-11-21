@@ -14,7 +14,13 @@ export function sortObjectKeys(v: unknown): unknown {
     if (Array.isArray(v)) return v.map(sortObjectKeys);
     if (v && typeof v === "object" && !(v instanceof Map) && !(v instanceof Set)) {
         const out: Record<string, unknown> = {};
-        for (const k of Object.keys(v as Record<string, unknown>).sort()) out[k] = sortObjectKeys((v as Record<string, unknown>)[k]);
+        for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+            const cv = sortObjectKeys((v as Record<string, unknown>)[k]);
+            // Same __proto__ accessor trap as canonicalize (#6222): define an
+            // own data property so retained __proto__ fields survive sorting.
+            if (k === "__proto__") Object.defineProperty(out, k, { value: cv, enumerable: true, writable: true, configurable: true });
+            else out[k] = cv;
+        }
         return out;
     }
     return v;
