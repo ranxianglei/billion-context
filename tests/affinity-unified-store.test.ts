@@ -18,6 +18,7 @@ process.env.XDG_CACHE_HOME = path.join(root, "cache");
 const { getStore, unifiedKvActive } = await import("../src/persist.js");
 const { scheduleAffinityPersist, flushPrefixAffinity, hydrateAffinityUnified, _resetAffinityPersistForTest } = await import("../src/affinity-persist.js");
 const { prefixAffinity } = await import("../src/prefix-affinity.js");
+const { journalDirOf } = await import("../src/snapshot-journal.js");
 
 test("environment resolves to a unified (non-legacy) store", () => {
     getStore();
@@ -67,16 +68,22 @@ test("post-hydration writes land in kv and outlive the legacy file", async () =>
     assert.equal(JSON.stringify(await getStore().getKvAsync("prefix-affinity", "v1")), before, "idempotent hydration");
 });
 
-test("pre-hydration mutations fall back to the file, which hydration then imports", async () => {
+test("pre-hydration mutations fall back to disk, which hydration then imports", async () => {
     _resetAffinityPersistForTest();
-    fs.rmSync(path.join(root, "state", "billion-context", "prefix-affinity.json"), { force: true });
+    const legacyFile = path.join(root, "state", "billion-context", "prefix-affinity.json");
+    fs.rmSync(legacyFile, { force: true });
+    fs.rmSync(journalDirOf(legacyFile), { recursive: true, force: true });
     const { prefixAffinity: pa } = await import("../src/prefix-affinity.js");
     pa.importSnapshot([{ sessionId: "early-chain", depth: 2, tailHash: "ee".repeat(8), itemHashes: ["ff".repeat(8)], lastSeen: Date.now() + 2 }]);
     scheduleAffinityPersist();
-    await new Promise((r) => setTimeout(r, 700)); // debounce window → file write (no kv yet)
-    assert.ok(fs.existsSync(path.join(root, "state", "billion-context", "prefix-affinity.json")), "pre-hydration window used the legacy file");
+    await new Promise((r) => setTimeout(r, 700)); // debounce window → journal publication (no kv yet)
+    // #5480: the pre-kv fallback publishes through the immutable journal — the
+    // legacy baseline is never rewritten, so durability here means a published
+    // leaf beside it, not the baseline's own existence.
+    const leaves = fs.existsSync(journalDirOf(legacyFile)) ? fs.readdirSync(journalDirOf(legacyFile)) : [];
+    assert.ok(leaves.length > 0, "pre-hydration window published a durable journal leaf");
 
     await hydrateAffinityUnified();
     const entries = await kvEntries();
-    assert.ok(entries.some((e) => e.sessionId === "early-chain"), "late import covered the early file write");
+    assert.ok(entries.some((e) => e.sessionId === "early-chain"), "late import covered the early journal write");
 });

@@ -25,7 +25,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import path from "node:path";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 
@@ -145,15 +145,32 @@ test("#3397 F1: snapshot hygiene — newer lastSeen wins per id; corrupt file de
     const fresh = { ...snapA.find((e) => e.id === id)!, kinds: ["user"], frags: [], lastSeen: Date.now() + 10_000 };
     assert.equal(applyOrderSnapshot([fresh]), 1, "a newer record replaces the stored skeleton");
 
-    // Corrupt file: hydrate must warn-and-continue, never throw.
+    // Corrupt legacy file: hydrate must warn-and-continue, never throw, and
+    // must NEVER delete or rewrite the baseline — a human may still need it.
     const file = path.join(stateDir(), "session-order.json");
+    const journalDir = `${file}.journal`;
     writeFileSync(file, "{ not json");
-    assert.doesNotThrow(() => hydrateOrderSkeletons(), "corrupt snapshot degrades to an empty import");
-    // A subsequent flush heals the file with valid content.
+    assert.doesNotThrow(() => hydrateOrderSkeletons(), "corrupt snapshot degrades to a warning, not a throw");
+    assert.equal(readFileSync(file, "utf8"), "{ not json", "the corrupt baseline is preserved byte-for-byte");
+
+    // A subsequent flush publishes into the journal and STILL leaves the
+    // corrupt baseline alone: the new data is readable, the damaged file is
+    // retained so its records are not silently discarded (#4125 conservation).
     flushOrderSkeletons();
-    const healed = JSON.parse(readFileSync(file, "utf8")) as { version: number; entries: unknown[] };
-    assert.equal(healed.version, 1, "flush rewrites a valid snapshot over the corrupt file");
-    assert.ok(Array.isArray(healed.entries));
+    assert.equal(readFileSync(file, "utf8"), "{ not json", "flush does not heal by overwriting — the baseline is immutable");
+    const published = existsSync(journalDir)
+        ? readdirSync(journalDir).filter((n) => n.startsWith("pub-")).sort()
+        : [];
+    assert.ok(published.length > 0, "flush published a valid journal output alongside the corrupt baseline");
+    const payload = path.join(journalDir, published[published.length - 1], "snapshot.json");
+    const written = JSON.parse(readFileSync(payload, "utf8")) as { version: number; entries: unknown[] };
+    assert.equal(written.version, 1, "the published output is a well-formed snapshot");
+    assert.ok(Array.isArray(written.entries) && written.entries.length > 0, "the new valid state is durable and readable");
+
+    // And that published state is what a restart actually sees.
+    resetSessionOrderForTest();
+    hydrateOrderSkeletons();
+    assert.ok(orderSnapshot().length > 0, "a restart reads the journal output even with a corrupt baseline present");
 });
 
 // ───────────────────── Part B: F2 — ref-fit routing e2e ─────────────────────
