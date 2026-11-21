@@ -199,7 +199,7 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
 
         assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
-        assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
+        assert.equal(parsed.error?.code, "context_too_large", "oversize 413 code unified to context_too_large (#7244); the measured gate answers before the relay");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
         assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
         assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");

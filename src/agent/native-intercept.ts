@@ -919,15 +919,16 @@ function emptySlotOversizeRefusal(
 /** #5405: same byte ceiling for an unattributed gate verdict. This is not a
  *  window-doom verdict (the 1M floor may still allow the body), so it needs
  *  its own marker and wording; retryable:true because attribution can return. */
-function unattributedByteOversizeRefusal(url: string): Response {
+function unattributedByteOversizeRefusal(url: string, bodyBytes: number, capBytes: number): Response {
+    const estTokens = Math.ceil(bodyBytes / 7.5);
     const message =
-        "billion-context refused this request locally: it is not attributed to a bili-managed session and its body is larger than the silent-direct byte ceiling, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
+        `billion-context refused this request locally: it is not attributed to a bili-managed session and its body is ~${bodyBytes} bytes (≥ ~${estTokens} tokens at ~7.5 bytes/token, #2122) vs the silent-direct byte ceiling ${capBytes} bytes, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). ` +
         "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
     }
-    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed_bytes", message, retryable: true } }), { status: 422, headers });
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "context_too_large", message, retryable: true } }), { status: 422, headers });
 }
 
 // ———— Oversized doom math (#2924/#4068, media-aware since #4111) ——————
@@ -1834,7 +1835,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
                     logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
-                    return unattributedByteOversizeRefusal(dispatchUrl);
+                    return unattributedByteOversizeRefusal(dispatchUrl, silentBytes, cap);
                 }
             }
             // #4566: clean the stale hops only when a real send follows — the

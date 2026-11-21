@@ -3448,13 +3448,13 @@ async function handleRequest(
                                 // (protocol error event for SSE, identical JSON body for
                                 // non-stream) instead of a status code we lost.
                                 if (prepared!.stream) {
-                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable, code: outcome.code }, (m) => log("warn", m));
                                 } else {
                                     try {
                                         res.end(JSON.stringify({
                                             error: {
                                                 type: "server_error",
-                                                code: "preflight_compress_failed",
+                                                code: outcome.code ?? "preflight_compress_failed",
                                                 message: outcome.message,
                                                 retryable: outcome.retryable,
                                             },
@@ -3472,7 +3472,7 @@ async function handleRequest(
                                 res.end(JSON.stringify({
                                     error: {
                                         type: "server_error",
-                                        code: "preflight_compress_failed",
+                                        code: outcome.code ?? "preflight_compress_failed",
                                         message: outcome.message,
                                         retryable: outcome.retryable,
                                     },
