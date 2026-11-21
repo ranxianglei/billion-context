@@ -60,6 +60,44 @@ test("an absent reasoning_content field is not invented", () => {
   assert.ok(!("reasoning_content" in wire[0]!), "no field, no echo");
 });
 
+// #7432: a provider that echoes the assistant thinking under `reasoning`
+// (Ollama Cloud) instead of `reasoning_content` — the read side accepts the
+// alias; the write side stays `reasoning_content` (an upstream that silently
+// drops a `reasoning` field would lose the CoT reuse).
+test("a `reasoning` alias is read and echoed back as reasoning_content", () => {
+  const wire = roundTrip([
+    { role: "assistant", content: "the answer", reasoning: "step 1... step 2..." },
+  ]);
+  const assistant = wire[0]!;
+  assert.equal(assistant.role, "assistant");
+  assert.strictEqual(
+    assistant.reasoning_content,
+    "step 1... step 2...",
+    "alias read, echoed as reasoning_content",
+  );
+  assert.ok(!("reasoning" in assistant), "no `reasoning` key on output");
+});
+
+test("a blank `reasoning` alias keeps the blank-echo contract", () => {
+  const wire = roundTrip([
+    { role: "assistant", content: ".", reasoning: "" },
+  ]);
+  const assistant = wire[0]!;
+  assert.ok("reasoning_content" in assistant, "blank alias re-emits the key");
+  assert.strictEqual(assistant.reasoning_content, "");
+});
+
+test("reasoning_content wins over the reasoning alias when both are present", () => {
+  const wire = roundTrip([
+    { role: "assistant", content: "a", reasoning_content: "from rc", reasoning: "from r" },
+  ]);
+  assert.strictEqual(
+    wire[0]!.reasoning_content,
+    "from rc",
+    "first non-empty in the chain wins",
+  );
+});
+
 test("an inline thinking block still wins over a blank field", () => {
   const wire = roundTrip([
     {

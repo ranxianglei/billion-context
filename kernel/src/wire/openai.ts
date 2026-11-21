@@ -43,6 +43,12 @@ export type OpenAIMessage = {
   role: "system" | "developer" | "user" | "assistant" | "tool";
   content?: string | null | OpenAIContentPart[];
   reasoning_content?: string | null;
+  // #7432: some OpenAI-wire providers (Ollama Cloud, ...) echo the assistant
+  // thinking under `reasoning` instead of `reasoning_content`. Read side
+  // accepts the alias; the wire echo stays `reasoning_content` (coreToOpenai
+  // never emits `reasoning` — an upstream that drops a `reasoning` field would
+  // silently lose the CoT reuse).
+  reasoning?: string | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -242,9 +248,24 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         break;
       }
       case "assistant": {
-        const rawReasoning = m.reasoning_content;
-        const fieldPresent = typeof rawReasoning === "string";
-        const fieldReasoning = fieldPresent ? rawReasoning : "";
+        // #7432: accept the reasoning alias (reasoning_content → reasoning),
+        // first non-empty wins. `fieldPresent` marks that the host sent the
+        // reasoning key (under either name, even empty) so coreToOpenai can
+        // re-emit it for strict-echo models. The write side stays
+        // reasoning_content — an upstream that silently drops a `reasoning`
+        // field would lose the CoT reuse.
+        let fieldPresent = false;
+        let fieldReasoning = "";
+        for (const f of ["reasoning_content", "reasoning"] as const) {
+          const v = m[f];
+          if (typeof v === "string") {
+            fieldPresent = true;
+            if (v.length > 0) {
+              fieldReasoning = v;
+              break;
+            }
+          }
+        }
         let reasoning = fieldReasoning;
         let text = stringContent(m.content);
         if (!reasoning) {
