@@ -428,33 +428,39 @@ CREATE TABLE IF NOT EXISTS state_fields (
  *  outbound conversation (B base / I insert / D delete-range / U
  *  update-content; anchors are msgids, never positions). DUAL TABLES:
  *  egress_state is what serving reads and compaction physically trims below
- *  the watermark; egress_flow is append-only and never deleted (any log_seq
+ *  the watermark; egress_flow is append-only and never deleted (any op_seq
  *  stays reconstructible — rollback is based on this table, not on client
  *  resends). SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
  *  the message's final core JSON for I/U rows — no hash refs, no content
- *  table; replay needs only this table pair. The secondary index serves +U
- *  targeting and -D endpoint resolution. Probe-first, no version bump. */
-const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes.
+ *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
+ *  canonical message number): op_seq orders EVERY row (the primary key);
+ *  log_seq is the canonical message number set ONLY on I rows (one number
+ *  per message, session-scoped, never re-issued — U/D/B carry NULL). The
+ *  secondary index serves +U targeting and -D endpoint resolution.
+ *  Probe-first, no version bump. */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes, canonical per-message numbers.
 CREATE TABLE IF NOT EXISTS egress_state (
     session_id TEXT NOT NULL,
-    log_seq INTEGER NOT NULL,
+    op_seq INTEGER NOT NULL,
+    log_seq INTEGER,
     row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
     msgid TEXT,
     payload TEXT NOT NULL,
     bytes TEXT,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, log_seq)
+    PRIMARY KEY (session_id, op_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
 CREATE TABLE IF NOT EXISTS egress_flow (
     session_id TEXT NOT NULL,
-    log_seq INTEGER NOT NULL,
+    op_seq INTEGER NOT NULL,
+    log_seq INTEGER,
     row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
     msgid TEXT,
     payload TEXT NOT NULL,
     bytes TEXT,
     created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, log_seq)
+    PRIMARY KEY (session_id, op_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
 `;
@@ -511,14 +517,17 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_state'")
         .get();
     if (!hasEgressState) db.exec(EGRESS_STATE_DDL);
-    // 7439 ruling 1: a dev DB created before the self-contained-bytes column
-    // upgrades with one probe-first ALTER (additive; the tables never
-    // shipped, so there is no real-migration burden).
+    // 7439 ruling (canonical message number): a dev DB created with the
+    // pre-numbering row shape (log_seq primary key, no op_seq column) is
+    // replaced in place — the two tables NEVER shipped in any release, so
+    // there is no user data and no migration path; a fresh recreate is the
+    // whole migration.
     const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
-    if (egressCols.length > 0 && !egressCols.includes("bytes")) {
-        db.exec("ALTER TABLE egress_state ADD COLUMN bytes TEXT");
-        db.exec("ALTER TABLE egress_flow ADD COLUMN bytes TEXT");
+    if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
+        db.exec("DROP TABLE IF EXISTS egress_flow");
+        db.exec("DROP TABLE IF EXISTS egress_state");
+        db.exec(EGRESS_STATE_DDL);
     }
     // 2×2 (#5874 brief, element-level world): the L1 world carries the
     // per-element msgid ENVELOPE ({id, pos} canon, §4.0) in addition to the

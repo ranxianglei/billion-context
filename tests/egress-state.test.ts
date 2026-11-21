@@ -23,6 +23,7 @@ import {
     egressStateCompact,
     egressStateView,
     egressStateAt,
+    egressFork,
     EgressStateCorruptError,
     diffEgressView,
     egressReplay,
@@ -56,6 +57,12 @@ function close(h: Harness): void {
 
 const h = (m: string) => `h_${m}`;
 
+// The canonical `num` is assigned at append/replay time from the stored
+// high-water, so pure diff/replay fixtures carry num: 0 — comparisons ignore
+// it (norm); the db-backed tests assert the stamped numbers explicitly.
+const norm = (rows: EgressViewRow[]) => rows.map(({ num, ...rest }) => rest);
+
+
 test("replay determinism: the five-op example from the proposal", () => {
     const H = open();
     try {
@@ -70,6 +77,9 @@ test("replay determinism: the five-op example from the proposal", () => {
         const view = egressStateView(H.db, S);
         assert.deepEqual(view.map((r) => r.msgid), ["c"]);
         assert.equal(view[0].bytes, h("c2"));
+        // ruling 7439: c was the 3rd I op (a=1, b=2, c=3); the -D and +U
+        // consumed no numbers, so c keeps 3 even though 5 rows exist
+        assert.equal(view[0].num, 3);
         // ref/tokens/type survive the content update untouched
         assert.equal(view[0].ref, "m00003");
         assert.equal(view[0].tokens, 9);
@@ -144,8 +154,8 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         seed("healthy");
         assert.deepEqual(egressStateView(H.db, "healthy").map((r) => r.msgid), ["a", "b"]);
         // a GOOD op after a BAD op must not be masked: drop the bad row, replay OK
-        H.db.prepare("DELETE FROM egress_state WHERE session_id = 'anchor-missing' AND log_seq = 3").run();
-        H.db.prepare("DELETE FROM egress_flow WHERE session_id = 'anchor-missing' AND log_seq = 3").run();
+        H.db.prepare("DELETE FROM egress_state WHERE session_id = 'anchor-missing' AND op_seq = 3").run();
+        H.db.prepare("DELETE FROM egress_flow WHERE session_id = 'anchor-missing' AND op_seq = 3").run();
         assert.deepEqual(egressStateView(H.db, "anchor-missing").map((r) => r.msgid), ["a", "b"]);
     } finally {
         close(H);
@@ -172,9 +182,10 @@ test("compaction equivalence: view before == view after; state bounded, flow tot
         assert.equal(stateRowsBefore, 12);
         assert.equal(flowRowsBefore, 12);
 
+        assert.deepEqual(before.map((r) => r.num), [11, 7, 8, 9, 10], "I rows numbered in append order (fold=11)");
         egressStateCompact(H.db, S, before, 2_000);
         const after = egressStateView(H.db, S);
-        assert.deepEqual(after, before);
+        assert.deepEqual(after, before, "compact base carries the stamped numbers inline");
         // state: base + nothing below (the 12 ops are physically gone)
         const stateRows = (H.db.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(S) as { n: number }).n;
         assert.equal(stateRows, 1);
@@ -206,6 +217,7 @@ test("any-log_seq rollback: compacted-away history stays reconstructible from eg
         }
         egressStateAppend(H.db, S, [{ type: "U", msgid: "m2", bytes: "h_m2-edit" }], 6_000);
         snapshots.set(6, egressStateView(H.db, S));
+        assert.equal(snapshots.get(6)![1].num, 2, "the +U did not change m2's canonical number");
         egressStateCompact(H.db, S, egressStateView(H.db, S), 10_000);
         // the state table is now just the base — every pre-compaction seq must
         // still come back byte-identical from the flow table
@@ -222,14 +234,15 @@ test("any-log_seq rollback: compacted-away history stays reconstructible from eg
 // ---- diff engine (segment 2) ------------------------------------------
 
 const V = (msgid: string, bytes = "h_" + msgid, ref = "m" + msgid, tokens = 3, type = "text"): EgressViewRow =>
-    ({ msgid, ref, tokens, type, bytes });
+    ({ num: 0, msgid, ref, tokens, type, bytes });
+
 
 test("diff: case 1 — tail append emits exactly one +I anchored to the last row", () => {
     const prev = [V("a"), V("b")];
     const next = [V("a"), V("b"), V("c")];
     const ops = diffEgressView(prev, next);
     assert.deepEqual(ops, [{ type: "I", msgid: "c", after: "b", ref: "mc", tokens: 3, typeTag: "text", bytes: "h_c" }]);
-    assert.deepEqual(egressReplay(prev, ops), next);
+    assert.deepEqual(norm(egressReplay(prev, ops)), norm(next));
 });
 
 test("diff: cases 2+3 — nudge appears (+I) and vanishes (-D) without touching the prefix", () => {
@@ -238,9 +251,9 @@ test("diff: cases 2+3 — nudge appears (+I) and vanishes (-D) without touching 
     assert.deepEqual(diffEgressView(base, nudged), [
         { type: "I", msgid: "nudge", after: "b", ref: "mn", tokens: 1, typeTag: "nudge", bytes: "h_n" },
     ]);
-    assert.deepEqual(egressReplay(base, diffEgressView(base, nudged)), nudged);
+    assert.deepEqual(norm(egressReplay(base, diffEgressView(base, nudged))), norm(nudged));
     assert.deepEqual(diffEgressView(nudged, base), [{ type: "D", start: "nudge", end: "nudge" }]);
-    assert.deepEqual(egressReplay(nudged, diffEgressView(nudged, base)), base);
+    assert.deepEqual(norm(egressReplay(nudged, diffEgressView(nudged, base))), norm(base));
 });
 
 test("diff: case 4 — fold replaces a range with one summary row after the surviving anchor", () => {
@@ -250,7 +263,7 @@ test("diff: case 4 — fold replaces a range with one summary row after the surv
         { type: "D", start: "b", end: "e" },
         { type: "I", msgid: "sum", after: "a", ref: "ms", tokens: 42, typeTag: "acp_summary", bytes: "h_sum" },
     ]);
-    assert.deepEqual(egressReplay(prev, diffEgressView(prev, folded)), folded);
+    assert.deepEqual(norm(egressReplay(prev, diffEgressView(prev, folded))), norm(folded));
 });
 
 test("diff: case U — content edit of an existing row is a +U, position and triple untouched", () => {
@@ -258,9 +271,10 @@ test("diff: case U — content edit of an existing row is a +U, position and tri
     const next = [V("a", "h_a2"), V("b")];
     assert.deepEqual(diffEgressView(prev, next), [{ type: "U", msgid: "a", bytes: "h_a2" }]);
     const replayed = egressReplay(prev, diffEgressView(prev, next));
-    assert.deepEqual(replayed, next);
+    assert.deepEqual(norm(replayed), norm(next));
     assert.equal(replayed[0].ref, "ma", "+U must not touch the ref");
     assert.equal(replayed[0].tokens, 3, "+U must not touch tokens");
+    assert.equal(replayed[0].num, 0, "+U must not touch the canonical number");
 });
 
 test("diff: move = D+I (no M op), msgid survives both ops", () => {
@@ -270,7 +284,9 @@ test("diff: move = D+I (no M op), msgid survives both ops", () => {
         { type: "D", start: "a", end: "a" },
         { type: "I", msgid: "a", after: "b", ref: "ma", tokens: 3, typeTag: "text", bytes: "h_a" },
     ]);
-    assert.deepEqual(egressReplay(prev, diffEgressView(prev, next)), next);
+    const moved = egressReplay(prev, diffEgressView(prev, next));
+    assert.deepEqual(norm(moved), norm(next));
+    assert.equal(moved.find((r) => r.msgid === "a")!.num, 1, "the D+I move takes the next number; the old one stays retired");
 });
 
 test("diff: empty views and empty diff (both directions)", () => {
@@ -313,7 +329,7 @@ test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next
                 next.splice(j, 0, ...next.splice(i, 1));
             }
             const ops = diffEgressView(prev, next);
-            assert.deepEqual(egressReplay(prev, ops), next, `replay identity at iter ${iter}`);
+            assert.deepEqual(norm(egressReplay(prev, ops)), norm(next), `replay identity at iter ${iter}`);
             view = next;
         }
         // the final view also round-trips through the DB: rebuild from ops
@@ -327,7 +343,49 @@ test("diff property: 300 random sparse mutations — replay(prev, diff) ≡ next
         }
         const fromEmpty = diffEgressView([], view);
         egressStateAppend(H.db, S, fromEmpty, 1_000);
-        assert.deepEqual(egressStateView(H.db, S), view, "DB log built from diff(empty, final) replays to the final view");
+        assert.deepEqual(norm(egressStateView(H.db, S)), norm(view), "DB log built from diff(empty, final) replays to the final view");
+    } finally {
+        close(H);
+    }
+});
+
+test("fork: whole-table copy — the child inherits the parent number space and retired marks (ruling 7439)", () => {
+    const H = open();
+    try {
+        const P = "parent";
+        const C = "child";
+        egressStateAppend(H.db, P, [
+            { type: "I", msgid: "a", after: null, ref: "m00001", tokens: 1, typeTag: "text", bytes: "h_a" },
+            { type: "I", msgid: "b", after: null, ref: "m00002", tokens: 1, typeTag: "text", bytes: "h_b" },
+            { type: "I", msgid: "sum", after: "b", ref: "m00003", tokens: 5, typeTag: "summary", bytes: "h_sum" },
+            { type: "D", start: "a", end: "b" },
+        ], 1_000);
+        // a compaction so the state table carries a base row too — the fork
+        // must copy BOTH tables (base entries keep their numbers)
+        egressStateCompact(H.db, P, egressStateView(H.db, P), 2_000);
+        const parentView = egressStateView(H.db, P);
+
+        const copied = egressFork(H.db, P, C);
+        assert.ok(copied > 0, "rows copied");
+        assert.deepEqual(egressStateView(H.db, C), parentView, "child view == parent view (incl. numbers)");
+
+        // the child's NEXT number continues where the parent stopped (a=1,
+        // b=2, sum=3 — b's deletion retired 2, it is never re-issued)
+        egressStateAppend(H.db, C, [
+            { type: "I", msgid: "c2", after: null, ref: "m00004", tokens: 1, typeTag: "text", bytes: "h_c2" },
+        ], 3_000);
+        const childView = egressStateView(H.db, C);
+        assert.equal(childView.find((r) => r.msgid === "c2")!.num, 4, "child continues the parent high-water");
+        // and the parent's own next number is UNTOUCHED by the fork
+        egressStateAppend(H.db, P, [
+            { type: "I", msgid: "p2", after: null, ref: "m00005", tokens: 1, typeTag: "text", bytes: "h_p2" },
+        ], 4_000);
+        assert.equal(egressStateView(H.db, P).find((r) => r.msgid === "p2")!.num, 4, "parent numbering independent of the fork");
+
+        // no-op without egress rows
+        const none = egressFork(H.db, "stranger", C);
+        assert.equal(none, 0, "fork from a session without egress rows is a no-op");
+        assert.throws(() => egressFork(H.db, P, P), /conflicting fork lineage/);
     } finally {
         close(H);
     }

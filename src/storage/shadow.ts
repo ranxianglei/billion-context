@@ -703,7 +703,7 @@ export class UnifiedShadow {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
+                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {}, legacy.metadata?.egressAuthority === true);
                 for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                     const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                     verifier.addBlocks(rows);
@@ -1451,7 +1451,7 @@ export class UnifiedShadow {
                     this.stats.verifySamples++;
                     const sessionRow = await backend.getSessionRow(legacy.id);
                     if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {});
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, await backend.getRefs(legacy.id), await backend.getDeadRefs(legacy.id), await backend.getCcrEntries(legacy.id), await backend.getStateFields(legacy.id), (await backend.getOrphanViews(legacy.id)) ?? {}, legacy.metadata?.egressAuthority === true);
                     for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
                         const rows = await backend.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
                         verifier.addBlocks(rows);
@@ -1773,7 +1773,7 @@ class BatchedViewVerification {
     private tailGaps = 0;
     private tailSlot: DriftDiagnostics["tailSlot"];
 
-    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null) {
+    constructor(private readonly legacy: LegacySessionLike, session: SessionRow, refs: RefRow[], deadRefs: { ord: number; ref: string }[], ccrRows: readonly CcrLedgerRow[] = [], stateFieldsRows: Record<string, string> | null = null, orphanViews: Record<string, { one: unknown; full: unknown }> | null = null, private readonly skipLastMessages = false) {
         const header = loadLegacyView({ session, refs, deadRefs, messages: [], blocks: [] }, ccrRows, stateFieldsRows, orphanViews ?? undefined);
         this.orphans = header.blockContents;
         this.remainingContents = new Map(completeBlockContents(legacy.blockContents, legacy.state.blocks));
@@ -1894,7 +1894,16 @@ class BatchedViewVerification {
         if (this.blockCount !== this.legacy.state.blocks.length) this.changed("state");
         for (const [id, view] of this.orphans) this.compareContents(id, view);
         if (this.remainingContents.size > 0) this.changed("blockContents");
-        this.compareMessages("lastMessages", this.tail.tailSeqs);
+        // Ruling 7439 (egress-authority sessions): the message BYTES are
+        // authoritative in the egress op log, not in the messages table —
+        // there the rows are the identity/cursor ledger (watermark, pin
+        // tail-overlap) and the client legitimately resends its OWN bytes
+        // while the server serves the canonical ones, so this comparison
+        // diverges by design on those sessions and would latch the session
+        // onto the O(rows) full-ingest path (observed: 'diverged:
+        // lastMessages' → chronic slow full ingests). Marked sessions skip
+        // ONLY this dimension; every other check still runs.
+        if (!this.skipLastMessages) this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
         if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;
