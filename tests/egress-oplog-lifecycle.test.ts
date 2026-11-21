@@ -34,8 +34,8 @@ const M = (id: string, text: string, role: string = "user") => ({ id, role, cont
 
 test("recording is content-table-free: rows carry bytes, content stays empty, replay is byte-equal", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-egress-lifecycle-"));
+    const store = UnifiedStore.open(join(dir, "index.db"));
     try {
-        const store = UnifiedStore.open(join(dir, "index.db"));
         const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
         migrateSchema(db);
         const sid = "sess-egress-selfcontained";
@@ -66,14 +66,19 @@ test("recording is content-table-free: rows carry bytes, content stays empty, re
         const contentRows = (db.prepare("SELECT count(*) AS n FROM content").get() as { n: number }).n;
         assert.equal(contentRows, 0, "the content table stayed untouched — the op-log is self-contained");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        // Windows locks open SQLite files: release the handle before the
+        // cleanup, then retry the unlink (same pattern as egress-state.test.ts).
+        try { store.close(); } catch { /* already closed */ }
+        try {
+            rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        } catch { /* leaked temp dir on a Windows runner is harmless */ }
     }
 });
 
 test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to release)", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-egress-lifecycle-"));
+    const store = UnifiedStore.open(join(dir, "index.db"));
     try {
-        const store = UnifiedStore.open(join(dir, "index.db"));
         const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
         migrateSchema(db);
         const sid = "sess-egress-cascade";
@@ -96,6 +101,9 @@ test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to rel
         assert.equal(count("egress_state"), 0, "egress_state rows cascade-deleted");
         assert.equal(count("egress_flow"), 0, "egress_flow rows cascade-deleted");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        try { store.close(); } catch { /* already closed */ }
+        try {
+            rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        } catch { /* leaked temp dir on a Windows runner is harmless */ }
     }
 });
