@@ -346,6 +346,11 @@ type AttributionHealthReport = {
     error?: string;
     /** #3651: masked endpoint (origin+pathname) of the last refused request. */
     endpoint?: string;
+    /** #5066: the episode contains a LOCAL oversize refusal — host attribution
+     *  dead AND body provably over the model window, so every retry stays
+     *  refused until the host restarts (the session is wedged). Sticky until
+     *  recovery resets the episode. */
+    wedged?: boolean;
 };
 
 /** Takeover-attribution health report (#3581, contract reworked by #3651):
