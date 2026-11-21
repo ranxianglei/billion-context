@@ -147,3 +147,74 @@ test("#4052 gate: a lone uncovered match still degrades as seam-too-short (#3812
     const { session, view } = render([{ blockId: "b1", active: true, effectiveMessageIds: ["a"] }], client, rows);
     assertDegraded(session, "seam-too-short", view, client);
 });
+
+// ---------------------------------------------------------------------------
+// #5632 — a signature-only deep-duplicate pair must NOT pass the seam gate
+// ---------------------------------------------------------------------------
+//
+// MIN_SEAM_RUN (=2) counts consecutive matches of EITHER class (byId fast path
+// or identity-signature fallback). Two adjacent UNCOVERED old rows whose
+// byte-identical twins sit at the client tail boundary (host re-minted their
+// ids => byId miss, bySig hit) therefore reach run=2 and used to pin the join
+// DEEP in the transcript -- silently truncating every genuinely-recent row
+// above it. The fix adds a depth gate: a seam resting SOLELY on signatures may
+// not drop more rows than it verified unless it carries an exact-id cell or
+// reaches MIN_NONLOCAL_SIG_SEAM_RUN (=3). Local seams (join at/near the
+// transcript end) keep today's behavior. Gate discipline (#3617): each positive
+// case below has its negative twin.
+
+test("#5632: signature-only deep-duplicate pair degrades instead of truncating recent history", () => {
+    // Transcript r0..r7 all uncovered. r1/r2 (deep) carry the twin texts
+    // "SA"/"SB"; r3..r7 are the genuinely-recent history a bad seam would drop.
+    // Client re-sends the tail as [x0, dupA("SA"), dupB("SB"), z] with FRESH ids
+    // (host re-mint => byId cannot bind): the walk chains dupB->r2, dupA->r1
+    // (run=2, pure sig) then breaks on x0. Pre-fix this rendered rows[0..r2]+[z]
+    // and lost r3..r7. Now it must degrade to the legacy view.
+    const rows = [
+        msg("r0", "m0"), msg("r1", "SA"), msg("r2", "SB"), msg("r3", "m3"),
+        msg("r4", "m4"), msg("r5", "m5"), msg("r6", "m6"), msg("r7", "m7"),
+    ];
+    const client = [msg("x0", "x0"), msg("dupA", "SA"), msg("dupB", "SB"), msg("z", "z-fresh")];
+    const { session, view } = render([{ blockId: "b1", active: true, effectiveMessageIds: ["r0"] }], client, rows);
+    assertDegraded(session, "seam-unverified-depth", view, client);
+});
+
+test("#5632: the same twin pair WITH an exact-id corroboration still renders (id anchor trusted at any depth)", () => {
+    // Identical shape, but the lower twin carries row r1's EXACT id. One byId
+    // cell anchors the seam, so the deep join is legitimate (kernel contract:
+    // ids never reused) and the view renders. Negative twin of the degrade case.
+    const rows = [
+        msg("r0", "m0"), msg("r1", "SA"), msg("r2", "SB"), msg("r3", "m3"),
+        msg("r4", "m4"), msg("r5", "m5"), msg("r6", "m6"), msg("r7", "m7"),
+    ];
+    const client = [msg("x0", "x0"), msg("r1", "SA"), msg("dupB", "SB"), msg("z", "z-fresh")];
+    const { session, view } = render([{ blockId: "b1", active: true, effectiveMessageIds: ["r0"] }], client, rows);
+    assertRendered(session);
+    // join at r2 => prefix rows[0..r2] (r0 suppressed behind its anchor) + tail [z]
+    assert.deepEqual(view.map((m) => m.id), ["acp_summary_b1", "r1", "r2", "z"]);
+});
+
+test("#5632: a run=2 pure-signature seam that is LOCAL (join at the transcript end) still renders", () => {
+    // Carve-out guard: pure sig, run=2, but the join sits at the last row so
+    // nothing is dropped above it (gapAbove=0). Today's behavior must survive;
+    // if the depth gate ever drops its locality condition, this breaks.
+    const rows = [msg("r0", "P"), msg("r1", "Q"), msg("r2", "R")];
+    const client = [msg("A1", "Q"), msg("B1", "R")];
+    const { session, view } = render([{ blockId: "b1", active: true, effectiveMessageIds: ["r0"] }], client, rows);
+    assertRendered(session);
+    assert.deepEqual(view.map((m) => m.id), ["acp_summary_b1", "r1", "r2"]);
+});
+
+test("#5632: a run=3 pure-signature seam renders even when non-local (threshold raised to 3)", () => {
+    // Three adjacent uncovered rows whose twins sit at the tail boundary, deep,
+    // with recent rows above: run reaches 3, so a longer signature-only chain is
+    // strong enough evidence even without an id anchor. Pins the >=3 escape.
+    const rows = [
+        msg("r0", "m0"), msg("r1", "SA"), msg("r2", "SB"), msg("r3", "SC"),
+        msg("r4", "m4"), msg("r5", "m5"), msg("r6", "m6"),
+    ];
+    const client = [msg("x0", "x0"), msg("dupA", "SA"), msg("dupB", "SB"), msg("dupC", "SC"), msg("z", "z-fresh")];
+    const { session, view } = render([{ blockId: "b1", active: true, effectiveMessageIds: ["r0"] }], client, rows);
+    assertRendered(session);
+    assert.deepEqual(view.map((m) => m.id), ["acp_summary_b1", "r1", "r2", "r3", "z"]);
+});
