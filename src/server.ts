@@ -2899,6 +2899,11 @@ const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
 // legitimately outrank an honest report by 16x+ (#1820 B e2e: 186K chars over
 // a 5k report = 37x) and the anchor must stay on the fast path.
 const CLIPPED_REPORT_MIN_OUTBOUND = 500_000;
+// #7444: minimum outbound-char-bound / report ratio that proves clipping.
+// 16x sits above the honest dense-code under-report band (#1820 B e2e observed
+// up to ~37x chars-per-token, but only below the 500K floor) and below the
+// agy-cli clip's ~40x gap, so it separates the two without a per-host knob.
+const CLIPPED_REPORT_MIN_RATIO = 16;
 
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
@@ -2957,7 +2962,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // below the forwarded history. The 500K-char floor keeps the #1820 B
     // honesty margin (186K-char harness) on the fast path.
     const reportClipped = session.stats.lastInputTokens > 0
-        && (session.stats.localInputEstimate ?? 0) >= session.stats.lastInputTokens * 16
+        && (session.stats.localInputEstimate ?? 0) >= session.stats.lastInputTokens * CLIPPED_REPORT_MIN_RATIO
         && (session.stats.localInputEstimate ?? 0) >= CLIPPED_REPORT_MIN_OUTBOUND;
     // #5135: pending compress credit proves THIS session executed its own fold
     // since the last settle — applyRanges (stream.ts) already netted the
