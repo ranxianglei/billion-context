@@ -54,7 +54,9 @@ function opencodeDataDir(): string {
 
 // Candidate DB paths: OPENCODE_DB (explicit) first, then the data dir's
 // opencode.db + opencode-<channel>.db variants (the CLI picks the file by
-// channel; we cannot know it, so try every candidate).
+// channel; we cannot know it, so try every candidate). An EMPTY result is
+// not cached: the DB may not exist yet at first probe (fresh machine, proxy
+// started before opencode's first run) and must be re-probed next session.
 let candidatePaths: string[] | undefined;
 function candidateDbPaths(): string[] {
     if (candidatePaths !== undefined) return candidatePaths;
@@ -71,7 +73,7 @@ function candidateDbPaths(): string[] {
     } catch {
         // data dir absent — no candidates
     }
-    candidatePaths = paths;
+    if (paths.length > 0) candidatePaths = paths;
     return paths;
 }
 

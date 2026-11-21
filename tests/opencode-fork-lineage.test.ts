@@ -169,6 +169,35 @@ test("discovery: OPENCODE_DB=:memory: is ignored (falls back to the data dir)", 
     }
 });
 
+test("discovery: an empty scan is re-probed when the DB appears later (fresh machine)", () => {
+    const parent = "ses_parent_9";
+    const child = "ses_child_9";
+    // The data dir does not exist yet (proxy started before opencode's first run).
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-late-"));
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = empty;
+    _resetOpencodeForkLineageForTest();
+    try {
+        // First probe: no DB yet → no lineage.
+        assert.equal(opencodeForkParent("ses_probe_9"), undefined);
+        // opencode starts up and creates the data dir + DB.
+        const dbPath = path.join(empty, "opencode", "opencode.db");
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+        const db = new DatabaseSync(dbPath);
+        db.exec("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, fork_session_id TEXT)");
+        db.prepare("INSERT INTO session_v2 (id, fork_session_id) VALUES (?, ?)").run(child, parent);
+        db.close();
+        // A later session must re-probe: an empty candidate list must not be
+        // cached, or the lineage fix would silently never apply this process.
+        assert.equal(opencodeForkParent(child), parent);
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdg;
+        _resetOpencodeForkLineageForTest();
+        fs.rmSync(empty, { recursive: true, force: true });
+    }
+});
+
 test("degradation: a corrupt DB file degrades to no lineage (never throws)", () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-corrupt-"));
     fs.writeFileSync(path.join(dataDir, "opencode.db"), "this is not a sqlite database");
