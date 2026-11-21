@@ -176,7 +176,7 @@ class StubMysqlBackend implements StorageBackend {
     clearIngestWatermark(): Promise<void> {
         return Promise.resolve();
     }
-    resetAllIngestWatermarks(): Promise<void> {
+    primeIngestTrust(): Promise<void> {
         return Promise.resolve();
     }
     probeIngestBoundary(): Promise<null> {
