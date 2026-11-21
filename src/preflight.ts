@@ -37,6 +37,7 @@ import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./ext
 export { describeExternalSummaryFailure };
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { newExternalCallId } from "./external-summary-marker.js";
+import { wrapV1Internal } from "./v1internal.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -279,6 +280,8 @@ export interface PreflightDeps {
     streamSummaryOff?: boolean;
     /** #2189: the client's billing-attribution block from the INBOUND anthropic system (extractBillingAttributionBlock). Carried into every summary call as system[0]; absent → legacy string system unchanged. */
     billingBlock?: { type: "text"; text: string };
+    /** CloudCode / Antigravity v1internal outer envelope metadata (project, requestId, model, userAgent, requestType). When present, in-channel summary calls are wrapped in `{ ...v1Meta, request: inner }`. */
+    v1Meta?: Record<string, unknown>;
     /** #5974: tokens by which this pass's blind view (processTurn on the client re-send) understates the ACTUAL outbound body, measured by the caller against a fresh full-pipeline rebuild (#4543-① — fold-reconcile id churn re-enters unfolded mass the two pipelines disagree about). When > 0, every fit judgment in this pass runs on the corrected scale (exit bar, futility deficit, relax triggers, tier-distillation funnel, final fitsWindow), so the walk keeps folding until the reconstruction is predicted to fit too. Absent/0 → byte-identical legacy behavior; only the bounded corrective second pass sets it. */
     viewDeltaCorrection?: number;
 }
@@ -935,8 +938,23 @@ function summaryHeaders(deps: PreflightDeps): Record<string, string> {
 // output, so it is skipped; several candidates only occur when n>1 is
 // requested, which the summary call never is — first candidate wins, mirroring
 // the OpenAI/Anthropic extractors.
+function unwrapGoogleResponseChunk(chunk: Record<string, unknown>): Record<string, unknown> {
+    if (
+        chunk.response &&
+        typeof chunk.response === "object" &&
+        !Array.isArray(chunk.response) &&
+        !("candidates" in chunk) &&
+        !("usageMetadata" in chunk) &&
+        !("promptFeedback" in chunk)
+    ) {
+        return chunk.response as Record<string, unknown>;
+    }
+    return chunk;
+}
+
 function googleChunkText(chunk: Record<string, unknown>): string {
-    const candidates = chunk.candidates;
+    const inner = unwrapGoogleResponseChunk(chunk);
+    const candidates = inner.candidates;
     if (!Array.isArray(candidates) || candidates.length === 0) return "";
     const first = candidates[0];
     if (!first || typeof first !== "object") return "";
@@ -1567,8 +1585,17 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 // fail-fasts with "context exceeds the model window" instead of compressing.
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
+function wrapV1SummaryPayload(payload: Record<string, unknown>, meta: Record<string, unknown>): Record<string, unknown> {
+    const cleanMeta: Record<string, unknown> = { ...meta };
+    delete cleanMeta.continuationToken;
+    delete cleanMeta.continuation_token;
+    return wrapV1Internal(payload, cleanMeta);
+}
+
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
+    const rawPayload = summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers));
+    const wirePayload = deps.v1Meta ? wrapV1SummaryPayload(rawPayload, deps.v1Meta) : rawPayload;
+    const text = await requestSummaryBody(deps, JSON.stringify(wirePayload), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);

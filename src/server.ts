@@ -3822,6 +3822,7 @@ export async function preflightCompressIfNeeded(
     anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
+    v1Meta?: Record<string, unknown>,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     // #3450: when an upstream-stated overflow proved this provider bills the
@@ -4301,6 +4302,7 @@ export async function preflightCompressIfNeeded(
         surface: prepared.surface,
         protocol: prepared.protocol,
         billingBlock: prepared.anthropicBillingBlock,
+        v1Meta,
         url: upstreamUrl,
         headers,
         resign: preflightResignCtx !== undefined ? (hdrs: Record<string, string>, bodyStr: string) => {
