@@ -409,6 +409,8 @@
 | `BILI_ZCODE_PORT` | number | unset | — | zcode 车道的端口钉死。 |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 凭据车道的固定签名模式。 |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
+| `BILI_WORKBUDDY_PROXY` | string | unset | — | workbuddy 车道的 origin 钉死（默认：常驻 http://127.0.0.1:8787）。 |
+| `BILI_WORKBUDDY_UPSTREAM` | string | unset | — | workbuddy 车道的上游钉死（默认：https://www.workbuddy.ai）。 |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。 |
@@ -1107,6 +1109,7 @@
 - **默认：** `{ retries: 0, bufCapBytes: 16777216 }`
 - **状态：** ACTIVE
 - **说明：** 针对流中途被宿主掐断场景的 fake-completion 安全网（#371）—— **显式开启**，`retries: 0`（默认）即 #371 之前的透传行为。`bufCapBytes` 是缓冲响应的 OOM 护栏。对应 `BILI_FAKE_COMPLETION_RETRIES`、`BILI_FAKE_BUF_CAP`。
+- 响应超过 `bufCapBytes` 时，已读前缀和后续内容会继续进入正常流式处理。未完成的检查不会触发重试或改变会话的 fake-completion 连续计数；该上限不会截断回答。首次响应与附带纠正提示的重试响应都遵循此规则。
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 

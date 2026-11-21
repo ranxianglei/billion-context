@@ -409,6 +409,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_ZCODE_PORT` | number | unset | — | Port pin for the zcode lane. |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | Fixed-signing mode for the zcode credential lane. |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
+| `BILI_WORKBUDDY_PROXY` | string | unset | — | Origin pin for the workbuddy lane (default: the resident http://127.0.0.1:8787). |
+| `BILI_WORKBUDDY_UPSTREAM` | string | unset | — | Upstream pin for the workbuddy lane (default: https://www.workbuddy.ai). |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait. |
@@ -1113,6 +1115,7 @@ Security boundary: the file controls ONLY *when* to upgrade and *which published
 - **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
 - **Status:** ACTIVE
 - **Description:** Fake-completion safety net for hosts that abort mid-stream (#371) — **opt-in**, `retries: 0` (default) is the pre-#371 passthrough. `bufCapBytes` is the OOM guard on the buffered response. Twins `BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP`.
+- A response exceeding `bufCapBytes` continues through the normal streaming path, including its already-read prefix. The incomplete inspection neither retries nor changes the session's fake-completion streak; the cap does not truncate the answer. This applies to the first response and hinted retries.
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 

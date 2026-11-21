@@ -8,7 +8,8 @@
 // ruling 2026-11-07: wire into ONE shared seam, never per-use-site reads).
 //
 // Roster status (see issue #5825 ledger + docs/identity-channels.md):
-// claude-code / codebuddy / mcode / goose / qwen ship here. Memo rows
+// claude-code / codebuddy (+ its WorkBuddy Desktop fork config root, #7456) /
+// mcode / goose / qwen ship here. Memo rows
 // (fact-audited 2026-11-07, /lane-scout): crush = wire key is an XXH3 hash of
 // the session UUID + project-local store path — no proxy-side join; gemini-cli
 // = install-level id only; hermes-agent = zero per-session wire signal;

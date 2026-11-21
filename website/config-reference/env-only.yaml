@@ -209,6 +209,24 @@ entries:
     desc_en: "Upstream pin for the claude lane."
     desc_zh: "claude 车道的上游钉死。"
     desc_ja: "claude レーン用のアップストリーム固定。"
+  - key: BILI_WORKBUDDY_PROXY
+    type: string
+    default: "unset"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Origin pin for the workbuddy lane (default: the resident http://127.0.0.1:8787)."
+    desc_zh: "workbuddy 车道的 origin 钉死（默认：常驻 http://127.0.0.1:8787）。"
+    desc_ja: "workbuddy レーン用の origin 固定（既定：レジデント http://127.0.0.1:8787）。"
+  - key: BILI_WORKBUDDY_UPSTREAM
+    type: string
+    default: "unset"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Upstream pin for the workbuddy lane (default: https://www.workbuddy.ai)."
+    desc_zh: "workbuddy 车道的上游钉死（默认：https://www.workbuddy.ai）。"
+    desc_ja: "workbuddy レーン用のアップストリーム固定（既定：https://www.workbuddy.ai）。"
   - key: BILI_CODEX_STATE_MODE
     type: string
     default: "auto"
