@@ -642,42 +642,29 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            // #3133 watermark: pay the full O(log) ingest only when the
-            // trusted-prefix probe cannot vouch for the stored prefix —
-            // steady-state saves stringify+hash+INSERT just the NEW tail.
-            // Any doubt (no watermark, foreign edit, tail shorter than the
-            // watermark, snapshot-bearing session) falls back to the exact
-            // full path below; the delta itself re-verifies the boundary
-            // inside the ingest transaction, so a racing writer degrades to
-            // a full ingest, never a corrupt one.
+            // Every save goes through the reconciled path (#3285/#4182): the
+            // log is reconciled against the stored rows by client-sent
+            // identity — a presented id re-points at its stored row (blind
+            // pin, zero serialization), everything genuinely new is a new
+            // row. There is no watermark and no delta fast path: the
+            // reconciler IS the steady state, O(new messages) per save by
+            // construction.
             // #5744: wall-clock guard on the ingest itself — message count is
             // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
             // SAME ~3k msgs). Names the path so a spike is attributable
-            // (delta fast path vs full fallback) without a profiler.
+            // without a profiler.
             const tIngestStart = performance.now();
-            let ingestPath = "reconciled";
-            phase = "ingest-delta";
-            // #5677: while drift-latched the sampled digest has PROVEN the
-            // stored view diverges from the live one — vouching for a trusted
-            // prefix is exactly the trust that sample just voided. A host that
-            // re-writes history slots below the watermark on every save (the
-            // #4614 producer class) makes the delta path re-diverge within ≤
-            // VERIFY_EVERY_INGESTS saves of each heal, so the samples drift in
-            // a row, the streak escalates and the envelope freezes — the
-            // chronic ESCALATED→FROZEN loop reported in #5677. Forcing the
-            // exact full path for every latched save keeps both legs
-            // same-generation at sample time: the next sample passes, the
-            // latch releases, the delta resumes. Bounded cost (full ingest per
-            // save) paid only by sessions whose views are already proven
-            // divergent; healthy sessions never see it.
-            ingestPath = "reconciled";
+            const ingestPath = "reconciled";
             phase = "ingest-session";
             // #5677: while drift-latched the sampled digest has PROVEN the
-            // stored view diverges — pinning the stored rows (the reconciler's
-            // steady state) would preserve exactly the divergent bytes, so
-            // latch the exact full path: every row re-serializes and the
-            // index converges to the live view byte-for-byte. Bounded cost,
-            // paid only by sessions already proven divergent.
+            // stored view diverges from the live one — pinning the stored
+            // rows (the reconciler's steady state) would preserve exactly the
+            // divergent bytes. Forcing the deep path (every row
+            // re-serializes) for every latched save keeps both legs
+            // same-generation at sample time: the next sample passes, the
+            // latch releases, the reconciler resumes. Bounded cost (full
+            // re-serialize per save) paid only by sessions whose views are
+            // already proven divergent; healthy sessions never see it.
             const latched = this.driftedSessions.has(legacy.id);
             // #3285/#5408 sweep gate: only a raw-tail plan is the complete
             // log — that is what lets the apply sweep foreign rows as stale.
@@ -1675,7 +1662,19 @@ class BatchedViewVerification {
 
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
-            const raw = JSON.parse(row.content);
+            let raw: unknown;
+            try {
+                raw = JSON.parse(row.content);
+            } catch {
+                // Unparseable stored content: the bytes no longer round-trip,
+                // so this is a proven divergence. raw stays undefined → its
+                // signature (the "null" digest) cannot match the live message,
+                // the sample reports drift, the latch fires and the deep path
+                // re-serializes. Without the guard this throw escaped AFTER the
+                // ingest commit: every sample blew up, the latch never set, and
+                // the deep-repair path was dead.
+                raw = undefined;
+            }
             this.messages.set(row.seq, { sig: messageSignature(raw), raw });
         }
     }
