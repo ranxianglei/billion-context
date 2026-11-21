@@ -21,7 +21,8 @@ import { rmrf } from "./tmp-rm.ts";
 // for a static asset no model client ever asks for. Three halves: the panel
 // page declares the bundled icon explicitly (page.ts), the proxy serves the
 // bundled .ico bytes locally at /favicon.ico as the backstop (admin.ts), and
-// every OTHER unknown path keeps the documented relay fallthrough.
+// every OTHER unknown origin-form path is refused locally with 404
+// unknown_upstream_path instead of being spliced onto the upstream (#5211).
 
 async function waitReady(port: number): Promise<void> {
     for (let i = 0; i < 200; i++) {
@@ -144,7 +145,7 @@ test("#4830: the embedded favicon constant decodes to a structurally valid .ico 
     assert.equal(end, ico.length, "no trailing bytes after the last entry");
 });
 
-test("#3536/#4830: GET /favicon.ico answers with the bundled icon locally and never reaches the upstream; other unknown paths keep the relay fallthrough", async () => {
+test("#3536/#4830: GET /favicon.ico answers with the bundled icon locally and never reaches the upstream; every other unknown origin-form path is refused locally (#5211)", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-issue3536-${process.pid}-${Date.now()}`);
@@ -179,13 +180,15 @@ test("#3536/#4830: GET /favicon.ico answers with the bundled icon locally and ne
         assert.ok(page.buf.toString("utf8").includes('<link rel="icon" type="image/x-icon" href="/favicon.ico">'), "served panel HTML declares the bundled icon");
 
         // Negative gates: ONLY GET /favicon.ico is pinned local. A non-GET on
-        // the same path and every other unknown path still fall through the
-        // relay onto the configured upstream (documented zero-config tunnel).
+        // the same path and every other unknown origin-form path are refused
+        // locally with 404 unknown_upstream_path (#5211) — nothing is spliced
+        // onto the configured upstream anymore.
         const post = await get(port, "/favicon.ico", { method: "POST", body: "{}" });
-        assert.equal(post.status, 403, `POST on the favicon path keeps the relay fallthrough (got ${post.status})`);
+        assert.equal(post.status, 404, `POST on the favicon path is refused locally (#5211, got ${post.status})`);
         const other = await get(port, "/definitely/not/an/admin/path");
-        assert.equal(other.status, 403, `unknown non-favicon paths keep the relay fallthrough (got ${other.status})`);
-        assert.deepEqual(up.hits, ["POST /favicon.ico", "GET /definitely/not/an/admin/path"], "exactly the non-asset requests were relayed");
+        assert.equal(other.status, 404, `unknown non-favicon origin-form paths are refused locally (#5211, got ${other.status})`);
+        assert.equal(JSON.parse(other.buf.toString("utf8")).error?.type, "unknown_upstream_path");
+        assert.deepEqual(up.hits, [], "no non-asset request may reach the configured upstream");
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         bili.closeAllConnections?.();

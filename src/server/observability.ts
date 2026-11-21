@@ -44,14 +44,40 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
     }
 }
 
-// #1290: instance-level view of the map above — surfaced at /__bili/stats
-// (unrecognizedPaths) and in the /acp status report so "this path never got
-// compressed" is visible in a status face, not just 3 transient stderr warns.
+// #5211: origin-form path refused LOCALLY instead of spliced onto the
+// configured upstream — a mistargeted local/private API payload must never
+// leave the machine. Same per-path rate limit as logUnrecognizedPath so a
+// stuck caller cannot spam the log; surfaced at /__bili/stats like its sibling.
+const refusedForeignPathCounts = new Map<string, number>();
+export function logRefusedForeignPath(log: (level: string, msg: string) => void, url: string): void {
+    const key = maskUrlsInText(url.split("?")[0]);
+    const n = (refusedForeignPathCounts.get(key) ?? 0) + 1;
+    refusedForeignPathCounts.set(key, n);
+    if (n <= 3) {
+        log("warn", `refused foreign path ${key} locally (404) — not a model API path and no providers declaration covers it; forwarding would splice the caller's payload onto the configured upstream (#5211); further occurrences suppressed`);
+    } else if (n === 4) {
+        log("info", `refused foreign path ${key}: further occurrences suppressed`);
+    }
+}
+
+// #1290/#5211: instance-level views — surfaced at /__bili/stats
+// (unrecognizedPaths / refusedForeignPaths) and in the /acp status report so
+// "this path never got compressed" (or "was never forwarded at all") is
+// visible in a status face, not just 3 transient stderr warns.
 type UnrecognizedPathStats = { total: number; paths: Record<string, number> };
 export function getUnrecognizedPathStats(): UnrecognizedPathStats {
     const paths: Record<string, number> = {};
     let total = 0;
     for (const [path, n] of unrecognizedPathCounts) {
+        paths[path] = n;
+        total += n;
+    }
+    return { total, paths };
+}
+export function getRefusedForeignPathStats(): UnrecognizedPathStats {
+    const paths: Record<string, number> = {};
+    let total = 0;
+    for (const [path, n] of refusedForeignPathCounts) {
         paths[path] = n;
         total += n;
     }
