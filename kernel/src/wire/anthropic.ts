@@ -592,11 +592,25 @@ function healUnpairedServerToolBlocks(out: AnthropicWireMessage[]): number {
     });
     if (kept.length === blocks.length) continue;
     dropped += blocks.length - kept.length;
+    const final = kept as unknown as AnthropicBlock[];
+    // #5864 second producer: dropping the orphaned server-tool half can leave a
+    // thinking-family block as the FINAL block — Anthropic 400s the whole
+    // request ("the final block in an assistant message cannot be thinking").
+    // Append the same placeholder the emptied case uses so the thinking block
+    // is never final. The thinking block itself is untouched (KDD #10: its
+    // bytes and signature round-trip verbatim); only a sibling text block is
+    // added after it.
+    const last = final[final.length - 1];
+    if (
+      last &&
+      (last.type === "thinking" || last.type === "redacted_thinking")
+    )
+      final.push({ type: "text", text: SERVER_TOOL_FOLDED_PLACEHOLDER });
     out[mi] = {
       role: "assistant",
       content:
-        kept.length > 0
-          ? (kept as unknown as AnthropicBlock[])
+        final.length > 0
+          ? final
           : [{ type: "text", text: SERVER_TOOL_FOLDED_PLACEHOLDER }],
     };
   }
