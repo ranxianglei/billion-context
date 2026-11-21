@@ -3,12 +3,14 @@
     {
       "file": "website/blog/posts/2026-10-08_meet-bili.md",
       "zh_file": "website/blog/posts/2026-10-08_meet-bili.zh.md",
-      "slug": "meet-bili"
+      "slug": "meet-bili",
+      "discussion": 5550
     },
     {
       "file": "website/blog/posts/2026-11-01_frequent-compression.md",
       "zh_file": "website/blog/posts/2026-11-01_frequent-compression.zh.md",
-      "slug": "frequent-compression"
+      "slug": "frequent-compression",
+      "discussion": 5551
     }
   ]
 }
