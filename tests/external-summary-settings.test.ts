@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { expandExternalSummaryChain, expandExternalSummaryChainTolerant, parseExternalSummaryChain, parseExternalSummarySettings } from "../src/external-summary-settings.ts";
 import { SummaryCredentialStore } from "../src/external-summary-credentials.ts";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
-import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, type NamedProviderRecipe } from "../src/config.ts";
+import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, pendingCompressValidationError, type NamedProviderRecipe } from "../src/config.ts";
 import { defaultConfig } from "acp-kernel";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -103,6 +103,49 @@ test("totalTimeoutMs accepts the widened cap and rejects above it (#2484)", () =
     // deadline, so the cap was raised from 50s to 600s; the default stays 50s.
     assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_000 } }));
     assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_001 } }));
+});
+
+test("lone targetTimeoutMs derives a default total instead of rejecting the block (#7100)", () => {
+    // A lone 90s target must not be rejected just because the default total
+    // (50s) is smaller — the total defaults to target × targetCount.
+    const one = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000 } });
+    assert.deepEqual(one.budget, { totalTimeoutMs: 90_000, targetTimeoutMs: 90_000, maxSummaryBytes: 65536 });
+    // Two targets → total = 2 × 90s = 180s (each sequential target gets its full window).
+    const two = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash", "claude/claude-haiku"], budget: { targetTimeoutMs: 90_000 } });
+    assert.deepEqual(two.budget, { totalTimeoutMs: 180_000, targetTimeoutMs: 90_000, maxSummaryBytes: 65536 });
+    // No target, no total → unchanged defaults.
+    const defaults = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"] });
+    assert.deepEqual(defaults.budget, { totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 65536 });
+    // Derived total is capped at the global 600s.
+    const capped = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash", "claude/claude-haiku", "google/gemini-flash", "remote/resp-model", "local/local"], budget: { targetTimeoutMs: 400_000 } });
+    assert.equal(capped.budget?.totalTimeoutMs, 600_000);
+    assert.equal(capped.budget?.targetTimeoutMs, 400_000);
+});
+
+test("totalTimeoutMs derived from target is floored at the 50s default (#7100)", () => {
+    // target=100 (below default total 50000) → total stays at 50000 (floor), target stays at 100.
+    const small = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 100 } });
+    assert.deepEqual(small.budget, { totalTimeoutMs: 50_000, targetTimeoutMs: 100, maxSummaryBytes: 65536 });
+});
+
+test("explicit total smaller than target is a genuine contradiction and still rejects (#7100)", () => {
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } }), /targetTimeoutMs 90000 exceeds totalTimeoutMs 50000/);
+    // The whole compress block is still dropped (contract preserved).
+    assert.equal(parseCompressSettings({ externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } } }), undefined);
+});
+
+test("pendingCompressValidationError does not go stale when the block is removed on reload (#7100)", () => {
+    // A failed load arms the pending error (parseCompressSettings drops the
+    // block and returns undefined rather than throwing — the throw is from
+    // parseExternalSummaryChain, caught here).
+    assert.equal(parseCompressSettings({ externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } } }), undefined);
+    assert.ok(pendingCompressValidationError());
+    // ...a reload with NO externalSummary key must clear it (no stale error)...
+    parseCompressSettings({});
+    assert.equal(pendingCompressValidationError(), undefined);
+    // ...and a reload with no compress section at all also clears it.
+    parseCompressSettings(undefined);
+    assert.equal(pendingCompressValidationError(), undefined);
 });
 
 for (const invalid of [
@@ -318,6 +361,31 @@ test("whole-file save accepts documented mitm:// URL lanes but still rejects rou
         response = await save({ providers: { myname: { compress: { maxContextLimit: "50%" } } } });
         assert.equal(response.status, 400);
         assert.match(await response.text(), /invalid recipe on named provider \\"myname\\"/);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+    }
+});
+
+test("/__bili/config carries the invalid reason when the compress block is dropped (#7100)", async () => {
+    const path = join(root(), "config.json");
+    const previous = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = path;
+    writeFileSync(path, JSON.stringify({ compress: { externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"], budget: { targetTimeoutMs: 90_000, totalTimeoutMs: 50_000 } } } }));
+    const server = http.createServer((req, res) => {
+        const handler = req.method === "GET" ? handleConfigGet(res) : handleConfigPut(req, res);
+        void handler.catch(() => { res.writeHead(500); res.end("test handler failed"); });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const base = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+    try {
+        const response = await fetch(base);
+        const body = JSON.parse(await response.text());
+        assert.equal(body.compress.externalSummary.invalid, true);
+        assert.match(body.compress.externalSummary.reason, /targetTimeoutMs 90000 exceeds totalTimeoutMs 50000/);
     } finally {
         server.closeAllConnections();
         await new Promise<void>((resolve) => server.close(() => resolve()));

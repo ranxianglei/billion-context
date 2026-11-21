@@ -233,10 +233,12 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
                 credentialStatus[ref] = state === "configured";
                 credentialDetail[ref] = state;
             }
-        } catch {
+        } catch (error) {
             // A manually edited invalid block can contain inline credentials.
             // Never echo that block through either structured or raw config GET.
-            config.compress = { ...rawCompress, externalSummary: { invalid: true } };
+            // #7100: carry the specific reason so the invalid sentinel is not a
+            // bare {invalid:true} — the reader can see WHY the block was dropped.
+            config.compress = { ...rawCompress, externalSummary: { invalid: true, reason: error instanceof Error ? error.message : String(error) } };
             hideInvalidSummary = true;
         }
     }
