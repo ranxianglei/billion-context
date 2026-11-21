@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // #2668: hermetic XDG roots, set BEFORE importing anything from src/ (the
 // auto-restart.test.ts pattern — several src modules capture XDG-derived
@@ -152,7 +153,7 @@ async function withProxy(upstreamHandler: (req: http.IncomingMessage, res: http.
             [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-drift-e2e": { context: 400_000 } } },
         },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

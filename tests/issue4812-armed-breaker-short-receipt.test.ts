@@ -6,6 +6,7 @@ import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig 
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
@@ -36,7 +37,7 @@ function makeCtx(messages: CoreMessage[], config?: Config, logs?: string[]): Rew
     const session = makeSession();
     const res = assignRefs(messages, { existing: emptyRefMap(), nextIndex: 0 });
     session.state.messageRefs = res.map;
-    return { core: createCore(), config: config ?? defaultConfig(200000), messages, session, log: logs ? (m) => logs.push(m) : () => {} };
+    return { core: createCore(), config: config ?? ({ ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig), messages, session, log: logs ? (m) => logs.push(m) : () => {} };
 }
 
 // Same shape as the #2146 fixture: two sub-gate messages plus six big ones, so

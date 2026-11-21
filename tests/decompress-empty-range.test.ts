@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 process.env.BILI_PERSIST = "0";
 
 import { createCore, defaultConfig, DEFAULT_CCR_CONFIG, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, type Config, type CoreMessage } from "acp-kernel";
-import { applyCompressSettings } from "../src/compress-settings.ts";
+import { applyCompressSettings, type ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { parseCompressInput, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE } from "../src/compress-tool.ts";
@@ -45,7 +45,7 @@ type FoldResult = {
 function fold(opts: { ccr: boolean; plugin?: string }): FoldResult {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         200_000,
         { ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
     ) as Config;
@@ -163,7 +163,7 @@ function readManifest(config: Config): ManifestBody {
 }
 
 test("#1712: manifest (CCR off by default) never advertises decompress range args on any wire", () => {
-    const m = readManifest(defaultConfig(200_000));
+    const m = readManifest({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig);
     for (const wire of ["anthropic", "openai", "responses"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.ok(props, `${wire}: decompress present`);
@@ -174,7 +174,7 @@ test("#1712: manifest (CCR off by default) never advertises decompress range arg
 });
 
 test("#1712: manifest with base CCR on advertises range args on anthropic/openai only — responses never arms CCR in plugin mode (#1271)", () => {
-    const m = readManifest({ ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } });
+    const m = readManifest({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } } as ResolvedKernelConfig);
     for (const wire of ["anthropic", "openai"]) {
         const props = propsOf(m.tools[wire] ?? [], DECOMPRESS_TOOL_NAME);
         assert.equal(props?.startId?.type, "string", `${wire}: startId advertised with base CCR on`);

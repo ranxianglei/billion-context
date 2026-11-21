@@ -8,6 +8,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 function makeCtx(messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -22,7 +23,7 @@ function makeCtx(messages: CoreMessage[] = []): {
 } {
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: {
             id: "loop-compress-test",
@@ -92,7 +93,7 @@ test("successful compress keeps every message in a large refreshed history", asy
 
 test("successful compress accepts a refresh hook returning its current view", async () => {
     const ctx = withRefs(makeCtx(Array.from({ length: 7 }, (_, i) =>
-        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `identity history ${i} ${bigText(5000)}`),
+        textMsg(`raw_${i}`, i % 2 === 0 ? "user" : "assistant", `identity history ${i} ${bigText(10000)}`),
     )));
     let refreshCalls = 0;
     ctx.refreshFolded = (current) => { refreshCalls++; return current; };
@@ -333,13 +334,13 @@ test("loop #6: philosophy systemPrompt is transient — appears in the ONE re-re
 test("loop #7: successful compress (real block) → re-request fires (model continues; one-compress guard prevents a second mutate)", async () => {
     // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
     const ctx = withRefs(makeCtx([
-        textMsg("raw_1", "user", bigText(5000)),
-        textMsg("raw_2", "assistant", bigText(5000)),
-        textMsg("raw_3", "user", bigText(5000)),
-        textMsg("raw_4", "assistant", bigText(5000)),
-        textMsg("raw_5", "user", bigText(5000)),
-        textMsg("raw_6", "assistant", bigText(5000)),
-        textMsg("raw_7", "user", bigText(5000)),
+        textMsg("raw_1", "user", bigText(10000)),
+        textMsg("raw_2", "assistant", bigText(10000)),
+        textMsg("raw_3", "user", bigText(10000)),
+        textMsg("raw_4", "assistant", bigText(10000)),
+        textMsg("raw_5", "user", bigText(10000)),
+        textMsg("raw_6", "assistant", bigText(10000)),
+        textMsg("raw_7", "user", bigText(10000)),
     ]));
     const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     const round1 = [
@@ -368,13 +369,13 @@ test("loop external summary: streaming compress uses the configured model and cr
     const previousKey = process.env.E2E_SUMMARY_KEY;
     const originalFetch = globalThis.fetch;
     const ctx = withRefs(makeCtx([
-        textMsg("raw_1", "user", bigText(5000)),
-        textMsg("raw_2", "assistant", bigText(5000)),
-        textMsg("raw_3", "user", bigText(5000)),
-        textMsg("raw_4", "assistant", bigText(5000)),
-        textMsg("raw_5", "user", bigText(5000)),
-        textMsg("raw_6", "assistant", bigText(5000)),
-        textMsg("raw_7", "user", bigText(5000)),
+        textMsg("raw_1", "user", bigText(10000)),
+        textMsg("raw_2", "assistant", bigText(10000)),
+        textMsg("raw_3", "user", bigText(10000)),
+        textMsg("raw_4", "assistant", bigText(10000)),
+        textMsg("raw_5", "user", bigText(10000)),
+        textMsg("raw_6", "assistant", bigText(10000)),
+        textMsg("raw_7", "user", bigText(10000)),
     ]));
     const summary = "Dedicated summary: preserve src/example.ts:27 and the pending test task.".repeat(3);
     const round1 = [
@@ -706,9 +707,9 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
     // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
     const ctx = withRefs(
         makeCtx([
-            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
-            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
-            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_1", "user", "task: audit files. " + bigText(10000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(10000)),
+            textMsg("raw_3", "user", bigText(10000)),
             textMsg("raw_4", "assistant", bigText(5000)),
             textMsg("raw_5", "user", bigText(5000)),
             textMsg("raw_6", "assistant", bigText(5000)),

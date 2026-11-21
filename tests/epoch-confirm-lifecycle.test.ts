@@ -10,6 +10,7 @@ import { reconcileFoldCoverage } from "../src/fold-reconcile.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { createSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
 
@@ -18,7 +19,7 @@ for (const shape of ["one-interior-survivor", "all-missing", "small-zombie"] as 
         const dir = mkdtempSync(join(tmpdir(), "bili-epoch-confirm-"));
         try {
             const core = createCore();
-            const config = defaultConfig(200_000);
+            const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
             const session = createSession(`epoch-confirm-${shape}`);
             const messages: CoreMessage[] = Array.from({ length: 40 }, (_, i) => ({
                 id: `h_original_${i}`, role: i % 2 ? "assistant" : "user", contentType: "text",

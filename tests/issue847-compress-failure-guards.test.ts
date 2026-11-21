@@ -103,7 +103,9 @@ test("#847: repeated identical failing spec escalates; success clears the streak
         textMsg("raw_1", "assistant", "a".repeat(800)),
         textMsg("raw_2", "assistant", "b".repeat(800)),
     ];
-    for (let i = 3; i <= 8; i++) msgs.push(textMsg(`raw_${i}`, "assistant", "x".repeat(5000)));
+    // #7333: 10000-char messages (2500 tok) so the foldable portion of
+    // m00003–m00008 (before the 5000-tok recent zone) reclaims ≥ 4096 tok.
+    for (let i = 3; i <= 8; i++) msgs.push(textMsg(`raw_${i}`, "assistant", "x".repeat(10000)));
     const ctx = makeCtx(msgs);
 
     const first = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;

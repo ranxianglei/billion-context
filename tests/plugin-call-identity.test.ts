@@ -40,7 +40,7 @@ async function harness() {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    const config = defaultConfig(200_000);
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 };
     const opts: ProxyOptions = {
         port: 0, host: "127.0.0.1", upstream: origin,
         routes: { [origin]: { models: { "gpt-identity": { context: 200_000 } } } },

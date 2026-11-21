@@ -8,6 +8,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { listSessions } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // Gemini native wire end-to-end: the client replays a growing `contents` array
 // against `/v1beta/models/<model>:streamGenerateContent?alt=sse`, the mock
@@ -237,11 +238,11 @@ function proxyOptions(upstreamPort: number): ProxyOptions {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gemini-test": { context: 1_000_000 } } } } as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, {
+        kernelConfig: { ...defaultConfig(1_000_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 800,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
-        }),
+        }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

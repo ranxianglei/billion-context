@@ -76,7 +76,7 @@ function findToolCallAssistant(rb: { messages: WireMessage[] }, toolName: string
 // Mirror of server.prepareOpenai: openaiToCore → processTurn.
 function prepare(body: Record<string, unknown>, session: Session) {
     const core = createCore();
-    const config = defaultConfig(200000);
+    const config = { ...defaultConfig(200000), minFoldBenefitTokens: 0 };
     const { msgs, systemText } = openaiToCore(body as OpenAIRequestBody) as { msgs: CoreMessage[]; systemText: string };
     const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 100, renderTags: "text-only" });
     session.state = turn.state;

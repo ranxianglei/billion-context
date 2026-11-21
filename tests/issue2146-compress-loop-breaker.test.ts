@@ -80,7 +80,14 @@ test("#2146: distinct-spec failure streak arms the circuit breaker at 3", () => 
 });
 
 test("#2146: success clears the streak; later failures start fresh", () => {
-    const ctx = makeCtx(fixtureMessages());
+    // #7333: 10000-char messages so the m00003–m00008 fold reclaims ≥ 4096 tok
+    // (the min-benefit floor); the small m00001/m00002 ranges stay sub-gate.
+    const msgs: CoreMessage[] = [
+        textMsg("raw_1", "assistant", "a".repeat(800)),
+        textMsg("raw_2", "assistant", "b".repeat(800)),
+    ];
+    for (let i = 3; i <= 8; i++) msgs.push(textMsg(`raw_${i}`, "assistant", "x".repeat(10000)));
+    const ctx = makeCtx(msgs);
     applyRanges(parseCompressInput(compressArgs("m00001", "m00001")), ctx);
     applyRanges(parseCompressInput(compressArgs("m00002", "m00002")), ctx);
     const armed = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
@@ -183,7 +190,14 @@ test("#2146: loopTracking:false (preflight lane) never touches the model-facing 
 });
 
 test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failures keep them verbatim", () => {
-    const ctx = makeCtx(fixtureMessages());
+    // #7333: 10000-char messages so the clamped m00001–m00008 fold reclaims
+    // ≥ 4096 tok (the min-benefit floor).
+    const msgs: CoreMessage[] = [
+        textMsg("raw_1", "assistant", "a".repeat(800)),
+        textMsg("raw_2", "assistant", "b".repeat(800)),
+    ];
+    for (let i = 3; i <= 8; i++) msgs.push(textMsg(`raw_${i}`, "assistant", "x".repeat(10000)));
+    const ctx = makeCtx(msgs);
     const stale = applyRanges(parseCompressInput(compressArgs("m00010", "m00014")), ctx).text;
     assert.ok(stale.startsWith("[Compression FAILED:"), `unknown refs fail (got: ${stale.slice(0, 120)})`);
     assert.match(stale, /above this session's highest ref \(m00008\)/, "frontier diagnosis present");

@@ -26,6 +26,7 @@ import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap 
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -41,7 +42,7 @@ function makeCtx(opts?: { id?: string; messages?: CoreMessage[]; refs?: boolean 
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: opts?.messages ?? [],
         session: {
             id: opts?.id ?? "sess-cfs",

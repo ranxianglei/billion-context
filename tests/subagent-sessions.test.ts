@@ -4,6 +4,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig, summaryMessageId } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { attachSubagentSessions, captureSubagentSessionIds, subagentSessionNote, subagentSessionsOf, syncSubagentSessions } from "../src/subagent-sessions.ts";
 
 // #1702 (redesign of #1704 per review): the sub-agent session id is captured
@@ -19,7 +20,7 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
     const logs: string[] = [];
     return {
         core: createCore(),
-        config: defaultConfig(200000, overrides as never),
+        config: { ...defaultConfig(200000, overrides as never), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: {
             id: "subagent-sessions-test",

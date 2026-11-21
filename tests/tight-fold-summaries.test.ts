@@ -42,6 +42,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Item = Record<string, unknown>;
 
@@ -150,7 +151,7 @@ function proxyOptions(upstreamPort: number, model: string, ctx: number): ProxyOp
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [model]: { context: ctx } } } },
         modelContextLimit: ctx,
-        kernelConfig: defaultConfig(ctx),
+        kernelConfig: { ...defaultConfig(ctx), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

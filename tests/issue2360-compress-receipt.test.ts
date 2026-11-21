@@ -113,11 +113,14 @@ test("#2360: unknown-ref failures label stale-ref; covered ranges label covered-
     assert.match(stale, /\[cause: stale-ref/);
 
     // Full-view context: compress a big range successfully, then re-request it.
+    // #7333: messages are 10000 chars (2500 tok) each so the foldable portion
+    // (m00003–m00006, before the 5000-tok recent zone) reclaims ≥ 4096 tok and
+    // passes the new min-benefit floor; 5000-char messages left only 2460 tok.
     const all = [
         textMsg("raw_1", "assistant", "a".repeat(800)),
         textMsg("raw_2", "assistant", "b".repeat(800)),
     ];
-    for (let i = 3; i <= 8; i++) all.push(textMsg(`raw_${i}`, "assistant", "x".repeat(5000)));
+    for (let i = 3; i <= 8; i++) all.push(textMsg(`raw_${i}`, "assistant", "x".repeat(10000)));
     const session = makeSession();
     const res = assignRefs(all, { existing: emptyRefMap(), nextIndex: 0 });
     session.state.messageRefs = res.map;

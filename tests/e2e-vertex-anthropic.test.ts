@@ -145,7 +145,7 @@ async function startHarness(scripts: string[][]): Promise<Harness> {
         // six filler turns sit just under the 5000-token default, which would put
         // the filler inside the zone and make the fold fail for a reason this test
         // is not about.
-        kernelConfig: { ...defaultConfig(400_000), preserveRecentTokens: 0 },
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0, preserveRecentTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

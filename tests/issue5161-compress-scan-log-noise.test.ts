@@ -24,6 +24,7 @@ import { applyRanges, visibleSummaryStubs, type RewriteCtx } from "../src/stream
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -31,7 +32,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [] as CoreMessage[],
         session: {
             id: `ext5161-${Math.random().toString(36).slice(2)}`,

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveDecompress } from "../src/decompress-shared.ts";
 import { applyRanges } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { getSession } from "../src/session.ts";
@@ -19,7 +20,7 @@ import { getSession } from "../src/session.ts";
 
 function makeCtx() {
     const core = createCore();
-    const config = defaultConfig(200000) as Config;
+    const config = { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig;
     const session = getSession(`refold-wiring-${Math.random().toString(36).slice(2)}`);
     return { core, config, session };
 }

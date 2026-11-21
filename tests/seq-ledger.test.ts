@@ -162,7 +162,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>): Promise<void> {
         proxyMode: "direct",
         proxySource: "direct",
         modelContextLimit: 15000,
-        kernelConfig: defaultConfig(15000),
+        kernelConfig: { ...defaultConfig(15000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

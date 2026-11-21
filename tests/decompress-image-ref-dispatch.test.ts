@@ -25,7 +25,7 @@ process.env.BILI_PERSIST = "0";
 process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), "bili-imgref-dispatch-"));
 
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
-import { applyCompressSettings } from "../src/compress-settings.ts";
+import { applyCompressSettings, type ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
@@ -59,7 +59,7 @@ type FoldResult = {
 function fold(): FoldResult {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         200_000,
         { ccr: { enabled: false, minToolTokens: 50 } },
     ) as Config;

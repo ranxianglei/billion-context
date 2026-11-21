@@ -21,6 +21,7 @@ import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
@@ -35,7 +36,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         // View present while the setup folds run; each eviction-scenario test
         // clears it afterwards (state survives, the message bytes do not).
         messages: MESSAGES,

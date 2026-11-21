@@ -521,7 +521,7 @@ async function driveWire(wire: Wire, steps: Step[], opts?: DriveOpts): Promise<C
         port: 0, host: "127.0.0.1", upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [adapter.model]: { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

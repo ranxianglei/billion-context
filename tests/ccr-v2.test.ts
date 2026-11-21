@@ -19,7 +19,7 @@ import {
     type CoreMessage,
     type MessageContentStore,
 } from "acp-kernel";
-import { applyCompressSettings } from "../src/compress-settings.ts";
+import { applyCompressSettings, type ResolvedKernelConfig } from "../src/compress-settings.ts";
 import { adoptContentStore, contentStoreOf, drainPendingRetrievals, storeEffectiveCcr } from "../src/store.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -62,7 +62,7 @@ type FoldResult = {
 function fold(opts: { ccr: boolean; preStore?: MessageContentStore }): FoldResult {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         200_000,
         { absorb: { enabled: true, minToolTokens: 50 }, ccr: opts.ccr ? { enabled: true, minToolTokens: 50 } : { enabled: false, minToolTokens: 50 } },
     ) as Config;
@@ -317,7 +317,7 @@ async function startV2Proxy(captured: string[], noCcr?: boolean): Promise<{ prox
             [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } },
         },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: noCcr ? { injectTool: true, injectNudge: false, minCompressRangeChars: 1000 } : { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
         compat: { roles: {} },
         streamErrorShape: "protocol",
@@ -455,7 +455,7 @@ test("e2e CCR v2 non-stream: fold persists across turns; range restore delivered
             [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } },
         },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false, minCompressRangeChars: 1000, ccr: { enabled: true } },
         compat: { roles: {} },
         streamErrorShape: "protocol",

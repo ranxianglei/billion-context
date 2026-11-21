@@ -12,6 +12,7 @@ import { exportSession, listSessions } from "../src/export.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // E2E for `bili export` (#151): drives the REAL proxy (startServer) against a
 // mock upstream that plays the model's side of the compress protocol — it reads
@@ -124,7 +125,7 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: { ...defaultConfig(400_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
