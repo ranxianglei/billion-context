@@ -112,6 +112,25 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
     return out;
 }
 
+// #7168/#7439: DSH rides top-level `dsh_*` client extensions on every request —
+// `dsh_session_log` (the 8 MiB lossless session-log upload for the official
+// DeepSeek API; the model never reads it) plus the sibling `dsh_plugin_packages`.
+// During the transition bili INTERCEPTS them: this drops every TOP-LEVEL `dsh_*`
+// key so the 8 MiB is never forwarded upstream (no bandwidth waste, no unknown-
+// field risk on a non-DeepSeek upstream). Nested `dsh_*` (inside messages, etc.)
+// is untouched — only top-level keys go. Returns the same reference when there is
+// nothing to drop (fast path). Gated by the `passDshExtensions` rollout flag
+// (default OFF = strip). RELEASE the intercept by flipping the flag to 100% once
+// the client-extension sideband ships (#6785 / discussion #7439). Exported for tests.
+export function withoutDshClientExtensions(parsed: unknown): unknown {
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return parsed;
+    const rec = parsed as Record<string, unknown>;
+    if (!Object.keys(rec).some((k) => k.startsWith("dsh_"))) return parsed;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rec)) if (!k.startsWith("dsh_")) out[k] = v;
+    return out;
+}
+
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
@@ -705,6 +724,12 @@ async function handleRequest(
             parsed = null;
         }
     }
+    // #7168/#7439: intercept DSH client extensions (default) — strip top-level
+    // `dsh_*` so the 8 MiB `dsh_session_log` is never forwarded upstream. Gated by
+    // the `passDshExtensions` rollout flag (default OFF = strip); release it once
+    // the client-extension sideband ships (#6785 / #7439). See
+    // withoutDshClientExtensions + src/rollout.ts.
+    if (!featureEnabled("passDshExtensions")) parsed = withoutDshClientExtensions(parsed);
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
     const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
