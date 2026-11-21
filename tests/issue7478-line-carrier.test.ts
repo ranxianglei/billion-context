@@ -110,3 +110,52 @@ test("preflight block (no compressCallId) always keeps its anchor, even with a f
     const out = stripKernelSummaries(messages, stateWith([{ blockId: "b0", active: true }]));
     assert.deepEqual(ids(out), ids(messages));
 });
+
+// Kernel-parity rows: the carrier index must accept exactly the header forms
+// the kernel's parseLineEntry accepts (kernel/src/parse-compress-input.ts) —
+// the nudge's tier condensation/distillation drives b-ref (block-id) headers,
+// and merged blocks keep startRef="bN" verbatim (kernel compress.ts).
+
+test("line-format b-ref pair (the nudge's tier-condensation header) -> stripped", () => {
+    const body = "b5–b9 合并\n" + "s".repeat(250);
+    const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+    const out = stripKernelSummaries(messages, pluginState("b5", "b9"));
+    assert.deepEqual(ids(out), ["tc_c1", "u0"]);
+});
+
+test("line-format unpadded m-refs normalize to the block's padded refs -> stripped", () => {
+    const body = "m150–m220 topic\n" + "s".repeat(250);
+    const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+    const out = stripKernelSummaries(messages, pluginState("m00150", "m00220"));
+    assert.deepEqual(ids(out), ["tc_c1", "u0"]);
+});
+
+test("line-format alt separators (tilde / ellipsis / to) -> stripped", () => {
+    for (const sep of ["~", "…", "to"]) {
+        const body = `m00150${sep}m00220 topic\n` + "s".repeat(250);
+        const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+        const out = stripKernelSummaries(messages, pluginState("m00150", "m00220"));
+        assert.deepEqual(ids(out), ["tc_c1", "u0"], `separator ${JSON.stringify(sep)}`);
+    }
+});
+
+test("line-format single-ref header (startRef == endRef) -> stripped", () => {
+    const body = "m00150\n" + "s".repeat(250);
+    const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+    const out = stripKernelSummaries(messages, pluginState("m00150", "m00150"));
+    assert.deepEqual(ids(out), ["tc_c1", "u0"]);
+});
+
+test("line-format pair with unrecognized separator is kernel-rejected -> never registered -> kept", () => {
+    const body = "m00150 ? m00220 topic\n" + "s".repeat(250);
+    const messages = [summary("b0"), toolCall("c1", lineArgs(body)), tail()];
+    const out = stripKernelSummaries(messages, pluginState("m00150", "m00220"));
+    assert.deepEqual(ids(out), ids(messages));
+});
+
+test("JSON entries with the kernel's canonical startRef/endRef field names -> stripped", () => {
+    const args = JSON.stringify({ content: [{ startRef: "m00150", endRef: "m00220", summary: "s".repeat(300) }] });
+    const messages = [summary("b0"), toolCall("c1", args), tail()];
+    const out = stripKernelSummaries(messages, pluginState("m00150", "m00220"));
+    assert.deepEqual(ids(out), ["tc_c1", "u0"]);
+});
