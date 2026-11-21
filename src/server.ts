@@ -2777,7 +2777,7 @@ export function warnResponsesReasoningPairs(
  *  full when its length reaches the same stub signature threshold; unparseable
  *  args, missing summaries, and stub-shaped text all fail safe to KEEP the
  *  anchor. */
-function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureRangePairs: () => Map<string, Set<string>>; ensureFullRangeKeys: () => Set<string> } {
+function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; compressCalls: BiliMessage[]; ensureFullRangeKeys: () => Set<string> } {
     const callIds = new Set<string>();
     const compressCalls: BiliMessage[] = [];
     for (const m of messages) {
@@ -2785,25 +2785,19 @@ function buildCarrierIndex(messages: BiliMessage[]): { callIds: Set<string>; com
         if (m.toolCallId) callIds.add(m.toolCallId);
         if (m.toolName === COMPRESS_TOOL_NAME) compressCalls.push(m);
     }
-    let rangePairs: Map<string, Set<string>> | null = null;
     let fullRangeKeys: Set<string> | null = null;
-    const ensureRangePairs = (): Map<string, Set<string>> => {
-        if (!rangePairs) {
-            rangePairs = new Map<string, Set<string>>();
+    const ensureFullRangeKeys = (): Set<string> => {
+        if (!fullRangeKeys) {
             fullRangeKeys = new Set<string>();
             for (const c of compressCalls) {
-                const entries = parseCarrierEntries(c.text ?? "");
-                for (const e of entries) {
-                    let ends = rangePairs.get(e.startRef);
-                    if (!ends) { ends = new Set<string>(); rangePairs.set(e.startRef, ends); }
-                    ends.add(e.endRef);
+                for (const e of parseCarrierEntries(c.text ?? "")) {
                     if (e.carryingFull) fullRangeKeys.add(`${e.startRef}::${e.endRef}`);
                 }
             }
         }
-        return rangePairs;
+        return fullRangeKeys;
     };
-    return { callIds, compressCalls, ensureRangePairs, ensureFullRangeKeys: () => { ensureRangePairs(); return fullRangeKeys!; } };
+    return { callIds, compressCalls, ensureFullRangeKeys };
 }
 
 // #7478: one parsed range entry of a compress call's args — which range it
