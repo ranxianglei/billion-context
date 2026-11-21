@@ -317,7 +317,8 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // Base-only report; never fall back to a stale snapshot.
     }
     // #4331: uncovered history — contiguous runs outside every active block AND
-    // outside the live offer above (older than the protected recent window).
+    // outside the live offer above (older than the protected window, or inside
+    // one of its components).
     // They keep going upstream raw while no surface names them; additive
     // section, rendered only when non-trivial. Advisory: any failure skips it.
     try {
@@ -336,7 +337,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             extra.push("");
-            extra.push(`UNCOVERED HISTORY — ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are absent from the Compressible-ranges list above (older than the protected recent window): ${describeUncoveredRuns(runs)}. They keep going upstream raw (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect their rows with scope:"uncompressed".`);
+            extra.push(`UNCOVERED HISTORY — ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are absent from the Compressible-ranges list above (outside the offered ranges — either older than the protected window, or inside one of its components): ${describeUncoveredRuns(runs)}. They keep going upstream raw (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect their rows with scope:"uncompressed".`);
         }
     } catch {
         // Advisory section; never break the status report.
