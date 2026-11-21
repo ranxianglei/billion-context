@@ -117,3 +117,30 @@ test("formatConflictSection: header age split + advice switches with liveness (#
     assert.ok(susText.includes("Every event above is [suspected]"));
     assert.ok(!susText.includes("Keep exactly ONE compressor"));
 });
+
+test("formatConflictSection: pure id-churn-adoption is bili's own recovery — no plugin hunt, no imperative (#5786/#4131)", () => {
+    const now = Date.now();
+    // The reporter's ledger from #5786: a single active, fully-re-anchored adoption.
+    const adopt: ConflictEvent[] = [
+        { at: now - 60000, kind: "id-churn-adoption", detail: "980/2967 incoming message(s) carry pre-turn refs of 2960 known; fold-reconcile re-anchored every covered id (0 unmatched)" },
+    ];
+    const text = formatConflictSection(adopt, now).join("\n");
+    assert.ok(text.includes("bili itself re-minted message ids across builds"), text);
+    assert.ok(!text.includes("something outside bili touched this conversation"), "not framed as external interference");
+    assert.ok(text.includes("cross-build id re-mints that bili itself adopted"), text);
+    assert.ok(text.includes("nothing to act on"), "a recovered adoption demands no corrective action");
+    assert.ok(!text.includes("Every event above is [suspected]"), "no verify-first plugin errand");
+    assert.ok(!text.includes("Keep exactly ONE compressor"), "no imperative without confirmed evidence");
+    assert.ok(!text.includes("disable the client's own auto-compaction"), "no per-client auto-compaction command for a self-recovery");
+});
+
+test("formatConflictSection: mixed id-churn-adoption + rewrite keeps the unconfirmed-signal tier verbatim (#5786)", () => {
+    const now = Date.now();
+    const mixed: ConflictEvent[] = [
+        { at: now - 60000, kind: "id-churn-adoption", detail: "adopted churn" },
+        { at: now - 30000, kind: "unannounced-rewrite", detail: "fresh rewrite" },
+    ];
+    const text = formatConflictSection(mixed, now).join("\n");
+    assert.ok(text.includes("UNCONFIRMED signal"), "the genuine rewrite still drives the unconfirmed tier");
+    assert.ok(!text.includes("cross-build id re-mints that bili itself adopted"), "pure-case framing must not leak into a mixed ledger");
+});
