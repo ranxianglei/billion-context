@@ -113,19 +113,24 @@ test("embed face echoes access-control-allow-origin for cross-origin pane probes
         const spoofed = await request(actualPort, { host: trusted, origin: "http://evil.com:8080" });
         assert.equal(spoofed.status, 403, "non-loopback Origin must still be rejected");
 
-        // #3513 (desktop variant): the dsh desktop Electron app renders the
-        // pane from the custom scheme origin dsh-app://app. The gate must
-        // admit exactly that origin so the probe's cors read carries the echo
-        // (real-world console: "blocked by CORS policy … from origin
-        // 'dsh-app://app'" with a bare 403).
-        const desktop = await request(actualPort, { host: trusted, origin: "dsh-app://app" });
-        assert.equal(desktop.status, 200, "dsh-app://app pane probe must be admitted");
-        assert.equal(desktop.acao, "dsh-app://app", "desktop scheme origin must be echoed verbatim");
+        // #3513/#5203 (desktop variant): the dsh desktop Electron app renders
+        // the pane from a custom scheme origin. Older builds use dsh-app://app;
+        // DSH Desktop 0.13.0 renamed the registered protocol to dsh-desktop
+        // (renderer flags --standard-schemes/--cors-schemes/--fetch-schemes=
+        // dsh-desktop), so its probe carries Origin dsh-desktop://app (#5203:
+        // panel stuck on "Failed to fetch" — bare 403, cors read rejected).
+        // The gate must admit exactly those origins so the probe's cors read
+        // carries the echo.
+        for (const [scheme, label] of [["dsh-app", "dsh-app"], ["dsh-desktop", "dsh-desktop"]] as const) {
+            const desktop = await request(actualPort, { host: trusted, origin: `${scheme}://app` });
+            assert.equal(desktop.status, 200, `${label}://app pane probe must be admitted`);
+            assert.equal(desktop.acao, `${scheme}://app`, `${label} scheme origin must be echoed verbatim`);
+            const desktopEvil = await request(actualPort, { host: trusted, origin: `${scheme}://evil` });
+            assert.equal(desktopEvil.status, 403, `${label} with a foreign hostname must be rejected`);
+        }
 
-        // The allowance is the dsh desktop convention ONLY: a foreign hostname
-        // under the same scheme, or any other custom scheme, stays rejected.
-        const desktopEvil = await request(actualPort, { host: trusted, origin: "dsh-app://evil" });
-        assert.equal(desktopEvil.status, 403, "dsh-app with a foreign hostname must be rejected");
+        // The allowance is the dsh desktop convention ONLY: any other custom
+        // scheme stays rejected.
         const fileLike = await request(actualPort, { host: trusted, origin: "file://" });
         assert.equal(fileLike.status, 403, "other non-http schemes stay rejected");
     } finally {
