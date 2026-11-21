@@ -2027,7 +2027,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
-                assert.match(lines[0]!, /refusals so far: 1 \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
+                assert.match(lines[0]!, /refusals so far: 1 \(body size unknown — streamed\/unreadable; the over-window fuse could not run, window unknown\)$/);
                 // the ALS boundary starts throwing (disposed/closing agent scope) →
                 // new category → re-print carrying the accumulated count.
                 // #2924: `threw` now goes through the bounded settle-retry
@@ -2041,7 +2041,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 lines = refusedLines();
                 assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
                 assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
-                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
+                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run, window unknown\)$/);
                 // further thrown refusals stay silent again
                 assert.equal(await gate(url), false);
                 assert.equal(refusedLines().length, 2);
@@ -2050,7 +2050,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
-                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
+                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run, window unknown\)$/);
                 // attributed traffic claims silently — no line
                 ctx.agents.currentInitiator = origCI;
                 ctx.setInitiator({ session: { id: "s1158l2" } });
@@ -2059,7 +2059,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
                 // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/m);
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run, window unknown\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
@@ -2067,6 +2067,55 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             }
         });
     } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#5613 gate refusal line self-describes egressed scale: body bytes + resolved window (or unknown)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Wire the model services the way a real host would so the gate can
+            // resolve a real window — the #5613 session's egressed scale was
+            // otherwise unprovable from the logs.
+            class Llm5613d {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm5613d(), { currentSelection: () => ({ provider: "p5613d", model: "m5613d" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const url = "https://api.gate-5613d.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
+            // A sub-ceiling unattributed body rides #1117 DIRECT; its durable line must
+            // carry the request's own scale — measured body bytes + resolved window.
+            _setModelInfoForTest({ provider: "p5613d", model: "m5613d", contextWindow: 1_000_000 });
+            assert.equal(await gate(url, { bytes: 927_000 }), false, "sub-ceiling unattributed body rides #1117 direct");
+            let lines = refusedLines();
+            assert.equal(lines.length, 1, `expected one refusal line, got: ${lines.join(" | ")}`);
+            assert.match(lines[0]!, /refusals so far: 1 \(this body 927,000 B, window 1,000,000\)$/);
+            // Window unresolvable → the line degrades to `window unknown` (never a
+            // fabricated number). A fresh endpoint earns its own first line — the
+            // same endpoint would stay silent until the every-10th cadence.
+            _setModelInfoForTest();
+            assert.equal(await gate("https://api.gate-5613d2.test/v1/chat/completions", { bytes: 927_000 }), false);
+            lines = refusedLines();
+            assert.equal(lines.length, 2, `expected the fresh endpoint's first line, got: ${lines.join(" | ")}`);
+            assert.match(lines[1]!, /refusals so far: 1 \(this body 927,000 B, window unknown\)$/);
+        });
+    } finally {
+        _setModelInfoForTest();
         proxy.close();
         rmrf(stateHome);
         rmrf(home);
@@ -2291,9 +2340,9 @@ test("#5613 gate DIRECT-send visibility: a continuous leak loop is logged on a b
                 assert.equal(await gate(url, { bytes: 2048 }), false, `send ${i + 1} rides #1117 direct (small body)`);
             }
             assert.equal(directLines().length, 3, "first + every-10th cadence, nothing else");
-            assert.match(directLines()[0]!, /refusals so far: 1 \(this body 2,048 B\)/);
-            assert.match(directLines()[1]!, /refusals so far: 10 \(state none→none\) \(this body 2,048 B\)/);
-            assert.match(directLines()[2]!, /refusals so far: 20 \(state none→none\) \(this body 2,048 B\)/);
+            assert.match(directLines()[0]!, /refusals so far: 1 \(this body 2,048 B, window unknown\)/);
+            assert.match(directLines()[1]!, /refusals so far: 10 \(state none→none\) \(this body 2,048 B, window unknown\)/);
+            assert.match(directLines()[2]!, /refusals so far: 20 \(state none→none\) \(this body 2,048 B, window unknown\)/);
             // 10 more sends whose size CANNOT be known (streamed/unreadable
             // bodies): they ride direct too, and the cadence line at count 30
             // names the blind spot instead of staying silent.
@@ -2301,7 +2350,7 @@ test("#5613 gate DIRECT-send visibility: a continuous leak loop is logged on a b
                 assert.equal(await gate(url), false, `send ${21 + i} rides #1117 direct (size unknown)`);
             }
             assert.equal(directLines().length, 4, "cadence line at count 30");
-            assert.match(directLines()[3]!, /refusals so far: 30 \(state none→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)/);
+            assert.match(directLines()[3]!, /refusals so far: 30 \(state none→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run, window unknown\)/);
         });
     } finally {
         proxy.close();
