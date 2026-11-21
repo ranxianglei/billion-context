@@ -31,7 +31,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
 import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
@@ -233,12 +233,16 @@ export { resolveStorageMode, type StorageMode } from "../knobs.ts";
 
 interface ShadowStats {
     ingests: number;
-    deltaIngests: number;
+
     /** #3133: sampled read-back verifications RUN (verifyOk + verifyDrift
      *  ≤ this). Sampling, not removal — drift stays observable. */
     verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
+    /** #5677: ingests that took the deep (full re-serialize) path because the
+     *  session was drift-latched. The #3133 deltaIngests counter is gone with
+     *  the delta/watermark mechanism; this is the latch's observable. */
+    deepIngests: number;
     imports: number;
     /** Retained on the status wire for panel compatibility. Never set to true
      *  anymore — the self-disable breaker was removed (2026-10-30 owner policy:
@@ -271,7 +275,7 @@ export function orphanContents(legacy: LegacySessionLike): boolean {
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
+    readonly stats: ShadowStats = { ingests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, deepIngests: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
     /** #3135 ④/#3818: sessions whose last sampled verify drifted. Members are
      *  served from the JSON envelope by persist.loadSync (while it exists)
      *  until a save verifies clean again; surfaced on /__bili/status wire as
@@ -349,6 +353,17 @@ export class UnifiedShadow {
         const detail = formatShadowFailure(err, phase, sessionId);
         this.consecutiveFailures += 1;
         this.stats.lastError = detail;
+        // #7156 (2026-11-21): with the open-time write gone (per-save
+        // reconcile is now the only write), corruption-shaped failures
+        // surface at INGEST time instead of boot time — classify them
+        // loudly instead of hiding behind the generic warn: the operator
+        // needs "the index is corrupt, back it up and hand-fix it", not
+        // "a write was retried".
+        const corruption = sqliteCorruptionDetail(err);
+        if (corruption !== null) {
+            integrityQuickCheckFailed = true;
+            loggerLog("error", `[storage] index.db FAILED at an ingest write (${corruption}) — the index is CORRUPT; the JSON envelopes keep serving but the index must be fixed BY HAND: back up ${this.dbPath ?? "index.db"}{,-wal,-shm}, move those files aside, start again (fresh index re-imports envelopes) (#7156)`);
+        }
         const key = String(err);
         if (key !== this.lastWarnKey) {
             this.lastWarnKey = key;
@@ -440,11 +455,10 @@ export class UnifiedShadow {
                 );
                 return null;
             }
-            // #3285: watermark trust does not cross process boundaries — a
-            // restart-handoff overlap leaves the previous writer's rows AND
-            // watermark behind; drop them all so this process's first save
-            // per session re-establishes trust from its own view.
-            store.resetAllIngestWatermarks();
+            // #3285 is obsolete by construction (2026-11-21): with no
+            // stored watermark there is no foreign trust to drop at boot —
+            // every save reconciles by client-sent identity and converges on
+            // the same rows no matter which process wrote them.
         } catch (err) {
             // The inner gate's refusal throw (or any StorageIntegrityError the
             // inner catch let through) re-enters THIS catch — it is already
@@ -632,61 +646,48 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-            // #3133 watermark: pay the full O(log) ingest only when the
-            // trusted-prefix probe cannot vouch for the stored prefix —
-            // steady-state saves stringify+hash+INSERT just the NEW tail.
-            // Any doubt (no watermark, foreign edit, tail shorter than the
-            // watermark, snapshot-bearing session) falls back to the exact
-            // full path below; the delta itself re-verifies the boundary
-            // inside the ingest transaction, so a racing writer degrades to
-            // a full ingest, never a corrupt one.
+            // Every save goes through the reconciled path (#3285/#4182): the
+            // log is reconciled against the stored rows by client-sent
+            // identity — a presented id re-points at its stored row (blind
+            // pin, zero serialization), everything genuinely new is a new
+            // row. There is no watermark and no delta fast path: the
+            // reconciler IS the steady state, O(new messages) per save by
+            // construction.
             // #5744: wall-clock guard on the ingest itself — message count is
             // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
             // SAME ~3k msgs). Names the path so a spike is attributable
-            // (delta fast path vs full fallback) without a profiler.
+            // without a profiler.
             const tIngestStart = performance.now();
-            let ingestPath = "delta";
-            phase = "ingest-delta";
+            const ingestPath = "reconciled";
+            phase = "ingest-session";
             // #5677: while drift-latched the sampled digest has PROVEN the
-            // stored view diverges from the live one — vouching for a trusted
-            // prefix is exactly the trust that sample just voided. A host that
-            // re-writes history slots below the watermark on every save (the
-            // #4614 producer class) makes the delta path re-diverge within ≤
-            // VERIFY_EVERY_INGESTS saves of each heal, so the samples drift in
-            // a row, the streak escalates and the envelope freezes — the
-            // chronic ESCALATED→FROZEN loop reported in #5677. Forcing the
-            // exact full path for every latched save keeps both legs
+            // stored view diverges from the live one — pinning the stored
+            // rows (the reconciler's steady state) would preserve exactly the
+            // divergent bytes. Forcing the deep path (every row
+            // re-serializes) for every latched save keeps both legs
             // same-generation at sample time: the next sample passes, the
-            // latch releases, the delta resumes. Bounded cost (full ingest per
-            // save) paid only by sessions whose views are already proven
-            // divergent; healthy sessions never see it.
-            const deltaApplied = !this.driftedSessions.has(legacy.id) && this.ingestDelta(legacy, hasRawTail);
-            if (!deltaApplied) {
-                ingestPath = "full";
-                phase = "plan-ingest";
-                const plan = planIngest(legacy);
-                phase = "ingest-session";
-                // #3285: only a raw-tail plan is the complete log — that is
-                // what lets the full path sweep foreign rows as stale.
-                // #5408: while drift-latched the ENVELOPE is what loadSync
-                // serves (the latch exists because the index diverged from
-                // it), so the index must converge to THAT view — sweep on
-                // every latched full ingest even without a raw tail. Before
-                // this, a folded-resident save (no raw tail) never swept:
-                // foreign rows rode every replay and the drift could never
-                // clear on its own (the incident behind #5408 sat frozen for
-                // 8h on exactly this shape).
-                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
-                this.sync.ingestSession(plan, undefined, { completeLog });
-            }
+            // latch releases, the reconciler resumes. Bounded cost (full
+            // re-serialize per save) paid only by sessions whose views are
+            // already proven divergent; healthy sessions never see it.
+            const latched = this.driftedSessions.has(legacy.id);
+            // #3285/#5408 sweep gate: only a raw-tail plan is the complete
+            // log — that is what lets the apply sweep foreign rows as stale.
+            // While drift-latched the ENVELOPE is what loadSync serves (the
+            // latch exists because the index diverged from it), so the index
+            // must converge to THAT view — sweep on every latched save even
+            // without a raw tail (the incident behind #5408 sat frozen for
+            // 8h before latched saves swept).
+            const completeLog = hasRawTail || latched;
+            this.sync.ingestReconciled(legacy, { deep: latched, completeLog });
             this.stats.ingests++;
+            if (latched) this.stats.deepIngests++;
             const ingestMs = Math.round(performance.now() - tIngestStart);
             if (ingestMs > SLOW_INGEST_WARN_MS) {
                 // #5744: attach WAL forensics so a stall spike can be attributed
                 // to a checkpoint burst (multi-second tick inside the window)
                 // instead of per-row statement cost — read-only, warn path only.
                 const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
-                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=reconciled(deep) means the drift latch forced the full re-serialize (#5677)`);
             }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
@@ -766,16 +767,15 @@ export class UnifiedShadow {
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
-                    // #3166 review: the backstop must heal, not only report —
-                    // the watermark still vouches for a prefix the digest just
-                    // proved stale (e.g. an envelope re-render or interior
-                    // rewrite below the boundary), and every same-length save
-                    // would re-take the unverified empty delta against it.
-                    // Drop the watermark so the next save re-points every
-                    // tail slot through the exact full path (divergence
-                    // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
-                    this.sync.clearIngestWatermark(legacy.id);
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
+                    // #3166 review: the backstop must heal, not only report.
+                    // The latch above IS the heal: every save until a clean
+                    // sample re-admits the session takes the exact full path
+                    // (deep reconcile) and re-points every tail slot, so the
+                    // divergence window is bounded to ≤ VERIFY_EVERY_INGESTS
+                    // saves. (Pre-2026-11-21 this cleared the ingest
+                    // watermark — the column is gone with the #3133 delta
+                    // path.)
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — latched the session: saves take the exact full path until a clean sample re-admits it`);
                 } else {
                     this.stats.verifyOk++;
                     // #3135 ④/#3818: a clean sample re-admits the session to
@@ -797,47 +797,6 @@ export class UnifiedShadow {
         }
     }
 
-    /** #3133 delta ingest attempt for one record's legacy view — returns
-     *  true when the O(new-messages) fast path committed. Every doubt
-     *  routes to `false` (→ the caller's full ingest); failures here must
-     *  never throw into record(), whose catch counts toward disabling the
-     *  shadow — a watermark hiccup is not a storage health problem. */
-    private ingestDelta(legacy: LegacySessionLike, hasRawTail: boolean): boolean {
-        if (this.sync === null) return false;
-        try {
-            const mark = this.sync.ingestWatermark(legacy.id);
-            if (!mark) return false;
-            // The pre-transaction probe is an optimization (skip building a
-            // doomed plan); ingestSession re-verifies the boundary inside
-            // BEGIN IMMEDIATE, which is the authoritative check.
-            const boundary = this.sync.probeIngestBoundary(legacy.id, mark.seq);
-            if (!boundary) return false;
-            // #3919: the head slot of the trusted prefix rides the same
-            // positional assumption as every slot below the boundary — probe
-            // its stored identity too so prefix rewrites fail the delta NOW
-            // instead of waiting for the sampled verify. trustedLen === 1:
-            // the head IS the boundary slot, already probed above. A MISSING
-            // row means a dangling pointer — refuse, never trust.
-            let head: { msgId: string } | undefined;
-            if (mark.tailSeqs.length > 1) {
-                const headMsgId = this.sync.headRowMsgId(legacy.id, mark.tailSeqs[0]);
-                if (headMsgId === null) return false;
-                head = { msgId: headMsgId };
-            }
-            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail, head);
-            if (!plan) return false;
-            const applied = this.sync.ingestSession(plan, {
-                trustedSeq: mark.seq,
-                boundaryMsgId: boundary.msgId,
-                boundaryHash: boundary.contentHash,
-                trustedTailSeqs: mark.tailSeqs,
-            });
-            if (applied) this.stats.deltaIngests++;
-            return applied;
-        } catch {
-            return false;
-        }
-    }
 
     /** Loads the unified view of one session (full mode read path).
      *  Returns null on miss — the caller falls back to the legacy file. */
@@ -954,7 +913,7 @@ export class UnifiedShadow {
             // viewFor rebuild; callers fall back to the envelope itself.
             // #4216/#4242: orphan shape is representable (journal rides the
             // plan) — import normally instead of rejecting.
-            this.sync.ingestSession(planIngest(legacy), undefined, { envelopeImport: true });
+            this.sync.ingestSession(planIngest(legacy), { envelopeImport: true });
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
             return legacy;
@@ -1326,46 +1285,24 @@ export class UnifiedShadow {
                 // #3818/#3841: same orphan-guard + reap-journal semantics.
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
-                // #3133 watermark delta.
-                phase = "ingest-delta";
-                let applied = false;
+                // Identity reconcile (2026-11-21; #3133 delta path gone).
                 // #5677: same latch gate as the sync path above — a drift-
-                // latched session's stored prefix is proven untrustworthy by
-                // definition; the exact full path keeps both legs same-
-                // generation so the next sample can re-admit and release it.
-                if (!this.driftedSessions.has(legacy.id)) {
-                    try {
-                        const mark = await backend.ingestWatermark(legacy.id);
-                        if (mark) {
-                            const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
-                            if (boundary) {
-                                const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
-                                if (plan) {
-                                    applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
-                                    if (applied) this.stats.deltaIngests++;
-                                }
-                            }
-                        }
-                    } catch {
-                        applied = false;
-                    }
-                }
-                // #5412: mirror the sync path's latched-sweep promotion (#5408
-                // B1 / #4323). While the sampler has latched this session as
-                // drift-latched, the envelope is the view loadSync serves —
-                // the full re-ingest must claim authoritative-set authority
-                // even without a raw tail so its stale sweep retires foreign
-                // residue rows; otherwise every latched save re-takes the
-                // incomplete view, the next sample drifts again, and the
-                // frozen session never self-heals.
-                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
-                if (!applied) {
-                    phase = "plan-ingest";
-                    const plan = planIngest(legacy);
-                    phase = "ingest-session";
-                    await backend.ingestSession(plan, undefined, { completeLog });
-                }
+                // latched session's stored rows are proven untrustworthy by
+                // definition, so pinning them (the reconciler's steady
+                // state) would preserve exactly the divergent bytes; the
+                // exact full path keeps both legs same-generation so the next
+                // sample can re-admit and release it.
+                // #5408/#5412 latched-sweep promotion: while latched the
+                // envelope is the view loadSync serves — the re-ingest must
+                // claim authoritative-set authority even without a raw tail
+                // so its stale sweep retires foreign residue rows; otherwise
+                // the frozen session never self-heals.
+                const latched = this.driftedSessions.has(legacy.id);
+                const completeLog = hasRawTail || latched;
+                phase = "ingest-session";
+                await backend.ingestReconciled(legacy, { deep: latched, completeLog });
                 this.stats.ingests++;
+                if (latched) this.stats.deepIngests++;
                 phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
@@ -1388,8 +1325,7 @@ export class UnifiedShadow {
                         this.stats.verifyDrift++;
                         this.driftedSessions.add(legacy.id);
                         this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
-                        await backend.clearIngestWatermark(legacy.id);
-                        loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
+                        loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — latched the session: saves take the exact full path until a clean sample re-admits it`);
                     } else {
                         this.stats.verifyOk++;
                         this.driftedSessions.delete(legacy.id);
@@ -1442,7 +1378,7 @@ export class UnifiedShadow {
                 // #4216/#4242: orphan shape rides the plan journal — import normally.
                 // envelopeImport: stored block lineage + stats stay authoritative
                 // (see the sync twin's contract, 2026-11-21 / #7156).
-                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy), undefined, { envelopeImport: true }));
+                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy), { envelopeImport: true }));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
                 return legacy;
@@ -1732,7 +1668,19 @@ class BatchedViewVerification {
 
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
-            const raw = JSON.parse(row.content);
+            let raw: unknown;
+            try {
+                raw = JSON.parse(row.content);
+            } catch {
+                // Unparseable stored content: the bytes no longer round-trip,
+                // so this is a proven divergence. raw stays undefined → its
+                // signature (the "null" digest) cannot match the live message,
+                // the sample reports drift, the latch fires and the deep path
+                // re-serializes. Without the guard this throw escaped AFTER the
+                // ingest commit: every sample blew up, the latch never set, and
+                // the deep-repair path was dead.
+                raw = undefined;
+            }
             this.messages.set(row.seq, { sig: messageSignature(raw), raw });
         }
     }

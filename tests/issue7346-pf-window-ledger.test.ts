@@ -95,10 +95,11 @@ test("a non-raw window save (the fix) appends the window and keeps the verified 
 
             // The watermark-HIT turn pins only the ~2-row window. The fix marks
             // it non-raw, so persist.ts omits the raw tail — shadow.record sees
-            // rawTail=undefined and the #3285 sweep never fires. Force the full
-            // path (the sweep's only home) by clearing the watermark.
+            // rawTail=undefined and the #3285 sweep never fires (the sweep's
+            // completeLog gate). (Pre-2026-11-21 this test forced the full path
+            // by clearing the ingest watermark — the column is gone; saves
+            // reconcile by identity and the gate is raw-tail/latch only.)
             const window = [msg(100), msg(101)];
-            store.clearIngestWatermark(id);
             shadow.record(mkLegacy(id, window), undefined);
 
             assert.equal(liveRows(store, id), 102, "prefix retained + window appended — no sweep on a HIT window save");
@@ -130,7 +131,6 @@ test("a raw window save (the pre-fix shape) still sweeps the prefix — genuine 
             // window omits. This is the genuine-truncation path the fix must
             // NOT mask.
             const window = [msg(100), msg(101)];
-            store.clearIngestWatermark(id);
             shadow.record(mkLegacy(id, window), { lastMessages: window, lastMessagesFolded: false });
 
             assert.equal(liveRows(store, id), 2, "the raw window save sweeps the verified prefix away (the bug, still reachable on genuine truncation)");

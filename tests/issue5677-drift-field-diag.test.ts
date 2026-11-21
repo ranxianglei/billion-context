@@ -94,7 +94,7 @@ function mkLegacy(id: string, lastMessages: LegacySessionLike["lastMessages"]): 
 
 interface StatsView {
     ingests: number;
-    deltaIngests: number;
+    deepIngests: number;
     verifySamples: number;
     verifyOk: number;
     verifyDrift: number;
@@ -202,14 +202,15 @@ test("latch gate: a drift-latched session rides the full path until a clean samp
                 // Text VALUES stay out (ids appear in the fingerprints by design).
                 assert.ok(!lines[0].includes("cas-swap-payload") && !lines[0].includes("hello 0"), "values never reach the log line");
 
-                // While latched: every save takes the exact full path — the
-                // trusted-prefix delta is suspended for the whole window.
-                const deltasAtLatch = stats(shadow).deltaIngests;
+                // While latched: every save takes the exact full (deep
+                // re-serialize) path — the reconciler's pinning steady state
+                // is suspended for the whole window.
+                const deepsAtLatch = stats(shadow).deepIngests;
                 for (let i = 0; i < 20; i++) {
                     k += 1;
                     shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, j) => msg(j))));
                 }
-                assert.equal(stats(shadow).deltaIngests, deltasAtLatch, "no delta ingest while drift-latched");
+                assert.equal(stats(shadow).deepIngests, deepsAtLatch + 20, "every latched save takes the deep path");
                 assert.equal(stats(shadow).verifyDrift, 2, "the tamper is permanent, so the second sample drifts too");
 
                 // Heal the stored bytes; the next sample must re-admit.
@@ -224,10 +225,10 @@ test("latch gate: a drift-latched session rides the full path until a clean samp
                 assert.equal(stats(shadow).verifyDrift, 2, "no further drift after the heal");
                 assert.ok(!drifted(shadow).has(ids), "a clean sample releases the latch");
 
-                // Delta resumes once the prefix is trusted again.
-                const before = stats(shadow).deltaIngests;
+                // The deep path stops once the prefix is trusted again.
+                const before = stats(shadow).deepIngests;
                 shadow.record(mkLegacy(ids, Array.from({ length: k + 1 }, (_, j) => msg(j))));
-                assert.equal(stats(shadow).deltaIngests, before + 1, "post-re-admission append rides the delta");
+                assert.equal(stats(shadow).deepIngests, before, "post-re-admission append does NOT take the deep path");
             } finally {
                 stop();
             }
@@ -255,14 +256,15 @@ test("latch gate (async twin): a drift-latched session on the backend queue also
             shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
             await settle();
             assert.equal(stats(shadow).ingests, 1, "first ingest is full");
-            assert.equal(stats(shadow).deltaIngests, 0);
+            assert.equal(stats(shadow).deepIngests, 0);
 
-            // Positive control: unlatched, an append rides the delta fast path.
+            // Positive control: unlatched, an append rides the reconciler's
+            // steady state (the non-deep path).
             k += 1;
             shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
             await settle();
-            assert.equal(stats(shadow).deltaIngests, 1, "unlatched append rides the delta");
-            assert.equal(stats(shadow).ingests, 2, "every save lands as an ingest (async lane counts deltas too)");
+            assert.equal(stats(shadow).deepIngests, 0, "unlatched append does NOT ride the deep path");
+            assert.equal(stats(shadow).ingests, 2, "every save lands as an ingest (async lane counts all ingests)");
 
             // Latch the session directly (same manual latch as the #5412
             // suite — this pins the GATE predicate, not the sampling that
@@ -272,7 +274,7 @@ test("latch gate (async twin): a drift-latched session on the backend queue also
             k += 1;
             shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
             await settle();
-            assert.equal(stats(shadow).deltaIngests, 1, "no delta ingest while drift-latched (async queue)");
+            assert.equal(stats(shadow).deepIngests, 1, "the latched save takes the deep path (async queue)");
             assert.equal(stats(shadow).ingests, 3, "the latched save landed via the exact full path");
         } finally {
             shadow.close();

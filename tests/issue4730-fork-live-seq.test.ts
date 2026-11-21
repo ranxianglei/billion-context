@@ -62,7 +62,7 @@ test("#4730: fork clone keeps the newest live rows when a middle row is tombston
         // Retire the MIDDLE row (f_c, seq 2) the way the historian does: a
         // completeLog re-ingest whose authoritative set no longer contains it.
         const sansMiddle = full.filter((m) => m.id !== "f_c");
-        store.ingestSession(planIngest(session(parent, sansMiddle)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(session(parent, sansMiddle)), { completeLog: true });
 
         const live = store.getMessages(parent).map((m) => m.msgId).sort();
         assert.deepEqual(live, ["f_a", "f_b", "f_d", "f_e", "f_f"], "fixture sanity: f_c tombstoned, the rest live");
@@ -107,7 +107,7 @@ test("#4730: lastLiveSeq is null for a session with no live rows", () => {
 
         // Retire everything, then assert the null contract the facade relies
         // on (null → kernel-only fork, never a fabricated bound).
-        store.ingestSession(planIngest(session(sid, [])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(session(sid, [])), { completeLog: true });
         assert.equal(store.getMessages(sid).length, 0, "fixture sanity: no live rows");
         assert.equal(store.lastLiveSeq(sid), null, "no live rows → null, not -1 and not 0");
         assert.equal(store.lastLiveSeq("never-ingested"), null, "unknown session → null");

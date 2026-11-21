@@ -131,10 +131,10 @@ test("--jsonl includes retired (rewound) rows marked by retiredAt; live rows omi
                 { id: "id-b", text: "bravo", wireIndex: 1 },
                 { id: "id-c", text: "charlie", wireIndex: 2 },
             ];
-            store.ingestSession(planIngest(histLike("retired-1", 10, msgs)), undefined, { completeLog: true });
+            store.ingestSession(planIngest(histLike("retired-1", 10, msgs)), { completeLog: true });
             // The client rewound past id-a → the historian sweep tombstones it (#4390).
             const rewound = msgs.slice(1).map((m, i) => ({ ...m, wireIndex: i }));
-            store.ingestSession(planIngest(histLike("retired-1", 11, rewound)), undefined, { completeLog: true });
+            store.ingestSession(planIngest(histLike("retired-1", 11, rewound)), { completeLog: true });
 
             // Precondition: default read hides the retired row, opt-in sees it.
             assert.equal(store.getMessages("retired-1").length, 2, "default getMessages filters retired");

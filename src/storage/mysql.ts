@@ -41,6 +41,9 @@ import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { sha256Hex, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
+// ESM cycle with ingest.ts (it imports row types from store.js; safe — both
+// sides touch the other's exports only inside function bodies).
+import { planIngest, type LegacySessionLike } from "./ingest.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
 import type {
@@ -623,55 +626,33 @@ export class MysqlBackend implements StorageBackend {
 
     async ingestSession(
         input: IngestSessionInput,
-        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean },
     ): Promise<boolean> {
-        return this.ingestSessionOn(input, delta, opts);
+        return this.ingestSessionOn(input, opts);
+    }
+
+    /** Steady-state save (mirror of the sqlite backend). The mysql path does
+     *  not port the reconciler's pin optimization — it keeps the exact full
+     *  path (same convergence contract, same no-watermark discipline; the
+     *  #3133 delta branch was removed 2026-11-21). `deep` is a no-op here:
+     *  the full path IS the deep path. */
+    async ingestReconciled(legacy: LegacySessionLike, opts?: { deep?: boolean; completeLog?: boolean }): Promise<boolean> {
+        const plan = planIngest(legacy);
+        return this.ingestSessionOn(plan, { completeLog: opts?.completeLog });
     }
 
     private async ingestSessionOn(
         input: IngestSessionInput,
-        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean },
         connection?: PoolConnection,
     ): Promise<boolean> {
         const s = { ...input.session, tailJson: input.session.tailJson };
         const ingest = async (c: PoolConnection): Promise<boolean> => {
             let messages: MessageRow[];
-            let watermark: number | null;
-            if (delta) {
-                const probe = await this.probeIngestBoundaryOn(c, s.sessionId, delta.trustedSeq);
-                if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
-                    return false;
-                }
-                for (const m of input.messages) {
-                    if (!m.contentHash) return false;
-                    // #4390: identity join; retired rows count as existing
-                    // (rewind-redo falls back to the full path).
-                    const [hit] = (await c.query(
-                        "SELECT 1 FROM messages WHERE session_id = ? AND msg_id = ? AND identity = ? LIMIT 1",
-                        [s.sessionId, m.msgId, m.identity ?? identityOfStoredContent(m.content)],
-                    )) as unknown as Row[][];
-                    if (hit.length > 0) return false;
-                }
-                messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
-                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
-                const prefixOk =
-                    Array.isArray(tail.tailSeqs) &&
-                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
-                    delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
-                if (!prefixOk) return false;
-                s.tailJson = JSON.stringify({
-                    ...tail,
-                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
-                });
-                watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
-            } else {
+            {
                 // Remapping mutates tailJson; persist the same session object
                 // it updates, not the caller's separate plan-space snapshot.
-                const full = await this.remapPlanToAbsoluteOn(c, { ...input, session: s });
-                messages = full.messages;
-                watermark = full.watermark;
+                messages = await this.remapPlanToAbsoluteOn(c, { ...input, session: s });
                 if (opts?.completeLog === true && !(await this.hasLaneExtOn(c, s.sessionId))) {
                     const incomingIds = new Set<string>();
                     for (const m of messages) {
@@ -742,7 +723,7 @@ export class MysqlBackend implements StorageBackend {
                    kstate_json = VALUES(kstate_json),
                    tail_json = VALUES(tail_json),
                    ccr_json = VALUES(ccr_json),
-                   last_ingested_seq = VALUES(last_ingested_seq)`,
+                   last_ingested_seq = NULL`,
                 [
                     s.sessionId,
                     s.parentSessionId ?? null,
@@ -764,7 +745,7 @@ export class MysqlBackend implements StorageBackend {
                     s.kstateJson,
                     s.tailJson,
                     s.ccrJson ?? null,
-                    watermark,
+                    null,
                 ],
             );
             await c.query(
@@ -1065,7 +1046,7 @@ export class MysqlBackend implements StorageBackend {
     private async remapPlanToAbsoluteOn(
         c: PoolConnection,
         input: IngestSessionInput,
-    ): Promise<{ messages: MessageRow[]; watermark: number | null }> {
+    ): Promise<MessageRow[]> {
         const s = input.session;
         const [rows] = (await c.query(
             "SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?",
@@ -1168,31 +1149,12 @@ export class MysqlBackend implements StorageBackend {
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
         const pluginSnapshotSeqs = remapSeqs(input.pluginSnapshotSeqs);
         const tailSeqs = remapSeqs(input.tailSeqs);
-        const watermark = tailSeqs !== null && tailSeqs !== undefined && tailSeqs.length > 0 ? tailSeqs[tailSeqs.length - 1] : null;
         s.tailJson = JSON.stringify({
             ...(JSON.parse(s.tailJson) as Record<string, unknown>),
             ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
             ...(tailSeqs !== undefined ? { tailSeqs } : {}),
         });
-        return { messages, watermark };
-    }
-
-    private async probeIngestBoundaryOn(
-        c: PoolConnection,
-        sessionId: string,
-        seq: number,
-    ): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
-        const [rows] = (await c.query(
-            "SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?",
-            [sessionId, seq],
-        )) as unknown as Row[][];
-        if (rows.length === 0) return null;
-        const [maxRows] = (await c.query(
-            "SELECT MAX(seq) AS m FROM messages WHERE session_id = ?",
-            [sessionId],
-        )) as unknown as Row[][];
-        const m = maxRows[0]?.m;
-        return { msgId: str(rows[0].msg_id), contentHash: str(rows[0].content_hash), maxSeq: m === null || m === undefined ? -1 : num(m) };
+        return messages;
     }
 
     async sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
@@ -1220,20 +1182,6 @@ export class MysqlBackend implements StorageBackend {
         return rows.length > 0 ? num(rows[0].updated_at) : null;
     }
 
-    async ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null> {
-        const [rows] = (await this.pool.query(
-            "SELECT last_ingested_seq, tail_json FROM sessions WHERE session_id = ?",
-            [sessionId],
-        )) as unknown as Row[][];
-        if (rows.length === 0) return null;
-        const seq = rows[0].last_ingested_seq;
-        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null;
-        const tail = JSON.parse(str(rows[0].tail_json)) as { tailSeqs?: number[] | null };
-        const seqs = tail.tailSeqs;
-        if (!Array.isArray(seqs) || seqs.length === 0 || seqs[seqs.length - 1] !== seq) return null;
-        return { seq, tailSeqs: seqs };
-    }
-
     async tailSeqs(sessionId: string): Promise<number[] | null> {
         const [rows] = (await this.pool.query(
             "SELECT tail_json FROM sessions WHERE session_id = ?",
@@ -1246,23 +1194,6 @@ export class MysqlBackend implements StorageBackend {
         } catch {
             return null;
         }
-    }
-
-    async probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
-        const conn = await this.pool.getConnection();
-        try {
-            return await this.probeIngestBoundaryOn(conn, sessionId, seq);
-        } finally {
-            conn.release();
-        }
-    }
-
-    async clearIngestWatermark(sessionId: string): Promise<void> {
-        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?", [sessionId]);
-    }
-
-    async resetAllIngestWatermarks(): Promise<void> {
-        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL");
     }
 
     async reapBlocks(
@@ -1430,7 +1361,7 @@ export class MysqlBackend implements StorageBackend {
                 [parentId],
             )) as unknown as Row[][];
             if (parents.length === 0) {
-                if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
+                if (initial && !await this.ingestSessionOn(initial, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
                 await conn.commit();
                 return initial !== undefined;
             }
@@ -1493,7 +1424,7 @@ export class MysqlBackend implements StorageBackend {
                  ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
                 [childId, Date.now(), Date.now(), parentId, throughSeq],
             );
-            if (initial && !await this.ingestSessionOn(initial, undefined, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
+            if (initial && !await this.ingestSessionOn(initial, { completeLog: true }, conn)) throw new Error("cloneSessionRows: initial child ingest failed");
             await conn.commit();
             return true;
         } catch (err) {
@@ -1939,13 +1870,13 @@ export class MysqlBackend implements StorageBackend {
             }
             await c.query(
                 `UPDATE sessions SET parent_session_id = ?, fork_point_seq = ?, protocol = ?, label = ?, title = ?, host_title = ?, namespace = ?, origin = ?,
-                    created_at = ?, updated_at = ?, next_block_id = ?, next_run_id = ?, meta_json = ?, stats_json = ?, metadata_json = ?, kstate_json = ?, tail_json = ?, ccr_json = ?, last_ingested_seq = ?, orphans_json = ?, status = 'active' WHERE session_id = ?`,
+                    created_at = ?, updated_at = ?, next_block_id = ?, next_run_id = ?, meta_json = ?, stats_json = ?, metadata_json = ?, kstate_json = ?, tail_json = ?, ccr_json = ?, last_ingested_seq = NULL, orphans_json = ?, status = 'active' WHERE session_id = ?`,
                 [
                     sess.parentSessionId ?? null, sess.forkPointSeq ?? null, sess.protocol ?? null, sess.label ?? null,
                     sess.title ?? null, sess.hostTitle ?? null, sess.namespace ?? "proxy", sess.origin ?? null,
                     sess.createdAt, sess.updatedAt, sess.nextBlockId, sess.nextRunId,
                     sess.metaJson, sess.statsJson, sess.metadataJson, sess.kstateJson, sess.tailJson, sess.ccrJson ?? null,
-                    sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
+                    sess.orphansJson ?? null, sessionId,
                 ],
             );
         });

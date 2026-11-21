@@ -91,7 +91,7 @@ test("#5756: repeated completeLog saves skip already-retired rows (no re-stamp, 
             stmts = 0;
             raw.prepare = (q: string) => { stmts++; return origPrepare(q); };
             try {
-                store.ingestSession(planIngest(mkSession(SID, corpus.slice(corpus.length - W))), undefined, { completeLog: true });
+                store.ingestSession(planIngest(mkSession(SID, corpus.slice(corpus.length - W))), { completeLog: true });
             } finally {
                 raw.prepare = origPrepare;
             }
@@ -99,7 +99,7 @@ test("#5756: repeated completeLog saves skip already-retired rows (no re-stamp, 
         };
 
         // Save 1: full-history baseline (e.g. initial sync).
-        store.ingestSession(planIngest(mkSession(SID, base)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(SID, base)), { completeLog: true });
         assert.equal(liveCount(), 300);
 
         // Save 2: history grew to 304, window shows the last W rows → FIRST
@@ -139,7 +139,7 @@ test("#5756: repeated completeLog saves skip already-retired rows (no re-stamp, 
 
         // Rewind-redo (#4390/#4506): the full history comes back — every
         // tombstone reactivates in place and the image mapping is restored.
-        store.ingestSession(planIngest(mkSession(SID, c308)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(SID, c308)), { completeLog: true });
         assert.equal(retiredCount(), 0, "rewind-redo reactivated every tombstone");
         assert.equal(liveCount(), 308);
         assert.equal(store.mediaRefCount(IMG_B64), 1, "reactivated image row re-owns its media ref");

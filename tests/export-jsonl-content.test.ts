@@ -36,11 +36,11 @@ function seed(store: UnifiedStore, value: Session, raw: string, retired: boolean
     historical.content = raw;
     delete historical.contentHash;
     delete historical.identity;
-    store.ingestSession(initial, undefined, { completeLog: true });
+    store.ingestSession(initial, { completeLog: true });
     if (retired) {
         value.lastMessages = value.lastMessages!.slice(1);
         value.stats.requests++;
-        store.ingestSession(plan(value), undefined, { completeLog: true });
+        store.ingestSession(plan(value), { completeLog: true });
         assert.ok(store.getMessages(value.id, { includeRetired: true })[0]!.retiredAt != null);
     }
 }

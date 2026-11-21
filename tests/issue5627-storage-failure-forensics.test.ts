@@ -106,7 +106,9 @@ test("#5627: a pathologically nested message names itself, phase, session and fr
         assert.equal(shadow.stats.disabled, false, "the breaker is gone — failures retry forever, never disable");
         const last = shadow.stats.lastError ?? "";
         assert.match(last, /message h_deep: nesting too deep for JSON serialization/, "must name the offending message");
-        assert.match(last, /phase=plan-ingest/, "must name the failing operation");
+        // The reconciled path fuses plan + apply into one transaction, so a
+        // serialization failure during planning reports the fused phase.
+        assert.match(last, /phase=ingest-session/, "must name the failing operation");
         assert.match(last, /session=sess-deep/, "must name the session");
         assert.match(last, /\| at /, "top stack frames ride along");
 

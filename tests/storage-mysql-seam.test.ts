@@ -19,6 +19,7 @@ import type {
     StorageReadView,
 } from "../src/storage/backend.ts";
 import { sha256 } from "../src/storage/canonical.ts";
+import { planIngest } from "../src/storage/ingest.ts";
 
 /**
  * #4942: the async reload seam on network storage backends — hermetic twin of
@@ -72,6 +73,11 @@ class StubMysqlBackend implements StorageBackend {
             ccrEntries: input.ccrEntries,
         });
         return Promise.resolve(true);
+    }
+    /** Contract mirror of MysqlBackend: the full path plans from the legacy
+     *  view (no pin optimization on the mysql side — 2026-11-21). */
+    ingestReconciled(legacy: Parameters<typeof planIngest>[0]): Promise<boolean> {
+        return this.ingestSession(planIngest(legacy));
     }
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
         const row = this.rows.get(sessionId)?.session;

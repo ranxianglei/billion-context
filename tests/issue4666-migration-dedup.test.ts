@@ -231,8 +231,8 @@ type Ingester = {
 async function retireSecondMessage(store: Ingester, sid: string): Promise<void> {
     const m1 = mkMsg("vm1", "first ".repeat(20));
     const m2 = mkMsg("vm2", "second ".repeat(20));
-    assert.equal(await store.ingestSession(planIngest(mkSession(sid, [m1, m2])), undefined, { completeLog: true }), true, "initial complete ingest applies");
-    assert.equal(await store.ingestSession(planIngest(mkSession(sid, [m1])), undefined, { completeLog: true }), true, "shorter authoritative log applies");
+    assert.equal(await store.ingestSession(planIngest(mkSession(sid, [m1, m2])), { completeLog: true }), true, "initial complete ingest applies");
+    assert.equal(await store.ingestSession(planIngest(mkSession(sid, [m1])), { completeLog: true }), true, "shorter authoritative log applies");
 }
 
 test("#4666 sqlite: verifyProjections catches projection drift on RETIRED rows", async () => {

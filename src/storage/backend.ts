@@ -45,6 +45,7 @@ import type {
     WebSummaryRow,
     IngestSessionInput,
 } from "./store.js";
+import { type LegacySessionLike } from "./ingest.js";
 
 /** Everything a storage backend must provide. Mirrors the operation surface
  *  the product consumes (persist/shadow hot path, web lists, export,
@@ -55,9 +56,14 @@ export interface StorageBackend {
     // --- ingest / session lifecycle -------------------------------------
     ingestSession(
         input: IngestSessionInput,
-        delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
         opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): Promise<boolean>;
+    /** Steady-state save: identity reconciliation against the stored rows
+     *  (planReconciled) applied in one transaction — the only normal save
+     *  path since the #3133 watermark went away (2026-11-21). `deep` forces
+     *  the full re-serialize path (drift-latched sessions, #5677); see
+     *  UnifiedStore.ingestReconciled for the contract. */
+    ingestReconciled(legacy: LegacySessionLike, opts?: { deep?: boolean; completeLog?: boolean }): Promise<boolean>;
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null>;
     sessionUpdatedAt(sessionId: string): Promise<number | null>;
     deleteSession(sessionId: string): Promise<void>;
@@ -87,12 +93,8 @@ export interface StorageBackend {
     getCcr(sessionId: string): Promise<MessageContentStore | null>;
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]>;
 
-    // --- ingest watermark / pointers (#3253, #3798) ------------------------
-    ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null>;
+    // --- view pointers (#3253, #3798) -----------------------------------
     tailSeqs(sessionId: string): Promise<number[] | null>;
-    clearIngestWatermark(sessionId: string): Promise<void>;
-    resetAllIngestWatermarks(): Promise<void>;
-    probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null>;
 
     // --- reap journal (#3841) ----------------------------------------------
     reapBlocks(sessionId: string, reapedIds: Set<string>, orphanContents: Map<string, { one: unknown; full: unknown }>): Promise<void>;
@@ -161,8 +163,11 @@ export class SqliteBackend implements StorageBackend {
         return new SqliteBackend(UnifiedStore.open(indexPath, engine));
     }
 
-    ingestSession(input: IngestSessionInput, delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] }, opts?: { completeLog?: boolean; envelopeImport?: boolean }): Promise<boolean> {
-        return Promise.resolve(this.store.ingestSession(input, delta, opts));
+    ingestSession(input: IngestSessionInput, opts?: { completeLog?: boolean }): Promise<boolean> {
+        return Promise.resolve(this.store.ingestSession(input, opts));
+    }
+    ingestReconciled(legacy: LegacySessionLike, opts?: { deep?: boolean; completeLog?: boolean }): Promise<boolean> {
+        return Promise.resolve(this.store.ingestReconciled(legacy, opts));
     }
     sessionCounters(sessionId: string): Promise<{ requests: number; nextBlockId: number } | null> {
         return Promise.resolve(this.store.sessionCounters(sessionId));
@@ -224,20 +229,8 @@ export class SqliteBackend implements StorageBackend {
     getCcrEntries(sessionId: string): Promise<CcrEntryRow[]> {
         return Promise.resolve(this.store.getCcrEntries(sessionId));
     }
-    ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null> {
-        return Promise.resolve(this.store.ingestWatermark(sessionId));
-    }
     tailSeqs(sessionId: string): Promise<number[] | null> {
         return Promise.resolve(this.store.tailSeqs(sessionId));
-    }
-    clearIngestWatermark(sessionId: string): Promise<void> {
-        return Promise.resolve(this.store.clearIngestWatermark(sessionId));
-    }
-    resetAllIngestWatermarks(): Promise<void> {
-        return Promise.resolve(this.store.resetAllIngestWatermarks());
-    }
-    probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
-        return Promise.resolve(this.store.probeIngestBoundary(sessionId, seq));
     }
     reapBlocks(sessionId: string, reapedIds: Set<string>, orphanContents: Map<string, { one: unknown; full: unknown }>): Promise<void> {
         return Promise.resolve(this.store.reapBlocks(sessionId, reapedIds, orphanContents));

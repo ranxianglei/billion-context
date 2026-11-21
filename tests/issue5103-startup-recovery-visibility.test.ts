@@ -198,9 +198,9 @@ test("#5103: first ingest failure warns immediately with the db path; failures N
         // keeps its file descriptors, so post-open chmod cannot simulate this
         // cross-platform — refuse at the store seam both record() paths
         // (delta + full) route through instead.
-        const store = (shadow as unknown as { sync: { ingestSession: (...args: never[]) => boolean } }).sync;
+        const store = (shadow as unknown as { sync: { ingestReconciled: (...args: never[]) => boolean } }).sync;
         const readonlyRefusal = () => { throw new Error("attempt to write a readonly database"); };
-        store.ingestSession = readonlyRefusal as typeof store.ingestSession;
+        store.ingestReconciled = readonlyRefusal as typeof store.ingestReconciled;
 
         const captured: Array<{ level: string; msg: string }> = [];
         setLogCapture((level, msg) => captured.push({ level, msg }));

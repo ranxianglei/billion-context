@@ -81,9 +81,9 @@ test("#4665: dump carries identity + retired_at; restore round-trips both; re-in
         const a = mkMsg("m-a", "alpha ".repeat(30));
         const b = mkMsg("m-b", "bravo ".repeat(30));
         const c = mkMsg("m-c", "charlie ".repeat(30));
-        store.ingestSession(planIngest(mkSession(sid, [a, b, c])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(sid, [a, b, c])), { completeLog: true });
         // Head truncation retires m-a (historian tombstone, #4390).
-        store.ingestSession(planIngest(mkSession(sid, [b, c])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(sid, [b, c])), { completeLog: true });
 
         const before = rowsOf(store, sid);
         assert.equal(before.length, 3, "3 rows: 2 live + 1 retired");
@@ -120,7 +120,7 @@ test("#4665: dump carries identity + retired_at; restore round-trips both; re-in
 
         // The actual bug: with restored identities intact the next full
         // ingest JOINs onto the same rows — no re-mint, no duplicate window.
-        store.ingestSession(planIngest(mkSession(sid, [b, c])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(sid, [b, c])), { completeLog: true });
         const stable = rowsOf(store, sid);
         assert.equal(stable.length, 3, "re-ingest after restore mints nothing new");
         for (const r of before) {
@@ -140,7 +140,7 @@ test("#4665: pre-fix dump (no identity/retired_at fields) restores via recompute
         const sid = "s4665-legacy";
         const x = mkMsg("m-x", "x-ray ".repeat(30));
         const y = mkMsg("m-y", "yankee ".repeat(30));
-        store.ingestSession(planIngest(mkSession(sid, [x, y])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(sid, [x, y])), { completeLog: true });
 
         const archiveDir = path.join(dir, "archive");
         assert.ok(store.archiveSession(sid, { archiveDir }).ok);
@@ -174,7 +174,7 @@ test("#4665: pre-fix dump (no identity/retired_at fields) restores via recompute
         }
         // The fallback re-connects the JOIN: a full re-ingest lands on the
         // same rows instead of minting duplicates.
-        store.ingestSession(planIngest(mkSession(sid, [x, y])), undefined, { completeLog: true });
+        store.ingestSession(planIngest(mkSession(sid, [x, y])), { completeLog: true });
         const stable = rowsOf(store, sid);
         assert.equal(stable.length, 2, "legacy-restore re-ingest mints nothing new");
         assert.deepEqual(
@@ -203,8 +203,8 @@ test("mysql lane: #4665 round-trip carries identity + retired_at", { skip: MYSQL
         const a = mkMsg("m-a", "alpha ".repeat(30));
         const b = mkMsg("m-b", "bravo ".repeat(30));
         const c = mkMsg("m-c", "charlie ".repeat(30));
-        assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [a, b, c])), undefined, { completeLog: true }));
-        assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [b, c])), undefined, { completeLog: true }));
+        assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [a, b, c])), { completeLog: true }));
+        assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [b, c])), { completeLog: true }));
 
         const archiveDir = fs.mkdtempSync(path.join(os.tmpdir(), "issue4665-mysql-"));
         try {
@@ -229,7 +229,7 @@ test("mysql lane: #4665 round-trip carries identity + retired_at", { skip: MYSQL
                 "live view excludes the restored retired row",
             );
             // Re-ingest stability: the JOIN reconnects, nothing re-minted.
-            assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [b, c])), undefined, { completeLog: true }));
+            assert.ok(await backend.ingestSession(planIngest(mkSession(sid, [b, c])), { completeLog: true }));
             const stable = await backend.getMessages(sid, { includeRetired: true });
             assert.equal(stable.length, 3, "mysql re-ingest after restore mints nothing new");
             assert.deepEqual(

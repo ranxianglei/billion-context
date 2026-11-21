@@ -80,7 +80,7 @@ test("S1+S2: head truncation keeps identities/seqs stable; sweep retires (not de
             { id: "id-d", text: "delta", wireIndex: 3 },
             { id: "id-e", text: "echo", wireIndex: 4 },
         ];
-        store.ingestSession(planIngest(histLike("s12", 10, msgs)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(histLike("s12", 10, msgs)), { completeLog: true });
         const seq1 = new Map(rowsOf(store, "s12").map((r) => [r.msg_id, r.seq]));
         assert.equal(seq1.size, 5);
 
@@ -88,7 +88,7 @@ test("S1+S2: head truncation keeps identities/seqs stable; sweep retires (not de
         // surviving wireIndex down by one. Same ids, same content, new wire
         // positions. Old behavior: whole row generation re-minted.
         const truncated = msgs.slice(1).map((m, i) => ({ ...m, wireIndex: i }));
-        store.ingestSession(planIngest(histLike("s12", 11, truncated)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(histLike("s12", 11, truncated)), { completeLog: true });
 
         const rows2 = rowsOf(store, "s12");
         // b..e survive at their ORIGINAL seqs (identity ignores wireIndex).
@@ -106,7 +106,7 @@ test("S1+S2: head truncation keeps identities/seqs stable; sweep retires (not de
         assert.deepEqual(liveOf(store, "s12"), ["id-b", "id-c", "id-d", "id-e"]);
 
         // Rewind-redo: the truncated head comes back. Same identity → same seq.
-        store.ingestSession(planIngest(histLike("s12", 12, msgs)), undefined, { completeLog: true });
+        store.ingestSession(planIngest(histLike("s12", 12, msgs)), { completeLog: true });
         const rows3 = rowsOf(store, "s12");
         assert.equal(rows3.length, 5, "still 5 rows after redo");
         const a3 = rows3.find((r) => r.msg_id === "id-a")!;
@@ -148,7 +148,7 @@ test("S5: v8 migration backfills identity and heals wireIndex-split generations"
         store.ingestSession(planIngest(histLike("mig", 3, [
             { id: "id-a", text: "alpha", wireIndex: 0 },
             { id: "id-b", text: "bravo", wireIndex: 1 },
-        ])), undefined, { completeLog: true });
+        ])), { completeLog: true });
         // Simulate a PRE-v8 database: the split-generation bug already
         // happened historically — id-b re-minted at a later seq with a
         // shifted wireIndex inside its content bytes, identity column empty.

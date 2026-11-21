@@ -29,7 +29,7 @@ function fixture(t: TestContext) {
     const dir = mkdtempSync(join(tmpdir(), "bili-active-block-count-"));
     process.env.BILI_CONFIG_FILE = join(dir, "no-config.json");
     const store = UnifiedStore.open(join(dir, "index.db"));
-    store.ingestSession(planIngest(seed("target")), undefined, { completeLog: true });
+    store.ingestSession(planIngest(seed("target")), { completeLog: true });
     const db = openSqliteDatabase(join(dir, "index.db"), "node:sqlite").db;
     const shadow = UnifiedShadow.maybeOpen(dir, { ...process.env, BILI_STORAGE_UNIFIED: "full" });
     assert.ok(shadow);
@@ -41,7 +41,7 @@ function fixture(t: TestContext) {
 
 test("active count is scoped to the session, exact active flag, and missing-session zero", (t) => {
     const { store, db, shadow } = fixture(t);
-    store.ingestSession(planIngest(seed("other")), undefined, { completeLog: true });
+    store.ingestSession(planIngest(seed("other")), { completeLog: true });
     assert.equal(shadow.activeBlockCount("target"), 2);
     db.prepare("UPDATE blocks SET active = 2 WHERE session_id = ? AND block_id = ?").run("target", "b0");
     assert.equal(shadow.activeBlockCount("target"), 1);

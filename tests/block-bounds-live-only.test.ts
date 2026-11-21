@@ -107,7 +107,7 @@ test("block seq bounds follow LIVE rows only: a retired generation never widens 
         // (its identity is absent from the incoming log) and lands the new one
         // past max(seq) — covered id A now spans two generations.
         const edited = ["A", "B", "C"].map((id) => (id === "A" ? { ...msg(id), text: "body A v2" } : msg(id)));
-        h.store.ingestSession(planIngest(session("sess-bounds", edited)), undefined, { completeLog: true });
+        h.store.ingestSession(planIngest(session("sess-bounds", edited)), { completeLog: true });
 
         assert.equal(h.bounds()[0], 1, "start bound follows the FIRST LIVE covered row (B@1) — pre-fix the retired A@0 leaked in and widened it to 0");
         assert.equal(h.bounds()[1], 3, "end bound follows the newest live generation (A'@3)");

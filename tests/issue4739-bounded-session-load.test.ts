@@ -7,7 +7,7 @@ import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { isDroppedMetadata, snapshotMessages } from "../src/session.ts";
 import { createInitialState, type CoreMessage } from "acp-kernel";
-import { planIngestDelta, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { UnifiedStore, messageRowReads } from "../src/storage/store.ts";
 import type { UnifiedShadow } from "../src/storage/shadow.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -96,9 +96,6 @@ test("full mode: viewFor decodes only pointer rows and matches the full-log deco
         const K = 40;
         const allRows = direct.getMessages("big-1");
         assert.equal(allRows.length, N, "generation 1 ingested the full history");
-        const maxSeq = allRows[allRows.length - 1]!.seq;
-        const suffixSeqs = allRows.slice(-K).map((m) => m.seq);
-        const boundaryRow = allRows[allRows.length - 1]!;
         const deltaLegacy: LegacySessionLike = {
             id: "big-1",
             createdAt: s.createdAt,
@@ -110,9 +107,11 @@ test("full mode: viewFor decodes only pointer rows and matches the full-log deco
             blockContents: new Map(),
             lastMessages: rawTail(N).slice(-K),
         };
-        const plan = planIngestDelta(deltaLegacy, maxSeq, suffixSeqs, { msgId: boundaryRow.msgId, contentHash: boundaryRow.contentHash }, true);
-        assert.ok(plan, "empty delta accepted for the shrunken raw tail");
-        direct.ingestSession(plan, { trustedSeq: maxSeq, boundaryMsgId: boundaryRow.msgId, boundaryHash: boundaryRow.contentHash, trustedTailSeqs: suffixSeqs });
+        // Pre-2026-11-21 this was an "empty delta" (trusted watermark prefix +
+        // suffix-only tail). Reconciliation is the same shape with no trust:
+        // every suffix row pins to its stored seq, the tail re-points, and the
+        // non-raw window (completeLog: false) sweeps nothing.
+        direct.ingestReconciled(deltaLegacy, { completeLog: false });
 
         // Reference decode: the OLD algorithm — every message row through
         // loadLegacyView on the second handle of the same database.

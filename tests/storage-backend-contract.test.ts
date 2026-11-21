@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 // The contract suite deliberately imports NOTHING from store.ts: every
 // assertion goes through the StorageBackend interface only. When the mysql
 // backend lands (#3388 step 2) this same file runs against it unchanged.
@@ -155,12 +155,9 @@ test("contract: session_ext + watermark + tailSeqs", async () => {
             // (verbatim store semantics — the contract keeps them).
             assert.equal(await backend.getSessionExt("sess-ext", "inc:canonical-ptrs"), undefined);
 
-            const wm = await backend.ingestWatermark("sess-ext");
-            assert.ok(wm && typeof wm.seq === "number", "watermark readable");
+            // (the #3133 ingest-watermark read/clear pair is gone — 2026-11-21)
             const tails = await backend.tailSeqs("sess-ext");
             assert.ok(Array.isArray(tails), "tailSeqs readable");
-            await backend.clearIngestWatermark("sess-ext");
-            assert.equal(await backend.ingestWatermark("sess-ext"), null, "clearIngestWatermark clears it");
         } finally {
             await backend.close();
         }
@@ -310,11 +307,8 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     // ext / watermark / tailSeqs
     await backend.setSessionExt(sid, "inc:canonical-ptrs", [0, 1]);
     assert.deepEqual(await backend.getSessionExt(sid, "inc:canonical-ptrs"), [0, 1]);
-    const wm = await backend.ingestWatermark(sid);
-    assert.ok(wm && typeof wm.seq === "number", "watermark readable");
+    // (the #3133 ingest-watermark read/clear pair is gone — 2026-11-21)
     assert.ok(Array.isArray(await backend.tailSeqs(sid)), "tailSeqs readable");
-    await backend.clearIngestWatermark(sid);
-    assert.equal(await backend.ingestWatermark(sid), null);
 
     // re-ingest the same identity is stable (seq preservation via remap)
     assert.ok(await backend.ingestSession(planIngest(mkSession(sid, msgs))), "re-ingest ok");
@@ -355,7 +349,6 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     assert.ok(await backend.cloneSessionRows(cpSid, chSid, 1), "idempotent replay ok");
     assert.equal((await backend.getMessages(chSid)).length, 2, "replay is a no-op");
     assert.equal(await backend.cloneSessionRows(`sess-mysql-absent-${run}`, `${chSid}-orphan`, 5), false, "absent parent → false");
-
     // reap journal
     await backend.reapBlocks(sid, new Set(["b2"]), new Map([["b2", { one: null, full: { text: "orphaned", count: 0 } }]]));
     await backend.reapBlocks(sid, new Set(["b2"]), new Map(), );
@@ -412,7 +405,7 @@ for (const lane of lanes) {
             const messages = Array.from({ length: 400 }, (_, i) => i === 3
                 ? { ...mkMsg(`m-${i}`, `body ${i}`), contentType: "image", imageBase64: image, imageMediaType: "image/png" }
                 : mkMsg(`m-${i}`, `body ${i}`));
-            const save = (tail: CoreMsg[], full: boolean) => backend.ingestSession(planIngest(mkSession(sid, tail)), undefined, { completeLog: full });
+            const save = (tail: CoreMsg[], full: boolean) => backend.ingestSession(planIngest(mkSession(sid, tail)), { completeLog: full });
             try {
                 assert.ok(await save(messages, true));
                 await backend.ingestSession(planIngest(mkSession(other, messages.slice(0, 2))));
