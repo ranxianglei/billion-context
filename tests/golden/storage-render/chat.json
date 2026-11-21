@@ -121,6 +121,7 @@
   "rules": "4f53cda18c2baa0c",
   "sweptOrphanCallIds": "74234e98afe7498f",
   "pendingOrphanSweepMinRef": "74234e98afe7498f",
+  "pendingOrphanSweepMaxRef": "74234e98afe7498f",
   "emergencyTruncateLatch": "74234e98afe7498f",
   "renderDeferredRefs": "74234e98afe7498f",
   "viewLatches": "74234e98afe7498f",

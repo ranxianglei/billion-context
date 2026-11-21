@@ -25,6 +25,8 @@ test("#4192: sweptOrphanCallIds / pendingOrphanSweepMinRef survive the unified r
             ...createInitialState(),
             sweptOrphanCallIds: ["m00042", "m00043"],
             pendingOrphanSweepMinRef: 42,
+            // #6116: the window's upper bound rides the same derived field list.
+            pendingOrphanSweepMaxRef: 43,
         };
         const legacy = {
             id: "sf-1",
@@ -51,6 +53,7 @@ test("#4192: sweptOrphanCallIds / pendingOrphanSweepMinRef survive the unified r
         // The two fields the hand list dropped (#4192) must round-trip intact.
         assert.deepEqual((view.state as Record<string, unknown>).sweptOrphanCallIds, ["m00042", "m00043"]);
         assert.equal((view.state as Record<string, unknown>).pendingOrphanSweepMinRef, 42);
+        assert.equal((view.state as Record<string, unknown>).pendingOrphanSweepMaxRef, 43); // #6116
         store.close();
     } finally {
         rmSync(dir, { recursive: true, force: true });

@@ -10,11 +10,14 @@ import type { CompressionState, CoreMessage } from "./types.js";
 // (billion-context-pi #9: 3,849 identical calls over 5h13m under keep=0), AND a
 // quiet turn must never move the cached prefix breakpoint forward just to delete
 // a few hundred chars of old failure residue — the old keep-last-two rotation did
-// exactly that (hid the oldest failure on EVERY turn, seam cost far exceeding the
-// bytes removed). Now: between folds nothing is swept; on a fold the node sweeps
-// orphans at/after the fold's earliest start ref onto the persistent
-// sweptOrphanCallIds set (they stay hidden forever), leaving orphans before it
-// visible. Residue is bounded by fold cadence, not a fixed pair count.
+ // exactly that (hid the oldest failure on EVERY turn, seam cost far exceeding the
+ // bytes removed). Now: between folds nothing is swept; on a fold the node sweeps
+ // orphans at/after the fold's earliest start ref — and at/before the highest ref
+ // allocated when that fold committed (#6116: the successful call and any later
+ // same-turn calls get refs above that frontier and keep their failure feedback
+ // visible) — onto the persistent sweptOrphanCallIds set (they stay hidden
+ // forever), leaving orphans outside the window visible. Residue is bounded by
+ // fold cadence, not a fixed pair count.
 
 export interface HideConsumedResult {
   messages: CoreMessage[];
@@ -319,8 +322,15 @@ export function hideConsumedCompressCalls(
   // fold pending nothing new is swept, so a quiet turn never breaks the prefix.
   // Orphans quoting an ACTIVE block's folded range are that block's summary
   // carrier (#1567) and are exempt from the sweep (quotesActiveBlock).
+  // #6116: the window is bounded above by pendingOrphanSweepMaxRef — the highest
+  // allocated ref when the pending fold committed. The successful call and any
+  // same-turn calls after it only get refs above that frontier, so their failure
+  // feedback must stay visible for the model to react to; sweeping them would be
+  // over-sweep (under-sweep is safe, over-sweep is not). States written before
+  // #6116 lack the max bound and keep the pre-fix unbounded behavior.
   const sweptSet = new Set(state.sweptOrphanCallIds ?? []);
   const foldMinRef = state.pendingOrphanSweepMinRef;
+  const foldMaxRef = state.pendingOrphanSweepMaxRef;
   const newlySweptCallIds: string[] = [];
 
   const keepCallIds = new Set<string>();
@@ -346,7 +356,9 @@ export function hideConsumedCompressCalls(
         hide = true;
       } else if (foldMinRef !== undefined && !quotesActiveBlock(messages[i]!.text, activeRangeKeys)) {
         const num = refNum(ref);
-        if (num !== null && num >= foldMinRef) {
+        // #6116: window is [foldMinRef, foldMaxRef]; a missing max bound
+        // (pre-#6116 state) degrades to the pre-fix unbounded sweep.
+        if (num !== null && num >= foldMinRef && (foldMaxRef === undefined || num <= foldMaxRef)) {
           hide = true;
           newlySweptCallIds.push(callId);
         }
