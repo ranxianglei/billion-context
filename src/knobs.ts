@@ -359,6 +359,33 @@ export function limitsIngestBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
 }
 
+// #7277: the #5794 large-decode ADMISSION slot budget — how many decoded bodies
+// over the cost band may be in flight at once, and the band itself. Both were
+// hardcoded module consts in request-body-budget.ts; they now resolve like the
+// rest of the #3128 family (env > file > default) so an operator of a long
+// single-user gateway can raise the concurrency or the band without a code
+// change, and the 503 refusal reports the live values.
+const DEFAULT_MAX_LARGE_DECODED_REQUESTS = 2;
+const DEFAULT_LARGE_DECODED_ADMISSION_BYTES = 32 * 1024 * 1024;
+
+/** BILI_MAX_LARGE_DECODED_REQUESTS > network.maxLargeDecodedRequests > 2. How many
+ *  decoded bodies over the admission band may be admitted at once; the next one
+ *  gets a retryable 503 (stage decode). #7277: was a hardcoded module const. */
+export function limitsMaxLargeDecodedRequests(): number {
+    const v = tInt("BILI_MAX_LARGE_DECODED_REQUESTS", loadConfigFile().network?.maxLargeDecodedRequests);
+    return Number.isFinite(v) && v >= 1 ? Math.floor(v) : DEFAULT_MAX_LARGE_DECODED_REQUESTS;
+}
+
+/** BILI_LARGE_DECODED_ADMISSION_BYTES > network.largeDecodedAdmissionBytes > 32 MiB.
+ *  The decoded-byte band above which a request consumes one of the admission
+ *  slots; keyed min() with limitsReceiveBytes() at the call site so a smaller
+ *  operator receive cap stays binding (strictly stricter, never looser).
+ *  #7277: was a hardcoded module const. */
+export function limitsLargeDecodedAdmissionBytes(): number {
+    const v = tInt("BILI_LARGE_DECODED_ADMISSION_BYTES", loadConfigFile().network?.largeDecodedAdmissionBytes);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LARGE_DECODED_ADMISSION_BYTES;
+}
+
 // #5000 item 2: per-upstream hard cap on the messages[] array length — a wire
 // constraint no byte/token estimate expresses (the 26,903-message #5000 session
 // cleared every size gate and died at the upstream). Per-UPSTREAM on purpose:

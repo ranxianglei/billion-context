@@ -558,7 +558,9 @@ async function handleRequest(
     } catch (err) {
         if (decodingSignal.aborted || res.destroyed) return;
         if (err instanceof DecodedRequestBusyError) {
-            log("warn", "503: large decoded request budget is busy");
+            // #7277: err.message now carries the live count/limit/oldest-running
+            // triple, so the log and the 503 body report the same diagnosis.
+            log("warn", `503: ${err.message}`);
             res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
             res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: err.message } }));
             return;
