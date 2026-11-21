@@ -167,6 +167,13 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
+        // #5172: the fuse sizes against the UNRESERVED wall — the 413 must name it
+        // "declared" (not "effective"), because "effective window" elsewhere means
+        // the lower reserved judging window nudge/preflight use. One word, two
+        // numbers was the incident's reader trap.
+        assert.match(parsed.error?.message ?? "", /declared model window/, "the fuse names the unreserved wall it sizes against (#5172)");
+        assert.match(parsed.error?.message ?? "", /unreserved upstream wall/, "the fuse states it is the unreserved wall, not the reserved judging window (#5172)");
+        assert.doesNotMatch(parsed.error?.message ?? "", /effective model window/, "the ambiguous 'effective model window' label is gone (#5172)");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
     } finally {

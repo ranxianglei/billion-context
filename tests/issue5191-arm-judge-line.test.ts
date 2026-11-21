@@ -165,6 +165,11 @@ test("the overflow arm's judging wall logs below [headroom] instead of contradic
         assert.match(headroom.msg, new RegExp(`judge input against ${HEADROOM_WINDOW}`));
         // ...and, since the fix, no longer claims to be the only judge.
         assert.match(headroom.msg, /\[arm-judge\]/, "[headroom] points at the arm override");
+        // #5172: the [headroom] line now also states the egress fuse's caliber
+        // (the unreserved wall) so the two-window split is visible in one line —
+        // the fuse 413 and nudge no longer look like they disagree.
+        assert.match(headroom.msg, /egress fuse sizes against/, "[headroom] states the egress fuse's caliber (#5172)");
+        assert.match(headroom.msg, /unreserved wall/, "[headroom] names the fuse bar as the unreserved wall (#5172)");
         // Turn 1's post-400 recovery pass arms mid-turn: the arm wall (792,576)
         // is already below the announced window (1,086,000) on THIS request's
         // retry — the #5191 story, now self-explaining in the log.
