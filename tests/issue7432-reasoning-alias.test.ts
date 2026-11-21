@@ -141,3 +141,20 @@ test("#7432 openai adapter: proxy-only tool frame delivers its alias reasoning p
     assert.ok(out.includes('"reasoning_content":"sibling thought"'), `canonical field, got: ${out}`);
     assert.ok(!out.includes("bili_compress"), "the proxy call still never rides along");
 });
+
+// 7. The full alias table is pinned, not just `reasoning`: the third entry
+//    (`reasoning_text`, same set and order as pi-ai's reasoningFields) streams
+//    as reasoning and rides out canonical.
+test("#7432 openai adapter: delta.reasoning_text is read and rewritten like the other aliases", async () => {
+    const events = await collect(
+        sseChunk({ reasoning_text: "third alias" }),
+        sseChunk({ content: "answer" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    );
+    assert.deepEqual(reasoningDeltas(events), ["third alias"], "reasoning_text chunk streams as reasoning");
+    const reasoning = events.find((e) => e.kind === "reasoning");
+    const raw = reasoning!.raw!.toString("utf8");
+    assert.ok(raw.includes('"reasoning_content":"third alias"'), `canonical field, got: ${raw}`);
+    assert.ok(!/"reasoning_text":/.test(raw), `alias key dropped, got: ${raw}`);
+});
