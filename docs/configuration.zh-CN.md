@@ -108,6 +108,7 @@
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.passDshExtensions` | boolean \| number | 0(关 = 拦截) | BILI_ROLLOUT_PASS_DSH_EXTENSIONS | DSH 客户端扩展拦截(#7168/#7439):DSH(deepseek-harness)每个请求都带顶层 `dsh_*` 字段——`dsh_session_log`(给官方 DeepSeek API 的 8 MiB 增量无损会话日志,模型根本不读)加孪生字段 `dsh_plugin_packages`;fork/seed 会话在水位追上前每轮从头整段重传。默认 0% = 拦截:bili 在入站 body 解析后、任何协议路径构建出站前,删掉所有**顶层** `dsh_*` 键(src/server/handle.ts),8 MiB 永不转发上游——不浪费带宽,非 DeepSeek 上游也不见陌生大字段。DSH 不受影响:其上传水位只在 2xx 时推进,bili 照常回 2xx,重传自愈。窗口计量另由 #7168 的 dsh_* 豁免(src/preflight.ts)兜底。等服务端权威 egress 工作(#6785 / 讨论 #7439)把客户端扩展旁路带做好后,翻到 100%(或移除裁切)即放开;现在想临时放行用 `true` / env = 1。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -2020,6 +2021,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
+| `BILI_ROLLOUT_PASS_DSH_EXTENSIONS` | `rollout.features.passDshExtensions` | 0 (off = intercept) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
