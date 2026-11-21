@@ -10,6 +10,7 @@ import { drainPendingRetrievals, imageRescaleToolArmed } from "./store.js";
 import { imageRescaleMaxDim } from "./knobs.js";
 import { applyImageRescaleItems } from "./image-rescale.js";
 import { executeProxyToolAsync, buildVisibilityMarker } from "./loop/core.js";
+import { type ToolOutcomeKind } from "./proxy-tool-result.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
 import { type ResponseInputItem } from "acp-kernel/wire";
@@ -120,17 +121,23 @@ async function surfaceProxyJson(
             loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed (len=${call.arguments.length}, head=${safePrefix(call.arguments, 200)}, tail=${safeSuffix(call.arguments, 200)})`);
         }
         let result: string;
+        let outcome: ToolOutcomeKind | undefined;
         try {
             const toolResult = mutating
                 ? await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal))
                 : await executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal);
             result = toolResult.text;
+            outcome = toolResult.outcome;
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
+            // #5389: an executor exception is a failure by definition — stamp the
+            // structured outcome so the marker icon never depends on scanning
+            // this synthesized text.
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
+            outcome = "failure";
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} FAILED: ${String(e)}]`);
         }
-        if (ctx.visibilityMarkers !== false) markers.push(buildVisibilityMarker(call.name, result));
+        if (ctx.visibilityMarkers !== false) markers.push(buildVisibilityMarker(call.name, result, outcome));
     }
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
@@ -201,7 +208,7 @@ export async function compressLoopResponsesJson(
             }
                 const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
-            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
+            if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text, toolResult.outcome) });
         }
         // #1097: retrieval injections ride the re-request after their ack —
         // as user items (bili's own artifacts take the #377-sanctioned user
