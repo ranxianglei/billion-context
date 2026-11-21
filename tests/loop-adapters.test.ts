@@ -919,16 +919,13 @@ test("F8 (#541): anthropic adapter — CJK char split across SSE chunk boundary 
     await cjkChunkSplitRoundTrip("anthropic", createAnthropicAdapter({ model: "claude" }), payload);
 });
 
-test("openai emitCompletion: usage with absent token counts still serializes complete numeric fields (#dsh)", () => {
+test("openai emitCompletion: usage with absent token counts omits the usage field (#dsh, #7086)", () => {
     const adapter = createOpenaiAdapter({ model: "deepseek-v4-flash" });
     const out = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: undefined, outputTokens: undefined } }).toString("utf8");
     const finishLine = out.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
     assert.ok(finishLine, "finish chunk present");
     const parsed = JSON.parse(finishLine.slice("data: ".length)) as { usage?: Record<string, unknown> };
-    assert.ok(parsed.usage, "usage object present");
-    assert.equal(parsed.usage!.prompt_tokens, 0, "prompt_tokens defaults to 0 (never dropped)");
-    assert.equal(parsed.usage!.completion_tokens, 0, "completion_tokens defaults to 0 (never dropped)");
-    assert.equal(parsed.usage!.total_tokens, 0);
+    assert.equal(parsed.usage, undefined, "usage field omitted when no real usage fields (Honest output — an all-zero report would look like a real one)");
     const real = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3 } }).toString("utf8");
     const realLine = real.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
     const realParsed = JSON.parse(realLine!.slice("data: ".length)) as { usage?: Record<string, unknown> };
