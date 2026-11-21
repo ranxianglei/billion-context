@@ -8,7 +8,7 @@ import type { Session } from "../src/session.ts";
 import { isDroppedMetadata, snapshotMessages } from "../src/session.ts";
 import { createInitialState, type CoreMessage } from "acp-kernel";
 import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { UnifiedStore, messageRowReads, viewPointerSeqs } from "../src/storage/store.ts";
+import { UnifiedStore, messageRowReads } from "../src/storage/store.ts";
 import type { UnifiedShadow } from "../src/storage/shadow.ts";
 import { rmrf } from "./tmp-rm.ts";
 

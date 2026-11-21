@@ -48,6 +48,20 @@ import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydrati
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
 
+/**
+ * Content-derived id prefix (kernel deriveMessageId mints "h_" + 16
+ * sha256-hex + optional _N cluster suffix; preflight.ts / fastpath.ts match
+ * the same family). The id IS the content hash, so same id ⇒ same bytes:
+ * the blind pin in planReconciled is only safe for these. Client-sent ids
+ * (msgid lane #4491, KDD #17: host-minted stable UUIDs) do NOT carry the
+ * "h_" prefix — an in-place edit keeps the id and changes the bytes, so a
+ * blind pin would silently drop the edit from the durable log (data loss).
+ * Those fall through to the identity-checked pin. The prefix (not the full
+ * 16-hex shape) is the gate: it is the kernel's minting namespace, and no
+ * client-sent id collides with it.
+ */
+const CONTENT_DERIVED_ID = /^h_/;
+
 export interface LegacySessionLike {
     id: string;
     createdAt: number;
@@ -318,15 +332,20 @@ function entryFor(m: CoreMessage, byRawRef: Record<string, string>): Omit<LogEnt
  *  handoff inherits nothing to be voided, and two writers converge on the
  *  same identities — the second simply re-points the rows the first wrote.
  *
- *  Cost model (the #3133 property, kept): a msg id with exactly ONE live
- *  stored row pins BLIND — zero serializations for that slot (client ids
- *  are content-derived, so a slot rewrite mints a NEW id and arrives as a
- *  new row; the same-id byte-drift residue — a #4390 wireIndex re-mint
- *  keeping id AND identity — rides the pinned old generation and is
- *  healed by the sampled verify → deep path within VERIFY_EVERY_INGESTS
- *  saves, the exact trade-off the #3919 delta made for its prefix). Only
- *  unknown ids, multi-generation ids (split tool-call cores, #1476) and
- *  tombstone rows (rewind-redo) pay stringify+hash.
+ *  Cost model (the #3133 property, kept): a CONTENT-DERIVED msg id (h_ + 16
+ *  hex + optional _N — the id IS the content hash) with exactly ONE live
+ *  stored row pins BLIND — zero serializations for that slot (a slot
+ *  rewrite mints a NEW id and arrives as a new row; the same-id byte-drift
+ *  residue — a #4390 wireIndex re-mint keeping id AND identity — rides the
+ *  pinned old generation and is healed by the sampled verify → deep path
+ *  within VERIFY_EVERY_INGESTS saves, the exact trade-off the #3919 delta
+ *  made for its prefix). The blind pin is GATED on that shape: client-sent
+ *  ids (msgid lane #4491, KDD #17: host-minted stable UUIDs) are NOT
+ *  content-derived, so an in-place edit keeps the id and changes the bytes —
+ *  a blind pin would silently drop the edit from the durable log (data
+ *  loss). Those, plus unknown ids, multi-generation ids (split tool-call
+ *  cores, #1476) and tombstone rows (rewind-redo), pay stringify+hash and
+ *  take the identity-checked pin below.
  *
  *  `known` MUST come from the SAME transaction the plan is applied in
  *  (UnifiedStore.ingestReconciled reads it under BEGIN IMMEDIATE); a
@@ -360,16 +379,21 @@ export function planReconciled(
         const candidates = knownById.get(m.id);
         if (candidates !== undefined && candidates.length === 1) {
             const row = candidates[0];
-            if (row.retiredAt === null) {
-                // BLIND pin (the steady-state append): zero serializations.
+            // BLIND pin (the steady-state append): zero serializations —
+            // ONLY for content-derived ids, where same id ⇒ same bytes so
+            // pinning the stored row drops nothing. Client-sent ids are not
+            // content-derived: an in-place edit keeps the id and changes the
+            // bytes, so a blind pin would silently drop the edit (data loss).
+            if (row.retiredAt === null && CONTENT_DERIVED_ID.test(m.id)) {
                 const idx = log.length;
                 log.push({ seq: row.seq, msgId: m.id, content: "", hash: row.contentHash, identity: row.identity, role: "pinned", kind: "pinned", ref: byRawRef[m.id] ?? null });
                 return idx;
             }
         }
-        // Serialize: unknown id, multi-generation id, or a tombstone row
+        // Serialize: unknown id, multi-generation id, a tombstone row
         // (rewind-redo — the insert loop restores its media mappings and
-        // the store clears the tombstone when the identity matches).
+        // the store clears the tombstone when the identity matches), or a
+        // client-sent id (not content-derived — the blind pin is unsafe).
         const entry = entryFor(m, byRawRef);
         let pin: StoredMessageRow | undefined;
         if (candidates !== undefined) {

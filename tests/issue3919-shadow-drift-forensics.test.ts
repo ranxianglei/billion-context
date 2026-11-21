@@ -21,7 +21,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { UnifiedStore, viewPointerSeqs } from "../src/storage/store.ts";
+import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow, describeViewDivergence, formatDriftDiagnostics } from "../src/storage/shadow.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
@@ -283,7 +283,8 @@ test("repeat marker: consecutive sampled drift stays flagged until a clean sampl
             // tail_json is the same contract).
             const row = store.getSessionRow(ids);
             assert.ok(row, "session row present");
-            assert.equal(viewPointerSeqs(row.tailJson).length, k, "tail points at every healed slot");
+            const tail = JSON.parse(row.tailJson) as { tailSeqs?: number[]; pluginSnapshotSeqs?: number[] };
+            assert.equal([...(tail.tailSeqs ?? []), ...(tail.pluginSnapshotSeqs ?? [])].length, k, "tail points at every healed slot");
         } finally {
             shadow.close();
             store.close();

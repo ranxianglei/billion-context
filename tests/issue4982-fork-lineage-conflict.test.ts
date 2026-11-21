@@ -257,7 +257,10 @@ test("#4982: MySQL atomic sparse clone persists absolute snapshot and tail point
     };
     assert.equal(await store.cloneSessionRows("parent", "child", 4, initial), true);
     assert.deepEqual(writtenSeqs, absoluteSeqs);
-    assert.equal(persistedWatermark, 4);
+    // The sessions.last_ingested_seq watermark was removed (2026-11-21,
+    // #3285 follow-through): cross-save reconciliation is by client identity
+    // only, so the clone persists a NULL watermark by design.
+    assert.equal(persistedWatermark, null);
     assert.deepEqual(JSON.parse(persistedTail!).tailSeqs, absoluteSeqs, "tail points to absolute cloned ledger positions");
     assert.deepEqual(JSON.parse(persistedTail!).pluginSnapshotSeqs, absoluteSeqs, "snapshot uses the same absolute positions");
 });

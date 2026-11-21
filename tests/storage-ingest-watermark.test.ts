@@ -216,7 +216,11 @@ test("reconcile: envelope re-render without rawTail re-points the tail in envelo
             legacy = mkLegacy("wm-render", envRender);
             ingestSerializations.count = 0;
             shadow.record(legacy);
-            assert.equal(ingestSerializations.count, 0, "envelope render must pin, not re-serialize");
+            // The h_ messages pin blind (content-derived); the acp_summary
+            // carrier re-serializes — it is not content-derived (a re-fold
+            // rewrites its bytes under the same id), so the blind pin is
+            // unsafe for it and it takes the identity-checked path.
+            assert.equal(ingestSerializations.count, 1, "envelope render pins the h_ messages; the acp_summary carrier re-serializes");
             const served = view(store, "wm-render");
             assert.ok(served.lastMessages);
             assert.deepEqual(served.lastMessages.map((m) => m.id), ["h_msg0", "acp_summary_b1", "h_msg1", "h_msg2"], "served view must follow the envelope render order");
