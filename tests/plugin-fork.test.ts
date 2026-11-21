@@ -104,7 +104,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100, ...compressExtra }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: { ...defaultConfig(400000), minFoldBenefitTokens: 0 }, compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100, ...compressExtra }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
@@ -1062,7 +1062,7 @@ for (const storageMode of ["legacy", "full"] as const) {
             // side before the stand-in proxy boots, so exactly one writer holds
             // the index at a time (this IS the policy, pinned here for real).
             if (process.env.BILI_STORAGE_UNIFIED !== "legacy") h.store.closeQuietly();
-            const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
+            const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:{ ...defaultConfig(400000), minFoldBenefitTokens: 0 },compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
             child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
             let stderr = "";
             child.stderr!.on("data", (b) => { stderr += b.toString(); });
@@ -1321,7 +1321,7 @@ test("HTTP fork before absorb summary preserves the original pair on the first c
         await sendModel(h, "parent", history);
         const parent = resolveConversation("parent").session!;
         const result = parent.pluginSnapshot!.find((m) => m.contentType === "tool-result" && m.toolCallId === "build_1")!;
-        const outcome = applyAbsorb({ ref: parent.state.messageRefs.byRaw[result.id], summary: "Build succeeded with all original checks.", absorbCallId: "absorb_1", messages: parent.pluginSnapshot!, state: parent.state, config: { ...defaultConfig(400000), absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, toolName: "acp_absorb" } } });
+        const outcome = applyAbsorb({ ref: parent.state.messageRefs.byRaw[result.id], summary: "Build succeeded with all original checks.", absorbCallId: "absorb_1", messages: parent.pluginSnapshot!, state: parent.state, config: { ...defaultConfig(400000), minFoldBenefitTokens: 0, absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, toolName: "acp_absorb" } } });
         assert.equal(outcome.ok, true, outcome.resultText);
         parent.state = outcome.state;
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;

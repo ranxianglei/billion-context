@@ -26,7 +26,7 @@ function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): 
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, overrides as never),
+        config: { ...defaultConfig(200000, overrides as never), minFoldBenefitTokens: 0 },
         messages,
         session: {
             id: "issue4331-test",

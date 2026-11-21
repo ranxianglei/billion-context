@@ -68,7 +68,7 @@ function makeCtx(): { ctx: RewriteCtx; logs: string[] } {
     const { session, messages } = restampedSession();
     const ctx = {
         core: createCore(),
-        config: defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 },
         messages,
         compressMessages: messages,
         session,

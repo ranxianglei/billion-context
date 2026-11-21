@@ -18,7 +18,7 @@ function makeCtx(messages: CoreMessage[] = []): {
 } {
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
         messages,
         session: {
             id: "issue1453-test",

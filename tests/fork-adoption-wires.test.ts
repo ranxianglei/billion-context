@@ -282,11 +282,11 @@ function proxyOpts(forkAdoption: boolean): ProxyOptions {
         upstream: "http://127.0.0.1",
         routes: {} as ProxyOptions["routes"],
         modelContextLimit: 1_000_000,
-        kernelConfig: defaultConfig(1_000_000, {
+        kernelConfig: { ...defaultConfig(1_000_000, {
             preserveRecentMessages: 2,
             preserveRecentTokens: 400,
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
-        }),
+        }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         forkAdoption,

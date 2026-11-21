@@ -26,7 +26,7 @@ function makeCtx(count: number, preserveRecentMessages = 5): RewriteCtx & { mess
     storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 },
         messages,
         session,
         log: () => {},

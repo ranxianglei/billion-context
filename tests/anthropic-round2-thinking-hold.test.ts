@@ -62,7 +62,7 @@ const UNSIGNED_BODY = { model: "claude", messages: [], stream: true, max_tokens:
 function makeCtx(id: string, messages: CoreMessage[] = []): LoopCtx {
     return {
         core: createCore(),
-        config: defaultConfig(200000) as Config,
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as Config,
         messages,
         session: {
             id,

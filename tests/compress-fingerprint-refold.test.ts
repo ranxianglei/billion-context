@@ -20,7 +20,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
         messages: [] as CoreMessage[],
         session: {
             id: `fpr-${Math.random().toString(36).slice(2)}`,

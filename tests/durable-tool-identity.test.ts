@@ -54,7 +54,7 @@ function filler(tag: string): string {
 
 test("withDurableProtection: default ensures durable/* latest-per-identity + classifier hook", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const base = defaultConfig(200_000);
+    const base = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 };
     const out = withDurableProtection(base, cl);
     assert.deepEqual(out.protectedLatestTools, ["durable/*"], "default adds durable/* to protectedLatestTools");
     assert.equal(out.messagePathOf, cl, "classifier attached");
@@ -66,14 +66,14 @@ test("withDurableProtection: default ensures durable/* latest-per-identity + cla
 
 test("withDurableProtection: a durable pattern in protectedTools = whole-identity takeover", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const out = withDurableProtection({ ...defaultConfig(200_000), protectedTools: ["read", "durable/agents-md"] }, cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedTools: ["read", "durable/agents-md"] }, cl);
     assert.deepEqual(out.protectedTools, ["read", "durable/agents-md"], "no durable/* injected — user policy wins verbatim");
     assert.equal(out.messagePathOf, cl, "classifier still attached (identity translation is bili's job)");
 });
 
 test("withDurableProtection: a durable pattern in protectedLatestTools = takeover too (no default injection)", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const out = withDurableProtection({ ...defaultConfig(200_000), protectedLatestTools: ["durable/*"] }, cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedLatestTools: ["durable/*"] }, cl);
     assert.deepEqual(out.protectedTools, [], "protectedTools not extended when latest takes over");
     assert.deepEqual(out.protectedLatestTools, ["durable/*"]);
     assert.equal(out.messagePathOf, cl);
@@ -95,14 +95,14 @@ test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor
     assert.equal(cl(reading), "oneshot/time-context");
     // ...and the default durable policy pins nothing in the injected/
     // namespace (stays foldable; the path exists for the Rule-3 anchor skip).
-    const out = withDurableProtection(defaultConfig(200_000), cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 }, cl);
     assert.deepEqual(out.protectedLatestTools, ["durable/*"], "latest-pin default covers durable/* only");
     assert.ok(!(out.protectedTools ?? []).some((p) => p.includes("injected")), "no all-instance protection for injected/*");
 });
 
 test("withDurableProtection: idempotent — no duplicate durable/* on re-apply", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const once = withDurableProtection(defaultConfig(200_000), cl);
+    const once = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 }, cl);
     const twice = withDurableProtection(once, cl);
     assert.deepEqual(twice.protectedLatestTools, ["durable/*"]);
 });
@@ -141,11 +141,11 @@ async function startRig(compress?: CompressSettings): Promise<Rig> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
         modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000, {
+        kernelConfig: { ...defaultConfig(200_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 0,
             compress: { minCompressRange: 500, maxSummaryLength: 20_000, minSummaryLength: 50 },
-        }),
+        }), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: false, ...compress },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

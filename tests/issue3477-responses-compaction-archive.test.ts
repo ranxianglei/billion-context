@@ -117,7 +117,7 @@ async function startHarness(modelFold: boolean): Promise<Harness> {
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { context: WINDOW } } } },
         modelContextLimit: WINDOW,
-        kernelConfig: defaultConfig(WINDOW),
+        kernelConfig: { ...defaultConfig(WINDOW), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

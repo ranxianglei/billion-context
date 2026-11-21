@@ -131,7 +131,7 @@ async function startHarness(
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
         modelContextLimit: 400_000,
-        kernelConfig: kernelConfig ?? defaultConfig(400_000),
+        kernelConfig: kernelConfig ?? { ...defaultConfig(400_000), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true, ...compress },
         compat: { roles: {} },
         streamErrorShape: "protocol",
@@ -274,7 +274,7 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
 // manifest advertises acp_rule again — enabling the feature must not
 // shrink the toolset dsh/pi/omp/MCP shims register.
 test("plugin manifest: acp_rule advertised when rules enabled in config", async () => {
-    const h = await startHarness([textScript()], { ...defaultConfig(400_000), rules: { enabled: true } });
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), minFoldBenefitTokens: 0, rules: { enabled: true } });
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
@@ -297,7 +297,7 @@ test("plugin manifest: acp_rule advertised when rules enabled in config", async 
 // manifest advertises all eight tools again — enabling the features must not
 // shrink the toolset dsh/pi/omp/MCP shims register.
 test("plugin manifest: absorb and acp_rule advertised when enabled in config", async () => {
-    const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true, toolName: "absorb", minToolTokens: 4000, contextThresholdPct: 0, excludeTools: [] }, rules: { enabled: true } });
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), minFoldBenefitTokens: 0, absorb: { enabled: true, toolName: "absorb", minToolTokens: 4000, contextThresholdPct: 0, excludeTools: [] }, rules: { enabled: true } });
     try {
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);

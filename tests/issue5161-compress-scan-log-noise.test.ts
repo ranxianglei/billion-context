@@ -31,7 +31,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     return {
         core: createCore(),
-        config: defaultConfig(200000),
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
         messages: [] as CoreMessage[],
         session: {
             id: `ext5161-${Math.random().toString(36).slice(2)}`,

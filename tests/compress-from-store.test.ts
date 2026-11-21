@@ -41,7 +41,7 @@ function makeCtx(opts?: { id?: string; messages?: CoreMessage[]; refs?: boolean 
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }),
+        config: { ...defaultConfig(200000, { preserveRecentMessages: 5, preserveRecentTokens: 0 }), minFoldBenefitTokens: 0 },
         messages: opts?.messages ?? [],
         session: {
             id: opts?.id ?? "sess-cfs",

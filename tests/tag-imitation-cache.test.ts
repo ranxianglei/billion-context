@@ -290,7 +290,7 @@ function proxyOptions(upstreamPort: number, model: string, ctx: number): ProxyOp
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { [model]: { context: ctx } } } },
         modelContextLimit: ctx,
-        kernelConfig: defaultConfig(ctx),
+        kernelConfig: { ...defaultConfig(ctx), minFoldBenefitTokens: 0 },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",

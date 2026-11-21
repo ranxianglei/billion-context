@@ -28,7 +28,7 @@ const pad = (n: number): string => String(n).padStart(5, "0");
 function foldBlock(tag: string, endRef: number, log?: (msg: string) => void) {
     const count = endRef + 8;
     const core = createCore();
-    const config = defaultConfig(200_000) as Config;
+    const config = { ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as Config;
     const session = getSession(`tf-${tag}-${Math.random().toString(36).slice(2)}`);
     const msgs: CoreMessage[] = [];
     for (let i = 0; i < count; i++) {
@@ -132,7 +132,7 @@ test("#1691 relative toFile resolves against the proxy cwd", () => {
 function foldCcr() {
     const core = createCore();
     const config = applyCompressSettings(
-        defaultConfig(200_000),
+        { ...defaultConfig(200_000), minFoldBenefitTokens: 0 },
         200_000,
         { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } },
     ) as Config;
