@@ -173,7 +173,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | Cooldown after a dead-end preflight before retrying reconciliation for the same session. |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | Maximum transport-failure replays of an identical request before surfacing the error. |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | Base backoff delay between replays (exponential). |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | Egress-side 429 governor (#4204): repeated upstream 429s are answered locally instead of forwarded. Account limits and unrecognized/malformed responses hold origin+credential; only KeyRing's exact `keyring_model_temporarily_unavailable` code with a matching request model holds origin+credential+model, leaving other models eligible. A mismatch or missing model remains account-wide; false restores the legacy always-forward behavior. |
+| `network.throttle429Enabled` | boolean | false | BILI_THROTTLE_429 | Egress-side 429 governor (#4204), **off by default** (#6639/#5853): upstream 429s are forwarded to the client untouched — the host owns the retry decision — and bili only logs a `[429-passthrough]` warn per observed 429. Set `true` (opt-in) for accounts where host-driven retry storms would pin a shared concurrency-style limit: then repeated upstream 429s are answered locally instead of forwarded. Account limits and unrecognized/malformed responses hold origin+credential; only KeyRing's exact `keyring_model_temporarily_unavailable` code with a matching request model holds origin+credential+model, leaving other models eligible. A mismatch or missing model remains account-wide. |
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears an account hold, or the matching model's non-429 response clears its model hold. |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger). |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | Ceiling for the 429 hold backoff and for the terminal-phase probe interval. |
@@ -2064,7 +2064,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | false |
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
