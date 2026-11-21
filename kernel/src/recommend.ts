@@ -198,9 +198,49 @@ export function computeProtectedRefs(
 // ─── 2. Build Compressible + Protected Ranges ────────────────────────────────
 
 /** Numeric part of a message ref ("m00005" → 5); null for non-m refs. */
-function refNumber(ref: string): number | null {
+export function refNumber(ref: string): number | null {
   const m = /^m(\d+)$/i.exec(ref);
   return m ? Number(m[1]) : null;
+}
+
+/** (#5508 family, display-only) ref-number holes owned by ACTIVE blocks:
+ *  covered ids that surface-replacing views drop from the array without
+ *  leaving an array slot or gap flag. Sorted by ref number. Shared by the
+ *  recommend and report span-label surfaces so the two can't diverge. */
+export function ownedHoles(
+  state: CompressionState,
+): { n: number; owner: string }[] {
+  const ownerByMsg = new Map<string, string>();
+  for (const blk of state.blocks) {
+    if (!blk.active) continue;
+    for (const id of blk.effectiveMessageIds) ownerByMsg.set(id, blk.blockId);
+  }
+  const covered = coveredMessageIds(state);
+  const holes: { n: number; owner: string }[] = [];
+  for (const [ref, raw] of Object.entries(state.messageRefs.byRef)) {
+    const n = refNumber(ref);
+    if (n === null || !covered.has(raw)) continue;
+    const owner = ownerByMsg.get(raw);
+    if (owner !== undefined) holes.push({ n, owner });
+  }
+  holes.sort((a, b) => a.n - b.n);
+  return holes;
+}
+
+/** Owners of holes STRICTLY between two ref numbers; undefined when the pair
+ *  is too narrow (≤1 hides nothing) or too wide (>512 scan cap) to label. */
+export function crossingOwnersBetween(
+  holes: { n: number; owner: string }[],
+  lo: number,
+  hi: number,
+): string[] | undefined {
+  if (hi - lo <= 1 || hi - lo > 512) return undefined;
+  const found: string[] = [];
+  for (const h of holes) {
+    if (h.n >= hi) break;
+    if (h.n > lo && !found.includes(h.owner)) found.push(h.owner);
+  }
+  return found.length > 0 ? found : undefined;
 }
 
 /** True when a recorded-dead ref sits STRICTLY between two live ref numbers —
@@ -283,6 +323,7 @@ export function buildCompressibleRanges(
     isTool: boolean;
     isUser: boolean;
     index: number;
+    crosses?: string[];
   }[] = [];
   const protectedMsgs: {
     ref: string;
@@ -293,6 +334,15 @@ export function buildCompressibleRanges(
   }[] = [];
 
   const covered = coveredMessageIds(state);
+
+  // Display-only honesty (#5508 family): on surface-replacing hosts the ids
+  // an active block already owns leave the array leaving NO slot and NO skip
+  // flag, so compressible runs render as one contiguous label spanning
+  // folded territory. Eligibility is never touched (KDD #12 keeps the
+  // projection as the single gate); this only NAMES which active blocks sit
+  // inside such a label, so blindly resubmitting it is recognizable as a
+  // re-fold instead of a fresh fold.
+  const holes = ownedHoles(state);
 
   // Pairing: a tool-result may carry only toolCallId (no toolName). Collect the
   // callIds of protected tool-calls first, then protect matching results too.
@@ -406,6 +456,18 @@ export function buildCompressibleRanges(
         skipSinceCompressible = true;
       }
     }
+    // Only a message CONTINUING the open group can hide covered territory in
+    // its ref-number hole (a broken group bridges nothing by definition).
+    const crosses =
+      !skipSinceCompressible &&
+      curRefNum !== null &&
+      lastCompressibleRefNum !== null
+        ? crossingOwnersBetween(
+            holes,
+            Math.min(curRefNum, lastCompressibleRefNum),
+            Math.max(curRefNum, lastCompressibleRefNum),
+          )
+        : undefined;
     compressibleMsgs.push({
       id: msg.id,
       ref,
@@ -415,6 +477,7 @@ export function buildCompressibleRanges(
       isTool: isToolMessage(msg),
       isUser: msg.role === "user",
       index: msgIndex,
+      crosses,
     });
     if (curRefNum !== null) lastCompressibleRefNum = curRefNum;
     skipSinceCompressible = false;
@@ -494,6 +557,8 @@ export function buildCompressibleRanges(
       }
       range.textPct = 100 - range.toolPct;
     }
+    const crossed = [...new Set(group.flatMap((info) => info.crosses ?? []))];
+    if (crossed.length > 0) range.crossesCoveredBy = crossed;
     compressible.push(range);
   }
 
@@ -566,6 +631,8 @@ function mergeBatch(batch: CompressibleRange[]): CompressibleRange {
   // position-based merging (formatRanges) still sees it after this batch is
   // re-emitted as a single range.
   if (first.noMergeBefore === true) merged.noMergeBefore = true;
+  const crossed = batch.flatMap((r) => r.crossesCoveredBy ?? []);
+  if (crossed.length > 0) merged.crossesCoveredBy = [...new Set(crossed)];
   return merged;
 }
 
