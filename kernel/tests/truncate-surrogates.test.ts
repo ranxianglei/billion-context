@@ -68,6 +68,8 @@ test("clampWindow: edges snap off surrogate pairs", () => {
 });
 
 test("compactEntry stub: emoji straddling the 200-char clamp leaves no lone surrogate (#816)", () => {
+  // No matching block ⇒ orphan fate ⇒ the #336 stub still applies (#6965
+  // kept stubs for orphans; bare-name ACTIVE calls are no longer stubbed).
   const state = createInitialState();
   state.blocks.push({
     blockId: "b1",
@@ -92,7 +94,7 @@ test("compactEntry stub: emoji straddling the 200-char clamp leaves no lone surr
     role: "assistant",
     contentType: "tool-call",
     toolName: "compress",
-    toolCallId: "call1",
+    toolCallId: "call9",
     text: JSON.stringify({
       content: [{ startId: "m00001", endId: "m00050", summary }],
     }),
@@ -108,6 +110,7 @@ test("compactEntry stub: emoji straddling the 200-char clamp leaves no lone surr
 });
 
 test("compactEntry stub: astral char fully inside the prefix survives intact", () => {
+  // Orphan call ⇒ stub still applies (see the #816 test note above).
   const state = createInitialState();
   state.blocks.push({
     blockId: "b1",
@@ -131,7 +134,7 @@ test("compactEntry stub: astral char fully inside the prefix survives intact", (
     role: "assistant",
     contentType: "tool-call",
     toolName: "compress",
-    toolCallId: "call1",
+    toolCallId: "call9",
     text: JSON.stringify({
       content: [{ startId: "m00001", endId: "m00050", summary }],
     }),
