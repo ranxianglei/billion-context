@@ -54,6 +54,13 @@ const PROBE_INFLIGHT_TTL_MS = 30_000;
 /** An upstream Retry-After beyond this is treated as "later than we will
  *  locally wait" — the hold still arms at our own backoff ceiling. */
 const RETRY_AFTER_CAP_MS = 600_000;
+/** A 429 observed this long after the previous one for the same key starts a
+ *  NEW rate-limit episode — the consecutive streak resets instead of carrying
+ *  across the quiet gap. Sized at 2× the default max hold (30 s): the hold has
+ *  expired plus a quiet margin, so the limit plausibly cleared. Probes re-drive
+ *  at most every maxDelay (30 s), so a still-active limit keeps the streak
+ *  alive (gaps < 60 s) and #4204's escalation is untouched. */
+const STREAK_QUIET_RESET_MS = 60_000;
 /** Only parse small structured errors; large/malformed bodies keep legacy scope. */
 const MAX_KEYRING_ERROR_BODY_BYTES = 16 * 1024;
 const KEYRING_MODEL_LIMIT_CODE = "keyring_model_temporarily_unavailable";
@@ -303,6 +310,9 @@ type HoldSlotKey = string | symbol;
 interface HoldState {
     streak: number;
     nextAttemptAt: number;
+    /** Wall-clock time the 429 that armed/extended this hold was observed —
+     *  drives the quiet-gap streak reset (#7295). */
+    lastObservedAt: number;
     /** Admission token and time for the probe currently owning this slot. */
     probeToken: symbol | undefined;
     probeAt: number | undefined;
@@ -494,7 +504,7 @@ function makeReject(st: HoldState, now: number): ThrottleLocalReject {
         return {
             status: 424,
             code: "bili_throttle_terminal",
-            message: `upstream rate-limited ${st.streak} consecutive request(s) to ${st.host}${modelText}; bili stops amplifying after ${maxC} consecutive rate limits — resend manually once the provider recovers (a background probe keeps checking at most every ${capSec}s) (#4204)`,
+            message: `upstream rate-limited ${st.streak} consecutive request(s) to ${st.host}${modelText}; bili stops amplifying after ${maxC} consecutive rate limits — resend manually once the provider recovers (a background probe keeps checking at most every ${capSec}s) (settings: network.throttle429Enabled, network.throttle429Scope; #4204 #7295)`,
             retryAfterSec: null,
             streak: st.streak,
             maxConsecutive: maxC,
@@ -506,7 +516,7 @@ function makeReject(st: HoldState, now: number): ThrottleLocalReject {
     return {
         status: 429,
         code: "bili_throttle_hold",
-        message: `upstream rate-limited ${st.streak} consecutive request(s) to ${st.host}${modelText}; bili is holding outbound sends until ${new Date(st.nextAttemptAt).toISOString()} (~${secsLeft}s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (#4204)`,
+        message: `upstream rate-limited ${st.streak} consecutive request(s) to ${st.host}${modelText}; bili is holding outbound sends until ${new Date(st.nextAttemptAt).toISOString()} (~${secsLeft}s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (settings: network.throttle429Enabled, network.throttle429Scope; #4204 #7295)`,
         retryAfterSec: secsLeft,
         streak: st.streak,
         maxConsecutive: maxC,
@@ -527,16 +537,27 @@ function createHoldState(
     provisional: boolean,
     provisionalRequestModel?: string,
 ): HoldState {
-    const streak = (previous?.streak ?? 0) + 1;
+    // #7295: a 429 observed after a quiet gap (hold expired + margin) starts a
+    // fresh episode — the streak does not carry across the gap, so scattered
+    // rate-limits (different sessions, minutes apart) no longer escalate to a
+    // terminal 424. A still-active limit re-drives via probes at most every
+    // maxDelay (30 s < 60 s), so its streak is preserved.
+    const quietGap = previous !== undefined && now - previous.lastObservedAt > STREAK_QUIET_RESET_MS;
+    const streak = quietGap ? 1 : (previous?.streak ?? 0) + 1;
     const base = throttle429BaseDelayMs();
     const cap = throttle429MaxDelayMs();
     const exp = Math.min(cap, base * 2 ** Math.min(streak - 1, 30));
     const jittered = exp * (0.5 + Math.random() * 0.5);
     const raMs = parseRetryAfterMs(retryAfterHeader, now);
-    const delay = Math.max(jittered, raMs ?? 0);
+    // #7295: the local hold is bounded by the throttle429MaxDelayMs knob. The
+    // upstream Retry-After still wins when it is larger than the backoff, but
+    // no longer bypasses the ceiling — a ~600 s free-tier header used to become
+    // a ~10 min local lockout.
+    const delay = Math.min(cap, Math.max(jittered, raMs ?? 0));
     return {
         streak,
         nextAttemptAt: now + delay,
+        lastObservedAt: now,
         probeAt: previous?.probeAt,
         probeToken: previous?.probeToken,
         host,
@@ -568,7 +589,10 @@ function logThrottle429(state: HoldState, retryAfterHeader: string | null, now: 
     const maxC = throttle429MaxConsecutive();
     const delay = state.nextAttemptAt - now;
     const raMs = parseRetryAfterMs(retryAfterHeader, now);
-    const raNote = raMs !== null && raMs >= delay ? ", upstream Retry-After honored" : "";
+    const capMs = throttle429MaxDelayMs();
+    const raNote = raMs !== null && raMs > capMs
+        ? `, upstream Retry-After ${Math.round(raMs / 1000)}s capped to ${Math.round(capMs / 1000)}s`
+        : raMs !== null && raMs >= delay ? ", upstream Retry-After honored" : "";
     const modelNote = state.model === undefined ? "" : ` for model "${state.model}"`;
     const delaySec = Math.round(delay / 1000);
     if (streak === 1) {
@@ -678,11 +702,18 @@ function settleProvisionalObservation(
     } else if (target.probeToken !== state.probeToken) {
         // Keep separate ownership records; a response may release only its
         // own probe even when several observations converge on one scope.
-        state.streak = target.streak + 1;
+        // #7295: same quiet-gap rule as the direct observation path — a stale
+        // target starts a fresh episode instead of carrying its streak.
+        const quietGap = state.lastObservedAt - target.lastObservedAt > STREAK_QUIET_RESET_MS;
+        state.streak = quietGap ? 1 : target.streak + 1;
         state.nextAttemptAt = Math.max(state.nextAttemptAt, target.nextAttemptAt);
         storeHold(Symbol("settled upstream throttle observation"), state, preserveAccountWide);
     } else {
-        target.streak += 1;
+        // #7295: refresh the observation timestamp — a stale target must not
+        // keep a frozen lastObservedAt that misfires the quiet-gap check later.
+        const quietGap = state.lastObservedAt - target.lastObservedAt > STREAK_QUIET_RESET_MS;
+        target.streak = quietGap ? 1 : target.streak + 1;
+        target.lastObservedAt = state.lastObservedAt;
         target.nextAttemptAt = Math.max(target.nextAttemptAt, state.nextAttemptAt);
     }
 }

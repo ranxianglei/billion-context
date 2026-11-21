@@ -58,14 +58,17 @@ for (const model of [undefined, "limited-model"]) {
                 noteUpstreamThrottle429(URL_A, H_CRED_A, "300", T0, model);
                 noteUpstreamThrottle429(URL_A, H_CRED_A, retryAfter, T0 + 1000, model);
                 const hold = activeThrottleHolds()[0]!;
-                assert.equal(hold.nextAttemptAt, T0 + 300_000);
+                // #7295: the first 429's 300 s Retry-After is now bounded by
+                // throttle429MaxDelayMs (8000 ms), so the "longer hold" is the
+                // capped 8 s — the second 429 must not shorten it.
+                assert.equal(hold.nextAttemptAt, T0 + 8000);
                 assert.equal(hold.streak, 2);
-                const rejected = upstreamThrottleGate(URL_A, H_CRED_A, T0 + 20_000, model).reject;
+                const rejected = upstreamThrottleGate(URL_A, H_CRED_A, T0 + 5000, model).reject;
                 assert.ok(rejected, "concurrent responses must not admit an early provider probe");
                 assert.equal(rejected.status, 429);
-                assert.equal(rejected.retryAfterSec, 280);
-                assert.equal(upstreamThrottleGate(URL_A, H_CRED_B, T0 + 20_000, model).reject, undefined);
-                if (model) assert.equal(upstreamThrottleGate(URL_A, H_CRED_A, T0 + 20_000, "other-model").reject, undefined);
+                assert.equal(rejected.retryAfterSec, 3);
+                assert.equal(upstreamThrottleGate(URL_A, H_CRED_B, T0 + 5000, model).reject, undefined);
+                if (model) assert.equal(upstreamThrottleGate(URL_A, H_CRED_A, T0 + 5000, "other-model").reject, undefined);
                 const probe = upstreamThrottleGate(URL_A, H_CRED_A, hold.nextAttemptAt, model);
                 assert.equal(probe.reject, undefined);
                 assert.equal(typeof probe.probeToken, "symbol");
@@ -76,13 +79,17 @@ for (const model of [undefined, "limited-model"]) {
     }
 }
 
-test("a later HTTP-date Retry-After can extend an existing hold", () => {
+test("a later HTTP-date Retry-After can extend an existing hold (bounded by maxDelay, #7295)", () => {
     withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "8", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
         _resetUpstreamThrottleForTest();
         noteUpstreamThrottle429(URL_A, H_CRED_A, "30", T0);
+        // First 429's 30 s Retry-After caps at maxDelay → hold to T0 + 8000.
         const deadline = T0 + 120_000;
         noteUpstreamThrottle429(URL_A, H_CRED_A, new Date(deadline).toUTCString(), T0 + 1000);
-        assert.equal(activeThrottleHolds()[0]!.nextAttemptAt, deadline);
+        // #7295: the second 429 (at T0 + 1000) arms a full capped 8 s hold →
+        // T0 + 9000, extending the first's T0 + 8000. The 120 s date no longer
+        // reaches past the knob.
+        assert.equal(activeThrottleHolds()[0]!.nextAttemptAt, T0 + 9000);
     });
 });
 
@@ -204,25 +211,33 @@ test("#4204: backoff doubles per consecutive 429 and caps at maxDelay", () => {
     });
 });
 
-test("#4204: upstream Retry-After wins when larger — seconds, HTTP-date, garbage ignored, hard cap 600s", () => {
+test("#4204/#7295: upstream Retry-After wins when larger, capped at throttle429MaxDelayMs — seconds, HTTP-date, garbage ignored", () => {
     withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "5", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        // Sub-cap Retry-After (5 s < 8 s cap): honored exactly.
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_EMPTY, "5", T0);
+        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 5_000, "sub-cap seconds form honored exactly");
+
+        // Over-cap Retry-After (30 s > 8 s cap): bounded by the knob.
         _resetUpstreamThrottleForTest();
         noteUpstreamThrottle429(URL_A, H_EMPTY, "30", T0);
-        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 30_000, "seconds form honored exactly");
+        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 8000, "over-cap seconds form capped at maxDelay");
 
         _resetUpstreamThrottleForTest();
         const dateForm = new Date(T0 + 45_000).toUTCString();
         noteUpstreamThrottle429(URL_A, H_EMPTY, dateForm, T0);
-        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 45_000, "HTTP-date form honored exactly");
+        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 8000, "over-cap HTTP-date form capped at maxDelay");
 
         _resetUpstreamThrottleForTest();
         noteUpstreamThrottle429(URL_A, H_EMPTY, "not-a-time", T0);
         const dGarbage = activeThrottleHolds()[0].nextAttemptAt - T0;
         assert.ok(dGarbage >= 500 && dGarbage <= 1000, `garbage header must fall back to backoff, got ${dGarbage}`);
 
+        // Huge Retry-After: capped at maxDelay (the 600 s parse bound no longer
+        // becomes the local hold — #7295's ~10 min lockout).
         _resetUpstreamThrottleForTest();
         noteUpstreamThrottle429(URL_A, H_EMPTY, "9999", T0);
-        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 600_000, "Retry-After capped at 600s");
+        assert.equal(activeThrottleHolds()[0].nextAttemptAt - T0, 8000, "huge Retry-After capped at maxDelay");
     });
 });
 
@@ -635,5 +650,104 @@ test("#4204: bounded state table — 65 origins evict the oldest, no crash", () 
         assert.equal(activeThrottleHolds().length, 64, "table bounded at 64");
         assert.equal(throttleReject("http://h0.invalid/v1/chat/completions", H_EMPTY, T0 + 1), undefined, "oldest origin evicted → no hold");
         assert.ok(throttleReject("http://h64.invalid/v1/chat/completions", H_EMPTY, T0 + 65), "newest origin still held");
+    });
+});
+
+test("#7295: streak resets after a quiet gap — scattered 429s no longer reach terminal", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // The #7295 report: 5 rate-limits spread over ~70 min / 5 sessions.
+        // Each 429 lands > 60 s after the previous, so each starts a fresh
+        // episode — the streak never climbs, never terminal.
+        for (let i = 0; i < 5; i++) {
+            const at = T0 + i * 1_200_000;
+            noteUpstreamThrottle429(URL_A, H_CRED_A, null, at);
+            const hold = activeThrottleHolds()[0]!;
+            assert.equal(hold.streak, 1, `429 #${i + 1}: quiet gap resets the streak`);
+            assert.equal(hold.terminal, false, "no quiet-gap episode is terminal");
+        }
+    });
+});
+
+test("#7295: streak continues for 429s within the quiet window — a live limit still escalates", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // Three 429s 30 s apart (probe cadence) — within the 60 s quiet window,
+        // so the streak climbs 1→2→3 and reaches terminal. #4204 escalation intact.
+        for (let i = 0; i < 3; i++) {
+            noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + i * 30_000);
+        }
+        const hold = activeThrottleHolds()[0]!;
+        assert.equal(hold.streak, 3, "within-window 429s keep the streak");
+        assert.equal(hold.terminal, true, "a live limit still escalates to terminal");
+    });
+});
+
+test("#7295: hold and terminal messages name the network.throttle429* settings", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const holdMsg = throttleReject(URL_A, H_CRED_A, T0 + 100);
+        assert.ok(holdMsg, "hold is active");
+        assert.equal(holdMsg.status, 429);
+        assert.ok(holdMsg.message.includes("network.throttle429Enabled"), "hold message names the enable knob");
+        assert.ok(holdMsg.message.includes("network.throttle429Scope"), "hold message names the scope knob");
+
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const termMsg = throttleReject(URL_A, H_CRED_A, T0 + 100);
+        assert.ok(termMsg, "terminal hold is active");
+        assert.equal(termMsg.status, 424);
+        assert.ok(termMsg.message.includes("network.throttle429Enabled"), "terminal message names the enable knob");
+        assert.ok(termMsg.message.includes("network.throttle429Scope"), "terminal message names the scope knob");
+    });
+});
+
+test("#7295: provisional settlement across a quiet gap resets the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // A confirmed account hold from T0 (streak 1), then a 429 observed 20
+        // min later through the provisional (degenerate-retry) lane — the stale
+        // hold is long expired, so this is a fresh episode, not a continuation.
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 1_200_000, undefined);
+        settle(undefined);
+        const hold = activeThrottleHolds()[0]!;
+        assert.equal(hold.streak, 1, "a quiet gap starts a fresh episode even through the provisional lane");
+        assert.equal(hold.terminal, false, "no quiet-gap episode is terminal");
+    });
+});
+
+test("#7295: provisional settlement within the quiet window keeps the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        // 30 s apart — inside the 60 s quiet window, so the provisional
+        // settlement continues the episode exactly like the direct path.
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 30_000, undefined);
+        settle(undefined);
+        const hold = activeThrottleHolds()[0]!;
+        assert.equal(hold.streak, 2, "within-window 429s keep the streak through the provisional lane");
+        assert.equal(hold.terminal, false, "one within-window step is not terminal");
+    });
+});
+
+test("#7295: provisional settlement onto a probed hold across a quiet gap resets the streak", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_MAX_CONSECUTIVE: "3", BILI_THROTTLE_429_BASE_DELAY_MS: "1000", BILI_THROTTLE_429_MAX_DELAY_MS: "8000" }, () => {
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_CRED_A, null, T0);
+        // A concurrent send is admitted as the probe of the expired hold and is
+        // still in flight when this send's 429 settles — the separate-ownership
+        // branch must apply the quiet-gap rule too.
+        const gate = upstreamThrottleGate(URL_A, H_CRED_A, T0 + 1_200_000);
+        assert.ok(gate.probeToken, "the expired hold admits a probe");
+        const settle = beginProvisionalUpstreamThrottle429(URL_A, H_CRED_A, null, T0 + 1_200_001, undefined);
+        settle(undefined);
+        for (const hold of activeThrottleHolds()) {
+            assert.equal(hold.streak, 1, "quiet gap resets the streak even when settling onto a probed hold");
+            assert.equal(hold.terminal, false, "no quiet-gap episode is terminal");
+        }
     });
 });
