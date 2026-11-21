@@ -4,7 +4,8 @@ import http from "node:http";
 import { once } from "node:events";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS, type UpstreamFailureKind } from "../src/upstream-fail.ts";
 import { ALERT_KINDS } from "../src/upstream-alerts.ts";
-import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
+import { REPLAY_MAX_ATTEMPTS, type FetchOptions, UpstreamHttpError, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
+import { withFetchTransport } from "../src/fetch-transport.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import { proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
 
@@ -222,6 +223,64 @@ test("fetchWithRetry: external abort is never replayed", async () => {
         assert.equal(retries.length, 0, "client-abort must not be retried");
     } finally {
         await close(upstream);
+    }
+});
+
+// #6133: once response HEADERS have arrived, a body that fails to READ
+// (transport body-timeout, abort, mid-stream reset) means the response never
+// completed — its status is not a reliable verdict and the body text needed for
+// transient classification is absent. The old blanket `.text().catch(() =>
+// "upstream error")` swallowed the transport cause and then REPLAYED on the
+// bare status (stacking the full idle budget across attempts). Such a failure
+// must be surfaced unchanged with no replay; only a fully-received error body
+// follows the normal HTTP-retry path.
+test("fetchWithRetry: a non-ok response whose body fails to read is NOT replayed — the transport cause is preserved (#6133)", async () => {
+    _resetFetchUtilForTest();
+    const prevMax = process.env.BILI_REPLAY_RETRY_MAX;
+    const prevBase = process.env.BILI_REPLAY_RETRY_BASE_MS;
+    process.env.BILI_REPLAY_RETRY_MAX = "3";
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+    try {
+        const abortErr = new Error("This operation was aborted");
+        abortErr.name = "AbortError";
+        const cases: Array<{ label: string; status: number; bodyError: Error }> = [
+            { label: "503 + UND_ERR_BODY_TIMEOUT", status: 503, bodyError: netError("UND_ERR_BODY_TIMEOUT", "response body timeout") },
+            { label: "500 + AbortError", status: 500, bodyError: abortErr },
+            { label: "400 + UND_ERR_BODY_TIMEOUT", status: 400, bodyError: netError("UND_ERR_BODY_TIMEOUT", "response body timeout") },
+        ];
+        for (const { label, status, bodyError } of cases) {
+            let hits = 0;
+            const retries: unknown[] = [];
+            const transport = async (_url: string, _opts: FetchOptions): Promise<Response> => {
+                hits += 1;
+                return new Response(
+                    new ReadableStream<Uint8Array>({ start(c) { c.error(bodyError); } }),
+                    { status },
+                );
+            };
+            await assert.rejects(
+                withFetchTransport(transport, () => fetchWithRetry(
+                    "http://127.0.0.1:1/unused",
+                    { method: "POST", body: "{}" },
+                    5000,
+                    undefined,
+                    (info) => retries.push(info),
+                )),
+                (err: unknown) => {
+                    assert.ok(!(err instanceof UpstreamHttpError), `${label}: must not be converted to UpstreamHttpError`);
+                    assert.ok(err instanceof Error, `${label}: must be an Error`);
+                    assert.equal(err, bodyError, `${label}: the body-read error must propagate unchanged`);
+                    return true;
+                },
+            );
+            assert.equal(hits, 1, `${label}: no replay after a post-headers body-read failure`);
+            assert.equal(retries.length, 0, `${label}: no retry callback fired`);
+        }
+    } finally {
+        if (prevMax === undefined) delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = prevMax;
+        if (prevBase === undefined) delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        else process.env.BILI_REPLAY_RETRY_BASE_MS = prevBase;
     }
 });
 
