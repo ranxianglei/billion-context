@@ -43,6 +43,15 @@ const RESERVED_PREFIX = "acp_summary_";
 const BAD_ID_CHARS = /[\s\p{C}]/u;
 const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
 const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
+// #7367: the tail list is [id(K-1)] + new ids since the last stamp. When the
+// stamp freezes (the flag flips off, a restart, a scan miss) K stops moving and
+// this slice grows with every turn — unbounded it crosses Node's 16 KB header
+// limit and the proxy drops the connection before any handler runs, wedging
+// the session on every retry. A tail this large would miss the fold anyway
+// (the server's width check requires len === T - stampT + 1), so keep only the
+// newest MAX_TAIL_IDS ids: the window origin the fastpath needs is the LAST
+// element, and a delta wider than this degrades to a (correct) miss.
+const MAX_TAIL_IDS = 160;
 
 type Tracked = { t?: number; ids?: string[] };
 
@@ -130,7 +139,12 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
     const ids = slot.ids;
     if (ids !== undefined && ids.length >= k) {
-        out[TAIL_IDS_HEADER] = ids.slice(k - 1).map(encodeURIComponent).join(",");
+        // #7367: cap the tail to the newest MAX_TAIL_IDS ids. When K is frozen
+        // the full [K-1..] slice would grow past the 16 KB header limit; a
+        // capped tail still ends at the true window origin (ids.length-1) and
+        // degrades a wide delta to a conservative server-side miss.
+        const start = Math.max(k - 1, ids.length - MAX_TAIL_IDS);
+        out[TAIL_IDS_HEADER] = ids.slice(start).map(encodeURIComponent).join(",");
     }
     return out;
 }

@@ -255,7 +255,10 @@ rule; proof tests in `tests/fold-anchor-doctrine.test.ts`):
 - **Epoch-confirm gate**: total collapse latches `foldEpochConfirmPending`,
   emits one error, and preflight passes requests through verbatim — folding
   *pauses*; nothing is deleted, nothing is silently reset. Alignment
-  recovery (the host resends the true history) auto-clears the latch.
+  recovery (the host resends the true history) auto-clears the latch. The
+  pause holds only while the verbatim payload fits the model window: an
+  over-window payload cannot pass through, so preflight folds it as usual
+  (#6069).
 - **Unresolved-anchor placement** (kernel `prune.ts`): a block whose anchors
   all failed to resolve now inserts at the last user message instead of the
   tail — a summary block can no longer ride *after* the user's newest

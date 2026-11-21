@@ -57,14 +57,14 @@ export function subagentSessionsOf(session: SubagentSession | undefined): Record
 const TASK_ENVELOPE_RE = /^<(?:task id|subagent sessionID)="(ses_[A-Za-z0-9]+)"(?:\s[^>]*)?>/;
 
 export function captureSubagentSessionIds(messages: SubagentMessage[], covered: Set<string>): string[] {
-    const out: string[] = [];
+    const ids = new Set<string>();
     for (const m of messages) {
         if (!covered.has(m.id)) continue;
         if (typeof m.toolName !== "string" || !SUBAGENT_TOOL_NAMES.has(m.toolName)) continue;
         if (m.contentType === "tool-result") {
             const first = (m.text ?? "").split("\n", 1)[0]?.trim() ?? "";
             const id = first.match(TASK_ENVELOPE_RE)?.[1];
-            if (id !== undefined && !out.includes(id)) out.push(id);
+            if (id !== undefined) ids.add(id);
             continue;
         }
         let parsed: unknown;
@@ -77,10 +77,10 @@ export function captureSubagentSessionIds(messages: SubagentMessage[], covered: 
         const obj = parsed as Record<string, unknown>;
         for (const key of ["sessionId", "sessionID", "session_id"]) {
             const v = obj[key];
-            if (typeof v === "string" && SES_ID_RE.test(v) && !out.includes(v)) out.push(v);
+            if (typeof v === "string" && SES_ID_RE.test(v)) ids.add(v);
         }
     }
-    return out;
+    return [...ids];
 }
 
 // Fold-commit hook. `changed` = new blocks plus refolds (summary replaced,

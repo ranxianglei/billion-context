@@ -70,7 +70,7 @@ import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
+import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -149,7 +149,7 @@ type ToolDefinition = {
 type CommandOutcome = { kind: "success" | "error"; text: string };
 
 export type PluginContext = {
-    tools: { register: (definition: ToolDefinition) => unknown };
+    tools: { register: (definition: ToolDefinition) => unknown; get?: (name: string) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
@@ -216,18 +216,9 @@ export function planNativeDsh(env: NodeJS.ProcessEnv): { mode: "off" | "attach" 
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
-// One registration lifecycle per HOST CONTEXT. toolsReady is the ONLY gate
-// for header stamping (pi.ts discipline): stamped headers flip the proxy into
-// plugin mode, which suppresses wire tool injection — stamping before the
-// local tools exist would send a tool-less request.
-// #3380: registrations live in the host process's tool layer and die ONLY
-// with their context (the apply() re-arm below is the sole reset). Proxy
-// death merely moves the origin — the execute closures read the LIVE base
-// (#983) — so proxy-death paths must NOT clear toolsReady: doing so forced a
-// doomed re-registration that DSH rejects ("tool X is already registered"),
-// locked the latch false forever, and silently stripped every request of its
-// identity headers (wire mode → anonymous zero-fold ledgers → 413 on large
-// sessions).
+// Tool readiness belongs to one activation, including Cordis restarts that
+// reuse their context. Proxy death only moves the live base read by execute
+// closures (#3380); it does not invalidate surviving host registrations.
 type RegisterState = {
     base: string | undefined;
     toolsReady: boolean;
@@ -303,12 +294,7 @@ export { DSH_BUILD_CHECK } from "./client-build-note.js";
  * the gate rows' fate implied. Best-effort by necessity: preset configs
  * resolve lazily, so "so far" is the honest frame. */
 function gateCoverageSuffix(): string {
-    const t = dshCompactionGateTelemetry();
-    if (t === null || t.covered.length === 0) {
-        return " Overlay coverage so far: no preset entry rewritten in this process (preset configs resolve lazily — zero at this point does not mean zero later).";
-    }
-    const entries = t.covered.map((c) => `${c.entry}\u00d7${c.rows}`).join(", ");
-    return ` Overlay coverage so far: ${t.covered.length} preset ${t.covered.length === 1 ? "entry" : "entries"} rewritten (${entries}).`;
+    return ` Overlay coverage so far: ${compactionCoverageText()}.`;
 }
 
 /** #1590/#1809: origin of the proxy as currently reachable — register.base
@@ -982,39 +968,109 @@ function fireGiveUp(): void {
     armRecoveryTimer();
 }
 
-async function registerTools(ctx: PluginContext): Promise<void> {
-    if (register.pending !== undefined) return register.pending;
-    const base = register.base;
-    if (register.toolsReady || base === undefined) return;
-    register.pending = (async () => {
-        const tools = await fetchManifest(base, "anthropic");
-        // #2082: land on the CURRENT context, not the one that started this
-        // flight — a re-activation mid-fetch must not register into (or die
-        // on) the deactivated context captured at call time.
-        const target = activeCtx ?? ctx;
+type ToolsOwner = {
+    ctx: PluginContext;
+    closed: boolean;
+    restoring: boolean;
+    definitions: Map<string, ToolDefinition>;
+};
+let toolsOwner: ToolsOwner | undefined;
+
+function toolsAreReady(): boolean {
+    const owner = toolsOwner;
+    if (owner === undefined) return register.toolsReady;
+    register.toolsReady = !owner.closed && owner.definitions.size > 0
+        && (owner.ctx.tools.get === undefined ? register.toolsReady
+            : [...owner.definitions.keys()].every((name) => owner.ctx.tools.get?.(name) !== undefined));
+    return register.toolsReady;
+}
+
+function restoreTools(owner: ToolsOwner): void {
+    if (owner !== toolsOwner || owner.closed || owner.restoring) return;
+    owner.restoring = true;
+    register.toolsReady = false;
+    try {
         let adopted = 0;
-        for (const tool of tools) {
+        for (const [name, definition] of owner.definitions) {
+            if (owner.ctx.tools.get?.(name) !== undefined) {
+                adopted++;
+                continue;
+            }
             try {
-                target.tools.register(toolDefinition(tool));
+                // The HOST owns the registration's lifetime: DSH's ToolsService
+                // attaches it to the calling fiber via layers.effect(ctx, …), so
+                // a restart or dispose removes it and tools/change lets the next
+                // activation restore (#6702). Proxy death runs no effect — the
+                // registration survives it (#3380).
+                owner.ctx.tools.register(definition);
             } catch (err) {
-                // #3380: idempotent adoption — a name this process ALREADY
-                // holds in the host tool layer throws "already registered";
-                // that registration is exactly what we want, so skip it and
-                // register the rest (also converges a partial registration
-                // left by an earlier interrupted flight).
                 if (!errMessage(err).includes("already registered")) throw err;
-                adopted += 1;
+                adopted++;
             }
         }
         if (adopted > 0 && !regAdoptLogged) {
             regAdoptLogged = true;
             persistClientEvent(`tool registration adopted ${adopted} pre-existing registration(s) from this process — continuing`);
         }
-        register.toolsReady = true;
+        register.toolsReady = owner.definitions.size > 0;
+        if (!toolsAreReady()) throw new Error("bili: tool registrations did not become visible");
+    } finally {
+        owner.restoring = false;
+    }
+}
+
+function beginToolsOwner(ctx: PluginContext): ToolsOwner {
+    if (ctx.effect === undefined && toolsOwner?.ctx === ctx && !toolsOwner.closed) return toolsOwner;
+    if (toolsOwner !== undefined) toolsOwner.closed = true;
+    const owner: ToolsOwner = { ctx, closed: false, restoring: false, definitions: new Map() };
+    toolsOwner = owner;
+    register.toolsReady = false;
+    register.pending = undefined;
+    register.retryAt = 0;
+    ctx.effect?.(() => () => {
+        owner.closed = true;
+        if (toolsOwner === owner) {
+            register.toolsReady = false;
+            register.pending = undefined;
+        }
+    }, "bili: tool registration lifetime");
+    ctx.on?.("tools/change", () => {
+        if (owner !== toolsOwner || owner.closed || owner.restoring || owner.definitions.size === 0) return;
+        // A real Cordis teardown fires tools/change from the tool disposers
+        // BEFORE the fiber's own disposers run: restoring while the fiber is
+        // past its active window (states beyond LOADING=1/ACTIVE=2 — FAILED,
+        // DISPOSED, UNLOADING) would resurrect registrations that teardown is
+        // releasing. Hosts without a fiber expose no state and keep restoring.
+        const fiberState = (owner.ctx as { fiber?: { state?: number } }).fiber?.state;
+        if (fiberState !== undefined && fiberState !== 1 && fiberState !== 2) return;
+        try {
+            restoreTools(owner);
+        } catch (err) {
+            register.toolsReady = false;
+            register.lastRegistrationError = errMessage(err);
+            armRecoveryTimer();
+        }
+    });
+    return owner;
+}
+
+async function registerTools(ctx: PluginContext): Promise<void> {
+    const owner = toolsOwner;
+    if (owner === undefined || owner.closed || owner.ctx !== ctx) return;
+    if (register.pending !== undefined) return register.pending;
+    const base = register.base;
+    if (toolsAreReady() || base === undefined) return;
+    const pending = (async () => {
+        const tools = await fetchManifest(base, "anthropic");
+        if (owner !== toolsOwner || owner.closed || register.base !== base) return;
+        owner.definitions = new Map(tools.map((tool) => [tool.name, toolDefinition(tool)]));
+        restoreTools(owner);
         register.failStreak = 0;
         register.lastRegistrationError = undefined;
     })()
         .catch((err: unknown) => {
+            if (owner !== toolsOwner || owner.closed) return;
+            register.toolsReady = false;
             // Cordis deactivates the plugin context while the host tears down
             // (dsh --help, early CLI exits): every later register attempt hits
             // "cannot get required service ... in inactive context" and would
@@ -1042,9 +1098,10 @@ async function registerTools(ctx: PluginContext): Promise<void> {
             persistClientEvent(`manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
-            register.pending = undefined;
+            if (owner === toolsOwner && register.pending === pending) register.pending = undefined;
         });
-    return register.pending;
+    register.pending = pending;
+    return pending;
 }
 
 // #2082: recovery retries are traffic-driven (headersFor on model
@@ -1057,13 +1114,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
 // ops knob); absent it tracks RETRY_INTERVAL_MS. Tests that do not opt in
 // never start a timer at all (NODE_TEST_CONTEXT guard keeps suites quiet).
 let recoveryTimer: NodeJS.Timeout | undefined;
-// #2082: the LATEST context seen by apply()/maybeRetry. Every async recovery
-// path (the timer tick below, an in-flight registration landing after a
-// re-activation) must resolve its context at landing time, not from a capture
-// taken when the retry was armed — a captured context may already be
-// deactivated by then (dsh reload / profile switch), and registering into it
-// throws "inactive context" and would re-poison register.dead, exactly what
-// this fix removes.
+// #2082: the recovery timer follows the latest activation's context.
 let activeCtx: PluginContext | undefined;
 function recoveryIntervalMs(): number {
     const raw = process.env.BILI_DSH_RECOVERY_INTERVAL_MS;
@@ -1091,7 +1142,10 @@ function armRecoveryTimer(): void {
 }
 
 function maybeRetry(ctx: PluginContext): void {
+    if (toolsOwner === undefined) beginToolsOwner(ctx);
+    if (toolsOwner?.closed || toolsOwner?.ctx !== ctx) return;
     activeCtx = ctx;
+    toolsAreReady();
     // #3380: the base-less state heals through the RESPAWN branch below even
     // when toolsReady is true (registrations survive proxy death) — gating on
     // toolsReady alone would strand a given-up register with no driver left.
@@ -1162,7 +1216,11 @@ function registerArmed(): Promise<void> {
 // log line each. Three states + per-endpoint cumulative counts make the
 // "dozens refused, one passed" distribution diagnosable at a glance.
 type GateAttribution =
-    | { state: "ok"; sid: string }
+    // #6880: `purpose` rides the dispatch's own options (GenerateOptions.purpose,
+    // dsh contract: set ONLY on auxiliary calls — ordinary conversation leaves
+    // it unset). Stamped as x-bili-plugin-purpose so the server classifies the
+    // request BY DECLARATION instead of content-guessing (#6880).
+    | { state: "ok"; sid: string; purpose?: string }
     | { state: "none"; initiatorPresent: boolean }
     | { state: "threw"; message: string };
 
@@ -1188,10 +1246,17 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    purpose?: string;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
 let noticedScopedAttribution = false;
+// #6770: the #3962 coverage readout only ever rode the profile-bundle note,
+// which stays silent wherever profileContext.startedBundles cannot be read
+// (observed on both a desktop dsh build and the dsh-go runtime), so the
+// coverage reading had no reachable exit. Emit it once per process on the
+// first routed request instead.
+let compactionCoverageNoted = false;
 
 /** #4491: extract the host message ids from llm/stream `options.messages`,
  *  all-or-nothing. Mirrors validateMsgIds in src/msgid-pin.ts (the 400-class
@@ -1276,13 +1341,22 @@ function attributionOf(ctx: PluginContext): GateAttribution {
     // driving), and it survives exactly the shapes the ambient reading does
     // not (agentless compaction/title lanes, disposed scopes, retried
     // re-sends whose initiator scope went away between attempts).
+    // #6770: first routed request is the earliest point where the overlay's
+    // structural rewrites can have happened (preset configs resolve lazily),
+    // so the coverage reading goes out here — the durable profile note that
+    // used to carry it never fires when profileContext.startedBundles cannot
+    // be read, which is the observed state on every host we checked.
+    if (!compactionCoverageNoted) {
+        compactionCoverageNoted = true;
+        persistClientEvent(`bili-native-dsh: compaction overlay coverage — ${compactionCoverageText()} (#6770)`);
+    }
     const scoped = dispatchScope.getStore();
     if (scoped !== undefined && scoped.sid.length > 0) {
         if (!noticedScopedAttribution) {
             noticedScopedAttribution = true;
             persistClientEvent("bili-native-dsh: llm/stream attribution active — session id rides the request object (#4082)");
         }
-        return { state: "ok", sid: scoped.sid };
+        return { state: "ok", sid: scoped.sid, purpose: scoped.purpose };
     }
     try {
         const init = ctx.agents?.currentInitiator?.();
@@ -1909,28 +1983,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // (disabling the plugin must not brick session creation, #3662).
     declareDshCompactionActive();
 
-    // #2082: a fresh activation invalidates the "host tearing down" verdict.
-    // Without this reset, ONE registerTools rejection carrying "inactive
-    // context" (a cordis deactivate/reactivate cycle — dsh reloading the
-    // plugin after the desktop profile copy was swapped in place, a profile
-    // switch, a settings toggle) poisons register.dead for the whole process
-    // lifetime: every later maybeRetry() returns immediately and the bili
-    // tools never come back until dsh restarts.
-    // #2101: a re-activation ALSO invalidates a SUCCESSFUL registration.
-    // Registrations die with their context: the tools registered into the
-    // previous activation are disposed when that context deactivates, but
-    // register.toolsReady keeps its stale stamp — and every
-    // registerTools()/maybeRetry() early-returns on it, so the new context
-    // never gets the bili tools (the #2082 symptom reached from the success
-    // ordering: a settings toggle, a profile switch or a plugin reload
-    // AFTER a healthy boot loses the tools until dsh restarts). Clear the
-    // stale stamp so the retry loop re-registers into the live context;
-    // retryAt goes with it (#1783: a fresh activation must not stand behind
-    // a stale back-off wall).
-    if (register.toolsReady && activeCtx !== undefined && activeCtx !== ctx) {
-        register.toolsReady = false;
-        register.retryAt = 0;
-    }
+    const owner = beginToolsOwner(ctx);
     register.dead = false;
     // #3380: a fresh activation starts a clean registration cycle — stale
     // failure bookkeeping from the previous context must not carry over
@@ -2041,13 +2094,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // #6880: capture the dispatch's declared purpose the same way
+                // (dsh sets it on every auxiliary call; conversation leaves it
+                // unset). Absent/odd values simply stay off the turn.
+                const purpose = typeof options?.purpose === "string" && options.purpose.length > 0 && options.purpose.length <= 64 && /^[\x21-\x7e]+$/.test(options.purpose) ? options.purpose : undefined;
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), purpose };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2562,6 +2619,18 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
         const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        // #6880: the declared purpose rides its own header (ASCII-gated like
+        // the model header below — an odd value degrades to no header, and
+        // the server falls back to its content heuristics). Post-#6883 this is
+        // stamped on EVERY dispatch: the real dsh purpose for auxiliary
+        // calls, or the "conversation" sentinel for main turns (dsh leaves
+        // GenerateOptions.purpose unset for ordinary conversation). PRESENCE
+        // is therefore the v2 declaration — the server routes declared aux by
+        // the header alone and keys declared main traffic on the raw session
+        // id (no persona-order ladder); the sentinel itself is not a side.
+        const declaredPurpose = attr.purpose ?? "conversation";
+        const purposeHeader = asciiHeaderValue(declaredPurpose);
+        if (purposeHeader !== undefined) headers["x-bili-plugin-purpose"] = purposeHeader;
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -2750,7 +2819,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         resolveToolsGate();
     } else {
         void state.ready.then(async (origin) => {
-            if (origin !== undefined) await registerTools(ctx).catch(() => {});
+            if (origin !== undefined && owner === toolsOwner && !owner.closed) await registerTools(ctx).catch(() => {});
             resolveToolsGate();
         });
     }
@@ -2919,6 +2988,8 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
         recoveryTimer = undefined;
     }
     activeCtx = undefined;
+    if (toolsOwner !== undefined) toolsOwner.closed = true;
+    toolsOwner = undefined;
     // #2187: apply() now reaches the respawn arming on every plan, so a stale
     // single-flight wrapper (capturing a previous test's spawn stub) must not
     // survive a reset.
@@ -3056,6 +3127,12 @@ export function _resetNonWebTraceForTest(): void {
 /** Test hook: reset the once-per-process unverified-dsh-build note flag. */
 export function _resetDshNewerBuildNoteForTest(): void {
     dshNewerBuildNoted = false;
+}
+
+/** Test hook (#6770): reset the once-per-process compaction-coverage readout
+ *  flag so a test can pin the emit wiring, not just the formatter. */
+export function _resetCompactionCoverageNoteForTest(): void {
+    compactionCoverageNoted = false;
 }
 
 /** #2924 direction 2: a `threw` attribution (host agent scope disposed
