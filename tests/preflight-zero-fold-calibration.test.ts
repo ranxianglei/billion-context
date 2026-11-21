@@ -9,6 +9,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { outboundPayloadBreakdown, preflightCompressIfNeeded, type Prepared } from "../src/server.ts";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY } from "../src/util.ts";
 import { _liveUpstreamTimersForTest, _resetFetchUtilForTest } from "../src/fetch-util.ts";
 
 process.env.NODE_ENV = "test";
@@ -90,6 +91,9 @@ async function run(s: Scenario) {
     session.stats.calibratedEstimate = s.k;
     session.stats.calibratedEstimateOrigin = s.otherOrigin ? "http://other.invalid" : origin;
     session.stats.calibratedEstimateModel = s.otherModel ? "another-model" : "test-model";
+    // #5952: the synthetic factor is text-only evidence, so it may decide —
+    // the origin/model mismatch cases still ignore it via their own gates.
+    session.stats.calibratedEstimateProvenance = CALIBRATION_PROVENANCE_TEXT_ONLY;
     session.metadata.lastModel = "test-model";
     if (s.localRefusal) session.metadata.localRefusals = [{ origin, model: "test-model", window: limit, at: Date.now() }];
     // Keep the normal no-ranges shortcut out of the way: this is the caller's

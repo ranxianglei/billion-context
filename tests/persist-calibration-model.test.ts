@@ -6,7 +6,7 @@ import path from 'node:path';
 import {createInitialState} from 'acp-kernel';
 import {SessionStore} from '../src/persist.ts';
 import type {Session} from '../src/session.ts';
-import {currentCalibrationFactor} from '../src/util.ts';
+import {CALIBRATION_PROVENANCE_TEXT_ONLY, currentCalibrationFactor} from '../src/util.ts';
 import {rmrf} from './tmp-rm.ts';
 
 process.env.BILI_CONFIG_FILE = path.join(tmpdir(), 'calibration-model-no-config.json');
@@ -19,6 +19,8 @@ function session(id: string, model?: string): Session {
       retrieveCalls:0,retrieveHits:0,retrieveMisses:0,storedBytes:0,storeBytesSaved:0,rangeRestores:0,
       calibratedEstimate:0.8,calibratedEstimateOrigin:'http://synthetic.invalid',
       calibratedEstimateModel:model,
+      // #5952: the seeded factor is text-only evidence, so it may decide.
+      calibratedEstimateProvenance:CALIBRATION_PROVENANCE_TEXT_ONLY,
       calibrationRing:{origin:'http://synthetic.invalid',...(model === undefined ? {} : {model}),values:[0.8,0.8]}},
     metadata:{},createdAt:1700000000000,lastSeen:1700000001000,state:createInitialState(),
     blockContents:new Map(),inFlight:0,persisted:false,pendingRetrievals:[]};
