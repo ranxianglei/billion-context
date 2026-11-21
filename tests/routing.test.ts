@@ -73,6 +73,9 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("gpt-4o"), 128_000);
     assert.equal(lookupContextLimit("gpt-5"), 400_000);
     assert.equal(lookupContextLimit("o1-preview"), 200_000);
+    assert.equal(lookupContextLimit("gemini-4-hydrogen-high"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-hydrogen"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-3-pro-preview"), 1_048_576);
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
     assert.equal(lookupContextLimit("glm-4.5-air"), 200_000);
@@ -93,6 +96,21 @@ test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 1
     assert.equal(lookupContextLimit("deepseek-v3"), 128_000);
     assert.equal(lookupContextLimit("deepseek-v3.2"), 128_000);
     assert.equal(lookupContextLimit("deepseek-ocr-2"), 128_000);
+});
+
+test("lookupContextLimit sizes the gemini-4 family at 1M (#6468)", () => {
+    // Antigravity ships gemini-4-hydrogen* (1M context, multimodal, thinking)
+    // under bare and namespaced ids; neither the models.dev snapshot nor the
+    // pre-#6468 table had a gemini-4 row, so it fell to the 200K anonymous
+    // default. The family rule must cover the bare id, the -high variant, the
+    // relay "vendor/model" form, and the colon-tail "vendor/region:model" form.
+    assert.equal(lookupContextLimit("gemini-4-hydrogen"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-hydrogen-high"), 1_048_576);
+    assert.equal(lookupContextLimit("antigravity/gemini-4-hydrogen-high"), 1_048_576);
+    assert.equal(lookupContextLimit("llmgateway-providers/google-vertex/gemini-4-hydrogen"), 1_048_576);
+    assert.equal(lookupContextLimit("acme/us:gemini-4-hydrogen-high"), 1_048_576);
+    // A different gemini major is untouched by the new row.
+    assert.equal(lookupContextLimit("gemini-2.5-flash"), 1_000_000);
 });
 
 test("lookupContextLimit matches relay/vLLM 'prefix/name' ids via the bare basename (#736)", () => {
