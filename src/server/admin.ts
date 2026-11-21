@@ -1039,11 +1039,15 @@ async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerRespon
         const raw = (await readBody(req)).toString("utf8");
         if (raw.trim().length > 0) {
             const doc: unknown = JSON.parse(raw);
-            if (doc && typeof doc === "object" && typeof (doc as { duration?: unknown })["duration"] === "string") duration = (doc as { duration: string })["duration"];
+            if (doc === null || typeof doc !== "object" || Array.isArray(doc)) throw new Error("pin body must be a JSON object");
+            const d: unknown = (doc as { duration?: unknown })["duration"];
+            if (d !== undefined && typeof d !== "string") throw new Error("pin duration must be a string");
+            if (typeof d === "string") duration = d;
         }
     } catch {
-        // malformed body: pin is input-optional, but a GARBAGE duration must
-        // not become "indefinite" — reject it like the other POSTs.
+        // malformed body: pin is input-optional, but a GARBAGE duration (or a
+        // non-object body / non-string duration) must not become "indefinite"
+        // — reject it like the other POSTs.
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: 'expected JSON body {"duration": "1h" | "12h" | "1d" | "7d" | "forever"} (or no body for indefinite)' }, null, 2));
         return;
@@ -1053,7 +1057,7 @@ async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerRespon
         res.end(JSON.stringify({ error: "duration must look like 1h / 12h / 1d / 7d / forever (see `bili pin --help`)" }, null, 2));
         return;
     }
-    log("info", `[update] web panel pinned the installed version ${duration ? `for ${duration}` : "indefinitely"}`);
+    log("info", `[update] web panel requested a pin of the installed version ${duration ? `for ${duration}` : "indefinitely"}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(await pinCurrentAction(VERSION, duration), null, 2));
 }
@@ -1061,7 +1065,7 @@ async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerRespon
 /** POST /__bili/update/pin/clear — release the local version pin (#6804).
  *  Always HTTP 200 {ok, error?}. */
 async function handleUpdatePinClear(res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
-    log("info", `[update] web panel released the version pin`);
+    log("info", `[update] web panel requested to release the version pin`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(await clearPinAction(), null, 2));
 }

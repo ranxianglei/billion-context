@@ -419,6 +419,14 @@ test("admin routes: state surfaces notices; install enforces charset/auth gates 
         const pinMalformed = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, "{nope");
         assert.equal(pinMalformed.status, 400);
         assert.match(JSON.stringify(pinMalformed.json), /expected JSON body/);
+        // A non-string duration or a non-object body must 400 too — it may
+        // not silently become an "indefinite" pin.
+        const pinNonString = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ duration: 42 }));
+        assert.equal(pinNonString.status, 400);
+        assert.match(JSON.stringify(pinNonString.json), /expected JSON body/);
+        const pinNonObject = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify("banana"));
+        assert.equal(pinNonObject.status, 400);
+        assert.match(JSON.stringify(pinNonObject.json), /expected JSON body/);
         const pinSpoofed = await call("POST", "/__bili/update/pin", { ...spoofedHeaders, "content-type": "application/json" }, JSON.stringify({ duration: "1h" }));
         assert.equal(pinSpoofed.status, 403, "gate must fire before body parsing on the pin route too");
         // Unwired process still pins: the action falls back to the running
