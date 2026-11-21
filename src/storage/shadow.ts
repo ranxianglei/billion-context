@@ -504,7 +504,7 @@ export class UnifiedShadow {
         loggerLog(
             "info",
             mode === "full"
-                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}${walTag}`
+                ? `[storage] unified FULL mode ENABLED (storage.unified=full, BILI_STORAGE_UNIFIED=full, or the default when neither is set): index.db is the load path (unified-first, legacy fallback) — set storage.unified=legacy or BILI_STORAGE_UNIFIED=legacy to roll back to legacy-first${engineTag}${walTag}`
                 : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}${walTag}`,
         );
         return shadow;
