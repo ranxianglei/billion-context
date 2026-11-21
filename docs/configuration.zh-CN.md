@@ -409,8 +409,8 @@
 | `BILI_ZCODE_PORT` | number | unset | — | zcode 车道的端口钉死。 |
 | `BILI_ZCODE_SIGNING_FIXED` | boolean-ish | off | — | zcode 凭据车道的固定签名模式。 |
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
-| `BILI_WB_PROXY` | string | unset | — | workbuddy 车道的 origin 钉死（默认：常驻 `http://127.0.0.1:8787`）。 |
-| `BILI_WB_UPSTREAM` | string | unset | — | workbuddy 车道的上游钉死（默认：`https://www.workbuddy.ai`）。 |
+| `BILI_WB_PROXY` | string | unset | — | workbuddy 车道的 origin 钉死（默认：常驻 http://127.0.0.1:8787）。 |
+| `BILI_WB_UPSTREAM` | string | unset | — | workbuddy 车道的上游钉死（默认：https://www.workbuddy.ai）。 |
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex 状态处理方式：auto（新版 codex 走 CODEX_SQLITE_HOME 共享库，旧版回退 overlay 副本）、shared、legacy。shared 模式最多 16 个并发会话，每会话一个独立 overlay 槽位；legacy 保持一次仅一个独占 overlay。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。 |
