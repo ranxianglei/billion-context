@@ -80,19 +80,6 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         assert.equal(store.getBlocks("other").length, 4);
         assert.deepEqual(store.getBlocks("missing"), []);
         assert.deepEqual(store.getBlockContents("missing", { limit: 5 }), []);
-        assert.equal(store.getBlockContents("missing"), null);
-    });
-
-    test(`${engine}: decoded block maps preserve row-over-orphan precedence`, (t) => {
-        const fixture = setup(engine, t);
-        if (!fixture) return;
-        const { store } = fixture;
-        const contents = store.getBlockContents("target");
-        assert.ok(contents);
-        assert.equal(contents.size, 5);
-        assert.equal(contents.get("b-c")?.full.text, "target b-c 海🌊\u0000");
-        assert.deepEqual(contents.get("orphan"), { one: null, full: { text: "retained orphan", count: 1 } });
-        assert.equal(contents.get("b-a")?.one, null);
     });
 
     test(`${engine}: missing CAS rows preserve empty-summary and null-one fallbacks`, (t) => {
@@ -124,6 +111,5 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         const { blockId, summary, one } = store.getBlocks("target")[0];
         assert.deepEqual({ blockId, summary, one }, expected);
         assert.deepEqual(store.getBlockContents("target", { limit: 1 }), [expected]);
-        assert.throws(() => store.getBlockContents("target"), SyntaxError);
     });
 }

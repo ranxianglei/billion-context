@@ -156,6 +156,11 @@ export const LIVE_FILES = [
     // the zone band is irrelevant; the entry is for the tripwire, like
     // #5046/#4612.
     "tests/storage-integrity-cache.test.ts",
+    // #7156: the only child is spawnSync("true") in freshDeadPid() — a
+    // guaranteed-dead pid for the stale-lock fixture; no ports, no servers,
+    // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
+    // for the tripwire, like #5046/#4612.
+    "tests/storage-backup-repair.test.ts",
     // #7176: the pinned-attach decision test. Every origin is a listen(0)
     // pick (the dead arm binds :0, reads the port, closes it and requires
     // ECONNREFUSED there), so no fixed port and no zone band is involved; no

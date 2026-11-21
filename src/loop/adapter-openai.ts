@@ -57,6 +57,31 @@ function filterRealToolFragments(
     return filtered;
 }
 
+// OpenAI-compatible upstreams disagree on the thinking field's name: DeepSeek
+// and llama.cpp stream reasoning_content, Ollama Cloud / vLLM / Magpie stream
+// reasoning (same alias set and order as pi-ai's openai-completions reader).
+// #7432: the adapter used to read reasoning_content only, so every
+// reasoning-only chunk of an alias upstream fell through the dispatch ladder
+// and was dropped — the client kept exactly the first token, the one frame
+// that also carries `role` and took the meta fallback.
+const REASONING_DELTA_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+
+function reasoningDeltaIn(delta: Record<string, unknown>): { field: string; value: string } | null {
+    for (const field of REASONING_DELTA_FIELDS) {
+        const value = delta[field];
+        if (typeof value === "string" && value.length > 0) return { field, value };
+    }
+    return null;
+}
+
+// Client-visible frames always speak the canonical name: an alias frame is
+// rewritten to reasoning_content and its original key dropped, so a client that
+// saw the alias never echoes it back (upstreams silently discard a replayed
+// `reasoning` field, they only read reasoning_content).
+function reasoningFrameFields(field: string, value: string): Record<string, string> {
+    return field === "reasoning_content" ? { reasoning_content: value } : { [field]: "", reasoning_content: value };
+}
+
 // #1881: settle drops proxy-only frames without forwarding their sibling prose.
 // Rebuild such a frame without tool_calls so that prose still reaches the
 // client. The stored copy already carries cleaned values; null when nothing
@@ -67,10 +92,14 @@ function withheldProseFrame(parsed: Record<string, unknown>): Buffer | null {
     const delta = choice?.delta as Record<string, unknown> | undefined;
     if (!choice || !delta) return null;
     const ct = typeof delta.content === "string" ? delta.content : "";
-    const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
-    if (ct.length === 0 && rc.length === 0) return null;
+    const rcDelta = reasoningDeltaIn(delta);
+    if (ct.length === 0 && rcDelta === null) return null;
     const cleanDelta = { ...delta };
     delete cleanDelta.tool_calls;
+    if (rcDelta !== null && rcDelta.field !== "reasoning_content") {
+        delete cleanDelta[rcDelta.field];
+        cleanDelta.reasoning_content = rcDelta.value;
+    }
     return Buffer.from("data: " + JSON.stringify({ ...parsed, choices: [{ ...choice, delta: cleanDelta }, ...(choices ?? []).slice(1)] }) + "\n\n", "utf8");
 }
 
@@ -622,7 +651,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 // was filtered — a dual-field frame leaked unfiltered content
                 // to the client while the filtered text event suppressed its
                 // raw to avoid double-sending.
-                const rcIn = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0 ? delta.reasoning_content : null;
+                const rcDelta = reasoningDeltaIn(delta);
+                const rcIn = rcDelta !== null ? rcDelta.value : null;
+                // #7432: an alias field (`reasoning`, `reasoning_text`) must ride
+                // out as reasoning_content — mark the frame changed so every raw
+                // path below rewrites it instead of forwarding the alias name.
+                const rcAliased = rcDelta !== null && rcDelta.field !== "reasoning_content";
+                const rcField = rcDelta !== null ? rcDelta.field : "reasoning_content";
                 const ctIn = typeof delta.content === "string" && delta.content.length > 0 ? delta.content : null;
                 let rcOut = rcIn;
                 let ctOut = ctIn;
@@ -643,10 +678,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     // echo (#1881). Structured events stay internal here.
                     let json = jsonStr;
                     let obj = parsed;
-                    if (rcChanged || ctChanged) {
+                    if (rcChanged || ctChanged || rcAliased) {
                         const fields: Record<string, string> = {};
                         if (ctIn !== null) fields["content"] = ctOut ?? "";
-                        if (rcIn !== null) fields["reasoning_content"] = rcOut ?? "";
+                        if (rcIn !== null) Object.assign(fields, reasoningFrameFields(rcField, rcOut ?? ""));
                         obj = applyDeltaFields(parsed, fields);
                         json = JSON.stringify(obj);
                     }
@@ -662,8 +697,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
                 const fin = (b: Buffer): Buffer => (finishReason ? stripFinishReasonChunk(b) : b);
                 if (rcIn !== null && ctIn !== null) {
-                    const raw = rcChanged || ctChanged
-                        ? rewriteDeltaFields(parsed, { content: ctOut ?? "", reasoning_content: rcOut ?? "" })
+                    const raw = rcChanged || ctChanged || rcAliased
+                        ? rewriteDeltaFields(parsed, { content: ctOut ?? "", ...reasoningFrameFields(rcField, rcOut ?? "") })
                         : rawBuf;
                     const fwd = fin(raw);
                     const hasText = ctOut !== null && ctOut.length > 0;
@@ -682,7 +717,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "text", delta: ctOut!, raw: fwd } as ParsedStreamEvent;
                     }
                 } else if (rcIn !== null) {
-                    const raw = rcChanged ? rewriteDeltaFields(parsed, { reasoning_content: rcOut ?? "" }) : rawBuf;
+                    const raw = rcChanged || rcAliased ? rewriteDeltaFields(parsed, reasoningFrameFields(rcField, rcOut ?? "")) : rawBuf;
                     yield { kind: "reasoning", delta: rcOut ?? "", raw: fin(raw) } as ParsedStreamEvent;
                 } else if (ctIn !== null) {
                     const raw = ctChanged ? rewriteDeltaFields(parsed, { content: ctOut ?? "" }) : rawBuf;
