@@ -491,15 +491,6 @@ const FOREIGN_CONVERSATION_FIELDS: Record<WireProtocol, ReadonlySet<string>> = {
     google: new Set(["input", "instructions", "messages", "system"]),
 };
 
-// #6844: DSH attaches model-hidden provider metadata as top-level body fields
-// (`dsh_session_log` diagnostics, `dsh_plugin_packages` inventory) — documented
-// as staying outside model input — but the measured-body walks priced every
-// top-level field, so an ordinary request 413'd at the egress fuse with the
-// hidden field dominating the `other` bucket (88% of the measured body, #6844).
-// Excluded at the top level only: the same key nested inside messages[] is
-// model-visible content and still counts.
-const MODEL_HIDDEN_BODY_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
-
 export function estimateRawBodyTokens(parsed: unknown, protocol?: WireProtocol): number {
     let tokens = 0;
     const foreign = protocol === undefined ? undefined : FOREIGN_CONVERSATION_FIELDS[protocol];
