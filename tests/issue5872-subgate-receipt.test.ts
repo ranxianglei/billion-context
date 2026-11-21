@@ -5,6 +5,7 @@ import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap 
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { uncoveredHistoryRuns } from "../src/uncovered.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 
 // #5872: the success-tail receipt named sub-gate runs as inspectable work
 // orders ("not at its minimum … inspect with acp_status") — refs that fail the
@@ -27,23 +28,29 @@ type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] 
 
 function makeCtx(messages: CoreMessage[], overrides?: Record<string, unknown>): Ctx {
     const logs: string[] = [];
+    const session = {
+        id: "issue5872-test",
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        metadata: {},
+        state: createInitialState(),
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        pendingRetrievals: [],
+    };
+    // #7318: the uncovered-history note is part of the opt-in "fold more"
+    // recommendation (compress.postComPressTail, default OFF, stamped per round
+    // by src/server/handle.ts). These tests exercise the #5872 receipt wording,
+    // so stamp the gate ON here (no prepare step in a unit-test ctx).
+    storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
         config: defaultConfig(200000, overrides as never),
         messages,
-        session: {
-            id: "issue5872-test",
-            meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 100000, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
-            metadata: {},
-            state: createInitialState(),
-            createdAt: Date.now(),
-            lastSeen: Date.now(),
-            blockContents: new Map(),
-            inFlight: 0,
-            persisted: false,
-            pendingRetrievals: [],
-        },
+        session,
         log: (m: string) => { logs.push(m); },
         logs,
     };
