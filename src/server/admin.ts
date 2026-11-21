@@ -1215,6 +1215,11 @@ function sendStats(res: http.ServerResponse): void {
             requests: s.stats.requests,
             contextTokens: s.stats.contextTokens,
             contextTokensSource: s.stats.contextTokensSource,
+            // #5928: nudge meter has nothing to read on this key yet (no usage
+            // report, no prior-turn estimate) — decideNudge is structurally
+            // idle here until the next measured turn; pair with the warn-level
+            // nudge line in bili.log.
+            nudgeBaselineUnknown: s.stats.lastInputTokens <= 0 && (s.stats.localInputEstimate ?? 0) <= 0,
             inputTokens: s.stats.inputTokens,
             cachedTokens: s.stats.cachedTokens,
             outputTokens: s.stats.outputTokens,
