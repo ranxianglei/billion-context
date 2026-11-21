@@ -24,8 +24,13 @@ function throttleReject(url: string, headers: Record<string, string>) {
 // The loop-side chokepoint wiring is exercised by the e2e lanes.
 
 test("429 governor contract: consecutive 429 verdicts arm the local gate; a resolved verdict lifts it", () => {
+    // #6639: the governor is OFF by default now — this pin verifies the
+    // ENABLED contract, so opt in explicitly (restored in finally).
+    const previousToggle = process.env.BILI_THROTTLE_429;
+    process.env.BILI_THROTTLE_429 = "1";
     const url = "http://loop-observe-4725.test/v1/chat/completions";
     const headers: Record<string, string> = {};
+    try {
     // resolved verdict first: no hold exists — stays clean
     noteUpstreamThrottleResolved(url, headers, 200);
     assert.equal(throttleReject(url, headers), undefined, "no hold before any 429");
@@ -37,4 +42,8 @@ test("429 governor contract: consecutive 429 verdicts arm the local gate; a reso
     // a settled success (exactly what the loop notes on 2xx) lifts the hold
     noteUpstreamThrottleResolved(url, headers, 200);
     assert.equal(throttleReject(url, headers), undefined, "resolved verdict lifts the hold");
+    } finally {
+        if (previousToggle === undefined) delete process.env.BILI_THROTTLE_429;
+        else process.env.BILI_THROTTLE_429 = previousToggle;
+    }
 });
