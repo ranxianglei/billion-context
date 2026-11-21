@@ -256,7 +256,14 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  the self-declaration is the survivor); only a tag change with NO such
  *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
  *  old ladder's fork keys, so persisted fork lanes keep their sessions
- *  across the upgrade.
+ *  across the upgrade. One more escape before the fork: a tag change whose
+ *  history continues this id's OWN derived-persona lane (forked earlier
+ *  under a previous persona text — the lane skeleton grew on later requests
+ *  while the raw one stayed behind) migrates onto that lane instead of
+ *  minting a sibling (same discriminator segment, long same-index frag
+ *  agreement, length gate, mainShaped — #6114: a host rewrite changing the
+ *  system text mid-conversation used to orphan the lane's folds on a fresh
+ *  empty sibling).
  *
  *  `laneToken` (optional, #5095 D1-C): a bili-minted dispatch token carried
  *  on the wire (SubagentStart hook → additionalContext → the dispatch's
@@ -394,6 +401,41 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             reason: `byte-level continuation failed but ${hits} host message id(s) match rows recorded for this key in the unified store (${firstHit}) — same conversation by sessionid+msgid identity (#5719)`,
         };
     };
+    /** #6114: the ONE definition of "the incoming continues one of this id's
+     *  existing derived-persona lanes" — the same-discriminator candidate
+     *  search shared by the model-switch guard (rung ③) and the lane-migration
+     *  rung before the fork exit. A tag change whose history continues such a
+     *  lane must migrate onto it; minting a fresh sibling (or re-anchoring
+     *  raw) orphans the lane's fold blocks. Candidates are persona lanes only
+     *  (the hex-shape check excludes aux/task/token lanes structurally), carry
+     *  the SAME discriminator segment as the incoming (#5095: parallel
+     *  same-persona runs share the parent id and must never collapse), are not
+     *  STALE-shorter than the incoming (a stale replay must never rewind a
+     *  live lane), and show ≥ CONTINUATION_MIN_RUN same-index fragment
+     *  agreements (the #4778 evidence bar). Best = longest skeleton, tie-break
+     *  newer lastSeen. */
+    const findContinuingLane = (): { key: string; rec: Recorded } | undefined => {
+        if (!mainShaped(kinds)) return undefined;
+        const prefix = `${rawId}|sub:`;
+        const discSeg = disc === "" ? "" : `:${fp16(disc)}`;
+        let best: { key: string; rec: Recorded } | undefined;
+        for (const [key, rec] of skeletons) {
+            if (!key.startsWith(prefix)) continue;
+            const rest = key.slice(prefix.length);
+            const shaped = disc !== ""
+                ? /^[0-9a-f]{16}:[0-9a-f]{16}$/.test(rest) && rest.endsWith(discSeg)
+                : /^[0-9a-f]{16}$/.test(rest);
+            if (!shaped) continue;
+            if (rec.kinds.length > kinds.length) continue; // stale-shorter replay must never rewind a live lane
+            if (maxAlignedFragRun(kinds, incomingFrags, rec.kinds, rec.frags) < CONTINUATION_MIN_RUN) continue;
+            if (best === undefined
+                || rec.kinds.length > best.rec.kinds.length
+                || (rec.kinds.length === best.rec.kinds.length && rec.lastSeen >= best.rec.lastSeen)) {
+                best = { key, rec };
+            }
+        }
+        return best;
+    };
     if (tagChanged) {
         // Persona guard (owner rule 3). Same id, different persona text:
         // keep raw ONLY with order AND content evidence — the kinds must
@@ -432,8 +474,17 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             // across a compacted/rewritten history whose fragments cannot
             // prove continuation. Without the header change this exact shape
             // still forks (the control case).
-            record(rawId, turns, tagHash, effectiveModel);
-            return { key: rawId, action: "reanchor", reason: "header-corroborated model switch — anchor migrated (#2601/#2817)" };
+            // #6114: that re-anchor is only right when the conversation lives
+            // on the RAW key. When it already lives on its own derived-persona
+            // lane, pulling it back to raw orphans the lane's fold blocks —
+            // the model-switch trigger of the same incident (a quota fleet
+            // switching models mid-session rewrites the system text every
+            // time). If the incoming continues such a lane, skip this rung
+            // and let the lane-migration rung below keep the lane.
+            if (findContinuingLane() === undefined) {
+                record(rawId, turns, tagHash, effectiveModel);
+                return { key: rawId, action: "reanchor", reason: "header-corroborated model switch — anchor migrated (#2601/#2817)" };
+            }
         }
         if (Array.isArray(history) && prefixAffinity.chainContinues(history, rawId)) {
             // Post-restart persona race (owner review of #2815, finding ①).
@@ -495,6 +546,23 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // same turn — fall back to the only surviving identity carrier.
         const msgRescue = tryMsgIdRescue("tag-changed");
         if (msgRescue !== null) return msgRescue;
+        // #6114: every escape above judged the RAW skeleton only — but this
+        // conversation may already live on its OWN derived-persona lane,
+        // forked earlier under a previous persona text: the lane skeleton was
+        // recorded at that fork exit and has grown with every later request
+        // while the raw skeleton still holds whatever claimed the raw id
+        // first. A tag change whose history CONTINUES such a lane must
+        // migrate onto it — minting a fresh sibling on every system-text
+        // change orphans the lane's fold blocks (#6114 incident: a ~2400-msg
+        // session with 9 active folds re-keyed onto an empty sibling by a
+        // host upgrade's system rewrite). The candidate search is
+        // findContinuingLane (same evidence bar as the #4778 rung); the
+        // model-switch guard at rung ③ consults it too.
+        const lane = findContinuingLane();
+        if (lane !== undefined) {
+            record(lane.key, turns, tagHash, effectiveModel);
+            return { key: lane.key, action: "reanchor", reason: `persona text changed but the incoming continues derived-persona lane ${lane.key} — lane kept, folds stay reachable (#6114)` };
+        }
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
