@@ -2519,7 +2519,7 @@ export class UnifiedStore {
             if (c) content[hash] = Buffer.from(c.bytes).toString("utf8");
         }
         mkdirSync(opts.archiveDir, { recursive: true });
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, blockId, archivedAt: Date.now(), block: row, content }) + "\n");
+        const archiveLine = JSON.stringify({ version: 1, sessionId, blockId, archivedAt: Date.now(), block: row, content }) + "\n";
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(sessionId, blockId);
@@ -2528,6 +2528,8 @@ export class UnifiedStore {
             const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
             contentRowsDeleted = zero.n;
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // Publish only after the sweep, while append failures can still roll it back.
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#5312] archived block ${blockId} from ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -2548,7 +2550,7 @@ export class UnifiedStore {
         let rawLines: string[];
         try { rawLines = readFileSync(exportPath, "utf8").split("\n"); } catch { return { ok: false, reason: "export-corrupt" }; }
         let lineNo = -1;
-        for (let i = 0; i < rawLines.length; i++) {
+        for (let i = rawLines.length - 1; i >= 0; i--) {
             if (!rawLines[i].trim()) continue;
             let head: unknown;
             try { head = JSON.parse(rawLines[i]) as unknown; } catch { continue; }
