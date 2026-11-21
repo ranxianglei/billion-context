@@ -132,6 +132,7 @@ _state: Dict[str, Any] = {
     # env_backup holds what apply_env overwrote so _unroute_env RESTORES it instead of deleting it.
     "watchdog_gen": 0,
     "watchdog_thread": None,
+    "heartbeat_thread": None,
     "recovering": False,
     "env_backup": {},
 }
@@ -165,6 +166,7 @@ def _reset_for_test() -> None:
         _state["compression_header"] = None
         _state["watchdog_gen"] = 0
         _state["watchdog_thread"] = None
+        _state["heartbeat_thread"] = None
         _state["recovering"] = False
         _state["env_backup"] = {}
 
@@ -342,6 +344,43 @@ def resolve_attach_lane_priority() -> List[str]:
     return out
 
 
+OWNER_HEARTBEAT_INTERVAL_S = 5.0
+
+
+def _ensure_heartbeat() -> None:
+    """Start the owner-heartbeat thread once per generation (#7491). Periodically POSTs
+    {pid, hb: true} to /__bili/watcher so the proxy can age out a recycled pid on heartbeat
+    silence instead of relying solely on kill(pid, 0)."""
+    if _stopped() or not _state.get("origin"):
+        return
+    thread = _state.get("heartbeat_thread")
+    if thread is not None and thread.is_alive():
+        return
+    gen = int(_state.get("watchdog_gen") or 0)
+    hb = threading.Thread(target=_heartbeat_loop, args=(gen,),
+                          name="bili-owner-heartbeat", daemon=True)
+    _state["heartbeat_thread"] = hb
+    hb.start()
+
+
+def _heartbeat_loop(gen: int) -> None:
+    while True:
+        if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
+            return
+        event = _state.get("stop_event")
+        if event is not None and event.wait(OWNER_HEARTBEAT_INTERVAL_S):
+            return
+        if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
+            return
+        origin = _state.get("origin")
+        if origin:
+            try:
+                http_post_json(origin + "/__bili/watcher", {"pid": os.getpid(), "hb": True},
+                               HEALTH_PROBE_TIMEOUT_S)
+            except Exception:
+                pass
+
+
 def register_watcher(origin: str) -> None:
     """Register this host pid as a watchdog owner of a shared proxy (#1199). The spawner's
     BILI_PARENT_PID watches only the FIRST session's process; without this, the shared proxy
@@ -349,7 +388,8 @@ def register_watcher(origin: str) -> None:
     409 = daemon proxy (no watchdog) → nothing to do; any other failure degrades to the
     single-owner watchdog and never blocks session start."""
     try:
-        status, _body = http_post_json(origin + "/__bili/watcher", {"pid": os.getpid()}, HEALTH_PROBE_TIMEOUT_S)
+        status, _body = http_post_json(origin + "/__bili/watcher",
+                                       {"pid": os.getpid(), "hb": True}, HEALTH_PROBE_TIMEOUT_S)
         if status is None:
             logger.warning("billion-context: watcher registration failed (no response from %s) — "
                            "the shared proxy may exit when its first owner does", origin)
@@ -1099,6 +1139,7 @@ def _attach(origin: str) -> str:
     """Record the attach and register this host as a watchdog owner (see register_watcher)."""
     _state.update(origin=origin, mode="attach")
     register_watcher(origin)
+    _ensure_heartbeat()
     return origin
 
 
@@ -1208,11 +1249,13 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
             inst = read_instance_file()
             if inst and inst.get("launch_token") == token and probe_proxy(inst["origin"]):
                 _state.update(origin=inst["origin"], mode="spawn")
+                _ensure_heartbeat()
                 return inst["origin"]
             mine = _find_spawned_in_registry(child.pid)
             if mine and probe_proxy(mine["origin"]):
                 _state.update(origin=mine["origin"], mode="spawn",
                               instance_id=mine.get("instance_id") or None)
+                _ensure_heartbeat()
                 return mine["origin"]
             if child.poll() is not None:
                 logger.warning("billion-context: proxy child exited before becoming healthy "
@@ -1600,6 +1643,9 @@ def _shutdown() -> None:
     watcher = _state.get("watchdog_thread")
     if watcher is not None and watcher.is_alive() and watcher is not threading.current_thread():
         watcher.join(timeout=1.0)
+    hb = _state.get("heartbeat_thread")
+    if hb is not None and hb.is_alive() and hb is not threading.current_thread():
+        hb.join(timeout=1.0)
     _reap_unready_child()
 
 
