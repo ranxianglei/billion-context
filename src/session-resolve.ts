@@ -117,6 +117,20 @@ function tailAligns(kinds: string[], recorded: string[]): boolean {
     return true;
 }
 
+/** #7481: tail-align that skips the last `offset` cells of `kinds` before
+ *  comparing — the CC auto-compact shape appends a fresh user prompt after
+ *  the preserved tail, shifting every tail cell by one. A byte-identical
+ *  fragment-verified tail (excluding the trailing prompt) cannot belong to a
+ *  different conversation (MESSAGE-IDENTITY). */
+function tailAlignsWithOffset(kinds: string[], recorded: string[], offset: number): boolean {
+    const window = Math.min(TAIL_WINDOW, kinds.length - offset, recorded.length);
+    if (window <= 0) return false;
+    for (let i = 1; i <= window; i++) {
+        if (kinds[kinds.length - i - offset] !== recorded[recorded.length - i]) return false;
+    }
+    return true;
+}
+
 /** A main conversation has assistant turns and at least a few cells; an
  *  aux persona (dsh auto-review: one flattened user blob) has neither.
  *  This is the ONLY aux/persona discriminator — no system text, no content
@@ -353,6 +367,13 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         const b = recorded.frags.slice(-w);
         return a.length === b.length && a.every((f, i) => f === b[i]);
     };
+    const fragTailEqualsWithOffset = (n: number, offset: number): boolean => {
+        const w = Math.min(TAIL_WINDOW, n, kinds.length - offset);
+        if (w <= 0) return false;
+        const a = incomingFrags.slice(-(w + offset), -offset);
+        const b = recorded.frags.slice(-w);
+        return a.length === b.length && a.every((f, i) => f === b[i]);
+    };
     const tagChanged = tagHash !== "" && tagHash !== recorded.tagHash;
     // An EMPTY incoming tag (system-less / instructions-less request) is
     // the old ladder's non-anchoring path: it rides whatever the id holds
@@ -489,6 +510,25 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         if (kinds.length > 0 && kinds.length < recorded.kinds.length && tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail — head rewrite under a new system prompt, anchor kept (#5686)" };
+        }
+        // #7481: the CC auto-compact shape — the incoming is
+        // [summary] + [preserved tail] + [new user prompt], so the
+        // fragment-verified tail is offset by the trailing prompt. The #5686
+        // rung above compares the last TAIL_WINDOW cells INCLUDING the new
+        // prompt → offset by 1 → mismatch → deterministic fork to a new
+        // derived-persona lane, losing all accumulated compression state.
+        // This rung tolerates the trailing offset: a byte-identical
+        // fragment-verified tail (excluding the trailing prompt) cannot
+        // belong to a different conversation (MESSAGE-IDENTITY), so
+        // re-anchor instead of forking.
+        if (kinds.length > 0 && kinds.length < recorded.kinds.length) {
+            const compactOffset = [1, 2].find(
+                (o) => tailAlignsWithOffset(kinds, recorded.kinds, o) && fragTailEqualsWithOffset(kinds.length, o),
+            );
+            if (compactOffset !== undefined) {
+                record(rawId, turns, tagHash, effectiveModel);
+                return { key: rawId, action: "reanchor", reason: `persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail with a trailing ${compactOffset}-cell offset (client auto-compact: summary + preserved tail + new prompt) — anchor kept (#7481)` };
+            }
         }
         // #5719: every byte-level escape needs EVIDENCE (fragments/cells/
         // chain continuity) that the composite field failure destroys in the
