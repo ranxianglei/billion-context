@@ -34,6 +34,13 @@ export const WIRE_RULES: readonly WireRule[] = [
     {
         id: "WC-026",
         wire: "responses",
+        lane: "responses-sse",
+        summary: "Responses text/content-part SSE events carry a non-negative integer content_index identifying the part inside the indexed output item",
+        provenance: "OpenAI openai-node v6.26.0 requires content_index in ResponseTextDeltaEvent/ResponseTextDoneEvent/ResponseContentPartAddedEvent/ResponseContentPartDoneEvent (https://github.com/openai/openai-node/blob/v6.26.0/src/resources/responses/responses.ts); ResponseStream indexes output.content[event.content_index] (https://github.com/openai/openai-node/blob/v6.26.0/src/lib/responses/ResponseStream.ts). Reproduced against that official SDK: bili's synthesized messages, legacy stream-error completions and filtered text tails omitted indices, so finalResponse() rejected with 'missing content at index undefined'. Gates exercise the actual SDK in proxy/plugin paths and the emitted error frames; the fake validates its outgoing SSE frames with the same constraint.",
+    },
+    {
+        id: "WC-027",
+        wire: "responses",
         lane: "agentrouter-content-rejected",
         summary: "An explicit HTTP 400 content-blocked / agent_router_content_blocked verdict is terminal for the current request: preserve its diagnostic and request ID even when received by a compatibility retry; do not rewrite roles, probe the cache key, strip thinking or infer context overflow.",
         provenance: "https://github.com/ranxianglei/billion-context/issues/6832: Codex Desktop / GPT-6 through bili 0.1.213 received the explicit verdict after committed compression, then a key-less probe failed again. The issue records the sanitized envelope; the matched content and upstream rule are unknown. This fake scripts the observed verdict, not a content-detection policy.",
@@ -779,6 +786,8 @@ interface FakeUpstream {
 }
 
 function sse(res: http.ServerResponse, events: Array<[string, unknown]>, opts?: { done?: boolean }): void {
+    const violations = events.flatMap(([, data]) => validateResponsesContentIndex(data));
+    if (violations.length) throw new Error(violations.join("; "));
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     // OpenAI streams carry no `event:` line at all — only Anthropic/Gemini name their events.
     for (const [ev, data] of events) {
@@ -816,6 +825,13 @@ function openAiChatReply(res: http.ServerResponse, parsed: Record<string, unknow
         choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
         usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 },
     }));
+}
+
+export function validateResponsesContentIndex(event: unknown): string[] {
+    if (!isPlainObject(event) || !["response.content_part.added", "response.output_text.delta", "response.output_text.done", "response.content_part.done"].includes(String(event.type))) return [];
+    return typeof event.content_index === "number" && Number.isInteger(event.content_index) && event.content_index >= 0
+        ? []
+        : ["WC-026 Responses content-part events require a non-negative integer content_index"];
 }
 
 function responsesReply(res: http.ServerResponse, parsed: Record<string, unknown>, text: string): void {
