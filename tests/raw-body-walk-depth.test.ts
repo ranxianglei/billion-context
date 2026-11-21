@@ -119,3 +119,13 @@ test("#7168: a nested dsh_session_log key is still counted (only top-level is ex
     assert.equal(bd.messages, t("user") + t("text") + t("hi") + t(logBlob));
     assert.equal(estimateRawBodyTokens(body), bd.total);
 });
+
+test("#7168: a top-level ARRAY body never triggers the exemption (invariant holds for every shape)", () => {
+    const body = [{ dsh_session_log: "g".repeat(1_000), note: "hi" }] as Record<string, unknown>[];
+    // Not a model-request shape, but the documented invariant must hold for it
+    // too: the breakdown buckets an array root's element keys (by index) and
+    // never exempts them — the tokens walk must mirror that exactly.
+    const bd = estimateRawBodyBreakdown(body);
+    assert.equal(bd.other, t("g".repeat(1_000)) + t("hi"));
+    assert.equal(estimateRawBodyTokens(body), bd.total);
+});

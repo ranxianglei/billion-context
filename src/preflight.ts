@@ -492,9 +492,13 @@ export function estimateRawBodyTokens(parsed: unknown): number {
         }
         if (value && typeof value === "object") {
             for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-                // #7168: at the root (key === undefined) skip client-bookkeeping
-                // fields — nested keys of that name are never a real collision.
-                if (key === undefined && NON_MODEL_TOPLEVEL_KEYS.has(k)) continue;
+                // #7168: skip client-bookkeeping fields on the ROOT object only.
+                // `value === parsed`, not `key === undefined` — the latter also
+                // holds for elements of a top-level ARRAY root, whose keys the
+                // breakdown walk buckets (by index) and never exempts; identity
+                // keeps `breakdown.total === estimateRawBodyTokens(parsed)` for
+                // every body shape, not just object roots.
+                if (value === parsed && NON_MODEL_TOPLEVEL_KEYS.has(k)) continue;
                 pending.push([v, k]);
             }
         }
