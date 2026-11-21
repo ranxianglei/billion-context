@@ -512,6 +512,21 @@ export function finalizeWatermarkTurn(
     return headers;
 }
 
+/** Stamp-only turn (flag off, #7367): the x-bili-pf-seq heartbeat is the
+ *  client's watermark advance, NOT fastpath-only state. When
+ *  pluginFullResendWatermark is gated off the fastpath never evaluates, so
+ *  finalizeWatermarkTurn never runs and the stamp stops — the client's k2
+ *  freezes and its x-bili-pf-tail-ids grows one id per turn until it crosses
+ *  Node's 16 KB header limit and wedges the session. Emit the stamp whenever
+ *  T is measurable (the structural scan is the same zero-allocation pass the
+ *  fastpath uses) so the client's tail stays bounded. No seed, no saved
+ *  state: the fastpath re-establishes both on its first evaluated turn. */
+export function stampOnlyWatermarkTurn(bodyText: string): Record<string, string> {
+    const scan = scanMessagesSpans(bodyText, "all");
+    if (scan === null) return {};
+    return { [PF_SEQ_HEADER]: String(scan.total) };
+}
+
 /** Drop the in-process seed (e.g. an announced compaction was detected while
  *  the fastpath was silent on later turns). Cheap and idempotent; the next
  *  turn simply re-verifies via the legacy path. */

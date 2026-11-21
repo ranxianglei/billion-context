@@ -56,6 +56,29 @@ test("pf-channel: long captured lists emit ONLY the fixed tail window (#5643 F1)
     assert.deepEqual(segs, many.slice(-64), "the window is the TAIL of the captured list (order preserved)");
 });
 
+test("pf-channel: tail-ids stay bounded when the stamp freezes (#7367, v6 fixed window)", () => {
+    const sid = "sid-cap-1";
+    const inH = { [CONVO]: sid };
+    // k2 frozen at 2 (the flag flipped off, so the stamp never advances again)
+    learn(inH, "2");
+    // a long session: 200 ids captured. Under the v6 fixed-window form the
+    // tail is ALWAYS the last PF_TAIL_WINDOW ids — bounded regardless of k2,
+    // so the 16 KB header limit can never be crossed (the #7367 overflow).
+    pfChannel.pfCaptureIds(sid, Array.from({ length: 200 }, (_, i) => `id${i}`));
+    const tail = pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"];
+    assert.ok(tail !== undefined, "tail-ids present");
+    const segs = tail!.split(",");
+    assert.equal(segs.length, 64, "tail bounded at the fixed PF_TAIL_WINDOW (64), never unbounded");
+    assert.equal(segs[0], "id136", "window is the TAIL of the captured list");
+    assert.equal(segs[63], "id199", "window ends at the newest id");
+    // a list NARROWER than the window rides in full (no truncation)
+    const sidNarrow = "sid-cap-narrow";
+    learn({ [CONVO]: sidNarrow }, "2");
+    pfChannel.pfCaptureIds(sidNarrow, Array.from({ length: 10 }, (_, i) => `n${i}`));
+    const narrowTail = pfChannel.pfRequestHeaders({ [CONVO]: sidNarrow })["x-bili-pf-tail-ids"];
+    assert.equal(narrowTail!.split(",").length, 10, "narrow list rides in full (10 < 64)");
+});
+
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
     const sid = "sid-clear-1";
     const inH = { [CONVO]: sid };

@@ -1061,10 +1061,23 @@ export class UnifiedStore {
      *  full plan. A stale or foreign-written watermark therefore costs one
      *  redundant full write — never wrong rows — and the watermark write
      *  itself rides the SAME transaction as the rows. */
+    /**
+     *  opts.envelopeImport (2026-11-21, #7156 incident follow-up): the plan
+     *  came from a LEGACY ENVELOPE, not from this process's own state. An
+     *  envelope is a pruned render, possibly written by ANOTHER process (a
+     *  degraded zero-copy instance, an older build): its block ids collide
+     *  with the stored lineage (b1..bN exist in both with different
+     *  coverage), so the incoming block set is adopted ONLY when the index
+     *  has no stored blocks for the session — otherwise the stored lineage
+     *  wins and the envelope contributes its new messages only. Its stats
+     *  are guarded the same way (lifetime counters must not regress to a
+     *  foreign writer's partial counts). Organic saves pass the flag off and
+     *  keep the authoritative-set discipline.
+     */
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
-        opts?: { completeLog?: boolean },
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): boolean {
         const s = input.session;
         const ok = this.db.transaction((): boolean => {
@@ -1221,7 +1234,25 @@ export class UnifiedStore {
                        next_block_id = excluded.next_block_id,
                        next_run_id = excluded.next_run_id,
                        meta_json = excluded.meta_json,
-                       stats_json = excluded.stats_json,
+                       -- 2026-11-21 (#7156 incident): an ENVELOPE import must never
+                       -- REGRESS the stored lifetime counters. The envelope's stats
+                       -- come from whichever process last rendered it — a degraded
+                       -- zero-copy instance carries only its own few requests, so a
+                       -- blind overwrite replaced a 1563-request/169M-token row with
+                       -- {"requests":2}. Counters are lifetime-monotonic within a
+                       -- lineage, so a smaller incoming total names a partial or
+                       -- foreign lineage: keep the stored row. Organic saves keep
+                       -- the blind overwrite — the live writer IS the counter.
+                       stats_json = CASE
+                           WHEN @statsGuard = 1
+                                AND json_valid(sessions.stats_json)
+                                AND json_valid(excluded.stats_json)
+                                AND json_extract(excluded.stats_json, '$.requests') IS NOT NULL
+                                AND json_extract(sessions.stats_json, '$.requests')
+                                    >= json_extract(excluded.stats_json, '$.requests')
+                           THEN sessions.stats_json
+                           ELSE excluded.stats_json
+                       END,
                        metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
                        kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
                        tail_json = excluded.tail_json,
@@ -1255,6 +1286,7 @@ export class UnifiedStore {
                     kstateJson: s.kstateJson,
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
+                    statsGuard: opts?.envelopeImport === true ? 1 : 0,
                     lastIngestedSeq: watermark,
                     // #4216/#4242: orphan journal rides the normal upsert with
                     // MERGE semantics (existing entries survive — LazyBlockContents
@@ -1344,8 +1376,20 @@ export class UnifiedStore {
             // incoming blocks is O(stored×incoming) string compares on the
             // sync record() path that #5744 exists to make cheaper.
             const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
+            // 2026-11-21 (#7156 incident): see the ingestSession envelopeImport
+            // contract — an envelope's block set must not delete or replace a
+            // stored lineage it never saw (a 32-block coarse render erased a
+            // 103-block fine lineage whose summaries existed nowhere else).
+            const skipIncomingBlocks =
+                opts?.envelopeImport === true && storedBlocks.size > 0 && input.blocks.length > 0;
+            if (skipIncomingBlocks) {
+                loggerLog(
+                    "info",
+                    `[storage] envelope import for ${s.sessionId}: preserving the stored block lineage (stored ${storedBlocks.size}, incoming ${input.blocks.length} block(s)) — the envelope is a pruned render, possibly from another writer (#7156, 2026-11-21)`,
+                );
+            }
             for (const [blockId, stale] of storedBlocks) {
-                if (incomingBlockIds.has(blockId)) continue;
+                if (skipIncomingBlocks || incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, blockId);
                 this.releaseContent(stale.summary_hash);
@@ -1360,7 +1404,7 @@ export class UnifiedStore {
             // and suppress the seq-0 message (PR #4725 N1); -1 keeps the
             // #4608 CASE guard honest (unknown < 0 → preserve stored bounds).
             const seqSpanById = new Map<string, [number, number]>();
-            if (input.blocks.length > 0) {
+            if (!skipIncomingBlocks && input.blocks.length > 0) {
                 // point query over the covered ids only (PR #4725 N3): a
                 // full-session scan per save taxed every session with blocks.
                 const wanted = new Set<string>();
@@ -1423,6 +1467,7 @@ export class UnifiedStore {
                    payload_json = excluded.payload_json`,
             );
             for (const b of input.blocks) {
+                if (skipIncomingBlocks) continue;
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
                 // #5744: steady-state saves re-send every block byte-identical.
                 // When the effective post-upsert row equals the stored row the
