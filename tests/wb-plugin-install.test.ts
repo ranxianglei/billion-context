@@ -132,6 +132,7 @@ test("wbConfigDir: WORKBUDDY_CONFIG_DIR > CODEBUDDY_CONFIG_DIR > ~/.workbuddy", 
     assert.equal(wbConfigDir({ CODEBUDDY_CONFIG_DIR: "/b" }), "/b");
     assert.equal(wbConfigDir({ WORKBUDDY_CONFIG_DIR: "/a", CODEBUDDY_CONFIG_DIR: "/b" }), "/a");
     assert.equal(wbConfigDir({ WORKBUDDY_CONFIG_DIR: "  " }), wbConfigDir({}));
+    assert.equal(wbConfigDir({ WORKBUDDY_CONFIG_DIR: "", CODEBUDDY_CONFIG_DIR: "/b" }), "/b");
     assert.equal(wbConfigDir({}), path.join(os.homedir(), ".workbuddy"));
     assert.equal(path.basename(wbSettingsFile({})), "settings.json");
 });

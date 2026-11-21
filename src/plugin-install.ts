@@ -2233,7 +2233,7 @@ export const WB_DEFAULT_UPSTREAM = "https://www.workbuddy.ai";
 /** <WORKBUDDY_CONFIG_DIR | CODEBUDDY_CONFIG_DIR | ~/.workbuddy> — the CLI
  *  resolves the config home in exactly this order. */
 export function wbConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-    const raw = (env.WORKBUDDY_CONFIG_DIR ?? env.CODEBUDDY_CONFIG_DIR)?.trim();
+    const raw = (env.WORKBUDDY_CONFIG_DIR || env.CODEBUDDY_CONFIG_DIR)?.trim();
     return raw !== undefined && raw.length > 0 ? raw : path.join(os.homedir(), ".workbuddy");
 }
 
