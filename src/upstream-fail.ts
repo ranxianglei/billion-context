@@ -38,7 +38,7 @@ export type UpstreamFailureKind =
      *  replays within the retry budget (#5807/#5831). Distinct from
      *  upstream-timeout: a mid-stream (body) idle expiry stays non-retried. */
     | "upstream-headers-timeout"
-    /** Connect-phase timeout (undici UND_ERR_CONNECT_TIMEOUT): the TCP
+    /** Connect-phase timeout (undici or an OS timeout proven to be at connect): the TCP
      *  handshake never completed, so nothing reached the upstream and each
      *  attempt costs at most one connect timeout — replayed within the retry
      *  budget (#1453). */
@@ -87,6 +87,16 @@ function chainOf(error: unknown): Array<Record<string, unknown>> {
     return out;
 }
 
+function isConnectPhaseTimeout(entry: Record<string, unknown>): boolean {
+    if (entry.syscall !== undefined && entry.syscall !== "connect") return false;
+    if (!Array.isArray(entry.errors)) return entry.syscall === "connect";
+    if (entry.errors.length === 0) return false;
+    for (const attempt of entry.errors) {
+        if (!(attempt instanceof Error) || (attempt as Error & { syscall?: unknown }).syscall !== "connect") return false;
+    }
+    return true;
+}
+
 /** Classify a transport-level failure into the diagnostic taxonomy. Pure:
  *  no IO, no clock — safe to call from anywhere, including tests. */
 export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {}): UpstreamFailureKind {
@@ -106,7 +116,8 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
             continue;
         }
         if (code === "UND_ERR_CONNECT_TIMEOUT") return "connect-timeout";
-        if (code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "upstream-timeout";
+        if (code === "ETIMEDOUT") return isConnectPhaseTimeout(entry) ? "connect-timeout" : "upstream-timeout";
+        if (code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "upstream-timeout";
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
         // #2465/#5663: ICMP no-route family — before this it fell through to
