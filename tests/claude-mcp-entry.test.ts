@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { main, startWatchdog, watchdogTick, type MutableWatchdogState, type WatchdogDeps } from "../src/claude-mcp-entry.ts";
+import { main, resolveClaudeMcpOrigin, startWatchdog, watchdogTick, type MutableWatchdogState, type WatchdogDeps } from "../src/claude-mcp-entry.ts";
 import { pluginInstall, readClaudeManagedBaseUrl, selfPackageRoot } from "../src/plugin-install.ts";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning, type LauncherDeps } from "../src/launcher.ts";
 
@@ -338,18 +338,23 @@ function writeMcpBili(box: { mcpJson: string }, entry: Record<string, unknown>):
     fs.writeFileSync(box.mcpJson, JSON.stringify({ mcpServers: { bili: entry } }, null, 2));
 }
 
-test("installer: fresh machine registers the watchdog entry", () => {
+test("installer: fresh machine registers the watchdog entry without an origin pin (#5128)", () => {
+    const prevPin = process.env.BILI_MCP_PROXY;
     const { box, logFile, cleanup } = mcpFaceSandbox();
     try {
+        delete process.env.BILI_MCP_PROXY;
         const note = pluginInstall("claude");
-        assert.match(note, /MCP face -> .*pinned http:\/\/127\.0\.0\.1:\d+/);
+        assert.match(note, /MCP face -> .*no origin pin/);
         const calls = cliLog(logFile);
         assert.equal(calls.length, 1);
         assert.ok(calls[0].startsWith("mcp add bili --scope user"), calls[0]);
+        assert.ok(!calls[0].includes("BILI_MCP_PROXY="), "no origin pin baked (#5128/#1660 lane drift)");
         const expected = path.join(selfPackageRoot(), "dist", "claude-mcp-entry.js").replace(/\\/g, "/");
         assert.ok(calls[0].replace(/\\/g, "/").includes(expected), calls[0]);
     } finally {
         cleanup();
+        if (prevPin === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevPin;
     }
 });
 
@@ -373,26 +378,31 @@ test("installer: legacy dist/mcp.js registration is migrated (remove + add)", ()
     }
 });
 
-test("installer: current registration with matching pin is left alone", () => {
+test("installer: our entry with no origin pin is left current (#5128)", () => {
+    const prevPin = process.env.BILI_MCP_PROXY;
     const { box, logFile, cleanup } = mcpFaceSandbox();
     try {
+        delete process.env.BILI_MCP_PROXY;
         writeMcpBili(box, {
             type: "stdio",
             command: "node",
             args: [path.join(selfPackageRoot(), "dist", "claude-mcp-entry.js")],
-            env: { BILI_MCP_PROXY: `http://127.0.0.1:${ZONE_PORT_BASE}` },
         });
         const note = pluginInstall("claude");
         assert.match(note, /MCP face current/);
-        assert.equal(cliLog(logFile).length, 0);
+        assert.equal(cliLog(logFile).length, 0, "no-pin entry is the canonical form — no CLI churn");
     } finally {
         cleanup();
+        if (prevPin === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevPin;
     }
 });
 
-test("installer: our entry with a stale port pin gets re-pinned", () => {
+test("installer: our entry with a stale port pin has the pin removed (healed, #5128)", () => {
+    const prevPin = process.env.BILI_MCP_PROXY;
     const { box, logFile, cleanup } = mcpFaceSandbox();
     try {
+        delete process.env.BILI_MCP_PROXY;
         writeMcpBili(box, {
             type: "stdio",
             command: "node",
@@ -400,13 +410,16 @@ test("installer: our entry with a stale port pin gets re-pinned", () => {
             env: { BILI_MCP_PROXY: "http://127.0.0.1:1" },
         });
         const note = pluginInstall("claude");
-        assert.match(note, /re-pinned/);
+        assert.match(note, /removed stale BILI_MCP_PROXY pin/);
         const calls = cliLog(logFile);
         assert.equal(calls.length, 2);
         assert.ok(calls[0].startsWith("mcp remove bili --scope user"), calls[0]);
         assert.ok(calls[1].startsWith("mcp add bili --scope user"), calls[1]);
+        assert.ok(!calls[1].includes("BILI_MCP_PROXY="), "re-added WITHOUT a stale pin");
     } finally {
         cleanup();
+        if (prevPin === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevPin;
     }
 });
 
@@ -424,17 +437,61 @@ test("installer: a foreign bili server keeps its registration untouched", () => 
     }
 });
 
-test("installer: unreadable .claude.json falls back to plain add", () => {
+test("installer: unreadable .claude.json falls back to plain add without a pin", () => {
+    const prevPin = process.env.BILI_MCP_PROXY;
     const { box, logFile, cleanup } = mcpFaceSandbox();
     try {
+        delete process.env.BILI_MCP_PROXY;
         fs.mkdirSync(path.dirname(box.mcpJson), { recursive: true });
         fs.writeFileSync(box.mcpJson, "{ not json");
         const note = pluginInstall("claude");
-        assert.match(note, /MCP face -> .*pinned/);
+        assert.match(note, /MCP face -> .*no origin pin/);
         const calls = cliLog(logFile);
         assert.equal(calls.length, 1);
         assert.ok(calls[0].startsWith("mcp add bili --scope user"), calls[0]);
+        assert.ok(!calls[0].includes("BILI_MCP_PROXY="), calls[0]);
     } finally {
         cleanup();
+        if (prevPin === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevPin;
     }
+});
+
+test("installer: an explicit BILI_MCP_PROXY env bakes the pin and keeps a matching entry current (#5128)", () => {
+    const prevPin = process.env.BILI_MCP_PROXY;
+    const { box, logFile, cleanup } = mcpFaceSandbox();
+    try {
+        process.env.BILI_MCP_PROXY = "http://127.0.0.1:18888";
+        // Fresh install: the explicit pin lands.
+        const note = pluginInstall("claude");
+        assert.match(note, /MCP face -> .*pinned http:\/\/127\.0\.0\.1:18888/);
+        const calls = cliLog(logFile);
+        assert.equal(calls.length, 1);
+        assert.ok(calls[0].includes("-e BILI_MCP_PROXY=http://127.0.0.1:18888"), calls[0]);
+        // Reinstall over the matching pinned entry: current, no churn.
+        writeMcpBili(box, {
+            type: "stdio",
+            command: "node",
+            args: [path.join(selfPackageRoot(), "dist", "claude-mcp-entry.js")],
+            env: { BILI_MCP_PROXY: "http://127.0.0.1:18888" },
+        });
+        const note2 = pluginInstall("claude");
+        assert.match(note2, /MCP face current.*pinned http:\/\/127\.0\.0\.1:18888/);
+        assert.equal(cliLog(logFile).length, 1, "the matching explicit pin is left untouched");
+    } finally {
+        cleanup();
+        if (prevPin === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevPin;
+    }
+});
+
+test("resolveClaudeMcpOrigin: managed repin beats a stale pin, then pin, then discovery (#5128)", () => {
+    const stalePin = { BILI_MCP_PROXY: "http://127.0.0.1:18787" };
+    // The reporter's exact case: the lane drifted to :18791 but the baked pin
+    // still says :18787 — the repinned URL must win so tools reach the live proxy.
+    assert.equal(resolveClaudeMcpOrigin("http://127.0.0.1:18791", stalePin), "http://127.0.0.1:18791");
+    // No managed URL → an explicit pin is honoured.
+    assert.equal(resolveClaudeMcpOrigin(undefined, stalePin), "http://127.0.0.1:18787");
+    // No managed URL and a blank pin → falls through to live discovery (a URL).
+    assert.match(resolveClaudeMcpOrigin(undefined, { BILI_MCP_PROXY: "   " }), /^https?:\/\//);
 });
