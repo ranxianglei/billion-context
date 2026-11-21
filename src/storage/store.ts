@@ -1902,21 +1902,29 @@ export class UnifiedStore {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
-    /** #3285: drop EVERY session's ingest watermark at once. A watermark
-     *  vouches "the writer that set it verified this prefix" but carries no
-     *  writer identity, so the trust must not survive a process handoff:
-     *  under the multi-process shared-directory contract (#2671) a
-     *  restart-handoff overlap (old instance still draining while the new
-     *  one boots, both sharing index.db) leaves a foreign process's rows
-     *  AND its watermark behind, and inheriting that trust lets the new
-     *  process take unverified empty deltas against rows it never wrote.
-     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
-     *  (export) must not call it. After the reset each session's first save
-     *  takes the exact full path — an authoritative replace, see
-     *  ingestSession — re-establishing trust from this process's own view.
-     *  Cost: one full ingest per saved session per boot. */
-    resetAllIngestWatermarks(): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+    /** #3285 (2026-11-21 per-session rework): watermark trust does not cross
+     *  process boundaries — a watermark vouches "the writer that set it
+     *  verified this prefix" but carries no writer identity, so under the
+     *  multi-process shared-directory contract (#2671) a restart-handoff
+     *  overlap leaves a foreign process's rows AND its watermark behind,
+     *  and inheriting that trust lets the new process take unverified empty
+     *  deltas against rows it never wrote.
+     *  The 2026-10-31 implementation dropped EVERY session's watermark in one
+     *  global write at open — it touched every other session and made open
+     *  itself a write (the #7156 first-write hazard). The trust boundary is
+     *  actually per-session: a process only needs to distrust watermarks it
+     *  did not set, for the session it is about to save. So the invalidation
+     *  moved here — first touch of a session in THIS process drops any
+     *  foreign-set watermark for that ONE session (→ the next save takes the
+     *  exact full path, re-establishing trust from this process's own view);
+     *  later touches trust this process's own watermarks. Per (process,
+     *  session) the trust decision is byte-identical to the global reset;
+     *  untouched sessions keep their watermarks, and open performs no write. */
+    private readonly ingestTouchedThisProcess = new Set<string>();
+    primeIngestTrust(sessionId: string): void {
+        if (this.ingestTouchedThisProcess.has(sessionId)) return;
+        this.ingestTouchedThisProcess.add(sessionId);
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext

@@ -91,7 +91,9 @@ export interface StorageBackend {
     ingestWatermark(sessionId: string): Promise<{ seq: number; tailSeqs: number[] } | null>;
     tailSeqs(sessionId: string): Promise<number[] | null>;
     clearIngestWatermark(sessionId: string): Promise<void>;
-    resetAllIngestWatermarks(): Promise<void>;
+    /** #3285 (2026-11-21 per-session rework): first-touch trust prime — drop
+     *  any FOREIGN-set watermark for one session; idempotent per process. */
+    primeIngestTrust(sessionId: string): Promise<void>;
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null>;
 
     // --- reap journal (#3841) ----------------------------------------------
@@ -233,8 +235,8 @@ export class SqliteBackend implements StorageBackend {
     clearIngestWatermark(sessionId: string): Promise<void> {
         return Promise.resolve(this.store.clearIngestWatermark(sessionId));
     }
-    resetAllIngestWatermarks(): Promise<void> {
-        return Promise.resolve(this.store.resetAllIngestWatermarks());
+    primeIngestTrust(sessionId: string): Promise<void> {
+        return Promise.resolve(this.store.primeIngestTrust(sessionId));
     }
     probeIngestBoundary(sessionId: string, seq: number): Promise<{ msgId: string; contentHash: string; maxSeq: number } | null> {
         return Promise.resolve(this.store.probeIngestBoundary(sessionId, seq));

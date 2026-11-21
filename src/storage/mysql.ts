@@ -1261,8 +1261,14 @@ export class MysqlBackend implements StorageBackend {
         await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?", [sessionId]);
     }
 
-    async resetAllIngestWatermarks(): Promise<void> {
-        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL");
+    // #3285 (2026-11-21 per-session rework): the open-time GLOBAL watermark
+    // reset is gone (it made open a write and touched every session); trust
+    // is primed per session on first touch instead.
+    private readonly ingestTouchedThisProcess = new Set<string>();
+    async primeIngestTrust(sessionId: string): Promise<void> {
+        if (this.ingestTouchedThisProcess.has(sessionId)) return;
+        this.ingestTouchedThisProcess.add(sessionId);
+        await this.pool.query("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?", [sessionId]);
     }
 
     async reapBlocks(

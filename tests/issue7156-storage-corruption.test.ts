@@ -179,7 +179,7 @@ test("#7156 FIX 2: unifiedWebSummaries logs a warn when webSummaryRows throws (f
     }
 });
 
-test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (not REFUSING TO START)", { skip: SKIP }, () => {
+test("#7156 FIX 4 (2026-11-21 per-session rework): open no longer writes — a pre-verdict corruption boots, then surfaces loudly at the first ingest write", { skip: SKIP }, () => {
     const dir = tmpDir();
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
@@ -196,19 +196,31 @@ test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (
         }
         ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         ro.close();
-        // Corrupt page 2: open() survives (async mode — the sync quick_check never
-        // runs), but the first write (resetAllIngestWatermarks) throws CORRUPT.
+        // Corrupt page 2. Before 2026-11-21 the open-time GLOBAL watermark
+        // reset made OPEN a write and this corruption refused the boot. Now
+        // open performs no write at all: the store BOOTS even with the
+        // verdict not yet landed, and the corruption surfaces — loudly — at
+        // the process's first ingest write (the per-session watermark prime).
         zeroPage(p, 2);
         setIntegritySyncThresholdForTests(1); // force async mode for any size
         const errors: string[] = [];
         setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
         try {
-            const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-            assert.equal(sh, null, "a first-write corruption yields 'no sidecar' (start without index) — never a REFUSING-TO-START throw");
-            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped");
+            const legacy = {
+                id: "s-corrupt-" + "x".repeat(10),
+                createdAt: 1, lastSeen: 2, meta: {}, stats: {}, metadata: {},
+                state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+                blockContents: new Map(),
+                lastMessages: [{ role: "user", content: "hello" }],
+            };
+            const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => legacy as never);
+            assert.ok(sh, "open performs NO write anymore — a pre-verdict corrupt store BOOTS (2026-11-21 per-session watermark fix)");
+            assert.equal(hadIntegrityQuickCheckFailure(), false, "no integrity latch before the first write");
+            sh.record({});
+            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped at the first ingest write");
             assert.ok(
-                errors.some((m) => m.includes("first post-open write")),
-                `the error names the first-write corruption; got ${JSON.stringify(errors)}`,
+                errors.some((m) => m.includes("ingest write")),
+                `the error names the first-ingest-write corruption; got ${JSON.stringify(errors)}`,
             );
         } finally {
             setLogCapture(null);
