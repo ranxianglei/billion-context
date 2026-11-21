@@ -140,7 +140,7 @@ export type EgressOp = InsertOp | DeleteOp | UpdateOp;
 /** Highest canonical number used by the view (retired rows are gone from
  * the view but their numbers live on — the append advances past the stored
  * high-water, which includes them). */
-export function egressViewHighWater(view: EgressViewRow[]): number {
+function egressViewHighWater(view: EgressViewRow[]): number {
     let hw = 0;
     for (const r of view) if (r.num > hw) hw = r.num;
     return hw;
