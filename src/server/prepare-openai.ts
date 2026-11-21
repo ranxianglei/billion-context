@@ -830,6 +830,7 @@ export async function prepareOpenai(
     // #5403/#5418: on a watermark hit pin only this turn's window — the
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
+
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     // #5874 P2-final: the in-request snapshot flush above already persisted
