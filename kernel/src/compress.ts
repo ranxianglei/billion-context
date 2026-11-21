@@ -37,7 +37,7 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import { projectUnit, collectCoverage, buildProjectionShared } from "./unit-projection.js";
 import {
   appendMediaRefsSection,
   collectFoldMediaRefs,
@@ -1509,6 +1509,7 @@ const nudgeNode: PipelineNode = {
       config: ctx.config,
       state: io.state,
       messages: io.messages,
+      applyView: io.effects.applyView ?? io.effects.originalMessages ?? io.messages,
       recommendation: io.effects.recommendation,
       countTokens: ctx.countTokens,
     });
@@ -2082,6 +2083,7 @@ interface NudgeInput {
   config: Config;
   state: CompressionState;
   messages: CoreMessage[];
+  applyView: CoreMessage[];
   recommendation?: Recommendation;
   countTokens: (t: string) => number;
 }
@@ -2128,6 +2130,8 @@ function pendingByTier(
   recommendation: Recommendation | undefined,
   countTokens: (t: string) => number,
   minCompressRange: number,
+  messages: CoreMessage[],
+  config: Config,
 ): Record<number, { pending: number; targetBlocks: CompressionBlock[] }> {
   const out: Record<
     number,
@@ -2146,8 +2150,39 @@ function pendingByTier(
   // foldable targets — counting them here would nudge distillation ranges the
   // apply side refuses.
   const active = activeBlocks(state).filter((b) => !b.retired);
-  const t1 = active.filter((b) => b.tier === 1);
-  const t2 = active.filter((b) => b.tier === 2);
+  if (active.length === 0) {
+    out[2] = { pending: 0, targetBlocks: [] };
+    out[3] = { pending: 0, targetBlocks: [] };
+    return out;
+  }
+  const coverage = collectCoverage(state);
+  const shared = buildProjectionShared(messages, state, config);
+  const protectedRefs = computeProtectedRefs(messages, state, config, countTokens);
+  const eligible = (blocks: CompressionBlock[]): CompressionBlock[] => {
+    if (blocks.length === 0) return blocks;
+    const valid = (candidates: CompressionBlock[]): boolean => {
+      try {
+        const projection = projectUnit({
+          messages, state, config, preExistingCoverage: coverage,
+          protectedMessageIds: protectedRefs, shared,
+          startRef: candidates[0]!.blockId,
+          endRef: candidates[candidates.length - 1]!.blockId,
+        });
+        return projection.fatal === null && projection.consumedBlockIds.length > 0;
+      } catch {
+        return false;
+      }
+    };
+    if (valid(blocks)) return blocks;
+    // Bound fallback projections: each can scan the history. A later turn can
+    // reconsider the full span after the selected block is distilled.
+    for (const block of blocks.slice(0, 8)) {
+      if (valid([block])) return [block];
+    }
+    return [];
+  };
+  const t1 = eligible(active.filter((b) => b.tier === 1));
+  const t2 = eligible(active.filter((b) => b.tier === 2));
   out[2] = {
     pending: t1.reduce((s, b) => s + countTokens(b.summary), 0),
     targetBlocks: t1,
@@ -2239,6 +2274,8 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     rec,
     countTokens,
     config.compress.minCompressRange,
+    input.applyView,
+    config,
   );
 
   // Tier arbitration. Emergency (usage >= emergencyThresholdPct) ignores tier

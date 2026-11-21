@@ -284,5 +284,19 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.equal(res.result.errors.length, 0, JSON.stringify(res.result.errors));
     assert.equal(res.result.blocksCreated, 1);
     assert.deepEqual(lostCoverage(before, res.state), []);
+
+    seeded.state.nudge.lastPerMessageNudgeTokens = 1;
+    const turn = core.processTurn({
+      messages,
+      state: seeded.state,
+      config: {
+        ...config,
+        tiers: { ...config.tiers, enabled: true, tier2Trigger: 2 },
+        nudge: { ...config.nudge, tierGrowthTokens: { t1: 1_000_000 } },
+      },
+      tokenCount: 100_000,
+    });
+    assert.equal(turn.nudge.tier, 2);
+    assert.deepEqual(turn.nudge.tierTargetBlocks.map((block) => block.blockId), ["b1", "b2"]);
   });
 });
