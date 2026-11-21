@@ -25,7 +25,8 @@ test("watermark capacity evicts one least recently used conversation and keeps o
         const headers = pfRequestHeaders(incoming(i));
         if (i === 1) continue;
         assert.equal(headers["x-bili-pf-count"], "2", `stamp lost for ${i}`);
-        if (i < 1024) assert.equal(headers["x-bili-pf-tail-ids"], `b-${i},c-${i}`);
+        // #5643 F1 wire form: fixed 64-id tail window — all 3 captured ids ride along
+        if (i < 1024) assert.equal(headers["x-bili-pf-tail-ids"], `a-${i},b-${i},c-${i}`);
         retained++;
     }
     assert.equal(retained, 1024);
@@ -33,7 +34,7 @@ test("watermark capacity evicts one least recently used conversation and keeps o
     pfCaptureIds(incoming(0)[CONVERSATION]!, ["first", "updated"]);
     learn(1025);
     assert.deepEqual(pfRequestHeaders(incoming(2)), {}, "capture refreshes recency without losing the stamp");
-    assert.deepEqual(pfRequestHeaders(incoming(0)), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "updated" });
+    assert.deepEqual(pfRequestHeaders(incoming(0)), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "first,updated" });
     learn(3);
     learn(1026);
     assert.deepEqual(pfRequestHeaders(incoming(4)), {}, "learning a stamp refreshes its existing slot");

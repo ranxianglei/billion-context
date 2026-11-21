@@ -89,7 +89,7 @@ test("#5539 v11: fresh install carries all six FK-child indexes and the DELETE p
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = rawDb(store).prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11);
+            assert.equal(ver.user_version, 13);
             for (const name of FK_CHILD_INDEXES) {
                 const idx = rawDb(store)
                     .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
@@ -129,7 +129,7 @@ test("#5539 v11: a v10-era library (no FK-child indexes) gains them on reopen", 
         const store = UnifiedStore.open(dbPath);
         try {
             const ver = rawDb(store).prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "v10 -> v11 migration ran");
+            assert.equal(ver.user_version, 13, "v10 -> v13 migration ran (includes the v11 FK-child-index step)");
             for (const name of FK_CHILD_INDEXES) {
                 const idx = rawDb(store)
                     .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?")
