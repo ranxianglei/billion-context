@@ -141,6 +141,7 @@
 | `BILI_SESSIONS_DIR` | 状态目录重定位 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | storage.archiveAfterDays，默认 365 天——超龄会话由 gc 归档（export + tombstone + CAS 释放；0 关闭年龄清扫，#3901/#3463） |
 | `BILI_STORAGE_QUICK_CHECK` | 默认开——index.db 开库在迁移前跑 PRAGMA quick_check 自检；失败=影子层隔离文件组（.corrupt-<ts>）+重建新库（JSON 信封为恢复源）；=0 跳过（超大库启动时间敏感场景，#4175） |
+| `BILI_STORAGE_ALLOW_LEGACY_DEGRADE` | 纯 SQLite 姿态下证实损坏拒启的逃生阀（#7156）：设 1/true/on 恢复旧契约（响亮告警后不挂索引启动、以 JSON 路径服务，尽管此时损坏索引是唯一持久副本）；缺省 off、不被任何配置值隐含 |
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | storage.walJournalSizeLimitBytes——SQLite WAL 回收字节上限（#3250；垃圾/非正值落回文件/默认层，不让 typo 崩 boot） |
 | `BILI_MYSQL_DSN` | storage.mysql.dsn——mysql 引擎连接串（env > 文件 > ""；空 = mysql 不可用走 sqlite，#3388/#3931） |
 
