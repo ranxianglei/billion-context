@@ -11,6 +11,7 @@ import {
     WATCHDOG_HARD_TIMEOUT_MS,
     WATCHDOG_SOFT_WARN_MS,
     armEventLoopWatchdog,
+    watchdogFreezeVerdict,
     watchdogVerdict,
 } from "../src/event-loop-watchdog.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -37,6 +38,20 @@ test("defaults are deadlock-scale, not load-scale (#4762)", () => {
     assert.equal(WATCHDOG_HEARTBEAT_MS, 5_000);
     assert.equal(WATCHDOG_SOFT_WARN_MS, 30_000);
     assert.equal(WATCHDOG_HARD_TIMEOUT_MS, 300_000);
+});
+
+test("watchdogFreezeVerdict: a worker tick gap within schedule is NOT a freeze; a jumped tick gap IS (#7482)", () => {
+    // checkIntervalMs = 5000 (the production default). A normal tick lands near
+    // the interval (with jitter) — never a freeze. A frozen process makes the
+    // worker miss its own ticks, so the tick gap jumps far past the interval.
+    assert.equal(watchdogFreezeVerdict(5_000, 5_000), false, "on-schedule tick is not a freeze");
+    assert.equal(watchdogFreezeVerdict(9_999, 5_000), false, "jitter within 2× the interval is not a freeze");
+    assert.equal(watchdogFreezeVerdict(10_000, 5_000), false, "exactly 2× the interval is not a freeze (strict >)");
+    assert.equal(watchdogFreezeVerdict(10_001, 5_000), true, "just past 2× the interval is a freeze");
+    assert.equal(watchdogFreezeVerdict(479_000, 5_000), true, "an overnight suspend (479s) is a freeze");
+    // the threshold scales with the interval, so a fast test cadence still works
+    assert.equal(watchdogFreezeVerdict(39, 20), false, "39ms tick on a 20ms cadence is not a freeze");
+    assert.equal(watchdogFreezeVerdict(41, 20), true, "41ms tick on a 20ms cadence is a freeze");
 });
 
 test("wedged main loop trips the watchdog: warn + fatal forensic lines land in the log file (#4762)", async () => {
