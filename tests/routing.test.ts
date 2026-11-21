@@ -84,6 +84,27 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("kimi-k2"), 200_000);
 });
 
+test("lookupContextLimit covers the Antigravity (CloudCode) Gemini line at 1M (#6963)", () => {
+    // The Antigravity CLI (agy) serves the Gemini 4 line plus the role-suffixed
+    // subagent models; none of these matched a table entry before #6963, so
+    // they fell to the anonymous 200K default and 502'd at ~227K input.
+    assert.equal(lookupContextLimit("gemini-4-carbon-low"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-argon-medium"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-hydrogen-high"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-4-carbon-xhigh"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-pro-orchestrator"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-pro-orchestrator-argon"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-pro-agent"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-flash-worker-agy"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-pro-latest"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-flash-latest"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-flash-lite-latest"), 1_048_576);
+    // Controls — the pre-existing Gemini entries are untouched.
+    assert.equal(lookupContextLimit("gemini-3.8-flash"), 1_048_576);
+    assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
+    assert.equal(lookupContextLimit("gemini-1.5-pro"), 1_000_000);
+});
+
 test("lookupContextLimit keeps DeepSeek flagship at 1M and legacy r1/v3/ocr at 128k (#852)", () => {
     assert.equal(lookupContextLimit("deepseek-flash"), 1_000_000);
     assert.equal(lookupContextLimit("deepseek-v4-flash"), 1_000_000);

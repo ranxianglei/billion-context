@@ -100,6 +100,76 @@ export function isV1BackgroundSideRequest(meta: Record<string, unknown>, inner: 
     return model.includes("flash-lite");
 }
 
+// #6963: a MAX_TOKENS-cut turn is continued by resending the SAME input plus a
+// `continuationToken` — upstream binds the token to the exact bytes it saw on
+// the minting leg and 400s any deviation ("pass the exact same input and
+// conversation history as the initial request"). The token may ride the
+// envelope meta, the inner request root, or inner.generationConfig, in
+// camelCase or snake_case.
+type V1Continuation = { location: "meta" | "inner" | "generationConfig"; key: string; value: string };
+
+const CONTINUATION_TOKEN_KEYS = ["continuationToken", "continuation_token"] as const;
+
+function readContinuationToken(obj: Record<string, unknown>): { key: string; value: string } | undefined {
+    for (const key of CONTINUATION_TOKEN_KEYS) {
+        const v = obj[key];
+        if (typeof v === "string" && v.length > 0) return { key, value: v };
+    }
+    return undefined;
+}
+
+export function findV1Continuation(meta: Record<string, unknown>, inner: Record<string, unknown>): V1Continuation | undefined {
+    const atMeta = readContinuationToken(meta);
+    if (atMeta !== undefined) return { location: "meta", ...atMeta };
+    const atInner = readContinuationToken(inner);
+    if (atInner !== undefined) return { location: "inner", ...atInner };
+    const gc = inner.generationConfig;
+    if (gc && typeof gc === "object" && !Array.isArray(gc)) {
+        const atGc = readContinuationToken(gc as Record<string, unknown>);
+        if (atGc !== undefined) return { location: "generationConfig", ...atGc };
+    }
+    return undefined;
+}
+
+// Rebuild the continuation leg's inner from the cached minting-leg egress inner:
+// contents / systemInstruction / tools / sessionId / the rest of
+// generationConfig stay byte-identical to what upstream minted the token for;
+// only the client's fresh maxOutputTokens (accumulated across legs — upstream
+// tells the client to pass a HIGHER value) and the token itself are spliced
+// back. A token located in the envelope meta is not spliced here: the relay
+// re-wraps with the incoming leg's own meta, which already carries it.
+export function spliceV1ContinuationInner(
+    cachedInner: Record<string, unknown>,
+    incomingInner: Record<string, unknown>,
+    cont: V1Continuation,
+): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...cachedInner };
+    const incomingGc = incomingInner.generationConfig;
+    const incomingGen = incomingGc && typeof incomingGc === "object" && !Array.isArray(incomingGc)
+        ? (incomingGc as Record<string, unknown>)
+        : {};
+    const cachedGc = out.generationConfig;
+    const hasCachedGen = cachedGc !== undefined && typeof cachedGc === "object" && !Array.isArray(cachedGc);
+    const mergedGen: Record<string, unknown> = hasCachedGen ? { ...(cachedGc as Record<string, unknown>) } : {};
+    // A stale token from a previous leg may sit at ANY location in the cached
+    // inner — strip every spelling at both spots before splicing the fresh one
+    // back, so the replayed inner carries exactly one token (or none, when it
+    // rides the envelope meta). A leftover token at another location is itself
+    // a deviation upstream would 400.
+    for (const key of CONTINUATION_TOKEN_KEYS) {
+        delete out[key];
+        delete mergedGen[key];
+    }
+    for (const key of ["maxOutputTokens", "max_output_tokens"] as const) {
+        const v = incomingGen[key];
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) mergedGen[key] = v;
+    }
+    if (cont.location === "generationConfig") mergedGen[cont.key] = cont.value;
+    if (hasCachedGen || Object.keys(mergedGen).length > 0) out.generationConfig = mergedGen;
+    if (cont.location === "inner") out[cont.key] = cont.value;
+    return out;
+}
+
 // Inbound unwrap: pull the GenerateContentResponse out of `response`. No-op when
 // not enveloped, so repeated application and non-v1 traffic pass through intact.
 export function unwrapV1ResponseJson(json: string): string {
