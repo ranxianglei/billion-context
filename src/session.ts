@@ -29,6 +29,22 @@ export type BlockContent = {
     full: BlockView;
 };
 
+/** The compression-time snapshot of a block, or undefined when there is none.
+ *  The unified index stores a placeholder for blocks whose legacy record had no
+ *  snapshot ({ one: null, full: { text: block.summary, count: 0 } }, see
+ *  completeBlockContents in src/storage/ingest.ts) so every block row has a view;
+ *  replay serves it back. It is not a snapshot: readers must treat it like a
+ *  missing entry (decompress collects from the live messages, the web view says
+ *  "no snapshot") or a migrated session returns the summary as the block's content. */
+export function blockContentSnapshot(
+    contents: { get(blockId: string): BlockContent | undefined },
+    block: { blockId: string; summary?: string },
+): BlockContent | undefined {
+    const content = contents.get(block.blockId);
+    if (content !== undefined && content.one === null && content.full.count === 0 && content.full.text === block.summary) return undefined;
+    return content;
+}
+
 /** #3050 R3 ②b: block-contents map that folds away to (almost) nothing once
  *  a save has captured it, and re-materializes from the store on the first
  *  access. Idle sessions stop carrying every folded block's originals; the
