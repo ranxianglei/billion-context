@@ -175,3 +175,110 @@ test("openai adapter: chunk with reasoning+content forwards raw once", async () 
     assert.ok(reasoning!.raw, "raw attached to reasoning event (carries full chunk)");
     assert.equal(text!.raw, undefined, "raw NOT duplicated on text event (no double-forwarding)");
 });
+
+// 9. #7432 TRIGGER: a provider that streams the thinking under `delta.reasoning`
+//    (Ollama Cloud) is captured as kind:reasoning, and the client-visible raw
+//    frame is normalized to `reasoning_content` (the alias field is gone).
+test("openai adapter: delta.reasoning alias captured + raw normalized to reasoning_content", async () => {
+    const stream = mockStream(
+        sseChunk({ role: "assistant", content: "", reasoning: "The" }),
+        sseChunk({ content: "", reasoning: " need answer" }),
+        sseChunk({ content: "answer" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    );
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) events.push(ev);
+
+    const reasoningEvents = events.filter((e) => e.kind === "reasoning");
+    assert.equal(reasoningEvents.length, 2, "both delta.reasoning frames captured as reasoning");
+    const deltas = reasoningEvents.map((e) => (e.kind === "reasoning" ? e.delta : ""));
+    assert.deepEqual(deltas, ["The", " need answer"], "reasoning deltas intact");
+
+    for (const ev of reasoningEvents) {
+        if (ev.kind === "reasoning" && ev.raw) {
+            const str = ev.raw.toString("utf8");
+            assert.ok(str.includes('"reasoning_content"'), "raw frame normalized to reasoning_content");
+            assert.ok(!str.includes('"reasoning":'), "alias field removed from raw frame");
+        }
+    }
+
+    const text = events.find((e) => e.kind === "text");
+    assert.ok(text && text.kind === "text", "text event still yielded");
+    if (text && text.kind === "text") assert.equal(text.delta, "answer");
+});
+
+// 10. #7432 NON-TRIGGER: the standard `delta.reasoning_content` path is
+//     unchanged — captured as kind:reasoning, raw frame keeps reasoning_content.
+test("openai adapter: delta.reasoning_content unchanged (non-trigger)", async () => {
+    const stream = mockStream(
+        sseChunk({ reasoning_content: "think" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    );
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) events.push(ev);
+
+    const reasoning = events.find((e) => e.kind === "reasoning");
+    assert.ok(reasoning && reasoning.kind === "reasoning", "reasoning event yielded");
+    if (reasoning && reasoning.kind === "reasoning") {
+        assert.equal(reasoning.delta, "think");
+        assert.ok(reasoning.raw, "raw buffer attached");
+        const str = reasoning.raw!.toString("utf8");
+        assert.ok(str.includes('"reasoning_content":"think"'), "raw frame keeps reasoning_content");
+    }
+});
+
+// 11. #7432 NON-TRIGGER: a frame with no reasoning field produces no reasoning
+//     event (a plain text frame is not reshaped into reasoning).
+test("openai adapter: plain text frame produces no reasoning event", async () => {
+    const stream = mockStream(
+        sseChunk({ content: "plain" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    );
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) events.push(ev);
+
+    assert.ok(!events.find((e) => e.kind === "reasoning"), "no reasoning event from a plain text frame");
+    const text = events.find((e) => e.kind === "text");
+    assert.ok(text && text.kind === "text", "text event yielded");
+    if (text && text.kind === "text") assert.equal(text.delta, "plain");
+});
+
+// 12. #7432 KERNEL TRIGGER: openaiToCore reads the `reasoning` alias (the
+//     client echoes history under `reasoning`), and coreToOpenai re-emits it as
+//     `reasoning_content` (write side stays standard).
+test("openai: `reasoning` alias read by openaiToCore, echoed as reasoning_content", () => {
+    const body: OpenAIRequestBody = {
+        messages: [
+            { role: "assistant", content: "the answer", reasoning: "step 1... step 2..." },
+        ],
+    };
+    const { msgs } = openaiToCore(body);
+    const reasoning = msgs.find((m) => m.contentType === "reasoning");
+    assert.ok(reasoning, "reasoning coreMessage emitted from the `reasoning` alias");
+    assert.equal(reasoning?.reasoningContent, "step 1... step 2...");
+
+    const rebuilt = coreToOpenai(msgs);
+    assert.equal(rebuilt.length, 1);
+    assert.equal(rebuilt[0]?.content, "the answer");
+    assert.equal(rebuilt[0]?.reasoning_content, "step 1... step 2...", "write side stays reasoning_content");
+    assert.equal("reasoning" in (rebuilt[0] as Record<string, unknown>), false, "no `reasoning` key on output");
+});
+
+// 13. #7432 KERNEL NON-TRIGGER: `reasoning_content` (standard) still wins when
+//     both fields are present (first non-empty in the chain).
+test("openai: reasoning_content wins over reasoning alias (non-trigger)", () => {
+    const body: OpenAIRequestBody = {
+        messages: [
+            { role: "assistant", content: "a", reasoning_content: "from rc", reasoning: "from r" },
+        ],
+    };
+    const { msgs } = openaiToCore(body);
+    const reasoning = msgs.find((m) => m.contentType === "reasoning");
+    assert.equal(reasoning?.reasoningContent, "from rc", "reasoning_content (first in chain) wins");
+});

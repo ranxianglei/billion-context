@@ -24,6 +24,51 @@ const PROXY_TOOL_SET = new Set([
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
+// #7432: OpenAI-wire upstreams disagree on the streaming reasoning field name —
+// the standard is `reasoning_content`, but Ollama Cloud (and some others) emit
+// `delta.reasoning`. Read side accepts the alias (order mirrors the client's
+// reasoningFields: reasoning_content → reasoning → reasoning_text); the frame
+// forwarded to the client is normalized back to `reasoning_content` so the
+// client-visible field name stays stable and the history echo never trips an
+// upstream that silently drops a `reasoning` field (it accepts the echo only
+// as `reasoning_content`).
+const REASONING_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+
+function readReasoningField(delta: Record<string, unknown>): { value: string | null; source: string | null } {
+    for (const f of REASONING_FIELDS) {
+        const v = delta[f];
+        if (typeof v === "string" && v.length > 0) return { value: v, source: f };
+    }
+    return { value: null, source: null };
+}
+
+// #7432: rebuild the delta with the reasoning field normalized to
+// `reasoning_content` (any alias field is deleted) and, when given, the content
+// field set. `reasoning`/`content` of null leave that field untouched so a
+// frame carrying only one of the two is not reshaped.
+function normalizeProseFields(
+    parsed: Record<string, unknown>,
+    reasoning: string | null,
+    content: string | null,
+): Record<string, unknown> {
+    const clone = { ...parsed } as { choices?: Array<Record<string, unknown>> };
+    if (clone.choices && clone.choices.length > 0) {
+        const choice = { ...(clone.choices[0] as Record<string, unknown>) };
+        const delta = { ...(choice.delta as Record<string, unknown>) };
+        if (reasoning !== null) {
+            for (const f of REASONING_FIELDS) delete delta[f];
+            if (reasoning.length > 0) delta.reasoning_content = reasoning;
+        }
+        if (content !== null) {
+            if (content.length > 0) delta.content = content;
+            else delete delta.content;
+        }
+        choice.delta = delta;
+        clone.choices = [choice, ...clone.choices.slice(1)];
+    }
+    return clone;
+}
+
 // Given a raw SSE chunk that carries tool_call fragments, decide how to
 // replay it for a real-tool round: "keep" = every fragment belongs to a real
 // call (forward verbatim), null = nothing real in it (drop), or a rewritten
@@ -67,10 +112,16 @@ function withheldProseFrame(parsed: Record<string, unknown>): Buffer | null {
     const delta = choice?.delta as Record<string, unknown> | undefined;
     if (!choice || !delta) return null;
     const ct = typeof delta.content === "string" ? delta.content : "";
-    const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
-    if (ct.length === 0 && rc.length === 0) return null;
+    const { value: rc } = readReasoningField(delta);
+    if (ct.length === 0 && (rc === null || rc.length === 0)) return null;
     const cleanDelta = { ...delta };
     delete cleanDelta.tool_calls;
+    // #7432: normalize the reasoning field to reasoning_content so the client
+    // sees a stable field name (the upstream may have used an alias).
+    if (rc !== null && rc.length > 0) {
+        for (const f of REASONING_FIELDS) delete cleanDelta[f];
+        cleanDelta.reasoning_content = rc;
+    }
     return Buffer.from("data: " + JSON.stringify({ ...parsed, choices: [{ ...choice, delta: cleanDelta }, ...(choices ?? []).slice(1)] }) + "\n\n", "utf8");
 }
 
@@ -108,28 +159,6 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
     } finally {
         reader.releaseLock();
     }
-}
-
-// Rebuild one SSE frame's choices[0].delta with cleaned field values (#1881):
-// a filtered frame must reach the client with the CLEANED bytes — forwarding
-// the original raw frame leaks the echo the filter just removed. Fields that
-// filtered down to empty are dropped from the delta rather than sent as "".
-function applyDeltaFields(parsed: Record<string, unknown>, fields: Record<string, string>): Record<string, unknown> {
-    const clone = { ...parsed } as { choices?: Array<Record<string, unknown>> };
-    if (clone.choices && clone.choices.length > 0) {
-        const choice = { ...(clone.choices[0] as Record<string, unknown>) };
-        const delta = { ...(choice.delta as Record<string, unknown>) };
-        for (const [k, v] of Object.entries(fields)) {
-            if (v === "") delete delta[k];
-            else delta[k] = v;
-        }
-        choice.delta = delta;
-        clone.choices = [choice, ...clone.choices.slice(1)];
-    }
-    return clone;
-}
-function rewriteDeltaFields(parsed: Record<string, unknown>, fields: Record<string, string>): Buffer {
-    return Buffer.from(`data: ${JSON.stringify(applyDeltaFields(parsed, fields))}\n\n`, "utf8");
 }
 
 // A chunk forwarded verbatim must never carry finish_reason: the ACP loop may run
@@ -600,7 +629,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 // was filtered — a dual-field frame leaked unfiltered content
                 // to the client while the filtered text event suppressed its
                 // raw to avoid double-sending.
-                const rcIn = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0 ? delta.reasoning_content : null;
+                // #7432: accept the reasoning alias (reasoning_content →
+                // reasoning → reasoning_text); rcSource drives the forward
+                // normalization below.
+                const { value: rcIn, source: rcSource } = readReasoningField(delta);
                 const ctIn = typeof delta.content === "string" && delta.content.length > 0 ? delta.content : null;
                 let rcOut = rcIn;
                 let ctOut = ctIn;
@@ -621,11 +653,12 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     // echo (#1881). Structured events stay internal here.
                     let json = jsonStr;
                     let obj = parsed;
-                    if (rcChanged || ctChanged) {
-                        const fields: Record<string, string> = {};
-                        if (ctIn !== null) fields["content"] = ctOut ?? "";
-                        if (rcIn !== null) fields["reasoning_content"] = rcOut ?? "";
-                        obj = applyDeltaFields(parsed, fields);
+                    // #7432: rebuild when a prose field was filtered OR the
+                    // reasoning field arrived under a non-standard alias (the
+                    // alias must be normalized to reasoning_content on the
+                    // client-visible bytes).
+                    if (rcChanged || ctChanged || (rcIn !== null && rcSource !== "reasoning_content")) {
+                        obj = normalizeProseFields(parsed, rcIn !== null ? rcOut : null, ctIn !== null ? ctOut : null);
                         json = JSON.stringify(obj);
                     }
                     rawToolChunks.push({ json, parsed: obj });
@@ -639,11 +672,16 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
 
                 const fin = (b: Buffer): Buffer => (finishReason ? stripFinishReasonChunk(b) : b);
+                // #7432: when a prose field was filtered OR the reasoning field
+                // arrived under a non-standard alias, rebuild the client-visible
+                // frame with the reasoning field normalized to
+                // reasoning_content; otherwise forward the original bytes.
+                const needRebuild = rcChanged || ctChanged || (rcIn !== null && rcSource !== "reasoning_content");
+                const rawFwd = needRebuild
+                    ? Buffer.from(`data: ${JSON.stringify(normalizeProseFields(parsed, rcIn !== null ? rcOut : null, ctIn !== null ? ctOut : null))}\n\n`, "utf8")
+                    : rawBuf;
                 if (rcIn !== null && ctIn !== null) {
-                    const raw = rcChanged || ctChanged
-                        ? rewriteDeltaFields(parsed, { content: ctOut ?? "", reasoning_content: rcOut ?? "" })
-                        : rawBuf;
-                    const fwd = fin(raw);
+                    const fwd = fin(rawFwd);
                     const hasText = ctOut !== null && ctOut.length > 0;
                     const hasReason = rcOut !== null && rcOut.length > 0;
                     // Both structured events feed the loop's internal state;
@@ -660,11 +698,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "text", delta: ctOut!, raw: fwd } as ParsedStreamEvent;
                     }
                 } else if (rcIn !== null) {
-                    const raw = rcChanged ? rewriteDeltaFields(parsed, { reasoning_content: rcOut ?? "" }) : rawBuf;
-                    yield { kind: "reasoning", delta: rcOut ?? "", raw: fin(raw) } as ParsedStreamEvent;
+                    yield { kind: "reasoning", delta: rcOut ?? "", raw: fin(rawFwd) } as ParsedStreamEvent;
                 } else if (ctIn !== null) {
-                    const raw = ctChanged ? rewriteDeltaFields(parsed, { content: ctOut ?? "" }) : rawBuf;
-                    yield { kind: "text", delta: ctOut ?? "", raw: fin(raw) } as ParsedStreamEvent;
+                    yield { kind: "text", delta: ctOut ?? "", raw: fin(rawFwd) } as ParsedStreamEvent;
                 } else if (delta.role || (Object.keys(delta).length === 0 && !finishReason)) {
                     yield { kind: "meta", chunk: fin(rawBuf), firstRoundOnly: true } as ParsedStreamEvent;
                 }
