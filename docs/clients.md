@@ -184,6 +184,17 @@ Two lanes, same plugin (#941):
      `DSH_HOME` is unset) — `- id: preset-standard` / `preset-ptc` /
      `preset-minimal` / `preset-cordis`, each with `inject: null`. Top-level
      keys are replaced wholesale, clearing the pending latch.
+   - **Before you uninstall (#6972):** while bili is active the host's
+     auto-compaction is off and bili never rewrites the host's session file,
+     so a long bili-era session's host-side history can grow past the model
+     window. Once you uninstall, stock dsh's overflow recovery answers that by
+     replaying the WHOLE oversized region into a single summarization call —
+     itself over the window, so it can never succeed: the session is stuck on
+     a provider context-length error every turn (its fallback compaction 400s
+     the same way). Before removing `billion-context` from
+     `dsh.profile.bundles`, rotate any heavy session to a new one; a session
+     already over the window cannot be continued by stock dsh after uninstall
+     — reinstalling bili is the only in-place recovery.
    - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
     the bare `billion-context` name in `dsh.profile.bundles` installation-
     anchor-first — from its own install tree (the global npm root) before the
