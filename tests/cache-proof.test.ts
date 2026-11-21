@@ -96,7 +96,7 @@ import { getSession } from "../src/session.ts";
 import { conflictEventsOf } from "../src/conflict-watch.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { DEGENERATE_RETRY_NUDGE } from "../src/degenerate-retry.ts";
+import { DEGENERATE_RETRY_NUDGE, DEGENERATE_RETRY_NUDGE_TAG_ECHO } from "../src/degenerate-retry.ts";
 import { TAG_OPEN } from "../src/chain-checkpoint.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -522,7 +522,7 @@ function checkFoldNext(wire: Wire, bodies: string[], field: string, i: number, l
  *  Contract proven here: element count unchanged, every element before the
  *  last byte-identical, and the last user turn's text extended by exactly
  *  "\n\n" + nudge — zero churn anywhere else. */
-function checkDegenerate(wire: Wire, bodies: string[], field: string, i: number, lines: string[]): void {
+function checkDegenerate(wire: Wire, bodies: string[], field: string, i: number, lines: string[], expectedNudge: string = DEGENERATE_RETRY_NUDGE): void {
     const orig = bodies[i - 1]!;
     const retry = bodies[i]!;
     const OB = Buffer.from(orig, "utf8");
@@ -539,7 +539,7 @@ function checkDegenerate(wire: Wire, bodies: string[], field: string, i: number,
     assert.ok(tailEq(OB, RB, O, R), `${wire} pair#${i}->#${i + 1}: refetch mutated the post-array suffix`);
     const rLast = JSON.parse(elText(RB, R, R.elems.length - 1)) as Item;
     assert.equal(rLast.role, "user", `${wire} pair#${i}->#${i + 1}: refetch replaced the last user turn's role`);
-    assert.equal(String(rLast.content), `${oLast.content}\n\n${DEGENERATE_RETRY_NUDGE}`, `${wire} pair#${i}->#${i + 1}: nudge not merged verbatim ("\\n\n" + nudge) into the last user turn`);
+    assert.equal(String(rLast.content), `${oLast.content}\n\n${expectedNudge}`, `${wire} pair#${i}->#${i + 1}: nudge not merged verbatim ("\\n\n" + nudge) into the last user turn`);
     lines.push(`proof[${wire}] pair#${i}->#${i + 1} DEGEN ok nudge-merged-into-trailing-user-turn zero-other-churn sha=${sha16(retry)}`);
 }
 
@@ -1105,7 +1105,9 @@ test("cache proof (degenerate refetch, chat wire): re-request is a pure tail app
         assert.equal(bodies.length, 3, `expected original + refetch (got ${bodies.length} bodies)`);
         const lines: string[] = [];
         checkGrowth("chat", bodies, "messages", 1, lines);
-        checkDegenerate("chat", bodies, "messages", 2, lines);
+        // #7440: the degenerate turn here is a tag-only echo, so the refetch
+        // carries the tag-forbidding nudge, not the generic continuation push.
+        checkDegenerate("chat", bodies, "messages", 2, lines, DEGENERATE_RETRY_NUDGE_TAG_ECHO);
         for (const l of lines) console.log(l);
         console.log(`proof[chat-degen] VERDICT pairs=2 growth=1 refetches=1 unexplainedDivergences=0`);
     } finally {
