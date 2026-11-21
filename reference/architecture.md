@@ -215,7 +215,7 @@ billion-context/
 │   │   ├── opencode-v2.ts        #   opencode V2 plugin (ModelApi probe, #1569)
 │   │   ├── opencode-native.ts    #   opencode native bootstrap gate
 │   │   ├── opencode-legacy.ts    #   Legacy DCP hooks table
-│   │   ├── pi.ts                 #   pi plugin factory (session derivation, #1333/#1362)
+│   │   ├── pi.ts                 #   pi plugin factory (session derivation, #1333/#1362; routed Anthropic thread compatibility)
 │   │   ├── pi-subagents.ts       #   Inlined acp_delegate sub-agent surface (markEmbedded wiring, #2186)
 │   │   ├── pi-host-stub.ts     #   esbuild alias stub for @earendil-works/pi-coding-agent (→ ".pi" fallback, #2186)
 │   │   ├── pi-native.ts          #   pi native bootstrap gate
@@ -291,6 +291,7 @@ billion-context/
 │   ├── notices.ts                # Built-in notice registry: activity predicates + i18n key table (#5548)
 │   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
 │   ├── nudge-debug.ts            # Nudge-injection bus: mirrors the exact wire nudge text to the pi lane's debug terminal notify (transient, never in LLM context, never persisted)
+│   ├── opencode-fork-lineage.ts # Fork lineage from opencode's local SQLite DB (session_v2.fork_session_id) (#7421)
 │   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
 │   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
 │   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)
@@ -313,6 +314,7 @@ billion-context/
 │   ├── startup-failure-page.ts   # Port-holding failure page when a launcher-spawned proxy dies (#5096)
 │   ├── state-gc.ts               # Opt-in retention GC for dump directories (size/age bounds) (#2412)
 │   ├── state-hydration.ts        # Single mergeState truth; persisted field list derived mechanically (#4242)
+│   ├── storage-backup-repair.ts  # bili storage backup / repair: verified index.db snapshot + corruption recovery (#7156)
 │   ├── storage-maintenance.ts    # bili sessions / bili storage gc CLI over store maintenance APIs (#3911)
 │   ├── turn-separator.ts         # Responses turn-separator id helpers, zero-dependency leaf (#2627)
 │   ├── uncovered.ts              # Uncovered-history audit: runs no active block can reach (#4331)

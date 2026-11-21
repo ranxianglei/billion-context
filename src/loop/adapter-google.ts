@@ -2,10 +2,10 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
-import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { ACP_NAME_ALT, composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData } from "../sse-util.js";
+import { createSseFramer, sseEventData } from "../sse-util.js";
 
 import type {
     CompressLoopAdapter,
@@ -169,6 +169,7 @@ interface GoogleChunk {
 async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<GoogleChunk> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
+    const framer = createSseFramer();
     let buf = "";
     let mode: "unknown" | "sse" | "array" = "unknown";
     let cursor = 0;
@@ -200,14 +201,11 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
                 }
             }
             if (mode === "sse") {
-                buf = normalizeSseLineEndings(buf);
-                let idx: number;
-                while ((idx = buf.indexOf("\n\n")) >= 0) {
-                    const raw = buf.slice(0, idx);
-                    buf = buf.slice(idx + 2);
+                for (const raw of framer.push(buf)) {
                     const json = dataLine(raw);
                     if (json !== null) yield { frame: raw, json };
                 }
+                buf = "";
                 continue;
             }
             for (; cursor < buf.length && !arrayDone; cursor++) {
@@ -241,22 +239,214 @@ async function* iterGoogleChunks(stream: ReadableStream<Uint8Array>): AsyncGener
             }
         }
         if (mode === "sse") {
-            buf = finalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.finish()) {
                 const json = dataLine(raw);
                 if (json !== null) yield { frame: raw, json };
-            }
-            if (buf.trim().length > 0) {
-                const json = dataLine(buf);
-                if (json !== null) yield { frame: buf, json };
             }
         }
     } finally {
         reader.releaseLock();
     }
+}
+
+// ─── #7416: hallucinated turn-bleed circuit breaker ────────────────────────
+// Long Google sessions condition the model on the per-message render tags, so
+// it occasionally misses its native turn stop and emits plain-text "\nuser\n"
+// followed by a second synthetic render tag and a hallucinated user-turn
+// envelope, then continues into a hallucinated next assistant turn that emits
+// real functionCall parts in the same response. The tag-echo filter strips the
+// echoed tags but cannot see the turn boundary: the fake user prose and the
+// post-bleed calls would both pass through, and the loop would execute the
+// calls as unauthorized tool calls. This breaker watches the VISIBLE text
+// channel only (part.thought !== true, unsigned parts — the same channel the
+// tag-echo filter owns; signed text is signature-bound per KDD #10 and is
+// never truncated, only fence-synced). Outside fenced code blocks, a "user"
+// line followed by a render tag or a client user-turn envelope ends the
+// assistant turn: everything from the "\n" before "user" on is dropped, the
+// stream is cancelled early, and the round settles with finishReason STOP.
+// Tool-call arguments are never touched here (#1039): only prose is cut, and
+// only calls buffered AFTER the bleed are suppressed — a genuine call from
+// the real turn, buffered before the bleed, still settles normally.
+const BLEED_ACP_FOLLOWER = new RegExp("^\\x3c" + ACP_NAME_ALT + "(?=[\\s/>=])");
+const BLEED_ENVELOPE_FOLLOWER = new RegExp("^\\x3c(?:USER_REQUEST|ADDITIONAL_METADATA|SYSTEM_MESSAGE)(?=[\\s>])", "i");
+const BLEED_SENTENCE_FOLLOWER = new RegExp("^The following is a \\x3cSYSTEM_MESSAGE\\x3e", "i");
+const BLEED_ENVELOPE_LITERALS = ["\x3cUSER_REQUEST", "\x3cADDITIONAL_METADATA", "\x3cSYSTEM_MESSAGE"];
+const BLEED_SENTENCE_LITERAL = "The following is a \x3cSYSTEM_MESSAGE\x3e";
+
+type BleedFollower = "match" | "ambiguous" | "no";
+
+/** What the text after a "user" line (leading whitespace skipped) proves:
+ *  a follower opener starts it ("match"), it is still a strict prefix of a
+ *  follower opener so the next chunk must decide ("ambiguous"), or it rules
+ *  every follower out ("no" — the "user" line was ordinary prose). */
+function bleedFollowerStatus(rest: string): BleedFollower {
+    if (rest.length === 0) return "ambiguous";
+    if (BLEED_ACP_FOLLOWER.test(rest) || BLEED_ENVELOPE_FOLLOWER.test(rest) || BLEED_SENTENCE_FOLLOWER.test(rest)) return "match";
+    const upper = rest.toUpperCase();
+    for (const lit of BLEED_ENVELOPE_LITERALS) {
+        if (lit.startsWith(upper)) return "ambiguous";
+    }
+    if (BLEED_SENTENCE_LITERAL.toUpperCase().startsWith(upper)) return "ambiguous";
+    // "\x3c" plus a still-growing tag name: an acp-style name or an envelope
+    // name may still complete in the next chunk.
+    if (/^\x3c[A-Za-z]{0,7}$/.test(rest)) return "ambiguous";
+    return "no";
+}
+
+interface TurnBleedFence {
+    inFence: boolean;
+    char: string;
+    len: number;
+}
+
+/** CommonMark fenced-code delimiter on one complete line, or null. A closing
+ *  fence needs the same char, at least the opening length, and nothing but
+ *  whitespace after it; a backtick opening's info string must hold no
+ *  backtick. */
+function bleedFenceDelimiter(line: string, st: TurnBleedFence): TurnBleedFence | null {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (m === null) return null;
+    const run = m[1];
+    const ch = run[0];
+    const rest = line.slice(m[0].length);
+    if (st.inFence) {
+        if (ch !== st.char || run.length < st.len) return null;
+        if (rest.trim() !== "") return null;
+        return { inFence: false, char: "", len: 0 };
+    }
+    if (ch === "`" && rest.includes("`")) return null;
+    return { inFence: true, char: ch, len: run.length };
+}
+
+/** Whether an incomplete line could still grow into the "user" line
+ *  (a strict prefix of it, or the full word plus trailing spaces/tabs). */
+function bleedCouldBeUserLine(s: string): boolean {
+    return /^(?:[Uu]|[Uu][Ss]|[Uu][Ss][Ee]|[Uu][Ss][Ee][Rr][ \t]*)$/.test(s);
+}
+
+/** Whether an incomplete line could still grow into a fence delimiter:
+ *  a fence run is already there (its verdict needs the completed line), or
+ *  only spaces plus at most two fence chars have arrived so far. */
+function bleedCouldBeFenceLine(s: string, inFence: boolean): boolean {
+    const m = /^ {0,3}(`{3,}|~{3,})/.exec(s);
+    if (m !== null) {
+        const rest = s.slice(m[0].length);
+        if (m[1][0] === "`" && rest.includes("`")) return false;
+        if (inFence && rest.trim() !== "") return false;
+        return true;
+    }
+    return /^ {0,3}[`~]{0,2}$/.test(s);
+}
+
+interface TurnBleedScan {
+    /** Index of the "\n" before the "user" line (0 when the bleed starts the
+     *  buffer), once a follower proves the bleed. */
+    cutAt: number | null;
+    /** Index from which bytes must be held: the undecided tail. */
+    holdFrom: number;
+    /** Fence state at holdFrom. */
+    stateAtHold: TurnBleedFence;
+}
+
+function scanTurnBleed(buf: string, start: TurnBleedFence): TurnBleedScan {
+    let st: TurnBleedFence = { ...start };
+    let pos = 0;
+    for (;;) {
+        const nl = buf.indexOf("\n", pos);
+        if (nl === -1) {
+            const tail = buf.slice(pos);
+            const mustHold = bleedCouldBeUserLine(tail) || bleedCouldBeFenceLine(tail, st.inFence);
+            return { cutAt: null, holdFrom: mustHold ? pos : buf.length, stateAtHold: st };
+        }
+        const rawLine = buf.slice(pos, nl);
+        const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+        const lineState: TurnBleedFence = { ...st };
+        const next = bleedFenceDelimiter(line, st);
+        if (next !== null) {
+            st = next;
+            pos = nl + 1;
+            continue;
+        }
+        if (!st.inFence && line.replace(/[ \t]+$/, "").toLowerCase() === "user") {
+            let cut = pos === 0 ? 0 : pos - 1;
+            if (cut > 0 && buf[cut - 1] === "\r") cut -= 1;
+            const after = buf.slice(nl + 1).replace(/^[ \t\r\n]*/, "");
+            const status = bleedFollowerStatus(after);
+            if (status === "match") return { cutAt: cut, holdFrom: buf.length, stateAtHold: st };
+            if (status === "ambiguous") return { cutAt: null, holdFrom: cut, stateAtHold: lineState };
+        }
+        pos = nl + 1;
+    }
+}
+
+interface TurnBleedFeed {
+    /** Decided-safe prefix: push it through the tag-echo filter. */
+    emit: string;
+    bled: boolean;
+}
+
+/** Streaming turn-bleed breaker over the visible text channel. feed() holds
+ *  back only the undecided tail — a line that could still become "user", a
+ *  fence delimiter still forming, or a "user" line whose follower has not
+ *  arrived yet — so a bleed split across SSE chunk boundaries is still cut
+ *  whole, and ordinary prose streams with no added delay. flush() releases
+ *  the held tail at stream end, when no follower can still arrive; once the
+ *  bleed is proven, feed() keeps returning empty and flush() discards the
+ *  held tail. */
+function createTurnBleedBreaker(): {
+    feed(text: string): TurnBleedFeed;
+    flush(): string;
+    fenceSync(text: string): void;
+} {
+    let buf = "";
+    let fence: TurnBleedFence = { inFence: false, char: "", len: 0 };
+    let bled = false;
+    return {
+        feed(text: string): TurnBleedFeed {
+            if (bled) return { emit: "", bled: true };
+            buf += text;
+            const scan = scanTurnBleed(buf, fence);
+            if (scan.cutAt !== null) {
+                bled = true;
+                const emit = buf.slice(0, scan.cutAt);
+                buf = "";
+                return { emit, bled: true };
+            }
+            const emit = buf.slice(0, scan.holdFrom);
+            buf = buf.slice(scan.holdFrom);
+            fence = scan.stateAtHold;
+            return { emit, bled: false };
+        },
+        flush(): string {
+            if (bled) {
+                buf = "";
+                return "";
+            }
+            const out = buf;
+            buf = "";
+            return out;
+        },
+        // Signature-bound text rides verbatim (KDD #10), so it cannot pass
+        // through feed() — but its fence lines still move the stream's fence
+        // state. Best-effort sync over its complete lines only; a fence line
+        // split across the signed/unsigned boundary is a known blind spot
+        // (it can only misjudge a later bleed, never truncate real text on
+        // its own — the cut still needs a proven follower).
+        fenceSync(text: string): void {
+            let st: TurnBleedFence = { ...fence };
+            let pos = 0;
+            for (;;) {
+                const nl = text.indexOf("\n", pos);
+                if (nl === -1) break;
+                const rawLine = text.slice(pos, nl);
+                const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+                const next = bleedFenceDelimiter(line, st);
+                if (next !== null) st = next;
+                pos = nl + 1;
+            }
+            fence = st;
+        },
+    };
 }
 
 export function createGoogleAdapter(
@@ -354,6 +544,20 @@ export function createGoogleAdapter(
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
                     yield { kind: "text", delta: tail, raw: buildChunk([{ text: tail }]) } as ParsedStreamEvent;
+                }
+            };
+            // #7416: the turn-bleed breaker watches the visible text channel
+            // ahead of the tag-echo filter (it needs the raw follower bytes
+            // the filter strips). turnBled ends the round once proven.
+            const bleed = createTurnBleedBreaker();
+            let turnBled = false;
+            const flushBleed = function* (): Generator<ParsedStreamEvent> {
+                const tail = bleed.flush();
+                if (tail.length > 0) {
+                    const clean = tagFilter.push(tail);
+                    if (clean.length > 0) {
+                        yield { kind: "text", delta: clean, raw: buildChunk([{ text: clean }]) } as ParsedStreamEvent;
+                    }
                 }
             };
             let callIndex = 0;
@@ -548,6 +752,7 @@ export function createGoogleAdapter(
 
                 const streamError = parsed.error;
                 if (streamError !== undefined && streamError !== null) {
+                    yield* flushBleed();
                     yield* flushFilter();
                     if (lastUsage && !usageEmitted) {
                         usageEmitted = true;
@@ -571,6 +776,7 @@ export function createGoogleAdapter(
                 // A prompt the safety filter refused up front carries no
                 // candidate at all; the client needs the reason as a terminal.
                 if (blockReason && !candidate && !sawDone) {
+                    yield* flushBleed();
                     yield* flushFilter();
                     sawDone = true;
                     yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
@@ -605,6 +811,10 @@ export function createGoogleAdapter(
                 for (let i = 0; i < parts.length; i++) {
                     const part = parts[i];
                     if (!part || typeof part !== "object") continue;
+                    // #7416: after a proven bleed the whole tail — prose and
+                    // functionCall parts alike — belongs to a turn that never
+                    // happened. Drop every later part in this chunk.
+                    if (turnBled) continue;
                     const fc = part.functionCall as { name?: unknown; args?: unknown; id?: unknown } | undefined;
                     if (fc) {
                         const idx = callIndex++;
@@ -634,13 +844,27 @@ export function createGoogleAdapter(
                         });
                         continue;
                     }
-                    const clean = tagFilter.push(part.text);
+                    // A signature may belong to ordinary text, without thought:true.
+                    // Preserve its bytes and part boundary on both replay paths.
+                    const signed = typeof part.thoughtSignature === "string" && part.thoughtSignature.length > 0;
+                    let clean: string;
+                    if (signed) {
+                        // #1960: signature-bound text is forwarded verbatim —
+                        // it cannot be truncated without desyncing the
+                        // signature. Only its fence lines are tracked.
+                        bleed.fenceSync(part.text);
+                        clean = part.text;
+                    } else {
+                        const fed = bleed.feed(part.text);
+                        if (fed.bled) turnBled = true;
+                        clean = tagFilter.push(fed.emit);
+                    }
                     if (clean !== part.text) {
                         editedParts ??= [...parts];
                         editedParts[i] = { ...part, text: clean };
                     }
                     if (clean.length === 0) continue;
-                    partEvents.push({ kind: "text", delta: clean, rawHandled: true });
+                    partEvents.push({ kind: "text", delta: clean, rawHandled: true, ...(signed ? { rawGooglePart: part } : {}) });
                 }
                 // Decide wire output only after every prose sibling has been
                 // cleaned. Each complete frame belongs to one event, regardless
@@ -677,6 +901,7 @@ export function createGoogleAdapter(
                 }
 
                 if (finishReason && !sawDone) {
+                    yield* flushBleed();
                     yield* flushFilter();
                     yield* settleToolCalls();
                     if (lastUsage && !usageEmitted) {
@@ -704,10 +929,31 @@ export function createGoogleAdapter(
                         yield { kind: "done", finishReason, ...(truncated ? { truncated: true } : {}) } as ParsedStreamEvent;
                     }
                 }
+                // #7416: the turn bled — stop reading the upstream here; the
+                // post-loop block settles the round with STOP.
+                if (turnBled) break;
             }
 
+            // #7416: a hallucinated turn bleed ends the round here. The
+            // post-bleed parts never entered pending, so settle only sees
+            // the real turn's calls; the held bleed tail is discarded.
+            if (turnBled && !sawDone) {
+                void upstream.cancel().catch(() => {});
+                yield* flushFilter();
+                yield* settleToolCalls();
+                if (lastUsage && !usageEmitted) {
+                    usageEmitted = true;
+                    yield usageEvent();
+                }
+                sawDone = true;
+                maybeWarnDegenerate("STOP");
+                maybeSummarizeStrips();
+                loggerLog("warn", "[tag-echo] turn-bleed: truncated response at hallucinated user turn");
+                yield { kind: "done", finishReason: "STOP" } as ParsedStreamEvent;
+            }
             // A stream that died mid-flight still has to hand the client the
             // usage it reported, and a held-back filter tail must not be lost.
+            yield* flushBleed();
             yield* flushFilter();
             if (!sawDone && lastUsage && !usageEmitted) {
                 usageEmitted = true;
