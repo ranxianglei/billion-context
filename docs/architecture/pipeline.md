@@ -1,6 +1,6 @@
 # Module: request pipeline (`src/server` + `src/loop`)
 
-> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-10, master
+> Part of the [architecture hub](../architecture.md) · 中文: [pipeline.zh-CN.md](./pipeline.zh-CN.md) · as of 2026-11-15, candidate
 
 ![Request pipeline module](./assets/pipeline.en.svg)
 (bitmap fallback: [pipeline.en.png](./assets/pipeline.en.png))
@@ -28,6 +28,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 **Egress.** `stream-*` rewrites the upstream SSE per wire (chunk framing, cache-control breakpoints #1637, `wire-body` trailing-user-turn append). On the request side, a user-registerable `egressTransforms[]` pipeline (`src/egress-transforms.ts`, #6003) runs ESM plugins over every outbound model-request body after session processing and before re-sign/v1Wrap — fail-open per plugin, hot-reloadable via `/__bili/config/reload`, an exact no-op when unconfigured. Protocol headers (pf-*/envelope) never leave the proxy — the upstream hop-header list strips them.
 
 **Gates & recovery.** `preflight.ts` (hold grace, dead-end cooldown), `reasoning-guard` (signed payloads are never fold inputs), `request-body-budget` (receive/decode/send byte caps, availability over performance #3128), `content-encoding` (decompression-bomb guard, 413). Error shapes: `stream-error` (minimal SSE error + finish), `fake-completion` (opt-in retry hint), `degenerate-turn` / `degenerate-retry`, and `exit-matrix` (wire-exit × concerns, #588).
+
+**Standing rules and nudges.** Host nudge rendering removes a repeated rule only when the host actually injected the identical full rule into the standing prompt. Missing or modified rules retain the full fallback; client quotations are not proof of coverage. A successful receipt identifying the created blocks is enough to continue. Missing or ambiguous results and new-range selection still require a status lookup. The short nudge tail is guidance, not a deletion anchor: user quotations and indistinguishable replays remain intact.
 
 ## Key entries
 
