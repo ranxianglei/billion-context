@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { applyRouteTables, loadConfigFile, loadOptions, resolveResignSettings } from "../config.js";
 import { resetEgressModuleCache } from "../egress-transforms.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
@@ -431,11 +431,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // #5079: routing must hot-apply too — the web switch changes it live.
             opts.promptCache = fresh.promptCache;
             resetProxyCache();
-            for (const k of Object.keys(opts.routes)) delete opts.routes[k];
-            Object.assign(opts.routes, loadRoutes());
-            opts.namedProviders ??= {};
-            for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
-            Object.assign(opts.namedProviders, loadNamedProviders());
+            applyRouteTables(opts);
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
@@ -917,16 +913,10 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // Hot-reload routes from the config file into the running process — no
     // restart needed. Routes and the global compress block are re-read;
     // port/host/upstream stay as-is (the listen socket is already bound).
-    // Mutates opts.routes in place so all in-flight handle() closures that
-    // captured `opts` see the new routes.
-    const fresh = loadRoutes();
-    // Clear and refill the SAME object reference so resolveUpstream/resolveContextLimit
-    // (which read opts.routes) pick up the new entries without needing reassignment.
-    for (const k of Object.keys(opts.routes)) delete opts.routes[k];
-    Object.assign(opts.routes, fresh);
-    opts.namedProviders ??= {};
-    for (const k of Object.keys(opts.namedProviders)) delete opts.namedProviders[k];
-    Object.assign(opts.namedProviders, loadNamedProviders());
+    // Shared helper (config.ts applyRouteTables): re-reads the route/proxy tables
+    // from the file and swaps them into opts in place (same object reference the
+    // in-flight handle() closures captured), stamping the #6644 change tracker.
+    const names = applyRouteTables(opts);
     const reloaded = loadOptions();
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;
@@ -941,7 +931,6 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
     resetProxyCache();
-    const names = Object.keys(fresh);
     log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, count: names.length, routes: names }));
