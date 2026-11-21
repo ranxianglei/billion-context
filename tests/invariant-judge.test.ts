@@ -5,11 +5,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
+import type { BiliMessage } from "acp-kernel/wire";
 import { judgeInboundOutbound, maybeRunInvariantJudge, maybeJudgeContinuity, _setInvariantJudgeForTest, type JudgeVerdict } from "../src/invariant-judge.js";
 import { setLogCapture } from "../src/logger.js";
 
 let n = 0;
-function mk(role: CoreMessage["role"], contentType: CoreMessage["contentType"], text?: string, extra: Partial<CoreMessage> = {}): CoreMessage {
+function mk(role: CoreMessage["role"], contentType: CoreMessage["contentType"], text?: string, extra: Partial<BiliMessage> = {}): BiliMessage {
   n++;
   return { id: `m${String(n).padStart(5, "0")}`, role, contentType, ...(text !== undefined ? { text } : {}), ...extra };
 }
@@ -52,6 +53,59 @@ test("I1 deterministic crush transform of a tool-result is exempt", () => {
   const crushed = JSON.stringify({ __acp_crush: "rows", rows: 3, const: { a: 1 }, items: [] });
   const exit = [mk("user", "text", "run"), mk("tool", "tool-result", crushed), mk("assistant", "text", "done")];
   assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+const SHED_NOTE = "[image: png 1024x768 m00042 omitted for size limit]";
+
+test("I1 egress-shed archived image twin is exempt (#5049 item 2)", () => {
+  const entry = [mk("user", "text", "[image]", { imagePart: true }), mk("assistant", "text", "done")];
+  const exit = [mk("user", "text", SHED_NOTE), mk("assistant", "text", "done")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true);
+  assert.equal(v.matched, 2);
+});
+
+test("I1 shed note among stable neighbors stays clean (realistic mixed cell)", () => {
+  const entry = [mk("user", "text", "look at this"), mk("user", "text", "[image]", { imagePart: true }), mk("user", "text", "and this too")];
+  const exit = [mk("user", "text", "look at this"), mk("user", "text", SHED_NOTE), mk("user", "text", "and this too")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("NEG shed-note-shaped text against a NON-image twin still red (#5049 item 2)", () => {
+  // The directional proof requires an image inbound twin — plain text that
+  // merely carries the note string is a mid-history rewrite, not an archive.
+  const entry = [mk("user", "text", "the placeholder reads [image: png omitted for size limit] here"), mk("assistant", "text", "ok")];
+  const exit = [mk("user", "text", SHED_NOTE), mk("assistant", "text", "ok")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
+
+test("NEG a real rewrite of an image cell (non-note text) still red (#5049 item 2)", () => {
+  const entry = [mk("user", "text", "[image]", { imagePart: true })];
+  const exit = [mk("user", "text", "[image: png omitted]")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite" || x.kind === "mid-history-drop"));
+});
+
+test("NEG malformed note shape against an image twin still red (#5049 item 2)", () => {
+  // Missing the trailing phrase / extra bracket — only the exact single-producer
+  // format qualifies, so a tampered or model-echoed near-miss stays flagged.
+  const entry = [mk("user", "text", "[image]", { imagePart: true })];
+  const exit = [mk("user", "text", "[image: png omitted for size limit")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+});
+
+test("NEG note-shaped text embedded in a longer exit cell stays red (anchored full-string, #1456)", () => {
+  // The exemption matches the producer's WHOLE-cell format, never a substring —
+  // an image twin whose outbound cell merely contains the note is a rewrite.
+  const entry = [mk("user", "text", "[image]", { imagePart: true })];
+  const exit = [mk("user", "text", `archived, see ${SHED_NOTE} for details`)];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite" || x.kind === "mid-history-drop"));
 });
 
 test("I1 tool-call id re-mint with identical content does not false-positive (#2821)", () => {
