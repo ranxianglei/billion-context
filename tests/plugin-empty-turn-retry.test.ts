@@ -614,6 +614,21 @@ test("plugin chat does not pass the tag-echo hint for a silent-thinking turn (#7
     assert.equal(hint, undefined, "a thinking-only degenerate turn keeps the generic nudge (no hint)");
 });
 
+test("plugin responses passes the tag-echo hint so the retry nudge forbids the tags (#7440)", async () => {
+    const out: string[] = [];
+    let hint: ContinuationRetryHint | undefined = {};
+    let calls = 0;
+    const refetch = (h?: ContinuationRetryHint) => {
+        calls += 1;
+        hint = h;
+        return Promise.resolve(streamOf(responsesProseTurn("real answer after the nudge")));
+    };
+    await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), makeSession(), undefined, refetch);
+    assert.equal(calls, 1, "the tag-echo turn is retried once");
+    assert.deepEqual(hint, { sawStrippedEcho: true }, "the responses pipe passes the hint to the refetch");
+    assert.ok(!out.join("").includes("m00155"), "the echoed tag never leaks");
+});
+
 test("the tag-echo retry nudge forbids the render tags and is injected as a trailing user turn (#7440)", () => {
     const openaiBody = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
     const merged = JSON.parse(injectContinuationNudge("openai", openaiBody, undefined, DEGENERATE_RETRY_NUDGE_TAG_ECHO)!) as { messages: { role: string; content: string }[] };
