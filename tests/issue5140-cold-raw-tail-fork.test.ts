@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.ts";
+import { startServer, _disposeServedWriterForTest } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
@@ -100,6 +100,10 @@ async function harness(mode: "shadow" | "legacy", dir?: string): Promise<Handle>
             upstream.closeIdleConnections?.();
             await once(upstream, "close");
             store.closeQuietly();
+            // #5716: record the simulated process's graceful stop AFTER the
+            //  final flush so the successor's hot-adoption guard sees a clean
+            //  handover instead of a still-writing predecessor.
+            _disposeServedWriterForTest();
             if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevMode;
         },
     };
