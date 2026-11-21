@@ -364,6 +364,9 @@ def _ensure_heartbeat() -> None:
 
 
 def _heartbeat_loop(gen: int) -> None:
+    # 409 = the origin is a daemon proxy with no watchdog (register_watcher's own policy):
+    # stop beating until the origin changes, instead of hammering a proxy that refuses it.
+    skip_origin: Optional[str] = None
     while True:
         if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
             return
@@ -373,12 +376,17 @@ def _heartbeat_loop(gen: int) -> None:
         if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
             return
         origin = _state.get("origin")
-        if origin:
-            try:
-                http_post_json(origin + "/__bili/watcher", {"pid": os.getpid(), "hb": True},
-                               HEALTH_PROBE_TIMEOUT_S)
-            except Exception:
-                pass
+        if not origin:
+            skip_origin = None
+            continue
+        if origin == skip_origin:
+            continue
+        status, _body = http_post_json(str(origin).rstrip("/") + "/__bili/watcher",
+                                       {"pid": os.getpid(), "hb": True}, HEALTH_PROBE_TIMEOUT_S)
+        if status == 409:
+            skip_origin = origin
+        else:
+            skip_origin = None
 
 
 def register_watcher(origin: str) -> None:
