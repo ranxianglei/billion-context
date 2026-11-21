@@ -1,5 +1,6 @@
 import { ACP_RETIRE_TOOL_NAME, ACP_RESTORE_TOOL_NAME, ACP_REWRITE_TOOL_NAME, BLOCKED_REF, BLOCK_OP_TOOL_NAMES, COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type RetrievalExport, type ToolPrompts, applyAcpToolOverrides, applyRetrieve, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { imageRescaleEnabled, publicSnapshotCapBytes } from "./knobs.js";
+import { parseCarrierEntries } from "./carrier-args.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -189,17 +190,19 @@ export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessa
     const results = new Map(messages.filter((m) => m.contentType === "tool-result" && m.toolCallId).map((m) => [m.toolCallId!, m.text ?? ""]));
     for (const message of messages) {
         if (message.contentType !== "tool-call" || message.toolName !== "compress" || !message.toolCallId) continue;
-        try {
-            const args = JSON.parse(message.text ?? "") as { content?: unknown; startId?: unknown; endId?: unknown };
-            for (const range of Array.isArray(args?.content) ? args.content : [args]) {
-                if (!range || typeof range.startId !== "string" || typeof range.endId !== "string") continue;
-                const key = JSON.stringify([range.startId, range.endId]);
-                if (!blocks.has(key)) continue;
-                const ids = calls.get(key) ?? new Set<string>();
-                ids.add(message.toolCallId);
-                calls.set(key, ids);
-            }
-        } catch { /* Invalid historical arguments cannot establish ownership. */ }
+        // #7478: recognize the current line-format args too — the JSON shapes
+        // alone misjudged every dsh-style fold as carrier-less, the same blind
+        // spot as stripKernelSummaries. parseCarrierEntries is the shared
+        // parser (src/carrier-args.ts): it accepts both the JSON drift shapes
+        // and the line format, and never throws (unparseable args yield no
+        // entries — the fail-safe direction, same as the old catch).
+        for (const e of parseCarrierEntries(message.text ?? "")) {
+            const key = JSON.stringify([e.startRef, e.endRef]);
+            if (!blocks.has(key)) continue;
+            const ids = calls.get(key) ?? new Set<string>();
+            ids.add(message.toolCallId);
+            calls.set(key, ids);
+        }
     }
     let changed = 0;
     for (const [key, sameRange] of blocks) {
