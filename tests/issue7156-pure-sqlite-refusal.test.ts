@@ -32,12 +32,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, truncateSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, truncateSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { UnifiedShadow, resetIntegrityQuickCheckLatchForTests, storageStancePureSqlite, legacyDegradeAllowed } from "../src/storage/shadow.js";
+import { DatabaseSync } from "node:sqlite";
+import { UnifiedShadow, hadIntegrityQuickCheckFailure, resetIntegrityQuickCheckLatchForTests, storageStancePureSqlite, legacyDegradeAllowed } from "../src/storage/shadow.js";
 import { openSqliteDatabase, probeBuiltinSqlite, probeHostBetterSqlite3 } from "../src/storage/driver.js";
-import { resetIntegrityCheckStateForTests } from "../src/storage/integrity-check.js";
+import { resetIntegrityCheckStateForTests, setIntegritySyncThresholdForTests } from "../src/storage/integrity-check.js";
+import { UnifiedStore } from "../src/storage/store.js";
+import { setLogCapture } from "../src/logger.js";
 import {
     _resetStorageRuntimeStatusForTest,
     storageStatusWire,
@@ -60,6 +63,19 @@ function seedValidDb(dbPath: string): void {
 
 function truncateHalf(dbPath: string): void {
     truncateSync(dbPath, Math.floor(statSync(dbPath).size / 2));
+}
+
+/** Zero one 4 KiB page (the deterministic recipe from
+ *  issue7156-storage-corruption.test.ts): open() survives (the pragmas +
+ *  migration only touch the header + page 1), but the first write that
+ *  resolves the schema throws "database disk image is malformed". */
+function zeroPage(p: string, page: number): void {
+    const fd = openSync(p, "r+");
+    try {
+        writeSync(fd, Buffer.alloc(4096, 0), 0, 4096, page * 4096);
+    } finally {
+        closeSync(fd);
+    }
 }
 
 /** Pure knob facets — no engine needed. The stance must mirror the persist
@@ -202,6 +218,53 @@ test("#7156 refusal is RECORDED for the diagnostics surface and repeats on every
         const wire = storageStatusWire();
         assert.match(wire.reason ?? "", /REFUSES TO START/i);
     } finally {
+        resetLatches();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#7156 pure-sqlite: a first-post-open-write corruption REFUSES TO START too", { skip: SKIP_NO_ENGINE }, () => {
+    const dir = tmpDir();
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "sqlite";
+    try {
+        // The incident's large-store path: the integrity check does not run
+        // synchronously (async mode forced), so a proven corruption surfaces
+        // at the FIRST post-open write (resetAllIngestWatermarks) instead of
+        // at quick_check — the branch the truncateHalf tests above cannot
+        // reach. Same recipe as the #7156 FIX 4 dual-write test, but the
+        // pure-sqlite stance must REFUSE, not degrade.
+        const p = join(dir, "index.db");
+        const s0 = UnifiedStore.open(p);
+        s0.close();
+        const ro = new DatabaseSync(p);
+        for (let i = 0; i < 60; i++) {
+            ro.prepare("INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, 1, 1)").run("s" + i + "-" + "x".repeat(300));
+        }
+        ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        ro.close();
+        zeroPage(p, 2);
+        setIntegritySyncThresholdForTests(1); // force async mode for any size
+        const errors: string[] = [];
+        setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
+        try {
+            assert.throws(
+                () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "sqlite" }, () => null),
+                /malformed|not a database/i,
+                "a first-write corruption in the pure-sqlite stance refuses to start",
+            );
+            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped");
+            assert.ok(
+                errors.some((m) => m.includes("first post-open write")),
+                `the error names the first-write corruption; got ${JSON.stringify(errors)}`,
+            );
+        } finally {
+            setLogCapture(null);
+        }
+    } finally {
+        setIntegritySyncThresholdForTests(null);
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         resetLatches();
         rmSync(dir, { recursive: true, force: true });
     }
