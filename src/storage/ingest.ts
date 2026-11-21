@@ -296,7 +296,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
  *  (same anchoring discipline the old delta path had, without the trust
  *  the watermark carried). The base sits far above any real seq and never
  *  touches the -1/-1 "no claim" block-bounds sentinel. */
-export const RECONCILE_SENTINEL_BASE = 2_000_000_000;
+const RECONCILE_SENTINEL_BASE = 2_000_000_000;
 
 /** One serialized log entry without its seq — the shared per-message work
  *  of both planners (serializeForStore → #5627-guarded parse →
