@@ -75,3 +75,39 @@ test("default options stay byte-identical to pre-fix behavior (bare-name only)",
   const bare = prune(seq("compress"), stateWithActiveCoverage());
   assert.ok(bare.some((m) => m.id === "pend"), "bare-name exemption unchanged under defaults");
 });
+
+// #5455 boundary: an ANSWERED compress call whose result is covered still
+// survives the orphan strip (the isCompressTool exemption at prune.ts:625).
+// This "answered but result covered" state is currently UNREACHABLE through
+// the pipeline (no producer), but the exemption means it would ship an
+// unanswered compress tool_call if it ever became reachable. Compress-call
+// atomicity rests on the apply-side pair widening + integrity gate ALONE —
+// this test pins that boundary. Contrast: an ordinary answered call whose
+// result is covered IS stripped.
+test("#5455 boundary: answered compress call whose result is covered survives the orphan exemption", () => {
+  const messages: CoreMessage[] = [
+    { id: "u0", role: "user", contentType: "text", text: "summarize" },
+    { id: "call", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "fixture-call", text: "{}" },
+    { id: "result", role: "tool", contentType: "tool-result", toolCallId: "fixture-call", text: "completed" },
+    { id: "u1", role: "user", contentType: "text", text: "continue" },
+  ];
+  const state = createInitialState();
+  state.blocks.push(block({ blockId: "fixture-block", effectiveMessageIds: ["result"] }));
+  const out = prune(messages, state);
+  assert.ok(!out.some((m) => m.id === "result"), "covered result removed");
+  assert.ok(out.some((m) => m.id === "call"), "answered compress call survives the orphan exemption (#5455 boundary)");
+});
+
+test("#5455 contrast: an ordinary answered call whose result is covered is stripped", () => {
+  const messages: CoreMessage[] = [
+    { id: "u0", role: "user", contentType: "text", text: "a" },
+    { id: "call", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "fixture-call", text: "{}" },
+    { id: "result", role: "tool", contentType: "tool-result", toolCallId: "fixture-call", text: "out" },
+    { id: "u1", role: "user", contentType: "text", text: "b" },
+  ];
+  const state = createInitialState();
+  state.blocks.push(block({ blockId: "fixture-block", effectiveMessageIds: ["result"] }));
+  const out = prune(messages, state);
+  assert.ok(!out.some((m) => m.id === "result"), "covered result removed");
+  assert.ok(!out.some((m) => m.id === "call"), "ordinary answered call whose result is covered is stripped");
+});

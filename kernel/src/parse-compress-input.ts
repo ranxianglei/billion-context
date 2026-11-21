@@ -51,9 +51,11 @@ export interface CompressParseDiagnostics {
   /** True when a non-array `content` value (single entry object or nested
    *  `ranges` array) was recovered into the canonical array form (#470). */
   contentSalvage?: boolean;
-  /** First 800 chars of the raw string input (string inputs only). */
+  /** First 800 chars of the raw string input, or of the stringified
+   *  content array when it was truncated (host argCorruption receipt). */
   rawPrefix?: string;
-  /** Raw string input length (string inputs only). */
+  /** Raw string input length, or the stringified content-array length when
+   *  it was truncated (host argCorruption receipt). */
   length?: number;
   /** Top-level keys of the parsed object — catches `content` vs `ranges` drift. */
   keys?: string[];
@@ -202,6 +204,23 @@ function parseObjectValue(
       parsed === null ||
       (parsed.entries.length === 0 && content.trim().length > 0)
     ) {
+      // A truncated JSON array — content opens with `[` and is structurally
+      // cut off (unbalanced brackets / an unterminated string, the
+      // mid-stream cutoff signature) — is NOT a line-form attempt. The
+      // line-form ladder below would misread the JSON prefix as headerless
+      // prose and report content-not-array / no-valid-ranges, steering the
+      // model away from a format that was legal all along. Classify it as
+      // truncated (finishSalvage already establishes "truncated input →
+      // kind=truncated" even with zero ranges) and record the length so the
+      // host's argCorruption receipt fires instead of the array-wrap hint.
+      // The gate fires ONLY on the truncation signature: a balanced-but-
+      // malformed document keeps today's line-form path (no regression).
+      const fenceStripped = stripFence(content.trim());
+      if (fenceStripped.startsWith("[") && looksTruncated(fenceStripped)) {
+        diag.length = content.length;
+        diag.rawPrefix = clampPrefix(content, 800);
+        return finishSalvage(parsed?.entries ?? [], callId, diag, true);
+      }
       // Not a JSON array (or nothing salvageable): bare line-form text.
       // Strip JSON-wrapper residue (stringified ["…"] with broken
       // escaping) — the line form needs structure only in the refs
@@ -255,6 +274,13 @@ function parseObjectValue(
     entries = parsed.entries;
     salvaged = parsed.salvaged;
     if (parsed.quoteRepaired) diag.quoteSalvage = true;
+    // A truncated content string that DID salvage complete entries (object
+    // or string) is still a truncated input; record the length so the host
+    // receipt reads as arg-corruption, not a generic no-valid-ranges.
+    if (salvaged) {
+      diag.length = content.length;
+      diag.rawPrefix = clampPrefix(content, 800);
+    }
   } else if (content !== null && typeof content === "object") {
     // #470: a single entry OBJECT in the content slot instead of a
     // one-element array — the SAME drift the top level already recovers
@@ -977,9 +1003,11 @@ function looksTruncated(s: string): boolean {
 /**
  * Recover the complete entries of the `content` array from a truncated JSON
  * prefix. Walks the prefix with a small state machine (string / escape /
- * bracket depth); every object that opens and closes at depth 1 is
- * re-parsed leniently and kept only if it still parses. Partial entries are
- * dropped — the parser never invents model content.
+ * bracket depth); every entry — an object `{…}` or a string `"…"` — that
+ * opens and closes at the top level of the content array (depth 0) is
+ * re-parsed leniently and kept only if it still parses. Partial entries
+ * (an unclosed trailing object or string) are dropped — the parser never
+ * invents model content.
  */
 function salvageContentEntries(raw: string): unknown[] {
   const match = /"content"\s*:\s*\[/.exec(raw);
@@ -995,11 +1023,24 @@ function salvageContentEntries(raw: string): unknown[] {
     if (inString) {
       if (escaped) escaped = false;
       else if (ch === "\\") escaped = true;
-      else if (ch === '"') inString = false;
+      else if (ch === '"') {
+        inString = false;
+        // A string that opened at depth 0 is a complete string entry (the
+        // line-form sibling of the object entries). Capture it; a partial
+        // trailing string never closes, so it is dropped, never guessed.
+        if (depth === 0 && entryStart !== -1) {
+          const entrySlice = raw.slice(entryStart, i + 1);
+          entryStart = -1;
+          const parsed = tryParseLenient(entrySlice);
+          if (parsed !== undefined) entries.push(parsed);
+        }
+      }
       continue;
     }
     if (ch === '"') {
       inString = true;
+      // A string opening at depth 0 is the start of a string entry.
+      if (depth === 0 && entryStart === -1) entryStart = i;
       continue;
     }
     if (ch === "{" || ch === "[") {
