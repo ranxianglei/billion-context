@@ -19,8 +19,9 @@ Two lanes, same plugin (#941):
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
    session-bound. dsh's native auto-compaction is disabled in the same patch
    (host-plane `compaction-basic` → `auto: false`; web-profile preset
-   instances are disabled at load time by the #3354 overlay); manual
-   `/compact` stays available in non-web profiles. The
+   instances are disabled at load time by the #3354 overlay; when
+   `bili-native` is disabled or absent the gate restores the host-plane row
+   to stock, #5245); manual `/compact` stays available in non-web profiles. The
   same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
   retry whitelist, so one sampling flake that breaks a tool-call argument JSON
   retries instead of killing the turn (#2605).
@@ -203,9 +204,10 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is now off everywhere — host
-plane via the bundle patch, web-profile presets via the #3354 load-time
-overlay; see the web-profile note above).
+kernel's natural ingest diff (auto-compaction is off everywhere while
+bili-native owns the lane — host plane via the bundle patch, web-profile
+presets via the #3354 load-time overlay; a disable restores stock since
+#5245; see the web-profile note above).
 
 **Host-side context meters diverge from the model's view by design (#2837):**
 in plugin mode the host's durable session log

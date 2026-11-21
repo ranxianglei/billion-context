@@ -43,7 +43,7 @@ test("#4147: custom preset entries nesting compaction rows are rewritten (group 
                 { name: "@deepseek-ai/dsh-command-compact" },
             ],
         };
-        const out = mw.call({ entry: { options: { name: "preset-general" } } }, null, () => cfg) as { plugins: Array<Record<string, unknown>> };
+        const out = mw.call(null, { entry: { options: { name: "preset-general" } } }, () => cfg) as { plugins: Array<Record<string, unknown>> };
         assert.equal(out.plugins[0].disabled, undefined, "unrelated sibling row untouched");
         const group = out.plugins[1] as { config: Array<Record<string, unknown>> };
         assert.equal(group.config[0].disabled, true, "nested group row disabled");
@@ -66,9 +66,9 @@ test("#4147 negative: no compaction rows → resolved config object identity kep
         declareDshCompactionActive();
         const mw = middleware();
         const unrelated = { plugins: [{ name: "@deepseek-ai/dsh-tool-result-pruner" }] };
-        assert.equal(mw.call({ entry: { options: { name: "preset-shipin" } } }, null, () => unrelated), unrelated);
+        assert.equal(mw.call(null, { entry: { options: { name: "preset-shipin" } } }, () => unrelated), unrelated);
         const noPlugins = { other: 1 };
-        assert.equal(mw.call({ entry: { options: { name: "preset-shipin" } } }, null, () => noPlugins), noPlugins);
+        assert.equal(mw.call(null, { entry: { options: { name: "preset-shipin" } } }, () => noPlugins), noPlugins);
         assert.equal(dshCompactionGateTelemetry(), null, "no rewrite, no coverage record");
     } finally {
         _resetDshCompactionVerdictForTest();
@@ -82,7 +82,7 @@ test("#4147/#3662 negative: absent verdict → stock passthrough records nothing
         _resetDshCompactionGateTelemetryForTest();
         const mw = middleware();
         const cfg = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        const out = mw.call({ entry: { options: { name: "preset-general" } } }, null, () => cfg) as { plugins: Array<Record<string, unknown>> };
+        const out = mw.call(null, { entry: { options: { name: "preset-general" } } }, () => cfg) as { plugins: Array<Record<string, unknown>> };
         assert.equal(out, cfg, "verbatim passthrough");
         assert.equal((cfg.plugins as Array<Record<string, unknown>>)[0].disabled, undefined);
         assert.equal(dshCompactionGateTelemetry(), null, "stock passthrough leaves no coverage record");
@@ -99,13 +99,13 @@ test("#3962: telemetry dedups per entry, keeps the max row count, flags the fact
         declareDshCompactionActive();
         const mw = middleware();
         const one = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        mw.call({ entry: { options: { name: "preset-general" } } }, null, () => one);
+        mw.call(null, { entry: { options: { name: "preset-general" } } }, () => one);
         const two = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }, { name: "@deepseek-ai/dsh-command-compact" }] };
-        mw.call({ entry: { options: { name: "preset-general" } } }, null, () => two);
+        mw.call(null, { entry: { options: { name: "preset-general" } } }, () => two);
         const factory = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        mw.call({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, null, () => factory);
+        mw.call(null, { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, () => factory);
         const unnamed = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        mw.call(undefined, null, () => unnamed);
+        mw.call(null, undefined, () => unnamed);
         const t = dshCompactionGateTelemetry()!;
         assert.deepEqual(t.covered.find((c) => c.entry === "preset-general"), { entry: "preset-general", rows: 2 }, "dedup keeps the max count");
         assert.equal(t.covered.some((c) => c.entry === "unnamed-entry"), true, "missing entry name still recorded");
@@ -126,7 +126,7 @@ test("#3962: long entry names (URLs) are truncated for the durable note", () => 
         const mw = middleware();
         const longName = "file:///".padEnd(200, "x");
         const cfg = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        mw.call({ entry: { options: { name: longName } } }, null, () => cfg);
+        mw.call(null, { entry: { options: { name: longName } } }, () => cfg);
         const t = dshCompactionGateTelemetry()!;
         assert.equal(t.covered[0].entry.length, 120);
     } finally {

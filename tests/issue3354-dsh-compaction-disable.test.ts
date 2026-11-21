@@ -120,7 +120,7 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         ];
         const cfg: Record<string, unknown> = { plugins, isolate: { compaction: true } };
         const self = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
-        const out = mw?.call(self, null, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
+        const out = mw?.call(null, self, () => cfg) as { plugins?: Array<Record<string, unknown>>; isolate?: Record<string, unknown> };
         assert.deepEqual(out.isolate, { compaction: true });
         assert.equal(out.plugins?.[0]?.disabled, true);
         assert.equal(out.plugins?.[1]?.disabled, true);
@@ -129,13 +129,13 @@ test("#3354 registerCompactionDisable: transform honors the entry predicate and 
         // compaction rows is rewritten too (custom presets), while an entry
         // whose plugins carry none keeps its resolved config object identity.
         const custom: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-compaction-basic" }] };
-        const customOut = mw?.call({ entry: { options: { name: "preset-general" } } }, null, () => custom) as { plugins?: Array<Record<string, unknown>> };
+        const customOut = mw?.call(null, { entry: { options: { name: "preset-general" } } }, () => custom) as { plugins?: Array<Record<string, unknown>> };
         assert.equal(customOut.plugins?.[0]?.disabled, true);
         const untouched: Record<string, unknown> = { plugins: [{ name: "@deepseek-ai/dsh-other" }] };
-        assert.equal(mw?.call({ entry: { options: { name: "other-entry" } } }, null, () => untouched), untouched);
-        assert.equal(mw?.call(undefined, null, () => untouched), untouched);
+        assert.equal(mw?.call(null, { entry: { options: { name: "other-entry" } } }, () => untouched), untouched);
+        assert.equal(mw?.call(null, undefined, () => untouched), untouched);
         // next() returning nothing → verbatim passthrough
-        assert.equal(mw?.call(self, null, () => undefined), undefined);
+        assert.equal(mw?.call(null, self, () => undefined), undefined);
     } finally {
         _resetDshCompactionVerdictForTest();
     }
