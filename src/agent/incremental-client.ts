@@ -18,6 +18,7 @@
 
 import { createHash } from "node:crypto";
 import type { DirectSendPrep } from "./native-intercept.js";
+import { compactRetouch, type WireRetouch } from "../incremental-retouch.js";
 
 /** Marker header the lane's divert recognizes. Client-side copy of
  * INCREMENTAL_TURN_MARKER_HEADER in src/incremental-lane.ts — the host-side
@@ -270,7 +271,12 @@ function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] |
 }
 
 const PROBE_TTL_MS = 30_000;
-const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; at: number }>();
+const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; cacheControlRetouchCompact: boolean; at: number }>();
+
+export function incrementalCompactCacheRetouchEnabled(proxyBase: string): boolean {
+    const cached = probeCache.get(proxyBase);
+    return cached !== undefined && cached.ok && cached.cacheControlRetouchCompact && Date.now() - cached.at < PROBE_TTL_MS;
+}
 
 /** The optional envelope extension must be positively advertised by the server.
  * Older servers ignore unknown fields, so sending retouches to them is unsafe. */
@@ -287,17 +293,19 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     if (cached && now - cached.at < PROBE_TTL_MS) return cached.ok;
     let ok = false;
     let cacheControlRetouch = false;
+    let cacheControlRetouchCompact = false;
     try {
         const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (res.ok) {
-            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown };
+            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown; cacheControlRetouchCompact?: unknown };
             ok = body.enabled === true;
             cacheControlRetouch = body.cacheControlRetouch === true;
+            cacheControlRetouchCompact = body.cacheControlRetouchCompact === true;
         }
     } catch {
         ok = false;
     }
-    probeCache.set(proxyBase, { ok, cacheControlRetouch, at: now });
+    probeCache.set(proxyBase, { ok, cacheControlRetouch, cacheControlRetouchCompact, at: now });
     return ok;
 }
 
@@ -402,6 +410,7 @@ type IncrementalPlan =
 interface PlanArgs {
     /** Only true after the server's capability probe advertised support. */
     cacheControlRetouch?: boolean;
+    cacheControlRetouchCompact?: boolean;
     conversationId: string;
     /** Forward path of the ORIGINAL request (the marker divert uses it);
      * optional — the lane defaults a bare `path` to /v1/messages. */
@@ -423,7 +432,7 @@ interface PlanArgs {
     msgIds?: string[];
 }
 
-function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: { index: number; message: IncrementalWireMessage }[]): string {
+function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: WireRetouch[]): string {
     // `request` is optional at the call sites (a host may plan with only
     // messages+system); missing params simply ride their lane defaults.
     const src = args.request ?? {};
@@ -479,13 +488,15 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
         return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson, fullIds) };
     }
-    const retouch: { index: number; message: IncrementalWireMessage }[] = [];
+    const retouch: WireRetouch[] = [];
+    const markUpdate = (index: number): WireRetouch => args.cacheControlRetouchCompact === true
+        ? compactRetouch(index, args.messages[index]) : { index, message: args.messages[index] };
     if (state.sentRaw !== undefined && state.sentRaw.length === state.sent.length) {
         for (let i = 0; i < state.sent.length; i++) {
-            if (state.sentRaw[i] !== pairs[i]!.raw) retouch.push({ index: i, message: args.messages[i] });
+            if (state.sentRaw[i] !== pairs[i]!.raw) retouch.push(markUpdate(i));
         }
     } else {
-        for (let i = 0; i < state.sent.length; i++) retouch.push({ index: i, message: args.messages[i] });
+        for (let i = 0; i < state.sent.length; i++) retouch.push(markUpdate(i));
     }
     // An older server would accept but ignore retouch. Keep the original
     // request on the normal path instead of forwarding stale cache marks.

@@ -59,6 +59,7 @@
  */
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { expandRetouch, isCompactRetouch, type RetouchMessage, type WireRetouch } from "./incremental-retouch.js";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
@@ -198,6 +199,9 @@ export interface Canonical {
      *  rebuild (the unified rows carry no wire boundaries), where a retouch
      *  answers 409 and the client resyncs once. */
     wireSpans?: string[][] | null;
+    /** Warm-only original wire shape for hash-bound mark patches. Never persisted;
+     * a cold canonical requires the existing full-resync handshake. */
+    wireMessages?: RetouchMessage[] | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -613,7 +617,7 @@ function applyTurn(
      *  collision in the ledger would misattribute decompress lookups. */
     deltaIds?: string[],
     /** Acked wire messages whose cache_control decoration changed (see Canonical.wireSpans). */
-    retouch: { index: number; message: { role: string; content: unknown } }[] = [],
+    retouch: WireRetouch[] = [],
 ): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number; detail?: string } {
     const serverSeq = entry.msgs.length;
     if (resync) {
@@ -633,14 +637,25 @@ function applyTurn(
     // cache_control decoration may differ); anything else is drift → 409 and
     // the client recovers with a full resync.
     const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[] }[] = [];
+    const retouchedWire: { index: number; message: RetouchMessage }[] = [];
     if (!resync && retouch.length > 0) {
         const spans = entry.wireSpans;
         if (spans === null || spans === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "retouch without wire spans (cold canonical)" };
+        // Validate the complete index set before hashing any retained payload.
+        // Otherwise a small envelope can request repeated large-message work.
+        const touched = new Set<number>();
+        for (const update of retouch) {
+            if (touched.has(update.index)) return { ok: false, status: 400, error: "duplicate retouch index", serverSeq };
+            touched.add(update.index);
+        }
         const byId = new Map(entry.msgs.map((m) => [m.id, m] as const));
         for (const r of retouch) {
             const ids = Number.isInteger(r.index) && r.index >= 0 && r.index < spans.length ? spans[r.index] : undefined;
             if (ids === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} outside ${String(spans.length)} wire spans` };
-            const conv = anthropicToCore({ messages: [r.message] } as never);
+            const original = entry.wireMessages?.[r.index];
+            const message = "message" in r ? r.message : original ? expandRetouch(original, r) : null;
+            if (message === null) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "compact retouch content hash or wire shape differs" };
+            const conv = anthropicToCore({ messages: [message] } as never);
             if (conv.msgs.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} span ${String(ids.length)} != ${String(conv.msgs.length)}` };
             const marks = new Map<string, unknown>();
             const rawBlocks: { message: BiliMessage; block: unknown }[] = [];
@@ -652,6 +667,7 @@ function applyTurn(
                 if (conv.msgs[k].rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: conv.msgs[k].rawAnthropicBlock });
             }
             retouchMarks.push({ ids, marks, rawBlocks });
+            retouchedWire.push({ index: r.index, message });
         }
     }
     const converted = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
@@ -697,6 +713,10 @@ function applyTurn(
         if (typeof wi === "number" && wi >= 0 && wi < deltaSpans.length) deltaSpans[wi].push(m.id);
     }
     entry.wireSpans = resync ? deltaSpans : entry.wireSpans === null || entry.wireSpans === undefined ? null : [...entry.wireSpans, ...deltaSpans];
+    const priorWire = entry.wireMessages;
+    entry.wireMessages = resync || base.length === 0 ? [...deltaWire]
+        : priorWire === null || priorWire === undefined ? null : [...priorWire, ...deltaWire];
+    if (entry.wireMessages) for (const update of retouchedWire) entry.wireMessages[update.index] = update.message;
     // Marks follow the CLIENT's current decoration: a resync re-derives the
     // marks of every message it carries, and a retouch replaces the marks of
     // exactly the retouched wire message — so a host's rolling breakpoints
@@ -801,6 +821,7 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
         // /__bili/plugin/render endpoint). Shims gate their splice on this.
         serverHistory: featureEnabled("pluginLaneServerHistory"),
         cacheControlRetouch: true,
+        cacheControlRetouchCompact: true,
         ...(conversation !== undefined ? { conversation } : {}),
     });
 }
@@ -866,11 +887,11 @@ export async function handleIncrementalTurn(
         }
     }
 
-    let retouch: { index: number; message: { role: string; content: unknown } }[] = [];
+    let retouch: WireRetouch[] = [];
     if (payload.retouch !== undefined) {
         if (!Array.isArray(payload.retouch)) return jsonReply(res, 400, { error: "retouch must be an array of { index, message }" });
         for (const r of payload.retouch as unknown[]) {
-            const ok = r !== null && typeof r === "object" && Number.isInteger((r as { index?: unknown }).index)
+            const ok = isCompactRetouch(r) || r !== null && typeof r === "object" && Number.isInteger((r as { index?: unknown }).index)
                 && laneMessagesLookAnthropic([(r as { message?: unknown }).message]);
             if (!ok) return jsonReply(res, 400, { error: "retouch entries must be { index: integer, message: anthropic wire message }", conversationId });
         }
