@@ -696,9 +696,24 @@ export class UnifiedShadow {
             // parity oracle, so it runs on the first ingest of a session and
             // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
             // stats.verifyDrift on the sampled saves).
+            // #7439 R-C step 1: a session latched before egress recording
+            // started is re-admitted here once — the flow table is the single
+            // byte generation (ruling 5: server canonical, never client
+            // bytes), so the drift it was latched for can no longer recur;
+            // the skipLastMessages gate in BatchedViewVerification (wired
+            // from egressAuthority) prevents re-latching on subsequent
+            // samples. Clearing the stale latch restores the delta fast path
+            // for sessions that were already on the O(rows) full-ingest path.
             phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
+            if (legacy.metadata?.egressAuthority === true && this.driftedSessions.delete(legacy.id)) {
+                this.driftStreaks.delete(legacy.id);
+                if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                    this.frozenEnvelopeSince.delete(legacy.id);
+                    loggerLog("info", `[storage] egress-active ${legacy.id}: stale drift latch cleared — flow table is the single byte generation, delta fast path restored (#7439 R-C)`);
+                }
+            }
             if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
