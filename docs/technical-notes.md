@@ -164,6 +164,19 @@ restores exactly. `bili claude` still works on a machine with the native
 block installed — it overrides the static URL with its own proxy and the
 hook stays dormant.
 
+**Unattended / suspending devices** (phones, NAS, deep-sleep laptops): the
+lane's event-loop watchdog now detects an OS-level freeze (the whole process
+suspended — main thread AND worker) by watching its OWN tick interval, and
+resets its baseline instead of self-exiting (#7482). So a lane that was alive
+when the device slept is still alive when it wakes — the next session attaches
+to it instead of racing a cold spawn. The lane's self-heal still depends on a
+session being present to trigger a respawn after a *genuine* wedge (a real
+deadlock, not a freeze); on an unattended device with no session, a wedged
+lane leaves its port dead until the next session starts. For maximum
+robustness on such devices, the **daemon posture** (`bili start --port N` +
+an external supervisor that health-checks and restarts) is still the safest
+choice — it does not depend on any session being present.
+
 ## Injection priority — no files unless unavoidable (#535)
 
 bili never owns user data: every launched client runs on its **real home**, so

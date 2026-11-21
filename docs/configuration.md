@@ -432,7 +432,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_INHERITED_HTTPS_PROXY` | string | unset | — | Launcher channel: inherited https_proxy value preserved across the spawn boundary. |
 | `BILI_INHERITED_ALL_PROXY` | string | unset | — | Launcher channel: inherited all_proxy value preserved across the spawn boundary. |
 | `BILI_INHERITED_NO_PROXY` | string | unset | — | Launcher channel: inherited no_proxy value preserved across the spawn boundary. |
-| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | Host posture: marks a claude-native plugin process. |
+| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | Host posture: marks a claude-native plugin process. `=0` opts the lane into **passthrough** mode (compression fully off) — the lane STILL starts and binds its port; it does NOT prevent the lane from starting (unlike the other `BILI_NATIVE_*` lanes, where `=0` turns the lane off entirely). |
 | `BILI_NATIVE_DSH` | boolean-ish | off | — | Host posture: marks a dsh-native plugin process. |
 | `BILI_NATIVE_KIMI` | boolean-ish | off | — | Host posture: marks a kimi-native plugin process. |
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: marks an omp-native plugin process. |

@@ -429,7 +429,7 @@
 | `BILI_INHERITED_HTTPS_PROXY` | string | unset | — | Launcher channel: spawn 境界をまたいで継承された https_proxy の値が保持されます。 |
 | `BILI_INHERITED_ALL_PROXY` | string | unset | — | Launcher channel: spawn 境界をまたいで継承された all_proxy の値が保持されます。 |
 | `BILI_INHERITED_NO_PROXY` | string | unset | — | Launcher channel: spawn 境界をまたいで継承された no_proxy の値が保持されます。 |
-| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | Host posture: claude ネイティブプラグインプロセスであることを示します。 |
+| `BILI_NATIVE_CLAUDE` | boolean-ish | off | — | Host posture: claude ネイティブプラグインプロセスであることを示します。`=0` はレーンを**passthrough**モード（圧縮完全オフ）にします — レーンは依然として起動しポートをバインドします。レーンの起動を阻止しません（他の `BILI_NATIVE_*` レーンとは異なり、それらの `=0` はレーンを完全にオフにします）。 |
 | `BILI_NATIVE_DSH` | boolean-ish | off | — | Host posture: dsh ネイティブプラグインプロセスであることを示します。 |
 | `BILI_NATIVE_KIMI` | boolean-ish | off | — | Host posture: kimi ネイティブプラグインプロセスであることを示します。 |
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: omp ネイティブプラグインプロセスであることを示します。 |

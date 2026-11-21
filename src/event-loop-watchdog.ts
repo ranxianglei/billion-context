@@ -24,6 +24,19 @@
  * seconds to minutes and yield between requests — so the hard threshold is
  * deadlock detection, not load detection.
  *
+ * Freeze detection (#7482): the worker's OWN tick interval is the signal that
+ * separates a real main-thread wedge from an OS-level freeze (a sleeping
+ * phone / deep-sleep laptop suspends the WHOLE process — main thread AND
+ * worker). On a wedge the worker keeps ticking on schedule, so its tick gap
+ * stays near `checkIntervalMs`; on a freeze the worker misses its own ticks
+ * and the tick gap jumps. When the tick gap exceeds 2× `checkIntervalMs` the
+ * worker resets its baseline (lastBeat/warned/tripped) instead of tripping, so
+ * an unattended lane survives the freeze and is still alive when the device
+ * wakes — instead of self-exiting into a dead port with no spawner to
+ * respawn it. A genuine wedge that happens to span a freeze is delayed by one
+ * freeze cycle, never masked permanently: after the reset the heartbeat gap
+ * grows again from the fresh baseline and trips as before.
+ *
  * Scope discipline: plugin-injection mode (dist/agent/*) never calls
  * startServer, so a wedged HOST process is never at risk of being killed by
  * this guardrail. Thresholds are deliberately hardcoded — a new config/env
@@ -57,6 +70,17 @@ export function watchdogVerdict(gapMs: number, warned: boolean, softWarnMs: numb
     if (gapMs >= hardTimeoutMs) return "trip";
     if (gapMs >= softWarnMs && !warned) return "warn";
     return "ok";
+}
+
+/** Pure freeze-detection (#7482): `true` when the worker's OWN tick interval
+ *  jumped far beyond `checkIntervalMs` — the worker missed its own ticks, so
+ *  the WHOLE process was frozen by the OS (a sleeping phone / deep-sleep
+ *  laptop), NOT a main-thread wedge (where the worker's event loop keeps
+ *  running on schedule). On a freeze the worker resets its baseline instead of
+ *  tripping, so an unattended lane survives the freeze instead of self-exiting
+ *  into a dead port with no spawner to respawn it. */
+export function watchdogFreezeVerdict(tickGapMs: number, checkIntervalMs: number): boolean {
+    return tickGapMs > 2 * checkIntervalMs;
 }
 
 interface EventLoopWatchdogHandle {
@@ -123,6 +147,8 @@ const WORKER_CODE = [
     "let hardTimeoutMs = 0;",
     "let fatalMode = \"exit\";",
     "let lastBeat = Date.now();",
+    "let lastWorkerTick = Date.now();",
+    "let checkIntervalMs = 5000;",
     "let warned = false;",
     "let tripped = false;",
     "let timer = null;",
@@ -132,6 +158,10 @@ const WORKER_CODE = [
     "  if (gap >= hardTimeoutMs) return \"trip\";",
     "  if (gap >= softWarnMs && !warned) return \"warn\";",
     "  return \"ok\";",
+    "}",
+    "",
+    "function isFrozen(tickGap) {",
+    "  return tickGap > 2 * checkIntervalMs;",
     "}",
     "",
     "function fmt(ms) {",
@@ -150,7 +180,20 @@ const WORKER_CODE = [
     "}",
     "",
     "function tick() {",
-    "  const gap = Date.now() - lastBeat;",
+    "  const now = Date.now();",
+    "  const tickGap = now - lastWorkerTick;",
+    "  lastWorkerTick = now;",
+    "  if (isFrozen(tickGap)) {",
+    "    // The worker's own tick interval jumped: the WHOLE process was frozen",
+    "    // by the OS (sleeping device), not a main-thread wedge. Reset the",
+    "    // baseline so the freeze does not count as silence (#7482).",
+    "    lastBeat = now;",
+    "    warned = false;",
+    "    tripped = false;",
+    "    line(\"info\", \"[event-loop-watchdog] process frozen for \" + fmt(tickGap) + \" (worker tick interval jumped) — resetting baseline, not tripping (#7482)\");",
+    "    return;",
+    "  }",
+    "  const gap = now - lastBeat;",
     "  const v = verdict(gap);",
     "  if (v === \"warn\") {",
     "    warned = true;",
@@ -172,10 +215,12 @@ const WORKER_CODE = [
     "    softWarnMs = Number(m.softWarnMs) || 0;",
     "    hardTimeoutMs = Number(m.hardTimeoutMs) || 0;",
     "    fatalMode = m.fatalMode === \"report\" ? \"report\" : \"exit\";",
+    "    checkIntervalMs = Math.max(10, Number(m.checkIntervalMs) || 5000);",
     "    lastBeat = Date.now();",
+    "    lastWorkerTick = Date.now();",
     "    warned = false;",
     "    tripped = false;",
-    "    if (timer === null) timer = setInterval(tick, Math.max(10, Number(m.checkIntervalMs) || 5000));",
+    "    if (timer === null) timer = setInterval(tick, checkIntervalMs);",
     "  } else if (m.type === \"beat\") {",
     "    lastBeat = Date.now();",
     "    warned = false;",

@@ -63,7 +63,8 @@
 
 | 变量 | 一句话用途 |
 |------|-----------|
-| `BILI_NATIVE_CLAUDE` / `BILI_NATIVE_DSH` / `BILI_NATIVE_KIMI` / `BILI_NATIVE_OMP` / `BILI_NATIVE_OPENCODE` / `BILI_NATIVE_PI` / `BILI_NATIVE_ZCODE` | 对应宿主 native 车道 `=0` 整体退出（bootstrap 各文件入口判断） |
+| `BILI_NATIVE_CLAUDE` | claude native 车道 `=0` → **passthrough**（lane 仍拉起、压缩关；不阻止 lane 启动）（claude-native-bootstrap.ts 入口判断） |
+| `BILI_NATIVE_DSH` / `BILI_NATIVE_KIMI` / `BILI_NATIVE_OMP` / `BILI_NATIVE_OPENCODE` / `BILI_NATIVE_PI` / `BILI_NATIVE_ZCODE` | 对应宿主 native 车道 `=0` 整体退出（mode: off，lane 不拉起；bootstrap 各文件入口判断） |
 | `BILI_NATIVE_ATTACH_POLICY` | native attach 策略（env > 文件 native.attachPolicy） |
 
 ### 2.2 内部 spawn 通道（launcher→子进程，非用户面）
