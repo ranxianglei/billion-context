@@ -29,6 +29,7 @@ import {
     egressStateAt,
     egressStateCompact,
     egressStateView,
+    egressFork,
     EgressStateCorruptError,
     type EgressOp,
     type EgressViewRow,
@@ -2015,14 +2016,26 @@ export class UnifiedStore {
     }
 
     egressStateMaxSeq(sessionId: string): number {
-        const row = this.db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+        // op_seq is the row-ordering high-water (log_seq is the per-message
+        // number and only I rows carry it — it is not the row cursor).
+        const row = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
         return Number(row.mx) || 0;
     }
 
-    egressStateTruncateAfter(sessionId: string, logSeq: number): number {
-        const a = this.db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sessionId, logSeq);
-        const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sessionId, logSeq);
+    egressStateTruncateAfter(sessionId: string, opSeq: number): number {
+        const a = this.db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
+        const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
         return Number(a.changes) + Number(b.changes);
+    }
+
+    /** Ruling 7439 (fork = whole-table copy): copy the parent's entire egress
+     *  op log (BOTH tables, every row) to the child session_id inside the
+     *  CALLER's transaction — the child inherits the parent's full canonical
+     *  number space and retired marks, so its next number continues where the
+     *  parent stopped and nothing is ever re-issued across the fork. No-op
+     *  (false) when the parent has no egress rows. */
+    egressForkSession(parentId: string, childId: string): boolean {
+        return egressFork(this.db, parentId, childId) > 0;
     }
 
     /** #7398: delete the session's egress op-log rows (state AND flow).
@@ -3799,6 +3812,14 @@ export class UnifiedStore {
                 .prepare("SELECT media_hash AS h FROM message_media WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
             for (const row of media) this.putContentRef(row.h as string);
+            // Ruling 7439 (fork = whole-table copy): the egress op log is
+            // self-contained (bytes + canonical numbers in its own tables),
+            // so the fork copies BOTH tables wholesale in this same
+            // transaction — the child inherits the parent's full number
+            // space and retired marks, nothing is re-issued across the
+            // fork, and no other logic changes. No-op when the parent has
+            // no egress rows (proxy-mode / egress-off sessions).
+            this.egressForkSession(parentId, childId);
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)

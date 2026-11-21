@@ -30,10 +30,10 @@ function open() {
         egressStateView: (sid) => egressStateView(db, sid),
         egressStateCompactView: (sid, view, nowMs) => egressStateCompact(db, sid, view, nowMs),
         egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
-        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid, seq) => {
-            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
-            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
+            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             return Number(a.changes) + Number(b.changes);
         },
     };
@@ -44,7 +44,7 @@ const flowRows = (db: ReturnType<typeof openSqliteDatabase>["db"], sid: string):
     (db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(sid) as { n: number }).n;
 
 const baseSeqs = (db: ReturnType<typeof openSqliteDatabase>["db"], sid: string): number[] =>
-    (db.prepare("SELECT log_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY log_seq ASC").all(sid) as { log_seq: number }[]).map((r) => r.log_seq);
+    (db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? AND row_type = 'B' ORDER BY op_seq ASC").all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
 
 /** A growing conversation driver: tracks the full message id list and records
  * each turn against it. `append` adds a tail run (I ops); `fold` replaces the
@@ -112,14 +112,14 @@ test("walk-back recovery still works after the flow reclamation (fold period > 1
         assert.ok(b2 - b1 > 16, `the fold period exceeds the walk-back window (b1=${b1}, b2=${b2}, gap=${b2 - b1}) — the reclamation deleted the first cycle`);
         // The reclamation kept b1 (the previous base) — the row the walk-back
         // restarts from when the newest base is corrupt.
-        const minSeq = (H.db.prepare("SELECT MIN(log_seq) AS m FROM egress_flow WHERE session_id = ?").get(S) as { m: number }).m;
+        const minSeq = (H.db.prepare("SELECT MIN(op_seq) AS m FROM egress_flow WHERE session_id = ?").get(S) as { m: number }).m;
         assert.equal(minSeq, b1, `the flow's oldest retained row is the previous base (min=${minSeq}, b1=${b1})`);
         // Corrupt the NEWEST base (b2) in BOTH tables. The state table holds
         // only b2 (the compaction trimmed it), so egressStateView throws and the
         // ladder walks back — it must restart at b1 (retained by the fix) and
         // recover a non-empty healthy point.
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = ?`).run('{"x":1}', S, b2);
-        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = ?`).run('{"x":1}', S, b2);
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND op_seq = ?`).run('{"x":1}', S, b2);
+        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND op_seq = ?`).run('{"x":1}', S, b2);
         const got = recoverEgressBase(H.store, S);
         assert.ok(got !== null, "the walk-back recovers after the reclamation (the previous base was retained)");
         assert.equal(got.degraded, true, "recovery is a degraded walk-back");

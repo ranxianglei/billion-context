@@ -116,14 +116,14 @@ test("recording: fold shape = -D range + +I summary, and the -D triggers compact
         // fold: b..d replaced by one summary row
         const folded = [M("a", "1"), M("acp_summary_9", "…", "assistant"), M("e", "5")];
         view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: folded, systemText: "SYS", nowMs: 2000 });
-        const ops = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND log_seq > 5 ORDER BY log_seq").all(S) as { row_type: string; msgid: string | null }[];
+        const ops = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND op_seq > 5 ORDER BY op_seq").all(S) as { row_type: string; msgid: string | null }[];
         const types = ops.map((o) => o.row_type);
         assert.ok(types.includes("D"), "fold emits a -D");
         assert.ok(types.includes("I"), "fold emits a +I for the summary");
         assert.equal(view.length, 4);
         // compaction fired: state table = base row + nothing else (the I was
         // replayed INTO the base by the same compact call)
-        const stateRows = H.db.prepare("SELECT row_type FROM egress_state WHERE session_id = ? ORDER BY log_seq").all(S) as { row_type: string }[];
+        const stateRows = H.db.prepare("SELECT row_type FROM egress_state WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
         assert.ok(stateRows.some((r) => r.row_type === "B"), "compaction wrote a base row");
         assert.equal(egressStateView(H.db, S).length, 4, "view has the system row + a + summary + e");
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives compaction byte-identical");
@@ -139,7 +139,7 @@ test("recording: content edit of one row = exactly one +U, no D/I churn", () => 
         const store = H.store;
         let view = recordEgressTurn({ store, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2", "assistant"), M("c", "3")], systemText: "SYS", nowMs: 1000 });
         view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2-edited", "assistant"), M("c", "3")], systemText: "SYS", nowMs: 2000 });
-        const rows = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND log_seq > 4").all(S) as { row_type: string; msgid: string | null }[];
+        const rows = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND op_seq > 4").all(S) as { row_type: string; msgid: string | null }[];
         assert.equal(rows.length, 1, "exactly one op");
         assert.equal(rows[0].row_type, "U", "it is a +U");
         assert.equal(rows[0].msgid, "b", "targeting the edited row");

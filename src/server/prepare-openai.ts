@@ -389,6 +389,14 @@ export async function prepareOpenai(
         // (the record below), from turn 2 the log is the content source.
         egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
         if (egressArmed) {
+            // Ruling 7439: from this turn the op log is the content source of
+            // truth for the session, so the unified-storage verifier must not
+            // compare client-resend bytes against the canonical rows (that
+            // compare diverges BY DESIGN once the server serves canonical
+            // bytes the client never saw verbatim). The marker persists in
+            // session metadata (meta_json) so it survives restarts and covers
+            // every later turn, not just this one.
+            session.metadata["egressAuthority"] = true;
             const st = getStore().egressOpLogStore();
             if (st) {
                 const base0 = recoverEgressBase(st, sessionId);

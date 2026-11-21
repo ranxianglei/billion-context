@@ -25,7 +25,7 @@
  * row — content identity is bytes, position/identity is the msgid).
  */
 
-import { diffEgressView, type EgressOp, type EgressViewRow } from "./egress-state.js";
+import { diffEgressView, egressReplay, type EgressOp, type EgressViewRow } from "./egress-state.js";
 
 /** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
  * has NO healthy point must FAIL the turn — never run on client bytes, never
@@ -59,7 +59,9 @@ export interface EgressSourceMsg {
  * (byte-equal), which is what makes the next diff sparse. `tokens` is a
  * chars/4 estimate (it only needs to be stable while the content is
  * unchanged); `bytes` is the FINAL core JSON of the message — the same
- * bytes the serve path rebuilds from. */
+ * bytes the serve path rebuilds from. `num` is left 0 (unnumbered): the
+ * canonical number is assigned when the row's I op is appended/replayed
+ * (ruling 7439) — an in-process row never carries a real number. */
 export function buildEgressViewRows(
     conversation: readonly EgressSourceMsg[],
     systemText: string | undefined,
@@ -67,6 +69,7 @@ export function buildEgressViewRows(
     const rows: EgressViewRow[] = [];
     if (systemText !== undefined && systemText.length > 0) {
         rows.push({
+            num: 0,
             msgid: EGRESS_SYSTEM_MSGID,
             ref: "",
             tokens: Math.max(1, Math.ceil(systemText.length / 4)),
@@ -78,6 +81,7 @@ export function buildEgressViewRows(
     for (const m of conversation) {
         const text = typeof m.text === "string" ? m.text : "";
         rows.push({
+            num: 0,
             msgid: m.id,
             ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
@@ -94,15 +98,15 @@ export interface EgressOpLogStore {
     egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[];
     egressStateView(sessionId: string): EgressViewRow[];
     egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number;
-    /** Rollback reconstruction at any log_seq (flow table is total). */
-    egressStateViewAt(sessionId: string, logSeq: number): EgressViewRow[];
-    /** Highest log_seq in the flow (0 = no rows). */
+    /** Rollback reconstruction at any op_seq (flow table is total). */
+    egressStateViewAt(sessionId: string, opSeq: number): EgressViewRow[];
+    /** Highest op_seq in the flow (0 = no rows). */
     egressStateMaxSeq(sessionId: string): number;
-    /** Recovery (ruling 7439-5): delete rows past `logSeq` in BOTH tables —
+    /** Recovery (ruling 7439-5): delete rows past `opSeq` in BOTH tables —
      *  rows beyond a corrupt point are unusable by definition (no replay can
      *  ever include them), so recovery = flow back to the last healthy point.
      *  Append-only covers HEALTHY history only. Returns rows removed. */
-    egressStateTruncateAfter(sessionId: string, logSeq: number): number;
+    egressStateTruncateAfter(sessionId: string, opSeq: number): number;
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is
@@ -112,7 +116,12 @@ export interface EgressOpLogStore {
  * Compacts when the batch carries a -D (the fold shape: cancellation is the
  * trigger, per the proposal). Any EgressStateCorruptError propagates — the
  * caller handles it per the degrade ladder (no fuzzy fallback, KDD
- * discipline). */
+ * discipline).
+ *
+ * Returns the STAMPED view — egressReplay(prev, ops), whose rows carry the
+ * canonical numbers (I rows: the number their append assigned; spine rows:
+ * inherited). The client-built `next` (num 0 everywhere) is diff input only;
+ * nothing unnumbered ever leaves this function. */
 export function recordEgressTurn(args: {
     store: EgressOpLogStore;
     sessionId: string;
@@ -127,11 +136,17 @@ export function recordEgressTurn(args: {
     const ops = diffEgressView(prev, next);
     if (ops.length > 0) {
         store.egressStateAppendOps(sessionId, ops, nowMs);
+        // The replay (not the client-built `next`) is the stamped view: its
+        // I rows carry the exact numbers the append assigned (same
+        // high-water + dense rule), so compaction below sees numbered
+        // entries and the caller's prev for the next turn is complete.
+        const view = egressReplay(prev, ops);
         if (ops.some((o) => o.type === "D")) {
-            store.egressStateCompactView(sessionId, next, nowMs);
+            store.egressStateCompactView(sessionId, view, nowMs);
         }
+        return view;
     }
-    return next;
+    return prev;
 }
 
 
@@ -139,7 +154,7 @@ export function recordEgressTurn(args: {
 const EGRESS_HEALTHY_WALK_MAX = 16;
 
 /** Ruling 7439-5 degrade ladder — hydrate the flow's CURRENT point; when it
- * fails replay (a corrupt row), walk back to the NEWEST healthy log_seq
+ * fails replay (a corrupt row), walk back to the NEWEST healthy op_seq
  * (bounded walk) and TRUNCATE past it: rows beyond a corrupt point are
  * unusable by definition (no replay can ever include them), so recovery
  * means flowing back to the last healthy point in the tables themselves —
@@ -148,7 +163,7 @@ const EGRESS_HEALTHY_WALK_MAX = 16;
  * and the caller hard-fails the turn instead of falling back to client
  * bytes (ruling 7439-5). The only legitimate empty flow is a ROW-LESS
  * session, which the try path above returns as seq 0 / degraded=false
- * (the turn-1 bootstrap). An empty replay at a lower log_seq while rows
+ * (the turn-1 bootstrap). An empty replay at a lower op_seq while rows
  * exist is corruption reaching the floor, not a live empty session — an
  * empty base row is never written (recordEgressTurn no-ops an empty diff
  * and compaction only runs on non-empty views). The truncated count is
