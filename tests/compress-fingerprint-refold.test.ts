@@ -13,6 +13,7 @@ import { parseCompressInput } from "../src/compress-tool.ts";
 import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { resolveDecompress } from "../src/decompress-shared.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -20,7 +21,7 @@ function makeCtx(): Ctx {
     const logs: string[] = [];
     const ctx: Ctx = {
         core: createCore(),
-        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages: [] as CoreMessage[],
         session: {
             id: `fpr-${Math.random().toString(36).slice(2)}`,

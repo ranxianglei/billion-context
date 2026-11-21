@@ -20,6 +20,7 @@ import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
 import { closeServers } from "./server-close-guard.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -1321,7 +1322,7 @@ test("HTTP fork before absorb summary preserves the original pair on the first c
         await sendModel(h, "parent", history);
         const parent = resolveConversation("parent").session!;
         const result = parent.pluginSnapshot!.find((m) => m.contentType === "tool-result" && m.toolCallId === "build_1")!;
-        const outcome = applyAbsorb({ ref: parent.state.messageRefs.byRaw[result.id], summary: "Build succeeded with all original checks.", absorbCallId: "absorb_1", messages: parent.pluginSnapshot!, state: parent.state, config: { ...defaultConfig(400000), minFoldBenefitTokens: 0, absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, toolName: "acp_absorb" } } });
+        const outcome = applyAbsorb({ ref: parent.state.messageRefs.byRaw[result.id], summary: "Build succeeded with all original checks.", absorbCallId: "absorb_1", messages: parent.pluginSnapshot!, state: parent.state, config: { ...defaultConfig(400000), minFoldBenefitTokens: 0, absorb: { ...DEFAULT_ABSORB_CONFIG, enabled: true, toolName: "acp_absorb" } } as ResolvedKernelConfig });
         assert.equal(outcome.ok, true, outcome.resultText);
         parent.state = outcome.state;
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;

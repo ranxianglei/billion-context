@@ -12,6 +12,7 @@ import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startChatRelay } from "./e2e/chat-relay.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 // Hermetic state dirs before any scenario boots a proxy (#2806 review): these
 // anonymous-fork scenarios reattach through prefix-affinity.json, and without
@@ -286,7 +287,7 @@ function proxyOpts(forkAdoption: boolean): ProxyOptions {
             preserveRecentMessages: 2,
             preserveRecentTokens: 400,
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
-        }), minFoldBenefitTokens: 0 },
+        }), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         compress: { injectTool: true, injectNudge: false },
         promptCache: { routing: "auto" },
         forkAdoption,

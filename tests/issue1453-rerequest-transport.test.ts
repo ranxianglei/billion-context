@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 function makeCtx(messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -18,7 +19,7 @@ function makeCtx(messages: CoreMessage[] = []): {
 } {
     return {
         core: createCore(),
-        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 },
+        config: { ...defaultConfig(200000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig,
         messages,
         session: {
             id: "issue1453-test",

@@ -36,6 +36,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
+import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -66,14 +67,14 @@ test("withDurableProtection: default ensures durable/* latest-per-identity + cla
 
 test("withDurableProtection: a durable pattern in protectedTools = whole-identity takeover", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedTools: ["read", "durable/agents-md"] }, cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedTools: ["read", "durable/agents-md"] } as ResolvedKernelConfig, cl);
     assert.deepEqual(out.protectedTools, ["read", "durable/agents-md"], "no durable/* injected — user policy wins verbatim");
     assert.equal(out.messagePathOf, cl, "classifier still attached (identity translation is bili's job)");
 });
 
 test("withDurableProtection: a durable pattern in protectedLatestTools = takeover too (no default injection)", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedLatestTools: ["durable/*"] }, cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0, protectedLatestTools: ["durable/*"] } as ResolvedKernelConfig, cl);
     assert.deepEqual(out.protectedTools, [], "protectedTools not extended when latest takes over");
     assert.deepEqual(out.protectedLatestTools, ["durable/*"]);
     assert.equal(out.messagePathOf, cl);
@@ -95,14 +96,14 @@ test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor
     assert.equal(cl(reading), "oneshot/time-context");
     // ...and the default durable policy pins nothing in the injected/
     // namespace (stays foldable; the path exists for the Rule-3 anchor skip).
-    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 }, cl);
+    const out = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig, cl);
     assert.deepEqual(out.protectedLatestTools, ["durable/*"], "latest-pin default covers durable/* only");
     assert.ok(!(out.protectedTools ?? []).some((p) => p.includes("injected")), "no all-instance protection for injected/*");
 });
 
 test("withDurableProtection: idempotent — no duplicate durable/* on re-apply", () => {
     const cl = durableMessageToolPaths["dsh"]!;
-    const once = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 }, cl);
+    const once = withDurableProtection({ ...defaultConfig(200_000), minFoldBenefitTokens: 0 } as ResolvedKernelConfig, cl);
     const twice = withDurableProtection(once, cl);
     assert.deepEqual(twice.protectedLatestTools, ["durable/*"]);
 });
