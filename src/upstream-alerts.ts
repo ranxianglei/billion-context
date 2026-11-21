@@ -121,6 +121,8 @@ export function recordUpstreamAlert(url: string, error: unknown, viaProxy: boole
         existing.count += 1;
         existing.hint = hint;
         if (code !== undefined) existing.code = code;
+        delete existing.skippedProxy;
+        delete existing.skippedSource;
         Object.assign(existing, skippedFields);
         return;
     }

@@ -216,6 +216,8 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     classificationReservation.release();
                     classificationReservation = undefined;
                     r.clearTimer();
+                    // A discarded body has no consumer; do not wait for a tee sibling to cancel.
+                    void r.response.body?.cancel().catch(() => undefined);
                 }
                 opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
                 return null;

@@ -5,7 +5,7 @@ import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { normalizeSseLineEndings, finalizeSseLineEndings, sseEventData, replaceSseEventData } from "../sse-util.js";
+import { createSseFramer, sseEventData, replaceSseEventData } from "../sse-util.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 
 import type {
@@ -57,6 +57,31 @@ function filterRealToolFragments(
     return filtered;
 }
 
+// OpenAI-compatible upstreams disagree on the thinking field's name: DeepSeek
+// and llama.cpp stream reasoning_content, Ollama Cloud / vLLM / Magpie stream
+// reasoning (same alias set and order as pi-ai's openai-completions reader).
+// #7432: the adapter used to read reasoning_content only, so every
+// reasoning-only chunk of an alias upstream fell through the dispatch ladder
+// and was dropped — the client kept exactly the first token, the one frame
+// that also carries `role` and took the meta fallback.
+const REASONING_DELTA_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+
+function reasoningDeltaIn(delta: Record<string, unknown>): { field: string; value: string } | null {
+    for (const field of REASONING_DELTA_FIELDS) {
+        const value = delta[field];
+        if (typeof value === "string" && value.length > 0) return { field, value };
+    }
+    return null;
+}
+
+// Client-visible frames always speak the canonical name: an alias frame is
+// rewritten to reasoning_content and its original key dropped, so a client that
+// saw the alias never echoes it back (upstreams silently discard a replayed
+// `reasoning` field, they only read reasoning_content).
+function reasoningFrameFields(field: string, value: string): Record<string, string> {
+    return field === "reasoning_content" ? { reasoning_content: value } : { [field]: "", reasoning_content: value };
+}
+
 // #1881: settle drops proxy-only frames without forwarding their sibling prose.
 // Rebuild such a frame without tool_calls so that prose still reaches the
 // client. The stored copy already carries cleaned values; null when nothing
@@ -67,10 +92,14 @@ function withheldProseFrame(parsed: Record<string, unknown>): Buffer | null {
     const delta = choice?.delta as Record<string, unknown> | undefined;
     if (!choice || !delta) return null;
     const ct = typeof delta.content === "string" ? delta.content : "";
-    const rc = typeof delta.reasoning_content === "string" ? delta.reasoning_content : "";
-    if (ct.length === 0 && rc.length === 0) return null;
+    const rcDelta = reasoningDeltaIn(delta);
+    if (ct.length === 0 && rcDelta === null) return null;
     const cleanDelta = { ...delta };
     delete cleanDelta.tool_calls;
+    if (rcDelta !== null && rcDelta.field !== "reasoning_content") {
+        delete cleanDelta[rcDelta.field];
+        cleanDelta.reasoning_content = rcDelta.value;
+    }
     return Buffer.from("data: " + JSON.stringify({ ...parsed, choices: [{ ...choice, delta: cleanDelta }, ...(choices ?? []).slice(1)] }) + "\n\n", "utf8");
 }
 
@@ -87,7 +116,7 @@ interface ToolCallBuffer {
 async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    const framer = createSseFramer();
     try {
         while (true) {
             let done: boolean;
@@ -98,23 +127,13 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) >= 0) {
-                const raw = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
+            for (const raw of framer.push(decoder.decode(value, { stream: true }))) {
                 if (raw.trim().length > 0) yield raw;
             }
         }
-        buf = finalizeSseLineEndings(buf);
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-            const raw = buf.slice(0, idx);
-            buf = buf.slice(idx + 2);
+        for (const raw of framer.finish()) {
             if (raw.trim().length > 0) yield raw;
         }
-        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -176,8 +195,24 @@ function openaiCachedTokens(u: Record<string, unknown>): number | null {
 
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[], errorShape: "protocol" | "completion" = "protocol"): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
+    // OpenAI clients opt into the trailing usage frame with
+    // stream_options.include_usage. bili forces the upstream option on for its
+    // own ledger, but the frame must also reach the CLIENT when it asked for
+    // it: cost/context-aware clients read provider fields from that frame, and
+    // swallowing it on plain-text rounds silently loses them. Tool-call rounds
+    // keep the existing verbatim forward.
+    const clientWantsUsage = (() => {
+        const so = (requestBody as { stream_options?: unknown }).stream_options;
+        return typeof so === "object" && so !== null
+            && (so as Record<string, unknown>).include_usage === true;
+    })();
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
+    // Last upstream usage object seen on the wire. The synthesized completion
+    // frame re-states tokens; provider-specific fields (cost/credits, cache
+    // details, validity flags) must survive that re-statement — dropping them
+    // breaks any client that prices or accounts the turn from them.
+    let lastUsageRaw: Record<string, unknown> | null = null;
 
     const makeBase = () => ({
         id: responseId,
@@ -261,6 +296,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
         },
 
         async *parseStream(upstream, round) {
+            // Per-round scope: a later round that emits no usage frame must not
+            // inherit the previous round's provider fields (e.g. `credits`).
+            lastUsageRaw = null;
             const pending = new Map<number, ToolCallBuffer>();
             // #206: strip model-imitated render tags from PROSE deltas; the
             // filter may hold back a short tail, flushed at finish/[DONE].
@@ -516,6 +554,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!choice) {
                     if (parsed.usage) {
                         const u = parsed.usage as Record<string, unknown>;
+                        lastUsageRaw = u;
                         yield {
                             kind: "usage",
                             inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -526,7 +565,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // from this trailing empty-choices frame; raw tool-call rounds
                         // must forward it verbatim, not swallow it into the internal
                         // ledger.
-                        if (sawRealToolCall) {
+                        if (sawRealToolCall || clientWantsUsage) {
                             yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
                         }
                     }
@@ -559,6 +598,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 // only the ledger gains the sample.
                 if (parsed.usage && !finishReason && delta && Object.keys(delta).length === 0) {
                     const u = parsed.usage as Record<string, unknown>;
+                    lastUsageRaw = u;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -572,6 +612,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
+                    if (u) lastUsageRaw = u;
                     yield {
                         kind: "usage",
                         inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
@@ -610,7 +651,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 // was filtered — a dual-field frame leaked unfiltered content
                 // to the client while the filtered text event suppressed its
                 // raw to avoid double-sending.
-                const rcIn = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0 ? delta.reasoning_content : null;
+                const rcDelta = reasoningDeltaIn(delta);
+                const rcIn = rcDelta !== null ? rcDelta.value : null;
+                // #7432: an alias field (`reasoning`, `reasoning_text`) must ride
+                // out as reasoning_content — mark the frame changed so every raw
+                // path below rewrites it instead of forwarding the alias name.
+                const rcAliased = rcDelta !== null && rcDelta.field !== "reasoning_content";
+                const rcField = rcDelta !== null ? rcDelta.field : "reasoning_content";
                 const ctIn = typeof delta.content === "string" && delta.content.length > 0 ? delta.content : null;
                 let rcOut = rcIn;
                 let ctOut = ctIn;
@@ -631,10 +678,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     // echo (#1881). Structured events stay internal here.
                     let json = jsonStr;
                     let obj = parsed;
-                    if (rcChanged || ctChanged) {
+                    if (rcChanged || ctChanged || rcAliased) {
                         const fields: Record<string, string> = {};
                         if (ctIn !== null) fields["content"] = ctOut ?? "";
-                        if (rcIn !== null) fields["reasoning_content"] = rcOut ?? "";
+                        if (rcIn !== null) Object.assign(fields, reasoningFrameFields(rcField, rcOut ?? ""));
                         obj = applyDeltaFields(parsed, fields);
                         json = JSON.stringify(obj);
                     }
@@ -650,8 +697,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
                 const fin = (b: Buffer): Buffer => (finishReason ? stripFinishReasonChunk(b) : b);
                 if (rcIn !== null && ctIn !== null) {
-                    const raw = rcChanged || ctChanged
-                        ? rewriteDeltaFields(parsed, { content: ctOut ?? "", reasoning_content: rcOut ?? "" })
+                    const raw = rcChanged || ctChanged || rcAliased
+                        ? rewriteDeltaFields(parsed, { content: ctOut ?? "", ...reasoningFrameFields(rcField, rcOut ?? "") })
                         : rawBuf;
                     const fwd = fin(raw);
                     const hasText = ctOut !== null && ctOut.length > 0;
@@ -670,7 +717,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "text", delta: ctOut!, raw: fwd } as ParsedStreamEvent;
                     }
                 } else if (rcIn !== null) {
-                    const raw = rcChanged ? rewriteDeltaFields(parsed, { reasoning_content: rcOut ?? "" }) : rawBuf;
+                    const raw = rcChanged || rcAliased ? rewriteDeltaFields(parsed, reasoningFrameFields(rcField, rcOut ?? "")) : rawBuf;
                     yield { kind: "reasoning", delta: rcOut ?? "", raw: fin(raw) } as ParsedStreamEvent;
                 } else if (ctIn !== null) {
                     const raw = ctChanged ? rewriteDeltaFields(parsed, { content: ctOut ?? "" }) : rawBuf;
@@ -702,13 +749,18 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // Numeric fields must never serialize to absent/undefined: strict
             // clients (dsh's mapUsage) compute over prompt_tokens/completion_tokens
             // and a usage object missing them yields NaN (non-JSON-serializable).
+            const raw = lastUsageRaw ?? {};
+            const rawDetails = raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object"
+                ? raw.prompt_tokens_details as Record<string, unknown>
+                : undefined;
             const usage = opts?.usage
                 ? {
+                      ...raw,
                       prompt_tokens: opts.usage.inputTokens ?? 0,
                       completion_tokens: opts.usage.outputTokens ?? 0,
                       total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
                       ...(typeof opts.usage.cachedTokens === "number"
-                          ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedTokens } }
+                          ? { prompt_tokens_details: { ...rawDetails, cached_tokens: opts.usage.cachedTokens } }
                           : {}),
                   }
                 : null;
