@@ -13,7 +13,10 @@
  *   3. repair without --from = no-backup salvage: row-by-row extraction
  *      from the corrupt file into a fresh schema — broken page ranges
  *      bisect to single rows, a corrupt cell nulls its own column, small
- *      tables survive intact, and the result self-verifies before the swap;
+ *      tables survive intact, WITHOUT ROWID tables are copied whole (no
+ *      rowid to walk), and any table the salvager cannot read is reported
+ *      as skipped and counts as loss (exit 1) — never silently emptied;
+ *      the result self-verifies before the swap;
  *   4. every swap path refuses while another live process holds
  *      index.db.lock (#4175 pid discipline — a quarantined file must not be
  *      stolen out from under an active writer);
@@ -63,6 +66,12 @@ function buildSeedDb(dir: string): string {
     const big = Buffer.alloc(100 * 1024, 0x41);
     big.write("overflow-row-head", 0);
     insContent.run("hash-big-0", big.length, big);
+    // WITHOUT ROWID tables (schema v11): no rowid to walk, so the salvage
+    // path must cover them via the whole-table copy — seed real rows.
+    db.prepare("INSERT INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?)").run("ns1", "conv-1", "s0-seed", now);
+    const insKv = db.prepare("INSERT INTO kv_store (namespace, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+    insKv.run("lane:1", "state", JSON.stringify({ a: 1 }), now);
+    insKv.run("lane:1", "cursor", JSON.stringify({ n: 42 }), now);
     db.close();
     return dbPath;
 }
@@ -220,11 +229,13 @@ test("repair (no --from): salvage extracts what survived into a fresh schema", {
         const data = JSON.parse(r.text) as {
             mode: string;
             rowsLost: number;
+            skippedTables: string[];
             quarantined: string[];
-            tables: Array<{ table: string; salvaged: number; lost: number }>;
+            tables: Array<{ table: string; salvaged: number; lost: number; note?: string }>;
         };
         assert.equal(data.mode, "salvage");
         assert.ok(Array.isArray(data.tables) && data.tables.length > 0, "per-table report");
+        assert.ok(Array.isArray(data.skippedTables), "skippedTables in the JSON report");
         const sessions = data.tables.find((t) => t.table === "sessions");
         assert.ok(sessions && sessions.salvaged === 3, `small tables survive intact (got ${JSON.stringify(sessions)})`);
         assert.ok(data.quarantined.length >= 1 && data.quarantined.some((f) => f.includes("index.db.corrupt-")), `the corrupt original is quarantined in place (${JSON.stringify(data.quarantined)})`);
@@ -235,6 +246,13 @@ test("repair (no --from): salvage extracts what survived into a fresh schema", {
         try {
             const rows = ro.db.prepare("SELECT count(*) AS n FROM sessions").get() as { n: number };
             assert.equal(rows.n, 3);
+            // WITHOUT ROWID tables are in the report and self-consistent:
+            // whatever the salvager claims, the new db must agree.
+            const kv = data.tables.find((t) => t.table === "kv_store");
+            assert.ok(kv, "kv_store (WITHOUT ROWID) must appear in the per-table report");
+            const n = (ro.db.prepare("SELECT count(*) AS n FROM kv_store").get() as { n: number }).n;
+            assert.equal(kv.salvaged, n, "kv_store salvaged count must match the new db");
+            if (n < 2) assert.ok(kv.note, "a lost WITHOUT ROWID table must carry a note");
         } finally {
             ro.db.close();
         }
@@ -250,6 +268,45 @@ test("repair (no --from): salvage extracts what survived into a fresh schema", {
         } finally {
             rmSync(dir2, { recursive: true, force: true });
         }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("repair (no --from): a corrupt WITHOUT ROWID table is reported as loss, not silently emptied", { skip: SKIP_NO_ENGINE }, async () => {
+    const dir = tmpDir();
+    try {
+        const dbPath = buildSeedDb(dir);
+        // Corrupt EXACTLY the kv_store root page (a deterministic target,
+        // unlike the 1/3 window): the DDL survives in sqlite_master, but
+        // the table's single data page is unreadable.
+        const { db } = openSqliteDatabase(dbPath);
+        const root = db.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'kv_store'").get() as { rootpage: number };
+        const ps = db.prepare("PRAGMA page_size").get() as { page_size: number };
+        db.close();
+        const buf = readFileSync(dbPath);
+        const off = (root.rootpage - 1) * ps.page_size;
+        for (let i = 0; i < ps.page_size; i++) buf[off + i] ^= 0xff;
+        writeFileSync(dbPath, buf);
+        assert.equal(quickCheckVerdict(dbPath).ok, false, "precondition: the corrupt index must fail quick_check");
+        const r = await runStorageRepairCommand({ dir, json: true });
+        const data = JSON.parse(r.text) as {
+            ok: boolean;
+            skippedTables: string[];
+            tables: Array<{ table: string; salvaged: number; note?: string }>;
+        };
+        assert.equal(r.code, 1, "a skipped table is loss — exit 1, not a silent ok");
+        assert.equal(data.ok, false);
+        const kv = data.tables.find((t) => t.table === "kv_store");
+        assert.ok(kv && kv.salvaged === 0, `the corrupt WITHOUT ROWID table salvages nothing (${JSON.stringify(kv)})`);
+        assert.ok(typeof kv.note === "string" && kv.note.length > 0, `a lost table carries a note (${JSON.stringify(kv)})`);
+        assert.match(kv.note, /WITHOUT ROWID/);
+        assert.ok(data.skippedTables.includes("kv_store"), "kv_store named in skippedTables");
+        const conv = data.tables.find((t) => t.table === "conversations");
+        assert.ok(conv && conv.salvaged === 1, "an intact WITHOUT ROWID table is copied whole");
+        const sessions = data.tables.find((t) => t.table === "sessions");
+        assert.ok(sessions && sessions.salvaged === 3, "rowid tables unaffected");
+        assert.equal(quickCheckVerdict(dbPath).ok, true, "the salvaged db self-verifies before it counts");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
