@@ -468,6 +468,11 @@ const ACP_STATUS_PARAMETERS = {
       description:
         "List pre-compaction archived blocks per-id instead of grouped by reason",
     },
+    protectedMass: {
+      type: "boolean",
+      description:
+        "Off by default. Adds the PROTECTED MASS attribution line: token mass metered into usage but reachable by no compress offer (hard protection + the protected recent window). It explains, it does not offer work — pass it when asked where the uncompressible mass is.",
+    },
   },
 };
 
@@ -476,7 +481,7 @@ export const ACP_STATUS_TOOL_OPENAI = {
   function: {
     name: ACP_STATUS_TOOL_NAME,
     description:
-      "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+      "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings; protectedMass:true adds the attribution-only protected-mass line (off by default).",
     parameters: ACP_STATUS_PARAMETERS,
   },
 };

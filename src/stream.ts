@@ -21,7 +21,7 @@ import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
-import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { describeUncoveredRuns, formatProtectedMassCompact, PROTECTED_MASS_RENDER_FLOOR, shortTokenCount, uncoveredAudit } from "./uncovered.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -766,7 +766,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // verbatim contract string (#1387) stays intact for genuinely-drained
     // sessions. Advisory only: audit failure degrades to the old wording path.
     try {
-        const runs = uncoveredHistoryRuns({
+        const audit = uncoveredAudit({
             core: ctx.core,
             messages: ctx.messages,
             state: ctx.session.state,
@@ -776,6 +776,13 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             applyView: ctx.compressMessages,
             actionableSpans: remaining,
         });
+        const runs = audit.runs;
+        // #7463: the meter bills protected mass that no offer carries and no
+        // model surface names by default — the bili log is its attribution
+        // surface (offline diagnosis); one line per qualifying fold, tee'd.
+        if (audit.mass.hardTokens + audit.mass.zoneTokens >= PROTECTED_MASS_RENDER_FLOOR) {
+            ctx.log(`[acp-compress-obs] protected mass (metered, in no compress offer): hard ${audit.mass.hardTokens} tok (${audit.mass.hardCount} msg) + zone ${audit.mass.zoneTokens} tok (${audit.mass.zoneCount} msg) — top: ${audit.mass.topCarriers.length > 0 ? audit.mass.topCarriers.map((c) => `${c.label} ~${c.tokens}`).join(", ") : "none"}`);
+        }
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
@@ -799,7 +806,13 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 // resets the latch (in-memory field) — at most one extra note.
                 if (!ctx.session.uncoveredReceiptNoted) {
                     ctx.session.uncoveredReceiptNoted = true;
-                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                    // #7463: name the protected mass in the same note — before
+                    // this, the meter-vs-offer gap (usage bills it, no offer
+                    // carries it, no surface names it) was unexplainable from
+                    // the model's side after a drained-fold receipt. Rides the
+                    // same #6522 latch: at most one note per nudge cycle.
+                    const protectedNote = formatProtectedMassCompact(audit.mass);
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions);${protectedNote} inspect with acp_status(scope:"uncompressed").`;
                 }
                 // Latch already fired this cycle but material mass still sits
                 // uncovered (totalTok >= floor): stay silent, do NOT fall

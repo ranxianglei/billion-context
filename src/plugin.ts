@@ -24,6 +24,7 @@ import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, co
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
+import { formatProtectedMass, uncoveredAudit, type ProtectedMassLedger } from "./uncovered.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
@@ -2106,13 +2107,16 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // as acp_status; on failure omit the nudge/ranges sections instead of
     // serving the stale snapshot.
     let nudge: NudgeDecision | undefined;
-    try {
-        const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
-        if (messages.length > 0) {
-            // #833: base kernelConfig carries no file/provider/model compress
-            // settings — render from the session's last resolved Config so the
-            // panel matches actual injection behavior.
-            const pluginCfg = effectiveConfig(session, deps.config);
+    // Hoisted out of the nudge try so the #7463 protected-mass audit below
+    // sees the same message view and resolved config (advisory surfaces must
+    // never classify against a different input than the panel did).
+    const messages: CoreMessage[] = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : (session.pluginSnapshot ?? []);
+    // #833: base kernelConfig carries no file/provider/model compress
+    // settings — render from the session's last resolved Config so the
+    // panel matches actual injection behavior.
+    const pluginCfg = effectiveConfig(session, deps.config);
+    if (messages.length > 0) {
+        try {
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
@@ -2124,9 +2128,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
                 // history, not this panel's processed view (#2627 split).
                 applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
+        } catch {
+            nudge = undefined;
         }
-    } catch {
-        nudge = undefined;
     }
     // #3204: the submit gate rejects any span that brackets a ref recorded DEAD
     // (the client rewrote/dropped those messages) — the same self-contradiction
@@ -2135,12 +2139,38 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     if (nudge) {
         nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
+    // #7463: protected-mass attribution on the HUMAN-only /acp panel + the
+    // structured context view (dsh Context tab). acp_status keeps the same
+    // ledger opt-in (protectedMass param); this panel is on-demand, so the
+    // one extra relaxed offer pass is paid only when a human asks for /acp.
+    // Advisory: any failure just omits the line.
+    let protectedMass: ProtectedMassLedger | undefined;
+    let protectedMassLine: string | undefined;
+    if (messages.length > 0) {
+        try {
+            const audit = uncoveredAudit({
+                core: deps.core,
+                messages,
+                state: session.state,
+                config: ccrLoopConfig(session, pluginCfg),
+                tokenCount: statusInputBaseline(session),
+                contentStore: contentStoreOf(session),
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
+                normalRanges: nudge?.compressibleRanges,
+            });
+            const pmLine = formatProtectedMass(audit.mass);
+            if (pmLine !== null) {
+                protectedMass = audit.mass;
+                protectedMassLine = pmLine;
+            }
+        } catch {}
+    }
     // #532/#3862: host-measured system+tools overhead (prepare-time, same
     // source as estimateInputTokens) — shared by the panel text below AND the
     // structured context view, so both surfaces classify identically.
     const sysTokRaw = session.metadata.systemPromptTokens;
     const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
-    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session });
+    const contextView = buildContextView({ nudge, systemPromptTokens, limit: modelContextLimit, session, protectedMass });
     let panel: string | undefined;
     try {
         // #532: the kernel breakdown classifies messages only; feeding in the
@@ -2180,6 +2210,9 @@ export async function handlePluginStatus(conversationId: string, res: import("no
     // users actually see — the /acp panel — via the same before-footer slot the
     // Web UI link uses (the footer anchors the LLM-context stripper).
     const preFooter: string[] = [];
+    if (protectedMassLine !== undefined) {
+        preFooter.push(protectedMassLine);
+    }
     const adv = getAdvisoryState();
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);

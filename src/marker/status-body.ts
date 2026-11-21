@@ -7,10 +7,14 @@
 // with the renderers:
 //   - kernel report:  kernel/src/report.ts (renderOverview / renderRanges /
 //     renderMessages / block detail)
-//   - host extras:    src/acp-status.ts (BILLED INPUT, breaker, STORE (CCR),
-//     RETRIEVAL QUALITY, BLOCK SPANS, STORAGE, PRE-COMPACTION ARCHIVE,
-//     CRITICAL ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS,
-//     PCK SELF-STAMPING OFF BY DEFAULT)
+//   - host extras:    src/acp-status.ts (BILLED INPUT, UNCOVERED HISTORY,
+//     PROTECTED MASS, FORK ADOPTION SKIPPED, PRESSURE NOTE, DEAD REFS,
+//     HOST-NATIVE COMPACTION, COMPRESS CIRCUIT BREAKER, UPSTREAM CIRCUIT
+//     OPEN / 429 HOLD, EMERGENCY SHRINK ARMED, OUTPUT BUDGET CLAMP,
+//     RESOLVER WEDGE, CACHE ROUTING KEY BLOCKED, STORE (CCR), RETRIEVAL
+//     QUALITY, BLOCK SPANS, STORAGE, PRE-COMPACTION ARCHIVE, CRITICAL
+//     ADVISORY / UPDATE, UNDECRYPTED TRAFFIC, UNRECOGNIZED PATHS, PCK
+//     SELF-STAMPING OFF BY DEFAULT)
 //   - conflict view:  src/conflict-watch.ts (COMPRESSION CONFLICTS, Fix (…))
 // tests/marker-render-contract.test.ts covers both emitted and legacy shapes.
 
@@ -33,8 +37,15 @@ const SECTION_HEADS: readonly string[] = [
     "Compressible ranges (",
     "BILLED INPUT ",
     "NOTE: the token figures",
+    "CACHE ROUTING KEY BLOCKED (instance-level): ",
+    "COMPRESS CIRCUIT BREAKER: ARMED — ",
+    "DEAD REFS — ",
+    "EMERGENCY SHRINK ARMED — ",
     "FOLD BASE GENERATION MISMATCH — ",
     "FOLD SUBSTRATE INVALID — ",
+    "FORK ADOPTION SKIPPED — ",
+    "HOST-NATIVE COMPACTION — ",
+    "OUTPUT BUDGET CLAMP —",
     "STORE (CCR) — ",
     "RETRIEVAL QUALITY — ",
     "BLOCK SPANS — ",
@@ -44,8 +55,14 @@ const SECTION_HEADS: readonly string[] = [
     "CRITICAL ADVISORY (instance-level): ",
     "CRITICAL UPDATE READY (instance-level): ",
     "CRITICAL UPDATE AVAILABLE (instance-level): ",
+    "PRESSURE NOTE: ",
+    "PROTECTED MASS — ",
+    "RESOLVER WEDGE SUSPECTED (instance-level): ",
+    "UNCOVERED HISTORY — ",
     "UNDECRYPTED TRAFFIC (instance-level): ",
     "UNRECOGNIZED PATHS (instance-level): ",
+    "UPSTREAM 429 HOLD — ",
+    "UPSTREAM CIRCUIT OPEN — ",
     "PCK SELF-STAMPING OFF BY DEFAULT (instance-level, #5079): ",
     "Last failures were attributed to ",
     "The Compressible-ranges list above was re-derived",
@@ -53,6 +70,7 @@ const SECTION_HEADS: readonly string[] = [
     "Tip: ",
     "Breakdown: ",
     "Live state: GET /__bili/status",
+    "Live state: the update field of GET /__bili/status",
     "Update with: npm install -g billion-context@",
 ];
 
@@ -63,6 +81,8 @@ const CONTINUATION = [
     /^\d+ of \d+ shown\.$/,
     /^Fix \(/, // conflict remediation (src/conflict-watch.ts)
     /^Fix: /,
+    /^\u2026\d+ more destination\(s\): /, // CACHE ROUTING KEY BLOCKED overflow (src/acp-status.ts)
+    /^If this destination is your relay/, // CACHE ROUTING KEY BLOCKED prose tail (src/acp-status.ts)
 ];
 
 function isHeadLine(line: string): boolean {
