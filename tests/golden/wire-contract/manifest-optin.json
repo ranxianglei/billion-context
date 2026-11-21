@@ -634,6 +634,10 @@
       ],
       "endpoint": "/__bili/plugin/fork",
       "snapshotEndpoint": "/__bili/plugin/snapshot"
+    },
+    "hostIdChannel": {
+      "bodyField": "_bili_toolcall_ids",
+      "maxUnits": 10000
     }
   }
 }
