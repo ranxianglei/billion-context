@@ -25,6 +25,10 @@ export const LIVE_FILES = [
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
     "tests/issue3472-mcp-structured-text.test.ts",
+    // #3978: spawns one short-lived child proxy (SIGKILL mid-test); all ports
+    // are listen(0)-dynamic, store dirs are per-test mkdtemp, so it runs clean
+    // at shard concurrency 4 like its neighbors.
+    "tests/issue3978-preflight-abort-persistence.test.ts",
     "tests/issue4341-early-twin-adoption.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",

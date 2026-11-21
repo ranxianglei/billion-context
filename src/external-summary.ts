@@ -1,3 +1,5 @@
+import { log } from "./logger.js";
+
 export interface SummaryWork {
     readonly content: string;
     readonly instructions: string;
@@ -43,9 +45,10 @@ export function summaryAbortSource(signal: AbortSignal): SummaryAbortSource | un
 
 /** #4833: human-readable WHY for a timed-out attempt — the source, the budget
  *  it hit, and how much wall-clock the range had burned. Pure numbers and fixed
- *  words; never echoes payload. */
-function timeoutDetail(source: SummaryAbortSource, limits: SummaryBudget, elapsedMs: number): string {
-    const budgetMs = source === "target-timeout" ? limits.targetTimeoutMs : limits.totalTimeoutMs;
+ *  words; never echoes payload. #6885: the budget is the ACTUAL window the
+ *  attempt had (a target window shrunk by the shared-pot reservation, or the
+ *  range's real remaining total), not the configured nominal value. */
+function timeoutDetail(source: SummaryAbortSource, budgetMs: number, elapsedMs: number): string {
     return `${source} ${budgetMs}ms (elapsed ${Math.round(elapsedMs)}ms)`;
 }
 
@@ -74,7 +77,7 @@ export type ExternalSummaryBatchResult =
     | { status: "finished" | "cancelled" | "deadline"; results: ExternalSummaryResult[] }
     | { status: "failed"; reason: "invalid_plan"; results: [] };
 
-type AttemptResult = { kind: "value"; value: string } | { kind: "error" } | { kind: "aborted" };
+type AttemptResult = { kind: "value"; value: string } | { kind: "error"; detail?: string; warnedByCandidate?: boolean } | { kind: "aborted" };
 type Release = () => void;
 interface Waiter {
     signal: AbortSignal;
@@ -97,6 +100,55 @@ function invalidSummaryDetail(value: unknown, limits: SummaryBudget, request: Re
     const floor = request.minSummaryChars ?? 1;
     if (chars < floor) return `summary ${chars} chars below floor ${floor}`;
     return `summary ${chars} chars exceeds cap ${request.maxSummaryChars}`;
+}
+
+/** #6885: a non-fetch rejection's SAFE cause, if it has one. The executor used
+ *  to drop every rejection reason, so a sync guard (context budget) or a
+ *  post-fetch parse failure left only a bare `tN:error` with no warn line and
+ *  no way to tell it from a network death. Only our own fixed error strings
+ *  are named — the message itself, which carries no payload, status aside —
+ *  so an unknown provider error stays opaque in the result (the no-leak rule
+ *  the executor tests pin). `warnedByCandidate` is true for the upstream
+ *  rejection, which the HTTP candidate already warns once per attempt with
+ *  status + truncated body; the executor must not warn it a second time. */
+interface SummaryErrorDetail { readonly detail: string; readonly warnedByCandidate: boolean; }
+function summaryErrorDetail(error: unknown): SummaryErrorDetail | undefined {
+    const message = error instanceof Error ? error.message : undefined;
+    if (message === undefined) return undefined;
+    if (message.startsWith("External summary upstream rejected the request with HTTP ")) return { detail: message, warnedByCandidate: true };
+    for (const prefix of [
+        "Summary attempt cancelled before dispatch",
+        "External summary input exceeds the target context budget",
+        "External summary response is empty",
+        "External summary response exceeds its byte budget",
+        "External summary response did not complete",
+        "External summary response contains an invalid frame",
+        "External summary response contains no summary",
+    ]) {
+        if (message.startsWith(prefix)) return { detail: message, warnedByCandidate: false };
+    }
+    return undefined;
+}
+
+/** #6885: pick the advice a failed compress result carries, from the batch's
+ *  own stop reason and attempt outcomes — a timeout/deadline means the budget
+ *  ran out, an over-cap rejection means the summary cap, and a named
+ *  non-fetch failure means the cause in the attempts, not the cap. The old
+ *  text blamed maxSummaryLength for every failure, which sent the operator to
+ *  a knob that cannot help a budget or parse failure. */
+export function externalSummaryFailureAdvice(batch: ExternalSummaryBatchResult): string {
+    const result = batch.status === "failed" ? undefined : (batch.results.find((entry) => entry.status !== "success") ?? batch.results[0]);
+    if (result === undefined) return "see the attempt outcomes for the cause.";
+    if (result.status === "deadline" || result.attempts.some((attempt) => attempt.outcome === "timeout")) {
+        return "candidates ran out of budget before a summary completed, so raise the external-summary budget (budget.totalTimeoutMs / budget.targetTimeoutMs) or request less via per-range summaryMaxChars.";
+    }
+    if (result.attempts.some((attempt) => attempt.outcome === "invalid_summary")) {
+        return "summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.";
+    }
+    if (result.attempts.some((attempt) => attempt.outcome === "error" && attempt.detail !== undefined)) {
+        return "the attempts below name the failing cause — address that cause; a rejected or unparseable reply is not fixed by raising the summary cap.";
+    }
+    return "see the attempt outcomes for the cause; raising the summary cap only helps replies rejected for length.";
 }
 
 /** #1775/#3635: the length-budget clause every external-summarizer prompt
@@ -266,16 +318,31 @@ export class ExternalSummaryExecutor {
                 const propagateOverall = (): void => { attempt.abort(overall.signal.reason); };
                 overall.signal.addEventListener("abort", propagateOverall, { once: true });
                 if (overall.signal.aborted) propagateOverall();
-                const targetDeadline = performance.now() + limits.targetTimeoutMs;
+                // #6885: the batch deadline is a shared pot. A fresh
+                // targetTimeoutMs per candidate let early candidates eat the
+                // whole pot (t0 25s + t1 25s = the 50s default), so the third
+                // candidate never got a request out — no matter how fast it
+                // was, the chain failed 100% on long payloads. Divide what is
+                // left among the remaining candidates (this one included); the
+                // configured targetTimeoutMs stays the per-candidate cap and
+                // only the reservation can shrink it (the 600s/180s
+                // workaround keeps its full 180s windows: 600s/3 > 180s).
+                const remainingTargets = targets.length - targetIndex;
+                const reservedMs = Math.floor((deadline - performance.now()) / remainingTargets);
+                const effectiveTargetMs = Math.max(1, Math.min(limits.targetTimeoutMs, reservedMs));
+                const targetDeadline = performance.now() + effectiveTargetMs;
                 const expireTarget = (): void => { attempt.abort(new SummaryAbortError("target-timeout")); };
-                const timer = setTimeout(expireTarget, limits.targetTimeoutMs);
+                const timer = setTimeout(expireTarget, effectiveTargetMs);
                 // Retain the permit until the actual call settles, even if it ignores cancellation.
                 const operation: Promise<AttemptResult> = Promise.resolve().then(() => {
                     if (performance.now() >= deadline) cancel("batch-deadline");
                     if (performance.now() >= targetDeadline) expireTarget();
                     if (attempt.signal.aborted) throw new Error("Summary attempt cancelled before dispatch");
                     return target.summarize(request, attempt.signal);
-                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), () => ({ kind: "error" })).finally(release);
+                }).then<AttemptResult, AttemptResult>((value) => ({ kind: "value", value }), (error) => {
+                    const known = summaryErrorDetail(error);
+                    return known === undefined ? { kind: "error" } : { kind: "error", detail: known.detail, warnedByCandidate: known.warnedByCandidate };
+                }).finally(release);
                 let result: AttemptResult;
                 try {
                     result = await awaitAttempt(operation, attempt.signal);
@@ -286,14 +353,25 @@ export class ExternalSummaryExecutor {
                 if (performance.now() >= deadline) cancel("batch-deadline");
                 if (overall.signal.aborted) {
                     if (signal?.aborted) attempts.push({ targetIndex, outcome: "cancelled", detail: "caller abort" });
-                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", limits, performance.now() - startedAt) });
+                    else attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(overall.signal) ?? "batch-deadline", Math.max(0, Math.round(deadline - startedAt)), performance.now() - startedAt) });
                     return stopped();
                 }
                 if (performance.now() >= targetDeadline) expireTarget();
                 if (result.kind === "aborted" || attempt.signal.aborted) {
-                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(summaryAbortSource(attempt.signal) ?? "target-timeout", limits, performance.now() - startedAt) });
+                    const source = summaryAbortSource(attempt.signal) ?? "target-timeout";
+                    attempts.push({ targetIndex, outcome: "timeout", detail: timeoutDetail(source, source === "target-timeout" ? effectiveTargetMs : Math.max(0, Math.round(deadline - startedAt)), performance.now() - startedAt) });
                 } else if (result.kind === "error") {
-                    attempts.push({ targetIndex, outcome: "error" });
+                    if (result.detail === undefined) {
+                        attempts.push({ targetIndex, outcome: "error" });
+                    } else {
+                        attempts.push({ targetIndex, outcome: "error", detail: result.detail });
+                        // #6885: a sync guard or a post-fetch parse failure used
+                        // to vanish without any warn line — the candidate logs
+                        // its fetch failures, but these never reached one. Log
+                        // it once here, unless the candidate already warned
+                        // (upstream rejection).
+                        if (!result.warnedByCandidate) log("warn", `[external-summary] candidate <t${targetIndex}> failed: ${result.detail}`);
+                    }
                 } else if (typeof result.value !== "string" || !result.value.trim()
                     || Buffer.byteLength(result.value, "utf8") > limits.maxSummaryBytes
                     || result.value.trim().length < (request.minSummaryChars ?? 1)
