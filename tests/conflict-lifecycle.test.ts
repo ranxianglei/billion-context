@@ -117,3 +117,34 @@ test("formatConflictSection: header age split + advice switches with liveness (#
     assert.ok(susText.includes("Every event above is [suspected]"));
     assert.ok(!susText.includes("Keep exactly ONE compressor"));
 });
+
+test("formatConflictSection: vacuum-only ledger gets its own tier (#2438 F1-a)", () => {
+    const now = Date.now();
+    const vac: ConflictEvent[] = [
+        { at: now - 60_000, kind: "fold-vacuum", detail: "5 stored fold block(s) with no anchorable covered surface — terminal coverage loss (#2438 F1-a)" },
+    ];
+    const text = formatConflictSection(vac, now).join("\n");
+    assert.ok(text.includes("fold-substrate vacuum reports"));
+    assert.ok(text.includes("NO second compressor"));
+    assert.ok(!text.includes("Every event above is [suspected]"), "vacuum is not a suspected-plugin ledger");
+    assert.ok(!/^Fix/m.test(text), "generic remediation footer must not contradict the vacuum tier");
+});
+
+test("formatConflictSection: mixed native-compaction+vacuum ledger keeps a non-vacuum tier (#2438 F1-a)", () => {
+    const now = Date.now();
+    const mixed: ConflictEvent[] = [
+        { at: now - 60_000, kind: "native-compaction", detail: "dsh native compaction: 9/12 covered id(s) replaced by the compacted history" },
+        { at: now - 30_000, kind: "fold-vacuum", detail: "1 stored fold block(s) with no anchorable covered surface" },
+    ];
+    const text = formatConflictSection(mixed, now).join("\n");
+    assert.ok(!text.includes("The events above are fold-substrate vacuum reports"), "vacuum tier is pure-case gated");
+});
+
+test("formatConflictSection: historical vacuum-only ledger reads as stock (#2438 F1-a)", () => {
+    const now = Date.now();
+    const old: ConflictEvent[] = [
+        { at: now - 8 * DAY, kind: "fold-vacuum", detail: "3 stored fold block(s) with no anchorable covered surface" },
+    ];
+    const text = formatConflictSection(old, now).join("\n");
+    assert.ok(text.includes("historical stock"));
+});
