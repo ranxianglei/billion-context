@@ -2118,7 +2118,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
@@ -4650,13 +4655,13 @@ export async function pipePluginResponsesWithStrip(
         if (proseAcc.length === 0 || !session) return;
         scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
-    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown; content_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
             answerProse += tail;
-            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            const meta = inRetry && heldItemId !== undefined ? { ...lastDeltaMeta, item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
@@ -5108,7 +5113,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         const clean = tagFilter.push(delta);
-                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"], content_index: ev["content_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
