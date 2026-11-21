@@ -78,7 +78,8 @@ import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
-import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, incrementalResponsesInputEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { planResponsesInput, responsesItems, responsesAckMatches, type ResponsesSnapshot } from "../responses-input.js";
 import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
@@ -1041,9 +1042,11 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
             return;
         }
         if (body === null || typeof body !== "object") return;
-        const b = body as { messages?: unknown; model?: unknown; system?: unknown };
-        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
+        const b = body as Record<string, unknown>;
+        const responses = new URL(url).pathname.replace(/\/+$/, "").endsWith("/responses") && responsesItems(b.input);
+        if (typeof b.model !== "string" || (!responses && !wireMessagesLookAnthropic(b.messages))) return;
         if (!(await probeIncrementalTurns(base))) return;
+        if (responses && !incrementalResponsesInputEnabled(base)) return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
         // its ack, later requests ride the normal pipeline. Pending entries
@@ -1059,6 +1062,21 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        if (responses) {
+            const key = `${base}\0${sid}\0${url}`;
+            sweepStale(responsesAcknowledged, 30 * 60_000);
+            const plan = planResponsesInput(sid, url, b, responsesAcknowledged.get(key)?.snapshot);
+            if (!plan) return;
+            // A dispatched replacement may commit even if its reply is lost.
+            // Until THIS turn is acknowledged, no earlier snapshot is safe:
+            // a same-length replacement would otherwise accept the old cursor.
+            responsesAcknowledged.delete(key);
+            const turnId = newIncrementalTurnId();
+            rememberOriginalBody(turnId, origText);
+            replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1", [INCREMENTAL_TURN_ID_HEADER]: turnId });
+            incPendingOpencode.set(turnId, { sid, url, messages: [], system: undefined, base, at: Date.now(), responses: { key, snapshot: plan.snapshot } });
+            return;
+        }
         const plan = planIncrementalTurn({ cacheControlRetouch: incrementalCacheRetouchEnabled(base), conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
         if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
@@ -1084,6 +1102,7 @@ interface IncrementalPendingTurn {
     system: unknown;
     base: string;
     at: number;
+    responses?: { key: string; snapshot: ResponsesSnapshot };
 }
 
 /** Planned turns age out: onResponse only fires on a SUCCESSFUL send, so a
@@ -1096,10 +1115,12 @@ const INC_PENDING_TTL_MS = 30_000;
  *  was planned on so the #3378 single-flight guard can scan for live
  *  same-URL entries — see maybeIncrementalOpencode. */
 const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
+const responsesAcknowledged = new Map<string, { snapshot: ResponsesSnapshot; at: number }>();
 
 /** Test hook: drop all planned turns (the map is module state across suites). */
 export function __resetOpencodeIncrementalForTests(): void {
     incPendingOpencode.clear();
+    responsesAcknowledged.clear();
 }
 
 /** Ack collector registered on the module's NativeInterceptState: the
@@ -1125,6 +1146,20 @@ export function opencodeIncrementalOnResponse(_url: string, response: Response, 
     }
     incPendingOpencode.delete(turnId);
     try {
+        if (pending.responses) {
+            if (response.status === 200 && responsesAckMatches(pending.responses.snapshot, seq)) {
+                while (responsesAcknowledged.size >= 64) {
+                    const oldest = responsesAcknowledged.keys().next().value;
+                    if (oldest === undefined) break;
+                    responsesAcknowledged.delete(oldest);
+                }
+                responsesAcknowledged.set(pending.responses.key, { snapshot: pending.responses.snapshot, at: Date.now() });
+            } else {
+                responsesAcknowledged.delete(pending.responses.key);
+                if (response.status === 503) clearIncrementalProbe(pending.base);
+            }
+            return;
+        }
         if (response.status === 200) {
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;

@@ -305,6 +305,8 @@ billion-context/
 │   ├── remote-notices.ts         # Remote announcement feed watcher: fail-open polling, last-known-good snapshot (#5548)
 │   ├── request-membership.ts     # Settle-side membership probe: is this usage report ours (#4805)
 │   ├── resolver-wedge.ts         # Persistent local DNS resolver wedge detector + alarm (#5221)
+│   ├── responses-input.ts        # Host-side Responses input transport: opaque item snapshots, delta plan, ack match (#6776)
+│   ├── responses-lane.ts         # Server lane re-entering the Responses pipeline with negotiated incremental input (#6776)
 │   ├── responses-system-sections.ts # Single source of truth for the Responses-wire developer-section join: steady prepare + round-2 rebuild share one separator (#6922)
 │   ├── responses-tool-output.ts  # Responses tool-output image parts: projection + patch helpers
 │   ├── rollout.ts                # Feature rollout: per-install uuid, basis-point buckets, nested cohorts (#3062)

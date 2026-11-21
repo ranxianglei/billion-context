@@ -21,11 +21,11 @@ import type { V2HttpRequestEvent, V2State } from "../src/agent/opencode-v2.ts";
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 
-async function fakeLane(enabled: boolean, cacheControlRetouch?: boolean): Promise<{ base: string; close: () => Promise<void> }> {
+async function fakeLane(enabled: boolean, cacheControlRetouch?: boolean, responsesInput?: boolean): Promise<{ base: string; close: () => Promise<void> }> {
     const srv = createServer((req, res) => {
         if (req.method === "GET" && req.url === "/__bili/plugin/turn") {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only", cacheControlRetouch }));
+            res.end(JSON.stringify({ ok: true, protocol: 1, feature: "pluginIncrementalTurns", enabled, storage: enabled ? "unified" : "legacy-only", cacheControlRetouch, responsesInput }));
             return;
         }
         res.writeHead(404); res.end("{}");
@@ -35,8 +35,8 @@ async function fakeLane(enabled: boolean, cacheControlRetouch?: boolean): Promis
     return { base: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => srv.close(() => r())) };
 }
 
-function fakeEvent(body: unknown, sid: string): { e: V2HttpRequestEvent; url: string } {
-    const req = new Request(MODEL_URL, {
+function fakeEvent(body: unknown, sid: string, modelUrl = MODEL_URL): { e: V2HttpRequestEvent; url: string } {
+    const req = new Request(modelUrl, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer sk-test" },
         body: JSON.stringify(body),
@@ -58,10 +58,114 @@ function headersOf(req: Request): Record<string, string> {
 }
 
 const lanes: { close: () => Promise<void> }[] = [];
+
+for (const supported of [undefined, false, true]) {
+    test(`HTTP Responses: capability ${String(supported)} gates exact input-item suffix transport`, async () => {
+        __resetIncrementalClientForTests();
+        __resetOpencodeIncrementalForTests();
+        const lane = await fakeLane(true, undefined, supported);
+        lanes.push(lane);
+        const s = state(lane.base);
+        const url = "https://api.openai.com/v1/responses";
+        const seed = [{ role: "user", content: [{ type: "input_text", text: "hello β" }] }];
+        const parameters = { model: "gpt-fixture", stream: true, instructions: "preserve opaque values" };
+        const first = fakeEvent({ ...parameters, input: seed }, "responses-items", url);
+        const original = first.e.request;
+        await maybeIncrementalOpencode(first.e, s);
+        if (supported !== true) {
+            assert.equal(first.e.request, original, "unadvertised support must retain the ORIGINAL request");
+            assert.equal((first.e.request as Request).headers.get("x-bili-plugin-turn"), null);
+            return;
+        }
+        const sent = first.e.request as Request;
+        assert.equal(sent.headers.get("x-bili-plugin-turn"), "1", "HTTP Responses must use the advertised item lane");
+        const initial = await sent.clone().json() as { wireFormat: string; sinceSeq: number; messages: unknown[]; request: Record<string, unknown> };
+        assert.equal(initial.wireFormat, "responses");
+        assert.equal(initial.sinceSeq, 0);
+        assert.deepEqual(initial.messages, seed);
+        assert.equal(initial.request.input, undefined);
+        assert.equal(initial.request.instructions, parameters.instructions);
+        opencodeIncrementalOnResponse(url, new Response("{}", { headers: { "x-bili-applied-seq": "1" } }), headersOf(sent));
+        const suffix = [
+            { type: "reasoning", id: "rs_fixture", summary: [], encrypted_content: "OPAQUE β\\n0==" },
+            { type: "function_call", id: "fc_fixture", call_id: "call_fixture", name: "read", arguments: '{"path":"synthetic β","limit":2}' },
+            { type: "function_call_output", call_id: "call_fixture", output: "exact tool result β\n" },
+            { role: "user", content: [{ type: "input_text", text: "next" }] },
+        ];
+        const next = fakeEvent({ ...parameters, input: [...seed, ...suffix] }, "responses-items", url);
+        await maybeIncrementalOpencode(next.e, s);
+        const body = await (next.e.request as Request).clone().json() as { wireFormat: string; sinceSeq: number; messages: unknown[] };
+        assert.equal(body.wireFormat, "responses");
+        assert.equal(body.sinceSeq, 1);
+        assert.deepEqual(body.messages, suffix, "opaque reasoning and ordered call/result values must remain exact");
+        assert.equal(body.messages.length, 4, "count wire items rather than core messages");
+    });
+}
+
 after(async () => {
     for (const l of lanes) await l.close();
     __resetIncrementalClientForTests();
     __resetOpencodeIncrementalForTests();
+});
+
+test("HTTP Responses: false item ack reseeds; upstream continuation remains untouched", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true, undefined, true);
+    lanes.push(lane);
+    const s = state(lane.base);
+    const url = "https://api.openai.com/v1/responses";
+    const firstInput = [{ role: "user", content: "one" }];
+    const first = fakeEvent({ model: "gpt-fixture", input: firstInput }, "responses-false-ack", url);
+    await maybeIncrementalOpencode(first.e, s);
+    opencodeIncrementalOnResponse(url, new Response("{}", { headers: { "x-bili-applied-seq": "2" } }), headersOf(first.e.request as Request));
+    const nextInput = [...firstInput, { role: "assistant", content: "two" }, { role: "user", content: "three" }];
+    const next = fakeEvent({ model: "gpt-fixture", input: nextInput }, "responses-false-ack", url);
+    await maybeIncrementalOpencode(next.e, s);
+    const sent = await (next.e.request as Request).clone().json() as { sinceSeq: number; resync: boolean; messages: unknown[] };
+    assert.equal(sent.sinceSeq, 0);
+    assert.equal(sent.resync, true);
+    assert.deepEqual(sent.messages, nextInput);
+    opencodeIncrementalOnResponse(url, new Response("{}", { headers: { "x-bili-applied-seq": "3" } }), headersOf(next.e.request as Request));
+    const continuing = fakeEvent({ model: "gpt-fixture", input: [{ role: "user", content: "four" }], previous_response_id: "resp_existing" }, "responses-false-ack", url);
+    const original = continuing.e.request;
+    await maybeIncrementalOpencode(continuing.e, s);
+    assert.equal(continuing.e.request, original);
+});
+
+test("HTTP Responses: a lost replacement acknowledgement cannot reuse an earlier equal-length prefix", async () => {
+    __resetIncrementalClientForTests();
+    __resetOpencodeIncrementalForTests();
+    const lane = await fakeLane(true, undefined, true);
+    lanes.push(lane);
+    const s = state(lane.base);
+    const url = "https://api.openai.com/v1/responses";
+    const a = { role: "user", content: "history A" };
+    const b = { role: "user", content: "replacement B" };
+    const c = { role: "user", content: "suffix C" };
+    const seed = fakeEvent({ model: "gpt-fixture", input: [a] }, "lost-replacement-ack", url);
+    await maybeIncrementalOpencode(seed.e, s);
+    opencodeIncrementalOnResponse(url, new Response("{}", { headers: { "x-bili-applied-seq": "1" } }), headersOf(seed.e.request as Request));
+    const replacement = fakeEvent({ model: "gpt-fixture", input: [b] }, "lost-replacement-ack", url);
+    await maybeIncrementalOpencode(replacement.e, s);
+    const replaced = await (replacement.e.request as Request).clone().json() as { resync: boolean; messages: unknown[] };
+    assert.equal(replaced.resync, true);
+    assert.deepEqual(replaced.messages, [b]);
+    // The server accepted B, but its response never reaches the adapter.
+    // Advance only the adapter's pending TTL, then return to the original branch.
+    const now = Date.now;
+    const advanced = now() + 31_000;
+    try {
+        Date.now = () => advanced;
+        const next = fakeEvent({ model: "gpt-fixture", input: [a, c] }, "lost-replacement-ack", url);
+        await maybeIncrementalOpencode(next.e, s);
+        const sent = await (next.e.request as Request).clone().json() as { sinceSeq: number; resync: boolean; messages: unknown[] };
+        assert.equal(sent.sinceSeq, 0, "an unacknowledged replacement invalidates the earlier prefix");
+        assert.equal(sent.resync, true);
+        assert.deepEqual(sent.messages, [a, c], "never append C to the server's replacement B");
+    } finally {
+        Date.now = now;
+    }
 });
 
 test("opencode incremental: seed swap (marker + shaped body, headers preserved), ack, then delta", async () => {
