@@ -275,6 +275,7 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         store2.closeQuietly();
         // shared singleton hygiene: leave no chain behind for later tests in this file
         prefixAffinity.forget("new");
+        prefixAffinity.forget("old");
         await closeServers([proxy2, upstream], "miss-seed phase 2");
         if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
         else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
@@ -334,6 +335,10 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
     const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
     delete process.env.BILI_MESSAGE_TIMESTAMPS;
     _resetSessionsForTest();
+    // Defense in depth: drop any stale "old" chain a previous test left in the
+    // shared singleton tracker so this test's phase-1 chain is the only "old"
+    // the phase-2 hydration can see (the #5608 Windows-CI stale-tracker race).
+    prefixAffinity.forget("old");
     // Ten distinct messages: the miss diagnostics only judge chains at or above
     // MIN_RESUME_PREFIX (8) — the truncated subview below stays just above that
     // floor so it still produces a closest candidate.
