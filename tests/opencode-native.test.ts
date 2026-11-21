@@ -1071,11 +1071,14 @@ test("#4669 composition: opencode inline chain — rewrites land on the inline e
     }
 });
 
-test("#4669 V2 composition: route rewrite + fetch chain serves INLINE_ORIGIN in-process", async () => {
-    // OpenCode 2.x production shape: the http.request route hook REPLACES the
-    // outgoing Request's target with `${INLINE_ORIGIN}/bili/<url>`, then the
-    // host's own fetch (patched by our chain) sends it. Route rewrite must
-    // compose with the inline link exactly like the intercept's own rewrite.
+test("#4669 V2 composition: inline route + fetch chain serves INLINE_ORIGIN in-process", async () => {
+    // OpenCode 2.x production shape: the http.request route hook pins
+    // state.proxyBase, then the host's own fetch (patched by our chain) sends
+    // the request. #5931: in inline mode the hook NO LONGER rewrites the URL
+    // to the pseudo-origin — a host whose fetch never passes through our chain
+    // would void those URLs — so the rewrite happens inside the chain's model
+    // branch, and this composition must land on the SAME engine input as the
+    // pre-#5931 route-side rewrite did.
     const ie = await import("../src/inline-engine.ts");
     const ni = await import("../src/agent/native-intercept.ts");
     const fc = await import("../src/agent/fetch-chain/index.ts");
@@ -1097,14 +1100,21 @@ test("#4669 V2 composition: route rewrite + fetch chain serves INLINE_ORIGIN in-
         piInline._resetInlineTransportForTest();
         piInline.installInlineTransport();
         const state: NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        // #5931: the rewrite now lives in the intercept's model branch, so the
+        // composition under test needs the full production chain installed
+        // (intercept + inline link), not just the inline link.
+        assert.equal(ni.installNativeFetchIntercept(state), true);
         const route = createNativeRoute(state, { probe: async () => true });
         const e: V2HttpRequestEvent = {
             sessionID: "ses_inline",
             request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
         };
-        await route(e, {});
-        assert.equal((e.request as Request).url, `${ie.INLINE_ORIGIN}/bili/${MODEL_URL}`, "route rewrites to the pseudo-origin");
-        // The host then sends the rewritten Request through global fetch.
+        const st: V2State = {};
+        await route(e, st);
+        assert.equal((e.request as Request).url, MODEL_URL, "#5931: inline mode keeps the real upstream URL on the wire");
+        assert.equal(st.proxyBase, ie.INLINE_ORIGIN, "stamping still binds to the inline engine origin");
+        // The host then sends the Request through global fetch; the chain's
+        // model branch performs the rewrite the route used to do.
         const r = await fetch(e.request as Request);
         assert.equal(r.status, 200);
         assert.equal(await r.text(), "inline-ok");
