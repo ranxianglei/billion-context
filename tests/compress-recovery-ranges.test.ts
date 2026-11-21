@@ -6,6 +6,7 @@ import { parseCompressInput } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { getSession } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
 import { liveCompressionRanges } from "../src/acp-status.ts";
 
 function spanContains(start: string, end: string, n: number): boolean {
@@ -27,6 +28,8 @@ function makeCtx(count: number, preserveRecentMessages = 5): RewriteCtx {
     }));
     const session = getSession(`compress-recovery-${randomUUID()}`);
     session.state.messageRefs = assignRefs(messages, { existing: emptyRefMap(), nextIndex: 0 }).map;
+    // #7318: legacy recommendation tail (default is now OFF).
+    storeUnpromptedGate(session, { nudgeInjected: false, requireNudge: false, requireRecommendation: false, postComPressTail: true });
     return {
         core: createCore(),
         config: defaultConfig(200000, { preserveRecentMessages, preserveRecentTokens: 0 }),
