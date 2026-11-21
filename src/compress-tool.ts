@@ -599,6 +599,25 @@ function decodeDoubleEscapedContent(input: unknown): Record<string, unknown> | u
     return { ...input, content: decoded };
 }
 
+// #6071: rejected line-form entries were logged without their payload, so an
+// unrecognized separator seen in the field had to be guessed from the model's
+// next retry. A bounded preview of the offending content (a bare string or
+// the string entries of a content array) pins the exact shape on first sight.
+// Server log only — never echoed into the model-facing receipt (#1454).
+function rejectedContentPreview(normalized: unknown): string | undefined {
+    const pieces: string[] = [];
+    if (typeof normalized === "string") pieces.push(normalized);
+    else if (isPlainObject(normalized)) {
+        const content = normalized["content"];
+        if (typeof content === "string") pieces.push(content);
+        else if (Array.isArray(content)) {
+            for (const item of content) if (typeof item === "string") pieces.push(item);
+        }
+    }
+    if (pieces.length === 0) return undefined;
+    return JSON.stringify(pieces.map((p) => p.slice(0, 150)).join(" // ").slice(0, 300));
+}
+
 // #5161: options.quiet suppresses every diagnostic log of this parse. The
 // internal #2749 scan (visibleSummaryStubs) re-parses ALL visible past compress
 // calls on every fold, and in external-summary mode a summary-less entry is
@@ -635,7 +654,8 @@ export function parseCompressInput(input: unknown, callId?: string, options: { q
         note(`[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s); summary text arrived in content alongside top-level refs`);
     }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
-        note(`[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
+        const preview = rejectedContentPreview(normalized);
+        note(`[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${preview !== undefined ? ` preview=${preview}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     } else if (parsed.diagnostics.invalidItems > 0 || parsed.diagnostics.kind === "truncated") {
         // #1494: partial drop — at least one range survived, so the old
         // condition above never fired and the rejection was invisible on both
