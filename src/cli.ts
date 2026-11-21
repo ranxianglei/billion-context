@@ -38,7 +38,8 @@ import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile, checkNamedConfigRef } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
-import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { checkForUpdate, forceInstallVersion, findInstallDir, readDiskVersion, startAutoUpdate } from "./update.js";
+import { clearPin, formatPinUntil, parsePinDuration, resolvePinState, writePin } from "./update-pin.js";
 import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
@@ -124,7 +125,14 @@ Usage:
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
                                    lines (default <dir>/bili.log), --no-log skips, --session SID filters
-  bili update                      check for & install a newer version now
+  bili update [version]            check for & install a newer version now — or
+                                   install an EXACT published version (master temp
+                                   builds included); an explicit install clears a pin
+  bili pin [duration]              hold the installed version: auto-upgrade keeps
+                                   checking & reporting but never installs; duration
+                                   1h/12h/1d/7d/forever (default forever); no arg =
+                                   show pin status
+  bili unpin                       release the pin now (same as: bili pin --clear)
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
                                     (read-only; --json for machine-readable output);
@@ -216,11 +224,14 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
+    command: "start" | "update" | "pin" | "unpin" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
     overrides: Record<string, string | undefined>;
+    updateVersion?: string;
+    pinDuration?: string;
+    pinClear?: boolean;
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
@@ -284,6 +295,9 @@ export function parseArgs(argv: string[]): Parsed {
     let storageDryRun = false;
     let jsonOutput = false;
     let doctorJson = false;
+    let updateVersion: string | undefined;
+    let pinDuration: string | undefined;
+    let pinClear = false;
     let doctorFix = false;
 
     for (let i = 0; i < argv.length; i++) {
@@ -327,6 +341,9 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--no-auto-update":
                 overrides.ACP_AUTO_UPDATE = "0";
+                break;
+            case "--clear":
+                pinClear = true;
                 break;
             case "--auto-restart-on-update":
                 overrides.ACP_AUTO_RESTART_ON_UPDATE = "1";
@@ -492,6 +509,10 @@ export function parseArgs(argv: string[]): Parsed {
             command = "start";
         } else if (cmd === "update") {
             command = "update";
+            updateVersion = positional[1];
+        } else if (cmd === "pin" || cmd === "unpin") {
+            command = cmd;
+            if (cmd === "pin") pinDuration = positional[1];
         } else if (cmd === "doctor") {
             command = "doctor";
         } else if (cmd === "export") {
@@ -585,6 +606,10 @@ export function parseArgs(argv: string[]): Parsed {
             process.exit(2);
         }
     }
+    if (pinClear && command !== "pin" && command !== "unpin") {
+        console.error("bili: --clear only applies to `bili pin`");
+        process.exit(2);
+    }
 
     // -i/-s posture flags (#5428): translate onto the existing lanes so the
     // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
@@ -612,11 +637,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, updateVersion, pinDuration, pinClear, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     // -c/--config fail-fast: a bare NAME that resolves to a missing
     // <configDir>/NAME.json names the typo + the available siblings instead of
     // silently starting on an empty config (see paths.ts for path behavior).
@@ -844,10 +869,67 @@ export async function main(): Promise<void> {
         } catch (e) {
             console.error(`bili update: config load failed (${String(e)}); updater egress goes direct`);
         }
+        if (updateVersion) {
+            // #6804: install an EXACT published version (release or master
+            // temp build). Explicit action: bypasses the throttle like a bare
+            // `bili update`, and forceInstallVersion clears any local pin on
+            // success (an explicit install beats a hold by definition).
+            const v = updateVersion.replace(/^v/, "");
+            const installDir = await findInstallDir(PACKAGE_NAME);
+            const disk = installDir ? await readDiskVersion(installDir) : undefined;
+            if ((disk ?? VERSION) === v) {
+                console.log(`Already on ${v} — nothing to do.`);
+                return;
+            }
+            const result = await forceInstallVersion(v, installDir, { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, "manual", "manual-cli");
+            if (!result.ok) {
+                console.error(`bili update: ${(result.error ?? "install failed").replace(/^advisory [^:]+: /, "")}`);
+                process.exit(1);
+            }
+            console.log(`Installed ${v}. Restart bili to finish.`);
+            return;
+        }
         await checkForUpdate(
             { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag },
             true,
         );
+        return;
+    }
+    if (command === "pin" || command === "unpin") {
+        // #6804: local version pin — hold the installed version. Auto-upgrade
+        // keeps checking + reporting but never installs (see the guard in
+        // checkForUpdate). Machine-level state in the cache dir
+        // (.pin.json); no config key. Pin target = the ON-DISK version when
+        // detectable (that is what the updater compares against), else the
+        // running version.
+        const installDir = await findInstallDir(PACKAGE_NAME);
+        const disk = installDir ? await readDiskVersion(installDir) : undefined;
+        const version = disk ?? VERSION;
+        if (command === "unpin" || pinClear) {
+            const removed = await clearPin();
+            console.log(removed ? `Pin on ${version} released. Auto-upgrade resumes on the next check.` : `No pin to release.`);
+            return;
+        }
+        if (!pinDuration) {
+            const state = await resolvePinState(version);
+            if (state.kind === "none") {
+                console.log(`No pin — installed ${version}, auto-upgrade is active. Set one with: bili pin [1h|12h|1d|7d|forever]`);
+            } else if (state.kind === "active") {
+                console.log(`Pinned ${version} — ${formatPinUntil(state.pin)} (set ${new Date(state.pin.setAt).toISOString()}). Release with: bili unpin`);
+            } else {
+                console.log(`No pin — the record on ${state.pin.version} ${state.kind === "expired" ? "expired" : `is stale (installed ${version})`} and was removed.`);
+            }
+            return;
+        }
+        const parsed = parsePinDuration(pinDuration);
+        if ("error" in parsed) {
+            console.error(parsed.error);
+            process.exit(2);
+        }
+        const now = Date.now();
+        const until = parsed.ms !== undefined ? now + parsed.ms : undefined;
+        await writePin({ v: 1, version, setAt: now, ...(until !== undefined ? { until } : {}) });
+        console.log(`Pinned ${version} — ${formatPinUntil({ until })}. Auto-upgrade keeps checking but will not install; release with: bili unpin`);
         return;
     }
     if (command === "test") {

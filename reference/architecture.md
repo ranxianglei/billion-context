@@ -317,6 +317,7 @@ billion-context/
 │   ├── turn-separator.ts         # Responses turn-separator id helpers, zero-dependency leaf (#2627)
 │   ├── uncovered.ts              # Uncovered-history audit: runs no active block can reach (#4331)
 │   ├── unprompted-gate.ts        # Gates refusing unprompted model-initiated compress (#5683)
+│   ├── update-pin.ts             # Local version pin + tag-channel auto-upgrade guard (#6804)
 │   ├── update-policy.ts          # Staggered upgrade draw + remote update-policy file (#3619)
 │   ├── upstream-ca.ts            # Merges network.caFile into bili's own outbound TLS trust (#3776)
 │   ├── upstream-throttle.ts      # Egress-side 429 governor: local hold, backoff, terminal 424 (#4204)
