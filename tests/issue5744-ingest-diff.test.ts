@@ -273,21 +273,21 @@ test("#5744: forced full-path save converges to the exact state the diff path le
     const rawDb = (store as unknown as { db: { prepare(q: string): { all(...a: unknown[]): unknown[] } } }).db;
 
     shadow.record(mkLegacy(SID, 200, 0, null));
-    shadow.record(mkLegacy(SID, 202, 0, null)); // delta turns
+    shadow.record(mkLegacy(SID, 202, 0, null)); // reconciled turns
 
     const snapshot = (): string => JSON.stringify([
         rawDb.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(SID),
         rawDb.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(SID),
         rawDb.prepare("SELECT block_id, ord, start_seq, end_seq, tier, summary_hash, one_hash, active, covered_hash FROM blocks WHERE session_id = ? ORDER BY ord").all(SID),
     ]);
-    const diffState = snapshot();
+    const firstState = snapshot();
 
-    // Force the next save down the full path: drop the watermark, keep the raw
-    // tail (complete-log full ingest). The authoritative-set contract means the
-    // three tables must come out BYTE-IDENTICAL to what the diff path wrote.
-    (shadow as unknown as { sync: { clearIngestWatermark(id: string): void } }).sync.clearIngestWatermark(SID);
+    // #3285/#4182: the watermark / delta-vs-full split is gone — every save is
+    // the reconciled path. The convergence contract now reads: re-saving the
+    // SAME log pins the existing rows by client-sent identity and adds
+    // nothing, so the three tables come out BYTE-IDENTICAL to the first save.
     shadow.record(mkLegacy(SID, 202, 0, null));
-    assert.equal(snapshot(), diffState, "full-path save reproduces the diff-path end state exactly");
+    assert.equal(snapshot(), firstState, "re-saved log converges to the exact state the first save left behind");
 });
 
 test("#5744: slow-ingest diagnostics expose WAL size and the last checkpoint triple", (t) => {

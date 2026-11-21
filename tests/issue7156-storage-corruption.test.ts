@@ -179,7 +179,7 @@ test("#7156 FIX 2: unifiedWebSummaries logs a warn when webSummaryRows throws (f
     }
 });
 
-test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (not REFUSING TO START)", { skip: SKIP }, () => {
+test("#7156 FIX 4: a corrupt index serves (open is zero-write) and the background quick_check alarms (ALARM-ONLY)", { skip: SKIP }, async () => {
     const dir = tmpDir();
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
@@ -196,20 +196,43 @@ test("#7156 FIX 4: a first-post-open-write corruption starts WITHOUT the index (
         }
         ro.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         ro.close();
-        // Corrupt page 2: open() survives (async mode — the sync quick_check never
-        // runs), but the first write (resetAllIngestWatermarks) throws CORRUPT.
+        // Corrupt page 2 (the schema-overflow page): open() survives — it is now
+        // ZERO-WRITE (the #3285 watermark reset is gone), so the corruption is
+        // detected by the ASYNC BACKGROUND quick_check (ALARM-ONLY, no
+        // boot-blocking verdict; owner policy 2026-10-30: runtime findings
+        // never refuse future boots — each boot re-scans fresh).
         zeroPage(p, 2);
         setIntegritySyncThresholdForTests(1); // force async mode for any size
         const errors: string[] = [];
         setLogCapture((level, msg) => { if (level === "error") errors.push(String(msg)); });
         try {
             const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-            assert.equal(sh, null, "a first-write corruption yields 'no sidecar' (start without index) — never a REFUSING-TO-START throw");
-            assert.equal(hadIntegrityQuickCheckFailure(), true, "the integrity latch tripped");
+            assert.ok(sh, "open is zero-write — a corrupt index opens cleanly; the store serves unverified");
+            sh.record({
+                id: "sess-corrupt",
+                createdAt: 1_000,
+                lastSeen: 2_000,
+                meta: { protocol: "anthropic" },
+                stats: { requests: 1 },
+                metadata: {},
+                state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+                blockContents: new Map(),
+                lastMessages: [{ id: "h_1", role: "user", contentType: "text", text: "hi" }] as never,
+                lastMessagesFolded: false,
+            });
+            // The first ingest write does NOT throw — the store serves unverified.
+            // The corruption is detected by the ASYNC BACKGROUND quick_check
+            // (ALARM-ONLY). Wait for it to log its verdict.
+            const deadline = Date.now() + 5000;
+            while (Date.now() < deadline) {
+                if (errors.some((m) => m.includes("background quick_check"))) break;
+                await new Promise((r) => setTimeout(r, 50));
+            }
             assert.ok(
-                errors.some((m) => m.includes("first post-open write")),
-                `the error names the first-write corruption; got ${JSON.stringify(errors)}`,
+                errors.some((m) => m.includes("background quick_check") && (m.includes("FAILED") || m.includes("corruption-shaped error"))),
+                `the background quick_check detected the corruption (ALARM-ONLY); got ${JSON.stringify(errors)}`,
             );
+            sh.close();
         } finally {
             setLogCapture(null);
         }
