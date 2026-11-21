@@ -189,6 +189,8 @@ test("#7156 pure-sqlite DEFAULT: a proven-corrupt index REFUSES TO START (throws
 
 test("#7156 escape hatch: BILI_STORAGE_ALLOW_LEGACY_DEGRADE restores the historical alarm-and-degrade", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "sqlite"; // wire 'requested' resolves from the REAL process env; a legacy ambient pin would blank the reason (same pin as the refusal test above)
     try {
         corruptFixture(dir);
         resetLatches();
@@ -199,6 +201,8 @@ test("#7156 escape hatch: BILI_STORAGE_ALLOW_LEGACY_DEGRADE restores the histori
         assert.match(wire.reason ?? "", /WITHOUT the index/i);
         assert.equal(wire.degraded, true);
     } finally {
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         resetLatches();
         rmSync(dir, { recursive: true, force: true });
     }
@@ -206,6 +210,8 @@ test("#7156 escape hatch: BILI_STORAGE_ALLOW_LEGACY_DEGRADE restores the histori
 
 test("#7156 refusal is RECORDED for the diagnostics surface and repeats on every boot", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "sqlite"; // wire 'requested' resolves from the REAL process env; a legacy ambient pin would blank the reason (same pin as the refusal test above)
     try {
         corruptFixture(dir);
         resetLatches();
@@ -218,6 +224,8 @@ test("#7156 refusal is RECORDED for the diagnostics surface and repeats on every
         const wire = storageStatusWire();
         assert.match(wire.reason ?? "", /REFUSES TO START/i);
     } finally {
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         resetLatches();
         rmSync(dir, { recursive: true, force: true });
     }
