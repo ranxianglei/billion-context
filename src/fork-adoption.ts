@@ -533,7 +533,7 @@ export function maybeAdoptResume(args: {
         session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
     log(
         "info",
-        `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
+        `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}${plan.straddled > 0 ? `, ${plan.straddled} active block(s) straddled the fork point (adopted once fully present, #6122)` : ""}; stale citations now resolve to their original messages (#1486)`,
     );
     const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
     const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
