@@ -72,24 +72,24 @@ test("recoverEgressBase: corrupt tail walks back to the newest healthy point and
     }
 });
 
-test("recoverEgressBase: no healthy point at all returns null (session-level recovery)", () => {
+test("recoverEgressBase: no healthy point at all returns null (hard fail, ruling 7439-5)", () => {
     const H = open();
     try {
+        // a ROW-LESS session is the one legitimate empty-flow case (turn-1 bootstrap)
+        const fresh = recoverEgressBase(H.store, "sess-empty");
+        assert.ok(fresh !== null && fresh.view.length === 0 && fresh.seq === 0 && fresh.degraded === false, "row-less session recovers to the clean bootstrap point");
         let view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: [M("m1", "alpha")], systemText: "sys", nowMs: 1 });
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 2 });
-        // structurally corrupt EVERY op row in both tables => the only healthy
-        // point is the empty flow (seq 0) = the bootstrap point
+        // structurally corrupt EVERY op row in both tables => every prefix
+        // replay throws, including the empty floor. A session that HAS rows
+        // and no healthy non-empty point is whole-flow-unreadable: the
+        // ladder must return null so the caller hard-fails — the old
+        // empty-floor escape let the seam re-record client bytes (#7439-5).
         H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
         H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
         const got = recoverEgressBase(H.store, S);
-        assert.ok(got !== null, "the empty flow is always a valid recovery point");
-        assert.equal(got.degraded, true);
-        assert.equal(got.seq, 0, "recovered to the bootstrap point");
-        assert.equal(got.view.length, 0);
-        assert.equal(H.store.egressStateMaxSeq(S), 0, "flow collapsed to empty");
-        // the next turn re-records the full batch (self-heal)
-        view = recordEgressTurn({ store: H.store, sessionId: S, prev: got.view, conversation: [M("m1", "alpha")], systemText: "sys", nowMs: 3 });
-        assert.equal(view.length, 2, "bootstrap re-record: system + m1");
+        assert.equal(got, null, "rows present + no healthy point => null (hard fail, never client bytes)");
+        assert.equal(H.store.egressStateMaxSeq(S), 3, "nothing truncated — the corrupt rows stay for the operator");
     } finally {
         H.db.close();
         fs.rmSync(H.dir, { recursive: true, force: true });
@@ -110,31 +110,44 @@ test("egressAuthorityProbe: identity + order + sampled-byte rows (#3617 both dir
     assert.equal(egressAuthorityProbe(base, [M("m9", "fresh")], S, quiet), true, "all-fresh client rows pass");
 });
 
-import { serveLaneCore, recordLaneTurn } from "../src/server/egress-lane-io.ts";
+import { serveLaneTurn, recordLaneTurn, rebuildLaneCore } from "../src/server/egress-lane-io.ts";
 
-test("egress-lane-io: serve/record round-trip + corrupt degrade (all-lanes helper, ruling 7439-4)", () => {
+test("egress-lane-io: serveLaneTurn records first, then serves the written view (#7439-4, P1-1 regression)", () => {
     const H = open();
     try {
-        // empty flow => nothing to serve (bootstrap turn records instead)
-        assert.equal(serveLaneCore(H.store, S, quiet), null, "empty flow serves nothing");
-        recordLaneTurn(H.store, S, [M("m1", "alpha"), M("m2", "beta")], "sys", quiet);
-        // second turn: the recorded core comes back lane-neutral (no system row, no wire shape)
-        const served = serveLaneCore(H.store, S, quiet);
-        assert.ok(served !== null, "a recorded flow serves");
-        assert.deepEqual(served.map((m) => m.id), ["m1", "m2"], "core rows only — the system row stays out");
-        assert.equal(served[0].text, "alpha");
+        // empty flow => nothing to rebuild (bootstrap turn records instead)
+        assert.equal(rebuildLaneCore(H.store, S, quiet), null, "empty flow serves nothing");
+        // turn 1: recorded AND served in the same call — the served core
+        // must already contain this turn's messages (record-first)
+        const t1 = serveLaneTurn({ st: H.store, sessionId: S, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", log: quiet });
+        assert.ok(t1 !== null, "a recorded flow serves");
+        assert.deepEqual(t1.map((m) => m.id), ["m1", "m2"], "core rows only — the system row stays out");
+        assert.equal(t1[0].text, "alpha");
+        const rowsBefore = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
+        // turn 2: the NEW message must ride out (pre-fix serve-before-record
+        // dropped it and froze the flow on a zero-op diff)
+        const t2 = serveLaneTurn({ st: H.store, sessionId: S, conversation: [M("m1", "alpha"), M("m2", "beta"), M("m3", "gamma")], systemText: "sys", log: quiet });
+        assert.ok(t2 !== null, "turn 2 serves");
+        assert.deepEqual(t2.map((m) => m.id), ["m1", "m2", "m3"], "the served core contains THIS turn's new message");
+        const rowsAfter = H.db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number };
+        assert.ok(rowsAfter.n > rowsBefore.n, `the flow keeps appending — it is not frozen (before: ${rowsBefore.n}, after: ${rowsAfter.n})`);
         // a single corrupt tail row does NOT degrade — the ladder walks back
-        // and truncates, then serves the newest healthy point
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
-        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
-        const partial = serveLaneCore(H.store, S, quiet);
+        // and truncates, then serves the newest healthy point. Target the ACTUAL
+        // max log_seq (a hardcoded 5 no-ops when the flow has 4 rows: the
+        // UPDATE matches nothing and the healthy flow serves unchanged).
+        const maxSeq = (H.db.prepare("SELECT MAX(log_seq) AS x FROM egress_flow WHERE session_id = ?").get(S) as { x: number }).x;
+        assert.ok(maxSeq >= 4, `the flow has the expected tail (max_seq: ${maxSeq})`);
+        H.db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = ?").run('{"x":1}', S, maxSeq);
+        H.db.prepare("UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = ?").run('{"x":1}', S, maxSeq);
+        const partial = rebuildLaneCore(H.store, S, quiet);
         assert.ok(partial !== null, "ladder recovery still serves the healthy point");
-        assert.deepEqual(partial.map((m) => m.id), ["m1"], "served core = the healthy point (m2 row truncated away)");
-        // total corruption (no healthy point except the empty flow) => serve
-        // degrades to null and the lane keeps its legacy core
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
-        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
-        assert.equal(serveLaneCore(H.store, S, quiet), null, "no healthy point degrades to legacy (never throws)");
+        assert.deepEqual(partial.map((m) => m.id), ["m1", "m2"], "served core = the healthy point (m3 row truncated away)");
+        // total corruption (no healthy point) => the lane rebuild returns
+        // null; the pinned seam hard-fails the turn on that (ruling 7439-5)
+        H.db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'").run('{"x":1}', S);
+        H.db.prepare("UPDATE egress_state SET payload = ? WHERE session_id = ? AND row_type != 'D'").run('{"x":1}', S);
+        assert.equal(rebuildLaneCore(H.store, S, quiet), null, "no healthy point => null (the seam hard-fails; never throws)");
+        void recordLaneTurn;
     } finally {
         H.db.close();
         fs.rmSync(H.dir, { recursive: true, force: true });

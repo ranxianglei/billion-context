@@ -114,10 +114,14 @@ interface ViewRow {
 
 interface SnapshotRenderDeps {
     sessionId: string;
-    /** #3812: plugin lanes are client-authoritative by design (the plugin
-     *  contract carries the host's own history management — divert paths,
-     *  incremental turns). They bypass this engine entirely: no render, no
-     *  degrade marker, nothing observed. */
+    /** #3812: plugin lanes bypass this engine's RENDER (no snapshot render,
+     *  no degrade marker, nothing observed) — the D-lane stays off for them.
+     *  NOTE (7439 ruling 5, 2026-11-21): "client-authoritative by design" is
+     *  OVERRIDDEN for pinned plugin sessions on the OpenAI wire — the
+     *  egress-authority seam in prepare-openai.ts serves their kernel input
+     *  from the op-log (server bytes win, client resends are the identity
+     *  channel). This bypass only means the D-lane render below never runs;
+     *  the egress plane is a different surface. */
     pluginMode?: boolean;
     log?: (level: string, msg: string) => void;
 }
@@ -522,7 +526,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     // live view — every early-return / degrade / shadow path leaves it unset,
     // which is exactly when the outbound is raw client bytes (legacy I1/I2 applies).
     delete session.metadata["snapshotRenderTailStart"];
-    if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
+    if (deps.pluginMode) return clientMsgs; // plugin lane: D-lane render stays off (see 7439 ruling 5 note above)
     const live = featureEnabled("snapshotRender");
     const shadow = !live && shadowLaneEnabled();
     if (!live && !shadow) return clientMsgs;

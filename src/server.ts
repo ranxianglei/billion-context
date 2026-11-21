@@ -167,6 +167,7 @@ import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
 import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 import { FoundationRejectError } from "./snapshot/plane.js";
+import { EgressAuthorityRejectError } from "./storage/egress-record.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -797,6 +798,20 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 if (!res.headersSent) {
                     res.writeHead(400, { "content-type": "application/json", "x-bili-snapshot": "identity" });
                     res.end(JSON.stringify({ error: { message: err.message, type: "snapshot_identity_fault" } }));
+                } else {
+                    res.end();
+                }
+                return;
+            }
+            // #6785 ruling 7439-5: a pinned session whose op-log has no
+            // healthy point fails the turn — a 500 with the unreadable
+            // marker, never the generic forward-on-client-bytes degrade.
+            // The session latches metadata.egressFlowUnreadable, so retries
+            // hit the same error until session-level recovery.
+            if (err instanceof EgressAuthorityRejectError) {
+                if (!res.headersSent) {
+                    res.writeHead(500, { "content-type": "application/json", "x-bili-egress": "unreadable" });
+                    res.end(JSON.stringify({ error: { message: err.message, type: "egress_flow_unreadable" } }));
                 } else {
                     res.end();
                 }

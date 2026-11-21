@@ -27,6 +27,19 @@
 
 import { diffEgressView, type EgressOp, type EgressViewRow } from "./egress-state.js";
 
+/** #6785 ruling 7439-5: a pinned (server-authoritative) session whose op-log
+ * has NO healthy point must FAIL the turn — never run on client bytes, never
+ * degrade to legacy. Thrown by the egress-authority seam and rethrown into
+ * the server funnel by the lane catch (like FoundationRejectError) so the
+ * generic "kernel transform failed, forwarding unchanged" path — which
+ * would forward the client's own bytes — can never swallow it. */
+export class EgressAuthorityRejectError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "EgressAuthorityRejectError";
+    }
+}
+
 /** Constant msgid of the system block row (no hash — identity is the
  * role, not the content; a system change is a +U carrying the new bytes). */
 export const EGRESS_SYSTEM_MSGID = "egress-system";
@@ -130,9 +143,16 @@ const EGRESS_HEALTHY_WALK_MAX = 16;
  * (bounded walk) and TRUNCATE past it: rows beyond a corrupt point are
  * unusable by definition (no replay can ever include them), so recovery
  * means flowing back to the last healthy point in the tables themselves —
- * never to the client's bytes. Returns null = no healthy point at all
- * (session-level recovery: the caller logs the marker and serves legacy for
- * this turn only). The truncated count is observability for the warn log. */
+ * never to the client's bytes. Returns null = no healthy NON-EMPTY point:
+ * a session that HAS rows but none that replay is whole-flow-unreadable,
+ * and the caller hard-fails the turn instead of falling back to client
+ * bytes (ruling 7439-5). The only legitimate empty flow is a ROW-LESS
+ * session, which the try path above returns as seq 0 / degraded=false
+ * (the turn-1 bootstrap). An empty replay at a lower log_seq while rows
+ * exist is corruption reaching the floor, not a live empty session — an
+ * empty base row is never written (recordEgressTurn no-ops an empty diff
+ * and compaction only runs on non-empty views). The truncated count is
+ * observability for the warn log. */
 export function recoverEgressBase(
     store: EgressOpLogStore,
     sessionId: string,
@@ -146,7 +166,7 @@ export function recoverEgressBase(
         for (let x = maxSeq - 1; x >= floor; x--) {
             try {
                 const view = store.egressStateViewAt(sessionId, x);
-                if (view.length > 0 || x === 0) {
+                if (view.length > 0) {
                     const truncated = store.egressStateTruncateAfter(sessionId, x);
                     return { view, seq: x, degraded: true, truncated };
                 }

@@ -52,7 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { recordLaneTurn, serveLaneCore } from "./egress-lane-io.js";
+import { serveLaneTurn } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -562,25 +562,28 @@ export async function prepareAnthropic(
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core from
-        // the egress op-log (no title-gen side requests ride this lane, so no
-        // extra gate). The lane's own conversion chain turns it into wire below.
-        if (featureEnabled("egressPlane")) {
-            const st = getStore().egressOpLogStore();
-            const served = st ? serveLaneCore(st, sessionId, log) : null;
-            if (served !== null) egressMessages = served;
-        }
+        // #7398 all-lanes (ruling 7439-4): the egress round-trip for this
+        // lane runs AFTER injectSystem below — the recorded system row must
+        // be the lane's OUTBOUND system, post-injection (a pre-injection
+        // client head would make the +U-visible system drift meaningless);
+        // the pre-injection core is captured here so the record sees this
+        // turn's messages regardless of the serve swap.
+        const laneCoreForRecord = egressMessages;
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
-        // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
-        if (featureEnabled("egressPlane")) {
-            const st = getStore().egressOpLogStore();
-            if (st) recordLaneTurn(st, sessionId, egressMessages, extractSystem(systemOut) ?? "", log);
-        }
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
+        // #7398 all-lanes (ruling 7439-4): record THIS turn's core view, then
+        // serve the view that call just wrote (record-first — the served
+        // core must contain this turn's new message; see egress-lane-io).
+        // No title-gen side requests ride this lane, so no extra gate.
+        if (featureEnabled("egressPlane")) {
+            const st = getStore().egressOpLogStore();
+            const served = st ? serveLaneTurn({ st, sessionId, conversation: laneCoreForRecord, systemText: extractSystem(systemOut) ?? "", log }) : null;
+            if (served !== null) rebuiltMessages = coreToAnthropic(served, anthropicCacheMarks ?? clientCacheControls);
+        }
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO

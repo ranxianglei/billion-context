@@ -51,7 +51,7 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recoverEgressBase, recordEgressTurn } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
 // Structural mirror of egress-record.ts's EgressSourceMsg (kept private
 // there by the unused-export gate): the recording seam only reads this shape.
@@ -188,7 +188,7 @@ export async function prepareOpenai(
     let legacyCoreElements: unknown = undefined;
     let egressBaseRows: EgressViewRow[] | null = null;
     let egressSwapApplied = false;
-    let egressDegraded = false;
+    let egressBootstrap = false;
     let egressArmed = false;
     let egressServedFromLog = false;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
@@ -376,20 +376,37 @@ export async function prepareOpenai(
         // and trip #1001/#2432/#4521). The proxy lane gets ruling 5 on the
         // EGRESS side (outbound served from the log); the pinned plugin lane
         // gets it end-to-end (kernel input + outbound).
-        // Degrade (never guess, never client-as-authority): store missing,
-        // empty/unreadable flow, unrebuildable view, or a failed probe → this
-        // turn runs the legacy client-byte path and re-attempts next turn.
+        // Degrade (never guess, never client-as-authority): store missing or
+        // an unrebuildable view → the swap simply does not happen this turn
+        // (record still runs — see below — and the next turn re-attempts).
+        // Hard failure (ruling 7439-5's one non-negotiable): NO healthy flow
+        // point at all → the request fails, it does NOT run on client bytes
+        // (a divergent client being served as authority is the exact
+        // condition the ruling forbids); the marker latches for the operator
+        // and the client's retry hits the same error until recovery.
+        // Bootstrap: an armed turn with an EMPTY flow is the turn-1 cold start
+        // the ruling allows — the client bytes enter the flow exactly once
+        // (the record below), from turn 2 the log is the content source.
         egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
         if (egressArmed) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 const base0 = recoverEgressBase(st, sessionId);
                 if (base0 === null) {
-                    log("error", `[${sessionId}] egress-authority: no healthy flow point — session-level recovery required (ruling 7439-5); legacy bytes this turn`);
+                    log("error", `[${sessionId}] egress-authority: no healthy flow point — refusing to run on client bytes (ruling 7439-5); latching egressFlowUnreadable, session-level recovery required`);
+                    session.metadata["egressFlowUnreadable"] = true;
+                    throw new EgressAuthorityRejectError(`egress-authority: session ${sessionId} has no healthy op-log point (ruling 7439-5) — failing the turn instead of trusting client bytes`);
+                }
+                egressBaseRows = base0.view;
+                if (base0.view.length === 0) {
+                    // Turn-1 cold start (ruling 7439-5): the client bytes are
+                    // the content source EXACTLY ONCE — the record below puts
+                    // them in the flow; from turn 2 this branch never runs
+                    // again for a healthy session.
+                    egressBootstrap = true;
+                    log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1 of the op-log)`);
                 } else {
-                    egressBaseRows = base0.view;
-                    egressDegraded = base0.degraded;
-                    const base = (base0.view.length > 0 ? rebuildCoreFromLog(base0.view) : null) ?? [];
+                    const base = rebuildCoreFromLog(base0.view) ?? [];
                     if (base.length > 0 && egressAuthorityProbe(base, msgs, sessionId, log)) {
                         const baseById = new Map(base.map((m) => [m.id, m] as const));
                         msgs = msgs.map((c) => baseById.get(c.id) ?? c);
@@ -852,6 +869,10 @@ export async function prepareOpenai(
         // BEFORE the generic 503; zero kernel side effects by construction
         // (it throws before processTurn).
         if (err instanceof FoundationRejectError) throw err;
+        // Ruling 7439-5: an unreadable op-log on a pinned session is a hard
+        // fail (500 + x-bili-egress: unreadable) — the generic forward
+        // below would send the CLIENT'S bytes, which the ruling forbids.
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
@@ -961,7 +982,11 @@ export async function prepareOpenai(
     // the serve path already ran or when the authority seam ran but did not
     // swap (ruling 7439-5: never advance the flow with untrusted client
     // bytes); a corrupt log skips this turn and self-heals next.
-    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied)) {
+    // The bootstrap exception (ruling 7439-5 turn 1): an armed turn with an
+    // empty flow records the client view ONCE — that is the cold start, not
+    // "untrusted bytes advancing the flow" (there is no flow to advance
+    // against; from turn 2 the armed gate is fully enforced again).
+    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied && !egressBootstrap)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -982,7 +1007,8 @@ export async function prepareOpenai(
     // from the log and byte-compare against the legacy elements. NO
     // swap: the pipeline always sends the legacy bytes; this measures the
     // identity rate the swap will rely on (rollout egressPlane, default 0;
-    // reads the hydrated flow view).
+    // reads the hydrated flow view — on a bootstrap turn that is the view
+    // the record above just wrote, i.e. an exact self-compare).
     if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();

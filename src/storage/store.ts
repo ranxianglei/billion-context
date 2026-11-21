@@ -2039,33 +2039,13 @@ export class UnifiedStore {
         return Number(a.changes) + Number(b.changes);
     }
 
-    /** #7398: delete the session's egress op-log rows (state AND flow) and
-     *  return the unified-content-CAS refs the rows carried (cas_ref on I/U
-     *  ops, casRef on B-row entries). The recorder's puts are the sole owner
-     *  of those refs (message bodies are additionally pinned by their own
-     *  messages rows); callers release + collect exactly as for other CAS.
-     *  Runs inside the caller's sweep transaction. */
-    deleteEgressOps(sessionId: string): string[] {
-        const refs: string[] = [];
-        const take = (payload: string): void => {
-            let parsed: { cas_ref?: unknown; entries?: unknown };
-            try {
-                parsed = JSON.parse(payload) as { cas_ref?: unknown; entries?: unknown };
-            } catch {
-                return;
-            }
-            if (typeof parsed.cas_ref === "string") refs.push(parsed.cas_ref);
-            if (Array.isArray(parsed.entries)) {
-                for (const e of parsed.entries as Array<{ casRef?: unknown }>) {
-                    if (typeof e.casRef === "string") refs.push(e.casRef);
-                }
-            }
-        };
-        for (const r of this.db.prepare("SELECT payload FROM egress_state WHERE session_id = ?").all(sessionId) as Array<{ payload: string }>) take(r.payload);
-        for (const r of this.db.prepare("SELECT payload FROM egress_flow WHERE session_id = ?").all(sessionId) as Array<{ payload: string }>) take(r.payload);
+    /** #7398: delete the session's egress op-log rows (state AND flow).
+     *  Egress rows are self-contained (ruling 7439-1: the bytes live in the
+     *  rows) — there is no content-CAS to release. Runs inside the caller's
+     *  sweep transaction. */
+    deleteEgressOps(sessionId: string): void {
         this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
         this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
-        return refs;
     }
 
 
@@ -2528,7 +2508,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
-            refs.push(...this.deleteEgressOps(sessionId));
+            this.deleteEgressOps(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
@@ -2781,7 +2761,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
-            rel.push(...this.deleteEgressOps(sessionId));
+            this.deleteEgressOps(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);

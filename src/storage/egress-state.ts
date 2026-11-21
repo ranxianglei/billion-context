@@ -143,9 +143,10 @@ export function egressReplay(prev: EgressViewRow[], ops: EgressOp[]): EgressView
 /** Deterministic diff between two consecutive views (owner design, 4 upper
  * cases: tail append / nudge appear+vanish / fold replace / content edit).
  *
- * Spine = the longest subsequence of `next` whose msgids appear in `prev` in
- * INCREASING prev order (pointer scan, O(n+m); exact for the sparse-change
- * regime this lane exists for). Spine rows with CHANGED BYTES (direct
+ * Spine = a monotonically increasing subsequence of `next` whose msgids
+ * appear in `prev` (greedy pointer scan, O(n+m); any monotone sub-spine
+ * replays equivalently, the greedy one is what this implementation picks).
+ * Spine rows with CHANGED BYTES (direct
  * inequality — no hash) emit +U; everything else emits -D (maximal
  * contiguous runs in PREV order) plus +I in NEXT order with the preceding
  * row as anchor. egressReplay(prev, diff) always reproduces `next` exactly.
