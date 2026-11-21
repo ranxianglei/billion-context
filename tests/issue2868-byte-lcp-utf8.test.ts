@@ -186,3 +186,30 @@ test("seam forensics reports byte-exact lcpBytes for CJK bodies", () => {
     assert.equal(ev!.lcpBytes, utf8Lcp(b1, b2), "SeamEvent.lcpBytes must be real UTF-8 bytes");
     assert.notEqual(ev!.lcpBytes, codeUnitLcp(b1, b2), "must NOT be the old code-unit value");
 });
+
+// #7149 batch3-1: byte-identical re-notes inherit the digest via a pure byte
+// compare (zero hashing on the common non-streaming settle path). The
+// inherited value MUST equal the full-body sha256 — `bd` stays the
+// ground-truth equality proof (#2131), only its derivation is memoized.
+test("byte-identical re-note inherits the digest (delta anchoring, #7149 batch3)", () => {
+    const b = JSON.stringify({ model: "m", messages: [{ role: "user", content: "重复的载荷".repeat(300) }] });
+    const s = makeSession();
+    noteForwardedBody(s, b);
+    settle(s, T0, 100_000, 99_000);
+    // Non-streaming settle re-notes the identical wire body: no new hash, the
+    // inherited bd equals what an independent full digest would produce.
+    noteForwardedBody(s, b);
+    settle(s, T0 + 1000, 100_000, 99_000);
+    const line = lastLine(s);
+    assert.equal(line.bd, createHash("sha256").update(b, "utf8").digest("hex"), "inherited bd equals the independent full digest");
+    assert.equal(line.be, 1, "identical re-note still settles as body-stable");
+
+    // A changed body recomputes a fresh digest and settles as changed.
+    const b2 = JSON.stringify({ model: "m", messages: [{ role: "user", content: "重复的载荷".repeat(299) }] });
+    noteForwardedBody(s, b2);
+    settle(s, T0 + 2000, 100_000, 90_000);
+    const line2 = lastLine(s);
+    assert.notEqual(line2.bd, line.bd);
+    assert.equal(line2.bd, createHash("sha256").update(b2, "utf8").digest("hex"), "changed body gets a fresh full digest");
+    assert.equal(line2.be, 0);
+});
