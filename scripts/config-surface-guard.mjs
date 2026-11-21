@@ -70,7 +70,7 @@ export function stripComments(src) {
 
 // Given src and the index of an opening "{", return the text between the matched
 // braces (exclusive of the braces). Tracks (), [], {} depth and string state.
-function objectBody(src, openIdx) {
+export function objectBody(src, openIdx) {
     let depth = 0;
     let inStr = null;
     for (let i = openIdx; i < src.length; i++) {

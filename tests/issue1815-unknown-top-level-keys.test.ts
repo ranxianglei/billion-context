@@ -122,11 +122,17 @@ test("#1815: the full documented top-level surface produces no warning (#2062)",
             JSON.stringify({
                 port: 8787, host: "127.0.0.1", upstream: "https://api.example.com/v1",
                 providersPath: "./providers.json", providers: {}, proxy: "http://127.0.0.1:7890",
+                // #7483: modelEndpointPatterns was consumed (parseModelEndpointPatterns) but
+                // missing from KNOWN_TOP_LEVEL_KEYS — a valid config warned as unknown.
+                modelEndpointPatterns: [{ match: "https://api.example.com/v2/chat/completions", wire: "openai" }],
                 modelContextLimit: 200000, sessionHeader: true, log: true, debug: true, dumpSse: false,
                 passthrough: {}, autoUpdate: true, autoRestartOnUpdate: true, updateTag: "latest",
                 advisoryCheck: false, advisoryUrl: "", releaseNotesCheck: false, releaseNotesUrl: "",
                 upstreamProxy: "", upstreamProxyMode: "direct",
-                logFile: "", compress: { promptPack: "lean" }, promptCache: {}, mitm: {}, maskHosts: true,
+                logFile: "", compress: { promptPack: "lean" }, promptCache: {}, mitm: {},
+                // #7483: snapshot.shadow was consumed (snapshot-render) but missing from
+                // KNOWN_TOP_LEVEL_KEYS — a valid config warned as unknown.
+                snapshot: { shadow: false }, maskHosts: true,
                 subagentSplit: true, forkAdoption: false, resumeInheritance: true,
                 chainContentDetection: true, chainEgressStamp: false, stableSystemAnchor: false,
                 dsh: {},
