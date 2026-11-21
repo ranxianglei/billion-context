@@ -343,8 +343,11 @@ pure-stdlib Python module shipped inside the npm package:
   opt in), the 8787 user-zone daemon as last-resort fallback — or spawns its
   own on an ephemeral port (declared `lane: hermes` so no other lane can ride
   it; parent-pid watchdog tears it down when
-  hermes exits; concurrent starts arbitrate through the same starting-marker
-  protocol the launcher uses). Only once the proxy is verified healthy does it
+  hermes exits — the plugin registers its pid with the heartbeat opt-in
+  (`hb: true`) and beats it to the proxy every 5 s (#7491), so the watchdog
+  ages a dead host out by heartbeat silence even when its pid is recycled,
+  which kill-0 alone cannot prove (#3544); concurrent starts arbitrate
+  through the same starting-marker protocol the launcher uses). Only once the proxy is verified healthy does it
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
   `SSL_CERT_FILE` (bili's combined CA bundle — current hermes resolves ambient
   trust there; `HERMES_CA_BUNDLE` stays set for older builds) —
