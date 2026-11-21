@@ -584,6 +584,17 @@ export function migrateSchema(db: {
         // envelope); NULL/0 = not latched, else the epoch-ms of the latch.
         if (!l1Cols.includes("r3_latched_at")) db.exec("ALTER TABLE l1_world ADD COLUMN r3_latched_at INTEGER");
     }
+    // #7439 step 6: blocks self-contained — the summary bytes and msgid
+    // coordinates move INTO the blocks table (zero cross-table pointers).
+    // PROBE-FIRST, not version-gated: the blocks table is a master table
+    // (pre-existing), so a probe-first ALTER is the safe pattern.
+    const blocksCols = (db.prepare("PRAGMA table_info(blocks)").all() as unknown as { name?: unknown }[])
+        .map((c) => (typeof c?.name === "string" ? c.name : ""));
+    if (blocksCols.length > 0) {
+        if (!blocksCols.includes("summary_bytes")) db.exec("ALTER TABLE blocks ADD COLUMN summary_bytes BLOB");
+        if (!blocksCols.includes("start_msgid")) db.exec("ALTER TABLE blocks ADD COLUMN start_msgid TEXT");
+        if (!blocksCols.includes("end_msgid")) db.exec("ALTER TABLE blocks ADD COLUMN end_msgid TEXT");
+    }
     // #6785 step 6: ccr_entries.orig_hash — PROBE-FIRST, not version-gated:
     // a db whose user_version is already at the current version (the #5855
     // field build wrote v12/v13 into shared databases) takes the early
