@@ -1310,6 +1310,7 @@ const assignRefsNode: PipelineNode = {
       isProtected: protectedFn,
       // Ephemeral retrieval injections never consume a ref slot.
       shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
+      deadRefs: io.state.deadRefs,
     });
     // #3939 ②/#3805: a BLOCKED→numeric migration mints the ref NOW but the
     // carrier's <acp> tag render is DEFERRED to the next fold boundary —

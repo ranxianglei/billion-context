@@ -37,6 +37,7 @@ export function rebuildCompressionState(
     existing: state.messageRefs,
     nextIndex: highestUsedIndex(state.messageRefs) + 1,
     shouldSkip: (m) => m.id.startsWith(RETRIEVED_ID_PREFIX),
+    deadRefs: state.deadRefs,
   });
   let working: CompressionState = { ...state, messageRefs: refResult.map };
 

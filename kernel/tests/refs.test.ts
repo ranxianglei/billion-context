@@ -11,7 +11,8 @@ import {
   refToIndex,
   rebuildRefIndex,
 } from "../src/refs.js";
-import type { CoreMessage } from "../src/types.js";
+import { createInitialState } from "../src/state.js";
+import type { CompressionState, CoreMessage } from "../src/types.js";
 
 function msg(id: string, role: CoreMessage["role"] = "user"): CoreMessage {
   return { id, role, contentType: "text", text: id };
@@ -121,14 +122,94 @@ test("assignRefs skips messages per shouldSkip", () => {
   assert.equal(refForRaw(result.map, "c"), "m00002");
 });
 
-test("assignRefs skips free indices already taken (no collision)", () => {
+test("assignRefs starts above an orphan byRef high-water", () => {
   const existing = emptyRefMap();
   existing.byRaw["old"] = "m00002";
   existing.byRef["m00002"] = "old";
+  // An orphan reservation can keep a byRef key without a byRaw owner. Its
+  // number is still issued, so the new allocation starts above it.
+  existing.byRef["m00003"] = "ghost";
 
   const result = assignRefs([msg("x")], { existing, nextIndex: 1 });
-  assert.equal(refForRaw(result.map, "x"), "m00001");
-  assert.equal(result.nextIndex, 2);
+  assert.equal(refForRaw(result.map, "x"), "m00004");
+  assert.equal(result.nextIndex, 5);
+});
+
+test("assignRefs counter never fills below an orphan byRef high-water", () => {
+  const existing = emptyRefMap();
+  existing.byRef["m00100"] = "ghost";
+
+  const result = assignRefs([msg("new")], { existing, nextIndex: 1 });
+
+  assert.equal(refForRaw(result.map, "new"), "m00101");
+  assert.equal(result.nextIndex, 102);
+});
+
+test("assignRefs refuses a reused ledger stamp below the historical floor", () => {
+  const existing = emptyRefMap();
+  existing.byRaw["floor"] = "m00010";
+  existing.byRef["m00010"] = "floor";
+  const newMessage: CoreMessage = { ...msg("new"), ledgerSeq: 7 };
+
+  const result = assignRefs([newMessage], {
+    existing,
+    nextIndex: 1,
+    deadRefs: ["m00007"],
+  });
+
+  assert.notEqual(refForRaw(result.map, "new"), "m00007", "dead ref never reissued");
+  assert.equal(refForRaw(result.map, "new"), "m00011", "counter allocation stays above the floor");
+  assert.equal(result.nextIndex, 12);
+});
+
+test("assignRefs counter path never drops below the historical floor", () => {
+  const existing = emptyRefMap();
+  existing.byRaw["floor"] = "m00010";
+  existing.byRef["m00010"] = "floor";
+
+  const result = assignRefs([msg("new")], {
+    existing,
+    nextIndex: 1,
+    deadRefs: ["m00007"],
+  });
+
+  assert.equal(refForRaw(result.map, "new"), "m00011");
+  assert.equal(result.nextIndex, 12);
+});
+
+test("assignRefs still accepts a ledger stamp above the historical floor", () => {
+  const existing = emptyRefMap();
+  existing.byRaw["floor"] = "m00010";
+  existing.byRef["m00010"] = "floor";
+  const newMessage: CoreMessage = { ...msg("new"), ledgerSeq: 11 };
+
+  const result = assignRefs([newMessage], {
+    existing,
+    nextIndex: 1,
+    deadRefs: ["m00007"],
+  });
+
+  assert.equal(refForRaw(result.map, "new"), "m00011");
+  assert.equal(result.nextIndex, 12);
+});
+
+test("assignRefs fresh allocation still starts at seq+1", () => {
+  const stamped: CoreMessage = { ...msg("first"), ledgerSeq: 1 };
+  const result = assignRefs([stamped], { existing: emptyRefMap(), nextIndex: 1 });
+  assert.equal(refForRaw(result.map, "first"), "m00001");
+});
+
+test("restampRefsToLedger re-homes displaced refs above dead tombstones", async () => {
+  const { restampRefsToLedger } = await import("../src/refs.js");
+  const state: CompressionState = createInitialState();
+  state.messageRefs.byRaw.a = "m00001"; state.messageRefs.byRef["m00001"] = "a";
+  state.messageRefs.byRaw.b = "m00003"; state.messageRefs.byRef["m00003"] = "b";
+  state.messageRefs.byRaw.d = "m00002"; state.messageRefs.byRef["m00002"] = "d";
+  state.deadRefs = ["m00004"];
+
+  const outcome = restampRefsToLedger(state, new Map([["a", 0], ["b", 1]]));
+  assert.equal(state.messageRefs.byRaw.d, "m00005", "dead m00004 is not a rehome target");
+  assert.equal(outcome.rehomed, 1);
 });
 
 test("rebuildRefIndex drops stale byRef entries and ignores BLOCKED", () => {

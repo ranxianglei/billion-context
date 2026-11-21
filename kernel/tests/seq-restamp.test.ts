@@ -218,3 +218,46 @@ test("#5196: the parked layout survives the next cold load untouched", () => {
   assert.equal(state.messageRefs.byRaw.z, "m00003");
 });
 
+for (const fixture of [
+  { name: "retired-seat leftover", byRaw: { a: "m00007", b: "m00009" }, seqs: [["a", 4], ["b", 6]], parked: "b", mover: "a", target: "m00005" },
+  { name: "displaced unbacked owner", byRaw: { a: "m00004", b: "m00005" }, seqs: [["a", 4]], parked: "b", mover: "a", target: "m00005" },
+  { name: "displaced and leftover overlap", byRaw: { a: "m00002", b: "m00001" }, seqs: [["a", 0], ["b", 1]], parked: "b", mover: "a", target: "m00001" },
+] satisfies Array<{ name: string; byRaw: Record<string, string>; seqs: Array<[string, number]>; parked: string; mover: string; target: string }>) {
+  test(`#5196 composition: ${fixture.name} parks above orphan and tombstone history`, () => {
+    const state = stateWith({ ...fixture.byRaw, protected: "BLOCKED" }, { deadRefs: ["m00090"] });
+    state.messageRefs.byRef.m00070 = "historical-orphan";
+    const seqs = new Map([...fixture.seqs, ["protected", 99] as [string, number]]);
+    const out = restampRefsToLedger(state, seqs);
+
+    assert.equal(state.messageRefs.byRaw[fixture.parked], "m00091");
+    assert.equal(state.messageRefs.byRef.m00091, fixture.parked);
+    assert.equal(state.messageRefs.byRaw[fixture.mover], fixture.target);
+    assert.equal(state.messageRefs.byRef[fixture.target], fixture.mover);
+    assert.equal(state.messageRefs.byRef.m00070, "historical-orphan");
+    assert.equal(state.messageRefs.byRef.m00090, undefined);
+    assert.equal(state.messageRefs.byRaw.protected, "BLOCKED");
+    assert.equal(out.rehomed, 1, "an owner in both settlement lists parks only once");
+    assert.equal(out.blocked, 1);
+    assert.deepEqual(state.deadRefs, ["m00090"]);
+    if (fixture.name === "retired-seat leftover") {
+      assert.equal(state.messageRefs.byRef.m00007, undefined);
+      assert.equal(out.superseded.get("m00007"), "a");
+    }
+    const after = structuredClone(state);
+    const again = restampRefsToLedger(state, seqs);
+    assert.equal(again.kept + again.restamped + again.rehomed, 0);
+    assert.deepEqual(state, after, "the parked layout and history survive a second pass");
+  });
+}
+
+for (const seqs of [
+  new Map([["a", 4], ["b", 6]]),
+  new Map([["a", 8]]),
+]) {
+  test(`#5196 composition: exhausted ${seqs.size === 2 ? "leftover" : "displaced"} parking is atomic`, () => {
+    const state = stateWith({ a: "m00007", b: "m00009" }, { deadRefs: ["m9999999"] });
+    const before = structuredClone(state);
+    assert.throws(() => restampRefsToLedger(state, seqs), /ref capacity exhausted/);
+    assert.deepEqual(state, before, "no partial ref swap or aligned marker escapes a failed pass");
+  });
+}
