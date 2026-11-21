@@ -346,14 +346,8 @@ async function bringUp(h: Harness2) {
     return { proxy, origin: `http://127.0.0.1:${paddr.port}`, upstreamUrl };
 }
 
-// The fill must NOT be one homogeneous character run: these requests mint a
-// FRESH ANONYMOUS session (no session header), whose provenance path masks the
-// ENTIRE first message through maskUrlsInText BEFORE truncating to the preview
-// cap. That masker's scheme-prefix scan ([a-z][a-z0-9+.-]*://) backtracks
-// O(n²) over long scheme-char runs — a megabyte of 'x' spins the event loop
-// for minutes (pre-existing since the #4191 any-scheme regex; tracked
-// separately). Whitespace-separated words keep the byte size identical while
-// keeping the scan linear.
+// Keep this held-forwarding fixture prose-shaped. Long unbroken input in the
+// anonymous provenance URL masker is covered by log-mask-linear.test.ts.
 const BIG_TURN_WORDS = "lorem ipsum dolor sit amet ";
 function bigTurn(model: string, targetBytes: number): unknown {
     const overhead = JSON.stringify({ model, messages: [{ role: "user", content: "" }], max_tokens: 64, stream: false }).length;

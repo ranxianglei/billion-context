@@ -556,10 +556,10 @@ type PlanTerms = Map<string, number>;
 function planTokenize(text: string): string[] {
     const out: string[] = [];
     // Rendered ref-tag markup () is proxy metadata, not plan content.
-    const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ");
+    const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ").toLowerCase();
     const re = /[a-z0-9]+|[\u4e00-\u9fff]/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(clean.toLowerCase())) !== null) {
+    while ((m = re.exec(clean)) !== null) {
         const t = m[0];
         const cjk = /[\u4e00-\u9fff]/.test(t);
         // Latin tokens need >= 3 chars to carry signal; CJK single chars count.
@@ -997,8 +997,8 @@ export function executeSearchContextTarget(
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
-                    if (!searchBlocks(blockDocs(anc.state), String(args.query ?? ""), { limit: anc.state.blocks.length, algorithm: "substring", minScore: 1e-9 }).length) continue;
-                    return executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    const inherited = executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    if (inherited.text.startsWith("Found ")) return inherited;
                 }
             }
         }
