@@ -81,6 +81,15 @@ export interface EgressOpLogStore {
     egressStateAppendOps(sessionId: string, ops: EgressOp[], nowMs: number): number[];
     egressStateView(sessionId: string): EgressViewRow[];
     egressStateCompactView(sessionId: string, view: EgressViewRow[], nowMs: number): number;
+    /** Rollback reconstruction at any log_seq (flow table is total). */
+    egressStateViewAt(sessionId: string, logSeq: number): EgressViewRow[];
+    /** Highest log_seq in the flow (0 = no rows). */
+    egressStateMaxSeq(sessionId: string): number;
+    /** Recovery (ruling 7439-5): delete rows past `logSeq` in BOTH tables —
+     *  rows beyond a corrupt point are unusable by definition (no replay can
+     *  ever include them), so recovery = flow back to the last healthy point.
+     *  Append-only covers HEALTHY history only. Returns rows removed. */
+    egressStateTruncateAfter(sessionId: string, logSeq: number): number;
 }
 
 /** Record this turn's outbound conversation view as sparse ops. `prev` is
@@ -110,4 +119,41 @@ export function recordEgressTurn(args: {
         }
     }
     return next;
+}
+
+
+/** Bounded walk-back distance when the flow's current point is corrupt. */
+const EGRESS_HEALTHY_WALK_MAX = 16;
+
+/** Ruling 7439-5 degrade ladder — hydrate the flow's CURRENT point; when it
+ * fails replay (a corrupt row), walk back to the NEWEST healthy log_seq
+ * (bounded walk) and TRUNCATE past it: rows beyond a corrupt point are
+ * unusable by definition (no replay can ever include them), so recovery
+ * means flowing back to the last healthy point in the tables themselves —
+ * never to the client's bytes. Returns null = no healthy point at all
+ * (session-level recovery: the caller logs the marker and serves legacy for
+ * this turn only). The truncated count is observability for the warn log. */
+export function recoverEgressBase(
+    store: EgressOpLogStore,
+    sessionId: string,
+): { view: EgressViewRow[]; seq: number; degraded: boolean; truncated: number } | null {
+    const maxSeq = store.egressStateMaxSeq(sessionId);
+    try {
+        const view = store.egressStateView(sessionId);
+        return { view, seq: maxSeq, degraded: false, truncated: 0 };
+    } catch {
+        const floor = Math.max(0, maxSeq - EGRESS_HEALTHY_WALK_MAX);
+        for (let x = maxSeq - 1; x >= floor; x--) {
+            try {
+                const view = store.egressStateViewAt(sessionId, x);
+                if (view.length > 0 || x === 0) {
+                    const truncated = store.egressStateTruncateAfter(sessionId, x);
+                    return { view, seq: x, degraded: true, truncated };
+                }
+            } catch {
+                // keep walking
+            }
+        }
+        return null;
+    }
 }

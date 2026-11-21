@@ -2063,6 +2063,17 @@ export class UnifiedStore {
         return egressStateCompact(this.db, sessionId, view, nowMs);
     }
 
+    egressStateMaxSeq(sessionId: string): number {
+        const row = this.db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+        return Number(row.mx) || 0;
+    }
+
+    egressStateTruncateAfter(sessionId: string, logSeq: number): number {
+        const a = this.db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sessionId, logSeq);
+        const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sessionId, logSeq);
+        return Number(a.changes) + Number(b.changes);
+    }
+
     /** #7398: delete the session's egress op-log rows (state AND flow) and
      *  return the unified-content-CAS refs the rows carried (cas_ref on I/U
      *  ops, casRef on B-row entries). The recorder's puts are the sole owner

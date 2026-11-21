@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import {
+    egressStateAt,
     egressStateAppend,
     egressStateCompact,
     egressStateView,
@@ -47,6 +48,13 @@ function open(): Harness {
         egressStateAppendOps: (sid, ops, nowMs) => egressStateAppend(db, sid, ops, nowMs),
         egressStateView: (sid) => egressStateView(db, sid),
         egressStateCompactView: (sid, view, nowMs) => egressStateCompact(db, sid, view, nowMs),
+        egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
+        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(log_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateTruncateAfter: (sid, seq) => {
+            const a = db.prepare(`DELETE FROM egress_state WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND log_seq > ?`).run(sid, seq);
+            return Number(a.changes) + Number(b.changes);
+        },
     };
     return { db, store, dir };
 }

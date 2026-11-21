@@ -51,7 +51,8 @@ import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-respon
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { recordEgressTurn } from "../storage/egress-record.js";
+import { recoverEgressBase, recordEgressTurn } from "../storage/egress-record.js";
+import type { EgressViewRow } from "../storage/egress-state.js";
 // Structural mirror of egress-record.ts's EgressSourceMsg (kept private
 // there by the unused-export gate): the recording seam only reads this shape.
 interface EgressRecordSourceMsg {
@@ -60,9 +61,54 @@ interface EgressRecordSourceMsg {
     contentType?: unknown;
     text?: unknown;
 }
-import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
+import { rebuildCoreFromLog, rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
+
+/** Ruling 7439-5 input probe (discussions/7439) — light per-turn identity
+ * + byte SAMPLING on sampled rows only (never a full byte comparison).
+ * Part 1 ORDER: every client id that exists in the server view must appear
+ * in server-view order (append-only + client-side folding contract; a
+ * reorder means the client is not echoing the server's conversation → the
+ * turn degrades to legacy). Part 2 DIVERGENCE: up to 8 sampled rows compare
+ * contentType + text length + (short, ≤32KB) exact text. A mismatch does NOT
+ * fail the probe — the seam keeps server bytes regardless of what the client
+ * sent; sampling only LOGS the divergence event (ruling: 记日志 + 警告,
+ * 内容跟服务端, 出站自然收敛). */
+export function egressAuthorityProbe(
+    base: readonly BiliMessage[],
+    client: readonly BiliMessage[],
+    sessionId: string,
+    log: (level: string, msg: string) => void,
+): boolean {
+    const baseIndex = new Map<string, number>();
+    base.forEach((m, i) => {
+        if (!baseIndex.has(m.id)) baseIndex.set(m.id, i);
+    });
+    let cursor = -1;
+    for (const c of client) {
+        const i = baseIndex.get(c.id);
+        if (i === undefined) continue;
+        if (i <= cursor) return false;
+        cursor = i;
+    }
+    let diverged = 0;
+    const step = Math.max(1, Math.floor(client.length / 8));
+    for (let i = 0; i < client.length; i += step) {
+        const c = client[i];
+        const bi = baseIndex.get(c.id);
+        if (bi === undefined) continue;
+        const b = base[bi];
+        const ct = typeof c.text === "string" ? c.text : "";
+        const bt = typeof b.text === "string" ? b.text : "";
+        if (c.contentType !== b.contentType || ct.length !== bt.length || (ct.length <= 32768 && ct !== bt)) diverged++;
+        if (diverged >= 4) break;
+    }
+    if (diverged > 0) {
+        log("warn", `[${sessionId}] egress-authority divergence: ${diverged} sampled row(s) differ client-vs-server — server bytes win (client edits do not stick until the egress update API exists; discussions/7439 ruling 5)`);
+    }
+    return true;
+}
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -140,6 +186,10 @@ export async function prepareOpenai(
     // #7398 seg 4: the legacy core-portion elements (captured at the
     // :coreToOpenai chain) — the shadow comparison target for serve-from-log.
     let legacyCoreElements: unknown = undefined;
+    let egressBaseRows: EgressViewRow[] | null = null;
+    let egressSwapApplied = false;
+    let egressDegraded = false;
+    let egressArmed = false;
     let egressServedFromLog = false;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
     // image-rescale) — segment 3 records this, not processedMessages, so the
@@ -305,6 +355,53 @@ export async function prepareOpenai(
         // taken between the cursor write and the flush otherwise reads a
         // STALE parent revision and lands the child on the wrong lane.
         if (s0.anchorAdvanced) markDirty(session);
+        // Ruling 7439-5 (owner strategy decision, discussions/7439 §1) — the
+        // server egress flow is the SOLE authority over conversation content.
+        // This is the ONE prepare-layer seam where the client's resend is
+        // demoted to what it is after turn 1: the identity/order channel (the
+        // probe below) and the byte source for NEW messages only. On a pinned
+        // plugin-lane turn with a live op-log flow, every EXISTING row below
+        // carries the bytes the SERVER recorded last turn; a client byte edit
+        // under a stable msgid is a divergence event (logged + warned), the
+        // server bytes win, and — because the outbound is served from the same
+        // log below — the client converges on its next echo. Legitimate client
+        // edits need the egress update API (follow-up, not in this PR). This
+        // OVERRIDES the pre-PR plugin-lane stance (snapshot-render.ts: "plugin
+        // lane: client-authoritative by design"). Scope is deliberately the
+        // PINNED plugin lane (both modes reasoned): bare proxy clients are
+        // tamper-evident by construction — their ids ARE content hashes, so a
+        // byte edit changes the id and already lands in the rewrite/drift
+        // gates — and proxy-lane kernel input must stay the RAW history (the
+        // kernel folds internally; a post-fold replay view would double-fold
+        // and trip #1001/#2432/#4521). The proxy lane gets ruling 5 on the
+        // EGRESS side (outbound served from the log); the pinned plugin lane
+        // gets it end-to-end (kernel input + outbound).
+        // Degrade (never guess, never client-as-authority): store missing,
+        // empty/unreadable flow, unrebuildable view, or a failed probe → this
+        // turn runs the legacy client-byte path and re-attempts next turn.
+        egressArmed = featureEnabled("egressServeLog") && pluginMode && !isTitleGen && s0.pinned !== null;
+        if (egressArmed) {
+            const st = getStore().egressOpLogStore();
+            if (st) {
+                const base0 = recoverEgressBase(st, sessionId);
+                if (base0 === null) {
+                    log("error", `[${sessionId}] egress-authority: no healthy flow point — session-level recovery required (ruling 7439-5); legacy bytes this turn`);
+                } else {
+                    egressBaseRows = base0.view;
+                    egressDegraded = base0.degraded;
+                    const base = (base0.view.length > 0 ? rebuildCoreFromLog(base0.view) : null) ?? [];
+                    if (base.length > 0 && egressAuthorityProbe(base, msgs, sessionId, log)) {
+                        const baseById = new Map(base.map((m) => [m.id, m] as const));
+                        msgs = msgs.map((c) => baseById.get(c.id) ?? c);
+                        originalMessages = msgs;
+                        egressSwapApplied = true;
+                        log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, msgs.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to log_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
+                    } else if (base.length > 0) {
+                        log("warn", `[${sessionId}] egress-authority: probe failed — flow NOT advanced this turn; legacy bytes served (re-attempts next turn)`);
+                    }
+                }
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -615,23 +712,23 @@ export async function prepareOpenai(
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         openaiOutboundSystem = sysParts.join("\n\n");
-        if (!isTitleGen && featureEnabled("egressServeLog")) {
+        if (!isTitleGen && featureEnabled("egressServeLog") && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 try {
-                    session.egressView = recordEgressTurn({
+                    const view = recordEgressTurn({
                         store: st,
                         sessionId,
-                        prev: session.egressView,
+                        prev: egressBaseRows ?? undefined,
                         conversation: egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                     });
-                    const reb = rebuildOutboundFromLog(session.egressView);
+                    const reb = rebuildOutboundFromLog(view);
                     if (reb !== null) {
                         rebuiltMessages = reb.elements;
                         egressServedFromLog = true;
-                        log("info", `[${sessionId}] egress-serve: served ${session.egressView.length} rows from op-log`);
+                        log("info", `[${sessionId}] egress-serve: served ${view.length} rows from op-log`);
                     }
                 } catch (err) {
                     egressServedFromLog = false;
@@ -859,37 +956,37 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    // #7398 seg 3: shadow-record this turn's outbound conversation view as
-    // sparse ops (rollout-gated, default off — zero rows, zero cost). Never
-    // touches outbound bytes; a corrupt log disables recording for the
-    // session and the turn proceeds legacy.
-    if (!isTitleGen && featureEnabled("egressOpLog")) {
+    // #7398 seg 3: record this turn's outbound conversation view as sparse
+    // ops (rollout-gated, default off — zero rows, zero cost). Skipped when
+    // the serve path already ran or when the authority seam ran but did not
+    // swap (ruling 7439-5: never advance the flow with untrusted client
+    // bytes); a corrupt log skips this turn and self-heals next.
+    if (!isTitleGen && featureEnabled("egressOpLog") && !egressServedFromLog && !(egressArmed && !egressSwapApplied)) {
         try {
             const st = getStore().egressOpLogStore();
-            if (st && session.egressView === undefined) {
-                session.egressView = recordEgressTurn({
+            if (st) {
+                recordEgressTurn({
                     store: st,
                     sessionId,
-                    prev: session.egressView,
+                    prev: egressBaseRows ?? undefined,
                     conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                 });
             }
         } catch (err) {
-            session.egressView = undefined;
-            log("warn", `[${sessionId}] egress op-log recording disabled for this session: ${String(err)}`);
+            log("warn", `[${sessionId}] egress op-log recording skipped this turn (corrupt log point — self-heals next turn): ${String(err)}`);
         }
     }
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
     // from the log and byte-compare against the legacy elements. NO
     // swap: the pipeline always sends the legacy bytes; this measures the
     // identity rate the swap will rely on (rollout egressServeLog, default 0;
-    // requires egressOpLog on, since it reads the recorded view).
+    // reads the hydrated flow view).
     if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
-            const view = session.egressView;
+            const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);
             if (st && view && legacyCoreElements !== undefined) {
                 const reb = rebuildOutboundFromLog(view);
                 if (reb === null) {

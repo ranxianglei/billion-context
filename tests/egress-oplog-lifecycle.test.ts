@@ -44,6 +44,9 @@ test("recording is content-table-free: rows carry bytes, content stays empty, re
             egressStateAppendOps: (s, o, nowMs) => store.egressStateAppendOps(s, o, nowMs),
             egressStateView: (s) => store.egressStateView(s),
             egressStateCompactView: (s, v, nowMs) => store.egressStateCompactView(s, v, nowMs),
+            egressStateViewAt: (s, x) => store.egressStateViewAt(s, x),
+            egressStateMaxSeq: (s) => store.egressStateMaxSeq(s),
+            egressStateTruncateAfter: (s, x) => store.egressStateTruncateAfter(s, x),
         };
         // turn 1: two messages; turn 2: tail append + fold shape; turn 3: an edit
         let view = recordEgressTurn({ store: ops, sessionId: sid, prev: undefined, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 1000 });
