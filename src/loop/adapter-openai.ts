@@ -612,13 +612,15 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
-                    if (u) lastUsageRaw = u;
-                    yield {
-                        kind: "usage",
-                        inputTokens: typeof u?.prompt_tokens === "number" ? u.prompt_tokens : undefined,
-                        outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
-                        cachedTokens: u ? openaiCachedTokens(u) : undefined,
-                    } as ParsedStreamEvent;
+                    if (u) {
+                        lastUsageRaw = u;
+                        yield {
+                            kind: "usage",
+                            inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                            outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+                            cachedTokens: openaiCachedTokens(u),
+                        } as ParsedStreamEvent;
+                    }
                     if (sawRealToolCall) {
                         // The raw finish chunk (provider-measured usage) reaches
                         // the host verbatim — no rewriting.
@@ -753,14 +755,20 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             const rawDetails = raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object"
                 ? raw.prompt_tokens_details as Record<string, unknown>
                 : undefined;
-            const usage = opts?.usage
+            const hasRealUsage =
+                opts?.usage &&
+                (opts.usage.inputTokens !== undefined ||
+                    opts.usage.outputTokens !== undefined ||
+                    opts.usage.cachedTokens !== undefined);
+            const usage = hasRealUsage
                 ? {
                       ...raw,
-                      prompt_tokens: opts.usage.inputTokens ?? 0,
-                      completion_tokens: opts.usage.outputTokens ?? 0,
-                      total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
-                      ...(typeof opts.usage.cachedTokens === "number"
-                          ? { prompt_tokens_details: { ...rawDetails, cached_tokens: opts.usage.cachedTokens } }
+                      prompt_tokens: opts.usage!.inputTokens ?? 0,
+                      completion_tokens: opts.usage!.outputTokens ?? 0,
+                      total_tokens:
+                          (opts.usage!.inputTokens ?? 0) + (opts.usage!.outputTokens ?? 0),
+                      ...(typeof opts.usage!.cachedTokens === "number"
+                          ? { prompt_tokens_details: { ...rawDetails, cached_tokens: opts.usage!.cachedTokens } }
                           : {}),
                   }
                 : null;
