@@ -2284,7 +2284,6 @@ type FileConfig = {
          *  cadence: a VALID cached row re-materializes only once K user turns
          *  have landed past it (between turns the short tail derives live, as
          *  it always has); any INVALIDATION still re-cuts immediately. */
-        snapBase?: { enabled?: boolean; cohorts?: string[]; cutEveryKUserTurns?: number };
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at

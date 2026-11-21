@@ -219,22 +219,6 @@
 | `storage.jsonWriter` | on\|off | unset (off for the pure-sqlite selection — absent/unified=sqlite — and on for explicit full) | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）—— 本次发布翻转缺省：UNSET（未设置）现在对纯 SQLite 选择（storage.unified 未设置或 "sqlite"）缺省为 OFF —— SQLite 索引成为唯一持久副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。显式 full 保留 #3818 的历史双写缺省（除非本键另说，信封照写）。有效 full 模式下任一层的显式 on/off 总是生效：shadow/legacy（或加密激活）下请求的 off 会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层（"off"/"on"）。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。恢复双写：设 storage.jsonWriter=on（或 BILI_STORAGE_JSON_WRITER=1）—— 纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
 | `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节：每次完成的 checkpoint 把 WAL 文件截回该大小，约束长驻进程的磁盘占用与崩溃恢复重放。不是每会话数据配额 —— 数据写入时就已落进 index.db，WAL 只是两次 checkpoint 之间的帧暂存区，会话数量/大小不会放大它；大 burst 可能暂时超出，直到下一次完成的 checkpoint 截回。调大 = truncate IO 更稀疏，但稳态磁盘占用更多、崩溃恢复重放尾更长。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。实际取值会出现在 unified-enable 日志行与 storage 诊断块中。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。 |
-| `storage.snapBase.enabled` | boolean | false | — | #5874 v2 纯增量 snapshot-base 平面的主开关：设置后，D 车道快照渲染把服务端正史渲染的稳定前缀物化成一条 CAS 引用的 egress_snapshot 行（切点取 fold 水位与最新存活用户消息中较新者——天然回滚点），暖轮渲染逐字节复服这些字节、跳过缓存前缀的内容加载。三道相互独立的拒绝门保证缓存诚实：id 绑定输入哈希重算（同 id 内容搬家即降级）、跨前缀已 pin fold 门（吃掉前缀的 fold 即降级）、拼接行存活检查（账本已不载的缓存行即降级）。任何失配该轮整体回退实时推导，下一轮渲染自修复切点——永不粘死、永不拼半截。默认关闭——不切不出任何缓存行，零行为变化；仅配置文件层，无环境变量档（#2030 纪律）。回滚 = 去掉开关：fold_journal 行继续积累（每个 fold 一行小记录，重新开启前惰性）。 |
-| `storage.snapBase.cohorts` | string[] | [] | — | 允许进入出站稳定前缀缓存平面的协议（#5874 v2）：openai/anthropic/google/responses 的子集。协议不在名单内的会话无条件走实时渲染（fold 日志照常记录）。缺省或空 = 全部协议；嵌套在 storage.snapBase.enabled 之下，两者须同时设置。 |
-| `storage.snapBase.cutEveryKUserTurns` | integer | 8 | — | 出站稳定前缀缓存的重切节奏（#5874 v2，#6785 评审）：一条有效的缓存行在上次切点之后累积到该数量的 user turn 时重新物化。一次 cut 要重 hash 全部 pin 的 id、重序列化整个前缀并写新 CAS blob，每 user turn 都切会让整个会话生命周期成本 O(n²)；两次切之间会话继续用仍有效的旧行、实时推导短尾巴（与不开平面的会话行为一致）。失效从不等待节奏：被读侧拒绝的行（折叠穿越/回滚/id 漂移）立即重切。1 恢复原每 turn 行为；小于 1、非整数或非法值回落默认 8（最坏方向只是退回节流前的成本）。仅在 storage.snapBase.enabled 开启时生效；彻底消除单次 cut O(前缀) 成本的段链设计见 #6935。 |
-| `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
-| `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
-| `sessions.warmMax` | number | 0 | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。 |
-| `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
-| `sessions.residentMaxBytes` | number | 4294967296 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。 |
-| `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。 |
-| `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | #4788 二期驻留丢弃的逃生门：把会话内容存储钉在内存（永不折叠）。默认关闭：每次已证明落盘的保存之后，空闲会话的内容存储在请求间隙被释放，需要时从统一索引镜像或伴生文件按需重读；没有可证明落盘副本的会话（如新建 fork 子会话）自动保持驻留。需要零重读延迟且愿意用内存换时可设此项。 |
-| `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
-| `sessions.gc.maxAgeDays` | number | 7 | BILI_SESSION_GC_MAX_AGE_DAYS | GC 年龄阈值（天）。 |
-| `sessions.gc.maxTokens` | number | 1000000 | BILI_SESSION_GC_MAX_TOKENS | GC 单会话记录的 token 大小阈值。 |
-| `sessions.gc.intervalMs` | number | 3600000 | BILI_SESSION_GC_INTERVAL_MS | GC 清扫间隔。 |
-| `plugin.snapshotCapBytes` | number | 104857600 (0 disables snapshots) | BILI_PUBLIC_SNAPSHOT_CAP_BYTES | 提供给原生插件的 fork API 公共快照大小上限。 |
-| `snapshot.shadow` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：渲染车道仍处灰度关闭时，每轮已折叠会话都现算一次快照视图，与 legacy 实际出站比对分类，逐会话记账（web 面板行 + /__bili/status snapshotShadow 汇总 + snapshot-shadow 诊断主题）。默认开 —— 这是全舰队干跑，其错误率决定灰度翻转。环境变量 BILI_SNAPSHOT_SHADOW 优先。不想要每轮额外计算可用 false/0/off 关闭。 |
 
 **更新与公告**
 
@@ -1984,7 +1968,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
 | `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
-| `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |
 | `BILI_MCP_PROXY` | `native.attachUrl` | unset (discover per lane) |
 | `BILI_MESSAGE_TIMESTAMPS` | `compress.messageTimestamps` | true |
@@ -2011,7 +1994,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
 | `BILI_PROXY_KEEPALIVE_MAX_MS` | `network.proxyKeepAliveMaxMs` | 55000 (0 = one-shot connections) |
-| `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | `plugin.snapshotCapBytes` | 104857600 (0 disables snapshots) |
 | `BILI_RECEIVE_BODY_BYTES` | `network.receiveBodyBytes` | 5368709120 |
 | `BILI_RELEASE_NOTES_CHECK` | `releaseNotesCheck` | true |
 | `BILI_RELEASE_NOTES_URL` | `releaseNotesUrl` | unset (built-in feed) |
@@ -2030,15 +2012,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 100 (on, GA) |
 | `BILI_ROLLOUT_PLUGIN_MSG_ID_INCREMENTAL` | `rollout.features.pluginMsgIdIncremental` | 100 (on, GA) |
-| `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
-| `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
-| `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |
-| `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
-| `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
-| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `sessions.residentMaxBytes`) |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 |
-| `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
-| `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
 | `BILI_STABLE_SYSTEM_ANCHOR` | `stableSystemAnchor` | false |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | `storage.archiveAfterDays` | 365 |

@@ -34,22 +34,11 @@ import {
     type EgressViewRow,
 } from "./egress-state.js";
 import {
-    appendEgressSnapshot,
-    appendFoldJournal,
-    bumpEgressScopeRev,
-    egressInputHash,
-    egressLatestRow,
-    egressScopeRev,
-    foldInputHash,
-    foldJournalRows,
-    foldUnpins,
     snapL1Record,
     snapR3LatchedRead,
     snapR3LatchClear,
     snapR3LatchWrite,
     snapR3LatchedList,
-    type EgressReadHit,
-    type EgressSnapshotRow,
 } from "./snap.js";
 import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
@@ -1314,7 +1303,6 @@ export class UnifiedStore {
                                 this.db
                                     .prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?")
                                     .run(s.sessionId, row.seq);
-                                bumpEgressScopeRev(this.db, s.sessionId); // reactivated row re-enters the hash scope
                             }
                             continue;
                         }
@@ -1348,7 +1336,6 @@ export class UnifiedStore {
                         this.db
                             .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
                             .run(Date.now(), s.sessionId, row.seq);
-                        bumpEgressScopeRev(this.db, s.sessionId); // retired row leaves the hash scope
                         const retiredMedia = this.db
                             .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
                             .all(s.sessionId, row.seq) as { media_hash: string }[];
@@ -1458,17 +1445,6 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
-            // #6785 review (owner): appends land at seq > every existing
-            //  watermark (seq is monotonic) and cannot enter a stored egress
-            //  scope — EXCEPT a genuinely NEW row at an old seq (gap-fill,
-            //  foreign-writer handoff #3285 class): that DOES change the
-            //  aggregate, so it bumps the revision. Idempotent re-receipts
-            //  (changes=0 — the M1 full-resend path) leave the row exactly
-            //  as stored and must NOT bump or the O(1) fast path dies for
-            //  full-resend sessions. One O(1) egress-row lookup per save.
-            const egressWm = (this.db.prepare(
-                "SELECT watermark FROM egress_snapshot WHERE session_id = ? ORDER BY snap_seq DESC LIMIT 1",
-            ).get(s.sessionId) as { watermark: number } | undefined)?.watermark ?? -1;
             for (const m of messages) {
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
@@ -1476,7 +1452,6 @@ export class UnifiedStore {
                         "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs);
-                if (res.changes > 0 && m.seq <= egressWm) bumpEgressScopeRev(this.db, s.sessionId);
                 if (res.changes === 0) {
                     // Idempotent re-receipt: the CAS row is still referenced
                     // by the existing message row — undo our refcount bump.
@@ -1702,22 +1677,6 @@ export class UnifiedStore {
                 }
             }
 
-            // #5874 v2: fold journal — one append-only row per NEW compression
-            // block (the fold decision point). A re-ingest of the same block
-            // is a no-op (the UNIQUE(session_id, block_id) constraint), and
-            // the input hash over the fold's ROW RANGE is the anchor the
-            // egress read re-derives (foldInputHash; #7064 slimming dropped
-            // the covered-id list — the range re-derives the same set).
-            // Blocks that arrived via a dump import have no row: the read
-            // side derives them lazily (journal absence is "derive", never
-            // an error).
-            for (const b of input.blocks) {
-                if (storedBlocks.get(b.blockId) !== undefined) continue;
-                if (!b.active) continue;
-                const [fStart, fEnd] = boundsForCovered(b.payloadJson);
-                if (fStart < 0) continue;
-                appendFoldJournal(this.db, s.sessionId, b.blockId, fStart, fEnd, foldInputHash(this.db, s.sessionId, fStart, fEnd), b.createdAt);
-            }
 
             // dead_refs: tombstones can be LIFTED (backing message
             // reappears) — the array is authoritative, so rows at ords the
@@ -2046,45 +2005,6 @@ export class UnifiedStore {
         }
     }
 
-    /** #5874 v2 (step 3): one EGRESS CUT — pin the derived stable prefix
-     *  (CAS bytes; undefined for a hash-only pin). #7064 slimming: the hash
-     *  scope IS the watermark (max live seq of the pinned set) — live rows
-     *  at seq <= wm; the stored id list is gone. Supersedes the previous
-     *  row (trimmed in the same transaction, its CAS ref released). The
-     *  FOLD-CROSSING gate runs on the READ side (egressReadView). null for
-     *  an empty id set or an unpinnable aggregate (no rows at all). */
-    egressCut(sessionId: string, ids: string[], prefixJson: string | undefined, nowMs: number): EgressSnapshotRow | null {
-        if (ids.length === 0) return null;
-        const last = this.db.prepare(
-            `SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")}) ORDER BY seq DESC LIMIT 1`,
-        ).get(sessionId, ...ids) as { msg_id: string } | undefined;
-        const lastStableId = last?.msg_id ?? ids[ids.length - 1];
-        const wm = this.db.prepare(
-            `SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ids.map(() => "?").join(",")})`,
-        ).get(sessionId, ...ids) as { m: number };
-        const inputHash = egressInputHash(this.db, sessionId, wm.m);
-        if (!inputHash) return null;
-        // #6785 review (owner): stamp the current mutation revision so the
-        // read side can trust the aggregate without re-deriving it (O(1)
-        // steady state instead of O(scope rows + sha256) every turn).
-        const scopeRev = egressScopeRev(this.db, sessionId);
-        const newRef = prefixJson != null ? this.putContent(prefixJson) : null;
-        const prev = egressLatestRow(this.db, sessionId);
-        try {
-            this.db.transaction(() => {
-                const snapSeq = appendEgressSnapshot(this.db, sessionId, wm.m, inputHash, newRef, lastStableId, nowMs, scopeRev);
-                this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ? AND snap_seq < ?").run(sessionId, snapSeq);
-            });
-        } catch (err) {
-            // The put above ran BEFORE the tx: a failing tx would otherwise
-            // leave a dangling +1 refcount GC can never collect. Release the
-            // fresh ref (the previous row's ref is untouched) and rethrow.
-            if (newRef) this.releaseContent(newRef);
-            throw err;
-        }
-        if (prev?.prefixRef != null && prev.prefixRef !== newRef) this.releaseContent(prev.prefixRef);
-        return egressLatestRow(this.db, sessionId);
-    }
 
     /** #6785 perf (proposal discussions/7398): EGRESS STATE LOG — op-log
      *  outbound view. The four methods below are the store surface over
@@ -2148,52 +2068,6 @@ export class UnifiedStore {
         return refs;
     }
 
-    /** #5874 v2 (step 3): the egress READ — serve the newest cut row's CAS
-     *  bytes ONLY if the input aggregate re-derives identically over the
-     *  watermark scope (live rows at seq <= watermark — #7064 slimming;
-     *  a miss degrades the round to the live derive — never sticky, never
-     *  partial) AND no PINNED post-cut fold crosses the prefix scope: an
-     *  active fold that landed after the cut and whose row range reaches
-     *  into seq <= watermark (pinned, summary in render) replaces the
-     *  originals with the summary, so the materialized bytes are stale;
-     *  an UNPINNED crossing fold (rows re-emerged live, #4390 / rewind
-     *  past the boundary) renders the originals again — the old bytes are
-     *  valid, serve them. Any fault ⇒ null (legacy derive). */
-    egressReadView(sessionId: string, _ids?: string[]): EgressReadHit | null {
-        try {
-            const row = egressLatestRow(this.db, sessionId);
-            if (!row || row.prefixRef == null) return null;
-            // #6785 review (owner): O(1) steady-state trust — the stored
-            // aggregate is still valid iff the session's message table has
-            // not moved since the cut (mutation revision equal). A mismatch
-            // (or a pre-upgrade NULL) falls back to the full re-derivation,
-            // which is still the authority; a hash miss degrades exactly as
-            // before. The fold-crossing gate below ALWAYS runs: fold rows
-            // are not message writes and do not bump the revision.
-            if (row.scopeRev === null || row.scopeRev !== egressScopeRev(this.db, sessionId)) {
-                const recomputed = egressInputHash(this.db, sessionId, row.watermark);
-                if (recomputed !== row.inputHash) return null;
-            }
-            const content = this.getContent(row.prefixRef);
-            if (content == null) return null;
-            const journal = foldJournalRows(this.db, sessionId);
-            if (journal.length > 0) {
-                const activeBlocks = new Set(
-                    (this.db.prepare("SELECT block_id FROM blocks WHERE session_id = ? AND active = 1").all(sessionId) as { block_id: string }[])
-                        .map((r) => r.block_id),
-                );
-                const unpinned = foldUnpins(this.db, journal, activeBlocks);
-                for (const f of journal) {
-                    if (f.createdAt <= row.createdAt) continue; // baked into these bytes
-                    if (!activeBlocks.has(f.blockId) || unpinned.has(f.blockId)) continue;
-                    if (f.startSeq <= row.watermark) return null; // pinned fold crossed the prefix scope
-                }
-            }
-            return { prefix: content, lastStableId: row.lastStableId, inputHash: row.inputHash };
-        } catch {
-            return null; // never-fail: the round falls back to the live derive
-        }
-    }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
      *  Never throws into the ingest path — a failed checkpoint just leaves the
@@ -2338,7 +2212,6 @@ export class UnifiedStore {
             this.db
                 .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL")
                 .run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
-            bumpEgressScopeRev(this.db, s.sessionId); // sibling retired out of the hash scope
             // A retired duplicate still occupies the triple (the constraint
             // is not partial): it is byte-identical, so dropping the row and
             // its media mappings loses nothing. Rare path; common case stays
@@ -2354,7 +2227,6 @@ export class UnifiedStore {
                     const leftoverMedia = selMedia.all(s.sessionId, l.seq) as { media_hash: string }[];
                     delMedia.run(s.sessionId, l.seq);
                     delRow.run(s.sessionId, l.seq);
-                    bumpEgressScopeRev(this.db, s.sessionId); // hard-deleted row
                     // Every deleted row owned one refcount on r.to (bumped at
                     // its insert) and each of its mapping rows owned one on
                     // its media hash. Deleting without releasing is a
@@ -2367,7 +2239,6 @@ export class UnifiedStore {
             }
             this.putContent(r.content, r.to);
             this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
-            bumpEgressScopeRev(this.db, s.sessionId); // content_hash feeds the aggregate directly
             this.releaseContent(r.from);
         }
         // #4390: a rewound message that comes back reactivates in place —
@@ -2378,7 +2249,6 @@ export class UnifiedStore {
             for (const seq of retiredSeqs) {
                 if (presentedSeqs.has(seq)) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
             }
-            bumpEgressScopeRev(this.db, s.sessionId); // rewind-redo reactivation
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
             seqs === null || seqs === undefined ? seqs : seqs.map((p) => planToAbs.get(p) ?? p);
@@ -2656,9 +2526,6 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM egress_scope_rev WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
             refs.push(...this.deleteEgressOps(sessionId));
@@ -2912,9 +2779,6 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM fold_journal WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM egress_snapshot WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM egress_scope_rev WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM orphan_blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM state_fields WHERE session_id = ?").run(sessionId);
             rel.push(...this.deleteEgressOps(sessionId));
@@ -3030,7 +2894,6 @@ export class UnifiedStore {
                 const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
                 insMsg.run(sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null, typeof m.ts === "number" ? m.ts : null);
             }
-            if (dump.messages.length > 0) bumpEgressScopeRev(this.db, sessionId); // restore re-writes the row set
             const insMedia = this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) insMedia.run(sessionId, mm.seq, mm.media_hash);
             const insBlock = this.db.prepare(`INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)

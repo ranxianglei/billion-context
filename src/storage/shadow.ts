@@ -1178,18 +1178,6 @@ export class UnifiedShadow {
         return this.sync.snapSidOfRaw(sessRaw);
     }
 
-    // #5874 v2 step 3: the egress prefix cache pass-throughs (see
-    // UnifiedStore.egressCut / egressReadView — never fail, null on any miss).
-
-    egressCut(sessionId: string, ids: string[], prefixJson: string | undefined, nowMs: number): import("./snap.js").EgressSnapshotRow | null {
-        if (this.sync === null) return null;
-        return this.sync.egressCut(sessionId, ids, prefixJson, nowMs);
-    }
-
-    egressReadView(sessionId: string): import("./snap.js").EgressReadHit | null {
-        if (this.sync === null) return null;
-        return this.sync.egressReadView(sessionId);
-    }
 
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");

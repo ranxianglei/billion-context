@@ -4,7 +4,7 @@ import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
 import { listSessions, type Session } from "../session.js";
 import { loadConfigFile } from "../config.js";
-import { resolveSnapshotShadow, snapBaseCutCadence, snapBasePlaneEnabled } from "../knobs.js";
+import { resolveSnapshotShadow } from "../knobs.js";
 import { createHash } from "node:crypto";
 
 /**
@@ -209,38 +209,6 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     }
     if (rows.length === 0) return { reason: "transcript-empty" };
 
-    // #5874 v2 step 3: the egress prefix cache (gated by storage.snapBase —
-    // config-file only, dormant by default). egressReadView already ran the
-    // input-hash re-derive and the fold-crossing gate inside the store; a hit
-    // carries the materialized stable rows, and its bytes are spliced into
-    // the identity rows so the content load below only reads what the cache
-    // does not cover. ANY mismatch (unparseable payload, a cached row that
-    // retired, an id drift) leaves egressMaxSeq at -1 and the lane derives
-    // every byte live — never a partial splice, never a guess.
-    let egressMaxSeq = -1;
-    if (snapBasePlaneEnabled(session.meta?.protocol)) {
-        let hit: import("../storage/snap.js").EgressReadHit | null = null;
-        try { hit = store.egressReadView(session.id); } catch { hit = null; }
-        if (hit) {
-            try {
-                const cached = JSON.parse(hit.prefix) as ViewRow[];
-                if (Array.isArray(cached) && cached.length > 0 && cached.every((c) => c && typeof c.seq === "number" && typeof c.msgId === "string")) {
-                    let ok = true;
-                    for (const c of cached) {
-                        const live = bySeq.get((c as ViewRow).seq);
-                        if (!live || live.msgId !== (c as ViewRow).msgId) { ok = false; break; }
-                    }
-                    const tail = cached[cached.length - 1] as ViewRow;
-                    if (ok && tail.msgId === hit.lastStableId) {
-                        for (const c of cached) {
-                            const live = bySeq.get((c as ViewRow).seq);
-                            if (live) { live.msg = (c as ViewRow).msg; egressMaxSeq = Math.max(egressMaxSeq, (c as ViewRow).seq); }
-                        }
-                    }
-                }
-            } catch { egressMaxSeq = -1; }
-        }
-    }
 
     // #4052: the covered-region map must exist BEFORE the chain — the signature
     // fallback must not offer covered rows as bind targets (see the bySig filter
@@ -275,7 +243,7 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
     // only for the uncovered window. Row-unparsable now guards UNCOVERED
     // bytes only — covered corruption cannot degrade the render.
     try {
-        const intervals: [number, number][] = egressMaxSeq >= 0 ? [[0, egressMaxSeq]] : [];
+        const intervals: [number, number][] = [];
         {
             const sorted = [...coveredSeqUnion].sort((a, b) => a - b);
             for (const seq of sorted) {
@@ -322,61 +290,6 @@ function loadTranscriptBase(session: Session): TranscriptBase | { reason: string
         }
     } catch {
         return { reason: "transcript-error" };
-    }
-    // #5874 v2 steps 3+4: re-materialize when the stable watermark advanced
-    // past the cached cut or the cache missed this turn (same gate as the
-    // read side — an off plane neither serves nor cuts). The cut lands on the
-    // max of the newest active fold's covered region and the newest live
-    // USER message (turn boundary — the natural rollback point, so a warm
-    // render after a rewind still serves a cut it can verify). The cached
-    // rows are exactly the rendered rows (parseRow's output) up to that
-    // watermark — bytes the fresh derive would have produced in this state,
-    // so the read side is byte-equivalent. Best-effort: a fault degrades to
-    // no cut (the next turn retries).
-    {
-        const newest = activeBlocks[activeBlocks.length - 1];
-        const seed = blockSeeds.find((s) => s.blockId === newest.blockId);
-        const wm = seed && seed.seqs.size > 0 ? Math.max(...seed.seqs) : -1;
-        let cutWm = wm;
-        for (const r of rows) {
-            if (r.msg && r.msg.role === "user" && r.seq > cutWm) cutWm = r.seq;
-        }
-        if (snapBasePlaneEnabled(session.meta?.protocol) && cutWm > egressMaxSeq) {
-            // #6785 review (O(n²) re-cut): a cut re-hashes every pinned id,
-            // re-serializes the WHOLE prefix and writes a fresh CAS blob,
-            // and the prefix grows every turn — so cutting on EVERY user
-            // turn costs O(n²) over a session's life. A cut is only worth
-            // paying once enough NEW tail exists to amortize it: re-cut
-            // only when no row is valid for this turn (egressMaxSeq < 0 —
-            // the first cut, or any rejection: fold crossing, rewind, id
-            // drift — those cut immediately, exactly as before, so the
-            // cadence can never delay an invalidation) or when K user turns
-            // have landed past the last cut (config
-            // storage.snapBase.cutEveryKUserTurns, default 8; 1 restores
-            // the original per-turn behavior). Between cuts the session
-            // serves the still-valid old row and derives its short tail
-            // live — precisely what a session without the plane does.
-            const k = snapBaseCutCadence();
-            let userTurnsPastCut = 0;
-            if (egressMaxSeq >= 0) {
-                for (const r of rows) {
-                    if (r.seq > egressMaxSeq && r.msg && r.msg.role === "user") userTurnsPastCut++;
-                }
-            }
-            if (egressMaxSeq < 0 || userTurnsPastCut >= k) {
-                try {
-                    const prefixRows = rows.filter((r) => r.seq <= cutWm);
-                    if (prefixRows.length > 0 && prefixRows.every((r) => coveredSeqUnion.has(r.seq) || r.msg)) {
-                        store.egressCut(
-                            session.id,
-                            prefixRows.map((r) => r.msgId),
-                            JSON.stringify(prefixRows),
-                            Date.now(),
-                        );
-                    }
-                } catch { /* never fail the render for a cache write */ }
-            }
-        }
     }
     return { rows, blockSeeds, coveredSeqUnion };
 }

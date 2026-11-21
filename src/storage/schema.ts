@@ -89,11 +89,10 @@ import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
 //        after the owner ruling) — ONE additive table (l1_world, the
 //        stage-0 identity ledger; the original four-table plane was retired
 //        before merge — superseded by docs/pr-6785-unified-storage-and-flows.md).
-//        No backfill; the tables are the substrate for the v2 skeleton
-//        (fold_journal + egress_snapshot, probe-first below), gated by
-//        storage.snapBase.enabled, rollback is DROP the table + index and
-//        rewind user_version. Additive-only: an older build opening a v12
-//        file ignores the extra tables.
+//        No backfill. Additive-only: an older build opening a v12 file
+//        ignores the extra tables. (The fold-journal / egress-snapshot /
+//        scope-rev tables that once lived here were retired before merge —
+//        discussions/7439; the egress op-log below is self-contained.)
 //        Applied PROBE-FIRST (table-existence check), NOT version-gated:
 //        the unmerged fastpath re-land (#5855) numbers its two table groups
 //        v12/v13 and landed them into a SHARED database first (field,
@@ -390,79 +389,6 @@ CREATE TABLE IF NOT EXISTS l1_world (
 CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
 `;
 
-/** #5874 v2 (pure-incremental): the append-only FOLD JOURNAL — one row per
- *  compression fold decision (a block that first lands in the ledger).
- *  kind stays 'fold': UNPIN is DERIVED state, not stored state — a fold is
- *  unpinned iff its block died or a covered id re-emerged live past the
- *  fold's end_seq (the pure predicate src/storage/snap.ts foldUnpins), so
- *  there is nothing extra to persist. input_hash is the sha256 aggregate
- *  over the covered LIVE message rows (seq, msg_id, content_hash) at fold
- *  time — the "poor-man's S4": the egress read re-derives the same
- *  aggregate and any mismatch (content rewrite, rewind crossing the fold,
- *  row loss) degrades the round to the legacy derive path instead of
- *  serving a stale view. #7064 slimming: the hash scope is the RANGE
- *  [start_seq, end_seq] itself — the id list (covered_ids) is dropped;
- *  re-derivation range-scans the live rows in the interval (tombstones
- *  hold their seq, re-mints keep seq with a new content_hash, so the range
- *  is a faithful re-derivation of the fold's input set). A fold whose rows
- *  all retired keeps its row — the journal is append-only and rows are
- *  never rewritten or deleted except by the session cascade. Probed
- *  separately from l1_world: a db
- *  already at v12 with l1_world but no fold_journal (a dev window between
- *  the two landings) upgrades with this one CREATE, no version bump. */
-const FOLD_JOURNAL_DDL = `-- #5874 v2: append-only fold journal (fold decisions + input aggregate hash).
-CREATE TABLE IF NOT EXISTS fold_journal (
-    session_id TEXT NOT NULL,
-    jseq INTEGER NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'fold' CHECK (kind IN ('fold')),
-    block_id TEXT NOT NULL,
-    start_seq INTEGER NOT NULL,
-    end_seq INTEGER NOT NULL,
-    input_hash TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, jseq),
-    UNIQUE (session_id, block_id)
-);
-`;
-
-/** #5874 v2 (pure-incremental, step 3): the EGRESS SNAPSHOT — one append-
- *  only row per CUT pinning the derived stable prefix as a content-CAS
- *  reference (prefix_ref, nullable for a hash-only pin) plus the input
- *  aggregate (input_hash) it was derived from and the prefix boundary
- *  (watermark = max live seq of the pinned set at cut time). #7064
- *  slimming: the hash scope IS the watermark — the read re-derives the
- *  aggregate over the LIVE rows with seq <= watermark (ids_json dropped;
- *  a content rewrite or a new-generation row within the scope degrades the
- *  round exactly as before). Only the newest row per session is ever
- *  served; superseded rows are trimmed by the writer in the same
- *  transaction (releasing their CAS refs) — the table is a cache, not a
- *  journal. Probed separately from fold_journal (same probe-first
- *  discipline, no version bump). */
-const EGRESS_SNAPSHOT_DDL = `-- #5874 v2: cut-point materialized egress prefix (CAS-referenced, verify-then-serve).
-CREATE TABLE IF NOT EXISTS egress_snapshot (
-    session_id TEXT NOT NULL,
-    snap_seq INTEGER NOT NULL,
-    watermark INTEGER NOT NULL,
-    input_hash TEXT NOT NULL,
-    prefix_ref TEXT,
-    last_stable_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    scope_rev INTEGER,
-    PRIMARY KEY (session_id, snap_seq)
-);
-`;
-
-/** #6785 review (owner): per-session message-mutation revision for the
- *  egress read-side O(1) fast path (see egressScopeRev in snap.ts). A
- *  separate table so the counter survives egress row trims and is never
- *  touched by the per-turn cut path. Probe-first, no version bump. */
-const EGRESS_SCOPE_REV_DDL = `-- #6785 review (owner): per-session egress input-mutation revision.
-CREATE TABLE IF NOT EXISTS egress_scope_rev (
-    session_id TEXT PRIMARY KEY,
-    rev INTEGER NOT NULL
-);
-`;
-
 /** #6785 step 7: the ORPHAN BLOCKS table. The orphan journal (#4216/#4242:
  *  blockContents entries whose block was reaped out of state.blocks) used to
  *  accumulate in sessions.orphans_json — an ever-growing JSON blob re-merged
@@ -567,44 +493,6 @@ export function migrateSchema(db: {
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
     if (!hasL1World) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
-    // #5874 v2: the fold journal is its OWN probe — a v12 db written before
-    // it landed has l1_world but not fold_journal and must pick it up here
-    // (same probe-first discipline; the CREATE is IF NOT EXISTS, so a fresh
-    // db that got both tables from the DDL above passes through untouched).
-    const hasFoldJournal = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fold_journal'")
-        .get();
-    if (!hasFoldJournal) db.exec(FOLD_JOURNAL_DDL);
-    // #7064 slimming: covered_ids is redundant with [start_seq, end_seq]
-    // (probe-first DROP — fresh tables have no such column).
-    if (hasFoldJournal) {
-        const fjCols = (db.prepare("PRAGMA table_info(fold_journal)").all() as unknown as { name?: unknown }[])
-            .map((c) => c.name);
-        if (fjCols.includes("covered_ids") && dropColumnOk) db.exec("ALTER TABLE fold_journal DROP COLUMN covered_ids");
-    }
-    // #5874 v2 (step 3): the egress snapshot is its OWN probe (a db written
-    // between the fold_journal and egress_snapshot landings picks it up here;
-    // fresh dbs pass through — same discipline, no version bump).
-    const hasEgressSnapshot = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_snapshot'")
-        .get();
-    if (!hasEgressSnapshot) db.exec(EGRESS_SNAPSHOT_DDL);
-    // #7064 slimming: ids_json is redundant with the watermark (probe-first
-    // DROP — fresh tables have no such column).
-    if (hasEgressSnapshot) {
-        const esCols = (db.prepare("PRAGMA table_info(egress_snapshot)").all() as unknown as { name?: unknown }[])
-            .map((c) => c.name);
-        if (esCols.includes("ids_json") && dropColumnOk) db.exec("ALTER TABLE egress_snapshot DROP COLUMN ids_json");
-        // #6785 review (owner): the cut-time mutation revision (additive —
-        // pre-upgrade rows read NULL and verify once as before).
-        if (!esCols.includes("scope_rev")) db.exec("ALTER TABLE egress_snapshot ADD COLUMN scope_rev INTEGER");
-    }
-    // #6785 review (owner): the egress mutation-revision counter (own probe,
-    // same discipline — no version bump).
-    const hasEgressScopeRev = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_scope_rev'")
-        .get();
-    if (!hasEgressScopeRev) db.exec(EGRESS_SCOPE_REV_DDL);
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).
@@ -836,9 +724,8 @@ export function migrateSchema(db: {
         // v12 (#5874 P0): snapshot-table compression foundation — ensured
         // PROBE-FIRST above (coexists with sibling-branch DDL that consumed
         // the v12/v13 numbers, see the note before the early return).
-        // Pure additivity: no backfill, no rewrite of existing rows; the
-        // plane stays dormant until storage.snapBase.enabled turns it on.
-        // Rollback = DROP the table + index and set user_version back
+        // Pure additivity: no backfill, no rewrite of existing rows.
+        // Rollback = DROP the tables and set user_version back
         // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
