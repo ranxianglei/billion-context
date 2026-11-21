@@ -4,6 +4,13 @@ on:
     push:
         branches: [master]
 
+# Queue hygiene: two rapid merges stack artifact builds, and only the newest
+# master commit's artifact matters — cancel the superseded run instead of
+# letting it hold a slot. Same pattern the e2e lanes use since #2637.
+concurrency:
+    group: master-build-${{ github.ref }}
+    cancel-in-progress: true
+
 permissions:
     contents: read
     pull-requests: write
