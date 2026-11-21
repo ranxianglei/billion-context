@@ -37,27 +37,40 @@ export interface EgressSourceMsg {
  * message. Deterministic over (ids, roles, texts): same inputs → same rows,
  * which is what makes the next diff sparse. `tokens` is a chars/4 estimate
  * for v1 (segment 4 replaces it with the rendered tag triple when the serve
- * path lands); it only needs to be stable while the content is unchanged. */
+ * path lands); it only needs to be stable while the content is unchanged.
+ * `prev` (the previous turn's view): a row whose content is UNCHANGED keeps
+ * its existing casRef instead of re-putting the same CAS body — putContent
+ * refcount-bumps on hit, so re-putting every turn would inflate each row's
+ * refcount by +1/turn forever (the only release is the session sweep). A
+ * changed/missing row puts fresh (a missing casRef is filled in, not left
+ * absent, so serve-from-log picks it up on the next turn). */
 export function buildEgressViewRows(
     conversation: readonly EgressSourceMsg[],
     systemText: string | undefined,
     cas?: { put(text: string): string },
+    prev?: readonly EgressViewRow[],
 ): EgressViewRow[] {
     const rows: EgressViewRow[] = [];
     if (systemText !== undefined && systemText.length > 0) {
         const sysHash = rowHash(systemText);
-        rows.push({ msgid: "system:" + sysHash, ref: "", tokens: Math.max(1, Math.ceil(systemText.length / 4)), type: "system", role: "system", contentHash: sysHash, casRef: cas ? cas.put(systemText) : undefined });
+        const sysMsgid = "system:" + sysHash;
+        const sysPrev = prev?.find((r) => r.msgid === sysMsgid && r.contentHash === sysHash);
+        rows.push({ msgid: sysMsgid, ref: "", tokens: Math.max(1, Math.ceil(systemText.length / 4)), type: "system", role: "system", contentHash: sysHash, casRef: cas ? (sysPrev?.casRef ?? cas.put(systemText)) : undefined });
     }
+    const prevByMsgid = new Map<string, EgressViewRow>();
+    for (const p of prev ?? []) if (!prevByMsgid.has(p.msgid)) prevByMsgid.set(p.msgid, p);
     for (const m of conversation) {
         const text = typeof m.text === "string" ? m.text : "";
+        const contentHash = rowHash(JSON.stringify([m.id, m.role, m.contentType ?? null, text]));
+        const p = prevByMsgid.get(m.id);
         rows.push({
             msgid: m.id,
             ref: /^m\d{4,}$/.test(m.id) ? m.id : "",
             tokens: Math.max(1, Math.ceil(text.length / 4)),
             type: m.id.startsWith("acp_summary") ? "acp_summary" : m.role === "tool" ? "tool" : "text",
             role: m.role,
-            contentHash: rowHash(JSON.stringify([m.id, m.role, m.contentType ?? null, text])),
-            casRef: cas ? cas.put(JSON.stringify(m)) : undefined,
+            contentHash,
+            casRef: cas ? ((p && p.contentHash === contentHash ? p.casRef : undefined) ?? cas.put(JSON.stringify(m))) : undefined,
         });
     }
     return rows;
@@ -90,7 +103,7 @@ export function recordEgressTurn(args: {
 }): EgressViewRow[] {
     const { store, sessionId, conversation, systemText, nowMs } = args;
     const prev = args.prev ?? store.egressStateView(sessionId);
-    const next = buildEgressViewRows(conversation, systemText, store.egressPutContent ? { put: (t) => store.egressPutContent!(t) } : undefined);
+    const next = buildEgressViewRows(conversation, systemText, store.egressPutContent ? { put: (t) => store.egressPutContent!(t) } : undefined, prev);
     const ops = diffEgressView(prev, next);
     if (ops.length > 0) {
         store.egressStateAppendOps(sessionId, ops, nowMs);
