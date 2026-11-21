@@ -55,8 +55,9 @@ test("buildEgressViewRows reuses the prev casRef for unchanged rows (no putConte
 
 test("deleteSession cascades egress_state/egress_flow and releases their CAS refs", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-egress-lifecycle-"));
+    let store: UnifiedStore | undefined;
     try {
-        const store = UnifiedStore.open(join(dir, "index.db"));
+        store = UnifiedStore.open(join(dir, "index.db"));
         const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
         migrateSchema(db);
         const sid = "sess-egress-cascade";
@@ -80,6 +81,9 @@ test("deleteSession cascades egress_state/egress_flow and releases their CAS ref
         const gone = (h: string) => (db.prepare("SELECT count(*) AS n FROM content WHERE hash = ?").get(h) as { n: number }).n;
         assert.equal(gone(h1), 0, "egress CAS body released to zero and collected");
     } finally {
+        // close the store before rmSync — Windows cannot unlink an open SQLite
+        // db (EPERM/EBUSY on index.db). Precedent: tests/archive-reference-counts.test.ts.
+        store?.close();
         rmSync(dir, { recursive: true, force: true });
     }
 });
