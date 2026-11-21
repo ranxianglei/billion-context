@@ -344,7 +344,7 @@ pure-stdlib Python module shipped inside the npm package:
   own on an ephemeral port (declared `lane: hermes` so no other lane can ride
   it; parent-pid watchdog tears it down when
   hermes exits — the plugin heartbeats its pid to the proxy every 5 s
-  (`hb: true`, #7493), so the watchdog ages a dead host out by heartbeat
+  (`hb: true`, #7491), so the watchdog ages a dead host out by heartbeat
   silence even when its pid is recycled, which kill-0 alone cannot prove
   (#3544); concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it

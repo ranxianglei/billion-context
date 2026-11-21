@@ -80,7 +80,7 @@ BOOTSTRAP_RETRY_BACKOFF_S = (10.0, 30.0, 60.0)
 # self-heal (30 s tick x 3 failures = recovery within ~90 s, README "Self-healing").
 ORIGIN_WATCH_INTERVAL_S = 30.0
 ORIGIN_WATCH_FAIL_LIMIT = 3
-# #7493: beat the routed proxy's /__bili/watcher with {pid, hb: true} on this cadence — the
+# #7491: beat the routed proxy's /__bili/watcher with {pid, hb: true} on this cadence — the
 # owner-attestation opt-in the TS lanes send (src/launcher.ts OWNER_HEARTBEAT_INTERVAL_MS).
 # Without it the proxy sees the host pid as a legacy kill-0-only watcher, and a RECYCLED host
 # pid reads alive forever (kill-0 is an existence check, identity-blind under pid reuse,
@@ -140,7 +140,7 @@ _state: Dict[str, Any] = {
     "watchdog_thread": None,
     "recovering": False,
     "env_backup": {},
-    # #7493: heartbeat_gen invalidates a previous generation's owner-heartbeat thread on
+    # #7491: heartbeat_gen invalidates a previous generation's owner-heartbeat thread on
     # load/unload; heartbeat_thread is the beating thread itself (see _owner_heartbeat_loop).
     "heartbeat_gen": 0,
     "heartbeat_thread": None,
@@ -1397,7 +1397,7 @@ def _watchdog_loop(sidecar: Dict[str, str], ctx: Any, gen: int) -> None:
 
 
 def _ensure_owner_heartbeat() -> None:
-    """Start the owner-heartbeat thread once per generation (#7493). A live thread means nothing
+    """Start the owner-heartbeat thread once per generation (#7491). A live thread means nothing
     to do; register()/unload bump heartbeat_gen so a previous generation's thread exits on its
     next tick. The thread follows _state["origin"] dynamically, so a #4644 re-route to a new
     origin is covered by the same thread — no restart needed."""
@@ -1414,7 +1414,7 @@ def _ensure_owner_heartbeat() -> None:
 
 
 def _owner_heartbeat_loop(gen: int) -> None:
-    """#7493: attest the host pid to the routed proxy every OWNER_HEARTBEAT_INTERVAL_S with
+    """#7491: attest the host pid to the routed proxy every OWNER_HEARTBEAT_INTERVAL_S with
     {pid, hb: true} — the opt-in that lets the proxy's parent-gone watchdog age the pid out by
     HEARTBEAT SILENCE instead of trusting kill-0 alone. kill(pid, 0) is an existence check,
     identity-blind under pid reuse (#3544): without the heartbeat, a host death whose pid gets

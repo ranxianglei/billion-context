@@ -487,7 +487,7 @@ if SCENARIO == "discover-foreign-lane":
 elif SCENARIO == "discover-user-zone":
     install_sidecar(True)
     write_origin(inst_rec(True, lane=None, token=None))
-    # Asserts the registration shape; keep the #7493 owner heartbeat out of the watcher call log.
+    # Asserts the registration shape; keep the #7491 owner heartbeat out of the watcher call log.
     mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     mod.register(ctx)
 elif SCENARIO == "discover-lane-first":
@@ -522,7 +522,7 @@ elif SCENARIO == "spawn-env":
 elif SCENARIO.startswith("discover-"):
     install_sidecar(SCENARIO == "discover-armed")
     write_origin(inst_rec(SCENARIO == "discover-armed"))
-    # These scenarios assert the registration shape; keep the #7493 owner heartbeat out of the
+    # These scenarios assert the registration shape; keep the #7491 owner heartbeat out of the
     # watcher call log (a 5 s beat could land on a slow machine and change the shape).
     mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     mod.register(ctx)
@@ -781,7 +781,7 @@ elif SCENARIO == "output-limits":
 elif SCENARIO.startswith("attach"):
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
-    # These scenarios assert the registration shape; keep the #7493 owner heartbeat out of the
+    # These scenarios assert the registration shape; keep the #7491 owner heartbeat out of the
     # watcher call log (a 5 s beat could land on a slow machine and change the shape).
     mod.OWNER_HEARTBEAT_INTERVAL_S = 3600.0
     ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
@@ -1189,7 +1189,7 @@ elif SCENARIO == "ready-unload":
     out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
     ctx.run_unload()
 elif SCENARIO == "owner-heartbeat":
-    # #7493: an attached host must beat the proxy's /__bili/watcher with {pid, hb: true} — the
+    # #7491: an attached host must beat the proxy's /__bili/watcher with {pid, hb: true} — the
     # opt-in that lets the proxy age a RECYCLED host pid out by heartbeat silence (kill-0 is an
     # existence check, identity-blind under pid reuse, #3544; without it the proxy never exits
     # when its host dies and the pid is recycled — runaway proxies, #7484).
@@ -1468,7 +1468,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
     });
 
-    test("attach: beats the proxy with owner heartbeats (hb:true) — the recycled-pid opt-in (#7493)", () => {
+    test("attach: beats the proxy with owner heartbeats (hb:true) — the recycled-pid opt-in (#7491)", () => {
         if (!PY) {
             console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
             return;
