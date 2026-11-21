@@ -27,16 +27,18 @@
   config:
     auto: false
 # #3354: keep in sync with writeDshAcpPatch in src/launcher.ts — entry inject
-# lists are REPLACED by patches, not concatenated; if a future dsh ships its
-# own inject list on these entries, merge manually in BOTH layers.
+# lists are REPLACED by patches, not concatenated; the row must restate the
+# host's own inject list (the factory preset's agentPresets dependency, #6456)
+# AND append the gate service; if a future dsh ships a different inject list
+# on these entries, merge it in manually in BOTH layers.
 - id: preset-standard
-  inject: [biliBasicCompactionPolicy]
+  inject: [agentPresets, biliBasicCompactionPolicy]
 - id: preset-ptc
-  inject: [biliBasicCompactionPolicy]
+  inject: [agentPresets, biliBasicCompactionPolicy]
 - id: preset-minimal
-  inject: [biliBasicCompactionPolicy]
+  inject: [agentPresets, biliBasicCompactionPolicy]
 - id: preset-cordis
-  inject: [biliBasicCompactionPolicy]
+  inject: [agentPresets, biliBasicCompactionPolicy]
 # #2605: DSH's default retry whitelist omits MALFORMED_RESPONSE, so one
 # sampling flake that breaks a tool-call argument JSON kills the whole turn
 # unretried. A patch replaces the targeted row's WHOLE config (no deep
