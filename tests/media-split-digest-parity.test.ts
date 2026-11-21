@@ -11,7 +11,7 @@ import { UnifiedShadow } from "../src/storage/shadow.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 
 /**
- * #6351: the sampled digest compared the same message in two different media
+ * #6356: the sampled digest compared the same message in two different media
  * representations and latched drift forever.
  *
  * Rows are WRITTEN media-split (`planIngest` -> `splitMediaContent`, big
