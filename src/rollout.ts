@@ -136,13 +136,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // Force with `rollout.features.egressOpLog: true` or
     // `BILI_ROLLOUT_EGRESS_OP_LOG=1`.
     egressOpLog: { percent: 0 },
-    // #7398 seg 4b: serve-from-log — when on (AND egressOpLog is on), the
-    // outbound conversation elements are REBUILT from the op log + content
-    // CAS (same legacy chain, bytes identical by construction) instead of the
-    // in-memory kernel view; any unrebuildable row (tool rows in v1, missing
-    // CAS) → whole turn stays on the legacy path (degrade, never guess).
-    // seg 4a's shadow byte-comparison remains for the fallback turns. Force
-    // with `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
+    // #7398 seg 4b: serve-from-log — when on, each OpenAI-lane turn
+    // self-records its outbound view as sparse ops (egressOpLog NOT required),
+    // rebuilds the outbound conversation elements from the op log + content
+    // CAS (same legacy chain, bytes identical by construction) and swaps them
+    // into the outbound body; any unrebuildable row (missing casRef / missing
+    // CAS body — pre-seg-4 rows, unknown role) or a corrupt log degrades the
+    // WHOLE turn to the legacy path (never a partial swap). seg 4a's shadow
+    // byte-comparison keeps running on the fallback turns. Force with
+    // `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
     egressServeLog: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+

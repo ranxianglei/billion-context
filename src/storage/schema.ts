@@ -88,7 +88,7 @@ import { parseLegacyEnvelopeToWindow } from "../snapshot/identity.js";
 //      - v12: snapshot foundation v2 (#5874 P0, pure-incremental redesign
 //        after the owner ruling) — ONE additive table (l1_world, the
 //        stage-0 identity ledger; the original four-table plane was retired
-//        before merge — see docs/proposals/snapshot-compression-foundation).
+//        before merge — superseded by docs/pr-6785-unified-storage-and-flows.md).
 //        No backfill; the tables are the substrate for the v2 skeleton
 //        (fold_journal + egress_snapshot, probe-first below), gated by
 //        storage.snapBase.enabled, rollback is DROP the table + index and

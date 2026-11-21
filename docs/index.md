@@ -13,7 +13,6 @@
 | [clients](clients.md) / [中文](clients.zh-CN.md) / [日本語](clients.ja.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
 | [how-it-works](how-it-works.en.svg) / [中文](how-it-works.zh-CN.svg) | One diagram: request flow + the injected context tools |
 | [README](README.md) / [中文](README.zh-CN.md) / [日本語](README.ja.md) | Directory landing page: section map + the rules that keep this directory live |
-| [storage-relations](storage-relations.en.svg) / [中文](storage-relations.zh.svg) | One diagram: every storage table — what it stores, when it is written/read, which feature it serves (snapshot-table foundation #5901) |
 
 ## Identity & protocol
 
@@ -36,4 +35,4 @@
 | [lifecycle](lifecycle.md) | Transition-switch ledger / retirement inventory / hygiene record (CI-enforced `BILI_*` coverage) |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | Evidence appendix behind §7 of `AGENTS.md` (AI auto-dev review history) |
 | [unified-loop-spec](unified-loop-spec.md) | Historical design: unified compress-loop spec (implemented; code is the source of truth) |
-| [snapshot-table foundation](proposals/snapshot-compression-foundation/README.md) / [中文](proposals/snapshot-compression-foundation/README.zh-CN.md) | Design record: six-stage fixed chain, single storage truth (#5874). P0+P1+P2 landed in #5901; P2 = mapEgress direct-authority cutover (per-round tripwire removed by owner ruling 2026-11-11) |
+| [PR #6785 in depth](pr-6785-unified-storage-and-flows.md) / [中文](pr-6785-unified-storage-and-flows.zh-CN.md) | Review-grade walkthrough of PR #6785: unified-storage tables (schema v12) / implementation logic / per-turn data flow / full switch ledger + measured validation (#5874/#7064/#7398/#4491) |
