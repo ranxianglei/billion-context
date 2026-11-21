@@ -160,6 +160,7 @@ export async function updateStateSnapshot(runningVersion: string): Promise<Updat
  *  "1h", "12h", "1d", "7d", or "forever" (indefinite). Returns the pin state
  *  that was written, or an error. Never throws. */
 export async function pinAction(version: string, duration?: string): Promise<{ ok: boolean; error?: string; pin?: PinState }> {
+    if (registeredOpts === undefined) return { ok: false, error: "self-update not wired in this process" };
     if (duration === undefined || duration === "forever") {
         const pin = await setPin(version);
         if (!pin) return { ok: false, error: "pin state could not be persisted (cache dir unwritable)" };
@@ -175,6 +176,7 @@ export async function pinAction(version: string, duration?: string): Promise<{ o
 /** #6804: lift the pin early. `hadPin` reports whether a pin was actually
  *  active and cleared (false = there was nothing to clear). Never throws. */
 export async function unpinAction(): Promise<{ ok: boolean; error?: string; hadPin: boolean }> {
+    if (registeredOpts === undefined) return { ok: false, error: "self-update not wired in this process", hadPin: false };
     const hadPin = (await activePin()) !== undefined;
     await clearPin();
     return { ok: true, hadPin };

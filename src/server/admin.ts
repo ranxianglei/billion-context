@@ -1054,7 +1054,7 @@ async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerRespon
     }
     if (duration !== undefined && duration !== "forever" && !/^\d+[hd]$/.test(duration)) {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "duration must be 1h, 12h, 1d, 7d, or forever" }, null, 2));
+        res.end(JSON.stringify({ error: "duration must be <N>h or <N>d (e.g. 1h, 12h, 1d, 7d), or forever" }, null, 2));
         return;
     }
     log("info", `[update] web panel requested pin ${version}${duration ? ` for ${duration}` : " (indefinite)"}`);

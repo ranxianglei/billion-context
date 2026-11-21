@@ -46,6 +46,7 @@ const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
 const { VERSION } = await import("../src/version.ts");
 const { _setReleaseNotesStateForTest, _resetReleaseNotesWatcherForTest } = await import("../src/update-notes.ts");
 const ua = await import("../src/server/update-actions.ts");
+const { readPin, _resetPinForTest } = await import("../src/update-pin.ts");
 const { forceInstallVersion, getLastInstall, readDiskVersion, lastUpdateCheckTime, _resetLastInstallForTest } = await import("../src/update.ts");
 const { rmrf } = await import("./tmp-rm.ts");
 
@@ -66,6 +67,12 @@ test("unwired process: every action degrades to a plain error string, never thro
     // Availability is checked before input validation — same string either way.
     const i = await ua.installVersionAction("0.9.999");
     assert.deepEqual(i, { ok: false, error: "self-update not wired in this process" });
+    // #6804: pin/unpin touch machine-level shared state — an unwired process
+    // must not write or clear it on behalf of another instance.
+    const p = await ua.pinAction("0.9.999", "1h");
+    assert.deepEqual(p, { ok: false, error: "self-update not wired in this process" });
+    const u = await ua.unpinAction();
+    assert.deepEqual(u, { ok: false, error: "self-update not wired in this process", hadPin: false });
     const s = await ua.updateStateSnapshot(VERSION);
     assert.equal(s.running, VERSION);
     assert.equal(s.checking, false);
@@ -317,15 +324,15 @@ test("panel installs attribute manual-web; advisory callers keep the legacy labe
     }
 });
 
-test("admin routes: state surfaces notices; install enforces charset/auth gates (#3719)", async () => {
-    _setStoreForTest(new SessionStore({ enabled: false }));
-    setRegistryForTest({});
-    ua._resetUpdateActionsForTest(); // unwired process: actions answer the plain string
-    _resetReleaseNotesWatcherForTest();
-    _setReleaseNotesStateForTest({
-        entries: [{ version: "0.1.500", tier: "critical", summary: "security fix", date: "2026-10-21" }],
-        diskVersion: "0.9.400",
-    });
+/** Shared harness for the /__bili/update/* route tests: a real startServer on
+ *  an ephemeral port, the DNS-rebinding header pair, a small call() helper,
+ *  and close(). Callers own the state setup and any root cleanup. */
+async function startUpdateProxy(): Promise<{
+    trustedHost: string;
+    spoofedHeaders: Record<string, string>;
+    call: (method: "GET" | "POST", urlPath: string, headers: Record<string, string>, body?: string) => Promise<{ status: number; json: unknown }>;
+    close: () => Promise<void>;
+}> {
     const opts: ProxyOptions = {
         port: 0,
         host: "127.0.0.1",
@@ -376,6 +383,23 @@ test("admin routes: state surfaces notices; install enforces charset/auth gates 
         req.end(body);
         return promise;
     }
+    async function close(): Promise<void> {
+        proxy.closeAllConnections?.();
+        await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+    return { trustedHost, spoofedHeaders, call, close };
+}
+
+test("admin routes: state surfaces notices; install enforces charset/auth gates (#3719)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    ua._resetUpdateActionsForTest(); // unwired process: actions answer the plain string
+    _resetReleaseNotesWatcherForTest();
+    _setReleaseNotesStateForTest({
+        entries: [{ version: "0.1.500", tier: "critical", summary: "security fix", date: "2026-10-21" }],
+        diskVersion: "0.9.400",
+    });
+    const { trustedHost, spoofedHeaders, call, close } = await startUpdateProxy();
     try {
         // Read path: pushed notices flow straight into the state endpoint.
         const state = await call("GET", "/__bili/update/state", { host: trustedHost });
@@ -411,9 +435,69 @@ test("admin routes: state surfaces notices; install enforces charset/auth gates 
         const spoofedPost = await call("POST", "/__bili/update/install", { ...spoofedHeaders, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203" }));
         assert.equal(spoofedPost.status, 403, "gate must fire before body parsing");
     } finally {
-        proxy.closeAllConnections?.();
-        await new Promise<void>((resolve) => proxy.close(() => resolve()));
+        await close();
         _resetReleaseNotesWatcherForTest();
+        try { rmrf(root); } catch { /* best-effort */ }
+    }
+});
+
+test("admin routes: pin/unpin validate input, gate spoofed hosts, and never touch the pin file unwired (#6804)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    ua._resetUpdateActionsForTest(); // unwired: the machine-level pin file must stay untouched
+    _resetReleaseNotesWatcherForTest();
+    _setReleaseNotesStateForTest({ entries: [] });
+    await _resetPinForTest();
+    const { trustedHost, spoofedHeaders, call, close } = await startUpdateProxy();
+    try {
+        // Unwired execution answers 200 with the plain string — and, unlike a
+        // real pin, never writes or clears the machine-level state file.
+        const unwiredPin = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203", duration: "1h" }));
+        assert.equal(unwiredPin.status, 200);
+        assert.deepEqual(unwiredPin.json, { ok: false, error: "self-update not wired in this process" });
+        const unwiredUnpin = await call("POST", "/__bili/update/unpin", { host: trustedHost });
+        assert.equal(unwiredUnpin.status, 200);
+        assert.deepEqual(unwiredUnpin.json, { ok: false, error: "self-update not wired in this process", hadPin: false });
+        assert.equal(await readPin(), undefined, "unwired pin/unpin must not write or clear the machine-level pin file");
+        // Input validation fires before the wiring check — same answers wired or not.
+        const badDuration = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203", duration: "5w" }));
+        assert.equal(badDuration.status, 400);
+        assert.match(JSON.stringify(badDuration.json), /<N>h or <N>d/);
+        const badVersion = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203; rm -rf /" }));
+        assert.equal(badVersion.status, 400);
+        assert.match(JSON.stringify(badVersion.json), /plain semver characters/);
+        const malformed = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, "{nope");
+        assert.equal(malformed.status, 400);
+        assert.match(JSON.stringify(malformed.json), /expected JSON body/);
+        // The DNS-rebinding gate covers the new routes like every other /__bili/ route.
+        const spoofed = await call("POST", "/__bili/update/pin", { ...spoofedHeaders, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203" }));
+        assert.equal(spoofed.status, 403, "gate must fire before body parsing");
+        // Wired: the route drives the real pin/unpin round-trip on the state file.
+        const installDir = makeFixture("0.1.203");
+        ua.registerUpdateActions({
+            packageName: "billion-context",
+            currentVersion: "0.1.202",
+            autoUpdate: false,
+            installDir,
+            resolveProxy: () => "",
+            updateTag: "latest",
+        });
+        const now = Date.now();
+        const wiredPin = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203", duration: "1h" }));
+        assert.equal(wiredPin.status, 200);
+        const wp = wiredPin.json as { ok: boolean; pin?: { version: string; until?: number } };
+        assert.equal(wp.ok, true);
+        assert.equal(wp.pin?.version, "0.1.203");
+        assert.ok(wp.pin?.until !== undefined && wp.pin.until > now + 3_500_000 && wp.pin.until < now + 3_630_000, "1h pin window");
+        const wiredUnpin = await call("POST", "/__bili/update/unpin", { host: trustedHost });
+        assert.equal(wiredUnpin.status, 200);
+        assert.deepEqual(wiredUnpin.json, { ok: true, hadPin: true });
+        assert.equal(await readPin(), undefined, "unpin clears the state file");
+    } finally {
+        await close();
+        ua._resetUpdateActionsForTest();
+        _resetReleaseNotesWatcherForTest();
+        await _resetPinForTest();
         try { rmrf(root); } catch { /* best-effort */ }
     }
 });

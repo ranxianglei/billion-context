@@ -135,13 +135,13 @@ Usage:
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
                                    lines (default <dir>/bili.log), --no-log skips, --session SID filters
-   bili update [version]            check for & install a newer version now; with a
+  bili update [version]             check for & install a newer version now; with a
                                      version argument, installs that exact published
                                      version (release or prerelease/temp build)
-   bili pin [duration]              pin the installed version (1h/12h/1d/7d/forever;
+  bili pin [duration]               pin the installed version (1h/12h/1d/7d/forever;
                                      default indefinite) — auto-upgrade becomes
-                                      check-only until the pin lifts or bili unpin
-   bili unpin                       lift the pin early
+                                     check-only until the pin lifts or bili unpin
+  bili unpin                        lift the pin early
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
                                     (read-only; --json for machine-readable output);
@@ -944,22 +944,21 @@ export async function main(): Promise<void> {
         // #6804: pin the installed version for a duration. The pin is
         // machine-level runtime state — no config file involved.
         const version = VERSION;
-        let until: number | undefined;
+        let durationMs: number | undefined;
         if (pinDuration) {
             if (pinDuration === "forever") {
                 // indefinite — no `until` field
             } else {
-                const ms = parsePinDuration(pinDuration);
-                if (ms === undefined) {
-                    console.error(`bili pin: invalid duration "${pinDuration}" (expected 1h, 12h, 1d, 7d, or forever)`);
+                durationMs = parsePinDuration(pinDuration);
+                if (durationMs === undefined) {
+                    console.error(`bili pin: invalid duration "${pinDuration}" (expected <N>h or <N>d, e.g. 1h, 12h, 1d, 7d, or forever)`);
                     process.exit(2);
                 }
-                until = Date.now() + ms;
             }
         }
-        const pin = await setPin(version, until);
+        const pin = await setPin(version, durationMs);
         if (pin) {
-            console.log(`bili: pinned ${version}${until ? ` until ${new Date(until).toISOString()}` : " (indefinite)"}`);
+            console.log(`bili: pinned ${version}${pin.until !== undefined ? ` until ${new Date(pin.until).toISOString()}` : " (indefinite)"}`);
         } else {
             console.error("bili pin: failed to write pin state");
             process.exit(1);

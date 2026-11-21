@@ -217,6 +217,32 @@ test("unpinAction reports hadPin=false when no pin is active", async () => {
     _resetUpdateActionsForTest();
 });
 
+test("CLI `bili pin 1h` persists a 1-hour window, not an absolute timestamp (review #6806)", async () => {
+    // The CLI handler must hand setPin a DURATION in ms. Passing
+    // Date.now()+ms (an absolute timestamp) makes setPin compute
+    // until = now + (now + ms) ≈ 2×epoch, so the pin never lifts.
+    const savedArgv = process.argv;
+    const savedConfigRef = process.env.BILI_CONFIG_FILE;
+    freshCacheDir();
+    try {
+        delete process.env.BILI_CONFIG_FILE;
+        process.argv = ["node", "bili", "pin", "1h"];
+        const { main } = await import("../src/cli.js");
+        await main();
+        const pin = await activePin();
+        assert.ok(pin, "pin must be written");
+        assert.ok(pin.until !== undefined, "a 1h pin must carry an until");
+        const now = Date.now();
+        assert.ok(pin.until! > now + 3_500_000, `until ${pin.until} must be ~now+1h, not in the past`);
+        assert.ok(pin.until! < now + 3_630_000, `until ${pin.until} must be ~now+1h (a value near 2×epoch means an absolute timestamp was passed as the duration)`);
+    } finally {
+        process.argv = savedArgv;
+        if (savedConfigRef === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = savedConfigRef;
+        await _resetPinForTest();
+    }
+});
+
 test("cleanup: remove scratch root", () => {
     rmSync(scratchRoot, { recursive: true, force: true });
 });
