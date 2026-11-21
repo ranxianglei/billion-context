@@ -127,6 +127,30 @@ test("all candidates failing preserves state and refuses without borrowing main 
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
 });
 
+test("oversized range names the offending range and suggested split in the refusal (#6945)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bili-summary-6945-"));
+    const path = join(root, "config.json");
+    const previous = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = path;
+    try {
+        // A small contextWindow makes the tightest input budget small, so the
+        // fixture's range exceeds it and the diagnostic fires. The credential
+        // does not resolve, so every candidate is a placeholder that throws —
+        // the batch fails and the refusal carries the oversized diagnostic.
+        const externalSummary = { enabled: true, targets: [{ name: "small", protocol: "responses", url: "http://127.0.0.1:1/small", model: "summary-small", credentialRef: "secret:small", contextWindow: 2048, outputTokens: 128 }] };
+        const ctx = context(externalSummary);
+        const result = await applyConfiguredCompression(args(ctx, SUMMARY), ctx);
+        assert.equal(result.outcome, "refused", result.text);
+        assert.ok(result.text.includes("oversized"), `expected the oversized diagnostic in: ${result.text}`);
+        assert.ok(result.text.includes("split ≥"), `expected a suggested split count in: ${result.text}`);
+        assert.ok(result.text.includes("tightest target input budget"), `expected the budget mention in: ${result.text}`);
+    } finally {
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+        rmrf(root);
+    }
+});
+
 test("SSE framing overhead does not consume the summary content budget", async () => {
     const text = "s".repeat(2000);
     await fixture(async (_base, externalSummary) => {
