@@ -43,6 +43,28 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2" });
 });
 
+test("pf-channel: tail-ids capped at 160 when the stamp freezes (#7367)", () => {
+    const sid = "sid-cap-1";
+    const inH = { [CONVO]: sid };
+    // k2 frozen at 2 (the flag flipped off, so the stamp never advances again)
+    learn(inH, "2");
+    // a long session: 200 ids captured; the full [K-1..] slice would be 199 ids
+    pfChannel.pfCaptureIds(sid, Array.from({ length: 200 }, (_, i) => `id${i}`));
+    const tail = pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"];
+    assert.ok(tail !== undefined, "tail-ids present");
+    const segs = tail!.split(",");
+    // capped to the NEWEST 160 ids (the window origin ids.length-1 is kept)
+    assert.equal(segs.length, 160, "tail capped at 160 ids");
+    assert.equal(segs[0], "id40", "cap keeps the newest ids, drops the oldest");
+    assert.equal(segs[159], "id199", "cap ends at the true window origin");
+    // a delta NARROWER than the cap is sent whole (no truncation)
+    const sidNarrow = "sid-cap-narrow";
+    learn({ [CONVO]: sidNarrow }, "2");
+    pfChannel.pfCaptureIds(sidNarrow, Array.from({ length: 10 }, (_, i) => `n${i}`));
+    const narrowTail = pfChannel.pfRequestHeaders({ [CONVO]: sidNarrow })["x-bili-pf-tail-ids"];
+    assert.equal(narrowTail!.split(",").length, 9, "narrow delta sent whole (ids.slice(k-1))");
+});
+
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
     const sid = "sid-clear-1";
     const inH = { [CONVO]: sid };

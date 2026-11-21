@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, stampOnlyWatermarkTurn, clearWatermarkSeed, watermarkDebugState, PF_COUNT_HEADER, PF_SEQ_HEADER, PF_TAIL_IDS_HEADER, PF_SLOT_UNKNOWN } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../src/incremental-lane.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
@@ -84,6 +84,20 @@ test("gate off / title-gen / incremental-turn requests are untouched", () => {
     assert.equal(r.out.measuredT, undefined);
 
     _resetStoreForTest();
+});
+
+test("stampOnlyWatermarkTurn: flag off still emits the seq heartbeat (#7367)", () => {
+    // The x-bili-pf-seq stamp is the client's watermark advance, NOT
+    // fastpath-only state. With pluginFullResendWatermark gated off the
+    // fastpath never evaluates, so finalizeWatermarkTurn never runs — the
+    // stamp must still flow (via the structural scan) or the client's k2
+    // freezes and its tail-ids grow past the 16 KB header limit.
+    const body = bodyOf([SYS("s"), USR("hi"), USR("yo"), ASST("ok"), USR("tail")]);
+    const headers = stampOnlyWatermarkTurn(body);
+    assert.equal(headers[PF_SEQ_HEADER], "5", "stamp = measured element count T");
+    // an unscannable body degrades to no stamp (the client's cap is the backstop)
+    assert.deepEqual(stampOnlyWatermarkTurn("not-json-at-all"), {});
+    assert.deepEqual(stampOnlyWatermarkTurn(""), {});
 });
 
 test("first turn: unseeded miss, measured T, response re-stamps", () => {

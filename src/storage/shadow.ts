@@ -28,11 +28,12 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
-import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
+import { resolveStorageMode, resolveStorageWalJournalSizeLimit, effectiveJsonWriterOff, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
+import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
@@ -45,6 +46,89 @@ import type { CoreMessage, MessageContentStore } from "acp-kernel";
 let integrityQuickCheckFailed = false;
 export function hadIntegrityQuickCheckFailure(): boolean {
     return integrityQuickCheckFailed;
+}
+
+/** Test seam: clear the proven-corruption latch (see integrity-check.js' own
+ *  test resets for the same pattern). */
+export function resetIntegrityQuickCheckLatchForTests(): void {
+    integrityQuickCheckFailed = false;
+}
+
+/** The process's effective storage stance: is the SQLite index the ONLY
+ *  persistent copy (the pure-sqlite stance)? True exactly when the persist
+ *  constructor's jsonWriterOff switch is in force — same knobs, same
+ *  precedence, so the two can never disagree: effective mode full, sqlite
+ *  backend, no encryption opt-out, and the envelope writer off (the
+ *  pure-sqlite default or an explicit off).
+ *
+ *  Why it matters (owner policy 2026-11-21, the #7156 production incident):
+ *  a proven-corrupt index.db in this stance has NO durable fallback behind
+ *  it — the historical "loud alarm + start WITHOUT the index" contract would
+ *  serve a near-empty, non-persistent JSON view and silently lose the
+ *  durable history, which is WORSE than the corruption itself. In every
+ *  other stance (explicit dual-write full, shadow, legacy, network
+ *  backends, encryption) the envelopes remain a real recovery source and
+ *  the historical contract applies.
+ *
+ *  Lives HERE (not in knobs.ts) because knobs.ts importing a storage module
+ *  at top level flips the config/knobs/update module-evaluation order into
+ *  a TDZ crash (update.ts calls knobs at top level; observed 2026-11-21). */
+export function storageStancePureSqlite(
+    env: NodeJS.ProcessEnv = process.env,
+    fileUnified?: string,
+    fileJsonWriter?: string,
+    fileBackend?: string,
+): boolean {
+    if (resolveStorageMode(env, fileUnified) !== "full") return false;
+    if ((env.BILI_ENCRYPTION_KEY ?? "").trim() !== "") return false; // encryption blocks the sidecar → legacy-only, envelope IS the source of truth
+    if (resolveBackendName(env, fileBackend) !== "sqlite") return false; // network backends keep the envelope as the sync read path
+    return effectiveJsonWriterOff(env, fileJsonWriter, fileUnified);
+}
+
+/** Escape hatch for the pure-sqlite proven-corruption refusal:
+ *  BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1/true/on restores the historical
+ *  alarm-and-degrade contract (start WITHOUT the index, serve the JSON path)
+ *  even though the corrupt index is the only persistent copy. Explicitly
+ *  dangerous — every turn served that way lands only in the non-durable
+ *  view — so it is never the default and never implied by any config value. */
+export function legacyDegradeAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+    const raw = (env.BILI_STORAGE_ALLOW_LEGACY_DEGRADE ?? "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "on";
+}
+
+/** Proven-corruption policy gate (owner policy 2026-11-21, #7156 incident).
+ *  Shared by both proven-corruption branches of maybeOpen: it always latches
+ *  the process verdict and records the boot failure (the status surface),
+ *  then decides the outcome by storage stance:
+ *   - PURE-SQLITE stance (envelopes are not a durable copy) and the escape
+ *     hatch is NOT set → THROW the refusal: boot exits, data stays exactly
+ *     where it is, operator fixes the files by hand (or sets the escape
+ *     hatch). This stance historically degraded, which served a near-empty
+ *     non-persistent JSON view over the only durable copy — strictly worse
+ *     than refusing.
+ *   - every other stance (explicit dual-write full, shadow, legacy,
+ *     network backends, encryption) → fall through; the caller keeps the
+ *     historical 2026-10-30 contract (loud alarm + start WITHOUT the index). */
+function applyProvenCorruptionPolicy(
+    dir: string,
+    env: NodeJS.ProcessEnv,
+    fileUnified: string | undefined,
+    fileJsonWriter: string | undefined,
+    fileBackend: string | undefined,
+    detail: string,
+    err: unknown,
+): void {
+    recordSidecarOpenFailure(detail);
+    integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
+    if (!storageStancePureSqlite(env, fileUnified, fileJsonWriter, fileBackend) || legacyDegradeAllowed(env)) return;
+    // Over-record so the status wire carries the REFUSAL, not the historical
+    // degrade wording (degradeReason() branches on this prefix).
+    recordSidecarOpenFailure(`REFUSING TO START (pure-sqlite stance): ${detail}`);
+    loggerLog(
+        "error",
+        `[storage] REFUSING TO START — the SQLite index (${path.join(dir, "index.db")}) is PROVEN CORRUPT (${detail}) and this process runs in the PURE-SQLITE stance, so the JSON envelopes are NOT a durable copy of your sessions — degrading to them would serve a near-empty, non-persistent view while your only durable history sits in the corrupt index. Refusing beats losing (2026-11-21 owner policy, #7156 incident). Fix it by hand: 1) back up ${path.join(dir, "index.db")}{,-wal,-shm}; 2) MOVE those files aside; 3) start again — the fresh index re-imports the JSON envelopes written since; 4) restore/recover what the backup can give (sqlite3 .recover is your friend). Set BILI_STORAGE_ALLOW_LEGACY_DEGRADE=1 only if you consciously accept serving the near-empty legacy view instead.`,
+    );
+    throw err;
 }
 
 const VERIFY_BATCH_SIZE = 32;
@@ -280,7 +364,12 @@ export class UnifiedShadow {
             : { name: "mysql", source: "network" };
     }
 
-    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
+    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
+     *  THROWS when the environment is broken (transient open failures) or
+     *  when a PROVEN-corrupt index would leave a pure-sqlite process without
+     *  any durable copy (owner policy 2026-11-21, #7156 incident) and the
+     *  BILI_STORAGE_ALLOW_LEGACY_DEGRADE escape hatch is not set — boot
+     *  refuses on the thrown error instead of degrading. */
     static maybeOpen(
         dir: string,
         env: NodeJS.ProcessEnv = process.env,
@@ -288,6 +377,7 @@ export class UnifiedShadow {
         fileUnified?: string,
         fileWalLimit?: number,
         fileBackend?: string,
+        fileJsonWriter?: string,
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
@@ -322,18 +412,26 @@ export class UnifiedShadow {
                 // envelopes — with a loud alarm naming the manual fix.
                 // writerOffActive() sees no sidecar, so even a jsonWriter=off
                 // operator keeps persisting every turn to the envelopes; no
-                // turn ever lands somewhere unsafe. The corrupt set stays
+                // turn ever lands somewhere unsafe — UNLESS the process is in
+                // the pure-sqlite stance, where the envelopes are NOT a
+                // durable copy: that case no longer degrades, it refuses (the
+                // 2026-11-21 layer below). The corrupt set stays
                 // EXACTLY in place: an operator repairs it or moves it aside
                 // by hand (back up first) and the next start picks up a fresh
                 // index that re-imports the envelopes. Transient open
                 // failures below are a different category ("environment
                 // broken", not "data proven bad") and still refuse.
+                // Owner policy 2026-11-21 layer (on top of the 2026-10-30
+                // degrade contract): in the PURE-SQLITE stance the envelopes
+                // are not a durable copy, so this branch THROWS the refusal
+                // (boot exits) unless BILI_STORAGE_ALLOW_LEGACY_DEGRADE is
+                // set; every other stance falls through to the historical
+                // alarm + return null below.
+                applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `integrity quick_check failed: ${err.detail}`, err);
                 loggerLog(
                     "error",
                     `[storage] index.db FAILED its integrity quick_check (${err.detail}) — starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#4175/#4626/#4816)`,
                 );
-                recordSidecarOpenFailure(`integrity quick_check failed: ${err.detail}`);
-                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
             // #3285: watermark trust does not cross process boundaries — a
@@ -342,21 +440,52 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
+            // The inner gate's refusal throw (or any StorageIntegrityError the
+            // inner catch let through) re-enters THIS catch — it is already
+            // fully handled (latched, recorded, logged); re-throw untouched
+            // instead of double-processing it as a first-post-open-write
+            // failure (that path only ever sees raw driver errors).
+            if (err instanceof StorageIntegrityError) throw err;
             const errStr = String(err);
-            // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
-            // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
-            // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
-            // session state in unified-full mode). The Node.js upgrade lever is surfaced via
-            // /__bili/status + the bootstrap warn.
-            // Corruption-shaped failures never reach here — the inner catch
-            // above handles them (loud alarm + boot WITHOUT the index).
+            // #7156: corruption-shaped failures CAN reach here. When the
+            // integrity check did not run synchronously — a store over the
+            // 512 MiB sync threshold checks in the background, or a poisoned
+            // .chk verdict cache skipped the rescan (see the close-time gate
+            // in store.ts) — the corruption surfaces at the FIRST post-open
+            // write (resetAllIngestWatermarks) instead of at quick_check.
+            // Classify it exactly like the inner catch: proven-corrupt →
+            // start WITHOUT the index, files left in place, loud alarm naming
+            // the manual fix (2026-10-30 owner policy).
+            const corruptionDetail = sqliteCorruptionDetail(err);
+            if (corruptionDetail !== null) {
+                // The opened handle is abandoned (GC releases it) rather than
+                // close()'d: close() would run the close-time integrity-cache
+                // refresh, and a runtime corruption finding must NOT write the
+                // verdict cache (owner policy 2026-10-30: runtime findings are
+                // alarm-only, no cache write — writing "ok" here would re-stamp
+                // the poisoned verdict). The operator moves the files aside by
+                // hand, so the uncheckpointed -wal state is moot.
+                // Same 2026-11-21 layer as the quick_check branch: pure-sqlite
+                // stance THROWS the refusal here too (the corruption surfaced
+                // at the first post-open write instead of at quick_check —
+                // large store / cached verdict); every other stance keeps the
+                // historical alarm + return null below.
+                applyProvenCorruptionPolicy(dir, env, fileUnified, fileJsonWriter, fileBackend, `first post-open write failed: ${corruptionDetail}`, err);
+                loggerLog(
+                    "error",
+                    `[storage] index.db FAILED at the first post-open write (${corruptionDetail}) — the integrity check did not run synchronously (large store / cached verdict), so the corruption surfaced here instead of at quick_check. Starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#7156/#4175/#4626)`,
+                );
+                return null;
+            }
+            // Deleting the index cannot fix a no-engine failure (the engine is
+            // missing from the process, not from the file), so the deletion
+            // hint below must not be offered for those shapes.
             // #4626-era owner decision chain (2026-10-30): every OTHER
             // sidecar-open failure REFUSES TO START instead of degrading —
-            // no-engine/CANTOPEN/readonly/OS-level: availability at the
-            // price of a silently different storage path was withdrawn by
-            // owner instruction "在任何情况下不降级". Intentional opt-outs
-            // (legacy mode / encryption opt-out / persistence off) resolve to
-            // mode===legacy above and never reach here.
+            // a boot that silently falls back to legacy JSON is exactly the
+            // "degraded mode" that policy forbids. The hint below names the
+            // two manual moves for the shapes that CAN be fixed by hand, and
+            // the loud log line carries the file path + the exact reason.
             const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
@@ -394,9 +523,10 @@ export class UnifiedShadow {
         fileWalLimit?: number,
         fileBackend?: string,
         fileMysqlDsn?: string,
+        fileJsonWriter?: string,
     ): Promise<UnifiedShadow | null> {
         const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
+        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend, fileJsonWriter);
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
@@ -804,7 +934,12 @@ export class UnifiedShadow {
     }
 
     /** Organic import (full mode): ingest a legacy record the index has not
-     *  seen so future loads serve from the unified store. Never throws. */
+     *  seen so future loads serve from the unified store. The envelope is a
+     *  PRUNED render (possibly from another writer): the index's stored block
+     *  lineage and lifetime stats stay authoritative (ingestSession's
+     *  envelopeImport contract, 2026-11-21 / #7156) — the envelope contributes
+     *  its new messages, and its block structure only when the index has none
+     *  for the session. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
         if (this.sync === null) return null;
         try {
@@ -815,7 +950,7 @@ export class UnifiedShadow {
             // viewFor rebuild; callers fall back to the envelope itself.
             // #4216/#4242: orphan shape is representable (journal rides the
             // plan) — import normally instead of rejecting.
-            this.sync.ingestSession(planIngest(legacy));
+            this.sync.ingestSession(planIngest(legacy), undefined, { envelopeImport: true });
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
             return legacy;
@@ -1359,7 +1494,9 @@ export class UnifiedShadow {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
                 // #4216/#4242: orphan shape rides the plan journal — import normally.
-                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
+                // envelopeImport: stored block lineage + stats stay authoritative
+                // (see the sync twin's contract, 2026-11-21 / #7156).
+                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy), undefined, { envelopeImport: true }));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
                 return legacy;
