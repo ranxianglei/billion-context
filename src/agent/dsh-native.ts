@@ -60,7 +60,7 @@ import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { decodeRequestBody } from "../content-encoding.js";
-import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
+import { dshContextTabEnabled, dshContextTabLabel, dshKeepCommandCompactEnabled, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEndpoints, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, setDeclaredModelEndpoints, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
@@ -70,7 +70,7 @@ import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
-import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
+import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry, dshCompactionKeepCommandCompact } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
@@ -1981,7 +1981,10 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // kill-switched or disabled bili-native never declares, and the gate then
     // leaves every row stock while its service still lets the presets boot
     // (disabling the plugin must not brick session creation, #3662).
-    declareDshCompactionActive();
+    // #4872: the declaration also carries the verdict scope — dsh.keepCommand-
+    // Compact ON narrows the overlay to compaction-basic only (the explicit
+    // /compact command stays armed); OFF keeps the both-packages rule.
+    declareDshCompactionActive({ keepCommandCompact: dshKeepCommandCompactEnabled() });
 
     const owner = beginToolsOwner(ctx);
     register.dead = false;
@@ -2889,36 +2892,38 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // whose internal 'internal/config' hook moved. Surface it once through the
     // durable channel (GUI hosts swallow stderr); ACP compression is
     // unaffected.
-    if (!webProfileWarned) {
-        let bundles: readonly string[] | undefined;
-        try {
-            if (typeof ctx.inject === "function") {
-                ctx.inject(["profileContext"], (sub) => {
-                    bundles = sub.profileContext?.startedBundles;
-                });
-            } else {
-                bundles = ctx.profileContext?.startedBundles;
-            }
-        } catch {
-            // older dsh builds without the service: diagnostic only
+    // #5686: the bundles/gap probes are pure structural typeof checks on the
+    // cordis host surface — cheap, side-effect-free — so they run on EVERY
+    // apply() now; the once-guard below only gates the durable NOTE. The
+    // pre-#5686 code ran the latch check only inside the
+    // @deepseek-ai/dsh-web-app branch, so every other form — in particular
+    // the desktop app-in-bundle layout where NO @deepseek-ai/* package sits
+    // under the profile and the core ships inside the app — booted SILENTLY
+    // when the #3354 disable middleware could not latch: native
+    // auto-compaction armed with zero boot-time signal while bili's wire
+    // refusals were its only backstop. (#4872/#6814: the /compact stub
+    // registration further down reuses the same verdicts.)
+    let bundles: readonly string[] | undefined;
+    try {
+        if (typeof ctx.inject === "function") {
+            ctx.inject(["profileContext"], (sub) => {
+                bundles = sub.profileContext?.startedBundles;
+            });
+        } else {
+            bundles = ctx.profileContext?.startedBundles;
         }
-        // #5686: the latch check (pure structural typeof probes on the cordis
-        // host surface — cheap, side-effect-free) runs for EVERY profile
-        // shape now. The pre-#5686 code only called it inside the
-        // @deepseek-ai/dsh-web-app branch, so every other form — in
-        // particular the desktop app-in-bundle layout where NO @deepseek-ai/*
-        // package sits under the profile and the core ships inside the app —
-        // booted SILENTLY when the #3354 disable middleware could not latch:
-        // native auto-compaction armed with zero boot-time signal while bili's
-        // wire refusals were its only backstop.
-        const isWeb = bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app");
-        const gap = detectCompactionOverlayGap(ctx);
+    } catch {
+        // older dsh builds without the service: diagnostic only
+    }
+    const isWeb = bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app");
+    const gap = detectCompactionOverlayGap(ctx);
+    if (!webProfileWarned) {
         webProfileWarned = true;
         if (gap !== null) {
             // #3806/#5686: overlay failed to latch -> boot-time alarm on ANY profile shape.
             persistClientEvent(`profile${isWeb ? " bundles include @deepseek-ai/dsh-web-app and" : bundles === undefined ? " shape could not be introspected (older dsh build) and" : " (non-web-app bundle list) and"} the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see docs/configuration.md)`);
         } else if (isWeb) {
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see docs/configuration.md)." + gateCoverageSuffix());
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected)." + (dshKeepCommandCompactEnabled() ? " With dsh.keepCommandCompact on (#4872), the overlay keeps @deepseek-ai/dsh-command-compact ENABLED — the explicit /compact command stays available, and its calls still pass the #1729 wire guard (answered locally by bili when the session holds active fold blocks, refused otherwise)." : "") + " If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see docs/configuration.md)." + gateCoverageSuffix());
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
             // the #3354 overlay took effect, and it is scoped to dsh-web-app
@@ -2927,7 +2932,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (docs/configuration.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested " + (dshKeepCommandCompactEnabled() ? "compaction-basic" : "compaction-basic/command-compact") + " rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (docs/configuration.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 
@@ -2943,6 +2948,25 @@ export async function apply(ctx: PluginContext): Promise<void> {
         description: "Prompt-cache reconciliation (same report as the acp_cache tool)",
         handler: (invocation) => cacheOutcome(ctx, invocation),
     });
+    // #4872/#6814: in a web profile where the overlay latched, the preset's
+    // own /compact is stood down (unless dsh.keepCommandCompact re-arms it) —
+    // and dsh demotes an unregistered /compact to a PLAIN model message with
+    // no visible signal (#6814 field evidence: typed twice, both forwarded
+    // as user/message, the user never told). Register a visible stub so the
+    // input is answered, never silently forwarded. Gated on gap===null: if
+    // the overlay failed to latch the real command-compact may still be
+    // armed and a stub would shadow it; non-web profiles keep the host-plane
+    // /compact armed, so no stub there either.
+    if (gap === null && isWeb && !dshCompactionKeepCommandCompact()) {
+        ctx.commands.register({
+            name: "compact",
+            description: "Compaction is handled by billion-context (dsh /compact is stood down by the bili gate)",
+            handler: async () => ({
+                kind: "success",
+                text: "This session's compaction is owned by billion-context: the dsh /compact command is disabled by bili's compaction gate (#3354/#4872), so there is no dsh checkpoint to run here. Use /acp for live compression state. To restore dsh's own /compact, set dsh.keepCommandCompact (env BILI_DSH_KEEP_COMMAND_COMPACT) and restart the host.",
+            }),
+        });
+    }
 
     // node:test drives apply() directly with a mock ctx — never patch
     // globalThis.fetch/WebSocket from inside a test run.
