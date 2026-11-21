@@ -1,19 +1,25 @@
 /**
  * Unified-storage sidecar (#2671).
  *
- * Two opt-in levels via BILI_STORAGE_UNIFIED:
+ * Selections via BILI_STORAGE_UNIFIED / storage.unified:
+ *   - absent or `sqlite` (the DEFAULT since #6480, "pure-sqlite"): the
+ *     drop-in replacement. Reads go unified-first with organic import (a
+ *     session the index has not seen is imported from its legacy file on
+ *     first load) and legacy fallback on any miss, and the JSON envelope
+ *     WRITER defaults off — index.db is the only persistent copy (restore
+ *     dual-write with storage.jsonWriter=on).
+ *   - `full`: the historical #3818 posture — the same unified-first
+ *     machinery, but the JSON envelope writer defaults ON (dual-write;
+ *     rollback = unset the knob).
  *   - `1`/`true`/`shadow` (Phase 1): double-write dry-run. Every session
  *     record the legacy SessionStore commits is ALSO ingested into
  *     <sessionsDir>/index.db, and the reconstructed view is digest-checked
  *     against what the legacy loader (buildSession) would serve after a
  *     restart. Any drift is logged as an error — that is the entire point:
  *     the unified layer must replay legacy bytes exactly, and production
- *     traffic becomes the migration test corpus.
- *   - `full` (Phase 1.5): the drop-in replacement. Reads flip to
- *     unified-first with organic import (a session the index has not seen
- *     is imported from its legacy file on first load) and legacy fallback
- *     on any miss. Legacy files keep being written (rollback = unset the
- *     env), but the unified index is the load path.
+ *     traffic becomes the migration test corpus. The JSON envelope stays
+ *     the sole source of truth at this level.
+ *   - `legacy`: the one-line escape hatch — no sidecar at all.
  *
  * Failure policy: sidecar problems must NEVER break the legacy write path.
  * All work is try/catch'd. The sidecar NEVER gives up on index writes
@@ -28,7 +34,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { splitMediaContent } from "./identity.js";
 import type { BlockView } from "../session.js";
-import { resolveStorageMode, resolveStorageWalJournalSizeLimit, effectiveJsonWriterOff, type StorageMode } from "../knobs.ts";
+import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -501,10 +507,26 @@ export class UnifiedShadow {
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
+        // #7408: the FULL-mode line must state the ACTUAL writer state and
+        // selection — the pre-#6480 wording ("legacy files keep being
+        // written — unset the knob to roll back") is false under the
+        // pure-sqlite default (no knob set, envelopes NOT written) and
+        // contradicted the accurate jsonWriter-off line printed by persist.
+        // At this point mode is full, the backend is sqlite (mysql logs its
+        // own line in openAsync), and encryption-blocking never reaches here
+        // (persist gates the open), so effectiveJsonWriterOff equals the
+        // jsonWriterOff persist.ts computes for save decisions.
+        const sqliteSelection = unifiedSelectionIsSqlite(env, fileUnified);
+        const selection = sqliteSelection
+            ? "pure-sqlite selection (storage.unified absent or =sqlite)"
+            : "storage.unified=full or BILI_STORAGE_UNIFIED=full";
+        const writerOff = effectiveJsonWriterOff(env, fileJsonWriter, fileUnified);
         loggerLog(
             "info",
             mode === "full"
-                ? `[storage] unified FULL mode ENABLED (storage.unified=full or BILI_STORAGE_UNIFIED=full): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — unset the knob to roll back${engineTag}${walTag}`
+                ? writerOff
+                    ? `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path AND the only persistent copy — JSON envelopes are not written; restore dual-write with storage.jsonWriter=on${engineTag}${walTag}`
+                    : `[storage] unified FULL mode ENABLED (${selection}): index.db is the load path (unified-first, legacy fallback); legacy files keep being written — ${sqliteSelection ? "remove the explicit storage.jsonWriter=on to return to the pure-sqlite default" : "unset the knob to roll back"}${engineTag}${walTag}`
                 : `[storage] unified shadow mode ENABLED (storage.unified=shadow or BILI_STORAGE_UNIFIED): every session write is double-ingested into index.db and digest-reconciled${engineTag}${walTag}`,
         );
         return shadow;
@@ -1177,31 +1199,6 @@ export class UnifiedShadow {
     getCcr(sessionId: string): MessageContentStore | null {
         if (this.sync === null) return null;
         return this.sync.getCcr(sessionId);
-    }
-
-    /** #4739: narrow single-column metadata read for lazy-field restore.
-     *  Full-trust only (shadow mode's index may lag its envelopes) — callers
-     *  gate on readsUnified; network backends degrade to null (the caller
-     *  falls back to the envelope, exactly like today's sync loadSync). */
-    getSessionMetadata(sessionId: string): Record<string, unknown> | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getSessionMetadata(sessionId);
-        } catch {
-            return null;
-        }
-    }
-
-    /** #4739: narrow blockContents read for lazy-field restore (block rows +
-     *  orphans journal, no message rows). Same trust/degrade contract as
-     *  getSessionMetadata. */
-    getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
-        if (this.sync === null) return null;
-        try {
-            return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
-        } catch {
-            return null;
-        }
     }
 
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
