@@ -285,7 +285,7 @@ test("e2e #6908 (B): a dsh compaction call (marker present) passes the ingest ba
     }
 });
 
-test("e2e #6908 negative: an over-band body with NO dsh plugin header and NO compaction marker is still refused 413 (the exemptions must not widen the band)", async () => {
+test("e2e #6908 negative: an over-band body with NO plugin header and NO compaction marker is still refused 413 (the exemptions must not widen the band)", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "bili-6908c-"));
     const disarm = armIngestBand();
     const { ctx, calls, close } = await setup();
@@ -295,9 +295,79 @@ test("e2e #6908 negative: an over-band body with NO dsh plugin header and NO com
         const r = await postMessages(ctx, "x".repeat(3 * 1024 * 1024));
         const body = await r.text();
         const parsed = JSON.parse(body) as { error?: { type?: string; stage?: string } };
-        assert.equal(r.status, 413, `non-dsh over-band body must still be refused (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(r.status, 413, `non-plugin over-band body must still be refused (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(parsed.error?.stage, "ingest", "still the ingest stage");
-        assert.equal(calls.length, 0, "zero upstream calls — the band still holds for non-dsh lanes");
+        assert.equal(calls.length, 0, "zero upstream calls — the band still holds for non-plugin lanes");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+// #7426: the #6908 exemption was dsh-only (`x-bili-plugin === "dsh"`), so the
+// opencode lane — which has the SAME full-resend structure (the host re-sends
+// its ENTIRE raw ledger every round; bili's job is to fold it) — was still
+// 413-locked at the band (field: 33.5 MiB inbound vs ~391K tokens of actual
+// context, a healthy 390-block session). The criterion generalizes to ANY
+// plugin lane: the `x-bili-plugin` header announces "my body is my ledger,
+// fold it," which is dimensionally true for every cooperative plugin lane.
+// Both directions are pinned below.
+
+test("e2e #7426: the opencode plugin lane (x-bili-plugin: opencode) is exempt from the ingest band — an over-band full-resend body is folded and forwarded, not 413 at ingest", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7426a-"));
+    const disarm = armIngestBand();
+    const { ctx, calls, close } = await setup();
+    try {
+        // A realistic opencode full-resend body: the host re-sends its ENTIRE
+        // raw ledger every round. The bulk is OLD foldable history (tool
+        // call/result pairs); the core is a small recent user message. Total
+        // body is over the 1 MiB test band, but the core is tiny — so bili
+        // folds the history and forwards. Without the lane exemption the gate
+        // 413s it at ingest before any folding happens (the field's self-lock).
+        const messages: Array<Record<string, unknown>> = [];
+        for (let i = 0; i < 1500; i++) {
+            messages.push({ role: "assistant", content: "", tool_calls: [{ id: `call_${i}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: `/tmp/file_${i}.txt` }) } }] });
+            messages.push({ role: "tool", tool_call_id: `call_${i}`, content: "x".repeat(700) });
+        }
+        messages.push({ role: "user", content: "Summarize what you found." });
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers, "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "s-count-ingest" },
+            body: JSON.stringify({ model: "gpt-test", stream: true, messages }),
+        });
+        const body = await r.text();
+        // The gate (ingest) must NOT refuse the opencode lane — the body is
+        // the host's fold substrate, not model input. A 200 SSE stream proves
+        // the body passed the ingest gate, was folded, and was forwarded
+        // upstream.
+        if (r.status !== 200) {
+            const parsed = JSON.parse(body) as { error?: { stage?: string } };
+            assert.notEqual(parsed.error?.stage, "ingest", `the opencode lane body must pass the ingest gate (got stage=${parsed.error?.stage}, status=${r.status}): ${body.slice(0, 300)}`);
+        }
+        assert.equal(r.status, 200, `the opencode lane body is folded and forwarded (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, "the opencode lane body reached the upstream");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #7426 negative: an over-band body from a NON-plugin lane (no x-bili-plugin header) is still refused 413 — the generalized exemption must not leak to plain clients", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7426b-"));
+    const disarm = armIngestBand();
+    const { ctx, calls, close } = await setup();
+    try {
+        // Over the 1 MiB band, plain openai lane, NO x-bili-plugin header —
+        // the band's original behavior is preserved for non-plugin clients
+        // (the #5794 shape). The generalized exemption must not leak here.
+        const r = await postMessages(ctx, "x".repeat(3 * 1024 * 1024));
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { type?: string; stage?: string } };
+        assert.equal(r.status, 413, `non-plugin over-band body must still be refused (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.stage, "ingest", "still the ingest stage");
+        assert.equal(calls.length, 0, "zero upstream calls — the band still holds for plain clients");
     } finally {
         disarm();
         await close();

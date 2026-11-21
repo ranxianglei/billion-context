@@ -535,19 +535,28 @@ async function handleRequest(
                 // pre-send byte budget. The probe is a cheap substring gate,
                 // so the text-dump rejection (#5794's shape) stays parse-free.
                 const ingestCap = protocol === "responses" ? 0 : knobLimitsIngestBytes();
-                // #6908: two dimensionally-motivated exemptions. The band's
-                // premise ("any parseable 32 MiB+ text body is ≥ ~8M tokens,
-                // beyond every window") equates INBOUND BYTES with MODEL INPUT —
-                // true for the outbound / incremental lanes, false for the dsh
-                // plugin lane, which re-sends the host's ENTIRE raw ledger every
-                // round on the OpenAI wire (no incremental lane there, #3433):
-                // the body is the host's history, not the model input, and bili's
-                // job is to fold it (field: 32.0 MiB inbound vs 446.4 KiB
-                // outbound, 70x). Refusing it 413s a healthy session forever, and
-                // the parse cost is the lane's structural cost — already paid
-                // every round below the cliff, so the gate only added a
-                // discontinuity at 32 MiB.
-                //   (A) x-bili-plugin: dsh → the body is fold substrate, exempt.
+                // #6908/#7426: two dimensionally-motivated exemptions. The
+                // band's premise ("any parseable 32 MiB+ text body is ≥ ~8M
+                // tokens, beyond every window") equates INBOUND BYTES with
+                // MODEL INPUT — true for the outbound / incremental lanes,
+                // false for the plugin lanes, which re-send the host's ENTIRE
+                // raw ledger on full-resend turns (dsh on the OpenAI wire, no
+                // incremental lane there, #3433; opencode V2 the same — field:
+                // 33.5 MiB inbound vs ~391K tokens of actual context, #7426):
+                // the body is the host's history, not the model input, and
+                // bili's job is to fold it (dsh field: 32.0 MiB inbound vs
+                // 446.4 KiB outbound, 70x). Refusing it 413s a healthy session
+                // forever, and the parse cost is the lane's structural cost —
+                // already paid every round below the cliff, so the gate only
+                // added a discontinuity at 32 MiB.
+                //   (A) x-bili-plugin present (ANY plugin lane) → the body is
+                //       fold substrate, exempt. #7426 generalized this from
+                //       `=== "dsh"` to the whole cooperative plugin surface:
+                //       the same full-resend structure (host ledger re-sent,
+                //       bili folds it) is what the header announces, and the
+                //       opencode lane was 413-locked by the dsh-only test.
+                //       Incremental-lane turns carry small deltas and never
+                //       reach the band, so the wider net is harmless there.
                 //   (B) the dsh compaction marker present → the call is the ONLY
                 //       action that shrinks the host's ledger via bili (#3733
                 //       answers it locally with the folded snapshot); rc.2
@@ -558,11 +567,18 @@ async function handleRequest(
                 //       the parse cost, identical to today's under-cliff behavior
                 //       — the full marker-decisive check (isDshCompactionCall)
                 //       still runs after parse.
-                const dshPluginLane = req.headers["x-bili-plugin"] === "dsh";
+                // #7426: the exemption generalizes from "is it dsh" to "is it a
+                // plugin lane" — every cooperative plugin lane (dsh, opencode,
+                // omp, pi, …) re-sends the host's ledger on full-resend turns,
+                // so the body is fold substrate, not model input. The gate's
+                // premise ("inbound bytes ≈ model input") is false for all of
+                // them; incremental-lane turns carry small deltas and never hit
+                // the band, so the wider exemption is harmless there.
+                const pluginLane = req.headers["x-bili-plugin"] !== undefined;
                 const dshCompactionSniff = decoded.body.includes(DSH_COMPACTION_MARKER_SNIFF);
                 if (ingestCap > 0 && decoded.body.byteLength > ingestCap
                     && countImagesInRawBody(protocol, decoded.body) === 0
-                    && !dshPluginLane && !dshCompactionSniff) {
+                    && !pluginLane && !dshCompactionSniff) {
                     throw new IngestBodyTooLargeError(ingestCap, decoded.body.byteLength);
                 }
                 bodyBuffer = decoded.body;
