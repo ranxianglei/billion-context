@@ -93,7 +93,9 @@ function resolveSpec(fromFile, spec) {
     let p = path.resolve(root, path.dirname(fromFile), spec);
     if (!p.endsWith(".ts") && !p.endsWith(".js")) p += ".ts";
     if (p.endsWith(".js")) p = p.slice(0, -3) + ".ts";
-    const rel = path.relative(root, p);
+    // Normalize win32 backslashes explicitly (path.sep would no-op on the POSIX
+    // CI that simulates the win32 shape to pin this line, #6831).
+    const rel = path.relative(root, p).split("\\").join("/");
     return SRC_FILES.includes(rel) ? rel : null;
 }
 
