@@ -1,5 +1,7 @@
 # Architecture
 
+DSH's opt-in [native model policy](dsh-native-compaction.md) branches before bili's HTTP/WS transforms. Its adapter owns the preset-local native backend; host replacement generations isolate later bili folds. The kernel and provider adapters are unchanged.
+
 > One hub for the system's architecture. This page holds the **overall diagram** and the **module ledger**; each module gets its own page (en + `.zh-CN` + `.ja`) in this directory, each with its own diagram.
 > 中文: [architecture.zh-CN.md](./architecture.zh-CN.md)
 > 日本語: [architecture.ja.md](./architecture.ja.md)

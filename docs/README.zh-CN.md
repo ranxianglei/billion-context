@@ -1,5 +1,7 @@
 # 文档导航
 
+- [DSH 按模型使用原生压缩](dsh-native-compaction.zh-CN.md)：配置、同会话切换、兼容性与补丁维护。[English](dsh-native-compaction.md)
+
 **billion-context** 的全部系统文档都集中在这个目录。仓库根目录只保留四个核心入口文件——`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`——外加受认可的社区 README 译本（`README.<locale>.md`，如 `README.ja.md`，批准于 2026-11-09 / #6000）。原根路径保留单行重定向占位（记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
 
 > **全量目录：** [index.zh-CN.md](index.zh-CN.md) / [index.md](index.md) —— 每篇文档一行说明。本页是目录落地页：东西在哪、什么规则让它们保持新鲜。
