@@ -1,7 +1,9 @@
 // #5683: unprompted-compression policy gates. Two opt-in knobs
 // (compress.requireNudge / compress.requireRecommendation) refuse model-initiated
 // compress calls that bili did not ask for. The per-round FACTS they judge on
-// are stamped at prepare (src/server/handle.ts) onto session.transient —
+// (plus the #7318 postComPressTail setting, which postCompressTail in
+// src/stream.ts reads for the receipt recommendation gate) are stamped at
+// prepare (src/server/handle.ts) onto session.transient —
 // in-memory only, re-stamped every model round — and read here by applyRanges
 // (src/stream.ts), the single execution point for every model-initiated compress
 // across all lanes (proxy loop + POST /__bili/plugin/tool).
@@ -31,6 +33,10 @@ interface UnpromptedGate {
     armed: boolean;
     requireNudge: boolean;
     requireRecommendation: boolean;
+    /** #7318: the compress.postComPressTail setting for this route — the
+     *  model-visible "fold more" recommendation in the success receipt
+     *  (remaining-offer range list + uncovered-history note). Default OFF. */
+    postComPressTail: boolean;
 }
 
 /** Stamp-side facts, one per prepare. `nudgeInjected` is THIS ROUND'S delivery
@@ -41,6 +47,7 @@ interface UnpromptedGateStamp {
     nudgeInjected: boolean;
     requireNudge: boolean;
     requireRecommendation: boolean;
+    postComPressTail?: boolean;
     modelRound?: boolean;
 }
 
@@ -51,9 +58,10 @@ export interface UnpromptedGateState {
     credit: number;
     requireNudge: boolean;
     requireRecommendation: boolean;
+    postComPressTail: boolean;
 }
 
-const OFF: UnpromptedGate = { armed: false, requireNudge: false, requireRecommendation: false };
+const OFF: UnpromptedGate = { armed: false, requireNudge: false, requireRecommendation: false, postComPressTail: false };
 
 export function storeUnpromptedGate(session: Session, stamp: UnpromptedGateStamp): void {
     const t = session.transient ?? (session.transient = {});
@@ -70,6 +78,7 @@ export function storeUnpromptedGate(session: Session, stamp: UnpromptedGateStamp
         credit: Math.max(0, credit),
         requireNudge: stamp.requireNudge === true,
         requireRecommendation: stamp.requireRecommendation === true,
+        postComPressTail: stamp.postComPressTail === true,
     };
 }
 
@@ -82,5 +91,6 @@ export function unpromptedGateOf(session: Session): UnpromptedGate {
         armed: Number.isFinite(g.credit) && g.credit > 0,
         requireNudge: g.requireNudge === true,
         requireRecommendation: g.requireRecommendation === true,
+        postComPressTail: g.postComPressTail === true,
     };
 }

@@ -25,6 +25,7 @@ import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { joinResponsesSystemSections } from "../responses-system-sections.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -75,7 +76,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { rejectionDiagnosticSuffix } from "./rejection-diagnostics.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
-import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
+import { awaitDrain, bufferStreamIfFits, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Retry the same input when the provider proved only its output reservation overflows. */
@@ -377,7 +378,7 @@ async function forwardCaptured(
 // client socket still open?" — a client that hangs up on the terminal frame
 // (pi's shape) must not lose the finished reply. Partial turns (no terminal)
 // are still never captured.
-const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session) : undefined;
+const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => true, prepared.protocol) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
@@ -2239,10 +2240,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
             log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
-        } else {
+        } else if (req.method !== "HEAD") {
             // #821: a 2xx with a null body (e.g. upstream answered 204/304) is a
             // SILENT empty response — the client receives zero SSE chunks and
             // reports an "empty stream" with no trace in the log. Name it.
+            // HEAD is excluded: a HEAD response carries no body by definition
+            // (RFC 9110 §9.3.2), so a 200 HEAD with a null body is normal, not
+            // the #821 anomaly — health probes (e.g. HEAD /api/hello) would
+            // otherwise log a warn on every request (#7072).
             loggerLog("warn", `[${prepared?.session.id ?? "unknown"}] ← upstream ${upstream.status} returned a null body; responding empty to client`);
         }
         return;
@@ -2291,6 +2296,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // leaked a live idle timer. (#721/#2563: the SSE pipes themselves no
         // longer rethrow an upstream cut — they emit an in-band truncation
         // signal, or end raw for permitlist hosts that own the handling.)
+        let clearFakeRetryTimer: (() => void) | undefined;
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             // #1295: the JSONL wire has no fake-completion shape to detect —
@@ -2303,7 +2309,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 // fake completion. The agent owning compression does not change this:
                 // the retry is a proxy→upstream HTTP call whose base must be what
                 // upstream just accepted (aligned with the proxy lane below).
-                const resolvedBuf = await resolveFakeCompletion(pluginBody, {
+                const resolved = await resolveFakeCompletion(pluginBody, {
                     protocol: prepared.protocol,
                     wireBody,
                     upstreamUrl,
@@ -2314,7 +2320,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     log,
                     model: prepared.model ?? prepared.google?.model,
                 });
-                pluginBody = bufferToStream(resolvedBuf);
+                pluginBody = resolved.body;
+                clearFakeRetryTimer = resolved.clearTimer;
             }
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.
@@ -2420,7 +2427,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             clearUpstreamTimer();
             // #2347: finish the dump before the turn closes — its value is the
             // full upstream tail, which the client may have stopped reading early.
-            if (dumpRaw) await dumpRaw;
+            try { if (dumpRaw) await dumpRaw; }
+            finally { clearFakeRetryTimer?.(); }
         }
         return;
     }
@@ -2456,6 +2464,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // response (any turn, not just compress-injected). Buffering is required:
     // the retry re-requests before the client sees the fake completion.
     let responseBody: ReadableStream<Uint8Array> = upstream.body;
+    let clearFakeRetryTimer: (() => void) | undefined;
     // #411: every body-consuming path below must clear the upstream idle timer
     // even when it throws (client abort / upstream cut) — previously an abort
     // skipped the trailing clearUpstreamTimer and leaked a live idle
@@ -2469,7 +2478,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // never the raw client body: upstream may have rejected those raw
             // bytes earlier in this session, and a 400'd hint would present the
             // fake completion instead of a corrected turn.
-            const resolvedBuf = await resolveFakeCompletion(upstream.body, {
+            const resolved = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
                 wrapBody: v1Active ? v1Wrap : undefined,
@@ -2481,7 +2490,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 log,
                 model: prepared.model ?? prepared.google?.model,
             });
-            responseBody = bufferToStream(resolvedBuf);
+            responseBody = resolved.body;
+            clearFakeRetryTimer = resolved.clearTimer;
         }
     // #2347: dump the FINAL upstream body for every prepared streaming turn,
     // regardless of rewriter branch — the previous tee sat INSIDE the useRewriter
@@ -2694,17 +2704,19 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
             // Cache-seam: the compress<->absorb join must be byte-identical to
-            // the steady prepare* paths. Every steady wire joins the absorb
-            // section with a plain "\n\n" (sysParts.join / injectSystem parts
-            // join); the historical "---" divider here existed ONLY on round-2
-            // and broke the system-element prefix on every fold while absorb
-            // was armed (probe: cache-seam-probes P1+P2, chat wire diverged at
-            // the absorb boundary char).
+            // the steady prepare* paths. The Responses wire joins its system
+            // sections with the "---" divider (see joinResponsesSystemSections,
+            // #6922) — round-2 must reuse the SAME helper or the developer
+            // element forks at the boundary-note position on every fold and the
+            // upstream prefix re-bills everything after it. Every OTHER steady
+            // wire joins the absorb section with a plain "\n\n" (sysParts.join /
+            // injectSystem parts join), so the non-responses rebuild keeps that
+            // historical "\n\n" glue (probes P1-P3 verified byte parity there).
             const absorbSection = absorbActive
-                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                ? buildAbsorbSystemPrompt(absorbToolName(loopConfig))
                 : "";
             const blockOpsSection = blockOpsActive
-                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
+                ? buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2724,8 +2736,15 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // between the compress prompt and the absorb section on every steady
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
-            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? GENERATION_BOUNDARY_NOTE : "";
+            const baseSystemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive));
+            // #6922: Responses goes through the shared section joiner (the
+            // steady prepare-responses path calls the very same function), so
+            // section order AND separators can no longer drift between the two
+            // builders. Non-responses keeps the historical plain-\n\n glue.
+            const systemPrompt = prepared.protocol === "responses"
+                ? joinResponsesSystemSections([baseSystemPrompt, genBoundaryNote, absorbSection, blockOpsSection].filter(s => s !== ""))
+                : baseSystemPrompt + (genBoundaryNote ? `\n\n${genBoundaryNote}` : "") + (absorbSection ? `\n\n${absorbSection}` : "") + (blockOpsSection ? `\n\n${blockOpsSection}` : "");
             // #1295: commandcode keeps the internal protocol "openai" (request
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode
@@ -2969,13 +2988,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         // the full upstream tail, which the client may have stopped reading
         // early. Idempotent where the rewriter lane already awaited it in its
         // own finally; this covers the non-rewriter branch's throw paths too.
-        if (dumpRaw) await dumpRaw;
+        try { if (dumpRaw) await dumpRaw; }
+        finally { clearFakeRetryTimer?.(); }
     }
 }
 
 // #371: buffer the raw upstream response, detect a fake completion (tool-call
 // XML, no real tool block), and — bounded per turn and per session — re-request
-// upstream with a corrective hint. Returns the bytes to stream to the client
+// upstream with a corrective hint. Returns the body to stream to the client
 // (the retry's response when a retry recovered, else the original). The session
 // streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
 // turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
@@ -3008,8 +3028,11 @@ async function resolveFakeCompletion(
          *  must go back out inside the CloudCode envelope. */
         wrapBody?: (body: string | Buffer) => string | Buffer;
     },
-): Promise<Buffer> {
-    let buffer = await readStreamToBuffer(stream, fakeBufCap());
+): Promise<{ body: ReadableStream<Uint8Array>; clearTimer?: () => void }> {
+    const buffered = await bufferStreamIfFits(stream, fakeBufCap());
+    // An incomplete inspection cannot classify this turn or change its streak.
+    if (!Buffer.isBuffer(buffered)) return { body: buffered };
+    let buffer = buffered;
     const max = maxFakeCompletionRetries();
     const sid = opts.session.id;
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
@@ -3037,14 +3060,20 @@ async function resolveFakeCompletion(
                 opts.log("warn", `[${sid}] fake-completion retry failed: ${String(e)}; presenting original`);
                 break;
             }
+            let handedOff = false;
             try {
                 if (!r.response.ok || !r.response.body) {
                     opts.log("warn", `[${sid}] fake-completion retry rejected (HTTP ${r.response.status}); presenting original`);
                     break;
                 }
-                buffer = await readStreamToBuffer(r.response.body, fakeBufCap());
+                const retried = await bufferStreamIfFits(r.response.body, fakeBufCap());
+                if (!Buffer.isBuffer(retried)) {
+                    handedOff = true;
+                    return { body: retried, clearTimer: r.clearTimer };
+                }
+                buffer = retried;
             } finally {
-                r.clearTimer();
+                if (!handedOff) r.clearTimer();
             }
             if (!isFakeCompletion(opts.protocol, buffer.toString("utf8"))) break;
         }
@@ -3052,5 +3081,5 @@ async function resolveFakeCompletion(
     const stillFake = isFakeCompletion(opts.protocol, buffer.toString("utf8"));
     opts.session.metadata.fakeCompletionStreak = stillFake ? priorStreak + 1 : 0;
     markDirty(opts.session);
-    return buffer;
+    return { body: bufferToStream(buffer) };
 }

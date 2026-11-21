@@ -144,6 +144,27 @@ const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
  *  agents route by intent (side-request.ts SIDE_REQUEST_AGENTS); explicit "main"
  *  vetoes side heuristics, while other persona ids remain inert telemetry. */
 const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+/** #6880: the host's declared PURPOSE for the dispatch (dsh stamps
+ *  GenerateOptions.purpose verbatim — "session-title", "compaction",
+ *  "auto-review", "timeline-report", ...; its contract: ordinary
+ *  conversation requests leave it unset). Carries the side/main intent
+ *  that content-guessing used to approximate: a PLUGIN-ANNOUNCED request
+ *  with a non-empty purpose is a side request by declaration, no per-feature
+ *  template matching needed (the content recognizers stay as the fallback
+ *  for pre-#6880 plugin installs). Honored only behind the x-bili-plugin
+ *  marker, same trust discipline as the conversation header: an unannounced
+ *  client's purpose header is inert telemetry. */
+const PLUGIN_PURPOSE_HEADER = "x-bili-plugin-purpose";
+/** #6880 v2 wire: the post-#6883 dsh plugin stamps this sentinel for MAIN
+ *  turns (dsh leaves GenerateOptions.purpose unset for ordinary conversation,
+ *  so no real dsh purpose can collide with it). PRESENCE of the header in any
+ *  value is the declaration that this conversation's plugin announces every
+ *  dispatch's purpose — main traffic then keys the raw session id directly
+ *  (dsh mints one UUID per session, ids never recycle) instead of routing
+ *  through the persona-order ladder, and its auxiliary traffic is a declared
+ *  side request by the header alone. The sentinel itself is NOT a side:
+ *  handle.ts normalizes it back to "absent" before the side classification. */
+export const PLUGIN_PURPOSE_CONVERSATION = "conversation";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -210,6 +231,14 @@ function headerValue(headers: Record<string, string | string[] | undefined>, nam
     const s = typeof v === "string" ? v : Array.isArray(v) ? v[0] : undefined;
     const t = s?.trim();
     return t && t.length > 0 ? t : undefined;
+}
+
+export function pluginPurposeHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    // #6880: purpose is a protocol-internal steering signal — honoring it
+    // without the plugin announcement would let any client that can reach
+    // the endpoint opt its traffic out of the session pipeline. A real
+    // plugin sends the marker and the purpose together.
+    return pluginAgentHeader(headers) !== undefined ? headerValue(headers, PLUGIN_PURPOSE_HEADER) : undefined;
 }
 
 export function pluginAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -2051,7 +2080,12 @@ export async function handlePluginStatus(conversationId: string, res: import("no
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null, sessionId: null, sessionRevision: null, contextTokens: null, contextTokensSource: "unavailable", contextTokensAt: null, contextGeneration: null }));
             return;
         }
-        res.writeHead(404, { "content-type": "application/json" });
+        // #6642: the 404 fallthrough must carry the SAME cors-mode headers the
+        // 2xx branches above do — the dsh Context tab reads this route
+        // cross-origin, and a bare 404 without access-control-allow-origin is
+        // rejected by the browser as "Failed to fetch", masking the real
+        // "unknown plugin conversation" error the panel is trying to surface.
+        res.writeHead(404, jsonHeaders());
         res.end(JSON.stringify({ ok: false, error: fallbackLatest ? "no session with activity since boot — issue a model request or pass the conversation id" : "unknown plugin conversation" }));
         return;
     }
@@ -3737,10 +3771,11 @@ export async function pipePluginChatWithStrip(
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
+                const signed = typeof p["thoughtSignature"] === "string" && p["thoughtSignature"].length > 0;
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
                         keptText = true;
                         appendReply(field, index, raw);
@@ -4582,13 +4617,13 @@ export async function pipePluginResponsesWithStrip(
         if (proseAcc.length === 0 || !session) return;
         scanModelOutputForPhantomAttachments(session.id, proseAcc);
     };
-    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown; content_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             visibleTextChars += tail.length;
             answerProse += tail;
-            const meta = inRetry && heldItemId !== undefined ? { item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
+            const meta = inRetry && heldItemId !== undefined ? { ...lastDeltaMeta, item_id: heldItemId, output_index: heldOutputIndex } : (lastDeltaMeta ?? {});
             appendReplyDelta(meta, tail);
             return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
@@ -5040,7 +5075,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         const clean = tagFilter.push(delta);
-                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"], content_index: ev["content_index"] };
                         if (!inRetry && heldItemId === undefined && ev["item_id"] !== undefined) {
                             heldItemId = ev["item_id"];
                             heldOutputIndex = ev["output_index"];
@@ -5178,12 +5213,16 @@ function stripGoogleChunk<T>(obj: T, drop: boolean = false, requestText?: string
             ...cand,
             content: {
                 ...cont,
-                parts: (cont["parts"] as unknown[]).map((p) =>
-                    // #1960/KDD#10: thought parts carry a thoughtSignature — leave them byte-for-byte.
-                    p && typeof p === "object" && (p as Record<string, unknown>)["thought"] !== true && typeof (p as Record<string, unknown>)["text"] === "string"
-                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string, drop, requestText) }
-                        : p,
-                ),
+                parts: (cont["parts"] as unknown[]).map((p) => {
+                    if (!p || typeof p !== "object") return p;
+                    const part = p as Record<string, unknown>;
+                    // #1960/KDD#10: ordinary text can carry a signature too.
+                    return part["thought"] !== true
+                        && !(typeof part["thoughtSignature"] === "string" && part["thoughtSignature"].length > 0)
+                        && typeof part["text"] === "string"
+                        ? { ...part, text: stripAcpTags(part["text"], drop, requestText) }
+                        : p;
+                }),
             },
         };
     });

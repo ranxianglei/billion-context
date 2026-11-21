@@ -528,6 +528,15 @@ export function rebaseNote(session: Session, errs: string, beyond: string): stri
 // session instance whose refs restart at m00001), stale refs from the previous
 // generation fail resolution. The kernel gate points at acp_status; inline the
 // current span here so the model can re-issue immediately without the round-trip.
+// 2026-11-17 (session 01a1e89d, qwen3.8-27b): the receipt that carries this
+// line is PERSISTED in visible history, so a long session accumulates many
+// stale copies with different max refs. The model read them as simultaneously
+// true ("summaries claimed m02129–m02325, but the highest ref is m02255 —
+// something's off"), then aimed compress calls at phantom endpoints
+// (m02383/m02489, all above the real frontier) in a 7-call loop. The label
+// below makes each copy self-describe as a point-in-time snapshot and names
+// the newest copy as the live frontier. Model-facing wording — any future
+// edit keeps this stale-copy disambiguation.
 function currentRefsSnapshot(ctx: RewriteCtx): string {
     // Refs live in state.messageRefs (mNNNNN namespace); message ids are raw
     // client ids and carry no ref numbers.
@@ -544,12 +553,17 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
     }
     if (!loId || !hiId) return "";
     const activeBlocks = ctx.session.state.blocks.filter((b) => b.active).length;
-    return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
+    return ` [Context snapshot at the moment of THIS receipt — point-in-time only: refs are minted continuously, so every earlier copy of this line in the transcript is stale, and the newest copy is the current frontier. ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside the newest such snapshot, or call acp_status for exact compressible ranges.]`;
 }
 
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
-// char length plus head/tail excerpts (newlines flattened to spaces) so the
-// model can verify its summary was stored intact without decompressing.
+// char length, the #4313 covered-time span and the head/tail excerpts
+// (newlines flattened to spaces) so the model can verify its summary was
+// stored intact without decompressing. 2026-11-18 (owner): the literal
+// `head`/`tail` LABELS were removed — with them the line read as "only the
+// ends were stored" and models answered by defensively decompressing fresh
+// blocks (#2544); the unlabeled excerpts keep the #1294 self-check and the
+// #1615 surrogate-safe cuts without that reading.
 export function summaryFingerprintLine(blockId: string, summary: string, range?: { startTs: number; endTs: number } | null): string {
     // #1615: code-unit cuts can split a surrogate pair and the lone half
     // breaks upstream JSON parsing of the whole body — clamp + scrub (#816
@@ -559,7 +573,7 @@ export function summaryFingerprintLine(blockId: string, summary: string, range?:
     // #4313: the covered window's local time span, appended deterministically
     // from STORED stamps (state.tsStamps) — never a wall-clock read here.
     const span = range ? ` [${formatTagTime(range.startTs)} – ${formatTagTime(range.endTs)}]` : "";
-    return ` · ${blockId} full summary ${summary.length}ch${span} · head "${head}" … tail "${tail}"`;
+    return ` · ${blockId} full summary ${summary.length}ch${span} "${head} … ${tail}"`;
 }
 
 /** #4313: resolve a block's covered time window from the persisted first-sight
@@ -723,7 +737,21 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     const remaining = ctx.lastNudge
         ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
         : base;
+    // #7318: the receipt's "fold more" recommendation — the remaining-offer
+    // range list AND the uncovered-history note — is opt-in via
+    // compress.postComPressTail (default OFF, stamped per round on
+    // session.transient by src/server/handle.ts). Re-advertising ranges after
+    // every successful fold drove models into endless fold loops against
+    // explicit user stop requests (#7318: 200+ folds in one night; #6522 and
+    // #5872 are the same family), each fold rewriting the context prefix and
+    // re-billing the prompt cache. The per-turn growth nudge (KDD #8) is a
+    // separate channel and is untouched by this knob. The verbatim stop
+    // signal below is NOT part of the recommendation — it stays in both
+    // modes; with the recommendation off, ranges still outstanding mean the
+    // receipt says nothing (no list, no "no ranges remain" claim).
+    const recommend = unpromptedGateOf(ctx.session).postComPressTail;
     if (remaining.length > 0) {
+        if (!recommend) return "";
         return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
     }
     // A tier-distillation nudge means block-boundary compress calls (bN..bM) are
@@ -752,7 +780,36 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
             if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
-                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                // #7318: recommendation off -> honest silence: no re-nag, and
+                // no "already at its minimum" claim while material mass sits
+                // uncovered (#4331).
+                if (!recommend) return "";
+                // #6522 anti-nag latch: notify at most ONCE per nudge-injection
+                // cycle. Re-emitting the note after every subsequent successful
+                // fold drove models into an infinite compress→note loop — as the
+                // session grows the newly offered ranges sit INSIDE the big
+                // uncovered tail run, so each fold split/shrunk a run and a
+                // span-level "changed set" check still re-fired. The note is
+                // advisory and the same detail stays available on demand via
+                // acp_status(scope:"uncompressed") (read-only, no gate), so one
+                // notice per cycle is enough. Each ACTUAL nudge injection
+                // (src/server/handle.ts, nudgeOutcome === "injected") re-opens
+                // the latch: a fresh nudge means the context grew big enough
+                // again, a new compress-while-you-are-at-it moment. Restart
+                // resets the latch (in-memory field) — at most one extra note.
+                if (!ctx.session.uncoveredReceiptNoted) {
+                    ctx.session.uncoveredReceiptNoted = true;
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+                }
+                // Latch already fired this cycle but material mass still sits
+                // uncovered (totalTok >= floor): stay silent, do NOT fall
+                // through to the "No compressible ranges remain" claim below —
+                // that would assert the context is at its minimum while a
+                // >=floor run sits outside every active block (#4331 honesty;
+                // the pre-#7318 code always returned the note here, never the
+                // minimum claim). The detail stays available on demand via
+                // acp_status(scope:"uncompressed").
+                return "";
             }
         }
     } catch {
@@ -1727,6 +1784,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // requested one — the requested number stays in `warn` for correlation.
         const effectiveDetail = effectiveCompressedDetail(ranges, highestMappedRef(ctx.session.state), r.warnings);
         let msg = `[Compressed ${effectiveDetail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}${applyErrorNote(r)}]`;
+        // 2026-11-18 (owner): receipts are the only system lines that quote
+        // user speech (Last-user anchor / summary content) yet carry NO <acp>
+        // time tag on the wire — a weak model cannot tell when a fold happened
+        // vs what the user said "just now" (ti_an incident 2026-11-17: phantom
+        // "user's latest message (m02386/m02387)"). Stamp the fold moment so
+        // the receipt has the same temporal footing as a tagged user message.
+        // Wall clock at commit is fine here — the receipt is a fresh tail
+        // message, never part of a prefix-cache-stable region.
+        msg += ` folded at ${formatTagTime(Date.now())}`;
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
@@ -1775,16 +1841,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 logMsg += note;
             }
         }
-        // #2544: the fingerprint's head/tail excerpts read as "only the ends
-        // were stored", and models have answered that reading by defensively
-        // decompressing freshly created blocks to recover the "missing"
-        // middle. State the opposite at the moment the suspicion arises and
-        // route detail retrieval through search_context first, matching the
-        // kernel's "use search_context BEFORE decompressing" guidance.
+        // #2544: receipt fingerprint lines once showed labeled head/tail
+        // excerpts and were read as "only the ends were stored", triggering
+        // defensive decompresses of freshly created blocks. The labels are
+        // gone (2026-11-18, owner) but the opposite is still stated at the
+        // moment the suspicion could arise, routing detail retrieval through
+        // search_context first, matching the kernel's "use search_context
+        // BEFORE decompressing" guidance.
         // Model-facing receipt only — the log copy carries no excerpts by
         // design (#1718), so it keeps neither the fingerprints nor this note.
         if (changedBlocks.length > 0) {
-            msg += "\nFingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
+            msg += "\nEvery summary is stored in full — to retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if that doesn't answer it.";
         }
         // #189 staged compression (gated): a rewrite above the configured max
         // shrink is the shape that trips provider risk-control; steer the model
