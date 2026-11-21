@@ -2417,7 +2417,7 @@ test("#4111 mediaBytesOfWireBody/bodyOverWindowDetail: prices the inline-media s
     const mixedDoom = bodyOverWindowDetail({ bytes: mixedBytes }, mixedInit, 1000);
     assert.ok(mixedDoom !== undefined, "same media PLUS >4MB of text stays over");
     assert.equal(mixedDoom?.provablyOver, true, ">4MB of text: even the optimistic floor alone exceeds the window");
-    assert.equal(mixedDoom?.estTokens, Math.ceil((mixedDoom?.floorTokens ?? 0) * 1.14), "calibrated tier = floor × CALIBRATED_TEXT_TOKEN_RATIO (src/util.ts)");
+    assert.equal(mixedDoom?.estTokens, mixedDoom?.floorTokens, "#7106: a shape-priced prompt mass is compared to the window as-is (no 1.14 re-calibration); only the byte fallback keeps the calibration bias");
     assert.equal(mixedDoom?.mediaBytes, Buffer.byteLength(bigUrl), "doom numbers carry the excluded media mass");
     assert.equal(mixedDoom?.coreBytes, mixedBytes - Buffer.byteLength(bigUrl), "doom numbers carry media-excluded core bytes");
     assert.equal(mixedDoom?.window, 1_000_000, "#4079 floor never assumes below the 1M common window");

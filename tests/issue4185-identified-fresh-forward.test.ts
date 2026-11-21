@@ -217,8 +217,8 @@ test("identified fresh session whose MEASURED body exceeds the native window but
         const r = await post(proxyPort, upstreamPort, "s-4185-measured", incidentConversation(300_000));
         const body = await r.text();
         assert.equal(r.status, 413, `measured-over body must fail fast: ${body.slice(0, 300)}`);
-        assert.match(body, /outbound body measures ~[\d,]+ TEXT tokens even after preflight compression/, `measured diagnostic present: ${body.slice(0, 300)}`);
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom wording present: ${body.slice(0, 300)}`);
+        assert.match(body, /outbound prompt measures ~[\d,]+ tokens even after preflight compression/, `measured diagnostic present: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("the prompt ITSELF exceeds the window"), `doom wording present: ${body.slice(0, 300)}`);
         assert.equal(calls.filter((c) => c.body.includes("TOOLMARKER_4185_")).length, 0, "the giant payload was never forwarded");
     });
 });
@@ -228,7 +228,7 @@ test("identified fresh session with mathematically doomed bytes (>2MB core) → 
         const r = await post(proxyPort, upstreamPort, "s-4185-doomed", incidentConversation(2_100_000));
         const body = await r.text();
         assert.equal(r.status, 413, "doomed bytes must still fail fast");
-        assert.ok(body.includes("the body ITSELF exceeds the window"), `doom diagnostic present: ${body.slice(0, 300)}`);
+        assert.ok(body.includes("the prompt ITSELF exceeds the window"), `doom diagnostic present: ${body.slice(0, 300)}`);
         assert.equal(calls.length, 0, "nothing forwarded and no summarization spent");
     });
 });

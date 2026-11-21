@@ -207,6 +207,7 @@ billion-context/
 │   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
 │   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
+│   │   ├── prompt-mass.ts   #   Protocol-shaped prompt-mass pricing for the client-local doom gate (#7106)
 │   │   ├── fetch-chain/
 │   │   │   └── index.ts          #   Fetch guard, re-entry cutoff and pi-web-access coexistence
 │   │   ├── native-ws-intercept.ts #  WebSocket-companion intercept: Codex Responses upgrades → /bili/ lane (#2111)

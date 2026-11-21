@@ -12,6 +12,7 @@ import { logHostEvent } from "./host-log.js";
 import { envMillis } from "./native-bootstrap.js";
 import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
+import { promptMassOfWireBody } from "./prompt-mass.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
@@ -831,7 +832,7 @@ async function streamBytesCapped(stream: ReadableStream<Uint8Array>, cap: number
  *  restart (session state is persisted on disk), not another attempt (#3589). */
 function oversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), and this body is priced over the model's context window under the calibrated size check (conservative text pricing — every declared byte counts as text, and the bar is the larger of the client-declared window and 1,000,000 tokens) — forwarding it uncompressed would be rejected upstream (#2924). " +
+        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), and this body is priced over the model's context window under the calibrated size check (conservative text pricing — every declared byte of prompt mass counts as text (transport-only fields are excluded when the body parses, #7106), and the bar is the larger of the client-declared window and 1,000,000 tokens) — forwarding it uncompressed would be rejected upstream (#2924). " +
         "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead. If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
     if (url.endsWith("/messages")) {
@@ -851,7 +852,7 @@ function oversizeRefusal(url: string): Response {
  *  (there is no broken scope to restart). */
 function unattributedOversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte counts as text, and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte of prompt mass counts as text (transport-only fields are excluded when the body parses, #7106), and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
         "If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens. Otherwise, route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
     if (url.endsWith("/messages")) {
@@ -907,7 +908,9 @@ function emptySlotOversizeRefusal(
           : `against the ${doom.window.toLocaleString("en-US")} token local bar (${doom.declaredWindow.toLocaleString("en-US")} resolved by the active lane; the bar never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}, #4079)`;
     const basis = doom === undefined
         ? "this model request is larger than the silent-direct byte ceiling"
-        : `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`;
+        : doom.promptTokens === undefined
+          ? `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`
+          : `this model request's prompt prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}; transport-only fields excluded on the ${doom.protocol ?? "detected"} lane, #7106) ${barNote}`;
     const message =
         "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and " + basis + " — forwarding it would send the prompt to the provider uncompressed (#5405/#5996). " +
         "The slot normally rebinds on the next plugin activation; retry shortly. If it persists, restart the host so the interceptor can rebind.";
@@ -969,18 +972,44 @@ export function bodyOverWindowDetail(
     bodyBytes: number | undefined,
     rawBody: string | undefined,
     declaredWindow: number | undefined,
-): { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number } | undefined {
+): { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number; promptTokens?: number; protocol?: string } | undefined {
     if (bodyBytes === undefined || declaredWindow === undefined) return undefined;
     const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
     // Worst case: zero media credits → core = full mass. If even THAT fits
     // the calibrated bar, no raw body can refuse — skip the JSON walk.
-    if (Math.ceil(Math.ceil(bodyBytes / 4) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
+    // #7106: bytes/3 bounds CJK-dense text (1 token per 3-byte char) from above;
+    // bytes/4 is only the ASCII bound and would skip this check for CJK bodies.
+    if (Math.ceil((bodyBytes / 3) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
     const mediaBytes = rawBody === undefined ? 0 : mediaBytesOfWireBody(rawBody);
     const coreBytes = Math.max(bodyBytes - mediaBytes, 0);
-    const floorTokens = Math.ceil(coreBytes / 4);
-    const estTokens = Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO);
+    // #7106: when the body parses, price the PROMPT mass instead of the whole
+    // wire body. DSH stamps transport-only top-level fields (dsh_session_log up
+    // to 8 MiB, dsh_plugin_packages) that never reach the model, so whole-body
+    // byte pricing refuses healthy in-window requests before the provider ever
+    // sees them. Byte pricing stays the fallback for bodies we cannot price by
+    // shape (non-JSON, or no recognizable prompt key).
+    const promptMass = promptMassOfWireBody(rawBody);
+    const floorTokens = promptMass === undefined
+        ? Math.ceil(coreBytes / 4)
+        : promptMass.promptTokens; // media stays excluded, as the byte math has since #4111
+    // A shape-priced prompt is a direct token count (CJK-aware, same walker as the
+    // server gates), not a byte heuristic: compare it to the window as-is. Only the
+    // byte fallback keeps the 1.14 calibration bias.
+    // #4111 two-tier contract unchanged: the calibrated tier is floor x 1.14 and
+    // the bare floor is the provably-over tier — #7106 only changes what the
+    // floor PRICES (prompt mass when the body parses, whole-body bytes otherwise).
+    // #7106 review: apply the 1.14 calibration ONLY to the byte heuristic. A
+    // shape-priced prompt is already a token count, so multiplying it would
+    // double-calibrate and refuse at ~0.877 x window (the wrong direction for
+    // the false-refusal this issue fixes).
+    const estTokens = promptMass === undefined
+        ? Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO)
+        : floorTokens;
     if (estTokens <= window) return undefined;
-    return { coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow };
+    return {
+        coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow,
+        ...(promptMass === undefined ? {} : { promptTokens: promptMass.promptTokens, protocol: promptMass.protocol }),
+    };
 }
 
 /** The model context window every plugin lane stamps onto its model requests
