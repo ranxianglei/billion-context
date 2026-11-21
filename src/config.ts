@@ -2400,9 +2400,12 @@ type FileConfig = {
          *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
         maxMessages?: number;
         /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
-         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
-         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
-         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+         *  decode; when re-enabled, a body above it is refused with an actionable 413 before the
+         *  sweep, because any parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model
+         *  window. DISABLED by default for all lanes (#7426): on the re-send lanes (opencode/dsh
+         *  re-send the entire raw ledger every turn and bili folds it) the raw inbound byte count
+         *  is not a valid "beyond model window" proxy. 0 = no ingest cap (the default); set a byte
+         *  value to re-enable. Env BILI_INGEST_BODY_BYTES wins. */
         ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
