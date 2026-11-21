@@ -534,6 +534,63 @@ export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     };
 }
 
+// #7273: per-TOP-LEVEL-KEY breakdown of the raw body. The four-bucket split
+// above lumps every non-messages/tools/system field into "other", so a body
+// whose mass rides a single DSH-side top-level field (the #7273 report: ~1.7M
+// tokens in "other" that the contextView never counts — the field is invisible
+// in the four-bucket clause) cannot be localized. This walk tracks each
+// top-level key's own token count (same CJK-aware meter, same
+// NON_TEXT_BODY_KEYS exclusions as estimateRawBodyTokens — so the sum of every
+// key's tokens equals estimateRawBodyTokens(parsed) exactly) plus its UTF-8
+// byte size, so the egress fuse can NAME the offending field instead of just
+// "other". topN caps the log line; the full per-key map is returned when
+// topN <= 0.
+export interface RawBodyTopKey {
+    key: string;
+    tokens: number;
+    bytes: number;
+}
+
+export function estimateRawBodyTopKeys(parsed: unknown, topN = 8): RawBodyTopKey[] {
+    const perKey = new Map<string, { tokens: number; bytes: number }>();
+    const pending: [unknown, string | undefined, string][] = [];
+    if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            pending.push([v, k, k]);
+        }
+    } else {
+        pending.push([parsed, undefined, "<root>"]);
+    }
+    while (pending.length > 0) {
+        const [value, key, topKey] = pending.pop()!;
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const tokens = defaultCountTokens(value);
+                const bytes = Buffer.byteLength(value, "utf8");
+                const entry = perKey.get(topKey);
+                if (entry) {
+                    entry.tokens += tokens;
+                    entry.bytes += bytes;
+                } else {
+                    perKey.set(topKey, { tokens, bytes });
+                }
+            }
+            continue;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) pending.push([item, key, topKey]);
+            continue;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, topKey]);
+        }
+    }
+    const all = [...perKey.entries()]
+        .map(([key, { tokens, bytes }]) => ({ key, tokens, bytes }))
+        .sort((a, b) => b.tokens - a.tokens || b.bytes - a.bytes);
+    return topN > 0 ? all.slice(0, topN) : all;
+}
+
 // #553: upper-bound variant of estimateCoreMessages — every character counts
 // as one token. A BPE token covers >=1 char (Latin/code) and CJK is already
 // ~1 token/char, so this never undershoots the real count, unlike
