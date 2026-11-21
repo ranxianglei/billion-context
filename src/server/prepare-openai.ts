@@ -665,6 +665,14 @@ export async function prepareOpenai(
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+    // #7346: on a HIT the pin is this turn's window (the new tail), NOT the
+    // complete raw log. snapshotMessages stamps it raw (folded=false), so the
+    // save presents the window as the full log and the #3285 authoritative-set
+    // sweep retires every verified prefix row the window omits — a 100k-session
+    // ledger drained to the ~2-row window each turn. Mark the pin non-raw so
+    // the save ingests the window through the bounded envelope view and does
+    // NOT sweep the prefix.
+    if (wpHit !== undefined) session.lastMessagesFolded = true;
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
     markDirty(session);
