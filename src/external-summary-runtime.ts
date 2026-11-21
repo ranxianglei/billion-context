@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, SUMMARY_CONCURRENCY_DEFAULT, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -24,6 +25,7 @@ export class ConfiguredSummaryPlan {
      *  (shared-pool congestion, or the plan's budget already exhausted before
      *  reaching the pool — congestion, not a chain failure). */
     readonly stats = { calls: 0, attempts: 0 };
+    readonly fingerprint: string;
     private readonly sessionId: string | undefined;
 
     // `raw` may be an already-parsed chain off the request rail or raw JSON
@@ -36,9 +38,11 @@ export class ConfiguredSummaryPlan {
         this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         this.sessionId = sessionId;
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
+        const fingerprint = createHash("sha256").update(JSON.stringify({ settings: this.settings, proxyUrl }));
         this.candidates = this.settings.targets.map((target) => {
             try {
                 const key = target.apiKey !== undefined ? target.apiKey : store.resolve(target.credentialRef ?? "", env);
+                fingerprint.update(JSON.stringify(key ?? null));
                 if (!key) throw new Error(`credential ${target.credentialRef || "(none)"} did not resolve to a value`);
                 const headers: Record<string, string> = target.protocol === "anthropic" ? { "x-api-key": key }
                     : target.protocol === "google" ? { "x-goog-api-key": key }
@@ -65,6 +69,7 @@ export class ConfiguredSummaryPlan {
                 return { async summarize(): Promise<string> { throw new Error("External summary candidate unavailable"); } };
             }
         });
+        this.fingerprint = fingerprint.digest("hex");
     }
 
     async summarize(work: readonly SummaryWork[], signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
