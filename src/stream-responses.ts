@@ -4,7 +4,7 @@ import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, runJsonRewrite, runJsonRewriteAsync, type JsonToolCall, type RewriteCtx } from "./stream.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { effectiveAbsorbConfig } from "./absorb.js";
-import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripResponsesText } from "./loop/tag-echo-filter.js";
+import { containsBareRefHeadWire, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripResponsesText } from "./loop/tag-echo-filter.js";
 
 /**
  * Responses API (non-streaming) JSON rewriter: strips compress function_call
@@ -38,7 +38,7 @@ function* rewriteResponsesJsonSteps(body: unknown, ctx: RewriteCtx): Generator<J
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb.
     const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
-    if (containsRenderTagText(probe) || containsMarkerLineText(probe) || containsBiliInternalText(probe) || (absorbArmed && containsToolCallEmissionText(probe))) {
+    if (containsRenderTagText(probe) || containsMarkerLineText(probe) || containsBiliInternalText(probe) || containsBareRefHeadWire(probe) || (absorbArmed && containsToolCallEmissionText(probe))) {
         ctx.log(`[tag-echo] stripped: non-stream responses output ACP echo (render tags/markers/internal artifacts): ${probe.slice(0, 120).replace(/\n/g, " ")}`);
         const requestText = absorbArmed ? JSON.stringify(ctx.messages) : undefined;
         stripResponsesText(b, absorbArmed, requestText);
