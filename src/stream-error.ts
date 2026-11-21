@@ -77,7 +77,14 @@ interface LegacyAnthropicState {
 // SDK cannot surface an in-band error event.
 function legacyCompletionChunk(protocol: Protocol, visible: string, state?: LegacyAnthropicState): string {
     if (protocol === "openai") {
-        return `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })}\n\n` +
+        // #7461: open with the assistant role — when the upstream dies before
+        // sending any bytes this completion is the client's first frame, and the
+        // official OpenAI SDK rejects a stream whose choice 0 never carries a
+        // role ("missing role for choice 0"), the same class as #7401. A
+        // duplicate role (upstream already sent one) is harmless: the SDK just
+        // re-sets the already-"assistant" role.
+        return `data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n` +
+            `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })}\n\n` +
             `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
             `data: [DONE]\n\n`;
     }

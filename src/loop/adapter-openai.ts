@@ -233,6 +233,19 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             "utf8",
         );
 
+    // #7461: the assistant-role opener. A synthesized stream (error completion,
+    // empty-body turn) that is the client's FIRST frame must carry it or the
+    // official OpenAI SDK rejects the whole response ("missing role for choice
+    // 0"). A duplicate role is harmless — the SDK re-sets the "assistant" role.
+    const buildRole = (): Buffer =>
+        Buffer.from(
+            `data: ${JSON.stringify({
+                ...makeBase(),
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            })}\n\n`,
+            "utf8",
+        );
+
     const buildReasoning = (content: string): Buffer =>
         Buffer.from(
             `data: ${JSON.stringify({
@@ -776,6 +789,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // streamErrorShape="completion" restores the legacy shape.
             if (errorShape === "completion") {
                 return Buffer.concat([
+                    buildRole(),
                     buildContent(`\n[acp-proxy: ${message}]\n`),
                     buildFinish("stop", null),
                     Buffer.from("data: [DONE]\n\n", "utf8"),
