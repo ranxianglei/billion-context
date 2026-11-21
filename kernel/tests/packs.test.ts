@@ -170,6 +170,31 @@ test("lean acpTags carries BOTH the summary-trust guardrail and the post-compres
   );
 });
 
+test("lean acpTags carries the receipt stop-signal clause after the standing compress bullet (#6930)", () => {
+  const pi = leanPack.surface.adapters?.pi as {
+    promptSections: Record<string, string | null>;
+  };
+  const tags = pi.promptSections.acpTags ?? "";
+  const standing = "Compress consumed history with compress:";
+  const stopClause = "Compress receipts are authoritative stop signals:";
+  assert.ok(tags.includes(standing), "standing compress bullet must be present");
+  assert.ok(tags.includes(stopClause), "stop-signal clause must be present");
+  assert.ok(
+    tags.indexOf(stopClause) > tags.indexOf(standing),
+    "stop-signal clause must be positioned after the standing compress bullet",
+  );
+  // The clause names the stop triggers and the two resume conditions — not a blanket ban.
+  for (const marker of [
+    'an "already compressed" receipt',
+    '"No compressible ranges remain"',
+    "issue no further compress calls",
+    "a receipt or nudge names ranges to fold",
+    "the user explicitly asks to compress",
+  ]) {
+    assert.ok(tags.includes(marker), `missing stop/resume detail: ${marker}`);
+  }
+});
+
 test("lean acpTags states ref stability across compression (no false renumbering claim, #417)", () => {
   const pi = leanPack.surface.adapters?.pi as {
     promptSections: Record<string, string | null>;
