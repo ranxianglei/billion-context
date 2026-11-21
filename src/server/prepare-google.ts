@@ -349,7 +349,7 @@ export async function prepareGoogle(
         // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core from
         // the egress op-log — the recorded bytes are this session's server
         // truth; the lane's own conversion chain turns it into wire below.
-        if (!isTitleGen && featureEnabled("egressServeLog")) {
+        if (!isTitleGen && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             const served = st ? serveLaneCore(st, sessionId, log) : null;
             if (served !== null) egressMessages = served;
@@ -386,7 +386,7 @@ export async function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
-        if (!isTitleGen && featureEnabled("egressOpLog")) {
+        if (!isTitleGen && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) recordLaneTurn(st, sessionId, egressMessages, googleOutboundSystem ?? googleClientSystem, log);
         }

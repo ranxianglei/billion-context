@@ -565,14 +565,14 @@ export async function prepareAnthropic(
         // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core from
         // the egress op-log (no title-gen side requests ride this lane, so no
         // extra gate). The lane's own conversion chain turns it into wire below.
-        if (featureEnabled("egressServeLog")) {
+        if (featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             const served = st ? serveLaneCore(st, sessionId, log) : null;
             if (served !== null) egressMessages = served;
         }
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
         // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
-        if (featureEnabled("egressOpLog")) {
+        if (featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) recordLaneTurn(st, sessionId, egressMessages, extractSystem(systemOut) ?? "", log);
         }

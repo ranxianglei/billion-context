@@ -540,7 +540,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // (trigger/prompt form) are transient, like title-gen, and are not
         // recorded nor served.
         let laneCore = processedMessages;
-        if (!isCompactionTrigger && featureEnabled("egressServeLog")) {
+        if (!isCompactionTrigger && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             const served = st ? serveLaneCore(st, sessionId, log) : null;
             if (served !== null) laneCore = served;
@@ -593,7 +593,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
-        if (!isCompactionTrigger && featureEnabled("egressOpLog")) {
+        if (!isCompactionTrigger && featureEnabled("egressPlane")) {
             const st = getStore().egressOpLogStore();
             if (st) recordLaneTurn(st, sessionId, laneCore, responsesDevContent ?? projection.systemParts.join("\n\n"), log);
         }

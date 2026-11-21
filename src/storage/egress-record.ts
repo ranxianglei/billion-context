@@ -4,7 +4,7 @@
  * ruling 1, #6785 perf work). Each turn diffs the outbound conversation view
  * against the previous turn's and appends the sparse op batch to the dual
  * tables. Outbound bytes are served from the log only behind the serve key
- * (segment 4b). Gated by rollout key `egressOpLog` (default 0 = no recording
+ * (segment 4b). Gated by rollout key `egressPlane` (default 0 = no recording
  * at all).
  *
  * SELF-CONTAINED BYTES (ruling 7439-1): each view row carries the message's

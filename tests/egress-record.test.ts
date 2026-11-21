@@ -169,9 +169,9 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
 });
 
 test("#3617 negative direction: rollout key OFF by default → gate never opens", () => {
-    delete process.env.BILI_ROLLOUT_EGRESS_OP_LOG;
-    assert.equal(featureEnabled("egressOpLog"), false, "egressOpLog defaults to 0 — the prepare-openai gate (featureEnabled) sees nothing and records zero rows");
-    process.env.BILI_ROLLOUT_EGRESS_OP_LOG = "1";
-    assert.equal(featureEnabled("egressOpLog"), true);
-    delete process.env.BILI_ROLLOUT_EGRESS_OP_LOG;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    assert.equal(featureEnabled("egressPlane"), false, "egressPlane defaults to 0 — the prepare-openai gate (featureEnabled) sees nothing and records zero rows");
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    assert.equal(featureEnabled("egressPlane"), true);
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
 });

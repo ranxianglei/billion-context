@@ -12,7 +12,7 @@
 | 块 | 提案/来源 | 开关(默认) |
 |---|---|---|
 | ① 快照底座 v2(stage-0 身份账本 + fold 日志 + 出站前缀缓存) | #5874 v2 / #7064 瘦身 | `storage.snapBase.enabled`(默认关,纯配置) |
-| ② 出站 op-log(egress_state/egress_flow + 重建 serve) | 讨论区 7398 | `egressOpLog`(0)/ `egressServeLog`(0) |
+| ② 出站 op-log(egress_state/egress_flow + 重建 serve + 服务端权威) | 讨论区 7398/7439 | `egressPlane`(0)——整条新链路的**唯一开关** |
 | ③ 全量重发水位 + delta 尾切片 | #5403/#5418 + 本 PR | `pluginFullResendWatermark`(5)/ `pluginDeltaResend`(0) |
 | ④ 增量 msgid pin(tail-ids 尾形态) | #7064 §8 | `pluginMsgIdIncremental`(**100**,本 PR 起默认开) |
 | ⑤ 服务端正史 GA | #4491 | `pluginLaneServerHistory`(**100**,本 PR 从 0 翻到 100) |
@@ -219,7 +219,7 @@ PRIMARY KEY (session_id, log_seq)
   → [handle] readBody(155MB 级)→ pf 协议扫描(fastpath-scan,零 parse)
   → [fastpath] HIT(戳前进+锚链对):跳整包 parse/转换/钉存
   → [prepare-openai] 重建视图 = 钉存前缀核 + 尾窗解析(delta 臂)
-     ├─ egressServeLog 开:recordEgressTurn(稀疏 I op,几 KB)
+     ├─ egressPlane 开:recordEgressTurn(稀疏 I op,几 KB)
      │   → rebuildOutboundFromLog(op log + CAS)→ swap 进出站字节
      └─ 关:legacy 内核视图 → coreToOpenai 链
   → [ingest] shadow.ingestDelta:watermark+边界+头探针 → planIngestDelta
@@ -274,8 +274,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 | `pluginMsgIdIncremental` | **100** | 新增即开 | ④ 尾形态 id 申报,账本重盖前缀 | env=0 |
 | `pluginFullResendWatermark` | 5 | (既有 5% 灰度) | ③ 水位快路径 | env=0 |
 | `pluginDeltaResend` | 0 | 新增,关 | ③ delta 尾切片臂;0 = 对 delta 请求 400,客户端一轮收敛回全量 | 天生回滚态 |
-| `egressOpLog` | 0 | 新增,关 | ② seg3 影子录制(只记账) | 天生回滚态 |
-| `egressServeLog` | 0 | 新增,关 | ② seg4b 真 serve+swap(自录制,不依赖 egressOpLog) | 天生回滚态 |
+| `egressPlane` | 0 | 新增,关 | ② 整条新链路一个开关:稀疏 op 记账(四车道)+ 日志回放 serve(字节一致 swap)+ pinned 插件车道服务端权威(裁定 7439-3/5);关 = legacy 链路零行、与特性前字节一致。取代已退役的 `egressOpLog`/`egressServeLog` 双键 | 天生回滚态 |
 
 **无新增静态 env 变量、无新增 CLI flag**(rollout env 由键名动态派生,docs-coverage CI 对动态名双向豁免——这也是 `pluginMsgIdIncremental` 此前漏文档的根因,本轮已补 yaml 条目)。
 
@@ -298,7 +297,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 ### 5.1 压测方法(perf/,2026-11-21)
 
-构造 = 用户场景的 plugin 形态:客户端历史从 1 条增长(纯 append-only),fake 理想模型每 ~300 refs(≈5w token 增长)注入一次 compress 工具调用(折最旧段、保 1800 refs≈30w token 存活尾)——**客户端在宿主侧应用折叠**(plugin 语义:模型发起、客户端执行),因此线上 wire 恒定 = 存活视图(1800–2100 条,0.7–0.8MB 请求体,出站 200–253k token),`cum` 计累计产生量(到 10w)。臂:master(`b10c1a0d4`,无 pf)/ PR 全量臂 / PR delta 臂。三臂同 fake 校准、同 driver(node:http `connection: close`——bili 按 #1982 设计每轮后关连)。**注意:本批所有跑都是 egressOpLog/egressServeLog 关闭态**(7398 臂未测,见 §5.4);155MB 原始 wire 形态(宿主不折叠的客户端)不在本批覆盖内。
+构造 = 用户场景的 plugin 形态:客户端历史从 1 条增长(纯 append-only),fake 理想模型每 ~300 refs(≈5w token 增长)注入一次 compress 工具调用(折最旧段、保 1800 refs≈30w token 存活尾)——**客户端在宿主侧应用折叠**(plugin 语义:模型发起、客户端执行),因此线上 wire 恒定 = 存活视图(1800–2100 条,0.7–0.8MB 请求体,出站 200–253k token),`cum` 计累计产生量(到 10w)。臂:master(`b10c1a0d4`,无 pf)/ PR 全量臂 / PR delta 臂。三臂同 fake 校准、同 driver(node:http `connection: close`——bili 按 #1982 设计每轮后关连)。**注意:本批所有跑都是 egress 平面关闭态**(7398 臂未测,见 §5.4);155MB 原始 wire 形态(宿主不折叠的客户端)不在本批覆盖内。
 
 ### 5.2 实测(RUN1 batch=500 三臂跑满 210 轮;RUN2 batch=100 仅 PR 全量臂跑到 g943≈9.4w,master 臂因代理误杀中止,delta 臂未启动)
 
@@ -330,6 +329,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 4. **[文档] `docs/storage-relations.{en,zh}.svg`** 缺 5 张新表、fold_journal 卡片还写已删的 covered_ids、egress_snapshot 卡片还写 ids_json、⑦级联卡片不准确 ⇒ **移除**,由本报告接替。
 5. **[文档] rollout.yaml 三处过时**:pluginLaneServerHistory 默认值 "0 (off)"(代码 100)、egressServeLog 描述 "seg 4a LOG ONLY never swaps"(4b 已真 swap)、缺 pluginMsgIdIncremental 条目 ⇒ 全部更正/补齐,重新生成 docs。
 6. **[注释] rollout.ts egressServeLog 注释** "(AND egressOpLog is on)"+"tool rows in v1" 两处过时 ⇒ 更正。
+7. **[开关] egress 双键合并为一个**(owner 裁定 2026-11-21):`egressOpLog` + `egressServeLog` 退役,由单一 `egressPlane` 灰度键取代——开 = 完整新链路(记账 + serve + 服务端权威,四车道),关 = legacy 链路与特性前字节一致。两个旧键从未发布(默认 0、天生回滚态),无需迁移。
 
 ### 5.4 留给后续(不在本 PR 范围)
 

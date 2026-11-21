@@ -10,7 +10,7 @@
  * rebuildCoreFromLog is LANE-NEUTRAL (owner ruling 7439-4): it returns the
  * core BiliMessage[] and each lane feeds its own conversion chain
  * (prepare-openai uses the openai wrapper below; anthropic/responses/google
- * join in the same way). prepare-openai (rollout `egressServeLog`, default
+ * join in the same way). prepare-openai (rollout `egressPlane`, default
  * 0) SERVES these elements as the outbound conversation when the rebuild
  * succeeds, and falls back to the legacy path — with the 4a shadow
  * byte-comparison still running on fallback turns — when it cannot (degrade,

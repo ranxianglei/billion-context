@@ -12,7 +12,7 @@ It turns the two O(full) paths — "recompute the outbound view from scratch eve
 | Block | Proposal / origin | Switch (default) |
 |---|---|---|
 | ① Snapshot base v2 (stage-0 identity ledger + fold journal + outbound prefix cache) | #5874 v2 / #7064 slimming | `storage.snapBase.enabled` (off by default, config-only) |
-| ② Outbound op-log (egress_state/egress_flow + rebuild-serve) | Discussion #7398 | `egressOpLog` (0) / `egressServeLog` (0) |
+| ② Outbound op-log (egress_state/egress_flow + rebuild-serve + server authority) | Discussion #7398/#7439 | `egressPlane` (0) — ONE switch for the whole new path |
 | ③ Full-resend watermark + delta tail slice | #5403/#5418 + this PR | `pluginFullResendWatermark` (5) / `pluginDeltaResend` (0) |
 | ④ Incremental msgid pin (tail-ids tail form) | #7064 §8 | `pluginMsgIdIncremental` (**100**, on by default from this PR) |
 | ⑤ Server-side canonical history GA | #4491 | `pluginLaneServerHistory` (**100**, flipped 0→100 by this PR) |
@@ -219,7 +219,7 @@ Client POST /bili/http://<upstream>/chat/completions
   → [handle] readBody (155MB-class) → pf protocol scan (fastpath-scan, zero parse)
   → [fastpath] HIT (stamp advanced + anchor chain intact): skip whole-body parse/convert/pin-stash
   → [prepare-openai] rebuild view = pinned prefix cores + tail-window parse (delta arm)
-     ├─ egressServeLog ON: recordEgressTurn (sparse I ops, a few KB)
+     ├─ egressPlane ON: recordEgressTurn (sparse I ops, a few KB)
      │   → rebuildOutboundFromLog (op log + CAS) → swap into outbound bytes
      └─ OFF: legacy kernel view → coreToOpenai chain
   → [ingest] shadow.ingestDelta: watermark + boundary + head probe → planIngestDelta
@@ -274,8 +274,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 | `pluginMsgIdIncremental` | **100** | new, on | ④ tail-form id declaration, ledger re-stamps prefix | env=0 |
 | `pluginFullResendWatermark` | 5 | (existing 5% rollout) | ③ watermark fast path | env=0 |
 | `pluginDeltaResend` | 0 | new, off | ③ delta tail-slice arm; 0 = 400 on delta requests, client converges to full in one round | born in rollback state |
-| `egressOpLog` | 0 | new, off | ② seg3 shadow recording (bookkeeping only) | born in rollback state |
-| `egressServeLog` | 0 | new, off | ② seg4b real serve+swap (self-recording, does NOT depend on egressOpLog) | born in rollback state |
+| `egressPlane` | 0 | new, off | ② the WHOLE new path under one switch: sparse-op recording (all four lanes) + serve-from-log (byte-identical swap) + server authority for pinned plugin lanes (rulings #7439 3/5); off = legacy chain, zero rows, byte-identical to pre-feature. Replaces the retired `egressOpLog`/`egressServeLog` pair | born in rollback state |
 
 **No new static env vars, no new CLI flags** (rollout env names are derived dynamically from key names; the docs-coverage CI exempts dynamic names in both directions — which is also why `pluginMsgIdIncremental` went undocumented until now; the yaml entry was added this round).
 
@@ -298,7 +297,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 
 ### 5.1 Bench method (perf/, 2026-11-21)
 
-Construction = the user scenario's plugin shape: client history grows from 1 message (pure append-only); the fake ideal model injects a compress tool call every ~300 refs of growth (≈50k tokens), folding the oldest span and keeping 1800 refs (≈300k-token live tail) — **the client applies folds host-side** (plugin semantics: the model initiates, the client executes), so the wire stays at the live view (1800–2100 messages, 0.7–0.8MB request body, outbound 200–253k tokens) while `cum` counts cumulative created messages (to 100k). Arms: master (`b10c1a0d4`, no pf) / PR full arm / PR delta arm. All arms share fake calibration and driver (node:http `connection: close` — bili closes the connection after each turn by design, #1982). **Note: every run in this batch was with egressOpLog/egressServeLog OFF** (the #7398 arm is untested, see §5.4); the 155MB raw-wire shape (a host that never folds) is not covered by this batch.
+Construction = the user scenario's plugin shape: client history grows from 1 message (pure append-only); the fake ideal model injects a compress tool call every ~300 refs of growth (≈50k tokens), folding the oldest span and keeping 1800 refs (≈300k-token live tail) — **the client applies folds host-side** (plugin semantics: the model initiates, the client executes), so the wire stays at the live view (1800–2100 messages, 0.7–0.8MB request body, outbound 200–253k tokens) while `cum` counts cumulative created messages (to 100k). Arms: master (`b10c1a0d4`, no pf) / PR full arm / PR delta arm. All arms share fake calibration and driver (node:http `connection: close` — bili closes the connection after each turn by design, #1982). **Note: every run in this batch was with the egress plane OFF** (the #7398 arm is untested, see §5.4); the 155MB raw-wire shape (a host that never folds) is not covered by this batch.
 
 ### 5.2 Measured (RUN1 batch=500 all three arms 210 turns; RUN2 batch=100 only the PR full arm reached g943≈94k — the master arm was aborted by a mis-killed proxy, the delta arm never launched)
 
@@ -330,10 +329,11 @@ Construction = the user scenario's plugin shape: client history grows from 1 mes
 4. **[docs] `docs/storage-relations.{en,zh}.svg`** was missing 5 new tables, the fold_journal card still listed the dropped covered_ids, the egress_snapshot card still listed ids_json, and the ⑦ cascade card was inaccurate ⇒ **removed**, superseded by this report.
 5. **[docs] rollout.yaml three stale entries**: pluginLaneServerHistory default "0 (off)" (code is 100), egressServeLog described as "seg 4a LOG ONLY never swaps" (4b really swaps), missing pluginMsgIdIncremental entry ⇒ all corrected/completed, docs regenerated.
 6. **[comment] rollout.ts egressServeLog comment** — "(AND egressOpLog is on)" and "tool rows in v1" both stale ⇒ corrected.
+7. **[switch] the egress keys collapsed to ONE** (owner ruling 2026-11-21): the `egressOpLog` + `egressServeLog` pair was retired and replaced by a single `egressPlane` rollout key — on = the complete new path (record + serve + server authority, all four lanes), off = legacy chain byte-identical to pre-feature. Both old keys never shipped (default 0, born in rollback state), so there is no migration.
 
 ### 5.4 Left for follow-up (out of scope for this PR)
 
-- **Minimal validation with the egress keys ON** (pending): 155MB raw wire (host never folds) + egressServeLog real serve ⇒ the full scenario with 300k-token outbound, checking the "few-KB new storage per turn" red line per turn (WAL diff) — this is the #7398 acceptance line; this batch did not cover it.
+- **Minimal validation with the egress keys ON** (pending): 155MB raw wire (host never folds) + egressPlane real serve ⇒ the full scenario with 300k-token outbound, checking the "few-KB new storage per turn" red line per turn (WAL diff) — this is the #7398 acceptance line; this batch did not cover it.
 - Profiling the accumulated-ledger cost of 1.1–1.8s per turn at 50k+ cumulative scale (the slow-ingest #5744 domain; includes the fold-turn retire+re-anchor, the fold-crossing gate over 309 fold_journal rows, kernel scans).
 - A valid delta-arm rerun in the growing scenario (with `pluginDeltaResend:true`).
 - The compact B row ≈8MB @ 100k rows vs the "few-KB per turn" red line: a design-declared exception (#7398 §5); to hold the red line strictly, the B row could become a "range reference + anti-forgery fingerprint" (the #7064 l1_world demotion idea), at the cost of losing the state table's self-contained replay closure — needs an owner ruling.

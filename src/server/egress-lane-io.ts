@@ -11,7 +11,7 @@
 // The system row lives INSIDE the recorded view (type "system") but is
 // excluded from the served core — each lane builds its own system block live
 // (prefix-cache anchor), exactly like the OpenAI lane.
-// Rollout gates (egressServeLog / egressOpLog, default 0) are owned by the
+// Rollout gates (egressPlane, default 0) are owned by the
 // caller. Any corrupt/unreadable log point degrades that one turn to the
 // lane's legacy core — never a crash, never partial, never client-as-authority.
 

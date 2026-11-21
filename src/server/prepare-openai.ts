@@ -379,7 +379,7 @@ export async function prepareOpenai(
         // Degrade (never guess, never client-as-authority): store missing,
         // empty/unreadable flow, unrebuildable view, or a failed probe → this
         // turn runs the legacy client-byte path and re-attempts next turn.
-        egressArmed = featureEnabled("egressServeLog") && pluginMode && !isTitleGen && s0.pinned !== null;
+        egressArmed = featureEnabled("egressPlane") && pluginMode && !isTitleGen && s0.pinned !== null;
         if (egressArmed) {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -712,7 +712,7 @@ export async function prepareOpenai(
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         openaiOutboundSystem = sysParts.join("\n\n");
-        if (!isTitleGen && featureEnabled("egressServeLog") && !(egressArmed && !egressSwapApplied)) {
+        if (!isTitleGen && featureEnabled("egressPlane") && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 try {
@@ -961,7 +961,7 @@ export async function prepareOpenai(
     // the serve path already ran or when the authority seam ran but did not
     // swap (ruling 7439-5: never advance the flow with untrusted client
     // bytes); a corrupt log skips this turn and self-heals next.
-    if (!isTitleGen && featureEnabled("egressOpLog") && !egressServedFromLog && !(egressArmed && !egressSwapApplied)) {
+    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog && !(egressArmed && !egressSwapApplied)) {
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
@@ -981,9 +981,9 @@ export async function prepareOpenai(
     // #7398 seg 4a: SHADOW comparison — rebuild the outbound core portion
     // from the log and byte-compare against the legacy elements. NO
     // swap: the pipeline always sends the legacy bytes; this measures the
-    // identity rate the swap will rely on (rollout egressServeLog, default 0;
+    // identity rate the swap will rely on (rollout egressPlane, default 0;
     // reads the hydrated flow view).
-    if (!isTitleGen && featureEnabled("egressServeLog") && !egressServedFromLog) {
+    if (!isTitleGen && featureEnabled("egressPlane") && !egressServedFromLog) {
         try {
             const st = getStore().egressOpLogStore();
             const view = egressBaseRows ?? (st ? st.egressStateView(sessionId) : undefined);

@@ -1,4 +1,4 @@
-// #7398 seg 4b: egress serve-from-log — when rollout egressServeLog is on the
+// #7398 seg 4b: egress serve-from-log — when rollout egressPlane is on the
 // outbound conversation elements come from the op-log (rebuildOutboundFromLog,
 // self-contained bytes per #7439 ruling 1) instead of the legacy re-conversion,
 // and are byte-identical to the legacy bytes by construction. Direction asserts
@@ -7,7 +7,7 @@
 //
 // Method: one server, two sessions with IDENTICAL message sequences. Session A
 // runs with the rollouts off (control = legacy). Session B runs with
-// egressOpLog+egressServeLog on (served). The fake upstream captures every
+// egressPlane on (served). The fake upstream captures every
 // request body; A[n] and B[n] must be byte-identical, and B's log must show
 // "egress-serve: served" lines scoped to the served sessions (both scenarios
 // serve now — tool rows ride the row bytes); the -A controls never do.
@@ -72,9 +72,9 @@ test("egress serve-from-log: served bytes == legacy bytes, text and tool alike (
     test.after(() => rmSync(dir, { recursive: true, force: true }));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = "full";
-    process.env.BILI_ROLLOUT_EGRESS_OP_LOG = "1";
-    const savedServe = process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG;
-    delete process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG;
+    process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+    const savedPlane = process.env.BILI_ROLLOUT_EGRESS_PLANE;
+    delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
     const logs: string[] = [];
     setLogCapture((_lvl, m) => { logs.push(m); });
     try {
@@ -136,7 +136,7 @@ test("egress serve-from-log: served bytes == legacy bytes, text and tool alike (
         await runSession(base, "serve-e2e-tool-A", toolScript, ctrlAT);
 
         // Session B: serve on — same sequences must produce identical upstream bytes.
-        process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG = "1";
+        process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         const serveB: string[] = [];
         await runSession(base, "serve-e2e-text-B", textScript, serveB);
         const servedT: string[] = [];
@@ -166,8 +166,8 @@ test("egress serve-from-log: served bytes == legacy bytes, text and tool alike (
         await new Promise((r) => upstream.close(() => r(undefined)));
         store.closeQuietly();
     } finally {
-        if (savedServe === undefined) delete process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG;
-        else process.env.BILI_ROLLOUT_EGRESS_SERVE_LOG = savedServe;
+        if (savedPlane === undefined) delete process.env.BILI_ROLLOUT_EGRESS_PLANE;
+        else process.env.BILI_ROLLOUT_EGRESS_PLANE = savedPlane;
         setLogCapture(null);
     }
 });

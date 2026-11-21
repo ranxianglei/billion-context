@@ -129,24 +129,21 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // Force with `rollout.features.pluginDeltaResend: true` or
     // `BILI_ROLLOUT_PLUGIN_DELTA_RESEND=1`.
     pluginDeltaResend: { percent: 0 },
-    // #7398 seg 3: shadow-record each turn's outbound conversation view as
-    // sparse ops into the egress dual tables (egress_state/egress_flow).
-    // RECORDING ONLY — outbound bytes are not read from or written through
-    // the log (that is seg 4, own key). Default 0 = zero rows, zero cost.
-    // Force with `rollout.features.egressOpLog: true` or
-    // `BILI_ROLLOUT_EGRESS_OP_LOG=1`.
-    egressOpLog: { percent: 0 },
-    // #7398 seg 4b: serve-from-log — when on, each OpenAI-lane turn
-    // self-records its outbound view as sparse ops (egressOpLog NOT required),
-    // rebuilds the outbound conversation elements from the op log (rows are
-    // SELF-CONTAINED — the message bytes ride the row, no content CAS, #7439
-    // ruling 1; same legacy chain, bytes identical by construction) and swaps
-    // them into the outbound body; any unrebuildable row (missing/empty bytes
-    // — pre-#7439 rows, unknown role) or a corrupt log degrades the WHOLE turn
-    // to the legacy path (never a partial swap). seg 4a's shadow
-    // byte-comparison keeps running on the fallback turns. Force with
-    // `rollout.features.egressServeLog: true` or BILI_ROLLOUT_EGRESS_SERVE_LOG=1.
-    egressServeLog: { percent: 0 },
+    // #7398/#7439: the egress plane — ONE switch for the whole new path.
+    // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
+    // outbound conversation view as sparse ops (I/D/U) into the
+    // egress_state/egress_flow dual tables (rows SELF-CONTAINED — message
+    // bytes ride the row, no content CAS, ruling 7439-1), serves the
+    // outbound core portion back from the op log (byte-identical by
+    // construction), and pinned plugin lanes take server authority — the
+    // kernel input is replayed from the flow (rulings 7439-3/5); a bounded
+    // backward ladder recovers to the newest healthy log point, and ANY
+    // unrebuildable/corrupt state degrades the turn to legacy (never a
+    // partial swap, never client-as-authority). OFF = legacy chain, zero
+    // rows, byte-identical to pre-feature.
+    // Force with `rollout.features.egressPlane: true` or
+    // `BILI_ROLLOUT_EGRESS_PLANE=1`.
+    egressPlane: { percent: 0 },
     // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
     // loopback clients without an explicit body channel get stable session+
     // message identity aligned from their OWN local transcript/sqlite
