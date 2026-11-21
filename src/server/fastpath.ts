@@ -410,7 +410,7 @@ function baseOfRawId(id: string): string {
 /** In-place head-edit check, IGNORING the `id` field. In a pinned session
  *  (pluginLaneServerHistory) the seed cores carry host/ledger msgids while a
  *  fresh openaiToCore parse mints content-hash ids, so the id namespace differs
- *  structurally on every turn (#7347) — the id is not a content signal here.
+ *  structurally on every turn (#7345) — the id is not a content signal here.
  *  Content/role/shape inequality is still caught via the full JSON minus the
  *  id; a remint with identical bytes is not a rewrite. */
 function headCoreContentDiffers(a: CoreMessage, b: CoreMessage): boolean {

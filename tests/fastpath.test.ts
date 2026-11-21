@@ -73,7 +73,7 @@ const runTurn = (
  *  materialized). This is the 2x2 traffic the watermark fastpath exists to
  *  accelerate — the seed cores carry host msgids while a fresh openaiToCore
  *  parse mints content-hash ids, so the id namespaces differ structurally
- *  (#7347). */
+ *  (#7345). */
 const runPinnedTurn = (
     session: Session,
     reqHeaders: Record<string, string>,
@@ -507,7 +507,7 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     assert.equal(out.decision, "unseeded");
 });
 
-test("pinned seed (host msgids) + tail-only growth HITS; in-place head edit still drifts (#7347)", () => {
+test("pinned seed (host msgids) + tail-only growth HITS; in-place head edit still drifts (#7345)", () => {
     makeStubStore();
     const session = freshSession("pf-pin");
     // turn 1: seed. pluginLaneServerHistory pins the seed cores to host msgids
