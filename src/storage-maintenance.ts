@@ -61,7 +61,7 @@ function indexDbSize(dir: string): number | undefined {
 // Decoded-bytes idiom (#2803): codec-decoded length of the session's files,
 // not raw stat size — framed (encrypted/zstd) files would otherwise report
 // framing overhead instead of content.
-async function sessionSizeBytes(store: SessionStore, id: string, meta: { protocol?: string; upstreamOrigin?: string }): Promise<number> {
+async function sessionSizeBytes(store: SessionStore, id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<number> {
     let total = 0;
     for (const rel of await store.findSessionFiles(id, meta)) {
         const abs = join(store.dir, rel);
@@ -84,26 +84,42 @@ function fail(text: string, json?: boolean, data?: Record<string, unknown>): Sto
 }
 
 async function runLs(store: SessionStore, json: boolean): Promise<StorageCommandResult> {
-    const loaded = await store.loadAll();
-    const dbRows = new Map<string, { status: string; updatedAt: number; label?: string }>();
-    for (const r of store.unifiedWebSummaries() ?? []) {
-        dbRows.set(r.sessionId, { status: r.status, updatedAt: r.updatedAt, label: r.label });
+    // #6795: metadata-only row source — one SQL over the sessions table
+    // (full mode: authoritative) plus a parse-and-drop legacy file walk.
+    // Never loadAll(): that materialized the whole corpus (every file parsed
+    // AND every full-mode index view rebuilt) into the heap — the 2.8 GiB
+    // OOM. The row-set follows webSummaryBaseline: full = DB ∪ files
+    // (ghost index rows are honest rows there: jsonWriter=off), shadow/legacy
+    // = files (JSON is the truth base; shadow index rows may lag).
+    const baseline = store.webSummaryBaseline();
+    const dbRows = new Map<string, { status: string; updatedAt: number; label?: string; protocol?: string; upstreamOrigin?: string }>();
+    if (baseline !== null) {
+        for (const r of store.unifiedWebSummaries() ?? []) {
+            dbRows.set(r.sessionId, { status: r.status, updatedAt: r.updatedAt, label: r.label, protocol: r.protocol, upstreamOrigin: r.origin });
+        }
     }
+    const fileRows = await store.enumerateLegacyMeta();
+    const ids = new Set<string>([...fileRows.keys()]);
+    if (baseline === "authoritative") for (const id of dbRows.keys()) ids.add(id);
     const rows: LsRow[] = [];
-    for (const [id, s] of loaded) {
+    for (const id of ids) {
         const d = dbRows.get(id);
-        let size = await sessionSizeBytes(store, id, s.meta);
+        const f = fileRows.get(id);
+        const meta = f ? { protocol: f.protocol, upstreamOrigin: f.upstreamOrigin } : d ? { protocol: d.protocol, upstreamOrigin: d.upstreamOrigin } : undefined;
+        let size = await sessionSizeBytes(store, id, meta);
         if (size === 0 && store.replicasAvailable()) {
-            // File-less row (deleted JSON, index-only survivor, #2960 R2.1):
+            // File-less row (jsonWriter=off, deleted JSON, index-only #2960 R2.1):
             // report the honest DB footprint instead of a misleading 0.
             const st = store.unifiedSessionStorageStats(id);
             if (st) size = st.inlineBytes + st.casExclusiveBytes;
         }
         rows.push({
             id,
-            label: s.meta.label ?? d?.label ?? "",
+            // Full mode: the index row is the load path, so its label wins
+            // (web parity); shadow/legacy: the file is the truth base.
+            label: baseline === "authoritative" ? d?.label ?? f?.label ?? "" : f?.label ?? d?.label ?? "",
             sizeBytes: size,
-            lastUpdated: Math.max(s.lastSeen, d?.updatedAt ?? 0),
+            lastUpdated: Math.max(f?.savedAt ?? 0, d?.updatedAt ?? 0),
             status: d?.status ?? "active",
         });
     }

@@ -60,9 +60,9 @@ const mkLegacy = (id: string, msgs: CoreMsg[], lastSeen: number, label?: string)
     id,
     createdAt: 1_000,
     lastSeen,
-    meta: { protocol: "openai" },
+    meta: { protocol: "openai", ...(label ? { label } : {}) },
     stats: {},
-    metadata: label ? { label } : {},
+    metadata: {},
     state: { blocks: [], nextBlockId: 1, nextRunId: 1, messageRefs: { byRaw: {}, byRef: {} } },
     blockContents: new Map(),
     lastMessages: msgs as unknown as LegacySessionLike["lastMessages"],
@@ -136,6 +136,79 @@ test("sessions ls: id/label/size/last-updated/status, sorted by recency", async 
         assert.equal(j[0].id, "s-new");
         assert.ok(j[0].sizeBytes > 0, "decoded bytes must be counted");
         assert.equal(j[0].status, "active");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("sessions ls: never materializes the corpus (loadAll-free, #6795)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maint-ls-noload-"));
+    try {
+        await seed(dir, [["ls-a", "a-label"], ["ls-b", "b-label"]]);
+        const orig = SessionStore.prototype.loadAll;
+        SessionStore.prototype.loadAll = (async () => {
+            throw new Error("loadAll must not be called by `sessions ls` (#6795)");
+        }) as typeof orig;
+        try {
+            const r = await runSessionsCommand({ sub: "ls", dir });
+            assert.equal(r.code, 0, r.text);
+            assert.match(r.text, /ls-a/);
+            assert.match(r.text, /ls-b/);
+            assert.match(r.text, /a-label/);
+        } finally {
+            SessionStore.prototype.loadAll = orig;
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("sessions ls: legacy files survive with no index rows (index.db removed)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maint-ls-nodb-"));
+    try {
+        await seed(dir, [["nodb-1", "file-only-label"]]);
+        for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(path.join(dir, "index.db" + suffix), { force: true });
+        const r = await runSessionsCommand({ sub: "ls", dir, json: true });
+        assert.equal(r.code, 0, r.text);
+        const j = JSON.parse(r.text) as Array<{ id: string; label: string; sizeBytes: number; status: string }>;
+        assert.equal(j.length, 1);
+        assert.equal(j[0].id, "nodb-1");
+        assert.equal(j[0].label, "file-only-label");
+        assert.ok(j[0].sizeBytes > 0, `file footprint must still be reported`);
+        assert.equal(j[0].status, "active");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("sessions ls: index-only rows (no legacy file) list with the DB footprint", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maint-ls-dbonly-"));
+    try {
+        seedDb(dir, [["dbonly-1", [mkMsg("m1", "index only ".repeat(80))], Date.now(), "db-only-label"]]);
+        const r = await runSessionsCommand({ sub: "ls", dir, json: true });
+        assert.equal(r.code, 0, r.text);
+        const j = JSON.parse(r.text) as Array<{ id: string; label: string; sizeBytes: number; status: string }>;
+        assert.equal(j.length, 1);
+        assert.equal(j[0].id, "dbonly-1");
+        assert.equal(j[0].label, "db-only-label");
+        assert.ok(j[0].sizeBytes > 0, `DB footprint (inlineBytes + casExclusiveBytes) must be reported, not 0`);
+        assert.equal(j[0].status, "active");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("sessions ls: a corrupt file is skipped, never quarantined (read-only lane)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "maint-ls-corrupt-"));
+    try {
+        await seed(dir, [["good-1", "still-here"]]);
+        const corruptPath = path.join(dir, "zz-corrupt.json");
+        fs.writeFileSync(corruptPath, "{not json");
+        const r = await runSessionsCommand({ sub: "ls", dir, json: true });
+        assert.equal(r.code, 0, r.text);
+        const j = JSON.parse(r.text) as Array<{ id: string }>;
+        assert.deepEqual(j.map((x) => x.id), ["good-1"]);
+        assert.ok(fs.existsSync(corruptPath), "ls must not rename/quarantine operator files");
     } finally {
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
