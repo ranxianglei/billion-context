@@ -282,3 +282,52 @@ test("openai: reasoning_content wins over reasoning alias (non-trigger)", () => 
     const reasoning = msgs.find((m) => m.contentType === "reasoning");
     assert.equal(reasoning?.reasoningContent, "from rc", "reasoning_content (first in chain) wins");
 });
+
+// 14. #7432 TRIGGER (tool replay path): a proxy-only tool frame that carries
+//     its thinking under the `reasoning` alias still delivers that prose to the
+//     client — normalized to reasoning_content — while the proxy call itself
+//     never rides along (#1881 withheld sibling prose).
+test("openai adapter: proxy-only tool frame delivers its alias reasoning prose", async () => {
+    const stream = mockStream(
+        sseChunk({ tool_calls: [{ index: 0, id: "call_p", type: "function", function: { name: "bili_compress", arguments: "{}" } }] }),
+        sseChunk({ reasoning: "sibling thought", tool_calls: [{ index: 1, id: "call_p2", type: "function", function: { name: "bili_compress", arguments: "{}" } }] }),
+        sseChunk({}, "tool_calls"),
+        `data: [DONE]\n\n`,
+    );
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) events.push(ev);
+
+    const out = events
+        .map((e) => (e as { raw?: Buffer; chunk?: Buffer }).raw ?? (e as { chunk?: Buffer }).chunk)
+        .filter((b): b is Buffer => b !== undefined)
+        .map((b) => b.toString("utf8"))
+        .join("");
+    assert.ok(out.includes("sibling thought"), `the withheld reasoning reaches the client, got: ${out}`);
+    assert.ok(out.includes('"reasoning_content":"sibling thought"'), `canonical field, got: ${out}`);
+    assert.ok(!out.includes('"reasoning":'), `alias key dropped, got: ${out}`);
+    assert.ok(!out.includes("bili_compress"), "the proxy call still never rides along");
+});
+
+// 15. #7432 TRIGGER (full alias table): the third alias `reasoning_text` is
+//     read like the others and rides out as reasoning_content.
+test("openai adapter: delta.reasoning_text is read and rewritten like the other aliases", async () => {
+    const stream = mockStream(
+        sseChunk({ reasoning_text: "third alias" }),
+        sseChunk({ content: "answer" }),
+        sseChunk({}, "stop"),
+        `data: [DONE]\n\n`,
+    );
+    const adapter = createOpenaiAdapter({ model: "gpt" });
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) events.push(ev);
+
+    const reasoning = events.find((e) => e.kind === "reasoning");
+    assert.ok(reasoning && reasoning.kind === "reasoning", "reasoning_text chunk streams as reasoning");
+    if (reasoning && reasoning.kind === "reasoning") {
+        assert.equal(reasoning.delta, "third alias");
+        const raw = reasoning.raw!.toString("utf8");
+        assert.ok(raw.includes('"reasoning_content":"third alias"'), `canonical field, got: ${raw}`);
+        assert.ok(!raw.includes('"reasoning_text":'), `alias key dropped, got: ${raw}`);
+    }
+});
