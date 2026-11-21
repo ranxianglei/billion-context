@@ -86,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, estimateRawBodyModelContext, MODEL_CONTEXT_KEYS, type PreflightDeps, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -3779,6 +3779,10 @@ export function buildWindowShrinkNote(args: {
 // callers keep the byte-floor fallback for them.
 interface MeasuredOutbound {
     tokens: number;
+    /** #7453: the model-context portion (protocol-specific) — the quantity the
+     *  egress fuse and measured-doom gates compare against the model window.
+     *  `tokens` (the total body) is kept for the byte-fallback paths and stats. */
+    modelContext: number;
     breakdown: RawBodyBreakdown;
 }
 
@@ -3786,11 +3790,26 @@ interface MeasuredOutbound {
 // of the body carries the mass, so "trim the oversized content" tells the
 // operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
 // mass is tools[], not a giant paste).
-export function measuredBreakdownClause(b: RawBodyBreakdown): string {
-    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+// #7453: the trigger is the MODEL CONTEXT (protocol-specific), not the total
+// body — side-channel host fields (dsh_session_log) and config fields do not
+// count. The clause names the top non-context contributor so the operator sees
+// WHY the total looked big (dsh_session_log~982,000) without it having blocked
+// the send.
+export function measuredBreakdownClause(b: RawBodyBreakdown, protocol?: WireProtocol): string {
+    const contextKeys = protocol ? MODEL_CONTEXT_KEYS[protocol] : MODEL_CONTEXT_KEYS.openai;
+    const contextParts: string[] = [];
+    for (const k of contextKeys) {
+        const v = b.perTopKey.find(([key]) => key === k)?.[1] ?? 0;
+        if (v > 0) contextParts.push(`${k} ~${v.toLocaleString("en-US")}`);
+    }
+    const contextPart = contextParts.length > 0 ? contextParts.join(" · ") : "model context ~0";
+    const nonContext = b.perTopKey.filter(([k]) => !contextKeys.includes(k) && k !== "");
+    const topNonContext = nonContext.slice(0, 3).map(([k, v]) => `${k}~${v.toLocaleString("en-US")}`).join(" ");
+    const otherPart = topNonContext ? `; non-context (NOT counted toward the window): ${topNonContext}` : "";
+    return `${contextPart}${otherPart}`;
 }
 
-export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown; protocol?: WireProtocol }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
@@ -3800,8 +3819,8 @@ export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?:
             return undefined;
         }
     }
-    const breakdown = estimateRawBodyBreakdown(parsed);
-    return { tokens: breakdown.total, breakdown };
+    const breakdown = estimateRawBodyBreakdown(parsed, prepared.protocol);
+    return { tokens: breakdown.total, modelContext: breakdown.modelContext, breakdown };
 }
 
 export async function preflightCompressIfNeeded(
@@ -4114,14 +4133,17 @@ export async function preflightCompressIfNeeded(
             ? session.metadata.effectiveContextLimit : 0;
         const probeMeasurement = declaredWindow > 0 && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD"
             ? measuredOutbound(prepared) : undefined;
+        // #7453: judge the MODEL CONTEXT (protocol-specific), not the total body —
+        // a side-channel host field (dsh_session_log) riding the wire must not
+        // false-block a probe whose real context fits the window.
         const probeBlockedByEgress = probeMeasurement !== undefined
-            && probeMeasurement.tokens > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+            && probeMeasurement.modelContext > Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — the estimate-only
             // bet is spent. Fall through to fold/fail-fast instead of re-forwarding.
             log("warn", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for evidence; falling through to fold/fail-fast (#3846)`);
         } else if (probeBlockedByEgress) {
-            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.tokens)} tokens); folding before forwarding instead of probing (#2313/#4079)`);
+            log("info", `[${session.id}] estimate-only probe would be refused by the local egress window fuse (~${Math.round(probeMeasurement!.modelContext)} model-context tokens); folding before forwarding instead of probing (#2313/#4079/#7453)`);
         } else {
             log("info", `[${session.id}] preflight trigger fired on estimate only (~${Math.round(textChannel)} text + ~${imageTokens} image vs window ${limit}); baseline ${session.stats.lastInputTokens} (${session.stats.lastInputTokensSource ?? "unprovenanced"}) carries no current-route upstream evidence — forwarding once to acquire usage/overflow evidence before compressing (#2313)`);
             return prepared;
@@ -4528,12 +4550,15 @@ export async function preflightCompressIfNeeded(
     // wire. Parse failure leaves both readings undefined — the byte-floor
     // fallbacks stay binding for those bodies.
     let outboundBudgetTokens: number | undefined;
-    let outboundRawTokens: number | undefined;
+    // #7453: the doom tiers judge the MODEL CONTEXT (protocol-specific), not the
+    // total body — a side-channel host field (dsh_session_log) riding the wire
+    // must not false-doom a rebuilt body whose real context fits the window.
+    let outboundModelContext: number | undefined;
     let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundBreakdown = estimateRawBodyBreakdown(outBody);
-        outboundRawTokens = outboundBreakdown.total;
+        outboundBreakdown = estimateRawBodyBreakdown(outBody, outbound.protocol);
+        outboundModelContext = outboundBreakdown.modelContext;
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
         if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
@@ -4564,12 +4589,14 @@ export async function preflightCompressIfNeeded(
         // the #496/#1800 billing-arbitration domain (forward, let upstream bill
         // or 400 for real evidence), not a doom — #857's screenshot turn pins
         // that. The #554 meter excludes image payloads (image_url/data/url/...),
-        // so `outboundRawTokens` is text-only by construction.
+        // and #7453 narrows the comparison to the MODEL CONTEXT (protocol-
+        // specific fields) — side-channel host fields and config fields do not
+        // count, so `outboundModelContext` is the model-readable mass only.
         const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+        if (outboundModelContext !== undefined && outboundModelContext > armMeasuredBar) {
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            const measuredDoomMessage = `rebuilt outbound MODEL CONTEXT measures ~${outboundModelContext.toLocaleString("en-US")} tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown, outbound.protocol) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the model context ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
@@ -4666,12 +4693,14 @@ export async function preflightCompressIfNeeded(
         // false-refuse a natively-fitting body), the headroom limit as
         // fallback. Measured tier first, byte floor below stays as the
         // fallback for unparseable bodies.
-        // Same text-only rule as the #1839 arm above: image-dominated overage
-        // belongs to the #496/#1800 billing arbitration, never to a local doom.
+        // Same model-context rule as the #1839 arm above (#7453): image-
+        // dominated overage belongs to the #496/#1800 billing arbitration, never
+        // to a local doom; side-channel host fields and config fields do not
+        // count toward the window.
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+        if (outboundModelContext !== undefined && outboundModelContext > gateMeasuredBar) {
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            const measuredDoomMessage = `outbound MODEL CONTEXT measures ~${outboundModelContext.toLocaleString("en-US")} tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown, outbound.protocol) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the model context ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };

@@ -164,7 +164,7 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound MODEL CONTEXT measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
@@ -201,7 +201,7 @@ test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte
         assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
+        assert.match(parsed.error?.message ?? "", /outbound MODEL CONTEXT measures ~[\d,]+ tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
         assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream
         // (before the measured tier it cleared the byte floor and rode forward
@@ -234,10 +234,44 @@ test("e2e #4543: a CJK body whose CORE TEXT alone measures over the floored fuse
         assert.equal(r.status, 413, `the CJK-measured body must stop at the fuse (got ${r.status}): ${body.slice(0, 300)}`);
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
         assert.equal(parsed.error?.retryable, false, "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound MODEL CONTEXT measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #7453: a body whose mass rides a side-channel host field (dsh_session_log) — model context under the window — is NOT stopped by the egress fuse (it forwards)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-7453a-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // #7453: a DSH session whose delivery window never advanced (delivery-
+        // accepted count 0) re-sent ~700 events of dsh_session_log on top of a
+        // small context. The egress fuse must judge the MODEL CONTEXT (protocol-
+        // specific), not the total body — a body whose context fits the window
+        // but whose side-channel field is huge must FORWARD (the upstream LLM
+        // ignores the side-channel field). No `model` in the body → preflight
+        // skipped → the relay fuse is the last line. The dsh_session_log mass
+        // (~1.1M tokens) dwarfs the context (~50 tokens), so the OLD total-body
+        // meter would false-block (the incident's permanent self-deadlock); the
+        // NEW model-context meter must forward.
+        // The events' bulk rides a `content` key (NOT in NON_TEXT_BODY_KEYS —
+        // the real dsh_session_log carries text, not base64), so the mass is
+        // counted by the meter.
+        const dshLog = { version: 1, session: "s-1", afterSeq: 0, throughSeq: 700, events: Array.from({ length: 700 }, (_, i) => ({ seq: i, content: "e".repeat(6_000) })) };
+        const messages = [{ role: "user", content: "hello world" }];
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({ stream: true, messages, dsh_session_log: dshLog }),
+        });
+        const status = r.status;
+        await r.text();
+        assert.equal(status, 200, `the side-channel-mass body must forward (got ${status}) — the fuse judges the model context, not the total body (#7453)`);
+        assert.equal(calls.length, 1, "the upstream saw the request (no permanent self-deadlock)");
     } finally {
         await close();
         rmrf(root);

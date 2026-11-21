@@ -1,5 +1,5 @@
 import type { WireProtocol } from "../util.js";
-import { estimateRawBodyTokens } from "../preflight.js";
+import { estimateRawBodyModelContext } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
@@ -1006,8 +1006,10 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
 
 /** #554: side requests are forwarded VERBATIM (no pipeline, #388), so a payload
  *  over the upstream window is a guaranteed 400 that preflight can never fix
- *  from this path. Block here instead of forwarding: estimate the RAW body
- *  (CJK-aware text + image tokens) against the effective window — the declared
+ *  from this path. Block here instead of forwarding: estimate the MODEL CONTEXT
+ *  (protocol-specific fields, CJK-aware — #7453: side-channel host fields like
+ *  dsh_session_log do not count toward the window) + image tokens against the
+ *  effective window — the declared
  *  modelContextLimit (#987: no learned window exists anymore) minus the output
  *  reservation on routes that carry one (#4205: decided by the caller via
  *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
@@ -1044,6 +1046,9 @@ export function sideRequestGuard(
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
-    const estimate = estimateRawBodyTokens(parsed) + imageMass;
+    // #7453: judge the MODEL CONTEXT (protocol-specific), not the total body —
+    // a side-channel host field (dsh_session_log) riding a side request must not
+    // hard-deny a payload whose real context fits the window.
+    const estimate = estimateRawBodyModelContext(parsed, protocol) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };
 }

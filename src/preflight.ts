@@ -27,7 +27,7 @@ import { epochConfirmPending } from "./fold-reconcile.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
-import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
+import { applyEstimateCalibration, currentCalibrationFactor, type WireProtocol } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { isCodexClient } from "./codex-compact.js";
@@ -485,53 +485,109 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     return tokens;
 }
 
+// #7453: the top-level fields that carry MODEL CONTEXT per wire protocol — the
+// fields the model actually reads. Side-channel host fields (dsh_session_log,
+// dsh_plugin_packages, ...) and config fields (model, stream, max_tokens, ...)
+// are NOT model context: they ride the wire but the model never reads them, so
+// counting them toward the model window false-positives the egress fuse and the
+// measured-doom gates. The canonical failure: a DSH session whose delivery
+// window never advanced (delivery-accepted count 0) re-sent ~700 events ≈ 982K
+// tokens of dsh_session_log on top of a 240K context; the fuse's total-body
+// meter read 1.22M > the 1M window and 413'd every turn, the upstream never
+// saw the body, the window never advanced — a permanent self-deadlock. The
+// context keys per protocol mirror estimateWireOverhead (budget.ts): the system
+// prompt may sit in a top-level field (system/instructions/systemInstruction)
+// AND/OR in role=system/developer items inside the message array (already
+// counted in the messages/input bucket).
+export const MODEL_CONTEXT_KEYS: Record<WireProtocol, readonly string[]> = {
+    openai: ["messages", "tools", "system"],
+    anthropic: ["messages", "tools", "system"],
+    responses: ["input", "tools", "instructions"],
+    google: ["contents", "tools", "systemInstruction"],
+};
+
 /** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
  *  must say whether it is messages[] (a giant paste / tool result), tools[]
  *  (84 schemas in #5000), the system prompt, or structural other — "trim the
  *  oversized content" is actively misleading for a 55.2 MiB body whose
  *  messages[] is only 1.44 MiB. Same walk + same exclusions as
  *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
- *  equals estimateRawBodyTokens(parsed) exactly. */
+ *  equals estimateRawBodyTokens(parsed) exactly.
+ *  #7453: `modelContext` is the sum of the protocol's context keys — the
+ *  quantity the window-comparison gates judge against the model window.
+ *  `other` (side-channel + config fields) does NOT count toward it. */
 export interface RawBodyBreakdown {
     total: number;
     messages: number;
     tools: number;
     system: number;
     other: number;
+    /** #7453: model-context token mass for the given protocol (sum of the
+     *  protocol's context keys). The egress fuse and measured-doom gates
+     *  compare THIS against the window, not `total`. */
+    modelContext: number;
+    /** #7453: per-TOP-LEVEL-key token attribution (descending), so a doom
+     *  message can name the field carrying the mass (dsh_session_log~982,000)
+     *  instead of just "other". */
+    perTopKey: [string, number][];
 }
 
-export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
-    const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
-    if (parsed && typeof parsed === "object") {
+export function estimateRawBodyBreakdown(parsed: unknown, protocol?: WireProtocol): RawBodyBreakdown {
+    const perTopKey = new Map<string, number>();
+    const pending: [unknown, string | undefined, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            pending.push([v, k, k]);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
+        pending.push([parsed, undefined, undefined]);
     }
     while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
+        const [value, key, top] = pending.pop()!;
         if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) {
+                const tokens = defaultCountTokens(value);
+                const t = top ?? "";
+                perTopKey.set(t, (perTopKey.get(t) ?? 0) + tokens);
+            }
             continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
+            for (const item of value) pending.push([item, key, top]);
             continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, top]);
         }
     }
+    const count = (k: string): number => perTopKey.get(k) ?? 0;
+    const messages = count("messages");
+    const tools = count("tools");
+    const system = count("system");
+    let total = 0;
+    for (const v of perTopKey.values()) total += v;
+    const other = total - messages - tools - system;
+    const contextKeys = protocol ? MODEL_CONTEXT_KEYS[protocol] : MODEL_CONTEXT_KEYS.openai;
+    let modelContext = 0;
+    for (const k of contextKeys) modelContext += count(k);
+    const perTopKeySorted = [...perTopKey.entries()].sort((a, b) => b[1] - a[1]);
     return {
-        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
-        messages: buckets[0],
-        tools: buckets[1],
-        system: buckets[2],
-        other: buckets[3],
+        total,
+        messages,
+        tools,
+        system,
+        other,
+        modelContext,
+        perTopKey: perTopKeySorted,
     };
+}
+
+/** #7453: the model-context portion of a raw body for the given protocol — the
+ *  quantity the window-comparison gates (egress fuse, measured-doom, side-request
+ *  guard) judge against the model window. Side-channel host fields and config
+ *  fields do not count. */
+export function estimateRawBodyModelContext(parsed: unknown, protocol: WireProtocol): number {
+    return estimateRawBodyBreakdown(parsed, protocol).modelContext;
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts

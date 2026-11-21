@@ -1037,10 +1037,17 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 return;
             }
             const fuseMeasured = measuredOutbound(prepared);
-            const fuseRawTokens = fuseMeasured?.tokens;
-            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+            // #7453: the fuse judges the MODEL CONTEXT (protocol-specific), not
+            // the total body — a side-channel host field (dsh_session_log) riding
+            // the wire must not false-block a body whose real context fits the
+            // window. The fuse's own #4079 contract is "never block what a
+            // largest-common-window upstream might accept", and a 1M upstream
+            // accepts a 240K-context body regardless of a 982K side-channel
+            // field, so counting it violated that contract.
+            const fuseModelContext = fuseMeasured?.modelContext;
+            if (fuseMeasured !== undefined && fuseModelContext !== undefined && fuseModelContext > fuseWindow) {
                 log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                const fuseMessage = `outbound MODEL CONTEXT measures ~${fuseModelContext.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown, prepared.protocol)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the model context ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068/#7453). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
                 else {

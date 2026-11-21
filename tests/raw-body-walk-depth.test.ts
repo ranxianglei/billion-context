@@ -81,6 +81,12 @@ test("shallow plumbing: exclusion set, key inheritance and bucket split stay int
 
 test("non-object top-level bodies land whole in the other bucket", () => {
     const bd = estimateRawBodyBreakdown("plain string body");
-    assert.deepEqual(bd, { total: t("plain string body"), messages: 0, tools: 0, system: 0, other: t("plain string body") });
+    assert.equal(bd.total, t("plain string body"));
+    assert.equal(bd.messages, 0);
+    assert.equal(bd.tools, 0);
+    assert.equal(bd.system, 0);
+    assert.equal(bd.other, t("plain string body"));
+    assert.equal(bd.modelContext, 0, "a bare string has no protocol context keys");
+    assert.deepEqual(bd.perTopKey, [["", t("plain string body")]]);
     assert.equal(estimateRawBodyTokens("plain string body"), t("plain string body"));
 });

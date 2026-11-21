@@ -7,7 +7,7 @@ import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, 
 import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown, estimateRawBodyModelContext } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -618,6 +618,62 @@ test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5
     assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
 });
 
+test("estimateRawBodyBreakdown: modelContext excludes side-channel host fields per protocol (#7453)", () => {
+    // The #7453 scenario: a DSH session whose delivery window never advanced
+    // re-sent ~700 events of dsh_session_log on top of a small context. The
+    // model context must exclude dsh_session_log (and other side-channel/config
+    // fields) so the egress fuse does not false-block a body whose real context
+    // fits the window.
+    // The events' bulk rides a `content` key (NOT in NON_TEXT_BODY_KEYS — the
+    // real dsh_session_log carries text, not base64), so the mass is counted.
+    const dshLog = { version: 1, session: "s-1", afterSeq: 0, throughSeq: 700, events: Array.from({ length: 700 }, (_, i) => ({ seq: i, content: "e".repeat(6_000) })) };
+    const body = {
+        model: "deepseek-flash",
+        max_tokens: 100,
+        stream: true,
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+        dsh_session_log: dshLog,
+    };
+    const b = estimateRawBodyBreakdown(body, "openai");
+    // The model context is just the messages (openai context keys: messages, tools, system).
+    assert.ok(b.modelContext < b.total / 2, "modelContext is far smaller than the total (dsh_session_log dominates)");
+    assert.ok(b.other > b.modelContext, "the dsh_session_log mass lands in other, not in the model context");
+    assert.equal(b.total, estimateRawBodyTokens(body), "total invariant holds (same walk, same exclusions)");
+    // The perTopKey names the dsh_session_log as the top contributor.
+    assert.equal(b.perTopKey[0][0], "dsh_session_log", "the top contributor is dsh_session_log");
+    // The model context for a body WITHOUT the side-channel field is the same.
+    const cleanBody = { model: "deepseek-flash", max_tokens: 100, stream: true, messages: [{ role: "user", content: "m".repeat(1_000) }] };
+    const clean = estimateRawBodyBreakdown(cleanBody, "openai");
+    assert.equal(b.modelContext, clean.modelContext, "the side-channel field does not change the model context");
+});
+
+test("estimateRawBodyModelContext: protocol-specific context keys (#7453)", () => {
+    // responses lane: the context is input + tools + instructions (NOT messages).
+    const responsesBody = {
+        model: "gpt-4",
+        instructions: "sys".repeat(500),
+        input: [{ role: "user", content: "in".repeat(1_000) }],
+        tools: [{ type: "function", function: { name: "t", description: "d".repeat(2_000) } }],
+        dsh_session_log: { events: Array.from({ length: 100 }, (_, i) => ({ seq: i, content: "e".repeat(6_000) })) },
+    };
+    const mc = estimateRawBodyModelContext(responsesBody, "responses");
+    const withoutLog = { model: "gpt-4", instructions: "sys".repeat(500), input: [{ role: "user", content: "in".repeat(1_000) }], tools: [{ type: "function", function: { name: "t", description: "d".repeat(2_000) } }] };
+    assert.equal(mc, estimateRawBodyModelContext(withoutLog, "responses"), "dsh_session_log does not count toward the responses model context");
+    assert.ok(mc >= defaultCountTokens("in".repeat(1_000)), "input is counted");
+    assert.ok(mc >= defaultCountTokens("sys".repeat(500)), "instructions is counted");
+    // google lane: the context is contents + tools + systemInstruction.
+    const googleBody = {
+        model: "gemini",
+        systemInstruction: { parts: [{ text: "sys".repeat(500) }] },
+        contents: [{ role: "user", parts: [{ text: "in".repeat(1_000) }] }],
+        dsh_session_log: { events: Array.from({ length: 100 }, (_, i) => ({ seq: i, content: "e".repeat(6_000) })) },
+    };
+    const gmc = estimateRawBodyModelContext(googleBody, "google");
+    const gWithoutLog = { model: "gemini", systemInstruction: { parts: [{ text: "sys".repeat(500) }] }, contents: [{ role: "user", parts: [{ text: "in".repeat(1_000) }] }] };
+    assert.equal(gmc, estimateRawBodyModelContext(gWithoutLog, "google"), "dsh_session_log does not count toward the google model context");
+    assert.ok(gmc >= defaultCountTokens("in".repeat(1_000)), "contents is counted");
+});
+
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {
     const llama = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)" } });
     const hit = inspectContextOverflow(400, llama);
@@ -635,7 +691,9 @@ test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) wi
 test("sideRequestGuard: raw-body fit against declared ∩ armed window minus output headroom (#554)", () => {
     const txt = "z".repeat(8000);
     const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
-    const est = estimateRawBodyTokens(body);
+    // #7453: the guard judges the MODEL CONTEXT (protocol-specific), not the
+    // total body — the expected estimate below mirrors the guard's own meter.
+    const est = estimateRawBodyModelContext(body, "anthropic");
     assert.ok(est > 0);
     assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1).blocked, false, "fits");
@@ -647,7 +705,7 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     // reserved. #4205: the reservation policy is passed from the call site —
     // these rows pin the reserving direction explicitly.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
-    const oaEst = estimateRawBodyTokens(oa);
+    const oaEst = estimateRawBodyModelContext(oa, "openai");
     const oaLimit = Math.floor(oaEst / 1.15);
     const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1, 0, undefined, true);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
@@ -666,13 +724,13 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
         { type: "text", text: "z".repeat(4000) },
         { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
     ] }] };
-    const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
+    const imgEst = estimateRawBodyModelContext(imgBody, "anthropic") + Math.ceil(8000 / 4);
     assert.equal(sideRequestGuard(imgBody, "anthropic", Math.floor(imgEst / 1.15), undefined, undefined, 1).blocked, true, "image cost included at boundary");
     // CJK estimator bias: defaultCountTokens counts CJK per-char (~1.6x real),
     // so a CJK-heavy payload estimated at ~110% of the window must forward —
     // the upstream's real overflow 400 arms the evidence that blocks re-sends.
     const cjkBody = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "汉".repeat(4000) }] };
-    const cjkEst = estimateRawBodyTokens(cjkBody);
+    const cjkEst = estimateRawBodyModelContext(cjkBody, "anthropic");
     assert.ok(cjkEst >= 4000, "CJK counted per-char");
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.10), undefined, undefined, 1).blocked, false, "CJK over-estimation absorbed by tolerance");
     assert.equal(sideRequestGuard(cjkBody, "anthropic", Math.floor(cjkEst / 1.20), undefined, undefined, 1).blocked, true, "genuinely oversized CJK still blocks");
