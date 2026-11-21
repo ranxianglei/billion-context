@@ -349,11 +349,18 @@ test("nudge: compress resets baseline, preventing feedback loop", () => {
   );
 
   const turn = core.processTurn({ messages, state, config, tokenCount: 30000 });
+  // #6720: the fold above was PARTIAL (3 of 10 messages ≈ 30% of the offer),
+  // so the one-shot re-inject re-offers T1 on this request even at 30% usage —
+  // the remainder drains instead of waiting for a full growth floor. (Before
+  // #6720 this asserted `shouldInject === false`; the re-inject is the intended
+  // behavior change that kills the ratchet.) The baseline still re-establishes
+  // at the new (lower) token count — the §5.7 reset is unchanged.
   assert.equal(
     turn.nudge.shouldInject,
-    false,
-    "30% < 45% threshold → no nudge",
+    true,
+    "partial fold re-injects T1 at low usage (#6720)",
   );
+  assert.match(turn.nudge.reason, /partial-fold re-inject/);
   assert.equal(
     turn.state.nudge.lastPerMessageNudgeTokens,
     30000,
@@ -390,7 +397,15 @@ test("nudge: full growth cycle — baseline → growth → nudge → compress �
   assert.equal(state.nudge.lastPerMessageNudgeTokens, 0);
 
   turn = core.processTurn({ messages, state, config, tokenCount: 30000 });
-  assert.equal(turn.nudge.shouldInject, false, "30% < 45%");
+  // #6720: the fold above was PARTIAL (5 of 20 messages ≈ 25% of the offer), so
+  // the one-shot re-inject re-offers T1 at 30% usage instead of the old
+  // "wait for a full growth floor" silence. The baseline still re-establishes.
+  assert.equal(
+    turn.nudge.shouldInject,
+    true,
+    "partial fold re-injects T1 at low usage (#6720)",
+  );
+  assert.match(turn.nudge.reason, /partial-fold re-inject/);
   assert.equal(
     turn.state.nudge.lastPerMessageNudgeTokens,
     30000,
@@ -1753,9 +1768,16 @@ test("nudge: first-sight bypass falls silent once usage drops below the band (#1
     config,
     tokenCount: 20000,
   });
+  // #6720: the drain fold above was PARTIAL (5 of 20 messages ≈ 25% of the
+  // offer), so the one-shot re-inject re-offers T1 at 20% usage. The #194
+  // first-sight bypass itself stays SILENT below the band — the nudge that
+  // fires here is the re-inject, NOT the bypass (assert the reason to keep the
+  // two mechanisms apart).
   assert.equal(
     turn2.nudge.shouldInject,
-    false,
-    "20% < 45% band → drain complete, pacing resumes",
+    true,
+    "partial fold re-injects T1 at low usage (#6720)",
   );
+  assert.match(turn2.nudge.reason, /partial-fold re-inject/);
+  assert.doesNotMatch(turn2.nudge.reason, /\[first-sight mass\]/, "the #194 bypass stays silent below the band");
 });
