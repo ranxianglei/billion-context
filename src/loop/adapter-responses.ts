@@ -710,7 +710,15 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     yield* settleNamelessDiag();
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
-                    yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                    const rawError = (obj.response as Record<string, unknown> | undefined)?.error ?? obj.error;
+                    const error = rawError && typeof rawError === "object" ? rawError as Record<string, unknown> : undefined;
+                    yield {
+                        kind: "done", finishReason: "failed",
+                        upstreamError: error ? {
+                            code: typeof error.code === "string" ? error.code : undefined,
+                            message: typeof error.message === "string" ? error.message : undefined,
+                        } : undefined,
+                    } as ParsedStreamEvent;
                 } else if (type.startsWith("response.reasoning")) {
                     // #1881: reasoning prose (summaries) streams through its own
                     // per-summary filter instead of the raw passthrough this

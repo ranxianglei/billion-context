@@ -46,7 +46,8 @@ import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../k
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
 import { log as loggerLog } from "../logger.js";
-import { promptInputTotal, type WireProtocol } from "../util.js";
+import { classifyStructuredOverflow, promptInputTotal, type WireProtocol } from "../util.js";
+import { armSessionOverflow } from "../overflow-arm.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithAnnouncement, endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
@@ -369,7 +370,7 @@ export type ParsedStreamEvent =
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
     // client's view.
-    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean; terminalExtra?: Record<string, unknown> }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean; terminalExtra?: Record<string, unknown>; upstreamError?: { code?: string; message?: string } }
     | { kind: "error"; message: string }
 | { kind: "diag"; level: "info" | "warn"; message: string }
     // #1455: stateless marks an inert keep-alive frame (anthropic ping) whose
@@ -575,6 +576,11 @@ export async function* runCompressLoop(
     // client can see.
     let continuationRetried = false;
     let degenerateRetried = false;
+    // #4950: an explicit structured context-overflow error riding a 200 stream
+    // arms the same emergency-shrink evidence as the relay paths, so the next
+    // turn's preflight compresses instead of re-probing with the same doomed
+    // bytes (#2313 probe loop). One-shot per request; never re-fetches here.
+    let overflowArmedHere = false;
     // #1029: a retry storm re-executes the same failing proxy call every round;
     // re-streaming the identical status marker each time only accumulates noise
     // in client-stored history (incoming-history stripping removes it next turn,
@@ -965,6 +971,24 @@ export async function* runCompressLoop(
                 // sign thinking, so it can keep round-2 thinking off the wire until
                 // the signature makes it valid (see ParseStreamOpts).
                 const parseOpts: ParseStreamOpts = { upstreamSignsThinking: historyHasSignedThinking || sawSignedThinkingThisTurn };
+                // Observe structured failure evidence without changing terminal
+                // frame forwarding, streamError, or the retry decisions below.
+                const noteOverflow = (fields: { code?: string; message?: string }): void => {
+                    const oinfo = classifyStructuredOverflow(fields);
+                    if (!oinfo.isOverflow || overflowArmedHere) return;
+                    overflowArmedHere = true;
+                    const sentFull = lastForwardedBody(ctx.session)?.full;
+                    try {
+                        armSessionOverflow(
+                            ctx.session, oinfo, requestOptions.url,
+                            sentFull === undefined || sentFull === null ? undefined : typeof sentFull === "string" ? sentFull : sentFull.toString("utf8"),
+                            loggerLog,
+                        );
+                    } catch {
+                        // Evidence persistence must not break the error path.
+                    }
+                    ctx.log(`[acp-loop] round ${round}: in-band context overflow classified — armed emergency shrink (#4950)`);
+                };
                 for await (const ev of adapter.parseStream(currentUpstream, round, parseOpts)) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
@@ -1035,6 +1059,7 @@ export async function* runCompressLoop(
                             cacheCreation: ev.cacheCreation,
                         };
                     } else if (ev.kind === "done") {
+                        if (ev.upstreamError) noteOverflow(ev.upstreamError);
                         sawDone = true;
                         finishReason = ev.finishReason;
                         suppressCompletion = ev.suppressCompletion === true;
@@ -1048,6 +1073,16 @@ export async function* runCompressLoop(
                         // Preserve it as an error path; never let the absence of
                         // choices fall through to a synthetic successful stop.
                     streamError = ev.message;
+                        // #4950: classify BEFORE anything else touches the
+                        // message — an explicit structured context-overflow
+                        // error is real evidence even though it rode a 200
+                        // stream; arm the shared emergency-shrink baseline so
+                        // the next turn's preflight compresses instead of
+                        // re-probing with the same over-limit bytes (#2313).
+                        // Generic failures stay un-armed (#570 discipline);
+                        // no re-fetch here — the zero-side-effect retry path
+                        // below is untouched.
+                        noteOverflow({ message: ev.message });
                 } else if (ev.kind === "diag") {
                     ctx.log(ev.message);
                     if (ev.level === "warn") loggerLog("warn", `[${ctx.session.id}] ${ev.message}`);
