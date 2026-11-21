@@ -130,6 +130,32 @@ test("json pipe: non-stream tool_calls land in the witness ring", async () => {
     assert.deepEqual([...lookupToolWitness("compress", COMPRESS_ARGS)], ["w-json"]);
 });
 
+test("chat pipe: non-plugin lane (session=undefined) ring-records via witnessSessionId (#6433)", async () => {
+    resetToolRingForTest();
+    const events = [
+        chatChunk({ role: "assistant" }),
+        chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "compress", arguments: '{"startId":"m00001",' } }] }),
+        chatChunk({ tool_calls: [{ index: 0, function: { arguments: '"endId":"m00009","summary":"witness lane test"}' } }] }),
+        chatChunk({}, { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+        DONE,
+    ];
+    // session omitted (non-plugin lane, usage accounting stays off); the
+    // witnessSessionId is the trailing param — the ring must record under it.
+    await pipePluginChatWithStrip(streamOf(events), makeRes([]), "openai", undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "w-np");
+    assert.deepEqual([...lookupToolWitness("compress", COMPRESS_ARGS)], ["w-np"]);
+});
+
+test("json pipe: non-plugin lane (session=undefined) ring-records via witnessSessionId (#6433)", async () => {
+    resetToolRingForTest();
+    const body = JSON.stringify({
+        id: "chatcmpl-x", object: "chat.completion", created: 1, model: "qwen",
+        choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "compress", arguments: COMPRESS_ARGS } }] }, finish_reason: "tool_calls" }],
+    });
+    // session omitted; witnessSessionId is the trailing param on pipePluginJson.
+    await pipePluginJson(streamOf([body]), makeRes([]), undefined, "openai", undefined, undefined, undefined, undefined, "w-np-json");
+    assert.deepEqual([...lookupToolWitness("compress", COMPRESS_ARGS)], ["w-np-json"]);
+});
+
 test("nameless tool call never becomes a witness (#1484 class)", async () => {
     resetToolRingForTest();
     const events = [

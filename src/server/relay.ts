@@ -2565,6 +2565,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    prepared.session?.id,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -2594,6 +2595,11 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // the main conversation (see pipePluginChatWithStrip docs).
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
+            // #6433: pass the session id (not the full session) so the pipe can
+            // ring-record outbound tool calls for the unbound shim's witness
+            // route, while keeping usage accounting off (the full session would
+            // turn it on and clobber lastInputTokens for title-gen / side calls).
+            const witnessSid = p.session?.id;
             if (p.protocol === "responses") {
                 await pipePluginResponsesWithStrip(
                     responseBody,
@@ -2618,6 +2624,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     upstreamMeta,
                     reply,
                     hostOwnsTruncationRecovery,
+                    witnessSid,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -2646,6 +2653,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     reply,
                     opts.streamErrorShape,
                     hostOwnsTruncationRecovery,
+                    witnessSid,
                 );
             }
         } else if (
@@ -2657,7 +2665,10 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
+            // #6433: pass the session id (not the full session) so the pipe can
+            // ring-record outbound tool calls for the unbound shim's witness
+            // route, mirroring the SSE branch above.
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol, undefined, undefined, undefined, reply, prepared.session?.id);
         } else {
             await pipeThrough(responseBody, res);
         }

@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "./proxy-tool-result.js";
 import type { ToolOutcomeKind } from "./proxy-tool-result.js";
+import { stripSessPrefix } from "./session-id.js";
 
 const VERSION = (() => {
     try {
@@ -89,7 +90,11 @@ const TOOL_TIMEOUT_MS = 60_000;
 // compress-call HTTP wait — covers the non-budgeted work around the batch outside the
 // totalTimeoutMs clock (same rationale as src/agent/shared.ts).
 const TOOL_TIMEOUT_OVERHEAD_MARGIN_MS = 30_000;
-const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
+// #6433: zcode's bootstrap-hook injects CLAUDE_CODE_SESSION_ID with a `sess_`
+// prefix (sess_<uuid>), but the proxy's plugin routing keys sessions by the
+// bare uuid (the model request header carries the bare form). Strip the prefix
+// so the shim's default binding matches the session the proxy created.
+const CONVERSATION_FROM_ENV = stripSessPrefix(process.env.CLAUDE_CODE_SESSION_ID) || stripSessPrefix(process.env.BILI_CONVERSATION_ID) || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // #656: hosts that resume a session (claude --resume forks a NEW session id)
 // do so after MCP children were spawned — the env-captured id goes stale and
