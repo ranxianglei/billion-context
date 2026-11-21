@@ -3472,6 +3472,17 @@ async function handleRequest(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
+                        // #7376: this is the only egress decision point for the
+                        // main payload. preflightCompressIfNeeded (above) runs
+                        // to completion BEFORE forward() is ever reached (below,
+                        // only when this branch is NOT taken) — it is a local
+                        // token-estimate + fold computation with no upstream I/O
+                        // for the MAIN body, so a fail-fast verdict means the
+                        // main payload was never sent upstream. The only egress
+                        // during preflight is the separate, smaller
+                        // summarization call (external summary chain) — a
+                        // different request, not the fail-fasted payload. The
+                        // "NOT forwarded" wording is therefore always true.
                         if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
