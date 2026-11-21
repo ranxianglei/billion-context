@@ -916,7 +916,12 @@ export class UnifiedShadow {
     }
 
     /** Organic import (full mode): ingest a legacy record the index has not
-     *  seen so future loads serve from the unified store. Never throws. */
+     *  seen so future loads serve from the unified store. The envelope is a
+     *  PRUNED render (possibly from another writer): the index's stored block
+     *  lineage and lifetime stats stay authoritative (ingestSession's
+     *  envelopeImport contract, 2026-11-21 / #7156) — the envelope contributes
+     *  its new messages, and its block structure only when the index has none
+     *  for the session. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
         if (this.sync === null) return null;
         try {
@@ -927,7 +932,7 @@ export class UnifiedShadow {
             // viewFor rebuild; callers fall back to the envelope itself.
             // #4216/#4242: orphan shape is representable (journal rides the
             // plan) — import normally instead of rejecting.
-            this.sync.ingestSession(planIngest(legacy));
+            this.sync.ingestSession(planIngest(legacy), undefined, { envelopeImport: true });
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
             return legacy;
@@ -1438,7 +1443,9 @@ export class UnifiedShadow {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
                 // #4216/#4242: orphan shape rides the plan journal — import normally.
-                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
+                // envelopeImport: stored block lineage + stats stay authoritative
+                // (see the sync twin's contract, 2026-11-21 / #7156).
+                await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy), undefined, { envelopeImport: true }));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
                 return legacy;
