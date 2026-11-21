@@ -9,6 +9,19 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ext-autofold-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 /** Anthropomorphic main upstream: records request bodies, answers SSE ok. */
 function startMainUpstream(): Promise<{ server: http.Server; url: string; bodies: unknown[] }> {
@@ -57,12 +70,16 @@ function startSummaryUpstream(mode: "ok" | "fail"): Promise<{ server: http.Serve
     });
 }
 
-function bigConversation(pairs = 12): unknown[] {
+// #5738: scenarios share ONE process-wide prefix-affinity resolver, so
+// byte-identical transcripts under different session ids read as fork shapes
+// and inherit each other's fold state. Each scenario tags its acks (tiny
+// cells, so the token budgets these fixtures pin stay put).
+function bigConversation(pairs = 12, tag = ""): unknown[] {
     const filler = "0123456789abcdef".repeat(280); // ~4.5KB ≈ 1.1K tokens per message
     const messages: unknown[] = [];
     for (let i = 0; i < pairs; i++) {
         messages.push({ role: "user", content: [{ type: "text", text: `doc chunk ${i}: ${filler}` }] });
-        messages.push({ role: "assistant", content: [{ type: "text", text: `ack ${i}` }] });
+        messages.push({ role: "assistant", content: [{ type: "text", text: tag ? `ack ${i} [${tag}]` : `ack ${i}` }] });
     }
     messages.push({ role: "user", content: [{ type: "text", text: "final question" }] });
     return messages;
@@ -74,7 +91,7 @@ function bigConversation(pairs = 12): unknown[] {
 // window, and reads as fallback-derived — where the #282 floor lifts any
 // reserved sub-100K window to 100K and dilutes the pressure bands these tests
 // exercise (#4205).
-async function postTurn(port: number, upstreamUrl: string, session: string, pairs = 12): Promise<{ status: number; body: string }> {
+async function postTurn(port: number, upstreamUrl: string, session: string, pairs = 12, tag = ""): Promise<{ status: number; body: string }> {
     const res = await fetch(`http://127.0.0.1:${port}/bili/${upstreamUrl}/v1/messages`, {
         method: "POST",
         headers: {
@@ -83,7 +100,7 @@ async function postTurn(port: number, upstreamUrl: string, session: string, pair
             "anthropic-version": "2023-06-01",
             "x-acp-session": session,
         },
-        body: JSON.stringify({ model: "test-model", max_tokens: 1024, stream: true, messages: bigConversation(pairs) }),
+        body: JSON.stringify({ model: "test-model", max_tokens: 1024, stream: true, messages: bigConversation(pairs, tag) }),
     });
     const body = await res.text();
     return { status: res.status, body };
@@ -166,7 +183,7 @@ test("auto-fold fires below the window via the external chain, and the model see
     // bypasses the growth gate — the control arm in the "auto-fold off" test
     // proves a nudge WOULD fire here without auto-fold. The 8192 growth floor
     // owns the cadence instead.
-    const turn = await postTurn(port, main.url, "autofold-1", 36);
+    const turn = await postTurn(port, main.url, "autofold-1", 36, "af1");
     assert.equal(turn.status, 200);
 
     // The external chain did the folding (zero model involvement).
@@ -226,7 +243,7 @@ test("auto-fold off: no growth fold below the window (growthArmed only when enga
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const turn = await postTurn(port, main.url, "autofold-off");
+    const turn = await postTurn(port, main.url, "autofold-off", 12, "off");
     assert.equal(turn.status, 200);
     assert.equal(sum.bodies.length, 0, "external chain must not fold when autoFold is off and the payload fits the window");
     const forwarded = main.bodies.at(-1) as { messages?: unknown[] };
@@ -240,10 +257,10 @@ test("auto-fold off: no growth fold below the window (growthArmed only when enga
     // where the classic cadence MUST
     // inject "Context breakdown:". That proves the first test's absence
     // assertion targets a live, firing cadence — not an always-idle one.
-    const warm = await postTurn(port, main.url, "autofold-off-pressure", 36);
+    const warm = await postTurn(port, main.url, "autofold-off-pressure", 36, "opress");
     assert.equal(warm.status, 200);
     assert.equal(sum.bodies.length, 0, "external chain stays idle below the window even in the pressure band");
-    const pressure = await postTurn(port, main.url, "autofold-off-pressure", 36);
+    const pressure = await postTurn(port, main.url, "autofold-off-pressure", 36, "opress");
     assert.equal(pressure.status, 200);
     assert.equal(sum.bodies.length, 0, "classic nudges never call the external chain");
     const pressured = JSON.stringify(main.bodies.at(-1));
@@ -286,7 +303,7 @@ test("auto-fold fail-open: broken chain forwards the request instead of failing 
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const turn = await postTurn(port, main.url, "autofold-fail");
+    const turn = await postTurn(port, main.url, "autofold-fail", 12, "fail");
     assert.equal(turn.status, 200, "growth-fold failure must forward (fail-open), not fail the request");
     assert.ok(main.bodies.length >= 1, "payload reached the main upstream");
     const text = JSON.stringify(main.bodies.at(-1));
@@ -331,7 +348,7 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
 
     // Turn 1: the chain is down — the growth fold fails, the request still
     // forwards (fail-open), and the failure arms the 10-minute backoff.
-    const turn1 = await postTurn(port, main.url, "autofold-backoff");
+    const turn1 = await postTurn(port, main.url, "autofold-backoff", 12, "back");
     assert.equal(turn1.status, 200, "turn 1 must forward despite the failing chain");
     assert.ok(sum.bodies.length >= 1, `turn 1 attempted external summaries, got ${sum.bodies.length}`);
 
@@ -339,7 +356,7 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
     // gate disengages auto-fold BEFORE any attempt, so the external chain is
     // never called again and the payload forwards raw.
     const attemptsAfterTurn1 = sum.bodies.length;
-    const turn2 = await postTurn(port, main.url, "autofold-backoff");
+    const turn2 = await postTurn(port, main.url, "autofold-backoff", 12, "back");
     assert.equal(turn2.status, 200, "turn 2 must forward (backoff = skip, not fail)");
     assert.equal(sum.bodies.length, attemptsAfterTurn1, "backoff must skip external calls on the very next turn");
     const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -408,7 +425,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
         // Turn 1: every batch is dropped in the queue. The fold makes zero
         // progress, yet NOTHING was wrong with the chain — under the pre-#2662
         // policy this still armed the 10-minute cooldown.
-        const turn1 = await postTurn(port, main.url, "autofold-qdrop", 36);
+        const turn1 = await postTurn(port, main.url, "autofold-qdrop", 36, "qdrop");
         assert.equal(turn1.status, 200, "queue-dropped fold must still forward (fail-open)");
         assert.equal(sum.bodies.length, 0, "pure queue-drop: no summary call may reach the endpoint at all");
         const forwarded1 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -418,7 +435,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
         // retries the chain and the fold lands.
         releaseHolders();
         await Promise.all(holders);
-        const turn2 = await postTurn(port, main.url, "autofold-qdrop", 36);
+        const turn2 = await postTurn(port, main.url, "autofold-qdrop", 36, "qdrop");
         assert.equal(turn2.status, 200, "turn 2 must forward");
         assert.ok(sum.bodies.length >= 1, `backoff must NOT have armed on pure queue-drops; expected external calls on turn 2, got ${sum.bodies.length}`);
         const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -434,8 +451,8 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
 // ---------------------------------------------------------------------------
 
 /** bigConversation with one extra ~4KB user pair spliced before the tail. */
-function conversationWithExtraPair(pairs: number): unknown[] {
-    const base = bigConversation(pairs) as unknown[];
+function conversationWithExtraPair(pairs: number, tag = ""): unknown[] {
+    const base = bigConversation(pairs, tag) as unknown[];
     base.pop(); // drop the trailing "final question"
     base.push({ role: "user", content: [{ type: "text", text: `extra doc: ${"abcdef".repeat(667)}` }] });
     base.push({ role: "assistant", content: [{ type: "text", text: "ack extra" }] });
@@ -483,7 +500,7 @@ test("#3444 sub-floor target: an exhausted fold measures the irreducible floor �
     // no fold can ever reach it. Pre-#3444 every turn re-fired the trigger
     // (payload >= target forever) and burned an external-summary round trip
     // for whatever sliver was foldable — the reported fold storm.
-    const t1 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: bigConversation(12) });
+    const t1 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: bigConversation(12, "floor") });
     assert.equal(t1.status, 200, "turn 1 must forward");
     assert.ok(sum.bodies.length >= 1, `turn 1 must attempt the growth fold, got ${sum.bodies.length} summary calls`);
     const attemptsAfterTurn1 = sum.bodies.length;
@@ -493,7 +510,7 @@ test("#3444 sub-floor target: an exhausted fold measures the irreducible floor �
     // CONFIGURED target 8192 — pre-#3444 this unconditionally re-ran the
     // chain. Now the effective target is the measured floor, so the expected
     // benefit (~1K) sits under the 4096-token cost bar: no new external calls.
-    const t2 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: conversationWithExtraPair(12) });
+    const t2 = await postRaw(port, "autofold-floor", { system: BIG_SYSTEM, messages: conversationWithExtraPair(12, "floor") });
     assert.equal(t2.status, 200, "turn 2 must forward");
     assert.equal(sum.bodies.length, attemptsAfterTurn1, "marginal growth past a sub-floor target must NOT re-run the external chain (fold storm)");
     const text2 = JSON.stringify(main.bodies.at(-1));
@@ -540,7 +557,7 @@ test("#3444 sub-benefit fold: a round trip that saves less than its cost arms th
     // payload is the live tail — one ~15K-token final user message that no
     // fold may touch. The trigger sees a large expected benefit and fires;
     // the actual pass saves ~3K < 4096 AUTO_FOLD_MIN_BENEFIT_TOKENS.
-    const giantTail = bigConversation(3) as unknown[];
+    const giantTail = bigConversation(3, "sub") as unknown[];
     giantTail.pop();
     giantTail.push({ role: "user", content: [{ type: "text", text: `giant paste: ${"0123456789abcdef".repeat(3750)}` }] });
 
@@ -675,9 +692,9 @@ test("degenerate sub-MIN growth window: classic nudges still fire (no silent sup
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const warm = await postTurn(port, main.url, "deg-win", 2);
+    const warm = await postTurn(port, main.url, "deg-win", 2, "degw");
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
-    const turn = await postTurn(port, main.url, "deg-win", 2);
+    const turn = await postTurn(port, main.url, "deg-win", 2, "degw");
     assert.equal(turn.status, 200, "turn 2 must forward cleanly");
     assert.equal(sum.bodies.length, 0, "growth folding never engaged (degenerate window) — no external calls");
     const text = JSON.stringify(main.bodies.at(-1));
@@ -722,9 +739,9 @@ test("explicit autoFoldTargetTokens clamped to the window: classic nudges still 
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const warm = await postTurn(port, main.url, "deg-target", 36);
+    const warm = await postTurn(port, main.url, "deg-target", 36, "degt");
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
-    const turn = await postTurn(port, main.url, "deg-target", 36);
+    const turn = await postTurn(port, main.url, "deg-target", 36, "degt");
     assert.equal(turn.status, 200, "turn 2 must forward cleanly");
     assert.equal(sum.bodies.length, 0, "clamped target is a no-op growth config — no external calls");
     const text = JSON.stringify(main.bodies.at(-1));

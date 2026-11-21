@@ -18,6 +18,19 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { diagnoseEmptySummary } from "../src/preflight.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-empty-sum-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #726 regression: after the #626/#663 compatibility retries, a ChatGPT-backend
 // summarization call can return HTTP 200 SSE carrying NO summary text (an
@@ -131,10 +144,10 @@ function makeUpstream(calls: Call[], failAboveChars: number, forwardInputTokens 
     });
 }
 
-function longResponsesInput(count: number) {
+function longResponsesInput(count: number, tag = "") {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < count; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: (i === 0 ? `${tag} ` : "") + `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return input;
 }
@@ -185,7 +198,7 @@ test("(#4079) no dead-end cooldown: retries — identical or changed — re-run 
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
-        const input = longResponsesInput(12);
+        const input = longResponsesInput(12, "changed-cooldown");
         const first = await driveResponses(proxyPort, upstreamPort, "changed-cooldown", "gpt-7-sol", input);
         assert.equal(first.status, 502);
         await first.text();
@@ -235,13 +248,13 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     try {
-        const first = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12));
+        const first = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12, "transient-cooldown"));
         const body = await first.json() as { error: { retryable: boolean } };
         assert.equal(body.error.retryable, true);
         const session = listSessions().find((s) => s.id.includes("transient-cooldown"));
         assert.equal(session?.metadata.preflightDeadEnd, undefined);
         const callsBefore = calls;
-        const next = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12));
+        const next = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12, "transient-cooldown"));
         await next.text();
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
@@ -266,7 +279,7 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r = await driveResponses(proxyPort, upstreamPort, "s726-recover", "gpt-7-sol", longResponsesInput(12));
+        const r = await driveResponses(proxyPort, upstreamPort, "s726-recover", "gpt-7-sol", longResponsesInput(12, "s726-recover"));
         assert.equal(r.status, 200, `request must recover via smaller chunks, got ${r.status}`);
 
         const summaries = calls.filter((c) => c.summary);
@@ -308,7 +321,7 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, retries re
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r1 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
+        const r1 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12, "s726-deadend"));
         assert.equal(r1.status, 502, `systemic failure must fail-fast, got ${r1.status}`);
         const j1 = (await r1.json()) as { error?: { code?: string; message?: string } };
         assert.equal(j1.error?.code, "preflight_compress_failed");
@@ -329,7 +342,7 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, retries re
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker may persist");
 
         const callsBeforeRetry = calls.length;
-        const r2 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
+        const r2 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12, "s726-deadend"));
         assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
         const j2 = (await r2.json()) as { error?: { code?: string; message?: string } };
         assert.equal(j2.error?.code, "preflight_compress_failed");
@@ -367,12 +380,12 @@ test("#300 regression (was #726 cooldown side-pin): fitting payload under a stal
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const seed = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(1));
+        const seed = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(1, "s726-stale"));
         assert.equal(seed.status, 200, `seed request must forward, got ${seed.status}`);
         let sess = listSessions().find((s) => s.id.includes("s726-stale"));
         assert.ok(sess && sess.stats.lastInputTokens >= 10_000, `seed must leave a high baseline, got ${sess?.stats.lastInputTokens}`);
 
-        const r1 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(12));
+        const r1 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(12, "s726-stale"));
         assert.equal(r1.status, 502, `systemic failure must fail-fast, got ${r1.status}`);
         sess = listSessions().find((s) => s.id.includes("s726-stale"));
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists");
@@ -474,7 +487,7 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const r = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12));
+        const r = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12, "s780-trunc"));
         assert.equal(r.status, 502, `truncated summaries must fail-fast, got ${r.status}`);
         const j = (await r.json()) as { error?: { code?: string; message?: string } };
         assert.equal(j.error?.code, "preflight_compress_failed");
@@ -492,7 +505,7 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists");
 
         const callsBeforeRetry = calls.length;
-        const r2 = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12));
+        const r2 = await driveResponses(proxyPort, upstreamPort, "s780-trunc", "gpt-7-sol", longResponsesInput(12, "s780-trunc"));
         assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
         const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
         assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 32, `the re-run walk is itself bounded, got ${retrySummaries.length}`);
