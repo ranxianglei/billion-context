@@ -28,6 +28,18 @@ function pct(n: number, total: number): number {
   return Math.round((n / total) * 100);
 }
 
+// #6168: bound + clean a projection exception for display on a flag line —
+// one bad row must not flood a status report, and the reason must survive
+// intact enough to distinguish a stale ref from other failures (the old flat
+// "refs unresolvable" verdict misdiagnosed known protection as ledger
+// corruption; #5667 family).
+function cleanProjectionError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const single = raw.replace(/\s+/g, " ").trim();
+  if (single.length <= 100) return single || "projection failed";
+  return `${single.slice(0, 97)}...`;
+}
+
 function numericPart(blockId: string): number {
   const match = /^b(\d+)$/.exec(blockId);
   return match && match[1] !== undefined ? Number(match[1]) : 0;
@@ -407,16 +419,7 @@ function renderUncompressedRanges(
   config?: Config,
   original?: CoreMessage[],
 ): string {
-  const lines: string[] = [];
   const totalTokens = visible.reduce((s, m) => s + m.tokens, 0);
-  lines.push(
-    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${visible.length} visible messages`,
-  );
-  lines.push("");
-  if (visible.length === 0) {
-    lines.push("  (no uncompressed messages)");
-    return lines.join("\n");
-  }
   // Segment via the shared primitive (segment.ts) — identical split rules to
   // buildCompressibleRanges — then aggregate token counts and dominant tool
   // so the view reads as blocks, not a per-message firehose.
@@ -439,9 +442,37 @@ function renderUncompressedRanges(
     }
     return best;
   };
+  // #6168/#6167: BLOCKED-ref entries are protected messages (refs.ts assigns
+  // them no numeric ref). They stay in `visible` so the totals above keep
+  // counting them, but they can never be a submittable candidate endpoint —
+  // resolveBoundaries rejects the sentinel, and recommend.ts screens them out
+  // at its base-set level (`if (!ref || ref === "BLOCKED") continue`), which
+  // this view must honor or it renders ranges the model cannot submit and
+  // misdiagnoses protection as ledger corruption. Every BLOCKED entry in a
+  // group leaves the candidate (its count + tokens go to the aggregate below);
+  // the candidate keeps the positional span between the group's first and last
+  // NORMAL members — projectUnit then judges exactly what apply executes on
+  // that span (protected messages carved per-message). Each visible message
+  // thus lands exactly once: in one candidate row's count/tokens or in the
+  // protected aggregate — nothing missing, nothing double-counted.
   const merged: Merged[] = [];
+  let protectedCount = 0;
+  let protectedTokens = 0;
   for (const group of segmentGroups(visible)) {
-    const first = group[0]!;
+    let firstNormal: number | null = null;
+    let lastNormal = -1;
+    for (let i = 0; i < group.length; i++) {
+      const m = group[i]!;
+      if (m.ref === BLOCKED_REF) {
+        protectedCount++;
+        protectedTokens += m.tokens;
+        continue;
+      }
+      if (firstNormal === null) firstNormal = i;
+      lastNormal = i;
+    }
+    if (firstNormal === null) continue;
+    const first = group[firstNormal]!;
     const r: Merged = {
       startRef: first.ref,
       endRef: first.ref,
@@ -450,14 +481,29 @@ function renderUncompressedRanges(
       tokens: first.tokens,
       toolTokens: new Map<string, number>([[first.tool, first.tokens]]),
     };
-    for (let i = 1; i < group.length; i++) {
+    for (let i = firstNormal + 1; i <= lastNormal; i++) {
       const m = group[i]!;
+      if (m.ref === BLOCKED_REF) continue;
       r.endRef = m.ref;
       r.count += 1;
       r.tokens += m.tokens;
       r.toolTokens.set(m.tool, (r.toolTokens.get(m.tool) ?? 0) + m.tokens);
     }
     merged.push(r);
+  }
+  const lines: string[] = [];
+  lines.push(
+    `UNCOMPRESSED — ${formatTokens(totalTokens)} | ${visible.length} visible messages`,
+  );
+  if (protectedCount > 0) {
+    lines.push(
+      `  protected: ${protectedCount} msgs, ${formatTokens(protectedTokens)} (BLOCKED refs — not submittable to compress)`,
+    );
+  }
+  lines.push("");
+  if (visible.length === 0) {
+    lines.push("  (no uncompressed messages)");
+    return lines.join("\n");
   }
   // Array index is the correct time proxy even on surface-replace hosts,
   // where mid-array summary nodes carry fresh HIGH refs and numeric-ref
@@ -504,8 +550,10 @@ function renderUncompressedRanges(
           protectedMessageIds: protectedRefs,
           shared,
         });
-      } catch {
-        return "\u26a0 not foldable: refs unresolvable";
+      } catch (err) {
+        // #6168: endpoints are now always resolvable refs, so a throw here is
+        // a GENUINE resolution/projection failure — show its actual reason.
+        return `\u26a0 not foldable: ${cleanProjectionError(err)}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
@@ -518,6 +566,10 @@ function renderUncompressedRanges(
   }
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
+  if (merged.length === 0) {
+    lines.push("  (no candidate ranges — every visible message is protected)");
+    return lines.join("\n");
+  }
   for (const r of merged.slice(0, limit)) {
     // Ascending endpoint labels: non-monotonic refs (#1001) can make a
     // positional span's labels numerically descending (#2168).
