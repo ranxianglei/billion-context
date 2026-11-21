@@ -2172,16 +2172,12 @@ export async function installViaTarball(
         }
     }
 
-    // Success: the backup is no longer needed, and neither is the displaced
-    // pnpm link (the store copy underneath it was left byte-identical).
+    // Success: the backup is no longer needed. The displaced pnpm link is the
+    // copy's only rollback source, so its removal waits for the ledger
+    // convergence below — a failed convergence leaves the ledgers on the old
+    // version while the copy stands at the new one, and destroying the old
+    // link would leave no way back (#7125).
     if (!pnpmOldLink) await rm(backupDir, { recursive: true, force: true });
-    if (pnpmOldLink) {
-        try {
-            await unlink(pnpmOldLink);
-        } catch {
-            // inert once installDir holds the fresh real directory
-        }
-    }
     await rm(workDir, { recursive: true, force: true });
 
     // #2894/#3496: the dsh desktop lane is the only one bili overwrites in
@@ -2194,13 +2190,22 @@ export async function installViaTarball(
     // lockfile record — to the version just installed, as one transaction.
     // Local pins stay respected; a ledger-sync failure logs but never fails
     // the install (the copy itself is verified and standing).
+    let keptPnpmLink: string | null = null;
     if (isDshDesktopBiliCopy(installDir, real, env)) {
         const profileDir = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE);
-        const conv = convergeDshLedger(profileDir, version);
+        const conv = convergeDshLedger(profileDir, version, { integrity });
         if (conv.error !== undefined) {
-            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced at ${version} but its ledgers were not converged (${conv.error}) — dsh may revert the copy on its next plugin install; rerun 'bili doctor --fix'`);
+            if (pnpmOldLink !== null && conv.divergent === true) keptPnpmLink = pnpmOldLink;
+            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced at ${version} but its ledgers were not converged (${conv.error}) — dsh may revert the copy on its next plugin install; rerun 'bili doctor --fix'${keptPnpmLink !== null ? `; the previous copy is kept at ${keptPnpmLink} as the rollback source` : ""}`);
         } else if (conv.changed.length > 0) {
             loggerLog("info", `[update] dsh ${DSH_DESKTOP_PROFILE} profile ledgers converged to ${version}: ${conv.details.map((d) => `${d.file} ${d.field} ${d.before} → ${d.after}`).join("; ")}`);
+        }
+    }
+    if (pnpmOldLink !== null && keptPnpmLink === null) {
+        try {
+            await unlink(pnpmOldLink);
+        } catch {
+            // inert once installDir holds the fresh real directory
         }
     }
 
@@ -2233,8 +2238,10 @@ export async function detectStaleInstall(
 
 /** Fetch one published version's registry doc (#1481): tarball URL plus
  *  integrity/shasum for verification. Returns undefined when the version does
- *  not exist or the fetch fails — callers treat that as "do nothing". */
-async function fetchVersionDoc(
+ *  not exist or the fetch fails — callers treat that as "do nothing". Also
+ *  used by `bili doctor --fix` (#7125) to source the SRI hash a pnpm store
+ *  entry needs when converging a dsh profile lockfile. */
+export async function fetchVersionDoc(
     opts: Pick<UpdateOptions, "resolveProxy">,
     packageName: string,
     version: string,
