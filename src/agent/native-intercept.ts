@@ -920,11 +920,20 @@ function emptySlotOversizeRefusal(
 
 /** #5405: same byte ceiling for an unattributed gate verdict. This is not a
  *  window-doom verdict (the 1M floor may still allow the body), so it needs
- *  its own marker and wording; retryable:true because attribution can return. */
-function unattributedByteOversizeRefusal(url: string): Response {
+ *  its own marker and wording; retryable:true because attribution can return.
+ *  #7450: the ceiling is on TOTAL bytes but compression only acts on text —
+ *  when the media split is known, name it in the message so the user can tell
+ *  at a glance whether any folding could ever bring this body under the cap. */
+function unattributedByteOversizeRefusal(url: string, detail: { bytes: number; cap: number; mediaBytes?: number }): Response {
+    const basis = `its body (${detail.bytes.toLocaleString("en-US")} B) is larger than the silent-direct byte ceiling (${detail.cap.toLocaleString("en-US")} B)`;
+    const remedy = detail.mediaBytes !== undefined && detail.mediaBytes > 0
+        ? detail.mediaBytes >= detail.cap
+            ? `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media (images/audio) that no compression can shrink — the media alone already exceeds the ceiling, so this conversation cannot fit under it as-is: start a fresh session or attach smaller images. Routing through a bili session will not remove the media.`
+            : `Of those bytes, ${detail.mediaBytes.toLocaleString("en-US")} B is inline media that compression cannot shrink; the rest is text a bili-managed session can fold. Route the conversation through a bili-managed session so the text can be compressed under the ceiling, or retry after the host re-establishes attribution.`
+        : "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
     const message =
-        "billion-context refused this request locally: it is not attributed to a bili-managed session and its body is larger than the silent-direct byte ceiling, so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
-        "Route the conversation through a bili-managed session so it can be compressed, or retry after the host re-establishes attribution.";
+        "billion-context refused this request locally: it is not attributed to a bili-managed session and " + basis + ", so forwarding it would send a multi-megabyte prompt to the provider uncompressed (#5405). " +
+        remedy;
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed-bytes" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message, retryable: true } }), { status: 422, headers });
@@ -1843,8 +1852,17 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                       : await outgoingBodyBytesCapped(defaultInput, init, cap);
                 if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
-                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
-                    return unattributedByteOversizeRefusal(dispatchUrl);
+                    // #7450: the ceiling is on TOTAL bytes but compression only
+                    // acts on text — bill the incompressible media share (when
+                    // the raw body is cheaply at hand) so the refusal and the
+                    // log say whether any folding could ever bring this body
+                    // under the cap.
+                    const silentRaw = prep.outcome === "restored"
+                        ? prep.body
+                        : measured?.raw ?? (typeof init?.body === "string" ? init.body : undefined);
+                    const silentMediaBytes = silentRaw !== undefined ? mediaBytesOfWireBody(silentRaw) : undefined;
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B${silentMediaBytes !== undefined && silentMediaBytes > 0 ? `; ${silentMediaBytes.toLocaleString("en-US")} B inline media, incompressible` : ""}); would be sent uncompressed (#5405/#5408)`);
+                    return unattributedByteOversizeRefusal(dispatchUrl, { bytes: silentBytes, cap, mediaBytes: silentMediaBytes });
                 }
             }
             // #4566: clean the stale hops only when a real send follows — the
