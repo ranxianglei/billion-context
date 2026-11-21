@@ -791,6 +791,67 @@ test("install: an unattributed oversized request is refused before direct send (
     assert.deepEqual(sink, [], "the oversized request must not reach the provider");
 });
 
+test("install: the unattributed byte-cap refusal names the incompressible media share (#7450)", async () => {
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    process.env.BILI_SILENT_DIRECT_MAX_MB = "1"; // 1 MiB cap keeps the test bodies small
+    const cap = 1024 * 1024;
+    try {
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40914",
+            ready: Promise.resolve("http://127.0.0.1:40914"),
+            takeoverGate: () => false,
+        };
+        const { sink } = await withPatch(state, async (fetch) => {
+            // Dead-end case: the inline media alone exceeds the ceiling — no
+            // folding can ever bring the body under it.
+            const deadMedia = `data:image/png;base64,${"A".repeat(1_200_000)}`;
+            const deadBody = JSON.stringify({
+                model: "m",
+                messages: [{ role: "user", content: [
+                    { type: "text", text: "hi" },
+                    { type: "image_url", image_url: { url: deadMedia } },
+                ] }],
+            });
+            assert.ok(Buffer.byteLength(deadBody) > cap, "dead-end body exceeds the 1 MiB cap");
+            const dead = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: deadBody });
+            assert.equal(dead.status, 422);
+            assert.equal(dead.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes");
+            const dj = (await dead.json()) as { error: { message: string } };
+            assert.match(dj.error.message, new RegExp(deadMedia.length.toLocaleString("en-US") + " B is inline media"));
+            assert.match(dj.error.message, /media alone already exceeds the ceiling/);
+
+            // Foldable case: media under the ceiling, text pushes the total over —
+            // the remainder is text a bili session can fold.
+            const foldMedia = `data:image/png;base64,${"A".repeat(900_000)}`;
+            const foldBody = JSON.stringify({
+                model: "m",
+                messages: [{ role: "user", content: [
+                    { type: "text", text: "pad".repeat(60_000) },
+                    { type: "image_url", image_url: { url: foldMedia } },
+                ] }],
+            });
+            assert.ok(Buffer.byteLength(foldBody) > cap, "foldable body exceeds the 1 MiB cap");
+            const fold = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: foldBody });
+            assert.equal(fold.status, 422);
+            const fj = (await fold.json()) as { error: { message: string } };
+            assert.match(fj.error.message, new RegExp(foldMedia.length.toLocaleString("en-US") + " B is inline media"));
+            assert.match(fj.error.message, /the rest is text a bili-managed session can fold/);
+
+            // Negative: a pure-text body over the cap keeps the legacy wording —
+            // no media claim, no byte-count basis change.
+            const text = await fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: "x".repeat(cap + 1) });
+            assert.equal(text.status, 422);
+            const tj = (await text.json()) as { error: { message: string } };
+            assert.doesNotMatch(tj.error.message, /inline media/);
+            assert.match(tj.error.message, /Route the conversation through a bili-managed session/);
+        });
+        assert.deepEqual(sink, [], "the oversized requests must not reach the provider");
+    } finally {
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+    }
+});
+
 test("install: a missing live-state slot refuses an oversized Request-object model body too (#5405/#5408)", async () => {
     const saved = globalThis.fetch;
     _resetForTest();
