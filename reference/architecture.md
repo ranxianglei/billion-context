@@ -65,6 +65,7 @@ billion-context/
 │   ├── upstream-proxy.ts         # undici ProxyAgent routing (explicit-direct vs no-preference, SOCKS reject)
 │   ├── fetch-util.ts             # Capped body reads, timeout/replay helpers (knob-resolved)
 │   ├── request-body-budget.ts   # 接收、解压、发送字节预算与大请求名额
+│   ├── codex-ws-replay.ts        # conservative Codex Responses replay egress normalization
 │   ├── fetch-transport.ts        # AsyncLocalStorage fetch-transport override (withFetchTransport)
 │   ├── content-encoding.ts       # gzip/deflate decode + decompression-bomb guard (413)
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies

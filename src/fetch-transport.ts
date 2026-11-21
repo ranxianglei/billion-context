@@ -11,6 +11,7 @@ const transports = new AsyncLocalStorage<FetchTransport>();
  * HTTP transports (dsh-inline, inline-engine.ts) deliver large bodies fine
  * (16 MiB observed succeeding) and must pass through untouched. */
 const wsLaneTransports = new WeakSet<FetchTransport>();
+const codexWsReplayTransports = new WeakSet<FetchTransport>();
 
 /** Tag a transport (and return it) as the Responses-WS lane. */
 export function markWsLaneTransport(transport: FetchTransport): FetchTransport {
@@ -21,6 +22,18 @@ export function markWsLaneTransport(transport: FetchTransport): FetchTransport {
 /** True only for transports installed via markWsLaneTransport. */
 export function isWsLaneTransport(transport: FetchTransport | undefined): boolean {
     return transport !== undefined && wsLaneTransports.has(transport);
+}
+
+/** Mark only the Codex WS lane, so its replay compatibility is not applied to
+ * generic Responses clients, plugins, or regular HTTP requests. */
+export function markCodexWsReplayTransport(transport: FetchTransport): FetchTransport {
+    codexWsReplayTransports.add(transport);
+    return transport;
+}
+
+export function isCodexWsReplayTransport(): boolean {
+    const transport = transports.getStore();
+    return transport !== undefined && codexWsReplayTransports.has(transport);
 }
 
 export function withFetchTransport<T>(transport: FetchTransport, run: () => T): T {
