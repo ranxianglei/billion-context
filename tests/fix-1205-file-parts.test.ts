@@ -92,6 +92,21 @@ test("droppedOpenaiParts applies the text-only preserved set to non-user roles",
     assert.deepEqual(droppedOpenaiParts(body), { count: 1, types: ["image_url"], firstIndex: 1 });
 });
 
+// #6875: DSH read_image attachment parts on tool results are preserved by
+// the codec (rawOpenaiContentParts sidecar), so the drop detector stays
+// silent for them — but a bare {type:"image"} part with no attachment is
+// still dropped and still reported.
+test("droppedOpenaiParts stays silent for DSH attachment parts on tool results (#6875)", () => {
+    const dshPart = { type: "image", attachment: { attachmentId: "sha256:abc", mediaType: "image/png", bytes: 123 } };
+    const body = openaiBody([{ role: "tool", tool_call_id: "c1", content: [{ type: "text", text: "shot" }, dshPart] }]);
+    assert.equal(droppedOpenaiParts(body), null);
+});
+
+test("droppedOpenaiParts still reports a bare image part with no attachment (#6875)", () => {
+    const body = openaiBody([{ role: "tool", tool_call_id: "c1", content: [{ type: "image", attachment: { mediaType: "image/png" } }] }]);
+    assert.deepEqual(droppedOpenaiParts(body), { count: 1, types: ["image"], firstIndex: 0 });
+});
+
 test("droppedOpenaiParts unions types across non-user messages and keeps the earliest index", () => {
     const body = openaiBody([
         { role: "user", content: [{ type: "input_audio", input_audio: {} }, { type: "text", text: "ok" }] },
