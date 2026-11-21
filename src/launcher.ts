@@ -5144,7 +5144,8 @@ function runCommandCapture(command: string, args: readonly string[], timeoutMs: 
  *  reused pid would inherit the dead occupant's observation history and get
  *  force-taken-over on first sight. Sources (all best-effort, zero new deps):
  *   linux: /proc/<pid>/stat field 22 (starttime, ticks since boot)
- *   win32: powershell Get-Process StartTime (~1-3s cold start, rare path only)
+ *   win32: powershell Get-Process StartTime (1-3s warm; 30s budget — a loaded
+ *          CI runner's cold start can exceed 10s, #6785)
  *   other POSIX: `ps -o lstart=`
  *  Failure → undefined → the key degrades to origin#pid (previous behavior); a
  *  stamp that appears or disappears across observations restarts the window
@@ -5163,7 +5164,7 @@ export async function processBirthStamp(pid: number): Promise<string | undefined
             return undefined;
         }
         if (process.platform === "win32") {
-            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 10_000);
+            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 30_000);
             const trimmed = out.trim();
             return trimmed === "" ? undefined : `ps-${trimmed}`;
         }

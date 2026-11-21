@@ -35,3 +35,4 @@
 | [lifecycle](lifecycle.md) | 过渡开关台账 / 退役模块盘点 / 卫生记录（CI 强制 `BILI_*` 覆盖） |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | `AGENTS.md` §7 背后的证据附录（AI 自动开发评审史） |
 | [unified-loop-spec](unified-loop-spec.md) | 历史设计：统一压缩循环规格（已落地，以代码为准） |
+| [PR #6785 详尽梳理](pr-6785-unified-storage-and-flows.zh-CN.md) / [EN](pr-6785-unified-storage-and-flows.md) | PR #6785 审查级梳理：统一存储表结构（schema v12）/ 实现逻辑 / 逐轮数据流转 / 开关总账 + 实测验证（#5874/#7064/#7398/#4491） |

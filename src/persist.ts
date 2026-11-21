@@ -2478,6 +2478,81 @@ export class SessionStore {
         }
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
+    // R3 reject to a hard 400 and any other fault to the legacy full path).
+
+    /** Stage 0 (element world match) for one turn. null when the unified
+     *  store is unavailable — the lane keeps the legacy path. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("./snapshot/plane.js").Stage0Result | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The stage-0 resync (diverge / re-baseline): clear the l1 envelope so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapStage0Reset(sessionId);
+    }
+
+    /** #7064 D2: whether this sid is CONVERSATION-BOUND — the host already
+     *  declared a conversation identity (a conversations row for this sid),
+     *  so the per-turn R3 identity-fault policy never fires for it: the
+     *  session IS the identity, the stage-0 cursor is bookkeeping. */
+    snapConvBound(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapConvBound(sessionId);
+    }
+
+    /** #7064 §8: live stamped msg_ids in seq order (see UnifiedStore.snapMsgIdLiveIds).
+     *  [] when the unified store is unavailable — the caller treats that as an
+     *  empty ledger (C=0) and degrades to the full-list signal. */
+    snapMsgIdLiveIds(sessionId: string): string[] {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapMsgIdLiveIds(sessionId);
+    }
+
+    /** #7398 seg 3: egress op-log surface (dual tables egress_state/
+     *  egress_flow). Null when the sqlite lane is unavailable (legacy mode,
+     *  network backends) — callers skip recording for the turn (shadow lane,
+     *  zero impact). */
+    egressOpLogStore(): import("./storage/store.js").UnifiedStore | null {
+        return this.replicasAvailable() ? this.liveShadow().egressOpLogSync() : null;
+    }
+
+    /** #6181 M3: whether this sid's R3 breaker latch persisted from a
+     *  previous process (a restart must not re-arm a misbehaving host). */
+    snapR3Latched(sessionId: string): boolean {
+        if (!this.replicasAvailable()) return false;
+        return this.liveShadow().snapR3Latched(sessionId);
+    }
+
+    /** #6181 M3: persist the R3 breaker latch (best-effort). */
+    snapR3Latch(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapR3Latch(sessionId);
+    }
+
+    /** #6785 review: operator escape hatch — clear the persisted R3 latch
+     *  (see UnifiedStore.snapR3LatchClear; /__bili/snapshot/r3-unlatch). */
+    snapR3LatchClear(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapR3LatchClear(sessRaw);
+    }
+
+    /** #6785 review: the persisted-latch roster (see UnifiedStore.snapR3LatchedList). */
+    snapR3LatchedList(): Array<{ sessRaw: string; ledgerId: string; latchedAt: number }> {
+        if (!this.replicasAvailable()) return [];
+        return this.liveShadow().snapR3LatchedList();
+    }
+
+    /** #6785 review: conversation-binding sid of a raw id (see UnifiedStore.snapSidOfRaw). */
+    snapSidOfRaw(sessRaw: string): string | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapSidOfRaw(sessRaw);
+    }
+
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check
@@ -3642,6 +3717,61 @@ export class SessionStore {
         this.dropResidentMetadata(session);
         this.dropResidentContentStore(session);
         this.drainFlushWaiters(session.id, true);
+    }
+
+    /** #5874 P2-final: the IN-REQUEST snapshot application — persist the
+     *  session's current canonical state right now (single store transaction
+     *  through writeNow: legacy tables AND the snapshot plane via
+     *  snapShadowSync), so the egress stage of the SAME request reads a plane
+     *  that already contains this turn (chain: raw → wire→core → kernel
+     *  rewrite → snapshot write → egress rewrite → egress). Before this the
+     *  plane write waited for the post-response debounce, so egress always
+     *  saw the plane one tick behind and re-stitched the live tail from the
+     *  client resend at the seam.
+     *
+     *  Never throws — a failed flush leaves the round on the legacy egress
+     *  path (the seam walk carries it) and the debounced retry is untouched.
+     *  On success the armed debounce is settled: our live build already
+     *  covers every mutation up to the epoch it captured, so the pending
+     *  timer is dropped (its build would be a byte-identical no-op); a
+     *  mutation that landed DURING the write's chain-run window re-arms via
+     *  the caller's end-of-prepare markDirty (the returned epoch lets it
+     *  distinguish "already saved" from "new state since").
+     *  @returns { ok: write landed, epoch: revisionEpoch captured BEFORE the
+     *  write (compare against session.revisionEpoch afterwards). */
+    async flushSessionNow(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const epoch = session.revisionEpoch;
+        try {
+            await this.writeNow(session);
+        } catch (err) {
+            this.log("warn", `[persist] ${session.id}: in-request snapshot flush failed (round stays on the legacy egress path): ${String(err).slice(0, 200)}`);
+            return { ok: false, epoch };
+        }
+        if ((session.revisionEpoch ?? 0) !== (epoch ?? 0)) {
+            // Newer mutation landed during the chain-run window — keep the
+            // debounce alive for it (re-arm; the pending timer already covers
+            // it when the timer still exists).
+            this.scheduleSave(session);
+        } else {
+            const t = this.saveTimers.get(session.id);
+            if (t) {
+                clearTimeout(t);
+                this.saveTimers.delete(session.id);
+            }
+            this.saveBuilders.delete(session.id);
+            this.writerOffPending.delete(session.id);
+            this.runIdleSpillIfIdle(session.id);
+        }
+        return { ok: true, epoch };
+    }
+
+    /** #5874 P2-final: lane-facing wrapper — a missing or PARTIAL store (test
+     *  stubs that answer only the accessors under test) degrades to "not
+     *  flushed" instead of throwing into the lane's kernel-fail catch. */
+    static async flushOrSkip(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const st = getStore();
+        if (!st || typeof st.flushSessionNow !== "function") return { ok: false, epoch: session.revisionEpoch };
+        return st.flushSessionNow(session);
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the

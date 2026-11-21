@@ -2268,6 +2268,22 @@ type FileConfig = {
      *  edits apply on the next restart, not mid-session. */
     storage?: {
         unified?: string;
+        /** #5874 v2 snapshot-base plane (pure-incremental): two-key switch,
+         *  config-file only, no env tier (#2030). `enabled` (default false)
+         *  arms the egress stable-prefix cache — a D-lane render materializes
+         *  its server-rendered stable prefix into a CAS-referenced snapshot
+         *  row and re-serves it verbatim on warm renders (three independent
+         *  reject gates; any miss re-derives live for that round and the cut
+         *  self-heals on the next render — never a sticky failure). Dormant
+         *  by default: no cache row is cut or served, zero behavior change.
+         *  `cohorts` (missing/empty = all) restricts the plane to listed
+         *  protocols (openai/anthropic/google/responses); other sessions
+         *  render live unconditionally. Rollback = unset (the fold-journal
+         *  rows keep accumulating — inert until re-armed).
+         *  `cutEveryKUserTurns` (default 8; #6785 review) bounds the re-cut
+         *  cadence: a VALID cached row re-materializes only once K user turns
+         *  have landed past it (between turns the short tail derives live, as
+         *  it always has); any INVALIDATION still re-cuts immediately. */
         /** SQLite engine self-download (#2833): when unified storage is
          *  requested but neither builtin node:sqlite nor a host-installed
          *  better-sqlite3 exists, bili downloads a pinned N-API prebuilt at

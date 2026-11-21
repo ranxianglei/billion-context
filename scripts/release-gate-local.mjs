@@ -26,11 +26,14 @@
 // Usage:
 //   node scripts/release-gate-local.mjs [--tarball <path>] [--keep]
 //        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>] [--reuse-base-dir]
+//        [--snapbase-full]
 //
 //   --tarball      built package tarball (default: `npm pack` on the current
 //                  tree — run `npm run build` first, as the release
 //                  pre-flight already does).
 //   --with-update  also run Lane U (needs verdaccio + GATE_VERDACCIO_NPMRC).
+//   --snapbase-full  run the #5874 snapshot plane (P0+P1+P2) fully ON for this
+//                  invocation (all four wire cohorts); default = plane off.
 //   --keep         keep the scratch dir (default: remove on success, keep on
 //                  failure for post-mortem).
 //   --reuse-base-dir  accept a NON-EMPTY --base-dir (default: refuse — a
@@ -180,6 +183,12 @@ const G = {
   keep: !!arg("keep"),
   skip: String(arg("skip", "")).split(",").filter(Boolean),
   withUpdate: !!arg("with-update"),
+  // #5874 snapshot-plane validation: turn the plane's four config-file flags
+  // ON for this run only (master + shadow-write lane + direct egress
+  // authority, all four wire cohorts). The gate's storage default is
+  // pure-sqlite — the only path the plane operates on. Without the flag the
+  // gate runs the plane fully OFF (its shipped default).
+  snapbaseFull: process.argv.includes("--snapbase-full"),
 };
 
 const results = [];
@@ -372,6 +381,20 @@ async function main() {
           },
           // Lane U reads `latest` from here (a dsh-managed proxy must NOT self-update in place).
           ...(verdaccioOk ? { update: { registry: G.verdaccio } } : {}),
+          // --snapbase-full: run the #5874 v2 snapshot-base plane fully ON
+          // for this gate invocation — egress stable-prefix cache for all
+          // four wire cohorts. Absent flag = plane off (the shipped
+          // default), so a normal gate run is byte-identical to pre-plane.
+          ...(G.snapbaseFull
+            ? {
+                storage: {
+                  snapBase: {
+                    enabled: true,
+                    cohorts: ["openai", "anthropic", "google", "responses"],
+                  },
+                },
+              }
+            : {}),
         },
         null,
         2,

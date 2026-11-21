@@ -94,7 +94,18 @@ export function gateStorageCfg() {
 export function gateRolloutCfg() {
   const v = String(process.env.GATE_SNAPSHOT_RENDER || "");
   if (!v || v === "0" || v.toLowerCase() === "off") return {};
-  return { rollout: { features: { snapshotRender: true } } };
+  // #6785 all-switches-on verification (LOCAL-ONLY, do not commit): also force
+  // the msgid-plane rollouts that ship with this candidate. Config tier only —
+  // the env tier (BILI_ROLLOUT_*) never reaches the lane proxies (cleanEnv).
+  return {
+    rollout: {
+      features: {
+        snapshotRender: true,
+        pluginMsgIdIncremental: true,
+        identityChannelHarvest: true,
+      },
+    },
+  };
 }
 const MODEL_MAIN = MODEL_IDS[0];
 const AGENTS = (process.env.GATE_AGENTS || "dsh,pi,codex,opencode,claude")

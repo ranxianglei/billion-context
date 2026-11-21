@@ -156,7 +156,7 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
         refs: store.getRefs(id),
     };
     assert.ok(rows.session, `session row missing: ${id}`);
-    return loadLegacyView(rows);
+    return loadLegacyView(rows, undefined, store.getStateFields(id), store.getOrphanViews(id) ?? {});
 }
 
 // ---------------------------------------------------------------------------
