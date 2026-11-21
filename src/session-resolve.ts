@@ -208,6 +208,10 @@ export type SessionOrderResolution = {
     action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
     /** Human-readable reason for the derived/reanchor branches (log surface). */
     reason?: string;
+    /** #5582: true when this derived-persona fork left a SHALLOW recording on
+     *  the raw key (sidecar-blob claim) behind a main-shaped arrival — the
+     *  non-recognized-sidecar anchor race (#2156 family). Diagnostic only. */
+    anchorRace?: boolean;
 };
 
 type Recorded = { kinds: string[]; frags: string[]; tagHash: string; model?: string; lastSeen: number };
@@ -501,7 +505,17 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // compression session; empty degrades to the two-segment key.
         const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
-        return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
+        const personaResolution: SessionOrderResolution = { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
+        // #5582: anchor-race signal — the raw key's recording is SHALLOW
+        // (sidecar blob: one user message, no assistant yet) while a MAIN-
+        // shaped conversation under a different persona arrives and cannot
+        // continue it. That is the signature of a non-recognized sidecar
+        // (title/review shape drift) claiming the virgin anchor before the
+        // first main turn (#2156 family). The fork itself stays correct per
+        // #150/#2948; handle.ts logs the flag once per id so the field shows
+        // WHICH sidecar shape drifted.
+        if (!mainShaped(recorded.kinds) && mainShaped(kinds)) personaResolution.anchorRace = true;
+        return personaResolution;
     }
     if (!mainShaped(kinds)) {
         // Shallow traffic under the claimed id rides the raw key — with a
@@ -574,6 +588,17 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
 /** Diagnostic/test surface: the recorded skeleton for an id. */
 export function sessionOrderSkeletonOf(rawId: string): string[] | undefined {
     return skeletons.get(rawId)?.kinds;
+}
+
+/** #5582: whether the recorded skeleton under an id is MAIN-shaped (≥3 cells
+ *  including an assistant). Stub-parent follow uses this to tell a sidecar-
+ *  claimed raw key (shallow claim: one user blob, no assistant yet) from a
+ *  genuinely young real conversation — the latter must never be bypassed, so
+ *  this gate can veto the ref-less follow even while the parent's minted
+ *  frontier is still small. Unknown id (never recorded) = not main-shaped. */
+export function orderIsMainShaped(id: string): boolean {
+    const r = skeletons.get(id);
+    return r !== undefined && mainShaped(r.kinds);
 }
 
 export function resetSessionOrderForTest(): void {
