@@ -160,3 +160,43 @@ test("seam range left with nothing new is an idempotent no-op, not a batch rejec
   );
   assertDisjointDirectClaims(r.state, "result alone");
 });
+
+test("pre-existing covering block (no same-batch block) gets the covered wording, never a same-batch claim", () => {
+  const core = createCore();
+  // The covering block is created in an EARLIER turn; the retried range is a
+  // sub-range of it whose anchor lies outside the requested span, so the
+  // covering block is not nested in the range and the no-op lands on the
+  // allCovered branch with no block created in this batch.
+  const messages = [
+    text("a1", "assistant"),
+    text("a2", "assistant"),
+    text("a3", "assistant"),
+    text("a4", "assistant"),
+    text("u1", "user"),
+  ];
+  const state = seed(messages);
+
+  const r1 = core.applyCompression({
+    ranges: [{ startRef: "m00001", endRef: "m00004", summary: "early material" }],
+    messages,
+    state,
+    config: config(),
+  });
+  assert.equal(r1.result.errors.length, 0, r1.result.errors.join("; "));
+  assert.equal(r1.state.blocks.length, 1, "expected exactly one pre-existing block");
+
+  const r2 = core.applyCompression({
+    ranges: [{ startRef: "m00002", endRef: "m00004", summary: "retry sub-range" }],
+    messages,
+    state: r1.state,
+    config: config(),
+  });
+  assert.equal(r2.result.errors.length, 0, r2.result.errors.join("; "));
+  const warning = r2.result.warnings.find((w) => /folded nothing/.test(w));
+  assert.ok(warning, `expected a no-op warning, got: ${JSON.stringify(r2.result.warnings)}`);
+  // The covered wording — not the protected/filtered one — and no claim of
+  // same-batch involvement (no block was created in this batch).
+  assert.match(warning, /already covered by active block/);
+  assert.doesNotMatch(warning, /same batch/);
+  assertDisjointDirectClaims(r2.state, "pre-existing cover");
+});

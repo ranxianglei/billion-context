@@ -1897,6 +1897,8 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // that is not fully inside the range — a same-batch sibling that claimed
     // the seam tool pair, or a pre-existing block straddling the range edge.
     // Name that class instead of the generic "protected or filtered" one.
+    // The wording must NOT claim same-batch involvement: the pre-existing
+    // straddling case lands here too, with no block created in this batch.
     const allCovered =
       effectiveMessageIds.size > 0 &&
       [...effectiveMessageIds].every((id) => input.preExistingCoverage.has(id));
@@ -1905,7 +1907,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
       warnings: [
         ...warnings,
         allCovered
-          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s), including block(s) created earlier in this same batch. Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
+          ? `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s). Nothing failed; do not resend this range. To rewrite or merge those blocks, reference them by block ID instead.`
           : `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
