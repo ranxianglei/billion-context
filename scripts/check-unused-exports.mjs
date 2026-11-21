@@ -103,6 +103,12 @@ const WAIVERS = new Map([
     // consume them through applyEgressTransforms' parameter types); keep the
     // exports so the user-plugin contract stays named at its definition site.
     ["src/egress-transforms.ts", new Set(["EgressTransformMatch", "EgressTransformCtx", "EgressTransformResult", "EgressTransformModule"])],
+    // #7478 carrier-arg parser: CarrierEntry is the return-element type of the
+    // exported parseCarrierEntries; both carrier-recognition sites (src/server.ts
+    // stripKernelSummaries, src/plugin.ts reconcilePluginFoldCallIds) consume it
+    // structurally through that return type. Keep the export so the carrier-entry
+    // shape stays named at its definition site.
+    ["src/carrier-args.ts", new Set(["CarrierEntry"])],
 ]);
 
 const findings = [];
