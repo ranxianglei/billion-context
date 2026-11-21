@@ -54,6 +54,7 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
+import { recordLaneTurn, serveLaneCore } from "./egress-lane-io.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -533,7 +534,18 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         }
         reapOrphansLogged(session, msgs, log, sessionId);
-        rebuiltInput = patchResponsesInput(projection, processedMessages);
+        // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core
+        // from the egress op-log before the item rebuild — the recorded bytes
+        // are this session's server truth. Compaction-generation turns
+        // (trigger/prompt form) are transient, like title-gen, and are not
+        // recorded nor served.
+        let laneCore = processedMessages;
+        if (!isCompactionTrigger && featureEnabled("egressServeLog")) {
+            const st = getStore().egressOpLogStore();
+            const served = st ? serveLaneCore(st, sessionId, log) : null;
+            if (served !== null) laneCore = served;
+        }
+        rebuiltInput = patchResponsesInput(projection, laneCore);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // #3400: the Responses steady path rebuilds items from the RAW parsed
         // input (patchOriginalItem), so BiliMessage-level modifications never
@@ -579,6 +591,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+        }
+        // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
+        if (!isCompactionTrigger && featureEnabled("egressOpLog")) {
+            const st = getStore().egressOpLogStore();
+            if (st) recordLaneTurn(st, sessionId, laneCore, responsesDevContent ?? projection.systemParts.join("\n\n"), log);
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"

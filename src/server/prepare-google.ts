@@ -43,6 +43,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { recordLaneTurn, serveLaneCore } from "./egress-lane-io.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -344,7 +345,15 @@ export async function prepareGoogle(
         reapOrphansLogged(session, msgs, log, sessionId);
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core from
+        // the egress op-log — the recorded bytes are this session's server
+        // truth; the lane's own conversion chain turns it into wire below.
+        if (!isTitleGen && featureEnabled("egressServeLog")) {
+            const st = getStore().egressOpLogStore();
+            const served = st ? serveLaneCore(st, sessionId, log) : null;
+            if (served !== null) egressMessages = served;
+        }
         rebuiltContents = coreToGoogle(egressMessages, { model });
 
         // ONLY the static compress prompt joins the client's system text — the
@@ -376,6 +385,11 @@ export async function prepareGoogle(
         // instead of being re-serialized into a new shape.
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
+        // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
+        if (!isTitleGen && featureEnabled("egressOpLog")) {
+            const st = getStore().egressOpLogStore();
+            if (st) recordLaneTurn(st, sessionId, egressMessages, googleOutboundSystem ?? googleClientSystem, log);
+        }
         if (injectTools) {
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }

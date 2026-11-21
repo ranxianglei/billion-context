@@ -109,3 +109,34 @@ test("egressAuthorityProbe: identity + order + sampled-byte rows (#3617 both dir
     // pure fresh tail (empty base ids in client) => pass
     assert.equal(egressAuthorityProbe(base, [M("m9", "fresh")], S, quiet), true, "all-fresh client rows pass");
 });
+
+import { serveLaneCore, recordLaneTurn } from "../src/server/egress-lane-io.ts";
+
+test("egress-lane-io: serve/record round-trip + corrupt degrade (all-lanes helper, ruling 7439-4)", () => {
+    const H = open();
+    try {
+        // empty flow => nothing to serve (bootstrap turn records instead)
+        assert.equal(serveLaneCore(H.store, S, quiet), null, "empty flow serves nothing");
+        recordLaneTurn(H.store, S, [M("m1", "alpha"), M("m2", "beta")], "sys", quiet);
+        // second turn: the recorded core comes back lane-neutral (no system row, no wire shape)
+        const served = serveLaneCore(H.store, S, quiet);
+        assert.ok(served !== null, "a recorded flow serves");
+        assert.deepEqual(served.map((m) => m.id), ["m1", "m2"], "core rows only — the system row stays out");
+        assert.equal(served[0].text, "alpha");
+        // a single corrupt tail row does NOT degrade — the ladder walks back
+        // and truncates, then serves the newest healthy point
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
+        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND log_seq = 3`).run('{"x":1}', S);
+        const partial = serveLaneCore(H.store, S, quiet);
+        assert.ok(partial !== null, "ladder recovery still serves the healthy point");
+        assert.deepEqual(partial.map((m) => m.id), ["m1"], "served core = the healthy point (m2 row truncated away)");
+        // total corruption (no healthy point except the empty flow) => serve
+        // degrades to null and the lane keeps its legacy core
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
+        H.db.prepare(`UPDATE egress_state SET payload = ? WHERE session_id = ? AND row_type != 'D'`).run('{"x":1}', S);
+        assert.equal(serveLaneCore(H.store, S, quiet), null, "no healthy point degrades to legacy (never throws)");
+    } finally {
+        H.db.close();
+        fs.rmSync(H.dir, { recursive: true, force: true });
+    }
+});

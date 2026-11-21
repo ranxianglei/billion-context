@@ -52,6 +52,7 @@ import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
+import { recordLaneTurn, serveLaneCore } from "./egress-lane-io.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -560,8 +561,21 @@ export async function prepareAnthropic(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
-        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        let egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        // #7398 all-lanes (ruling 7439-4): serve this turn's outbound core from
+        // the egress op-log (no title-gen side requests ride this lane, so no
+        // extra gate). The lane's own conversion chain turns it into wire below.
+        if (featureEnabled("egressServeLog")) {
+            const st = getStore().egressOpLogStore();
+            const served = st ? serveLaneCore(st, sessionId, log) : null;
+            if (served !== null) egressMessages = served;
+        }
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? clientCacheControls);
+        // #7398 all-lanes: record this turn's outbound core view (rollout-gated).
+        if (featureEnabled("egressOpLog")) {
+            const st = getStore().egressOpLogStore();
+            if (st) recordLaneTurn(st, sessionId, egressMessages, extractSystem(systemOut) ?? "", log);
+        }
         if (sysNotes.length > 0) {
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
