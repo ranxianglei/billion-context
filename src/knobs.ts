@@ -283,7 +283,10 @@ const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
-const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+// #6511: aligned with MAX_SILENT_DIRECT_BODY_BYTES (8 MiB, native-intercept.ts)
+// so the shed budget never exceeds the silent-direct refusal cap — bodies in
+// the 8–10 MiB band would otherwise survive the shed and die at the gate.
+const DEFAULT_HTTP_OUTBOUND_BYTES = 8 * 1024 * 1024;
 // #5794 → #7426: disabled by default (0 = no ingest cap, all lanes). The original
 // 32 MiB cost band was a proxy for "beyond every model window", but on the re-send
 // lanes (opencode/dsh re-send the ENTIRE raw ledger every turn and bili folds it)
@@ -334,14 +337,15 @@ export function limitsWsOutboundBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_WS_OUTBOUND_BYTES;
 }
 
-/** BILI_HTTP_OUTBOUND_BYTES > network.httpOutboundBytes > 10 MiB. Soft egress byte budget for the
+/** BILI_HTTP_OUTBOUND_BYTES > network.httpOutboundBytes > 8 MiB. Soft egress byte budget for the
  *  plain/proxy/pi-native HTTP relay lane (#3909): above it, older non-protected images are shed from
  *  the OUTBOUND COPY before sending, because an image-dense session can carry tens of MiB of base64
  *  that upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space
  *  folding stays below its trigger. Applies only when no managed transport is installed; the WS lane
  *  uses network.wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never
  *  shed (#3701 Finding 1). 0 disables the pre-send shed (legacy send-as-is). The hard refusal cap
- *  stays network.outboundBodyBytes. */
+ *  stays network.outboundBodyBytes. #6511: default aligned with the silent-direct cap (8 MiB) so
+ *  the shed never leaves a body that the gate would refuse. */
 export function limitsHttpOutboundBytes(): number {
     const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;

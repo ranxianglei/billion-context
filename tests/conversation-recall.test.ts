@@ -17,6 +17,8 @@ import {
     learnConversation,
     recallBoundaryOfMessages,
     recallConversation,
+    recallConversationGlobal,
+    recallHasAnyEntries,
     recallHistoryFingerprints,
     recallLaneKey,
 } from "../src/agent/conversation-recall.ts";
@@ -92,6 +94,91 @@ test("recall: unknown lane and TTL expiry keep today's direct-send behavior", ()
     __ageConversationRecallForTests(11 * 60_000);
     assert.equal(recallConversation(lane, historyFps(MSG_A, MSG_B)), undefined);
     assert.ok(conversationRecallStats().expired >= 1);
+});
+
+test("recall: #6511 same-hostname different-scheme-port-pathname shares one lane", () => {
+    __resetConversationRecallForTests();
+    // Attributed traffic rides the proxy to http://host:9452/v1/… while an
+    // unattributed connector dials https://host/v2/… directly — the learn
+    // lane and the claim lane MUST intersect or the recall net is dead.
+    const learn = recallLaneKey("http://192.168.1.50:9452/v1/chat/completions");
+    const claim = recallLaneKey("https://192.168.1.50/v2/chat/completions");
+    assert.equal(learn, claim, "same hostname must share one lane regardless of scheme/port/pathname");
+
+    // Distinct hostnames stay in distinct lanes (no cross-provider leakage).
+    const other = recallLaneKey("https://other-provider.example.com/v1/chat/completions");
+    assert.notEqual(learn, other, "different hostname must be a different lane");
+
+    // The lane is still a working namespace: learn on one form, recall on the other.
+    const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
+    assert.ok(boundary !== undefined);
+    learnConversation(learn, "sess-1", boundary);
+    assert.equal(recallConversation(claim, historyFps(MSG_A, MSG_B)), "sess-1");
+});
+
+test("recall: #7102 model switch to a NEW hostname is bridged by the global fallback", () => {
+    __resetConversationRecallForTests();
+    // The session was learned on model A's hostname (the lane the attributed
+    // traffic rode). The user switches to model B — a DIFFERENT hostname, a
+    // lane with no entries of its own. The lane-scoped recall on the new lane
+    // finds nothing (the bootstrap deadlock); the global fallback must find
+    // the session on the old lane.
+    const laneA = recallLaneKey("https://model-a.example.com/v1/chat/completions");
+    const laneB = recallLaneKey("https://model-b.example.com/v2/chat/completions");
+    assert.notEqual(laneA, laneB, "the switch must land on a different lane");
+    const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
+    assert.ok(boundary !== undefined);
+    learnConversation(laneA, "sess-1", boundary);
+
+    // The lane probe on the new lane is empty (the deadlock's trigger)…
+    assert.equal(recallHasAnyEntries(), true, "a session IS learned somewhere");
+    assert.equal(recallConversation(laneB, historyFps(MSG_A, MSG_B)), undefined, "lane-scoped recall on the fresh lane finds nothing");
+    // …but the global fallback bridges it.
+    assert.equal(recallConversationGlobal(historyFps(MSG_A, MSG_B)), "sess-1");
+    assert.equal(conversationRecallStats().recalledGlobal, 1);
+});
+
+test("recall: #7102 global fallback requires GLOBAL uniqueness (cross-lane ambiguity refuses)", () => {
+    __resetConversationRecallForTests();
+    // Two sessions on TWO different hostnames that happen to end on the SAME
+    // last message (a shared boundary). A global recall for that boundary is
+    // ambiguous across the whole net — refuse rather than guess. The
+    // lane-scoped recall would have claimed each within its own lane, but the
+    // global pass is strictly stronger.
+    const laneA = recallLaneKey("https://model-a.example.com/v1/chat/completions");
+    const laneB = recallLaneKey("https://model-b.example.com/v2/chat/completions");
+    const shared = recallBoundaryOfMessages([MSG_A, MSG_B]);
+    assert.ok(shared !== undefined);
+    learnConversation(laneA, "sess-1", shared);
+    learnConversation(laneB, "sess-2", shared);
+
+    assert.equal(recallConversationGlobal(historyFps(MSG_A, MSG_B)), undefined, "two sessions share the boundary globally — ambiguous");
+    assert.equal(conversationRecallStats().rejectedAmbiguous, 1);
+    // The lane-scoped recall is unaffected: within lane A only sess-1 has it.
+    assert.equal(recallConversation(laneA, historyFps(MSG_A, MSG_B)), "sess-1");
+});
+
+test("recall: #7102 a sid learned on several lanes counts once in the global pass", () => {
+    __resetConversationRecallForTests();
+    // A session that rode two hostnames (a model switch that DID get
+    // attributed on both sides) is learned on both lanes with the same
+    // boundary. The global pass must count it ONCE (unique) and claim it.
+    const laneA = recallLaneKey("https://model-a.example.com/v1/chat/completions");
+    const laneB = recallLaneKey("https://model-b.example.com/v2/chat/completions");
+    const boundary = recallBoundaryOfMessages([MSG_A, MSG_B]);
+    assert.ok(boundary !== undefined);
+    learnConversation(laneA, "sess-1", boundary);
+    learnConversation(laneB, "sess-1", boundary);
+
+    assert.equal(recallConversationGlobal(historyFps(MSG_A, MSG_B)), "sess-1", "same sid on two lanes is one candidate");
+    assert.equal(conversationRecallStats().recalledGlobal, 1);
+});
+
+test("recall: #7102 cold net (no session learned anywhere) stays a no-op", () => {
+    __resetConversationRecallForTests();
+    assert.equal(recallHasAnyEntries(), false, "empty net: the claim probe bails before any parse");
+    assert.equal(recallConversationGlobal(historyFps(MSG_A, MSG_B)), undefined);
+    assert.equal(conversationRecallStats().rejectedNoBoundary, 1);
 });
 
 test("recall: per-lane LRU cap evicts the idle session, not the active one", () => {

@@ -207,7 +207,7 @@ test("dsh recall: routed (settings-overlay) lane — learn on the overlay URL, c
     });
 });
 
-test("dsh recall: a different logical lane is never claimed, raw or routed", async () => {
+test("dsh recall: #7102 a different logical lane is bridged by the global fallback for a unique boundary", async () => {
     await withSetup(async (ctx, proxy) => {
         const beforeSend = _stateBeforeSendForTest();
         const gate = _stateTakeoverGateForTest();
@@ -222,17 +222,61 @@ test("dsh recall: a different logical lane is never claimed, raw or routed", asy
         ]) };
         await beforeSend(`${proxy.origin}/bili/${MODEL_URL}`, init1);
 
-        // An unattributed dispatch on a DIFFERENT logical lane (another
-        // provider endpoint) carries the identical history — the lane is the
-        // search namespace, so no evidence, no claim, refusal stands.
+        // #7102: an unattributed dispatch on a DIFFERENT logical lane (another
+        // provider endpoint — the model-switch shape) carries the identical
+        // history. The lane is the fast path, but the GLOBAL fallback bridges
+        // it when the boundary is unique across every remembered session — the
+        // claim now succeeds where the old lane-scoped recall deadlocked (the
+        // fresh lane had no entries, so the bootstrap could never seed it).
         ctx.setInitiator(undefined);
         const otherLaneUrl = "https://api.openai.com/v1/chat/completions";
         const init2: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
             { role: "user", content: "shared opening question" },
             { role: "assistant", content: "shared answer closes the parent turn" },
         ]) };
-        assert.equal(await gate(otherLaneUrl, { bytes: 400 }, init2), false, "history evidence never crosses lanes");
+        assert.equal(await gate(otherLaneUrl, { bytes: 400 }, init2), true, "#7102: the global fallback bridges the lane for a unique boundary");
         await beforeSend(otherLaneUrl, init2);
+        const headers = new Headers(init2.headers);
+        assert.equal(headers.get("x-bili-plugin"), "dsh");
+        assert.equal(headers.get("x-bili-plugin-conversation"), "sess-lane-a");
+    });
+});
+
+test("dsh recall: #7102 the cross-lane claim is refused when the boundary is globally ambiguous", async () => {
+    await withSetup(async (ctx, proxy) => {
+        const beforeSend = _stateBeforeSendForTest();
+        const gate = _stateTakeoverGateForTest();
+        assert.ok(beforeSend !== undefined && gate !== undefined);
+
+        // Two sessions on TWO different lanes (neither is the request's lane)
+        // that end on the SAME boundary.
+        const laneBUrl = "https://api.google.com/v1beta/models/gemini-pro:generateContent";
+        ctx.setInitiator({ session: { id: "sess-lane-a" } });
+        const initA: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
+            { role: "user", content: "shared opening question" },
+            { role: "assistant", content: "shared answer closes the parent turn" },
+        ]) };
+        await beforeSend(`${proxy.origin}/bili/${MODEL_URL}`, initA);
+
+        ctx.setInitiator({ session: { id: "sess-lane-b" } });
+        const initB: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
+            { role: "user", content: "shared opening question" },
+            { role: "assistant", content: "shared answer closes the parent turn" },
+        ]) };
+        await beforeSend(laneBUrl, initB);
+
+        // An unattributed dispatch on a THIRD lane (no entries of its own)
+        // carries the boundary — the lane-scoped recall finds nothing, and the
+        // global fallback sees TWO sessions sharing it → ambiguous → refuse
+        // rather than guess (the "never guess" rule on the wider namespace).
+        ctx.setInitiator(undefined);
+        const laneCUrl = "https://api.openai.com/v1/chat/completions";
+        const init2: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-live-4" }, body: bodyOf([
+            { role: "user", content: "shared opening question" },
+            { role: "assistant", content: "shared answer closes the parent turn" },
+        ]) };
+        assert.equal(await gate(laneCUrl, { bytes: 400 }, init2), false, "globally ambiguous boundary — the global fallback refuses");
+        await beforeSend(laneCUrl, init2);
         const headers = new Headers(init2.headers);
         assert.equal(headers.get("x-bili-plugin"), null);
         assert.equal(headers.get("x-bili-plugin-conversation"), null);

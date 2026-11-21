@@ -73,7 +73,7 @@ import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER
 import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
-import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
+import { conversationRecallStats, learnConversation, recallBoundaryOfMessages, recallConversation, recallConversationGlobal, recallHasAnyEntries, recallHistoryFingerprints, recallLaneHasEntries, recallLaneKey } from "./conversation-recall.js";
 export { sideShapedBody } from "./fork-adopt.js";
 export { mediaBytesOfWireBody } from "./media-bytes.js";
 
@@ -1894,21 +1894,39 @@ const pendingNegotiatedStamps = new WeakMap<object, string>();
 
 /** #4082: gate-side recall. Attribution is `none` (retry / model switch /
  * post-resume resend ran outside the agent scope). If the body's history
- * contains a remembered boundary for this lane — provably a known session's
- * continuation — claim the request for the plugin lane; beforeSend stamps the
- * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
+ * contains a remembered boundary — provably a known session's continuation —
+ * claim the request for the plugin lane; beforeSend stamps the negotiated sid.
+ * The lane-scoped recall is the fast path; #7102 adds a GLOBAL fallback for
+ * the model-switch shape (the session was learned on the previous model's
+ * lane, so the new hostname's lane is empty and the lane-scoped recall finds
+ * nothing). No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
 async function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): Promise<string | undefined> {
     if (init === undefined) return undefined;
     const laneKey = recallLaneKey(url);
     // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
     // hit this path constantly, and multi-MB quota-retry bodies must not pay
     // full JSON.parse + per-message hashing when no session was ever learned.
-    if (!recallLaneHasEntries(laneKey)) return undefined;
+    // #7102: the probe is now "any lane" — a model switch lands on a lane that
+    // has NEVER been attributed (the lane probe would bail and the recall net
+    // would be dead for the switch), but the session IS learned on the
+    // previous model's lane. The global fallback below needs the parse, so the
+    // probe must see entries anywhere; the cold case (no session learned at
+    // all) still bails before any parse, so sidecars keep paying nothing.
+    if (!recallHasAnyEntries()) return undefined;
     const body = await bodyJsonOf(init);
     if (body === undefined || typeof body !== "object") return undefined;
     const messages = (body as { messages?: unknown }).messages;
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
-    const sid = recallConversation(laneKey, recallHistoryFingerprints(messages));
+    const fps = recallHistoryFingerprints(messages);
+    if (fps.size === 0) return undefined;
+    // Fast path: the lane-scoped recall (uniqueness within the lane) — the
+    // common case where the session was learned on this same lane.
+    let sid = recallLaneHasEntries(laneKey) ? recallConversation(laneKey, fps) : undefined;
+    // #7102 fallback: a model switch rides a NEW hostname (a lane with no
+    // entries of its own); the session was learned on the previous model's
+    // lane, so recall GLOBALLY (uniqueness across every remembered session —
+    // strictly stronger, "never guess" still holds).
+    if (sid === undefined) sid = recallConversationGlobal(fps);
     if (sid === undefined) return undefined;
     pendingNegotiatedStamps.set(init, sid);
     const stats = conversationRecallStatsLine();
