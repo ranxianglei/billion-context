@@ -47,6 +47,7 @@
 | `BILI_CHAIN_STAMP` | egress stamp | stripped-middlebox 场景的出口戳（默认 off） | 同上 | 默认 off |
 | `BILI_STABLE_SYSTEM_ANCHOR` | stable-system-anchor 实验 | 每会话 system 锚点实验（默认 OFF） | 稳定性评估后转正或删 | opt-in（默认 OFF） |
 | `BILI_FORK_ADOPTION` | fork-adoption 特性 | fork 继承实验（opt-in；禁用时提示从零开始，fork-adoption.ts:300） | 稳定后转正或退役 | opt-in（默认 off） |
+| `BILI_DEGENERATE_RETRY` | #5897 | 空轮续跑 opt-in：开启后轮次零可见输出时自动带中性续跑提示重发一次（loop 车道与 plugin 管道都受管；默认关 = 空轮原样透传，不重发不注入） | 空轮续跑行为定型后转正或退役 | opt-in（默认 off） |
 | `BILI_ALLOW_DSH_COMPACTION` | dsh compaction | dsh compaction opt-in（env 语义同 BILI_PERSIST 家族） | 转正后移 §2 | opt-in（`=1`） |
 | `BILI_SNAPSHOT_SHADOW` | #3756 | snapshot-render 影子观测：每个 armed turn 计算快照视图但**不使用**（出站仍走 legacy 路径），与实际发送对比记 per-session 计数（面板 + `snapshot-shadow` 诊断话题）——render 引擎在 rollout 翻转前用真实流量证明健康（dry-run-then-flip，同存储 #2815 shadow→#3818 full 纪律） | render 车道转正（rollout 100% 且影子计数归稳）后退役 | 默认 on（render lane 本身 rollout 0%，纯观测） |
 | `BILI_DSH_AUTHORED_COMPACTION` | #3733 | dsh 原生 compaction summarize 调用由 #1729 guard 拒绝改为**本地应答折叠快照**（零出账；dsh 记 checkpoint、会话文件收缩） | adoption 后按 #2028 模式转 file/web 开关，env 退役（file 键 `dsh.authoredCompaction` 已镜像） | 0.1.203 dogfood 站稳后默认 on；`=0` 回 #1729 拒绝路径 |

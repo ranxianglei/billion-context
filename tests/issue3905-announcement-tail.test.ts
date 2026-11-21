@@ -294,6 +294,7 @@ function makeCtx(id: string, protocol: "responses" | "openai" = "openai") {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
+        degenerateRetry: true,
         messages: [] as CoreMessage[],
         session: {
             id,
@@ -360,7 +361,7 @@ async function drainOpenai(first: string, retries: string[], id: string): Promis
 test("#3905 loop: a bare announcement → one invisible retry with the continuation nudge", async () => {
     const { out, fetchCalls, bodies } = await drainOpenai(OPENAI_ANNOUNCE, [OPENAI_GOOD], "at-l1");
     assert.equal(fetchCalls, 1, "exactly one announcement-tail auto-retry");
-    assert.ok(bodies[0]!.includes("ended without a tool call"), "the retry carries the continuation nudge");
+    assert.ok(bodies[0]!.includes("produced no visible output"), "the retry carries the continuation nudge");
     assert.ok(out.includes(ANNOUNCE_STUB), "the stub itself reached the client (the host already rendered it)");
     assert.ok(out.includes("continued after nudge"), "the retried turn's content was delivered");
 });

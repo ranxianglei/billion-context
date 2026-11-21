@@ -2363,13 +2363,15 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 } else if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
-                    // when the turn completes with nothing visible.
+                    // when the turn completes with nothing visible. Opt-in via
+                    // degenerateRetry (default OFF): without it the empty turn
+                    // passes through unchanged and the pipe logs the not-armed note.
                     await pipePluginResponsesWithStrip(
                         pluginBody,
                         res,
                         prepared.session,
                         (msg) => log("info", `[${prepared.session.id}] ${msg}`),
-                        makeContinuationRefetch({
+                        opts.degenerateRetry === true ? makeContinuationRefetch({
                             protocol: "responses",
                             body,
                             model: throttleModel ?? prepared.google?.model,
@@ -2380,7 +2382,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
-                        }),
+                        }) : undefined,
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
@@ -2392,14 +2394,14 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     // #732/#821: the plugin pipe re-issues the agent's own body
                     // once when a turn ends with nothing visible (the render-tag
                     // echo case) — it holds the URL and headers, this is where
-                    // they live.
+                    // they live. Opt-in via degenerateRetry (default OFF).
                     await pipePluginChatWithStrip(
                         pluginBody,
                         res,
                         prepared.protocol,
                         prepared.session,
                         (msg) => log("info", `[${prepared.session.id}] ${msg}`),
-                        makeContinuationRefetch({
+                        opts.degenerateRetry === true ? makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
                             model: throttleModel ?? prepared.google?.model,
@@ -2410,7 +2412,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                             signal: clientAbort.signal,
                             log,
                             label: prepared.session.id,
-                        }),
+                        }) : undefined,
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
@@ -2547,7 +2549,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     res,
                     undefined,
                     tagLog,
-                    makeContinuationRefetch({
+                    opts.degenerateRetry === true ? makeContinuationRefetch({
                         protocol: "responses",
                         body,
                         model: throttleModel ?? prepared.google?.model,
@@ -2558,7 +2560,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: prepared.session.id,
-                    }),
+                    }) : undefined,
                     undefined,
                     undefined,
                     undefined,
@@ -2600,7 +2602,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     res,
                     undefined,
                     tagLog,
-                    makeContinuationRefetch({
+                    opts.degenerateRetry === true ? makeContinuationRefetch({
                         protocol: "responses",
                         body,
                         model: throttleModel ?? p.google?.model,
@@ -2611,7 +2613,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
-                    }),
+                    }) : undefined,
                     undefined,
                     undefined,
                     undefined,
@@ -2626,7 +2628,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     p.protocol,
                     undefined,
                     tagLog,
-                    makeContinuationRefetch({
+                    opts.degenerateRetry === true ? makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
                         model: throttleModel ?? p.google?.model,
@@ -2638,7 +2640,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                         signal: clientAbort.signal,
                         log,
                         label: p.session.id,
-                    }),
+                    }) : undefined,
                     undefined,
                     undefined,
                     undefined,
@@ -2825,7 +2827,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, separatorSlots: () => loopSeparatorSlots, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, degenerateRetry: opts.degenerateRetry === true, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, separatorSlots: () => loopSeparatorSlots, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
