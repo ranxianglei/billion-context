@@ -211,3 +211,56 @@ test("#6317: failed archive sweep leaves no archive line; restore uses the newes
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
 });
+
+test("archiveSession: tombstone resets runtime payload columns; restore round-trips them (#4991)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-archive-tomb-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        store.ingestSession(planIngest(mkSession("sess-A", [mkMsg("m-a", "body a ".repeat(50))])));
+        // Simulate accumulated runtime state in the row (white-box: the
+        // contract under test is wipe-on-archive, not ingest serialization).
+        const db = (store as unknown as { db: { prepare: (q: string) => { run: (...p: unknown[]) => unknown } } }).db;
+        db.prepare("UPDATE sessions SET kstate_json = ?, meta_json = ? WHERE session_id = ?").run('{"sentinel":"kstate"}', '{"sentinel":"meta"}', "sess-A");
+        const archiveDir = path.join(dir, "archive");
+        assert.ok(store.archiveSession("sess-A", { archiveDir }).ok);
+        const tomb = store.getSessionRow("sess-A") as unknown as { kstateJson: string; metaJson: string; tailJson: string; statsJson: string; metadataJson: string; ccrJson: string | null; orphansJson: string | null };
+        assert.equal(tomb.kstateJson, "{}", "kstate_json reset to schema default");
+        assert.equal(tomb.metaJson, "{}", "meta_json reset to schema default");
+        assert.equal(tomb.tailJson, "{}", "tail_json reset to schema default");
+        assert.equal(tomb.statsJson, "{}", "stats_json reset to schema default");
+        assert.equal(tomb.metadataJson, "{}", "metadata_json reset to schema default");
+        assert.equal(tomb.ccrJson, null, "ccr_json reset to NULL");
+        assert.equal(tomb.orphansJson, null, "orphans_json reset to NULL");
+        // Restore re-inserts the pre-wipe row from the archive line.
+        assert.ok(store.restoreArchived("sess-A", { archiveDir }).ok);
+        const back = store.getSessionRow("sess-A") as unknown as { status: string; kstateJson: string; metaJson: string };
+        assert.equal(back.status, "active");
+        assert.equal(back.kstateJson, '{"sentinel":"kstate"}', "kstate round-trips from the archive line");
+        assert.equal(back.metaJson, '{"sentinel":"meta"}', "meta round-trips from the archive line");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("gc(): a soft archive failure is counted and reported, never swallowed (#4991)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-gc-skip-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const now = Date.now();
+        const DAY = 86_400_000;
+        store.ingestSession(planIngest(mkSession("sess-old", [mkMsg("m-old", "ancient body ".repeat(50))], now - 400 * DAY)));
+        store.ingestSession(planIngest(mkSession("sess-new", [mkMsg("m-new", "fresh body ".repeat(50))], now - 1 * DAY)));
+        // Simulate the concurrent-delete race: the row vanishes between the
+        // stale select and the per-session archive.
+        const real = store.archiveSession.bind(store);
+        store.archiveSession = (id: string, opts: { archiveDir: string }) => (id === "sess-old" ? { ok: false, reason: "not-found" } : real(id, opts));
+        const result = store.gc({ archiveAfterDays: 365, archiveDir: path.join(dir, "archive"), now });
+        assert.equal(result.archived, 0, "the raced session did not archive");
+        assert.equal(result.skipped, 1, "the soft failure is counted, not swallowed");
+        assert.equal((store.getSessionRow("sess-new") as unknown as { status: string }).status, "active", "the fresh session is untouched");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});

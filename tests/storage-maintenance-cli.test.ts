@@ -248,7 +248,7 @@ test("storage gc: e2e numbers match the direct store.gc() path on an equivalent 
         const facadeStore = new SessionStore({ dir: cliDir, enabled: true, debounceMs: 0 });
         const again = facadeStore.unifiedGc({ archiveAfterDays: 365, vacuum: "incremental" });
         facadeStore.closeQuietly();
-        assert.deepEqual(again, { archived: 0, contentRowsDeleted: 0 }, "second sweep on the collected store is a no-op");
+        assert.deepEqual(again, { archived: 0, contentRowsDeleted: 0, skipped: 0 }, "second sweep on the collected store is a no-op");
 
         const refStore = UnifiedStore.open(path.join(refDir, "index.db"));
         const ref = refStore.gc({ archiveAfterDays: 365, archiveDir: path.join(refDir, "archive"), vacuum: "incremental" });

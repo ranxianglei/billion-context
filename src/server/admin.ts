@@ -637,7 +637,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
                 res.end(JSON.stringify({ ok: false, error: "unified store unavailable mid-call" }));
                 return;
             }
-            log("info", `[admin] POST /__bili/storage/gc — archived=${result.archived} contentRowsDeleted=${result.contentRowsDeleted} vacuum=${vacuum ?? "none"}`);
+            log("info", `[admin] POST /__bili/storage/gc — archived=${result.archived} skipped=${result.skipped} contentRowsDeleted=${result.contentRowsDeleted} vacuum=${vacuum ?? "none"}`);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, ...result }));
             return;
