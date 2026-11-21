@@ -37,6 +37,7 @@ jobs:
   gate:
     if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') }}  # #CI-hold: [ework:ci-held] in commit message -> hold CI until final unmarked push
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -68,6 +69,7 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[ework:ci-held]') && (needs.gate.outputs.run == 'true') }}
     name: codex accepts CODEX_HOME overlay + registers bili MCP
     runs-on: windows-latest
+    timeout-minutes: 20
     # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
     # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
     # instead of aborting setup. Job-level → covers every registry op here
