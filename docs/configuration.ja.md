@@ -170,7 +170,7 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 行き止まりのプリフライト後、同じセッションの調整を再試行するまでのクールダウン。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | エラーを表面化させる前に、同一リクエストの最大トランスポート失敗リプレイ回数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | リプレイ間のベースバックオフ遅延（指数関数的）。 |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | エグレス側の 429 ガバナナ（#4204）：繰り返される上流 429 は転送されるのではなくローカルで応答される。アカウント制限および未認識/不正なレスポンスは origin+credential を保持する；KeyRing の正確な keyring_model_temporarily_unavailable コードと一致するリクエストモデルのみが origin+credential+model を保持し、他のモデルを適格とする。モデルの不一致または欠落はアカウント全体に適用される；false は従来の常に転送する動作を復元する。 |
+| `network.throttle429Enabled` | boolean | false | BILI_THROTTLE_429 | エグレス側の 429 ガバナナ（#4204）、#6639/#5853 以降既定でオフ：上流の 429 は変更なしにクライアントへ転送され、bili は 1 件あたり [429-passthrough] warn ログを記録する。true（または BILI_THROTTLE_429=1）にするとエスケープハッチとして再有効化：繰り返される上流 429 が転送されずローカルで応答される。アカウント制限および未認識/不正なレスポンスは origin+credential を保持；KeyRing の正確な keyring_model_temporarily_unavailable コードと一致するリクエストモデルのみが origin+credential+model を保持し、他のモデルを適格とする。モデルの不一致または欠落はアカウント全体に適用される。 |
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | ホールドがターミナル（既知のすべての SDK リトライセットの外側のローカル 424）に変わるまでの連続上流 429 の回数；バックオフウィンドウごとに1回のプローブが、アカウントホールドをクリアする非 429 レスポンス、またはそのモデルホールドをクリアする一致するモデルの非 429 レスポンスがあるまでチェックを続ける。 |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 ホールドのベースバックオフ（連続する 429 ごとに倍増し、[0.5×, 1×] にジャッターされ、throttle429MaxDelayMs で上限が設定される；上流の Retry-After が大きい場合は優先される）。 |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 のバックオフおよびターミナルフェーズのプローブ間隔の上限。 |
@@ -2049,7 +2049,7 @@ ACP ネイティブエージェント（現在は `pi` 拡張機能）は、プ�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | false |
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
