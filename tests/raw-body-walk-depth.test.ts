@@ -164,21 +164,21 @@ test("#6844: measuredBreakdownClause stays bare when other is empty", () => {
 // (and `total`) but NOT in `prompt`. The fix keys off PROMPT_BODY_KEYS per
 // wire format, never a hardcoded exclusion of one plugin's field.
 
-test("#7013: openai prompt mass = messages + tools (system rides inside messages)", () => {
+test("#7013: openai prompt mass = messages + tools + top-level system (aligned with estimateWireOverhead)", () => {
     const body = {
-        system: "in-body system rides inside messages for openai",
+        system: "top-level system field on the openai wire",
         messages: [{ role: "user", content: "hello message" }],
         tools: [{ name: "search", description: "find things fast" }],
         dsh_session_log: { entries: ["telemetry one", "telemetry two"] },
         metadata: { note: "structural note" },
     };
     const bd = estimateRawBodyBreakdown(body, PROMPT_BODY_KEYS.openai);
-    // messages bucket: "user" + "hello message"; tools bucket: "search" + "find things fast".
-    const expectedPrompt = t("user") + t("hello message") + t("search") + t("find things fast");
+    // messages bucket: "user" + "hello message"; tools bucket: "search" + "find things fast"; system bucket: "top-level system field on the openai wire".
+    const expectedPrompt = t("user") + t("hello message") + t("search") + t("find things fast") + t("top-level system field on the openai wire");
     assert.equal(bd.prompt, expectedPrompt);
-    // The non-prompt dsh_session_log + top-level system + metadata land in other/total but NOT prompt.
-    assert.equal(bd.prompt, bd.messages + bd.tools);
-    assert.ok(bd.other > 0, "dsh_session_log + system + metadata are non-prompt mass");
+    // The non-prompt dsh_session_log + metadata land in other/total but NOT prompt.
+    assert.equal(bd.prompt, bd.messages + bd.tools + bd.system);
+    assert.ok(bd.other > 0, "dsh_session_log + metadata are non-prompt mass");
     assert.equal(bd.total, bd.messages + bd.tools + bd.system + bd.other);
     assert.ok(bd.total > bd.prompt, "total includes non-prompt mass the prompt mass excludes");
     assert.equal(bd.total, estimateRawBodyTokens(body), "total invariant holds with promptKeys");

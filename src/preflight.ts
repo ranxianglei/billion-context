@@ -508,12 +508,13 @@ export function estimateRawBodyTokens(parsed: unknown): number {
 // the wire but consumes NO window, so a window-fit judgment must price only
 // these — NOT a hardcoded exclusion of one plugin's field (the next plugin that
 // registers a different upload field would recur the #7013 bug). The keys mirror
-// what each prepare lane feeds its core converter: openai (messages — system
-// rides inside it — + tools), anthropic (messages + tools + top-level system),
-// google (contents + systemInstruction + tools), responses (input + instructions
-// + tools).
+// what each prepare lane feeds its core converter: openai (messages + tools +
+// top-level system — the system prompt normally rides inside messages, but a
+// top-level system field is also counted to align with estimateWireOverhead),
+// anthropic (messages + tools + top-level system), google (contents +
+// systemInstruction + tools), responses (input + instructions + tools).
 export const PROMPT_BODY_KEYS: Record<WireProtocol, ReadonlySet<string>> = {
-    openai: new Set(["messages", "tools"]),
+    openai: new Set(["messages", "tools", "system"]),
     anthropic: new Set(["messages", "tools", "system"]),
     google: new Set(["contents", "systemInstruction", "tools"]),
     responses: new Set(["input", "instructions", "tools"]),
