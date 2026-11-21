@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
 import { dumpsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -57,7 +58,28 @@ function capText(text: string, budget: number, escaped = false): string {
     return prefix + marker(text.length - prefix.length);
 }
 
+// Timestamps and sanitized session ids are descriptive, not unique: multiple
+// failures can arrive in one millisecond, including from different processes.
+// Each incident owns a fresh path; exclusive creation also prevents replacing
+// existing evidence if that path is already present.
+function writeIncident(dir: string, prefix: string, sid: string, status: number, text: string): string {
+    const stamp = Date.now();
+    const out = path.join(dir, `${prefix}-${stamp}-${sid}-${status}.json`);
+    try {
+        fs.writeFileSync(out, text, { flag: "wx" });
+        return out;
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    // Keep the historical name when it is free. On a collision, bound the
+    // descriptive session portion so the unique suffix still fits a filename.
+    const unique = path.join(dir, `${prefix}-${stamp}-${sid.slice(0, 100)}-${status}-${randomUUID()}.json`);
+    fs.writeFileSync(unique, text, { flag: "wx" });
+    return unique;
+}
+
 /** Write the rejected forwarded body to `<dumpDir>/err-<ts>-<sid>-<status>.json`
+ *  (with a unique suffix on collision)
  *  when BILI_DUMP_4XX=1. Returns the file path, or null when disabled/skipped/failed. */
 export function dumpRejectedBody(status: number, sessionId: string, body: string | Buffer): string | null {
     if (!knobDump4xxEnabled()) return null;
@@ -73,8 +95,7 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
         const dir = dumpsDir();
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const out = path.join(dir, `err-${Date.now()}-${sid}-${status}.json`);
-        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${text}`);
+        const out = writeIncident(dir, "err", sid, status, `${DUMP_PLAINTEXT_BANNER}\n${text}`);
         loggerLog("info", `[dump] upstream ${status} rejected body written to ${out}`);
         gcDumpDirIfConfigured(dir);
         return out;
@@ -117,8 +138,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
         const dir = dumpsDir();
         fs.mkdirSync(dir, { recursive: true });
         const sid = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const out = path.join(dir, `summary-err-${Date.now()}-${sid}-${status}.json`);
-        fs.writeFileSync(out, `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify(envelope, null, 2)}`);
+        const out = writeIncident(dir, "summary-err", sid, status, `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify(envelope, null, 2)}`);
         loggerLog("info", `[dump] upstream ${status} rejected summary exchange written to ${out}`);
         gcDumpDirIfConfigured(dir);
         return out;

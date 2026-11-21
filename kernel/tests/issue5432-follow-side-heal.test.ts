@@ -84,18 +84,19 @@ function a(id: string, text: string): BiliMessage {
  *  enforces (follow side: nearest non-system predecessor must be a user or a
  *  server-tool-result-terminated assistant; no predecessor at array start is
  *  legal by contract. Precede side: run's first non-system follower must be
- *  an assistant or the array end). Directive-only exempt anywhere. */
+ *  an assistant or the array end). Directive-only systems (#7270) are judged
+ *  on the PRECEDE side only — the real heal does not constrain their follow
+ *  side — so they are flagged when their nearest non-system follower is a
+ *  non-assistant (the heal moves them to the trailing run). */
 function orphanSystems(messages: AnthropicWireMessage[]): number[] {
   const bad: number[] = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role !== "system") continue;
-    if (
+    const isDir =
       Array.isArray(m.content) &&
       m.content.length === 0 &&
-      (m as { output_config?: unknown }).output_config != null
-    )
-      continue;
+      (m as { output_config?: unknown }).output_config != null;
     let k = i + 1;
     while (k < messages.length && messages[k]!.role === "system") k++;
     const next = messages[k];
@@ -116,7 +117,7 @@ function orphanSystems(messages: AnthropicWireMessage[]): number[] {
         typeof lastType === "string" &&
         lastType.endsWith("tool_result"));
     const nextOk = !next || next.role === "assistant";
-    if (!predOk || !nextOk) bad.push(i);
+    if (isDir ? !nextOk : !predOk || !nextOk) bad.push(i);
   }
   return bad;
 }
@@ -334,7 +335,7 @@ test("gate (both directions): same real shape violating the PRECEDE side is heal
   assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "delta" }]);
 });
 
-test("directive-only system behind an assistant stays system (exempt at any position)", () => {
+test("directive-only system at a legal position (array end) stays system", () => {
   const dir = {
     role: "system",
     content: [],

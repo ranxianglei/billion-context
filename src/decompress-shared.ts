@@ -556,10 +556,10 @@ type PlanTerms = Map<string, number>;
 function planTokenize(text: string): string[] {
     const out: string[] = [];
     // Rendered ref-tag markup () is proxy metadata, not plan content.
-    const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ");
+    const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ").toLowerCase();
     const re = /[a-z0-9]+|[\u4e00-\u9fff]/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(clean.toLowerCase())) !== null) {
+    while ((m = re.exec(clean)) !== null) {
         const t = m[0];
         const cjk = /[\u4e00-\u9fff]/.test(t);
         // Latin tokens need >= 3 chars to carry signal; CJK single chars count.
@@ -734,6 +734,24 @@ function poolTermFrequency(pool: CompressionBlock[], terms: string[]): Map<strin
     return freq;
 }
 
+// Search uses the whole-string lowercase form (including contextual final
+// sigma), but its offsets cannot slice the original: e.g. İ becomes i + ◌̇.
+// Walk code point widths to map a matched span back without splitting either
+// an expanded lowercase character or an original surrogate pair.
+function originalLowercaseSpan(text: string, lowerStart: number, lowerEnd: number): { start: number; end: number } {
+    let lowerOffset = 0;
+    let start = 0;
+    let end = 0;
+    for (const char of text) {
+        const nextLower = lowerOffset + char.toLowerCase().length;
+        if (nextLower <= lowerStart) start += char.length;
+        end += char.length;
+        if (nextLower >= lowerEnd) break;
+        lowerOffset = nextLower;
+    }
+    return { start, end };
+}
+
 // Most distinctive query term present in this block's summary = fewest
 // containing blocks, tie → earliest occurrence. Null when no term is in the
 // summary body (hit then lives in the topic, already shown in the header line).
@@ -748,13 +766,16 @@ function pickAnchorTerm(summary: string, terms: string[], freq: Map<string, numb
         const f = freq.get(tl) ?? 0;
         if (!best || f < best.freq || (f === best.freq && i < best.index)) best = { term: tl, index: i, freq: f };
     }
-    return best ? { term: best.term, index: best.index } : null;
+    if (!best) return null;
+    const span = originalLowercaseSpan(summary, best.index, best.index + best.term.length);
+    return { term: best.term, index: span.start };
 }
 
 function markFirstMatch(text: string, needle: string): string {
     const idx = text.toLowerCase().indexOf(needle);
     if (idx === -1) return text;
-    return text.slice(0, idx) + "\u3010" + text.slice(idx, idx + needle.length) + "\u3011" + text.slice(idx + needle.length);
+    const { start, end } = originalLowercaseSpan(text, idx, idx + needle.length);
+    return text.slice(0, start) + "\u3010" + text.slice(start, end) + "\u3011" + text.slice(end);
 }
 
 function evidenceSnippet(summary: string, terms: string[], freq: Map<string, number>): string {
@@ -976,8 +997,8 @@ export function executeSearchContextTarget(
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
-                    if (!searchBlocks(blockDocs(anc.state), String(args.query ?? ""), { limit: anc.state.blocks.length, algorithm: "substring", minScore: 1e-9 }).length) continue;
-                    return executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    const inherited = executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
+                    if (inherited.text.startsWith("Found ")) return inherited;
                 }
             }
         }

@@ -328,6 +328,15 @@ function previewFoldTargetKey(core: CompressionCore, messages: CoreMessage[], st
     return target && foldTargetKey(target, state);
 }
 
+function coveredMessageChars(messages: readonly CoreMessage[], ids: readonly string[]): number {
+    const covered = new Set(ids);
+    let chars = 0;
+    messages.forEach((message) => {
+        if (covered.has(message.id)) chars += (message.text ?? "").length;
+    });
+    return chars;
+}
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
@@ -455,10 +464,27 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
 // `source.data` and Gemini `inline_data.data` were already excluded.
 const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
+// DSH official-API extension plugins attach transport-only top-level sibling fields
+// (such as `dsh_session_log` up to 8 MiB and `dsh_plugin_packages`) that consume 0 model
+// tokens and are stripped/ignored before inference, whereas nested fields inside
+// `messages[]` remain model-visible and must still be counted.
+const NON_MODEL_TOP_LEVEL_KEYS = new Set(["dsh_session_log", "dsh_plugin_packages"]);
+
+function isNonModelTopLevelKey(key: string): boolean {
+    return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
+}
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    const pending: [unknown, string | undefined][] = [];
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
+            pending.push([v, k]);
+        }
+    } else {
+        pending.push([parsed, undefined]);
+    }
     while (pending.length > 0) {
         const [value, key] = pending.pop()!;
         if (typeof value === "string") {
@@ -494,8 +520,9 @@ export interface RawBodyBreakdown {
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
     const pending: [unknown, string | undefined, number][] = [];
-    if (parsed && typeof parsed === "object") {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
             pending.push([v, k, bucket]);
         }
@@ -1733,20 +1760,6 @@ export function deterministicDigest(entries: DigestEntry[], startRef: string, en
 }
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
-    // #3641: epoch confirmation pending — the fold state and the resent
-    // history share nothing (wholesale replacement, no word evidence), so any
-    // fold computed here would summarize a substrate whose anchor set can
-    // never re-anchor. Pause folding for this session (verbatim passthrough)
-    // and say so once per pass at debug level: the error line lives at the
-    // escalation site (fold-reconcile). The FIRST realigned pass clears the
-    // latch (resetFoldDriftState), resuming folding automatically — no
-    // restart, no manual reset. Import direction: preflight → fold-reconcile
-    // is acyclic (fold-reconcile never imports preflight).
-    if (epochConfirmPending(deps.session)) {
-        deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
-        const paused = estimateCoreMessages(messages) + (deps.wireOverhead ?? 0);
-        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit, hadFoldableCandidates: false };
-    }
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
     // text estimate vs `target − imageReserve`. Algebraically the same firing
@@ -1803,6 +1816,26 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // failure stamp below).
     let fitExitForward = false;
     if (limit <= 0) return result;
+    // #3641: epoch confirmation pending — the fold state and the resent
+    // history share nothing (wholesale replacement, no word evidence), so any
+    // fold computed here would summarize a substrate whose anchor set can
+    // never re-anchor. Pause folding for this session (verbatim passthrough)
+    // and say so once per pass at debug level: the error line lives at the
+    // escalation site (fold-reconcile). The FIRST realigned pass clears the
+    // latch (resetFoldDriftState), resuming folding automatically — no
+    // restart, no manual reset. Import direction: preflight → fold-reconcile
+    // is acyclic (fold-reconcile never imports preflight).
+    // #6069: the pause holds only while the verbatim payload fits the window,
+    // judged on the same scale as the loop below. An over-window payload cannot
+    // pass through, and the latch clears only after a turn is forwarded, so a
+    // paused over-window session was refused on every turn. Fold it instead.
+    if (epochConfirmPending(deps.session)) {
+        if (result.payloadEstimate + viewDeltaCorrection < limit) {
+            deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
+            return result;
+        }
+        deps.log("warn", `[preflight] fold epoch confirmation pending for ${deps.session.id}, but the verbatim payload (~${Math.round(result.payloadEstimate + viewDeltaCorrection)} tokens) exceeds the model window ${limit} — folding the resent history instead of refusing the turn (#6069)`);
+    }
     if (deps.externalSummary === undefined) {
         try {
             // The plan rides the request Config rail: deps.config is this
@@ -2551,7 +2584,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // baseline currentTokens is char-based, so net the folded span's
             // char count against it instead of the token-based credit.
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-            const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+            const folded = baselineKnown ? compressed : coveredMessageChars(messages, effectiveMessageIds);
             currentTokens = Math.max(0, currentTokens - folded + countText(summary));
             // The apply path (stream.ts applyRanges) already netted the gross
             // fold out of lastInputTokens and credited compressCreditTokens;
@@ -2706,7 +2739,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     const spanUnits = baselineKnown
                         ? planned.compressedTokens
-                        : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                        : coveredMessageChars(messages, planned.effectiveMessageIds);
                     const chunks = splitSummaryContent(content, budget, countText);
                     // Track reservations locally: they count against the pass
                     // budget only once the batch actually fires (≥2 nominations).
@@ -2991,7 +3024,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // summary exists; units match the post-fold accounting.
                 const spanUnits = baselineKnown
                     ? planned.compressedTokens
-                    : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                    : coveredMessageChars(messages, planned.effectiveMessageIds);
                 if (emergencyFold) {
                     // Zero-upstream-call fold. The digest fits maxSummaryLength AND
                     // the net-shrink bound by construction (fallback forms), so it

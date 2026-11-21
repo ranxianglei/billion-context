@@ -114,7 +114,10 @@ interface RecordedUpstream {
 // Records every request body in order. Streaming requests are answered by
 // `onStreaming(callIndex)`; stream:false (summarization) requests by the
 // in-band summary response.
-async function recordedUpstream(onStreaming: (callIndex: number, res: http.ServerResponse) => void): Promise<RecordedUpstream> {
+async function recordedUpstream(
+    onStreaming: (callIndex: number, res: http.ServerResponse, body: string) => void,
+    summarize = summaryJson,
+): Promise<RecordedUpstream> {
     const bodies: string[] = [];
     let streamingCall = 0;
     const server = http.createServer((req, res) => {
@@ -131,12 +134,12 @@ async function recordedUpstream(onStreaming: (callIndex: number, res: http.Serve
             }
             if (parsed.stream === false) {
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(summaryJson());
+                res.end(summarize());
                 return;
             }
             const call = streamingCall;
             streamingCall += 1;
-            onStreaming(call, res);
+            onStreaming(call, res, raw);
         });
     });
     server.listen(0, "127.0.0.1");
@@ -336,3 +339,90 @@ test("e2e #1195 C: when the folded retry is ALSO rejected, the client sees the R
     assert.equal(s!.stats.overflowArmTokens, 128000, "#1110 arm record stays at the stated window");
     assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
 });
+
+for (const scenario of ["fits-before-refold", "fits-after-refold", "still-oversized", "budget-retry-rate-limited", "mismatched-output"] as const) {
+    test(`e2e #1195: LiteLLM input ${scenario}`, async (t) => {
+        const window = 128_000;
+        const firstInput = scenario === "fits-after-refold" || scenario === "still-oversized" ? 150_000 : 108_000;
+        const foldedInput = scenario === "still-oversized" ? 129_000 : 108_000;
+        const upstream = await recordedUpstream((call, res, raw) => {
+            const { max_tokens: output } = JSON.parse(raw) as { max_tokens: number };
+            const input = call === 0 ? firstInput : foldedInput;
+            if (scenario === "budget-retry-rate-limited" && call === 1) {
+                res.writeHead(429, { "content-type": "application/json", "retry-after": "12" });
+                res.end('{"error":{"message":"rate limited"}}');
+                return;
+            }
+            if (input + output <= window) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(
+                    'data: {"id":"reply","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"recovered"},"finish_reason":null}]}\n\n' +
+                    'data: {"id":"reply","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":108000,"completion_tokens":1,"total_tokens":108001}}\n\n' +
+                    "data: [DONE]\n\n",
+                );
+                return;
+            }
+            const statedOutput = scenario === "mismatched-output" ? output + 1 : output;
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "BadRequestError", message:
+                `Requested token count exceeds the model's maximum context length of ${window} tokens. You requested a total of ${input + statedOutput} tokens: ${input} tokens from the input messages and ${statedOutput} tokens for the completion.`
+            } }));
+        }, () => JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }] }));
+
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        const proxy = await startServer(proxyBaseOptions(upstream.port, 400_000));
+        await once(proxy, "listening");
+        t.after(async () => {
+            proxy.close();
+            proxy.closeIdleConnections?.();
+            await once(proxy, "close");
+            upstream.server.close();
+            upstream.server.closeIdleConnections?.();
+            await once(upstream.server, "close");
+        });
+
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstream.port}/v1/chat/completions`;
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 32_000, stream: true, messages: bigConversation() });
+        const headers = { "content-type": "application/json", "x-acp-session": `refold-split-${scenario}` };
+        const response = await fetch(url, { method: "POST", headers, body });
+        const responseText = await response.text();
+        const sends = upstream.bodies
+            .map(raw => JSON.parse(raw) as { stream?: boolean; max_tokens: number })
+            .filter(body => body.stream === true);
+        if (scenario === "budget-retry-rate-limited") {
+            assert.equal(response.status, 429);
+            assert.equal(response.headers.get("retry-after"), "12");
+            assert.match(responseText, /rate limited/);
+            assert.equal(upstream.bodies.length, 2);
+            return;
+        }
+        if (scenario === "mismatched-output") {
+            assert.equal(response.status, 400);
+            assert.equal(sends.length, 2, "only the existing refold is sent when reported output differs from the wire");
+            assert.ok(JSON.stringify(sends[1]).includes(SUMMARY_TEXT));
+            return;
+        }
+        if (scenario === "fits-before-refold") {
+            assert.equal(response.status, 200, responseText);
+            assert.match(responseText, /recovered/);
+            assert.equal(upstream.bodies.length, 2, "the exact payload fits after a budget-only retry, without any summarization");
+            assert.deepEqual(sends[1], { ...sends[0], max_tokens: window - firstInput });
+            return;
+        }
+        assert.ok(sends[1].max_tokens > window - foldedInput, "the folded retry must be rejected by the billed-token wall");
+        assert.ok(JSON.stringify(sends[1]).includes(SUMMARY_TEXT), "the second send contains the refold");
+        if (scenario === "fits-after-refold") {
+            assert.equal(response.status, 200, responseText);
+            assert.match(responseText, /recovered/);
+            assert.equal(sends.length, 3);
+            assert.equal(sends[2].max_tokens, window - foldedInput);
+            assert.deepEqual(sends[2], { ...sends[1], max_tokens: window - foldedInput });
+        } else {
+            assert.equal(response.status, 400);
+            assert.match(responseText, /129000 tokens from the input messages/);
+            assert.equal(sends.length, 2, "an output clamp cannot rescue oversized input");
+        }
+    });
+}

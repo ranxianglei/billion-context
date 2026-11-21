@@ -5,9 +5,11 @@
  * diagnostic blob (environment facts + host client versions + sanitized bili
  * config + one topic-specific section) plus a prefilled GitHub issue link, so
  * any future warning can offer "copy diagnostics / report on GitHub" without
- * inventing its own plumbing. Consumers: the SQLite legacy-only degradation
- * banner (topic `storage-legacy-only`) and the compression-conflict banner
- * (topic `conflict-banner`, #3235).
+ * inventing its own plumbing. Consumers (one topic each): the SQLite legacy-only
+ * degradation banner (`storage-legacy-only`), the snapshot-render shadow banner
+ * (`snapshot-shadow`, #3756 follow-up), the compression-conflict banner
+ * (`conflict-banner`, #3235), and the takeover-attribution banner
+ * (`attribution`, #3581/#3651).
  *
  * #3611 enrichment: the first field reports showed the blob was not
  * diagnosable as-is — no client version, no config, no log evidence. Every
@@ -38,18 +40,19 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
 import { summarizeConflicts } from "../conflict-watch.js";
+import { attributionStatusWire } from "../server/attribution-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
 import { recentClientUas } from "../client-ua-registry.js";
 import { redactForPublish } from "../log-mask.js";
-import { readLogLines } from "../log-file-lines.js";
+import { readLogFileLines } from "../log-file-lines.js";
 import { getLogPath } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
-import { safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 import { storageDiagnosticsLines } from "../storage/runtime-status.js";
 import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "../version.js";
 
@@ -62,6 +65,10 @@ const STORAGE_LOG_TAIL_LINES = 12;
 const CONFIG_SECTION_MAX_CHARS = 1600;
 const CONFLICT_LOG_TAIL_LINES = 20;
 const LOG_LINE_MAX_CHARS = 240;
+// #3581: the attribution error is a single host-supplied error message (the
+// primary diagnostic evidence for a `threw` episode); bound it so a pathological
+// message cannot outgrow the pasteable blob budget.
+const ATTRIBUTION_ERROR_MAX_CHARS = 500;
 const DSH_PROFILE_CAP = 8;
 // #4649: display budget for the observed-UA lines (the registry itself is
 // bounded tighter — 24 families × 8 UAs — so the blob stays pasteable).
@@ -89,22 +96,17 @@ function baseLines(): string[] {
     ];
 }
 
-// #3813: count full-pair scans so tests pin the single-read-per-report
-// contract (a regression to per-tail reads would re-double the cost).
+// #3813: keep tail collection shared if a topic needs both kinds of evidence.
 let candidateLogReads = 0;
 
-/** All non-empty lines across every retained generation (sealed history oldest-
- *  first, then the active file); [] on any fs failure. ONE enumeration shared
- *  with the other default readers, read once per report (#3813).
- *  Streaming: the retention set is a byte budget of many generations, so this
- *  keeps only the two bounded tails the report publishes instead of every line
- *  of every generation. */
+/** Collect bounded chronological tails, starting with the newest generation.
+ *  Once a requested tail is full, older files cannot contribute to it. Each
+ *  needed file is still streamed to its end to select its newest matches. */
 async function candidateLogTails(needStorage: boolean, needConflict: boolean): Promise<{
     storage: string[];
     conflict: string[];
-    /** Files that could not be read — the tails are then INCOMPLETE and the
-     *  report must say so rather than present a partial scan as the whole
-     *  retained history. */
+    /** Needed files that could not be read — the tails are then INCOMPLETE
+     *  even if older readable generations fill the remaining slots. */
     unreadable: string[];
 }> {
     candidateLogReads += 1;
@@ -116,12 +118,21 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
         if (into.length > cap) into.shift();
     };
     try {
-        const files = logGenerations(getLogPath() ?? defaultLogFile()).map((g) => g.path);
-        for await (const line of readLogLines(files, { onError: (f) => unreadable.push(f) })) {
-            if (needStorage && line.includes("[storage]")) pushBounded(storage, line, STORAGE_LOG_TAIL_LINES);
-            if (needConflict && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
-                pushBounded(conflict, line, CONFLICT_LOG_TAIL_LINES);
+        const files = logGenerations(getLogPath() ?? defaultLogFile());
+        for (let i = files.length - 1; i >= 0; i--) {
+            const storageRemaining = needStorage ? STORAGE_LOG_TAIL_LINES - storage.length : 0;
+            const conflictRemaining = needConflict ? CONFLICT_LOG_TAIL_LINES - conflict.length : 0;
+            if (storageRemaining === 0 && conflictRemaining === 0) break;
+            const fileStorage: string[] = [];
+            const fileConflict: string[] = [];
+            for await (const line of readLogFileLines(files[i]!.path, { onError: (f) => unreadable.push(f) })) {
+                if (storageRemaining > 0 && line.includes("[storage]")) pushBounded(fileStorage, line, storageRemaining);
+                if (conflictRemaining > 0 && CONFLICT_LOG_PATTERNS.some((p) => line.includes(p))) {
+                    pushBounded(fileConflict, line, conflictRemaining);
+                }
             }
+            storage.unshift(...fileStorage);
+            conflict.unshift(...fileConflict);
         }
     } catch {
         // Enumeration or iteration blew up: report nothing rather than a
@@ -131,8 +142,7 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
     return { storage, conflict, unreadable };
 }
 
-/** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
- * match). The caller reads the rotated pair once per report (#3813). #4427:
+/** Last N `[storage]` lines collected for this report ([] when none match). #4427:
  * these are VERBATIM on-disk bytes (written under whatever BILI_LOG_MASK_HOSTS
  * was in effect), so each line gets the same publish-boundary redaction +
  * length bound as conflictLogTail — a [storage] line can carry a URL with
@@ -140,7 +150,7 @@ async function candidateLogTails(needStorage: boolean, needConflict: boolean): P
 function storageLogTail(lines: string[]): string[] {
     return lines.map((l) => {
         const masked = redactForPublish(l);
-        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
     });
 }
 
@@ -175,7 +185,7 @@ function conflictLogTail(lines: string[]): string[] {
         // unconditionally, so under BILI_LOG_MASK_HOSTS=0 (real hosts in the
         // on-disk log) the published tail still cannot leak them.
         const masked = redactForPublish(l);
-        return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
+        return masked.length > LOG_LINE_MAX_CHARS ? safePrefix(masked, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
     });
 }
 
@@ -209,7 +219,7 @@ function conflictDiagnosticsLines(summary: ReturnType<typeof summarizeConflicts>
         lines.push("newest event per session:");
         for (const e of summary.latest.slice(0, 8)) {
             const sid = e.sessionId.length > 12 ? "…" + safeSuffix(e.sessionId, 8) : e.sessionId;
-            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${e.detail.slice(0, 160)}`);
+            lines.push(`  [${new Date(e.at).toISOString()}] ${sid} ${e.kind}: ${safePrefix(e.detail, 160)}`);
         }
     }
     lines.push("banner policy (#3235): only landed-unrecovered evidence alarms — recovered (intercepted+rebased) and");
@@ -327,7 +337,7 @@ function configSectionLines(): string[] {
         return lines;
     }
     if (text.length > CONFIG_SECTION_MAX_CHARS) {
-        text = text.slice(0, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
+        text = safePrefix(text, CONFIG_SECTION_MAX_CHARS - 1) + `… (truncated, ${text.length} chars total)`;
     }
     lines.push(text);
     return lines;
@@ -364,6 +374,17 @@ const TOPICS: Record<string, TopicDef> = {
     "snapshot-shadow": {
         title: () => `Snapshot-render shadow mismatch (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
         section: () => snapshotShadowDiagnosticsLines(),
+    },
+    // #3581/#3651: the takeover-attribution banner ships "copy diagnostics /
+    // report on GitHub" buttons wired to topic=attribution, but the topic was
+    // never registered — the blob fell back to the generic title and printed
+    // "no topic-specific section registered", so the report carried NONE of the
+    // attribution evidence (which agent degraded, state, refusals, error,
+    // endpoint) that a maintainer needs to adjudicate a takeover-broken episode.
+    // Register it so the banner's report is diagnosable on its own.
+    "attribution": {
+        title: () => `Takeover attribution failure (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
+        section: () => attributionDiagnosticsLines(),
     },
     "conflict-banner": {
         title: () => `Compression conflict banner (bili v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`,
@@ -413,16 +434,42 @@ function snapshotShadowDiagnosticsLines(): string[] {
     return lines;
 }
 
+// #3581/#3651: the takeover-attribution banner's diagnostic section. The
+// evidence lives in the HOST process (the proxy only learns of a refusal when a
+// plugin reports it), so this renders the latest per-agent report the proxy has
+// kept. Under the #3651 diagnosable-failure contract only DIAGNOSABLE failures
+// reach this surface: `threw` episodes carry the error text + masked endpoint,
+// while a by-design agentless lane never reports — so an EMPTY map means "no
+// diagnosable failure observed since process start", not "no plugins". The
+// error/endpoint bytes are host-supplied free text; the sink-level
+// redactForPublish in buildDiagnostics is what makes them publish-safe (same as
+// every other section here), so no per-field scrubbing is needed upstream.
+function attributionDiagnosticsLines(): string[] {
+    const lines = ["--- takeover attribution ---"];
+    const reports = attributionStatusWire();
+    const agents = Object.entries(reports);
+    if (agents.length === 0) {
+        lines.push("(no attribution reports received by this process — a healthy or by-design-agentless lane never reports, so this means no diagnosable failure was observed since process start)");
+        return lines;
+    }
+    for (const [agent, r] of agents) {
+        const sinceText = r.since > 0 ? new Date(r.since).toISOString() : "?";
+        lines.push(`${agent}: state=${r.state} refusals=${r.refusals} since=${sinceText}`);
+        if (r.error !== undefined) {
+            const err = redactForPublish(r.error);
+            lines.push(`  error: ${err.length > ATTRIBUTION_ERROR_MAX_CHARS ? safePrefix(err, ATTRIBUTION_ERROR_MAX_CHARS - 1) + "…" : err}`);
+        }
+        if (r.endpoint !== undefined) lines.push(`  endpoint: ${r.endpoint}`);
+    }
+    lines.push("banner policy (#3581/#3651): only DIAGNOSABLE failures reach this surface (threw episodes report error text + masked endpoint; by-design agentless lanes never report).");
+    lines.push("remedy: restart the host process to restore takeover; if it persists after restart, the error line above is the first thing to look at.");
+    return lines;
+}
+
 export async function buildDiagnostics(topic?: string): Promise<DiagnosticsReport> {
-    const t = topic?.trim().slice(0, 64) ?? "";
+    const t = safePrefix(topic?.trim() ?? "", 64);
     const def = t ? TOPICS[t] : undefined;
-    // #3813: read the rotated log pair at most ONCE per report — the storage
-    // tail and the conflict banner filter the SAME candidate lines, so a
-    // conflict-banner request used to read the whole pair twice (hundreds of MB
-    // possible), stalling the event loop synchronously. Both tails are now
-    // collected in the same streaming pass, which retains only their bounded
-    // buffers instead of every line of every generation.
-    const needStorage = Boolean(def);
+    const needStorage = t === "storage-legacy-only";
     const needConflict = t === "conflict-banner";
     const tails = needStorage || needConflict
         ? await candidateLogTails(needStorage, needConflict)
@@ -430,7 +477,7 @@ export async function buildDiagnostics(topic?: string): Promise<DiagnosticsRepor
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
         storageLogLines: needStorage ? storageLogTail(tails.storage) : [],
-        conflicts: needStorage ? safeConflictSummary() : null,
+        conflicts: needConflict ? safeConflictSummary() : null,
         conflictLogLines: needConflict ? conflictLogTail(tails.conflict) : [],
         unreadableLogs: tails.unreadable,
     };
