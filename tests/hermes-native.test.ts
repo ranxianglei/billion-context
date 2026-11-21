@@ -1420,8 +1420,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.transcribed_result, "compressed 3 blocks");
         assert.deepEqual(out!.runtime_info, [{ agent: "hermes", model: "test-model", maxOutput: 4096, source: "hermes-native" }]);
         // #1199: an attaching session registers its host pid so the shared proxy
-        // outlives the first (spawning) owner's exit.
-        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }], "attached session registers its host pid as a watchdog owner");
+        // outlives the first (spawning) owner's exit. #7491: the registration opts into the
+        // owner heartbeat (hb: true) so a recycled pid ages out on heartbeat silence instead
+        // of relying on kill(pid, 0) alone (identity-blind under pid reuse on Windows).
+        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid, hb: true }], "attached session registers its host pid as a watchdog owner with heartbeat opt-in");
     });
 
     // A toolset the host DEFERS (Hermes tool_search) is invisible in the outgoing snapshot even
