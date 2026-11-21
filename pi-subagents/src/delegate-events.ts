@@ -22,7 +22,34 @@ export interface Usage {
 
 export interface UsageUpdateEvent {
   kind: "usage-update";
-  usage: Usage;
+  /** Absent when the message carried no usable usage block. */
+  usage?: Usage;
+  /** Present when the message carried terminal-state fields (#4359). */
+  terminal?: AssistantTerminalInfo;
+}
+
+/** Terminal state of an assistant message as reported by the upstream provider
+ *  on message_end (#4359): distinguishes an upstream error/incomplete stop from
+ *  a completed-but-empty response. Absent fields stay undefined — the consumer
+ *  renders them as unknown rather than guessing. */
+export interface AssistantTerminalInfo {
+  stopReason?: string;
+  rawStopReason?: string;
+  errorMessage?: string;
+  textBlocks: number;
+  thinkingBlocks: number;
+}
+
+/** Merged view of the LAST assistant message_end (terminal state + that
+ *  turn's usage) used for empty-reply diagnostics (#4359). */
+export interface EmptyReplyDiagnostics {
+  stopReason?: string;
+  rawStopReason?: string;
+  errorMessage?: string;
+  textBlocks: number;
+  thinkingBlocks: number;
+  usageIn?: number;
+  usageOut?: number;
 }
 
 export interface AgentSettledEvent {
@@ -31,6 +58,34 @@ export interface AgentSettledEvent {
 
 function safeNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Extract the terminal-state fields from an assistant message_end payload
+ *  (#4359). Returns undefined when nothing is known (no stop reason and no
+ *  content array) so callers can distinguish "observed" from "unknown". */
+export function extractAssistantTerminal(msg: Record<string, unknown>): AssistantTerminalInfo | undefined {
+  let textBlocks = 0;
+  let thinkingBlocks = 0;
+  let hasContent = false;
+  if (Array.isArray(msg.content)) {
+    hasContent = true;
+    for (const b of msg.content) {
+      if (!b || typeof b !== "object") continue;
+      const t = (b as Record<string, unknown>).type;
+      if (t === "text") textBlocks++;
+      else if (t === "thinking" || t === "reasoning") thinkingBlocks++;
+    }
+  }
+  const stopReason = typeof msg.stopReason === "string" ? msg.stopReason : undefined;
+  const rawStopReason = typeof msg.rawStopReason === "string" ? msg.rawStopReason : undefined;
+  const errorMessage =
+    typeof msg.errorMessage === "string"
+      ? msg.errorMessage
+      : typeof msg.error === "string"
+        ? msg.error
+        : undefined;
+  if (!hasContent && stopReason === undefined && rawStopReason === undefined && errorMessage === undefined) return undefined;
+  return { stopReason, rawStopReason, errorMessage, textBlocks, thinkingBlocks };
 }
 
 export function handleMessageEnd(
@@ -145,7 +200,7 @@ export class ThinkingCollector {
     if (ev.kind === "thinking-delta") {
       this.push(ev.delta);
     }
-    if (ev.kind === "usage-update") {
+    if (ev.kind === "usage-update" && ev.usage) {
       this.usage = ev.usage;
     }
   }
@@ -240,7 +295,15 @@ export function parseEventLine(line: string): ParsedEvent | null {
     };
   }
   if (e.type === "message_end") {
-    return handleMessageEnd(e);
+    const ev = handleMessageEnd(e);
+    const msg = e.message as Record<string, unknown> | undefined;
+    const terminal = msg && msg.role === "assistant" ? extractAssistantTerminal(msg) : undefined;
+    if (!ev && !terminal) return null;
+    if (ev) {
+      if (terminal) ev.terminal = terminal;
+      return ev;
+    }
+    return { kind: "usage-update", terminal };
   }
   if (e.type === "agent_settled") {
     return { kind: "agent-settled" };
