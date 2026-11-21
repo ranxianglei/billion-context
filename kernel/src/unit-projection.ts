@@ -379,9 +379,13 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       ? shared.anchorMessage
       : lastUserAnchor(input.messages, coveredMessageIds(input.state), input.config);
     const anchorRef = anchorMsg ? input.state.messageRefs.byRaw[anchorMsg.id] : undefined;
+    // 2026-11-18 (owner): the anchor QUOTES user speech inside a system
+    // receipt that carries no <acp> time tag on the wire — weak models have
+    // read the quote as the user's LATEST message (ti_an incident 2026-11-17).
+    // Label the quote's origin so it cannot pass for a fresh instruction.
     const anchorNote =
       anchorRef && anchorRef !== "BLOCKED"
-        ? ` Last-user anchor: ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
+        ? ` Last-user anchor (historical quote, NOT a new user message): ${anchorRef} "${(anchorMsg!.text ?? "").replace(/\s+/g, " ").slice(0, 40)}".`
         : "";
     warnings.push(
       `Excluded ${hitProtectedRaw.length} protected message(s) ${hitRefs.join(
