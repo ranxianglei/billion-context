@@ -197,3 +197,27 @@ test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failu
     assert.match(mixed, /clamped to it/, "the model is told what happened to its endpoint");
     assert.match(mixed, /m00009/, "the above-frontier endpoint stays verbatim (typo-correctable)");
 });
+
+test("#6855: clamped success headline echoes the effective end, not the requested one", () => {
+    const ctx = makeCtx(fixtureMessages());
+    // endId m00009 is above the highest allocated ref (m00008) — the kernel
+    // clamps it to m00008 and the fold succeeds.
+    const out = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
+    assert.ok(out.startsWith("[Compressed "), `clamped endId still folds (got: ${out.slice(0, 120)})`);
+    // The headline must echo the EFFECTIVE (clamped) end m00008, not the
+    // requested m00009 — otherwise the model's next call starts at m00009+1,
+    // above the highest ref, which START anchors refuse (#4521).
+    assert.match(out, /^\[Compressed m00001–m00008 →/, "headline shows the clamped end, not the requested one");
+    assert.doesNotMatch(out, /^\[Compressed m00001–m00009/, "headline does NOT echo the requested (above-frontier) end");
+    // The kernel's snapped warning keeps the requested number for correlation.
+    assert.match(out, /endId="m00009" is above this session's highest allocated ref \(m00008\)/, "the warning still names the requested end");
+});
+
+test("#6855: unclamped success headline is byte-identical to the requested range", () => {
+    const ctx = makeCtx(fixtureMessages());
+    // endId m00008 is exactly the highest allocated ref — no clamp, the
+    // headline must show the requested range verbatim (no behavior drift).
+    const out = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx).text;
+    assert.ok(out.startsWith("[Compressed "), `in-frontier range folds (got: ${out.slice(0, 120)})`);
+    assert.match(out, /^\[Compressed m00003–m00008 →/, "headline echoes the requested range verbatim when no clamp");
+});
