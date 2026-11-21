@@ -36,7 +36,7 @@ import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSum
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
-import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
+import { estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyBreakdown } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
@@ -234,6 +234,11 @@ export async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
         const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", reserveBody, opts, billingUpstream ?? upstreamOrigin));
+        // #6876: the nudge's meter on the ACTUAL parsed body — live wire
+        // evidence that keeps working while the usage reading is frozen behind
+        // the egress fuse (a blocked request never reports usage). Under the
+        // window the kernel ignores it (byte-identical nudge, #4383 guard).
+        const measuredBodyTokens = estimateRawBodyBreakdown(parsed).total;
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -344,7 +349,7 @@ export async function prepareOpenai(
         // nudge-carrying request rolls the cadence back to pre-turn (lane
         // mirror of the anthropic-lane fix).
         nudgeStampsBefore = nudgeStampsOf(session);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, measuredBodyTokens, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         const nudgeHeldAfterReject = session.transient?.nudgeHeldAfterReject === true;
         if (nudgeHeldAfterReject) restoreNudgeStamps(session, nudgeStampsBefore);

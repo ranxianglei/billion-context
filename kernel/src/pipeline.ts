@@ -8,6 +8,15 @@ export interface PipelineContext {
    *  phantom-pressure guard in the nudge node. Optional — omit for legacy.
    */
   readonly tokenCountSource?: "usage" | "estimate";
+  /** The #554 meter on the ACTUAL serialized outbound body (every string
+   *  field, CJK-aware — tools[], system, extension fields, encrypted
+   *  reasoning replay), measured by the host BEFORE this turn: when it
+   *  exceeds the model window the nudge node arms a measured-pressure
+   *  EMERGENCY regardless of the (possibly frozen/stale) usage reading.
+   *  #6876: usage-grade 437,971 frozen at 43% while the wire body measured
+   *  1,068,060 — every nudge path sat below gate while the egress fuse 413'd
+   *  every round. Omit for legacy behavior (byte-identical). */
+  readonly measuredBodyTokens?: number;
   readonly countTokens: (text: string) => number;
   /** Per-session CCR content store for this turn (ccr-store node updates it
    *  via effects.ccr; processTurn echoes it back in the result). */
